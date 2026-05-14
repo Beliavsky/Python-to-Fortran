@@ -5294,6 +5294,12 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None):
             if (
                 isinstance(n.func.value, ast.Name)
                 and n.func.value.id in {"np", "numpy"}
+                and n.func.attr == "argsort"
+            ):
+                return "int", 1
+            if (
+                isinstance(n.func.value, ast.Name)
+                and n.func.value.id in {"np", "numpy"}
                 and n.func.attr in {"zeros", "ones", "empty", "full", "arange", "linspace"}
             ):
                 k = "real"
@@ -8801,6 +8807,7 @@ class translator(ast.NodeVisitor):
         self.sys_func_aliases = dict(getattr(translator, "global_sys_func_aliases", {}))
         self.math_aliases = set(translator.global_math_aliases)
         self.math_func_aliases = dict(translator.global_math_func_aliases)
+        self.module_global_names = set()
         self.broadcast_object_args = {}
         self.promoted_colvec_results = set()
         self.uses_sys_argv = False
@@ -9537,8 +9544,6 @@ class translator(ast.NodeVisitor):
     def _mark_int(self, name):
         if name == "_":
             return
-        if name in self.reserved_names:
-            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9554,8 +9559,6 @@ class translator(ast.NodeVisitor):
 
     def _force_mark_int(self, name):
         if name == "_":
-            return
-        if name in self.reserved_names:
             return
         if name in self.params:
             return
@@ -9577,8 +9580,6 @@ class translator(ast.NodeVisitor):
     def _mark_real(self, name, kind_tag=None):
         if name == "_":
             return
-        if name in self.reserved_names:
-            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9597,8 +9598,6 @@ class translator(ast.NodeVisitor):
     def _mark_complex(self, name):
         if name == "_":
             return
-        if name in self.reserved_names:
-            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9615,8 +9614,6 @@ class translator(ast.NodeVisitor):
     def _mark_log(self, name):
         if name == "_":
             return
-        if name in self.reserved_names:
-            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9632,8 +9629,6 @@ class translator(ast.NodeVisitor):
     def _mark_char(self, name):
         if name == "_":
             return
-        if name in self.reserved_names:
-            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9647,8 +9642,6 @@ class translator(ast.NodeVisitor):
 
     def _mark_alloc_int(self, name, rank=1):
         if name == "_":
-            return
-        if name in self.reserved_names:
             return
         if name in self.params:
             return
@@ -19645,6 +19638,16 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
+                and is_numpy_name_node(node.value.func.value)
+                and node.value.func.attr == "argsort"
+            ):
+                self._mark_alloc_int(node.targets[0].id, rank=1)
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
                 and node.value.func.attr == "readline"
                 and isinstance(node.value.func.value, ast.Name)
             ):
@@ -22621,6 +22624,8 @@ class translator(ast.NodeVisitor):
             # currently visible value and emit invalid Fortran (e.g. x = x + ...).
             if rk is not None and _expr_uses_name(v, t.id):
                 rk = None
+            if rk is not None and self._aliased_name(t.id) in getattr(self, "module_global_names", set()):
+                rk = None
             if rk is not None:
                 # Prefer sequential non-nested rebinding blocks for repeated
                 # type changes of the same variable.
@@ -22659,6 +22664,7 @@ class translator(ast.NodeVisitor):
                         and (not is_function_result_target)
                         and (not _stack_array_assign)
                         and (not _expr_uses_name(v, t.id))
+                        and self._aliased_name(t.id) not in getattr(self, "module_global_names", set())
                     ):
                         self._open_type_rebind_block(t.id, k_rhs, r_rhs)
         if isinstance(t, ast.Name):
@@ -23659,7 +23665,7 @@ class translator(ast.NodeVisitor):
             outs = []
             for e in t.elts:
                 if isinstance(e, ast.Name):
-                    outs.append(e.id)
+                    outs.append(self._aliased_name(e.id))
                 elif isinstance(e, ast.Starred):
                     outs.append("_")
                 else:
@@ -26266,6 +26272,10 @@ class translator(ast.NodeVisitor):
             and len(v.args) >= 1
         ):
             name = t.id
+            aname = self._aliased_name(name)
+            if self.open_type_rebind_stack and self.open_type_rebind_stack[-1] == aname:
+                self._close_one_type_rebind_block()
+            name = aname
             a0 = self.expr(v.args[0])
             self.o.w(f"if (allocated({name})) deallocate({name})")
             self.o.w(f"allocate({name}(1:size({a0})))")
@@ -27299,6 +27309,150 @@ class translator(ast.NodeVisitor):
             self.o.w("end do")
             self.o.pop()
             self.o.w("end block")
+            return
+
+        if (
+            isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "zip"
+            and isinstance(node.target, (ast.Tuple, ast.List))
+        ):
+            tgt_elts = list(node.target.elts)
+            zip_args = list(node.iter.args)
+            if len(tgt_elts) != len(zip_args):
+                raise NotImplementedError("zip() loop target arity must match number of iterables")
+            if not all(isinstance(t, ast.Name) for t in tgt_elts):
+                raise NotImplementedError("zip() loop targets must be names")
+            if not zip_args:
+                return
+            for _arg in zip_args:
+                if self._rank_expr(_arg) != 1 and not self._is_python_list_expr(_arg):
+                    raise NotImplementedError("zip() loop currently supports only rank-1 iterables")
+
+            iv = self._aliased_name("i_zip")
+            nv = self._aliased_name("n_zip")
+            self._mark_int(iv)
+            self._mark_int(nv)
+            tmp_specs = []
+            for j, _arg in enumerate(zip_args, start=1):
+                _kind = self._expr_kind(_arg)
+                if isinstance(_arg, ast.Name):
+                    _src_name = self._resolve_list_alias(_arg.id)
+                    _tmp = self._aliased_name(f"zip_{_src_name}")
+                else:
+                    _tmp = self._aliased_name(f"zip_arg_{j}")
+                if _kind == "real":
+                    decl = f"real(kind=dp), allocatable :: {_tmp}(:)"
+                elif _kind == "logical":
+                    decl = f"logical, allocatable :: {_tmp}(:)"
+                elif _kind == "complex":
+                    decl = f"complex(kind=dp), allocatable :: {_tmp}(:)"
+                elif _kind == "char":
+                    decl = f"character(len=:), allocatable :: {_tmp}(:)"
+                else:
+                    decl = f"integer, allocatable :: {_tmp}(:)"
+                tmp_specs.append((_tmp, _kind, decl, self.expr(_arg), _arg))
+
+            print_only_body = all(
+                isinstance(_st, ast.Expr)
+                and isinstance(_st.value, ast.Call)
+                and (
+                    (isinstance(_st.value.func, ast.Name) and _st.value.func.id == "print")
+                    or (
+                        isinstance(_st.value.func, ast.Attribute)
+                        and isinstance(_st.value.func.value, ast.Name)
+                        and _st.value.func.value.id == "pprint"
+                        and _st.value.func.attr == "pprint"
+                    )
+                )
+                for _st in node.body
+            )
+            direct_print_zip = print_only_body and all(isinstance(_arg, ast.Name) for _arg in zip_args)
+            if direct_print_zip:
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"integer :: {iv}, {nv}")
+                self.o.w(f"{nv} = min(" + ", ".join(f"size({_expr})" for _tmp, _kind, _decl, _expr, _arg_node in tmp_specs) + ")")
+                self.o.w(f"do {iv} = 1, {nv}")
+                self.o.push()
+                repl = {}
+                for _t, (_tmp, _kind, _decl, _expr, _arg_node) in zip(tgt_elts, tmp_specs):
+                    if _t.id == "_":
+                        continue
+                    repl[_t.id] = ast.Subscript(
+                        value=copy.deepcopy(_arg_node),
+                        slice=ast.BinOp(
+                            left=ast.Name(id=iv, ctx=ast.Load()),
+                            op=ast.Sub(),
+                            right=ast.Constant(value=1),
+                        ),
+                        ctx=ast.Load(),
+                    )
+
+                class _ZipPrintRewriter(ast.NodeTransformer):
+                    def __init__(self, repl_map):
+                        self.repl_map = repl_map
+
+                    def visit_Name(self, _node):
+                        if isinstance(_node.ctx, ast.Load) and _node.id in self.repl_map:
+                            return copy.deepcopy(self.repl_map[_node.id])
+                        return _node
+
+                _rw = _ZipPrintRewriter(repl)
+                for s in node.body:
+                    s2 = ast.fix_missing_locations(_rw.visit(copy.deepcopy(s)))
+                    self._emit_print_call(s2.value)
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {iv}, {nv}")
+            for _t, (_tmp, _kind, _decl, _expr, _arg_node) in zip(tgt_elts, tmp_specs):
+                if _t.id == "_":
+                    continue
+                _emit_name = self._aliased_name(_t.id)
+                if _kind == "real":
+                    self.o.w(f"real(kind=dp) :: {_emit_name}")
+                elif _kind == "logical":
+                    self.o.w(f"logical :: {_emit_name}")
+                elif _kind == "complex":
+                    self.o.w(f"complex(kind=dp) :: {_emit_name}")
+                elif _kind == "char":
+                    self.o.w(f"character(len=:), allocatable :: {_emit_name}")
+                else:
+                    self.o.w(f"integer :: {_emit_name}")
+            for _tmp, _kind, decl, _expr, _arg_node in tmp_specs:
+                self.o.w(decl)
+            for _tmp, _kind, decl, _expr, _arg_node in tmp_specs:
+                self.o.w(f"{_tmp} = {_expr}")
+            self.o.w(f"{nv} = min(" + ", ".join(f"size({_tmp})" for _tmp, *_rest in tmp_specs) + ")")
+            self.o.w(f"do {iv} = 1, {nv}")
+            self.o.push()
+            for _t, (_tmp, _kind, _decl, _expr, _arg_node) in zip(tgt_elts, tmp_specs):
+                if _t.id == "_":
+                    continue
+                _emit_name = self._aliased_name(_t.id)
+                if _kind == "real":
+                    self._mark_real(_t.id)
+                elif _kind == "logical":
+                    self._mark_log(_t.id)
+                elif _kind == "complex":
+                    self._mark_complex(_t.id)
+                elif _kind == "char":
+                    self._mark_char(_t.id)
+                else:
+                    self._mark_int(_t.id)
+                self.o.w(f"{_emit_name} = {_tmp}({iv})")
+            _visit_loop_body_and_close_rebinds()
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
 
         def _emit_for_over_synthetic_slices(iter_name, target_name, idx_name=None, enum_start_txt=None):
             mapping = self.synthetic_slices.get(iter_name, {})
@@ -27643,7 +27797,7 @@ class translator(ast.NodeVisitor):
             if not zip_args:
                 return
             for _arg in zip_args:
-                if self._rank_expr(_arg) != 1:
+                if self._rank_expr(_arg) != 1 and not self._is_python_list_expr(_arg):
                     raise NotImplementedError("zip() loop currently supports only rank-1 iterables")
             iv = self._aliased_name("i_zip")
             nv = self._aliased_name("n_zip")
@@ -30276,6 +30430,7 @@ def _emit_local_function(
         shape_donor_by_rank=shape_donor_by_rank,
     )
     tr.current_function_name = fn.name
+    tr.module_global_names = set(module_global_names)
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
@@ -30914,7 +31069,19 @@ def _emit_local_function(
         if (not _force_rr1) and (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
-                rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
+                _hint_rr = int(local_func_arg_ranks[fn.name][idx])
+                if (
+                    _hint_rr == 0
+                    and not any(
+                        isinstance(_n, ast.Subscript)
+                        and isinstance(_n.value, ast.Name)
+                        and _n.value.id == a.arg
+                        for _n in ast.walk(fn)
+                    )
+                ):
+                    rr = 0
+                else:
+                    rr = max(rr, _hint_rr)
                 if rr > int(local_func_arg_ranks[fn.name][idx]):
                     local_func_arg_ranks[fn.name][idx] = int(rr)
         if rr > 0:
@@ -37043,8 +37210,10 @@ def generate_flat(
     call_kind_hints = {fn.name: [None for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_rank_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    call_actual_rank_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_pairs = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_islist = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+    _top_level_scan_nodes = []
     _prov_scalar_specs, _prov_scalar_ranks, _prov_tuple_out, _prov_tuple_out_ranks = _local_return_maps(
         local_funcs,
         params,
@@ -37212,6 +37381,7 @@ def generate_flat(
                 rk = call_kind_hints[callee]
                 rks = call_kind_sets[callee]
                 rrs = call_rank_sets[callee]
+                ars = call_actual_rank_sets[callee]
                 krp = call_kind_rank_pairs[callee]
                 krl = call_kind_rank_islist[callee]
                 for i, a in enumerate(n.args):
@@ -37230,6 +37400,8 @@ def generate_flat(
                     ar = tr_ctx._rank_expr(a)
                     if direct_actual is not None:
                         ar = max(ar, direct_actual[1])
+                    if direct_actual is not None or not isinstance(a, ast.Name):
+                        ars[i].add(ar)
                     rr[i] = max(rr[i], ar)
                     rrs[i].add(ar)
                     ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(a)
@@ -37282,6 +37454,8 @@ def generate_flat(
                         ar = tr_ctx._rank_expr(kw.value)
                         if direct_actual is not None:
                             ar = max(ar, direct_actual[1])
+                        if direct_actual is not None or not isinstance(kw.value, ast.Name):
+                            ars[i].add(ar)
                         rr[i] = max(rr[i], ar)
                         rrs[i].add(ar)
                         ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(kw.value)
@@ -37585,6 +37759,20 @@ def generate_flat(
                 and hint_rank == 0
             ):
                 local_func_arg_ranks[fn.name][i] = 0
+            _rank_obs = call_actual_rank_sets.get(fn.name, [])
+            if (
+                i < len(local_func_arg_ranks[fn.name])
+                and i < len(_rank_obs)
+                and _rank_obs[i]
+                and max(int(_r) for _r in _rank_obs[i]) == 0
+                and not any(
+                    isinstance(_n, ast.Subscript)
+                    and isinstance(_n.value, ast.Name)
+                    and _n.value.id == arg_name
+                    for _n in ast.walk(fn)
+                )
+            ):
+                local_func_arg_ranks[fn.name][i] = 0
     # Reconcile weak callee-side real inference with concrete local call sites.
     # Python integer arrays/scalars are often used in real formulas inside a
     # callee; that does not make the dummy argument real if all visible actuals
@@ -37679,6 +37867,33 @@ def generate_flat(
                     if _i >= len(_observed_actual_kinds[_callee]):
                         continue
                     _ak = _callsite_expr_kind(_caller_fn, _kw.value)
+                    if _ak in {"int", "alloc_int", "real", "alloc_real", "logical", "alloc_log", "complex", "alloc_complex", "char", "alloc_char"}:
+                        _observed_actual_kinds[_callee][_i].add(_ak)
+
+    if _top_level_scan_nodes:
+        _top_level_caller = ast.Module(body=list(_top_level_scan_nodes), type_ignores=[])
+        for _call in ast.walk(_top_level_caller):
+            if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
+                continue
+            _callee = _call.func.id
+            if _callee not in _observed_actual_kinds:
+                continue
+            _callee_args = list(local_func_arg_names.get(_callee, []))
+            for _i, _actual in enumerate(getattr(_call, "args", [])):
+                if _i >= len(_observed_actual_kinds[_callee]):
+                    break
+                _ak = _callsite_expr_kind(_top_level_caller, _actual)
+                if _ak in {"int", "alloc_int", "real", "alloc_real", "logical", "alloc_log", "complex", "alloc_complex", "char", "alloc_char"}:
+                    _observed_actual_kinds[_callee][_i].add(_ak)
+            if getattr(_call, "keywords", []):
+                _idx_by_name = {_nm: _i for _i, _nm in enumerate(_callee_args)}
+                for _kw in _call.keywords:
+                    if _kw.arg is None or _kw.arg not in _idx_by_name:
+                        continue
+                    _i = _idx_by_name[_kw.arg]
+                    if _i >= len(_observed_actual_kinds[_callee]):
+                        continue
+                    _ak = _callsite_expr_kind(_top_level_caller, _kw.value)
                     if _ak in {"int", "alloc_int", "real", "alloc_real", "logical", "alloc_log", "complex", "alloc_complex", "char", "alloc_char"}:
                         _observed_actual_kinds[_callee][_i].add(_ak)
 
@@ -39320,6 +39535,30 @@ def generate_flat(
             _ranks_sync[_argc_sync + _j_sync] = max(0, int(_tuple_r_sync[_j_sync])) if _j_sync < len(_tuple_r_sync) else 0
         local_func_arg_kinds[_fn_tuple_sync.name] = _kinds_sync
         local_func_arg_ranks[_fn_tuple_sync.name] = _ranks_sync
+    for _fn_scalar_actuals in (local_funcs or []):
+        if not isinstance(_fn_scalar_actuals, ast.FunctionDef):
+            continue
+        _rank_obs_final = call_actual_rank_sets.get(_fn_scalar_actuals.name, [])
+        if not _rank_obs_final or _fn_scalar_actuals.name not in local_func_arg_ranks:
+            continue
+        _arg_names_final = local_func_arg_names.get(_fn_scalar_actuals.name, [])
+        for _i_final, _obs_final in enumerate(_rank_obs_final):
+            if (
+                _i_final >= len(local_func_arg_ranks[_fn_scalar_actuals.name])
+                or _i_final >= len(_arg_names_final)
+                or not _obs_final
+                or max(int(_r) for _r in _obs_final) != 0
+            ):
+                continue
+            _arg_name_final = _arg_names_final[_i_final]
+            if any(
+                isinstance(_n, ast.Subscript)
+                and isinstance(_n.value, ast.Name)
+                and _n.value.id == _arg_name_final
+                for _n in ast.walk(_fn_scalar_actuals)
+            ):
+                continue
+            local_func_arg_ranks[_fn_scalar_actuals.name][_i_final] = 0
     local_generic_overloads = set(local_overload_specs.keys())
     pure_local_calls = set(known_pure_calls or set()) | set((user_class_types or {}).keys())
 
@@ -39981,6 +40220,7 @@ def generate_flat(
         rng_replay_path=rng_replay_path,
         local_proc_name_aliases=fn_alias_map if use_proc_module else None,
     )
+    tr.module_global_names = set(module_global_names)
     tr.prescan(tree.body)
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":
