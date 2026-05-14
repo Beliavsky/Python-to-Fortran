@@ -13937,6 +13937,12 @@ class translator(ast.NodeVisitor):
             b0 = self.expr(node.comparators[0])
             a = a0
             b = b0
+            if op in (ast.Eq, ast.NotEq):
+                left_kind = self._expr_kind(node.left)
+                right_kind = self._expr_kind(node.comparators[0])
+                if left_kind == "logical" and right_kind == "logical":
+                    logical_op = ".eqv." if op is ast.Eq else ".neqv."
+                    return f"({a} {logical_op} {b})"
             # Limited broadcasting for comparisons: rank-2 with rank-1.
             if self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1:
                 if self._is_col2_expr(node.comparators[0]):
@@ -36636,7 +36642,7 @@ def generate_flat(
                 return "real"
             return None
 
-        cb_sig = {}  # (callee_name, cb_param_name) -> (in_rank, ret_rank, in_kind, out_kind)
+        cb_sig = {}  # (callee_name, cb_param_name) -> (in_rank, ret_rank, in_kind, out_kind, arg_kinds)
         for _callee in local_funcs:
             if not isinstance(_callee, ast.FunctionDef):
                 continue
@@ -36649,9 +36655,24 @@ def generate_flat(
                 _outr = 0
                 _ink = None
                 _outk = None
+                _arg_kinds = {}
                 for _n in ast.walk(_callee):
                     if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == _cbp):
                         continue
+                    for _ia, _arg in enumerate(_n.args):
+                        _ak = None
+                        try:
+                            _ak = tr_seed._expr_kind(_arg)
+                        except Exception:
+                            pass
+                        if isinstance(_arg, ast.Name):
+                            try:
+                                _ak = _promote_kind_hint(_ak, _infer_arg_kind_in_fn(_callee, _arg.id))
+                            except Exception:
+                                pass
+                            _ak = _promote_kind_hint(_ak, _scan_name_kind(_cb_tr, _arg.id))
+                        if _ak in {"int", "real", "complex", "logical", "char"}:
+                            _arg_kinds[_ia] = _promote_kind_hint(_arg_kinds.get(_ia), _ak)
                     if _n.args:
                         _a0 = _n.args[0]
                         try:
@@ -36694,7 +36715,7 @@ def generate_flat(
                         pass
                 if _outk is None and _ink == "complex":
                     _outk = "complex"
-                cb_sig[(_callee.name, _cbp)] = (_inr, _outr, _ink, _outk)
+                cb_sig[(_callee.name, _cbp)] = (_inr, _outr, _ink, _outk, _arg_kinds)
         for _caller in local_funcs:
             if not isinstance(_caller, ast.FunctionDef):
                 continue
@@ -36728,11 +36749,14 @@ def generate_flat(
                     _sig = cb_sig.get((_callee_name, _cbp), None)
                     if _sig is None:
                         continue
-                    _inr, _outr, _ink, _outk = _sig
+                    _inr, _outr, _ink, _outk = _sig[:4]
+                    _arg_kinds = _sig[4] if len(_sig) > 4 else {}
                     if (not _actual_scalar) and local_func_arg_ranks[_a.id]:
                         local_func_arg_ranks[_a.id][0] = max(int(local_func_arg_ranks[_a.id][0]), int(_inr))
-                    if _ink in {"int", "real", "complex", "logical", "char"} and local_func_arg_kinds.get(_a.id):
-                        local_func_arg_kinds[_a.id][0] = _promote_kind_hint(local_func_arg_kinds[_a.id][0], _ink)
+                    if local_func_arg_kinds.get(_a.id):
+                        for _ia, _ak in sorted(_arg_kinds.items()):
+                            if _ak in {"int", "real", "complex", "logical", "char"} and _ia < len(local_func_arg_kinds[_a.id]):
+                                local_func_arg_kinds[_a.id][_ia] = _promote_kind_hint(local_func_arg_kinds[_a.id][_ia], _ak)
                     if (not _actual_scalar) and _outr > 0 and _a.id in local_return_ranks:
                         local_return_ranks[_a.id] = max(int(local_return_ranks[_a.id]), int(_outr))
                     if _outk in {"int", "real", "complex", "logical", "char"} and _a.id in local_return_specs:
@@ -36769,11 +36793,14 @@ def generate_flat(
                     _sig = cb_sig.get((_callee_name, _cbp), None)
                     if _sig is None:
                         continue
-                    _inr, _outr, _ink, _outk = _sig
+                    _inr, _outr, _ink, _outk = _sig[:4]
+                    _arg_kinds = _sig[4] if len(_sig) > 4 else {}
                     if (not _actual_scalar) and local_func_arg_ranks[_kw.value.id]:
                         local_func_arg_ranks[_kw.value.id][0] = max(int(local_func_arg_ranks[_kw.value.id][0]), int(_inr))
-                    if _ink in {"int", "real", "complex", "logical", "char"} and local_func_arg_kinds.get(_kw.value.id):
-                        local_func_arg_kinds[_kw.value.id][0] = _promote_kind_hint(local_func_arg_kinds[_kw.value.id][0], _ink)
+                    if local_func_arg_kinds.get(_kw.value.id):
+                        for _ia, _ak in sorted(_arg_kinds.items()):
+                            if _ak in {"int", "real", "complex", "logical", "char"} and _ia < len(local_func_arg_kinds[_kw.value.id]):
+                                local_func_arg_kinds[_kw.value.id][_ia] = _promote_kind_hint(local_func_arg_kinds[_kw.value.id][_ia], _ak)
                     if (not _actual_scalar) and _outr > 0 and _kw.value.id in local_return_ranks:
                         local_return_ranks[_kw.value.id] = max(int(local_return_ranks[_kw.value.id]), int(_outr))
                     if _outk in {"int", "real", "complex", "logical", "char"} and _kw.value.id in local_return_specs:
@@ -37052,8 +37079,6 @@ def generate_flat(
                                 _txt = ast.unparse(_kw.value).lower()
                             if "float" in _txt or "complex" in _txt:
                                 return True
-                if isinstance(_st, ast.BinOp) and isinstance(_st.op, ast.Div):
-                    return True
             return False
 
         for _ in range(max(1, len(local_funcs)) + 2):
