@@ -402,7 +402,7 @@ def debug_flags_for_compiler(compiler_exe):
 
 
 def default_compiler_command():
-    return "gfortran -O3 -Wfatal-errors"
+    return "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -Wfatal-errors"
 
 
 def _compiler_parts_with_debug_flags(compiler_parts):
@@ -4180,11 +4180,6 @@ def detect_needed_helpers(tree):
             )
             if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr"}:
                 needed.add("py_str")
-            if is_print_like:
-                for kw in getattr(node, "keywords", []):
-                    if kw.arg == "sep" and is_const_str(kw.value) and kw.value.value != " ":
-                        needed.add("py_str")
-                        break
             if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
                 sf = self.statistics_func_aliases[node.func.id]
                 if sf in {"mean", "fmean"}:
@@ -5050,11 +5045,6 @@ def collect_module_global_decls(local_funcs):
         return k0
 
     def _infer_from_node(n):
-        def _shape_rank(node):
-            if isinstance(node, (ast.Tuple, ast.List)):
-                return max(1, len(node.elts))
-            return 1
-
         if isinstance(n, ast.Constant):
             v = n.value
             if isinstance(v, bool):
@@ -5089,13 +5079,9 @@ def collect_module_global_decls(local_funcs):
         if isinstance(n, ast.Call):
             if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name):
                 if n.func.value.id in {"np", "numpy"} and n.func.attr in {
-                    "array", "asarray", "linspace", "arange"
+                    "array", "asarray", "linspace", "arange", "zeros", "ones", "empty"
                 }:
                     return "real", 1
-                if n.func.value.id in {"np", "numpy"} and n.func.attr in {
-                    "zeros", "ones", "empty", "full"
-                }:
-                    return "real", _shape_rank(n.args[0]) if n.args else 1
                 if n.func.value.id in {"np", "numpy"} and n.func.attr in {
                     "zeros_like", "ones_like", "empty_like"
                 }:
@@ -5254,11 +5240,6 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None):
         return (k or "real"), 1
 
     def _infer_from_node(n):
-        def _shape_rank(node):
-            if isinstance(node, (ast.Tuple, ast.List)):
-                return max(1, len(node.elts))
-            return 1
-
         if isinstance(n, ast.Constant):
             v = n.value
             if isinstance(v, bool):
@@ -5291,12 +5272,6 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None):
                     if kw.arg == "dtype":
                         k = _kind_from_dtype_node(kw.value) or k
                 return (k or "real"), max(1, r)
-            if (
-                isinstance(n.func.value, ast.Name)
-                and n.func.value.id in {"np", "numpy"}
-                and n.func.attr == "argsort"
-            ):
-                return "int", 1
             if (
                 isinstance(n.func.value, ast.Name)
                 and n.func.value.id in {"np", "numpy"}
@@ -8807,7 +8782,6 @@ class translator(ast.NodeVisitor):
         self.sys_func_aliases = dict(getattr(translator, "global_sys_func_aliases", {}))
         self.math_aliases = set(translator.global_math_aliases)
         self.math_func_aliases = dict(translator.global_math_func_aliases)
-        self.module_global_names = set()
         self.broadcast_object_args = {}
         self.promoted_colvec_results = set()
         self.uses_sys_argv = False
@@ -9114,16 +9088,12 @@ class translator(ast.NodeVisitor):
             return arg_expr
         if want == "real":
             if have == "int":
-                if self._rank_expr(arg_node) > 0 and not isinstance(arg_node, ast.Subscript):
-                    return arg_expr
                 return f"real({arg_expr}, kind=dp)"
             if have == "logical":
                 return f"merge(1.0_dp, 0.0_dp, {arg_expr})"
             return arg_expr
         if want == "int":
             if have == "real":
-                if self._rank_expr(arg_node) > 0:
-                    return arg_expr
                 return f"int({arg_expr})"
             if have == "logical":
                 return f"merge(1, 0, {arg_expr})"
@@ -9544,6 +9514,8 @@ class translator(ast.NodeVisitor):
     def _mark_int(self, name):
         if name == "_":
             return
+        if name in self.reserved_names:
+            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9559,6 +9531,8 @@ class translator(ast.NodeVisitor):
 
     def _force_mark_int(self, name):
         if name == "_":
+            return
+        if name in self.reserved_names:
             return
         if name in self.params:
             return
@@ -9580,6 +9554,8 @@ class translator(ast.NodeVisitor):
     def _mark_real(self, name, kind_tag=None):
         if name == "_":
             return
+        if name in self.reserved_names:
+            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9598,6 +9574,8 @@ class translator(ast.NodeVisitor):
     def _mark_complex(self, name):
         if name == "_":
             return
+        if name in self.reserved_names:
+            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9614,6 +9592,8 @@ class translator(ast.NodeVisitor):
     def _mark_log(self, name):
         if name == "_":
             return
+        if name in self.reserved_names:
+            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9629,6 +9609,8 @@ class translator(ast.NodeVisitor):
     def _mark_char(self, name):
         if name == "_":
             return
+        if name in self.reserved_names:
+            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -9642,6 +9624,8 @@ class translator(ast.NodeVisitor):
 
     def _mark_alloc_int(self, name, rank=1):
         if name == "_":
+            return
+        if name in self.reserved_names:
             return
         if name in self.params:
             return
@@ -11986,8 +11970,6 @@ class translator(ast.NodeVisitor):
                 return base_rank + sum(vec_ranks)
             if isinstance(node.slice, ast.Slice):
                 base_r = self._rank_expr(node.value)
-                if base_r == 0 and self._expr_kind(node.value) in {"char", "str"}:
-                    return 0
                 if base_r > 1:
                     return base_r
                 return 1
@@ -12307,15 +12289,6 @@ class translator(ast.NodeVisitor):
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
                 if node.func.attr in {"add", "multiply", "maximum", "power", "logical_and", "logical_or", "logical_xor"} and len(node.args) >= 2:
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
-                if node.func.attr in {"sum", "max", "min", "mean"} and len(node.args) >= 1:
-                    axis_node = None
-                    for kw in node.keywords:
-                        if kw.arg == "axis":
-                            axis_node = kw.value
-                            break
-                    if axis_node is not None:
-                        return max(0, self._rank_expr(node.args[0]) - 1)
-                    return 0
                 if node.func.attr == "arange" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "ndim" and len(node.args) >= 1:
@@ -13749,16 +13722,12 @@ class translator(ast.NodeVisitor):
                     b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
             if op is ast.Div:
                 if lk0 in {"int", "logical"} and rk0 in {"int", "logical"}:
-                    if self._rank_expr(node.left) <= 0 or isinstance(node.left, ast.Subscript):
-                        a = f"real({a}, kind=dp)"
-                    if self._rank_expr(node.right) <= 0 or isinstance(node.right, ast.Subscript):
-                        b = f"real({b}, kind=dp)"
+                    a = f"real({a}, kind=dp)"
+                    b = f"real({b}, kind=dp)"
                 elif lk0 in {"int", "logical"} and rk0 == "real":
-                    if self._rank_expr(node.left) <= 0 or isinstance(node.left, ast.Subscript):
-                        a = f"real({a}, kind=dp)"
+                    a = f"real({a}, kind=dp)"
                 elif lk0 == "real" and rk0 in {"int", "logical"}:
-                    if self._rank_expr(node.right) <= 0 or isinstance(node.right, ast.Subscript):
-                        b = f"real({b}, kind=dp)"
+                    b = f"real({b}, kind=dp)"
             if op is ast.Mod:
                 # Python old-style string formatting: "x=%g" % (v,)
                 if self._expr_kind(node.left) == "char" and self._rank_expr(node.left) == 0 and is_const_str(node.left):
@@ -14868,8 +14837,6 @@ class translator(ast.NodeVisitor):
                 if callee in {"np.transpose", "np.permute_dims"}:
                     a0 = self.expr(node.args[0]) if len(node.args) >= 1 else ""
                     if len(node.args) == 1:
-                        if len(node.args) >= 1 and self._rank_expr(node.args[0]) <= 1:
-                            return a0
                         return f"transpose({a0})"
                     axes = node.args[1]
                     if not isinstance(axes, (ast.Tuple, ast.List)):
@@ -16347,8 +16314,6 @@ class translator(ast.NodeVisitor):
                     return f"eye(int({self.expr(node.args[0])}), int({self.expr(node.args[0])}))"
                 a0 = self.expr(node.args[0])
                 if len(node.args) == 1:
-                    if self._rank_expr(node.args[0]) <= 1:
-                        return a0
                     return f"transpose({a0})"
                 axes = node.args[1]
                 if not isinstance(axes, (ast.Tuple, ast.List)):
@@ -19243,12 +19208,6 @@ class translator(ast.NodeVisitor):
 
         self.local_assigned_names = set()
         self.real_assignment_exprs = {}
-        subscripted_base_names = {
-            _n.value.id
-            for _node in nodes
-            for _n in ast.walk(_node)
-            if isinstance(_n, ast.Subscript) and isinstance(_n.value, ast.Name)
-        }
 
         def _record_real_assignment_exprs_in_order(seq):
             for _node in seq:
@@ -19632,16 +19591,6 @@ class translator(ast.NodeVisitor):
                 for _e in node.targets[0].elts[:2]:
                     if isinstance(_e, ast.Name):
                         self._mark_real(_e.id)
-            if (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and is_numpy_name_node(node.value.func.value)
-                and node.value.func.attr == "argsort"
-            ):
-                self._mark_alloc_int(node.targets[0].id, rank=1)
             if (
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
@@ -20106,8 +20055,7 @@ class translator(ast.NodeVisitor):
                         else:
                             # Unknown tuple-output type: defer marking rather than
                             # forcing INTEGER and causing downstream mismatches.
-                            if nm in subscripted_base_names:
-                                self._mark_alloc_real(nm, rank=max(1, rr if rr > 0 else 1))
+                            pass
                         self._check_type_stability_explicit(nm, k, rr, None, node)
                     continue
                 if (
@@ -22571,19 +22519,6 @@ class translator(ast.NodeVisitor):
                 and len(v.args) >= 1
                 and isinstance(v.args[0], (ast.Tuple, ast.List))
             )
-            _logical_zero_fill_assign = (
-                t.id in self.alloc_logs
-                and isinstance(v, ast.Call)
-                and isinstance(v.func, ast.Attribute)
-                and is_numpy_name_node(v.func.value)
-                and v.func.attr in {"zeros", "ones"}
-            )
-            _numeric_zero_fill_assign = (
-                isinstance(v, ast.Call)
-                and isinstance(v.func, ast.Attribute)
-                and is_numpy_name_node(v.func.value)
-                and v.func.attr in {"zeros", "zeros_like"}
-            )
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
             _tuple_out_or_src_names = set(self.tuple_return_out_names or []) | set(getattr(self, "tuple_return_src_names", []) or [])
             if rk is not None and t.id in _tuple_out_or_src_names:
@@ -22592,22 +22527,11 @@ class translator(ast.NodeVisitor):
                 rk = None
             if _stack_array_assign:
                 rk = None
-            if _logical_zero_fill_assign:
-                rk = None
             if rk is not None:
                 k_vis0, _r_vis0 = self._visible_kind_rank(t.id)
                 k_rhs0 = self._expr_kind(v)
                 r_rhs0 = max(0, int(self._rank_expr(v)))
                 if (
-                    _numeric_zero_fill_assign
-                    and k_vis0 in {"int", "logical"}
-                    and k_rhs0 == "real"
-                    and int(_r_vis0) == int(r_rhs0)
-                ):
-                    rk = None
-                if (
-                    rk is not None
-                    and
                     k_vis0 is not None
                     and k_rhs0 is not None
                     and k_vis0 == k_rhs0
@@ -22623,8 +22547,6 @@ class translator(ast.NodeVisitor):
             # Rebinding a name on a self-referential assignment would shadow the
             # currently visible value and emit invalid Fortran (e.g. x = x + ...).
             if rk is not None and _expr_uses_name(v, t.id):
-                rk = None
-            if rk is not None and self._aliased_name(t.id) in getattr(self, "module_global_names", set()):
                 rk = None
             if rk is not None:
                 # Prefer sequential non-nested rebinding blocks for repeated
@@ -22642,7 +22564,7 @@ class translator(ast.NodeVisitor):
                     k_vis = None
                     r_vis = 0
                 else:
-                    k_rhs = "logical" if _logical_zero_fill_assign else self._expr_kind(v)
+                    k_rhs = self._expr_kind(v)
                     r_rhs = max(0, int(self._rank_expr(v)))
                     k_vis, r_vis = self._visible_kind_rank(t.id)
                     if (
@@ -22655,16 +22577,9 @@ class translator(ast.NodeVisitor):
                         k_rhs is not None
                         and k_vis is not None
                         and ((k_rhs != k_vis) or (int(r_rhs) != int(r_vis)))
-                        and not (
-                            _numeric_zero_fill_assign
-                            and k_vis in {"int", "logical"}
-                            and k_rhs == "real"
-                            and int(r_rhs) == int(r_vis)
-                        )
                         and (not is_function_result_target)
                         and (not _stack_array_assign)
                         and (not _expr_uses_name(v, t.id))
-                        and self._aliased_name(t.id) not in getattr(self, "module_global_names", set())
                     ):
                         self._open_type_rebind_block(t.id, k_rhs, r_rhs)
         if isinstance(t, ast.Name):
@@ -23178,7 +23093,6 @@ class translator(ast.NodeVisitor):
                 raw_want_kind = rk[0] if rk is not None else None
                 want_kind = raw_want_kind
                 want_rank = rk[1] if rk is not None else None
-                tuple_hint_kind = None
                 if out_name_pos < len(out_kinds_hint):
                     tuple_hint_kind = out_kinds_hint[out_name_pos]
                     if tuple_hint_kind is not None and (want_kind is None or rk is not None):
@@ -23187,20 +23101,6 @@ class translator(ast.NodeVisitor):
                         # assignment line.
                         raw_want_kind = tuple_hint_kind
                         want_kind = raw_want_kind
-                _formal_out_idx = len(args_nodes) + out_name_pos
-                _formal_out_kinds = list(self.local_func_arg_kinds.get(v.func.id, []))
-                _formal_out_ranks = list(self.local_func_arg_ranks.get(v.func.id, []))
-                formal_hint_kind = None
-                if _formal_out_idx < len(_formal_out_kinds):
-                    _formal_out_kind = _formal_out_kinds[_formal_out_idx]
-                    if _formal_out_kind in {"int", "real", "logical", "char", "complex"}:
-                        formal_hint_kind = _formal_out_kind
-                        raw_want_kind = _formal_out_kind
-                        want_kind = _formal_out_kind
-                if _formal_out_idx < len(_formal_out_ranks):
-                    _formal_out_rank = _formal_out_ranks[_formal_out_idx]
-                    if _formal_out_rank is not None:
-                        want_rank = max(0, int(_formal_out_rank))
                 if want_kind == "alloc_real":
                     want_kind = "real"
                     want_rank = max(1, int(want_rank)) if want_rank is not None else (
@@ -23253,11 +23153,6 @@ class translator(ast.NodeVisitor):
                     and k_vis0 is not None
                     and r_vis0 is not None
                     and not matched_overload_profile
-                    and (target_aliases_input or (tuple_hint_kind is None and formal_hint_kind is None))
-                    and not (
-                        raw_want_kind in {"int", "logical", "char", "complex"}
-                        and k_vis0 != want_kind
-                    )
                 ):
                     # Prefer the already-visible target declaration when there
                     # is no explicit rebind event on this line. Tuple-return
@@ -23276,15 +23171,6 @@ class translator(ast.NodeVisitor):
                     and not matched_overload_profile
                 ):
                     want_rank = max(1, int(r_vis0))
-                if target_aliases_input and k_vis0 is not None and r_vis0 is not None:
-                    # A tuple-return target that is also an input is loop-carried
-                    # state. Do not shadow it with a block-local rebind; the
-                    # temporary output assignment below can do any scalar cast.
-                    want_kind = k_vis0
-                    want_rank = int(r_vis0)
-                if target_aliases_input:
-                    out_name_pos += 1
-                    continue
                 if k_vis0 == want_kind and int(r_vis0) == int(want_rank):
                     out_name_pos += 1
                     continue
@@ -23306,31 +23192,13 @@ class translator(ast.NodeVisitor):
             formal_kinds = list(self.local_func_arg_kinds.get(v.func.id, []))
             def _coerced_local_actual(_idx, _node):
                 _txt = self.expr(_node)
+                if (
+                    isinstance(_node, ast.Name)
+                    and self._aliased_name(_node.id) in {onm for onm in outs if onm != "_"}
+                ):
+                    return _txt
                 if v.func.id in self.local_generic_overloads:
                     return _txt
-                if isinstance(_node, ast.Name):
-                    _actual_nm = self._aliased_name(_node.id)
-                    for _j_out, _out_nm in enumerate(outs):
-                        if _out_nm == "_" or _out_nm != _actual_nm:
-                            continue
-                        _out_formal_idx = len(args_nodes) + _j_out
-                        _out_want_k = (
-                            formal_kinds[_out_formal_idx]
-                            if _out_formal_idx < len(formal_kinds)
-                            else (out_kinds_hint[_j_out] if _j_out < len(out_kinds_hint) else None)
-                        )
-                        _have_k = self._expr_kind(_node)
-                        _have_r = self._rank_expr(_node)
-                        _vis_k, _vis_r = self._visible_kind_rank(_node.id)
-                        if (
-                            _out_want_k == "int"
-                            and (_have_k == "real" or _vis_k == "real")
-                            and _have_r == 0
-                        ):
-                            return f"int({_txt})"
-                        if _out_want_k == "real" and _have_k == "int" and _have_r == 0:
-                            return f"real({_txt}, kind=dp)"
-                        break
                 _want_k = formal_kinds[_idx] if _idx < len(formal_kinds) else None
                 _want_r = formal_ranks[_idx] if _idx < len(formal_ranks) else 0
                 _have_k = self._expr_kind(_node)
@@ -23349,13 +23217,6 @@ class translator(ast.NodeVisitor):
                     and _have_k == "int"
                 ):
                     return f"real({_txt}, kind=dp)"
-                if (
-                    _want_k == "int"
-                    and _want_r == 0
-                    and _have_r == 0
-                    and _have_k == "real"
-                ):
-                    return f"int({_txt})"
                 return _txt
             vec_rank = 0
             vec_idx = -1
@@ -23453,11 +23314,6 @@ class translator(ast.NodeVisitor):
             if alias_idx:
                 for j in alias_idx:
                     k = out_kinds_hint[j] if j < len(out_kinds_hint) else "int"
-                    formal_idx = len(args_nodes) + j
-                    if formal_idx < len(formal_kinds) and formal_kinds[formal_idx] in {
-                        "int", "real", "logical", "complex", "char"
-                    }:
-                        k = formal_kinds[formal_idx]
                     rr = None
                     if j < len(out_ranks_hint):
                         try:
@@ -23468,7 +23324,7 @@ class translator(ast.NodeVisitor):
                     if dst != "_":
                         try:
                             _vk, _vr = self._visible_kind_rank(dst)
-                            if _vk is not None and (dst not in in_actual_txt or v.func.id in self.local_generic_overloads):
+                            if _vk is not None:
                                 k = _vk
                             if _vr is not None:
                                 rr = max(0, int(_vr))
@@ -23480,27 +23336,6 @@ class translator(ast.NodeVisitor):
                     tnm = f"tmp_out_{j + 1}_{getattr(node, 'lineno', 0)}"
                     out_actuals[j] = tnm
                     tmp_decl.append((j, tnm, k, rr))
-
-            for j, dst in enumerate(list(out_actuals)):
-                if dst == "_" or j in alias_idx:
-                    continue
-                formal_idx = len(args_nodes) + j
-                fk = formal_kinds[formal_idx] if formal_idx < len(formal_kinds) else (
-                    out_kinds_hint[j] if j < len(out_kinds_hint) else None
-                )
-                if fk not in {"int", "real", "logical", "complex"}:
-                    continue
-                try:
-                    vk, vr = self._visible_kind_rank(dst)
-                except Exception:
-                    vk, vr = (None, None)
-                if vk is None or vk == fk or int(vr or 0) != 0:
-                    continue
-                tnm = f"tmp_out_{j + 1}_{getattr(node, 'lineno', 0)}"
-                while tnm in self.ints or tnm in self.reals or tnm in self.logs or tnm in self.complexes:
-                    tnm += "_2"
-                out_actuals[j] = tnm
-                tmp_decl.append((j, tnm, fk, 0))
 
             if tmp_decl:
                 self.o.w("block")
@@ -23538,30 +23373,6 @@ class translator(ast.NodeVisitor):
             else:
                 call_args.extend(out_actuals)
             _tuple_call_name = v.func.id if v.func.id in self.local_generic_overloads else self._aliased_name(v.func.id)
-            if (
-                v.func.id == "i4_sobol"
-                and args_nodes
-                and args_nodes[0] is not None
-                and out_actuals
-            ):
-                _out0 = out_actuals[0]
-                if (
-                    isinstance(_out0, str)
-                    and re.match(r"^[A-Za-z_]\w*$", _out0)
-                    and (
-                        _out0 in self.alloc_reals
-                        or _out0 in self.alloc_ints
-                        or _out0 in self.alloc_logs
-                        or _out0 in self.alloc_complexes
-                    )
-                ):
-                    _dim0 = self.expr(args_nodes[0])
-                    self.o.w(f"if (allocated({_out0})) then")
-                    self.o.push()
-                    self.o.w(f"if (size({_out0}) /= int({_dim0})) deallocate({_out0})")
-                    self.o.pop()
-                    self.o.w("end if")
-                    self.o.w(f"if (.not. allocated({_out0})) allocate({_out0}(int({_dim0})))")
             self.o.w(f"call {_tuple_call_name}(" + ", ".join(call_args) + ")")
 
             if tmp_decl:
@@ -23665,7 +23476,7 @@ class translator(ast.NodeVisitor):
             outs = []
             for e in t.elts:
                 if isinstance(e, ast.Name):
-                    outs.append(self._aliased_name(e.id))
+                    outs.append(e.id)
                 elif isinstance(e, ast.Starred):
                     outs.append("_")
                 else:
@@ -25858,24 +25669,17 @@ class translator(ast.NodeVisitor):
             shp = v.args[0]
             fill_expr = "0"
             dtype_txt = self._np_dtype_text(v)
-            if name in self.alloc_logs:
-                fill_expr = ".false."
-            elif "float" in dtype_txt or (name in self.alloc_reals):
+            if "float" in dtype_txt or (name in self.alloc_reals):
                 fill_expr = "0.0_dp"
             elif "bool" in dtype_txt:
                 fill_expr = ".false."
             if v.func.attr == "ones":
-                if name in self.alloc_logs:
-                    fill_expr = ".true."
-                elif "float" in dtype_txt or (name in self.alloc_reals):
+                if "float" in dtype_txt or (name in self.alloc_reals):
                     fill_expr = "1.0_dp"
                 elif "bool" in dtype_txt:
                     fill_expr = ".true."
                 else:
                     fill_expr = "1"
-            if getattr(self, "current_function_name", None) == "i4_sobol" and name == "quasi":
-                self.o.w(f"{name} = {fill_expr}")
-                return
             self.o.w(f"if (allocated({name})) deallocate({name})")
             dims_list = self._shape_dim_exprs(shp)
             dims = ", ".join(f"1:{d}" for d in dims_list)
@@ -26272,10 +26076,6 @@ class translator(ast.NodeVisitor):
             and len(v.args) >= 1
         ):
             name = t.id
-            aname = self._aliased_name(name)
-            if self.open_type_rebind_stack and self.open_type_rebind_stack[-1] == aname:
-                self._close_one_type_rebind_block()
-            name = aname
             a0 = self.expr(v.args[0])
             self.o.w(f"if (allocated({name})) deallocate({name})")
             self.o.w(f"allocate({name}(1:size({a0})))")
@@ -26828,9 +26628,6 @@ class translator(ast.NodeVisitor):
             lhs = self.expr(node.target)
         rhs = self.expr(node.value)
         if isinstance(node.op, ast.Add):
-            if self._expr_kind(node.target) == "char" or self._expr_kind(node.value) == "char":
-                self.o.w(f"{lhs} = {lhs} // {rhs}")
-                return
             self.o.w(f"{lhs} = {lhs} + {rhs}")
             return
         if isinstance(node.op, ast.Sub):
@@ -27309,150 +27106,6 @@ class translator(ast.NodeVisitor):
             self.o.w("end do")
             self.o.pop()
             self.o.w("end block")
-            return
-
-        if (
-            isinstance(node.iter, ast.Call)
-            and isinstance(node.iter.func, ast.Name)
-            and node.iter.func.id == "zip"
-            and isinstance(node.target, (ast.Tuple, ast.List))
-        ):
-            tgt_elts = list(node.target.elts)
-            zip_args = list(node.iter.args)
-            if len(tgt_elts) != len(zip_args):
-                raise NotImplementedError("zip() loop target arity must match number of iterables")
-            if not all(isinstance(t, ast.Name) for t in tgt_elts):
-                raise NotImplementedError("zip() loop targets must be names")
-            if not zip_args:
-                return
-            for _arg in zip_args:
-                if self._rank_expr(_arg) != 1 and not self._is_python_list_expr(_arg):
-                    raise NotImplementedError("zip() loop currently supports only rank-1 iterables")
-
-            iv = self._aliased_name("i_zip")
-            nv = self._aliased_name("n_zip")
-            self._mark_int(iv)
-            self._mark_int(nv)
-            tmp_specs = []
-            for j, _arg in enumerate(zip_args, start=1):
-                _kind = self._expr_kind(_arg)
-                if isinstance(_arg, ast.Name):
-                    _src_name = self._resolve_list_alias(_arg.id)
-                    _tmp = self._aliased_name(f"zip_{_src_name}")
-                else:
-                    _tmp = self._aliased_name(f"zip_arg_{j}")
-                if _kind == "real":
-                    decl = f"real(kind=dp), allocatable :: {_tmp}(:)"
-                elif _kind == "logical":
-                    decl = f"logical, allocatable :: {_tmp}(:)"
-                elif _kind == "complex":
-                    decl = f"complex(kind=dp), allocatable :: {_tmp}(:)"
-                elif _kind == "char":
-                    decl = f"character(len=:), allocatable :: {_tmp}(:)"
-                else:
-                    decl = f"integer, allocatable :: {_tmp}(:)"
-                tmp_specs.append((_tmp, _kind, decl, self.expr(_arg), _arg))
-
-            print_only_body = all(
-                isinstance(_st, ast.Expr)
-                and isinstance(_st.value, ast.Call)
-                and (
-                    (isinstance(_st.value.func, ast.Name) and _st.value.func.id == "print")
-                    or (
-                        isinstance(_st.value.func, ast.Attribute)
-                        and isinstance(_st.value.func.value, ast.Name)
-                        and _st.value.func.value.id == "pprint"
-                        and _st.value.func.attr == "pprint"
-                    )
-                )
-                for _st in node.body
-            )
-            direct_print_zip = print_only_body and all(isinstance(_arg, ast.Name) for _arg in zip_args)
-            if direct_print_zip:
-                self.o.w("block")
-                self.o.push()
-                self.o.w(f"integer :: {iv}, {nv}")
-                self.o.w(f"{nv} = min(" + ", ".join(f"size({_expr})" for _tmp, _kind, _decl, _expr, _arg_node in tmp_specs) + ")")
-                self.o.w(f"do {iv} = 1, {nv}")
-                self.o.push()
-                repl = {}
-                for _t, (_tmp, _kind, _decl, _expr, _arg_node) in zip(tgt_elts, tmp_specs):
-                    if _t.id == "_":
-                        continue
-                    repl[_t.id] = ast.Subscript(
-                        value=copy.deepcopy(_arg_node),
-                        slice=ast.BinOp(
-                            left=ast.Name(id=iv, ctx=ast.Load()),
-                            op=ast.Sub(),
-                            right=ast.Constant(value=1),
-                        ),
-                        ctx=ast.Load(),
-                    )
-
-                class _ZipPrintRewriter(ast.NodeTransformer):
-                    def __init__(self, repl_map):
-                        self.repl_map = repl_map
-
-                    def visit_Name(self, _node):
-                        if isinstance(_node.ctx, ast.Load) and _node.id in self.repl_map:
-                            return copy.deepcopy(self.repl_map[_node.id])
-                        return _node
-
-                _rw = _ZipPrintRewriter(repl)
-                for s in node.body:
-                    s2 = ast.fix_missing_locations(_rw.visit(copy.deepcopy(s)))
-                    self._emit_print_call(s2.value)
-                self.o.pop()
-                self.o.w("end do")
-                self.o.pop()
-                self.o.w("end block")
-                return
-
-            self.o.w("block")
-            self.o.push()
-            self.o.w(f"integer :: {iv}, {nv}")
-            for _t, (_tmp, _kind, _decl, _expr, _arg_node) in zip(tgt_elts, tmp_specs):
-                if _t.id == "_":
-                    continue
-                _emit_name = self._aliased_name(_t.id)
-                if _kind == "real":
-                    self.o.w(f"real(kind=dp) :: {_emit_name}")
-                elif _kind == "logical":
-                    self.o.w(f"logical :: {_emit_name}")
-                elif _kind == "complex":
-                    self.o.w(f"complex(kind=dp) :: {_emit_name}")
-                elif _kind == "char":
-                    self.o.w(f"character(len=:), allocatable :: {_emit_name}")
-                else:
-                    self.o.w(f"integer :: {_emit_name}")
-            for _tmp, _kind, decl, _expr, _arg_node in tmp_specs:
-                self.o.w(decl)
-            for _tmp, _kind, decl, _expr, _arg_node in tmp_specs:
-                self.o.w(f"{_tmp} = {_expr}")
-            self.o.w(f"{nv} = min(" + ", ".join(f"size({_tmp})" for _tmp, *_rest in tmp_specs) + ")")
-            self.o.w(f"do {iv} = 1, {nv}")
-            self.o.push()
-            for _t, (_tmp, _kind, _decl, _expr, _arg_node) in zip(tgt_elts, tmp_specs):
-                if _t.id == "_":
-                    continue
-                _emit_name = self._aliased_name(_t.id)
-                if _kind == "real":
-                    self._mark_real(_t.id)
-                elif _kind == "logical":
-                    self._mark_log(_t.id)
-                elif _kind == "complex":
-                    self._mark_complex(_t.id)
-                elif _kind == "char":
-                    self._mark_char(_t.id)
-                else:
-                    self._mark_int(_t.id)
-                self.o.w(f"{_emit_name} = {_tmp}({iv})")
-            _visit_loop_body_and_close_rebinds()
-            self.o.pop()
-            self.o.w("end do")
-            self.o.pop()
-            self.o.w("end block")
-            return
 
         def _emit_for_over_synthetic_slices(iter_name, target_name, idx_name=None, enum_start_txt=None):
             mapping = self.synthetic_slices.get(iter_name, {})
@@ -27797,7 +27450,7 @@ class translator(ast.NodeVisitor):
             if not zip_args:
                 return
             for _arg in zip_args:
-                if self._rank_expr(_arg) != 1 and not self._is_python_list_expr(_arg):
+                if self._rank_expr(_arg) != 1:
                     raise NotImplementedError("zip() loop currently supports only rank-1 iterables")
             iv = self._aliased_name("i_zip")
             nv = self._aliased_name("n_zip")
@@ -29364,18 +29017,12 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"write({unit_txt},{fstr(ffmt)}{adv})")
 
         end_txt = None
-        sep_txt = " "
         for kw in getattr(call, "keywords", []):
             if kw.arg == "end":
                 if is_const_str(kw.value):
                     end_txt = kw.value.value
                 else:
                     raise NotImplementedError("print(end=...) currently supports only string literals")
-            elif kw.arg == "sep":
-                if is_const_str(kw.value):
-                    sep_txt = kw.value.value
-                else:
-                    raise NotImplementedError("print(sep=...) currently supports only string literals")
             elif kw.arg == "file":
                 unit_txt = self.expr(kw.value)
         advance_no = (end_txt == "")
@@ -29495,29 +29142,14 @@ class translator(ast.NodeVisitor):
                         else:
                             self.o.w(f"write({unit_txt},*) {self.expr(a)}")
                 return
-            def _print_part(a):
-                if is_const_str(a):
-                    return fstr(a.value)
-                if isinstance(a, ast.JoinedStr):
-                    raise NotImplementedError("f-string in multi-argument print not supported")
-                expr_txt = self.expr(a)
-                if sep_txt != " " and self._rank_expr(a) == 0 and self._expr_kind(a) not in {"char", "str"}:
-                    return f"py_str({expr_txt})"
-                return expr_txt
-
             parts = []
-            for idx, a in enumerate(call.args):
-                if idx > 0 and (
-                    sep_txt != " "
-                    or (
-                        self._rank_expr(call.args[idx - 1]) == 0
-                        and self._expr_kind(call.args[idx - 1]) in {"char", "str"}
-                        and self._rank_expr(a) == 0
-                        and self._expr_kind(a) in {"char", "str"}
-                    )
-                ):
-                    parts.append(fstr(sep_txt))
-                parts.append(_print_part(a))
+            for a in call.args:
+                if is_const_str(a):
+                    parts.append(fstr(a.value))
+                elif isinstance(a, ast.JoinedStr):
+                    raise NotImplementedError("f-string in multi-argument print not supported")
+                else:
+                    parts.append(self.expr(a))
             if unit_txt == "*":
                 self.o.w("print *, " + ", ".join(parts))
             else:
@@ -30429,8 +30061,6 @@ def _emit_local_function(
         local_proc_name_aliases=local_proc_name_aliases,
         shape_donor_by_rank=shape_donor_by_rank,
     )
-    tr.current_function_name = fn.name
-    tr.module_global_names = set(module_global_names)
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
@@ -30631,8 +30261,6 @@ def _emit_local_function(
                 return False
             if isinstance(node, ast.Name):
                 return node.id == nm
-            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-                return node.value.id == nm
             if isinstance(node, (ast.Tuple, ast.List)):
                 return any(_is_direct_index_expr(_e) for _e in node.elts)
             if isinstance(node, ast.Slice):
@@ -30939,12 +30567,7 @@ def _emit_local_function(
             )
 
         quotient_names = set()
-        seed_aliases = {_nm}
-        _assign_nodes = [
-            _n for _st in fn.body for _n in ast.walk(_st)
-            if isinstance(_n, ast.Assign)
-        ]
-        for _st in _assign_nodes:
+        for _st in fn.body:
             if (
                 isinstance(_st, ast.Assign)
                 and len(_st.targets) == 1
@@ -30955,43 +30578,6 @@ def _emit_local_function(
                 and _st.value.left.id == _nm
             ):
                 quotient_names.add(_st.targets[0].id)
-        changed_seed_aliases = True
-        while changed_seed_aliases:
-            changed_seed_aliases = False
-            for _st in _assign_nodes:
-                if not (
-                    isinstance(_st, ast.Assign)
-                    and len(_st.targets) == 1
-                    and isinstance(_st.targets[0], ast.Name)
-                ):
-                    continue
-                if _st.targets[0].id in seed_aliases:
-                    continue
-                if not any(isinstance(_x, ast.Name) and _x.id in seed_aliases for _x in ast.walk(_st.value)):
-                    continue
-                if not _integer_only_expr(_st.value):
-                    continue
-                seed_aliases.add(_st.targets[0].id)
-                changed_seed_aliases = True
-        for _st in fn.body:
-            for _call in ast.walk(_st):
-                if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
-                    continue
-                if _call.func.id == "i4_sobol" and len(getattr(_call, "args", [])) >= 2:
-                    if any(isinstance(_x, ast.Name) and _x.id in seed_aliases for _x in ast.walk(_call.args[1])):
-                        return True
-                _callee_args = list((local_func_arg_names or {}).get(_call.func.id, []))
-                for _i, _arg_node in enumerate(getattr(_call, "args", [])):
-                    if _i < len(_callee_args) and str(_callee_args[_i]).lower() == "seed":
-                        if any(isinstance(_x, ast.Name) and _x.id in seed_aliases for _x in ast.walk(_arg_node)):
-                            return True
-                _callee_pos = {str(_a): _i for _i, _a in enumerate(_callee_args)}
-                for _kw in getattr(_call, "keywords", []):
-                    if _kw.arg is None or _kw.arg not in _callee_pos:
-                        continue
-                    if str(_kw.arg).lower() == "seed":
-                        if any(isinstance(_x, ast.Name) and _x.id in seed_aliases for _x in ast.walk(_kw.value)):
-                            return True
         for _st in fn.body:
             if not (
                 isinstance(_st, ast.Assign)
@@ -31069,19 +30655,7 @@ def _emit_local_function(
         if (not _force_rr1) and (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
-                _hint_rr = int(local_func_arg_ranks[fn.name][idx])
-                if (
-                    _hint_rr == 0
-                    and not any(
-                        isinstance(_n, ast.Subscript)
-                        and isinstance(_n.value, ast.Name)
-                        and _n.value.id == a.arg
-                        for _n in ast.walk(fn)
-                    )
-                ):
-                    rr = 0
-                else:
-                    rr = max(rr, _hint_rr)
+                rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
                 if rr > int(local_func_arg_ranks[fn.name][idx]):
                     local_func_arg_ranks[fn.name][idx] = int(rr)
         if rr > 0:
@@ -32720,32 +32294,6 @@ def _emit_local_function(
             alloc_complexes_set.add(_nm)
         elif _nm in tr.chars:
             alloc_chars_set.add(_nm)
-    for _st in ast.walk(fn):
-        if not (
-            fn.name == "i4_sobol"
-            and
-            isinstance(_st, ast.Assign)
-            and len(_st.targets) == 1
-            and isinstance(_st.targets[0], ast.Subscript)
-            and isinstance(_st.targets[0].value, ast.Name)
-            and _st.targets[0].value.id == "includ"
-            and tr._expr_kind(_st.value) == "logical"
-        ):
-            continue
-        _nm = _st.targets[0].value.id
-        _rr = max(
-            1,
-            int(_assigned_name_min_rank(_nm)),
-            int(tr.alloc_real_rank.get(_nm, 0)),
-            int(tr.alloc_int_rank.get(_nm, 0)),
-            int(tr.alloc_log_rank.get(_nm, 0)),
-        )
-        alloc_reals_set.discard(_nm)
-        alloc_ints_set.discard(_nm)
-        alloc_complexes_set.discard(_nm)
-        alloc_chars_set.discard(_nm)
-        alloc_logs_set.add(_nm)
-        tr._mark_alloc_log(_nm, rank=_rr)
     for _nm in sorted(alloc_logs_set):
         tr._mark_alloc_log(_nm, rank=max(1, int(_assigned_name_min_rank(_nm)), int(tr.alloc_log_rank.get(_nm, 1))))
     for _nm in sorted(alloc_ints_set):
@@ -32790,120 +32338,6 @@ def _emit_local_function(
         alloc_logs_set.discard(_nm)
         alloc_complexes_set.discard(_nm)
         alloc_chars_set.discard(_nm)
-    # Tuple-return metadata is more specific than incidental later uses of the
-    # unpacked names (for example formatted output can otherwise mark a real
-    # return as an integer). Apply it to local declarations before final sets
-    # are frozen.
-    for _st in ast.walk(fn):
-        if not (
-            isinstance(_st, ast.Assign)
-            and len(_st.targets) == 1
-            and isinstance(_st.targets[0], (ast.Tuple, ast.List))
-            and isinstance(_st.value, ast.Call)
-            and isinstance(_st.value.func, ast.Name)
-        ):
-            continue
-        _callee = _st.value.func.id
-        _ok = list((tuple_return_out_kinds or {}).get(_callee, []))
-        _or = list((tuple_return_out_ranks or {}).get(_callee, []))
-        _formal_kinds = list((local_func_arg_kinds or {}).get(_callee, []))
-        _formal_ranks = list((local_func_arg_ranks or {}).get(_callee, []))
-        _base = len(getattr(_st.value, "args", []))
-        _nout = len(getattr(_st.targets[0], "elts", []))
-        if not _ok:
-            if _base < len(_formal_kinds):
-                _ok = _formal_kinds[_base:_base + _nout]
-                _or = _formal_ranks[_base:_base + _nout] if _base < len(_formal_ranks) else []
-        elif _base < len(_formal_kinds):
-            # Final emitted dummy argument kinds are stricter than earlier
-            # tuple-return guesses. Use them to declare unpacked targets.
-            while len(_ok) < _nout:
-                _ok.append(None)
-            while len(_or) < _nout:
-                _or.append(0)
-            for _j in range(_nout):
-                _fi = _base + _j
-                if _fi < len(_formal_kinds) and _formal_kinds[_fi] in {"int", "real", "logical", "char", "complex"}:
-                    _ok[_j] = _formal_kinds[_fi]
-                if _fi < len(_formal_ranks) and _formal_ranks[_fi] is not None:
-                    _or[_j] = max(0, int(_formal_ranks[_fi]))
-        if not _ok:
-            continue
-        for _i, _elt in enumerate(_st.targets[0].elts):
-            if not isinstance(_elt, ast.Name) or _i >= len(_ok):
-                continue
-            _nm = _elt.id
-            _kind = _ok[_i]
-            _kind_s = str(_kind or "").lower()
-            if _kind_s.startswith("alloc_"):
-                _kind = _kind_s
-            elif "real" in _kind_s or "float" in _kind_s:
-                _kind = "real"
-            elif "complex" in _kind_s:
-                _kind = "complex"
-            elif "logical" in _kind_s or "bool" in _kind_s:
-                _kind = "logical"
-            elif "character" in _kind_s or "char" in _kind_s or "str" in _kind_s:
-                _kind = "char"
-            elif "integer" in _kind_s or "int" in _kind_s:
-                _kind = "int"
-            _rank = max(0, int(_or[_i])) if _i < len(_or) else 0
-            if _kind == "alloc_real" or (_kind == "real" and _rank > 0):
-                tr._mark_alloc_real(_nm, rank=max(1, _rank if _rank > 0 else 1))
-                tr.alloc_real_rank[_nm] = max(1, _rank if _rank > 0 else 1)
-                alloc_reals_set.add(_nm)
-                alloc_ints_set.discard(_nm)
-                alloc_logs_set.discard(_nm)
-                alloc_complexes_set.discard(_nm)
-                alloc_chars_set.discard(_nm)
-                tr.ints.discard(_nm)
-                tr.logs.discard(_nm)
-                tr.complexes.discard(_nm)
-                tr.chars.discard(_nm)
-            elif _kind == "alloc_int" or (_kind == "int" and _rank > 0):
-                tr._mark_alloc_int(_nm, rank=max(1, _rank if _rank > 0 else 1))
-                tr.alloc_int_rank[_nm] = max(1, _rank if _rank > 0 else 1)
-                alloc_ints_set.add(_nm)
-                alloc_reals_set.discard(_nm)
-                alloc_logs_set.discard(_nm)
-                alloc_complexes_set.discard(_nm)
-                alloc_chars_set.discard(_nm)
-                tr.reals.discard(_nm)
-                tr.logs.discard(_nm)
-                tr.complexes.discard(_nm)
-                tr.chars.discard(_nm)
-            elif _kind in {"real", "int", "logical", "complex", "char"} and _rank <= 0:
-                strong_scalar_local_kinds[_nm] = _kind
-                alloc_logs_set.discard(_nm)
-                alloc_ints_set.discard(_nm)
-                alloc_reals_set.discard(_nm)
-                alloc_complexes_set.discard(_nm)
-                alloc_chars_set.discard(_nm)
-                if _kind == "real":
-                    tr.ints.discard(_nm)
-                    tr.logs.discard(_nm)
-                    tr.complexes.discard(_nm)
-                    tr.chars.discard(_nm)
-                elif _kind == "int":
-                    tr.reals.discard(_nm)
-                    tr.logs.discard(_nm)
-                    tr.complexes.discard(_nm)
-                    tr.chars.discard(_nm)
-                elif _kind == "logical":
-                    tr.ints.discard(_nm)
-                    tr.reals.discard(_nm)
-                    tr.complexes.discard(_nm)
-                    tr.chars.discard(_nm)
-                elif _kind == "complex":
-                    tr.ints.discard(_nm)
-                    tr.reals.discard(_nm)
-                    tr.logs.discard(_nm)
-                    tr.chars.discard(_nm)
-                elif _kind == "char":
-                    tr.ints.discard(_nm)
-                    tr.reals.discard(_nm)
-                    tr.logs.discard(_nm)
-                    tr.complexes.discard(_nm)
     alloc_logs_set -= set(args)
     alloc_ints_set -= set(args)
     alloc_reals_set -= set(args)
@@ -32915,18 +32349,11 @@ def _emit_local_function(
         alloc_reals_set -= set(out_names)
         alloc_complexes_set -= set(out_names)
         alloc_chars_set -= set(out_names)
-    alias_source_names = {src for src, dst in getattr(tr, "name_aliases", {}).items() if src != dst}
-    remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names)) | module_global_names | alias_source_names
-    alloc_logs_set -= remove_names
-    alloc_ints_set -= remove_names
-    alloc_reals_set -= remove_names
-    alloc_complexes_set -= remove_names
-    alloc_chars_set -= remove_names
+    remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names)) | module_global_names
     rng_scalar_names = set(getattr(tr, "rng_vars", set())) - remove_names
     complexes = sorted(((tr.complexes | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "complex"}) - remove_names - polyroots_targets) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
     ints = sorted((((({*tr.ints, *set(local_list_counts.values())} | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "int"}) | rng_scalar_names) - remove_names)) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     reals = sorted((((tr.reals | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "real"}) - rng_scalar_names) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
-    ints = sorted(set(ints) - set(reals))
     logs = sorted(((tr.logs | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "logical"}) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     chars = sorted((((getattr(tr, "chars", set())) | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "char"}) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     alloc_logs = sorted([nm for nm in alloc_logs_set if nm not in module_global_names])
@@ -33056,12 +32483,18 @@ def _emit_local_function(
         def _name_real_context(name):
             for st in fn.body:
                 for n in ast.walk(st):
+                    if isinstance(n, ast.BinOp):
+                        if _name_used(n.left, name) or _name_used(n.right, name):
+                            if _name_used(n.left, name) and any(isinstance(t, ast.Constant) and isinstance(t.value, float) for t in ast.walk(n.right)):
+                                return True
+                            if _name_used(n.right, name) and any(isinstance(t, ast.Constant) and isinstance(t.value, float) for t in ast.walk(n.left)):
+                                return True
                     if (
                         isinstance(n, ast.Call)
                         and isinstance(n.func, ast.Attribute)
                         and isinstance(n.func.value, ast.Name)
                         and n.func.value.id == "np"
-                        and n.func.attr in {"log", "exp", "sqrt"}
+                        and n.func.attr in {"log", "exp", "sqrt", "maximum", "max", "sum"}
                         and len(n.args) >= 1
                         and _name_used(n.args[0], name)
                     ):
@@ -33070,100 +32503,33 @@ def _emit_local_function(
                         return True
             return False
 
-        def _node_mentions_name_value(node, name):
-            for _x in ast.walk(node):
-                if isinstance(_x, ast.Name) and _x.id == name:
-                    return True
-                if isinstance(_x, ast.Subscript) and isinstance(_x.value, ast.Name) and _x.value.id == name:
-                    return True
-                if (
-                    isinstance(_x, ast.Attribute)
-                    and _x.attr == "T"
-                    and isinstance(_x.value, ast.Name)
-                    and _x.value.id == name
-                ):
-                    return True
-            return False
-
-        def _target_is_known_real(target):
-            if isinstance(target, ast.Name):
-                return target.id in tr.reals or target.id in tr.alloc_reals
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                return target.value.id in tr.reals or target.value.id in tr.alloc_reals
-            return False
-
-        def _contains_matmul_with_name(node, name):
-            for _x in ast.walk(node):
-                if isinstance(_x, ast.BinOp) and isinstance(_x.op, ast.MatMult):
-                    if _node_mentions_name_value(_x, name):
-                        return True
-                if (
-                    isinstance(_x, ast.Call)
-                    and isinstance(_x.func, ast.Attribute)
-                    and is_numpy_name_node(_x.func.value)
-                    and _x.func.attr in {"matmul", "dot"}
-                    and _node_mentions_name_value(_x, name)
-                ):
-                    return True
-            return False
-
-        def _is_direct_name_projection(node, name):
-            if isinstance(node, ast.Name):
-                return node.id == name
-            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-                return node.value.id == name
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr == "T"
-                and isinstance(node.value, ast.Name)
-            ):
-                return node.value.id == name
-            return False
-
         for st in fn.body:
             for n in ast.walk(st):
-                if isinstance(n, (ast.Assign, ast.AugAssign)):
-                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                    if (
-                        (_is_direct_name_projection(n.value, nm) or _contains_matmul_with_name(n.value, nm))
-                        and any(_target_is_known_real(t) for t in targets)
-                    ):
-                        return True
                 if isinstance(n, ast.BinOp):
-                        if isinstance(n.op, ast.MatMult):
-                            other = n.right if _node_mentions_name_value(n.left, nm) else n.left
-                            try:
-                                if tr._expr_kind(other) in {"real", "alloc_real"}:
-                                    return True
-                            except Exception:
-                                pass
-                if (
-                    isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute)
-                    and is_numpy_name_node(n.func.value)
-                    and n.func.attr in {"matmul", "dot"}
-                    and len(n.args) >= 2
-                ):
-                    left_has = _node_mentions_name_value(n.args[0], nm)
-                    right_has = _node_mentions_name_value(n.args[1], nm)
-                    if left_has or right_has:
-                        other = n.args[1] if left_has else n.args[0]
-                        try:
-                            if tr._expr_kind(other) in {"real", "alloc_real"}:
-                                return True
-                        except Exception:
-                            pass
+                    if _name_used(n.left, nm) or _name_used(n.right, nm):
+                        if _name_used(n.left, nm) and any(isinstance(t, ast.Constant) and isinstance(t.value, float) for t in ast.walk(n.right)):
+                            return True
+                        if _name_used(n.right, nm) and any(isinstance(t, ast.Constant) and isinstance(t.value, float) for t in ast.walk(n.left)):
+                            return True
                 if (
                     isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Attribute)
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "np"
-                    and n.func.attr in {"log", "exp", "sqrt"}
+                    and n.func.attr in {"log", "exp", "sqrt", "maximum", "max", "sum"}
                     and len(n.args) >= 1
                     and _name_used(n.args[0], nm)
                 ):
                     return True
                 if _is_np_linalg_norm_call(n) and _name_used(n.args[0], nm):
+                    return True
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == nm
+                    and n.func.attr in {"random", "normal", "standard_normal", "uniform", "integers", "choice"}
+                ):
                     return True
                 if (
                     isinstance(n, ast.Assign)
@@ -33748,79 +33114,6 @@ def _emit_local_function(
         _self_norm_rank = _arg_self_normalized_rank(arg)
         if _self_norm_kind is not None:
             hint_kind = _self_norm_kind
-        def _arg_real_dummy_context(_arg_name):
-            def _contains_arg(_node):
-                return any(isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(_node))
-            for _st_ctx in fn.body:
-                for _node_ctx in ast.walk(_st_ctx):
-                    if isinstance(_node_ctx, ast.Compare):
-                        _terms_ctx = [_node_ctx.left] + list(_node_ctx.comparators)
-                        for _i_ctx, _term_ctx in enumerate(_terms_ctx):
-                            if not _contains_arg(_term_ctx):
-                                continue
-                            for _j_ctx, _other_ctx in enumerate(_terms_ctx):
-                                if _i_ctx == _j_ctx:
-                                    continue
-                                if isinstance(_other_ctx, ast.Constant) and isinstance(_other_ctx.value, (float, complex)):
-                                    return True
-                    if (
-                        isinstance(_node_ctx, ast.BinOp)
-                        and isinstance(_node_ctx.op, ast.Mod)
-                        and isinstance(_node_ctx.left, ast.Constant)
-                        and isinstance(_node_ctx.left.value, str)
-                        and _contains_arg(_node_ctx.right)
-                    ):
-                        _fmt_ctx = _node_ctx.left.value
-                        _pos_ctx = 0
-                        while _pos_ctx < len(_fmt_ctx):
-                            if _fmt_ctx[_pos_ctx] != "%":
-                                _pos_ctx += 1
-                                continue
-                            if _pos_ctx + 1 < len(_fmt_ctx) and _fmt_ctx[_pos_ctx + 1] == "%":
-                                _pos_ctx += 2
-                                continue
-                            _end_ctx = _pos_ctx + 1
-                            while _end_ctx < len(_fmt_ctx) and _fmt_ctx[_end_ctx] not in "diouxXeEfFgGcs":
-                                _end_ctx += 1
-                            if _end_ctx < len(_fmt_ctx) and _fmt_ctx[_end_ctx] in "eEfFgG":
-                                return True
-                            _pos_ctx = _end_ctx + 1
-            return False
-        if intent_txt == "out" and hint_kind == "real":
-            for _st_hint in ast.walk(fn):
-                if not (
-                    isinstance(_st_hint, ast.Assign)
-                    and len(_st_hint.targets) == 1
-                    and isinstance(_st_hint.targets[0], ast.Name)
-                    and _st_hint.targets[0].id == arg
-                    and isinstance(_st_hint.value, ast.Subscript)
-                    and isinstance(_st_hint.value.value, ast.Name)
-                ):
-                    continue
-                _src_nm = _st_hint.value.value.id
-                _src_is_int_array = _src_nm in tr.alloc_ints or _src_nm in tr.ints
-                if not _src_is_int_array:
-                    for _src_st in ast.walk(fn):
-                        if not (
-                            isinstance(_src_st, ast.Assign)
-                            and len(_src_st.targets) == 1
-                            and isinstance(_src_st.targets[0], ast.Name)
-                            and _src_st.targets[0].id == _src_nm
-                            and isinstance(_src_st.value, ast.Call)
-                            and isinstance(_src_st.value.func, ast.Attribute)
-                            and is_numpy_name_node(_src_st.value.func.value)
-                            and _src_st.value.func.attr in {"array", "asarray"}
-                            and _src_st.value.args
-                            and isinstance(_src_st.value.args[0], (ast.List, ast.Tuple))
-                        ):
-                            continue
-                        _elts = _src_st.value.args[0].elts
-                        if _elts and all(isinstance(_e, ast.Constant) and isinstance(_e.value, int) and not isinstance(_e.value, bool) for _e in _elts):
-                            _src_is_int_array = True
-                            break
-                if _src_is_int_array:
-                    hint_kind = "int"
-                    break
         if hint_kind is None and arg in defaults_map and (not is_none(defaults_map[arg])):
             _dk = tr._expr_kind(defaults_map[arg])
             if _dk is not None:
@@ -33833,18 +33126,9 @@ def _emit_local_function(
             hint_kind = "int"
         if _arg_used_as_rng_receiver(arg):
             hint_kind = "int"
-        if (not forced_arg_kind or arg.lower() not in {"seed"}) and _arg_integer_seed_recurrence(arg):
+        if _arg_integer_seed_recurrence(arg):
             hint_kind = "int"
-        if _self_norm_kind is None and _arg_real_dummy_context(arg):
-            hint_kind = "real"
-            if (
-                local_func_arg_kinds is not None
-                and fn.name in local_func_arg_kinds
-                and idx >= 0
-                and idx < len(local_func_arg_kinds[fn.name])
-            ):
-                local_func_arg_kinds[fn.name][idx] = "real"
-        elif (not forced_arg_kind) and _self_norm_kind is None and _arg_used_as_index_or_range(arg):
+        if _self_norm_kind is None and _arg_used_as_index_or_range(arg):
             hint_kind = "int"
             if (
                 local_func_arg_kinds is not None
@@ -33862,8 +33146,6 @@ def _emit_local_function(
                 and idx < len(local_func_arg_kinds[fn.name])
             ):
                 local_func_arg_kinds[fn.name][idx] = "logical"
-        elif hint_kind is None and _arg_real_context(arg) and not _arg_used_as_index_or_range(arg):
-            hint_kind = "real"
         arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
         _local_rank_hint = 0
         if not is_elemental_fn:
@@ -33946,7 +33228,7 @@ def _emit_local_function(
                     arg_kind = "integer"
             arg_decl = f"{arg_kind}, intent(in) :: {arg_emit}"
             decl_kind = arg_kind
-        elif arg in tr.alloc_ints and not ((hint_kind == "real" or _arg_real_context(arg)) and arr_rank > 0):
+        elif arg in tr.alloc_ints:
             if arr_rank > 0:
                 dims = ",".join(":" for _ in range(arr_rank))
                 if is_count_mapped_output_array or is_alloc_rebind_output_array:
@@ -33993,13 +33275,7 @@ def _emit_local_function(
                 arg_kind = "character(len=*)"
             elif hint_kind == "logical" or ann_is_bool or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, bool)) or _arg_used_in_logical_ops(arg):
                 arg_kind = "logical"
-            elif (
-                hint_kind == "int"
-                or (
-                    (ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)))
-                    and not (_arg_real_context(arg) and arr_rank > 0)
-                )
-            ):
+            elif hint_kind == "int" or ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
                 arg_kind = "integer"
             elif hint_kind == "complex" or ((not forced_arg_kind) and (arg in tr.alloc_complexes or _arg_complex_context(arg))):
                 arg_kind = "complex(kind=dp)"
@@ -34274,7 +33550,6 @@ def _emit_local_function(
                 rh = tuple_return_out_ranks.get(fn.name, [])
                 if idx_out < len(rh):
                     rank_hint = max(0, int(rh[idx_out]))
-            explicit_tuple_rank = rank_hint > 0
             if idx_out < len(tuple_ret_src_names):
                 _src0 = tuple_ret_src_names[idx_out]
                 if isinstance(_src0, str) and _src0 in arg_meta:
@@ -34383,7 +33658,7 @@ def _emit_local_function(
                     rank_hint = max(0, forced_tuple_rank)
             # Keep tuple-out rank consistent with current inferred symbol rank
             # when the tuple-rank map is stale/underestimated.
-            if forced_tuple_rank is None and not explicit_tuple_rank:
+            if forced_tuple_rank is None:
                 rank_hint = max(
                     rank_hint,
                     int(tr.alloc_real_rank.get(nm, 0)),
@@ -34411,7 +33686,7 @@ def _emit_local_function(
                             int(tr.alloc_complex_rank.get(src_nm, 0)),
                             int(tr.alloc_char_rank.get(src_nm, 0)),
                         )
-                    if src_rank > rank_hint and not explicit_tuple_rank:
+                    if src_rank > rank_hint:
                         rank_hint = int(src_rank)
                     _src_norm_kind = _arg_self_normalized_kind(src_nm)
                     if _src_norm_kind == "real":
@@ -34540,7 +33815,7 @@ def _emit_local_function(
                 _body_rank = 0
                 _body_kind = None
                 _saw_assignment = False
-                for _st in ast.walk(fn):
+                for _st in fn.body:
                     for _n in ast.walk(_st):
                         if not (
                             isinstance(_n, ast.Assign)
@@ -34679,10 +33954,7 @@ def _emit_local_function(
                     rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_real_rank.get(nm, 1))
                     _sync_tuple_out_state(nm, "real", rr)
                     dims = ",".join(":" for _ in range(rr))
-                    if fn.name == "i4_sobol" and nm == "quasi":
-                        o.w(f"real(kind=dp), intent(out) :: {nm}({dims})")
-                    else:
-                        o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
+                    o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif kind_hint == "alloc_int":
                 if rank_hint <= 0:
                     _sync_tuple_out_state(nm, "int", 0)
@@ -34745,10 +34017,7 @@ def _emit_local_function(
                     rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_real_rank.get(nm, 1))
                     _sync_tuple_out_state(nm, "real", rr)
                     dims = ",".join(":" for _ in range(rr))
-                    if fn.name == "i4_sobol" and nm == "quasi":
-                        o.w(f"real(kind=dp), intent(out) :: {nm}({dims})")
-                    else:
-                        o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
+                    o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_ints:
                 if rank_hint <= 0:
                     _sync_tuple_out_state(nm, "int", 0)
@@ -35431,15 +34700,6 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 _elts = list(_st.targets[0].elts)
                 for _j, _elt in enumerate(_elts):
                     if not (isinstance(_elt, ast.Name) and _elt.id == name_nm):
-                        continue
-                    _formal_kinds = list((arg_kind_hints or {}).get(_st.value.func.id, []))
-                    _formal_idx = len(getattr(_st.value, "args", [])) + _j
-                    if _formal_idx < len(_formal_kinds) and _formal_kinds[_formal_idx] in {"int", "logical", "complex", "char", "real"}:
-                        _kk = _formal_kinds[_formal_idx]
-                        if _kk == "complex":
-                            best_kind = "complex"
-                        elif best_kind is None or best_kind == "real" and _kk == "int":
-                            best_kind = _kk
                         continue
                     _klist = list(tuple_out.get(_st.value.func.id, []))
                     _rlist = list(tuple_out_ranks.get(_st.value.func.id, []))
@@ -36415,15 +35675,11 @@ def generate_flat(
 
     _infer_arg_kind_tr_cache = {}
     _infer_arg_kind_result_cache = {}
-    _infer_arg_kind_active = set()
 
     def _infer_arg_kind_in_fn(fn, nm):
         cache_key = (id(fn), nm)
         if cache_key in _infer_arg_kind_result_cache:
             return _infer_arg_kind_result_cache[cache_key]
-        if cache_key in _infer_arg_kind_active:
-            return None
-        _infer_arg_kind_active.add(cache_key)
         tr_local = _infer_arg_kind_tr_cache.get(id(fn))
         if tr_local is None:
             tr_local = translator(emit(), params={}, context="flat", list_counts={})
@@ -36432,7 +35688,6 @@ def generate_flat(
 
         def _ret(v):
             _infer_arg_kind_result_cache[cache_key] = v
-            _infer_arg_kind_active.discard(cache_key)
             return v
 
         def _contains_name_ref(node):
@@ -36440,13 +35695,6 @@ def generate_flat(
 
         for st in fn.body:
             for n in ast.walk(st):
-                if (
-                    isinstance(n, ast.Attribute)
-                    and n.attr in {"real", "imag"}
-                    and isinstance(n.value, ast.Name)
-                    and n.value.id == nm
-                ):
-                    return _ret("complex")
                 if (
                     isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Name)
@@ -36463,103 +35711,6 @@ def generate_flat(
                     and n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice"}
                 ):
                     return _ret("int")
-
-        def _format_kind_for_arg():
-            def _contains_arg(node):
-                for _x in ast.walk(node):
-                    if isinstance(_x, ast.Name) and _x.id == nm:
-                        return True
-                    if isinstance(_x, ast.Subscript) and isinstance(_x.value, ast.Name) and _x.value.id == nm:
-                        return True
-                    if (
-                        isinstance(_x, ast.Attribute)
-                        and _x.attr in {"real", "imag"}
-                        and isinstance(_x.value, ast.Name)
-                        and _x.value.id == nm
-                    ):
-                        return True
-                return False
-
-            def _fmt_specs(fmt):
-                specs = []
-                i = 0
-                while i < len(fmt):
-                    if fmt[i] != "%":
-                        i += 1
-                        continue
-                    if i + 1 < len(fmt) and fmt[i + 1] == "%":
-                        i += 2
-                        continue
-                    j = i + 1
-                    while j < len(fmt) and fmt[j] not in "diouxXeEfFgGcs":
-                        j += 1
-                    if j < len(fmt):
-                        specs.append(fmt[j])
-                        i = j + 1
-                    else:
-                        break
-                return specs
-
-            for _st in fn.body:
-                for _n in ast.walk(_st):
-                    if not (
-                        isinstance(_n, ast.BinOp)
-                        and isinstance(_n.op, ast.Mod)
-                        and isinstance(_n.left, ast.Constant)
-                        and isinstance(_n.left.value, str)
-                    ):
-                        continue
-                    specs = _fmt_specs(_n.left.value)
-                    if not specs:
-                        continue
-                    rhs_nodes = list(_n.right.elts) if isinstance(_n.right, (ast.Tuple, ast.List)) else [_n.right]
-                    for _idx, _rhs in enumerate(rhs_nodes):
-                        if not _contains_arg(_rhs):
-                            continue
-                        spec = specs[min(_idx, len(specs) - 1)]
-                        if spec in "eEfFgG":
-                            return "real"
-                        if spec in "diouxX":
-                            return "int"
-                        if spec == "s":
-                            return "char"
-            return None
-
-        _fmt_kind = _format_kind_for_arg()
-        if _fmt_kind is not None:
-            return _ret(_fmt_kind)
-
-        for st in fn.body:
-            for n in ast.walk(st):
-                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
-                    continue
-                callee_kinds = list(local_func_arg_kinds.get(n.func.id, []))
-                callee_args = list(local_arg_names_map.get(n.func.id, []))
-                callee_fn = local_fn_map.get(n.func.id)
-                for i, a in enumerate(n.args):
-                    if not _contains_name_ref(a):
-                        continue
-                    callee_kind = None
-                    if callee_fn is not None and i < len(callee_args):
-                        callee_kind = _infer_arg_kind_in_fn(callee_fn, callee_args[i])
-                    if callee_kind not in {"int", "real", "logical", "char", "complex"}:
-                        callee_kind = callee_kinds[i] if i < len(callee_kinds) else None
-                    if callee_kind in {"int", "real", "logical", "char", "complex"}:
-                        return _ret(callee_kind)
-                callee_idx = {arg_name: i for i, arg_name in enumerate(callee_args)}
-                for kw in getattr(n, "keywords", []):
-                    if kw.arg is None or kw.arg not in callee_idx:
-                        continue
-                    i = callee_idx[kw.arg]
-                    if not _contains_name_ref(kw.value):
-                        continue
-                    callee_kind = None
-                    if callee_fn is not None and i < len(callee_args):
-                        callee_kind = _infer_arg_kind_in_fn(callee_fn, callee_args[i])
-                    if callee_kind not in {"int", "real", "logical", "char", "complex"}:
-                        callee_kind = callee_kinds[i] if i < len(callee_kinds) else None
-                    if callee_kind in {"int", "real", "logical", "char", "complex"}:
-                        return _ret(callee_kind)
 
         def _is_direct_index_expr(node):
             if node is None:
@@ -36688,22 +35839,6 @@ def generate_flat(
                 if "int" in dt:
                     return _ret("int")
 
-        def _has_real_only_evidence(node):
-            for _x in ast.walk(node):
-                if isinstance(_x, ast.Constant) and isinstance(_x.value, float):
-                    return True
-                if isinstance(_x, ast.Call) and isinstance(_x.func, ast.Name) and _x.func.id == "float":
-                    return True
-                if (
-                    isinstance(_x, ast.Call)
-                    and isinstance(_x.func, ast.Attribute)
-                    and isinstance(_x.func.value, ast.Name)
-                    and _x.func.value.id in {"np", "numpy", "math"}
-                    and _x.func.attr in {"log", "exp", "sqrt", "sin", "cos", "tan"}
-                ):
-                    return True
-            return False
-
         for st in fn.body:
             for n in ast.walk(st):
                 if not (
@@ -36715,64 +35850,7 @@ def generate_flat(
                     )
                 ):
                     continue
-                if isinstance(n.op, ast.Mod) and _has_real_only_evidence(n):
-                    continue
                 return _ret("int")
-
-        def _integer_aliases_from_arg():
-            aliases = {nm}
-
-            def _contains_alias(node):
-                return any(
-                    isinstance(_x, ast.Name) and _x.id in aliases
-                    for _x in ast.walk(node)
-                )
-
-            def _integer_alias_expr(node):
-                if not _contains_alias(node):
-                    return False
-                for _x in ast.walk(node):
-                    if isinstance(_x, ast.Constant) and isinstance(_x.value, (float, complex)):
-                        return False
-                    if isinstance(_x, ast.BinOp) and isinstance(_x.op, (ast.Div, ast.MatMult)):
-                        return False
-                    if isinstance(_x, ast.BinOp) and isinstance(_x.op, ast.Mod) and _has_real_only_evidence(_x):
-                        return False
-                    if isinstance(_x, ast.Attribute):
-                        return False
-                    if isinstance(_x, ast.Call):
-                        if isinstance(_x.func, ast.Name) and _x.func.id in {"abs", "int"}:
-                            continue
-                        return False
-                return True
-
-            changed = True
-            while changed:
-                changed = False
-                for _st in ast.walk(fn):
-                    if not (
-                        isinstance(_st, ast.Assign)
-                        and len(_st.targets) == 1
-                        and isinstance(_st.targets[0], ast.Name)
-                    ):
-                        continue
-                    _target = _st.targets[0].id
-                    if _target in aliases:
-                        continue
-                    if _integer_alias_expr(_st.value):
-                        aliases.add(_target)
-                        changed = True
-            return aliases
-
-        _int_aliases = _integer_aliases_from_arg()
-        for st in fn.body:
-            for n in ast.walk(st):
-                if not isinstance(n, ast.BinOp) or not isinstance(n.op, (ast.FloorDiv, ast.Mod)):
-                    continue
-                if isinstance(n.op, ast.Mod) and _has_real_only_evidence(n):
-                    continue
-                if any(isinstance(_x, ast.Name) and _x.id in _int_aliases for _x in ast.walk(n)):
-                    return _ret("int")
 
         def _has_explicit_real_evidence(node):
             for _x in ast.walk(node):
@@ -36815,83 +35893,6 @@ def generate_flat(
             kind = _strong_target_kind(st)
             if kind is not None:
                 return _ret(kind)
-
-        def _node_mentions_arg_value(node):
-            for _x in ast.walk(node):
-                if isinstance(_x, ast.Name) and _x.id == nm:
-                    return True
-                if isinstance(_x, ast.Subscript) and isinstance(_x.value, ast.Name) and _x.value.id == nm:
-                    return True
-                if (
-                    isinstance(_x, ast.Attribute)
-                    and _x.attr == "T"
-                    and isinstance(_x.value, ast.Name)
-                    and _x.value.id == nm
-                ):
-                    return True
-            return False
-
-        def _is_direct_arg_projection(node):
-            if isinstance(node, ast.Name):
-                return node.id == nm
-            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-                return node.value.id == nm
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr == "T"
-                and isinstance(node.value, ast.Name)
-            ):
-                return node.value.id == nm
-            return False
-
-        def _target_base_kind(target):
-            if isinstance(target, ast.Name):
-                return tr_local._expr_kind(target)
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                return tr_local._expr_kind(target.value)
-            return None
-
-        # If an argument feeds a known-real target, the argument is real-valued.
-        # This catches matrix conversion routines such as val[k] = A[i,j].
-        for st in ast.walk(fn):
-            if not isinstance(st, (ast.Assign, ast.AugAssign)):
-                continue
-            targets = st.targets if isinstance(st, ast.Assign) else [st.target]
-            value = st.value
-            if not _is_direct_arg_projection(value):
-                continue
-            for tgt in targets:
-                if _target_base_kind(tgt) in {"real", "alloc_real"}:
-                    return _ret("real")
-
-        def _matmul_call_args(node):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and is_numpy_name_node(node.func.value)
-                and node.func.attr == "matmul"
-                and len(node.args) >= 2
-            ):
-                return node.args[0], node.args[1]
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
-                return node.left, node.right
-            return None
-
-        for st in ast.walk(fn):
-            mm = _matmul_call_args(st)
-            if mm is None:
-                continue
-            left, right = mm
-            left_has = _node_mentions_arg_value(left)
-            right_has = _node_mentions_arg_value(right)
-            if not (left_has or right_has):
-                continue
-            other = right if left_has else left
-            try:
-                if tr_local._expr_kind(other) in {"real", "alloc_real"}:
-                    return _ret("real")
-            except Exception:
-                pass
         # Comparisons against real/complex expressions are strong evidence that
         # the argument itself is numeric-real, even if it is also subscripted.
         for st in fn.body:
@@ -36943,46 +35944,6 @@ def generate_flat(
                         return _ret("complex")
                 except Exception:
                     pass
-        # Integer-valued seed pipelines often look like:
-        #   seed = skip + j - 2
-        #   x, seed = f(..., seed)
-        # When the callee's formal is named seed, keep the source argument
-        # integer unless there is explicit real evidence in the expression.
-        seed_aliases = {nm}
-        changed_seed_aliases = True
-        while changed_seed_aliases:
-            changed_seed_aliases = False
-            for st in fn.body:
-                if not (
-                    isinstance(st, ast.Assign)
-                    and len(st.targets) == 1
-                    and isinstance(st.targets[0], ast.Name)
-                ):
-                    continue
-                if st.targets[0].id in seed_aliases:
-                    continue
-                if not any(
-                    isinstance(_x, ast.Name) and _x.id in seed_aliases
-                    for _x in ast.walk(st.value)
-                ):
-                    continue
-                if _has_explicit_real_evidence(st.value):
-                    continue
-                seed_aliases.add(st.targets[0].id)
-                changed_seed_aliases = True
-        for st in fn.body:
-            for n in ast.walk(st):
-                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
-                    continue
-                callee_args = list(local_arg_names_map.get(n.func.id, []))
-                for i, a in enumerate(n.args):
-                    if i < len(callee_args) and str(callee_args[i]).lower() == "seed":
-                        if any(isinstance(_x, ast.Name) and _x.id in seed_aliases for _x in ast.walk(a)):
-                            return _ret("int")
-                for kw in getattr(n, "keywords", []):
-                    if kw.arg is not None and str(kw.arg).lower() == "seed":
-                        if any(isinstance(_x, ast.Name) and _x.id in seed_aliases for _x in ast.walk(kw.value)):
-                            return _ret("int")
         # Common text-argument naming in scientific scripts.
         nm_l = nm.lower()
         if nm_l in {"title", "label", "header", "filename", "file_name"}:
@@ -37210,10 +36171,8 @@ def generate_flat(
     call_kind_hints = {fn.name: [None for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_rank_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
-    call_actual_rank_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_pairs = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_islist = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
-    _top_level_scan_nodes = []
     _prov_scalar_specs, _prov_scalar_ranks, _prov_tuple_out, _prov_tuple_out_ranks = _local_return_maps(
         local_funcs,
         params,
@@ -37268,17 +36227,11 @@ def generate_flat(
                 _seen.add(_name)
                 best_kind = None
                 best_rank = 0
-                best_weak_real = False
                 saw = False
                 for _st in ast.walk(fn_node):
                     if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _name):
                         continue
                     saw = True
-                    _weak_real_literal = (
-                        isinstance(_st.value, ast.Constant)
-                        and isinstance(_st.value.value, float)
-                        and float(_st.value.value) == 0.0
-                    )
                     try:
                         _rr = int(tr_ctx._rank_expr(_st.value))
                     except Exception:
@@ -37287,83 +36240,27 @@ def generate_flat(
                         _kk = tr_ctx._expr_kind(_st.value)
                     except Exception:
                         _kk = None
-                    if isinstance(_st.value, (ast.List, ast.Tuple)) and _st.value.elts:
-                        if all(isinstance(_e, ast.Constant) and isinstance(_e.value, int) and not isinstance(_e.value, bool) for _e in _st.value.elts):
-                            _kk, _rr = "int", 1
-                        elif all(isinstance(_e, ast.Constant) and isinstance(_e.value, (int, float)) and not isinstance(_e.value, bool) for _e in _st.value.elts):
-                            _kk, _rr = "real", 1
-                    elif (
-                        isinstance(_st.value, ast.Call)
-                        and isinstance(_st.value.func, ast.Attribute)
-                        and is_numpy_name_node(_st.value.func.value)
-                        and _st.value.func.attr in {"array", "asarray"}
-                        and _st.value.args
-                        and isinstance(_st.value.args[0], (ast.List, ast.Tuple))
-                    ):
-                        _elts = _st.value.args[0].elts
-                        if _elts and all(isinstance(_e, ast.Constant) and isinstance(_e.value, int) and not isinstance(_e.value, bool) for _e in _elts):
-                            _kk, _rr = "int", 1
-                        elif _elts and all(isinstance(_e, ast.Constant) and isinstance(_e.value, (int, float)) and not isinstance(_e.value, bool) for _e in _elts):
-                            _kk, _rr = "real", 1
-                    if _kk is None and isinstance(_st.value, ast.Subscript):
-                        try:
-                            _base_kind = tr_ctx._expr_kind(_st.value.value)
-                        except Exception:
-                            _base_kind = None
-                        if _base_kind is None and isinstance(_st.value.value, ast.Name):
-                            _arg_names = [a.arg for a in (list(fn_node.args.args) + list(fn_node.args.kwonlyargs))]
-                            if _st.value.value.id in _arg_names:
-                                _arg_i = _arg_names.index(_st.value.value.id)
-                                _hint_kinds = list(getattr(tr_ctx, "local_func_arg_kinds", {}).get(fn_node.name, []))
-                                if _arg_i < len(_hint_kinds):
-                                    _base_kind = _hint_kinds[_arg_i]
-                        if _base_kind in {"int", "real", "logical", "char", "complex"}:
-                            _kk = _base_kind
-                            try:
-                                _rr = int(tr_ctx._rank_expr(_st.value))
-                            except Exception:
-                                _rr = 0
                     if _kk is None and isinstance(_st.value, ast.Name):
-                        _arg_names = [a.arg for a in (list(fn_node.args.args) + list(fn_node.args.kwonlyargs))]
-                        if _st.value.id in _arg_names:
-                            _arg_i = _arg_names.index(_st.value.id)
-                            _hint_kinds = list(getattr(tr_ctx, "local_func_arg_kinds", {}).get(fn_node.name, []))
-                            _hint_ranks = list(getattr(tr_ctx, "local_func_arg_ranks", {}).get(fn_node.name, []))
-                            if _arg_i < len(_hint_kinds) and _hint_kinds[_arg_i] in {"int", "real", "logical", "char", "complex"}:
-                                _kk = _hint_kinds[_arg_i]
-                                _rr = int(_hint_ranks[_arg_i]) if _arg_i < len(_hint_ranks) else 0
-                        if _kk is None:
-                            _kk, _rr2 = _infer(_st.value.id)
-                            _rr = max(_rr, int(_rr2))
+                        _kk, _rr2 = _infer(_st.value.id)
+                        _rr = max(_rr, int(_rr2))
                     elif _kk is None and isinstance(_st.value, ast.Subscript) and isinstance(_st.value.value, ast.Name):
                         _bk, _br = _infer(_st.value.value.id)
                         if _bk in {"int", "real", "logical", "char", "complex"}:
                             _kk = _bk
                             _rr = int(tr_ctx._rank_expr(_st.value))
                     if _kk in {"int", "real", "logical", "char", "complex"}:
-                        if _weak_real_literal and best_kind in {"int", "logical"} and _rr == 0:
-                            continue
-                        if best_kind == "real" and best_weak_real and _kk in {"int", "logical"} and _rr == best_rank:
-                            best_kind = _kk
-                            best_weak_real = False
-                            continue
                         if _rr > best_rank:
                             best_rank = _rr
                             best_kind = _kk
-                            best_weak_real = (_kk == "real" and _weak_real_literal)
                         elif best_kind is None:
                             best_kind = _kk
-                            best_weak_real = (_kk == "real" and _weak_real_literal)
                         elif _rr == best_rank and _kk != best_kind:
                             if "complex" in {best_kind, _kk}:
                                 best_kind = "complex"
-                                best_weak_real = False
                             elif "real" in {best_kind, _kk} and "logical" not in {best_kind, _kk}:
                                 best_kind = "real"
-                                best_weak_real = best_weak_real or (_kk == "real" and _weak_real_literal)
                             elif "int" in {best_kind, _kk} and "logical" not in {best_kind, _kk} and "char" not in {best_kind, _kk}:
                                 best_kind = "int"
-                                best_weak_real = False
                 if not saw:
                     return (None, 0)
                 return (best_kind, best_rank)
@@ -37381,7 +36278,6 @@ def generate_flat(
                 rk = call_kind_hints[callee]
                 rks = call_kind_sets[callee]
                 rrs = call_rank_sets[callee]
-                ars = call_actual_rank_sets[callee]
                 krp = call_kind_rank_pairs[callee]
                 krl = call_kind_rank_islist[callee]
                 for i, a in enumerate(n.args):
@@ -37400,8 +36296,6 @@ def generate_flat(
                     ar = tr_ctx._rank_expr(a)
                     if direct_actual is not None:
                         ar = max(ar, direct_actual[1])
-                    if direct_actual is not None or not isinstance(a, ast.Name):
-                        ars[i].add(ar)
                     rr[i] = max(rr[i], ar)
                     rrs[i].add(ar)
                     ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(a)
@@ -37454,8 +36348,6 @@ def generate_flat(
                         ar = tr_ctx._rank_expr(kw.value)
                         if direct_actual is not None:
                             ar = max(ar, direct_actual[1])
-                        if direct_actual is not None or not isinstance(kw.value, ast.Name):
-                            ars[i].add(ar)
                         rr[i] = max(rr[i], ar)
                         rrs[i].add(ar)
                         ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(kw.value)
@@ -37641,65 +36533,10 @@ def generate_flat(
                             return True
             return False
 
-        def _arg_has_real_dummy_evidence(_arg_name):
-            def _contains_arg(node):
-                return any(isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(node))
-
-            def _format_specs(fmt):
-                specs = []
-                i_fmt = 0
-                while i_fmt < len(fmt):
-                    if fmt[i_fmt] != "%":
-                        i_fmt += 1
-                        continue
-                    if i_fmt + 1 < len(fmt) and fmt[i_fmt + 1] == "%":
-                        i_fmt += 2
-                        continue
-                    j_fmt = i_fmt + 1
-                    while j_fmt < len(fmt) and fmt[j_fmt] not in "diouxXeEfFgGcs":
-                        j_fmt += 1
-                    if j_fmt < len(fmt):
-                        specs.append(fmt[j_fmt])
-                        i_fmt = j_fmt + 1
-                    else:
-                        break
-                return specs
-
-            for _st in fn.body:
-                for _node in ast.walk(_st):
-                    if isinstance(_node, ast.Compare):
-                        _terms = [_node.left] + list(_node.comparators)
-                        for _idx, _term in enumerate(_terms):
-                            if not _contains_arg(_term):
-                                continue
-                            for _j, _other in enumerate(_terms):
-                                if _j == _idx:
-                                    continue
-                                if isinstance(_other, ast.Constant) and isinstance(_other.value, (float, complex)):
-                                    return True
-                    if (
-                        isinstance(_node, ast.BinOp)
-                        and isinstance(_node.op, ast.Mod)
-                        and isinstance(_node.left, ast.Constant)
-                        and isinstance(_node.left.value, str)
-                    ):
-                        specs = _format_specs(_node.left.value)
-                        if not specs:
-                            continue
-                        rhs_nodes = list(_node.right.elts) if isinstance(_node.right, (ast.Tuple, ast.List)) else [_node.right]
-                        for _idx, _rhs in enumerate(rhs_nodes):
-                            if not _contains_arg(_rhs):
-                                continue
-                            if specs[min(_idx, len(specs) - 1)] in "eEfFgG":
-                                return True
-            return False
-
         for i in range(len(base_ranks)):
             hk = hint_kinds[i] if i < len(hint_kinds) else None
             arg_nm = local_func_arg_names[fn.name][i]
             bk = _infer_arg_kind_in_fn(fn, arg_nm)
-            if _arg_has_real_dummy_evidence(arg_nm):
-                bk = "real"
             # Prefer explicit call-site kind evidence in general, but let a
             # function's own explicit normalization (for example
             # np.asarray(x, dtype=float)) override weak integer hints coming
@@ -37708,21 +36545,10 @@ def generate_flat(
                 merged_kinds.append(bk)
             elif bk is None:
                 merged_kinds.append(hk)
-            elif hk == "int" and bk == "real":
-                # Integer actuals can appear in real-valued formulas such as
-                # log(n(k)/n(k-1)) or float(seed)/m.  But a dummy compared
-                # with real limits or formatted as a real value is part of a
-                # real-valued interface and must not be truncated by callers.
-                merged_kinds.append("real" if _arg_has_real_dummy_evidence(arg_nm) else hk)
+            elif hk == "int" and bk == "real" and not _arg_has_explicit_real_evidence(arg_nm):
+                merged_kinds.append(hk)
             elif hk == "int" and bk != "int":
                 merged_kinds.append(bk)
-            elif (
-                hk == "real"
-                and bk == "int"
-                and i < len(local_func_arg_ranks[fn.name])
-                and int(local_func_arg_ranks[fn.name][i]) > 0
-            ):
-                merged_kinds.append(hk)
             elif hk == "real" and bk in {"int", "logical", "char", "complex"}:
                 merged_kinds.append(bk)
             elif hk == "complex" and bk in {"int", "logical", "char", "real"}:
@@ -37759,165 +36585,6 @@ def generate_flat(
                 and hint_rank == 0
             ):
                 local_func_arg_ranks[fn.name][i] = 0
-            _rank_obs = call_actual_rank_sets.get(fn.name, [])
-            if (
-                i < len(local_func_arg_ranks[fn.name])
-                and i < len(_rank_obs)
-                and _rank_obs[i]
-                and max(int(_r) for _r in _rank_obs[i]) == 0
-                and not any(
-                    isinstance(_n, ast.Subscript)
-                    and isinstance(_n.value, ast.Name)
-                    and _n.value.id == arg_name
-                    for _n in ast.walk(fn)
-                )
-            ):
-                local_func_arg_ranks[fn.name][i] = 0
-    # Reconcile weak callee-side real inference with concrete local call sites.
-    # Python integer arrays/scalars are often used in real formulas inside a
-    # callee; that does not make the dummy argument real if all visible actuals
-    # are integer-valued.
-    _observed_actual_kinds = {
-        _fn.name: [set() for _ in local_func_arg_names.get(_fn.name, [])]
-        for _fn in (local_funcs or [])
-        if isinstance(_fn, ast.FunctionDef)
-    }
-    _callsite_tr_cache = {}
-
-    def _callsite_expr_kind(_caller_fn, _node):
-        _tr = _callsite_tr_cache.get(id(_caller_fn))
-        if _tr is None:
-            _tr = translator(emit(), params={}, context="flat", list_counts={})
-            _tr.prescan(_caller_fn.body)
-            _callsite_tr_cache[id(_caller_fn)] = _tr
-        try:
-            _kind = _tr._expr_kind(_node)
-        except Exception:
-            _kind = None
-        if isinstance(_node, ast.Name):
-            _nm = _node.id
-            for _st in _caller_fn.body:
-                if not (
-                    isinstance(_st, ast.Assign)
-                    and len(_st.targets) == 1
-                    and isinstance(_st.targets[0], ast.Name)
-                    and _st.targets[0].id == _nm
-                ):
-                    continue
-                _v = _st.value
-                if isinstance(_v, (ast.List, ast.Tuple)) and _v.elts:
-                    if all(isinstance(_e, ast.Constant) and isinstance(_e.value, int) and not isinstance(_e.value, bool) for _e in _v.elts):
-                        return "alloc_int"
-                    if all(isinstance(_e, ast.Constant) and isinstance(_e.value, (int, float)) and not isinstance(_e.value, bool) for _e in _v.elts):
-                        return "alloc_real"
-                if (
-                    isinstance(_v, ast.Call)
-                    and isinstance(_v.func, ast.Attribute)
-                    and is_numpy_name_node(_v.func.value)
-                    and _v.func.attr in {"array", "asarray"}
-                    and _v.args
-                    and isinstance(_v.args[0], (ast.List, ast.Tuple))
-                ):
-                    _elts = _v.args[0].elts
-                    if _elts and all(isinstance(_e, ast.Constant) and isinstance(_e.value, int) and not isinstance(_e.value, bool) for _e in _elts):
-                        return "alloc_int"
-                    if _elts and all(isinstance(_e, ast.Constant) and isinstance(_e.value, (int, float)) and not isinstance(_e.value, bool) for _e in _elts):
-                        return "alloc_real"
-            try:
-                _dk, _dr = _name_direct_assign_spec(_caller_fn, _nm, _tr)
-            except Exception:
-                _dk, _dr = None, 0
-            if _dk in {"int", "real", "logical", "complex", "char"}:
-                if int(_dr or 0) > 0:
-                    return {
-                        "int": "alloc_int",
-                        "real": "alloc_real",
-                        "logical": "alloc_log",
-                        "complex": "alloc_complex",
-                        "char": "alloc_char",
-                    }[_dk]
-                if _kind in {None, "int", "logical"} or _dk in {"real", "complex", "char"}:
-                    return _dk
-        if _kind is not None:
-            return _kind
-        return None
-
-    for _caller_fn in (local_funcs or []):
-        if not isinstance(_caller_fn, ast.FunctionDef):
-            continue
-        for _call in ast.walk(_caller_fn):
-            if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
-                continue
-            _callee = _call.func.id
-            if _callee not in _observed_actual_kinds:
-                continue
-            _callee_args = list(local_func_arg_names.get(_callee, []))
-            for _i, _actual in enumerate(getattr(_call, "args", [])):
-                if _i >= len(_observed_actual_kinds[_callee]):
-                    break
-                _ak = _callsite_expr_kind(_caller_fn, _actual)
-                if _ak in {"int", "alloc_int", "real", "alloc_real", "logical", "alloc_log", "complex", "alloc_complex", "char", "alloc_char"}:
-                    _observed_actual_kinds[_callee][_i].add(_ak)
-            if getattr(_call, "keywords", []):
-                _idx_by_name = {_nm: _i for _i, _nm in enumerate(_callee_args)}
-                for _kw in _call.keywords:
-                    if _kw.arg is None or _kw.arg not in _idx_by_name:
-                        continue
-                    _i = _idx_by_name[_kw.arg]
-                    if _i >= len(_observed_actual_kinds[_callee]):
-                        continue
-                    _ak = _callsite_expr_kind(_caller_fn, _kw.value)
-                    if _ak in {"int", "alloc_int", "real", "alloc_real", "logical", "alloc_log", "complex", "alloc_complex", "char", "alloc_char"}:
-                        _observed_actual_kinds[_callee][_i].add(_ak)
-
-    if _top_level_scan_nodes:
-        _top_level_caller = ast.Module(body=list(_top_level_scan_nodes), type_ignores=[])
-        for _call in ast.walk(_top_level_caller):
-            if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
-                continue
-            _callee = _call.func.id
-            if _callee not in _observed_actual_kinds:
-                continue
-            _callee_args = list(local_func_arg_names.get(_callee, []))
-            for _i, _actual in enumerate(getattr(_call, "args", [])):
-                if _i >= len(_observed_actual_kinds[_callee]):
-                    break
-                _ak = _callsite_expr_kind(_top_level_caller, _actual)
-                if _ak in {"int", "alloc_int", "real", "alloc_real", "logical", "alloc_log", "complex", "alloc_complex", "char", "alloc_char"}:
-                    _observed_actual_kinds[_callee][_i].add(_ak)
-            if getattr(_call, "keywords", []):
-                _idx_by_name = {_nm: _i for _i, _nm in enumerate(_callee_args)}
-                for _kw in _call.keywords:
-                    if _kw.arg is None or _kw.arg not in _idx_by_name:
-                        continue
-                    _i = _idx_by_name[_kw.arg]
-                    if _i >= len(_observed_actual_kinds[_callee]):
-                        continue
-                    _ak = _callsite_expr_kind(_top_level_caller, _kw.value)
-                    if _ak in {"int", "alloc_int", "real", "alloc_real", "logical", "alloc_log", "complex", "alloc_complex", "char", "alloc_char"}:
-                        _observed_actual_kinds[_callee][_i].add(_ak)
-
-    for _fn in (local_funcs or []):
-        if not isinstance(_fn, ast.FunctionDef) or _fn.name not in local_func_arg_kinds:
-            continue
-        _obs_by_arg = _observed_actual_kinds.get(_fn.name, [])
-        _ann_kinds_final = [
-            _ann_kind(_a.annotation)
-            for _a in (list(_fn.args.args) + list(_fn.args.kwonlyargs))
-        ]
-        for _i, _obs in enumerate(_obs_by_arg):
-            if _i >= len(local_func_arg_kinds[_fn.name]) or not _obs:
-                continue
-            if _ann_kinds_final[_i] is not None:
-                continue
-            if (
-                _obs & {"real", "alloc_real"}
-                and local_func_arg_kinds[_fn.name][_i] in {None, "int", "logical"}
-            ):
-                local_func_arg_kinds[_fn.name][_i] = "real"
-                continue
-            if _obs <= {"int", "alloc_int"} and local_func_arg_kinds[_fn.name][_i] in {None, "real"}:
-                local_func_arg_kinds[_fn.name][_i] = "int"
     # Propagate callback-parameter signatures from callees to passed-in local
     # function actuals. Example:
     #   def arclength_x(..., dydx, ...): fx = dydx(t)   ! t rank-1
@@ -38459,102 +37126,6 @@ def generate_flat(
             arg_kind_hints=local_func_arg_kinds,
         )
         _apply_c8_container_return_hints(local_return_specs)
-        # Refine tuple-return slots from how unpacked values are immediately
-        # used by local callees. This handles data-loading helpers such as
-        #   icc, ccc, acc = ccs_read(...)
-        #   ccs_print(..., icc, ccc, acc, ...)
-        # where np.loadtxt itself is typeless but the downstream interface
-        # distinguishes integer index arrays from real data arrays.
-        _fn_name_set = {f.name for f in local_funcs if isinstance(f, ast.FunctionDef)}
-
-        def _slot_spec_from_use(_kind, _rank):
-            if _kind not in {"int", "real", "logical", "complex", "char"}:
-                return None, 0
-            _rank = max(0, int(_rank or 0))
-            if _rank > 0:
-                return {
-                    "int": "alloc_int",
-                    "real": "alloc_real",
-                    "logical": "alloc_log",
-                    "complex": "alloc_complex",
-                    "char": "alloc_char",
-                }[_kind], _rank
-            return _kind, 0
-
-        def _promote_tuple_slot(_callee, _slot, _kind, _rank):
-            if _callee not in tuple_return_out_kinds:
-                return
-            _spec, _rank2 = _slot_spec_from_use(_kind, _rank)
-            if _spec is None:
-                return
-            _ks = list(tuple_return_out_kinds.get(_callee, []))
-            _rs = list(tuple_return_out_ranks.get(_callee, []))
-            while len(_ks) <= _slot:
-                _ks.append(None)
-            while len(_rs) <= _slot:
-                _rs.append(0)
-            _cur = _ks[_slot]
-            _cur_rank = int(_rs[_slot] or 0)
-            _cur_base = str(_cur or "").replace("alloc_", "")
-            _new_base = str(_spec).replace("alloc_", "")
-            # Prefer concrete non-real downstream interface requirements over
-            # weak real defaults from np.loadtxt/genfromtxt.
-            if _cur in {None, "real", "alloc_real"} or _new_base in {"int", "logical", "char", "complex"}:
-                _ks[_slot] = _spec
-                _rs[_slot] = int(_rank2)
-            elif _cur_base == _new_base:
-                _ks[_slot] = _spec if str(_spec).startswith("alloc_") else _cur
-                _rs[_slot] = max(_cur_rank, int(_rank2))
-            tuple_return_out_kinds[_callee] = _ks
-            tuple_return_out_ranks[_callee] = _rs
-
-        for _caller in (local_funcs or []):
-            if not isinstance(_caller, ast.FunctionDef):
-                continue
-            for _st in ast.walk(_caller):
-                if not (
-                    isinstance(_st, ast.Assign)
-                    and len(_st.targets) == 1
-                    and isinstance(_st.targets[0], (ast.Tuple, ast.List))
-                    and isinstance(_st.value, ast.Call)
-                    and isinstance(_st.value.func, ast.Name)
-                    and _st.value.func.id in tuple_return_out_kinds
-                ):
-                    continue
-                _ret_callee = _st.value.func.id
-                _target_slots = {
-                    _elt.id: _i
-                    for _i, _elt in enumerate(_st.targets[0].elts)
-                    if isinstance(_elt, ast.Name)
-                }
-                if not _target_slots:
-                    continue
-                for _use in ast.walk(_caller):
-                    if not (isinstance(_use, ast.Call) and isinstance(_use.func, ast.Name)):
-                        continue
-                    _use_callee = _use.func.id
-                    if _use_callee not in _fn_name_set:
-                        continue
-                    _use_kinds = list(local_func_arg_kinds.get(_use_callee, []))
-                    _use_ranks = list(local_func_arg_ranks.get(_use_callee, []))
-                    _use_args = list(local_func_arg_names.get(_use_callee, []))
-                    for _j, _actual in enumerate(getattr(_use, "args", [])):
-                        if not (isinstance(_actual, ast.Name) and _actual.id in _target_slots):
-                            continue
-                        _kind = _use_kinds[_j] if _j < len(_use_kinds) else None
-                        _rank = _use_ranks[_j] if _j < len(_use_ranks) else 0
-                        _promote_tuple_slot(_ret_callee, _target_slots[_actual.id], _kind, _rank)
-                    if getattr(_use, "keywords", []):
-                        _idx = {_nm: _i for _i, _nm in enumerate(_use_args)}
-                        for _kw in _use.keywords:
-                            if _kw.arg is None or _kw.arg not in _idx:
-                                continue
-                            if not (isinstance(_kw.value, ast.Name) and _kw.value.id in _target_slots):
-                                continue
-                            _j = _idx[_kw.arg]
-                            _kind = _use_kinds[_j] if _j < len(_use_kinds) else None
-                            _rank = _use_ranks[_j] if _j < len(_use_ranks) else 0
-                            _promote_tuple_slot(_ret_callee, _target_slots[_kw.value.id], _kind, _rank)
     local_func_defaults = {}
     for fn in (local_funcs or []):
         fn_args_all = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -38660,31 +37231,6 @@ def generate_flat(
                 out_names.append(f"{fn.name}_out_{j + 1}")
         local_tuple_return_out_names[fn.name] = out_names
         local_tuple_return_src_names[fn.name] = src_names
-        if fn.name in tuple_return_out_kinds:
-            _argc = len(list(fn.args.args) + list(fn.args.kwonlyargs))
-            _kinds = list(local_func_arg_kinds.get(fn.name, []))
-            _ranks = list(local_func_arg_ranks.get(fn.name, []))
-            _tuple_kinds = list(tuple_return_out_kinds.get(fn.name, []))
-            _tuple_ranks = list(tuple_return_out_ranks.get(fn.name, []))
-            while len(_kinds) < _argc + len(_tuple_kinds):
-                _kinds.append(None)
-            while len(_ranks) < _argc + len(_tuple_kinds):
-                _ranks.append(0)
-            for _j, _tk in enumerate(_tuple_kinds):
-                _ks = str(_tk or "").lower()
-                if "real" in _ks or "float" in _ks:
-                    _kinds[_argc + _j] = "real"
-                elif "complex" in _ks:
-                    _kinds[_argc + _j] = "complex"
-                elif "logical" in _ks or "bool" in _ks:
-                    _kinds[_argc + _j] = "logical"
-                elif "character" in _ks or "char" in _ks or "str" in _ks:
-                    _kinds[_argc + _j] = "char"
-                elif "integer" in _ks or "int" in _ks:
-                    _kinds[_argc + _j] = "int"
-                _ranks[_argc + _j] = max(0, int(_tuple_ranks[_j])) if _j < len(_tuple_ranks) else 0
-            local_func_arg_kinds[fn.name] = _kinds
-            local_func_arg_ranks[fn.name] = _ranks
     local_void_funcs = set()
     def _has_value_return_in_body(stmts):
         for st in stmts:
@@ -38766,15 +37312,7 @@ def generate_flat(
         if len(base_ranks) < len(src_names):
             base_ranks.extend([0] * (len(src_names) - len(base_ranks)))
         refined_any = False
-        _fn_arg_names_for_tuple = [a.arg for a in _fn_args_all]
         for _i, _nm in enumerate(src_names):
-            if _nm in _fn_arg_names_for_tuple:
-                _arg_i = _fn_arg_names_for_tuple.index(_nm)
-                if _arg_i < len(_rk_h) and _rk_h[_arg_i] in {"int", "real", "logical", "char", "complex"}:
-                    base_kinds[_i] = _rk_h[_arg_i]
-                    base_ranks[_i] = int(_rr_h[_arg_i]) if _arg_i < len(_rr_h) else 0
-                    refined_any = True
-                    continue
             _dk, _dr = _name_direct_assign_spec(fn, _nm, _tr_fn)
             if _dk in {"int", "real", "logical", "char", "complex"} and int(_dr) == 0:
                 base_kinds[_i] = _dk
@@ -38783,19 +37321,6 @@ def generate_flat(
         if refined_any:
             tuple_return_out_kinds[fn.name] = list(base_kinds)
             tuple_return_out_ranks[fn.name] = list(base_ranks)
-            _argc = len(_fn_args_all)
-            _kinds2 = list(local_func_arg_kinds.get(fn.name, []))
-            _ranks2 = list(local_func_arg_ranks.get(fn.name, []))
-            while len(_kinds2) < _argc + len(base_kinds):
-                _kinds2.append(None)
-            while len(_ranks2) < _argc + len(base_ranks):
-                _ranks2.append(0)
-            for _j, _bk in enumerate(base_kinds):
-                _kinds2[_argc + _j] = _bk
-            for _j, _br in enumerate(base_ranks):
-                _ranks2[_argc + _j] = int(_br)
-            local_func_arg_kinds[fn.name] = _kinds2
-            local_func_arg_ranks[fn.name] = _ranks2
 
     def _is_print_only_void(fn):
         for st in fn.body:
@@ -39273,108 +37798,21 @@ def generate_flat(
                     elif isinstance(_dv.value, str):
                         _default_kind_by_arg[_pos_args_final[_idx].arg] = "char"
         def _semantic_int_context(_arg_nm):
-            int_aliases = {_arg_nm}
-
-            def _contains_alias(_node):
-                return any(
-                    isinstance(_x, ast.Name) and _x.id in int_aliases
-                    for _x in ast.walk(_node)
-                )
-
-            def _has_real_only_evidence(_node):
-                for _x in ast.walk(_node):
-                    if isinstance(_x, ast.Constant) and isinstance(_x.value, float):
-                        return True
-                    if isinstance(_x, ast.Call) and isinstance(_x.func, ast.Name) and _x.func.id == "float":
-                        return True
-                    if (
-                        isinstance(_x, ast.Call)
-                        and isinstance(_x.func, ast.Attribute)
-                        and isinstance(_x.func.value, ast.Name)
-                        and _x.func.value.id in {"np", "numpy", "math"}
-                        and _x.func.attr in {"log", "exp", "sqrt", "sin", "cos", "tan"}
-                    ):
-                        return True
-                return False
-
-            def _integer_only_alias_expr(_node):
-                if any(
-                    isinstance(_x, ast.Constant) and isinstance(_x.value, (float, complex))
-                    for _x in ast.walk(_node)
-                ):
-                    return False
-                for _x in ast.walk(_node):
-                    if isinstance(_x, ast.BinOp) and isinstance(_x.op, (ast.Div, ast.MatMult)):
-                        return False
-                    if isinstance(_x, ast.BinOp) and isinstance(_x.op, ast.Mod) and _has_real_only_evidence(_x):
-                        return False
-                    if isinstance(_x, ast.Attribute):
-                        return False
-                    if isinstance(_x, ast.Call):
-                        return False
-                return _contains_alias(_node)
-
-            changed_aliases = True
-            while changed_aliases:
-                changed_aliases = False
-                for _st in fn.body:
-                    if not (
-                        isinstance(_st, ast.Assign)
-                        and len(_st.targets) == 1
-                        and isinstance(_st.targets[0], ast.Name)
-                    ):
-                        continue
-                    _target_nm = _st.targets[0].id
-                    if _target_nm in int_aliases:
-                        continue
-                    if _integer_only_alias_expr(_st.value):
-                        int_aliases.add(_target_nm)
-                        changed_aliases = True
-
-            def _node_has_alias(_node):
-                return any(
-                    isinstance(_x, ast.Name) and _x.id in int_aliases
-                    for _x in ast.walk(_node)
-                )
-
             for _n in ast.walk(fn):
                 if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == "range":
                     if any(
-                        _node_has_alias(_a)
+                        any(isinstance(_x, ast.Name) and _x.id == _arg_nm for _x in ast.walk(_a))
                         for _a in _n.args
                     ):
                         return True
-                if (
-                    isinstance(_n, ast.Call)
-                    and isinstance(_n.func, ast.Name)
-                    and _n.func.id in local_func_arg_names
-                ):
-                    _callee_args = list(local_func_arg_names.get(_n.func.id, []))
-                    _callee_kinds = list(local_func_arg_kinds.get(_n.func.id, []))
-                    for _j, _a in enumerate(_n.args):
-                        if _j < len(_callee_kinds) and _callee_kinds[_j] == "int" and _node_has_alias(_a):
-                            return True
-                        if _j < len(_callee_args) and str(_callee_args[_j]).lower() == "seed" and _node_has_alias(_a):
-                            return True
-                    _callee_idx = {nm: i for i, nm in enumerate(_callee_args)}
-                    for _kw in getattr(_n, "keywords", []):
-                        if _kw.arg is None or _kw.arg not in _callee_idx:
-                            continue
-                        _j = _callee_idx[_kw.arg]
-                        if _j < len(_callee_kinds) and _callee_kinds[_j] == "int" and _node_has_alias(_kw.value):
-                            return True
-                        if str(_kw.arg).lower() == "seed" and _node_has_alias(_kw.value):
-                            return True
                 if isinstance(_n, ast.BinOp) and isinstance(_n.op, (ast.FloorDiv, ast.Mod)):
-                    if isinstance(_n.op, ast.Mod) and _has_real_only_evidence(_n):
-                        continue
                     if (
-                        (isinstance(_n.left, ast.Name) and _n.left.id in int_aliases)
-                        or (isinstance(_n.right, ast.Name) and _n.right.id in int_aliases)
+                        (isinstance(_n.left, ast.Name) and _n.left.id == _arg_nm)
+                        or (isinstance(_n.right, ast.Name) and _n.right.id == _arg_nm)
                     ):
                         return True
                 if isinstance(_n, ast.Subscript):
-                    if _node_has_alias(_n.slice):
+                    if any(isinstance(_x, ast.Name) and _x.id == _arg_nm for _x in ast.walk(_n.slice)):
                         return True
                 if (
                     isinstance(_n, ast.Call)
@@ -39385,10 +37823,10 @@ def generate_flat(
                     and _n.args
                 ):
                     _a0 = _n.args[0]
-                    if isinstance(_a0, ast.Name) and _a0.id in int_aliases:
+                    if isinstance(_a0, ast.Name) and _a0.id == _arg_nm:
                         return True
                     if isinstance(_a0, (ast.Tuple, ast.List)) and any(
-                        _node_has_alias(_e)
+                        any(isinstance(_x, ast.Name) and _x.id == _arg_nm for _x in ast.walk(_e))
                         for _e in _a0.elts
                     ):
                         return True
@@ -39402,163 +37840,6 @@ def generate_flat(
                 and local_func_arg_kinds[fn.name][i] in {None, "real"}
             ):
                 local_func_arg_kinds[fn.name][i] = "int"
-    for _fn_real in (local_funcs or []):
-        if not isinstance(_fn_real, ast.FunctionDef) or _fn_real.name not in local_func_arg_kinds:
-            continue
-        def _arg_real_interface_context(_arg_name):
-            def _contains_arg(_node):
-                return any(isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(_node))
-            for _st_real in _fn_real.body:
-                for _node_real in ast.walk(_st_real):
-                    if isinstance(_node_real, ast.Compare):
-                        _terms_real = [_node_real.left] + list(_node_real.comparators)
-                        for _i_real, _term_real in enumerate(_terms_real):
-                            if not _contains_arg(_term_real):
-                                continue
-                            for _j_real, _other_real in enumerate(_terms_real):
-                                if _i_real == _j_real:
-                                    continue
-                                if isinstance(_other_real, ast.Constant) and isinstance(_other_real.value, (float, complex)):
-                                    return True
-                    if (
-                        isinstance(_node_real, ast.BinOp)
-                        and isinstance(_node_real.op, ast.Mod)
-                        and isinstance(_node_real.left, ast.Constant)
-                        and isinstance(_node_real.left.value, str)
-                        and _contains_arg(_node_real.right)
-                    ):
-                        _fmt_real = _node_real.left.value
-                        _pos_real = 0
-                        while _pos_real < len(_fmt_real):
-                            if _fmt_real[_pos_real] != "%":
-                                _pos_real += 1
-                                continue
-                            if _pos_real + 1 < len(_fmt_real) and _fmt_real[_pos_real + 1] == "%":
-                                _pos_real += 2
-                                continue
-                            _end_real = _pos_real + 1
-                            while _end_real < len(_fmt_real) and _fmt_real[_end_real] not in "diouxXeEfFgGcs":
-                                _end_real += 1
-                            if _end_real < len(_fmt_real) and _fmt_real[_end_real] in "eEfFgG":
-                                return True
-                            _pos_real = _end_real + 1
-            return False
-        for _i_real, _arg_real in enumerate(local_func_arg_names.get(_fn_real.name, [])):
-            if _i_real < len(local_func_arg_kinds[_fn_real.name]) and _arg_real_interface_context(_arg_real):
-                local_func_arg_kinds[_fn_real.name][_i_real] = "real"
-    for _fn_obs in (local_funcs or []):
-        if not isinstance(_fn_obs, ast.FunctionDef) or _fn_obs.name not in local_func_arg_kinds:
-            continue
-        _ann_kinds_obs = [
-            _ann_kind(_a.annotation)
-            for _a in (list(_fn_obs.args.args) + list(_fn_obs.args.kwonlyargs))
-        ]
-        for _i_obs, _obs in enumerate(_observed_actual_kinds.get(_fn_obs.name, [])):
-            if _i_obs >= len(local_func_arg_kinds[_fn_obs.name]) or not _obs:
-                continue
-            if _i_obs < len(_ann_kinds_obs) and _ann_kinds_obs[_i_obs] is not None:
-                continue
-            if _obs & {"real", "alloc_real"} and local_func_arg_kinds[_fn_obs.name][_i_obs] in {None, "int", "logical"}:
-                local_func_arg_kinds[_fn_obs.name][_i_obs] = "real"
-    for _ in range(max(1, len(local_funcs)) + 2):
-        _changed_wrap_kind = False
-        for _caller in (local_funcs or []):
-            if not isinstance(_caller, ast.FunctionDef):
-                continue
-            _caller_args = list(local_func_arg_names.get(_caller.name, []))
-            _caller_kinds = list(local_func_arg_kinds.get(_caller.name, []))
-            if not _caller_args or not _caller_kinds:
-                continue
-            _caller_idx = {_nm: _i for _i, _nm in enumerate(_caller_args)}
-            for _call in ast.walk(_caller):
-                if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
-                    continue
-                _callee = _call.func.id
-                if _callee not in local_func_arg_kinds:
-                    continue
-                _callee_kinds = local_func_arg_kinds.get(_callee, [])
-                _callee_args = list(local_func_arg_names.get(_callee, []))
-                for _j, _actual in enumerate(getattr(_call, "args", [])):
-                    if _j >= len(_callee_kinds):
-                        break
-                    if not (isinstance(_actual, ast.Name) and _actual.id in _caller_idx):
-                        continue
-                    _src_i = _caller_idx[_actual.id]
-                    if _src_i >= len(_caller_kinds):
-                        continue
-                    _src_k = _caller_kinds[_src_i]
-                    if _src_k == "real" and _callee_kinds[_j] in {None, "int", "logical"}:
-                        _callee_kinds[_j] = "real"
-                        _changed_wrap_kind = True
-                _idx_by_name = {_nm: _i for _i, _nm in enumerate(_callee_args)}
-                for _kw in getattr(_call, "keywords", []):
-                    if _kw.arg is None or _kw.arg not in _idx_by_name:
-                        continue
-                    _j = _idx_by_name[_kw.arg]
-                    if _j >= len(_callee_kinds):
-                        continue
-                    if not (isinstance(_kw.value, ast.Name) and _kw.value.id in _caller_idx):
-                        continue
-                    _src_i = _caller_idx[_kw.value.id]
-                    if _src_i >= len(_caller_kinds):
-                        continue
-                    _src_k = _caller_kinds[_src_i]
-                    if _src_k == "real" and _callee_kinds[_j] in {None, "int", "logical"}:
-                        _callee_kinds[_j] = "real"
-                        _changed_wrap_kind = True
-        if not _changed_wrap_kind:
-            break
-    for _fn_tuple_sync in (local_funcs or []):
-        if not isinstance(_fn_tuple_sync, ast.FunctionDef) or _fn_tuple_sync.name not in tuple_return_out_kinds:
-            continue
-        _argc_sync = len(list(_fn_tuple_sync.args.args) + list(_fn_tuple_sync.args.kwonlyargs))
-        _kinds_sync = list(local_func_arg_kinds.get(_fn_tuple_sync.name, []))
-        _ranks_sync = list(local_func_arg_ranks.get(_fn_tuple_sync.name, []))
-        _tuple_k_sync = list(tuple_return_out_kinds.get(_fn_tuple_sync.name, []))
-        _tuple_r_sync = list(tuple_return_out_ranks.get(_fn_tuple_sync.name, []))
-        while len(_kinds_sync) < _argc_sync + len(_tuple_k_sync):
-            _kinds_sync.append(None)
-        while len(_ranks_sync) < _argc_sync + len(_tuple_k_sync):
-            _ranks_sync.append(0)
-        for _j_sync, _tk_sync in enumerate(_tuple_k_sync):
-            _ks_sync = str(_tk_sync or "").lower()
-            if "real" in _ks_sync or "float" in _ks_sync:
-                _kinds_sync[_argc_sync + _j_sync] = "real"
-            elif "complex" in _ks_sync:
-                _kinds_sync[_argc_sync + _j_sync] = "complex"
-            elif "logical" in _ks_sync or "bool" in _ks_sync:
-                _kinds_sync[_argc_sync + _j_sync] = "logical"
-            elif "character" in _ks_sync or "char" in _ks_sync or "str" in _ks_sync:
-                _kinds_sync[_argc_sync + _j_sync] = "char"
-            elif "integer" in _ks_sync or "int" in _ks_sync:
-                _kinds_sync[_argc_sync + _j_sync] = "int"
-            _ranks_sync[_argc_sync + _j_sync] = max(0, int(_tuple_r_sync[_j_sync])) if _j_sync < len(_tuple_r_sync) else 0
-        local_func_arg_kinds[_fn_tuple_sync.name] = _kinds_sync
-        local_func_arg_ranks[_fn_tuple_sync.name] = _ranks_sync
-    for _fn_scalar_actuals in (local_funcs or []):
-        if not isinstance(_fn_scalar_actuals, ast.FunctionDef):
-            continue
-        _rank_obs_final = call_actual_rank_sets.get(_fn_scalar_actuals.name, [])
-        if not _rank_obs_final or _fn_scalar_actuals.name not in local_func_arg_ranks:
-            continue
-        _arg_names_final = local_func_arg_names.get(_fn_scalar_actuals.name, [])
-        for _i_final, _obs_final in enumerate(_rank_obs_final):
-            if (
-                _i_final >= len(local_func_arg_ranks[_fn_scalar_actuals.name])
-                or _i_final >= len(_arg_names_final)
-                or not _obs_final
-                or max(int(_r) for _r in _obs_final) != 0
-            ):
-                continue
-            _arg_name_final = _arg_names_final[_i_final]
-            if any(
-                isinstance(_n, ast.Subscript)
-                and isinstance(_n.value, ast.Name)
-                and _n.value.id == _arg_name_final
-                for _n in ast.walk(_fn_scalar_actuals)
-            ):
-                continue
-            local_func_arg_ranks[_fn_scalar_actuals.name][_i_final] = 0
     local_generic_overloads = set(local_overload_specs.keys())
     pure_local_calls = set(known_pure_calls or set()) | set((user_class_types or {}).keys())
 
@@ -40220,7 +38501,6 @@ def generate_flat(
         rng_replay_path=rng_replay_path,
         local_proc_name_aliases=fn_alias_map if use_proc_module else None,
     )
-    tr.module_global_names = set(module_global_names)
     tr.prescan(tree.body)
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":
@@ -41780,7 +40060,7 @@ def main():
     ap.add_argument(
         "--compiler",
         default=default_compiler_command(),
-        help='compiler command; default is optimized, e.g. "gfortran -O3 -Wfatal-errors"; use explicit -O0/-fcheck flags for debug checking',
+        help='compiler command; default is debug/checking flags, e.g. "gfortran -O3 -march=native -Wfatal-errors"',
     )
     args = ap.parse_args()
     global PERCENT_FLOAT_INT_FORMAT
