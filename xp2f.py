@@ -29866,6 +29866,7 @@ def _emit_local_function(
     module_global_decls=None,
     local_proc_name_aliases=None,
     callback_scalar_actuals=None,
+    local_callback_actual_specs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -31620,6 +31621,37 @@ def _emit_local_function(
         cb_nargs = 0
         cb_arg_kinds = {}
         saw_direct_cb_call = False
+        _fn_arg_kind_by_name = {}
+        if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
+            _kinds = list(local_func_arg_kinds.get(fn.name, []))
+            for _i, _arg_name in enumerate(args):
+                if _i < len(_kinds) and _kinds[_i] in {"int", "real", "complex", "logical", "char"}:
+                    _fn_arg_kind_by_name[_arg_name] = _kinds[_i]
+
+        def _simple_alias_kind(name):
+            """Return the kind of a local that is a direct alias of a dummy."""
+            seen = set()
+            cur = name
+            while cur not in seen:
+                seen.add(cur)
+                if cur in _fn_arg_kind_by_name:
+                    return _fn_arg_kind_by_name[cur]
+                src = None
+                for _st in fn.body:
+                    if (
+                        isinstance(_st, ast.Assign)
+                        and len(_st.targets) == 1
+                        and isinstance(_st.targets[0], ast.Name)
+                        and _st.targets[0].id == cur
+                        and isinstance(_st.value, ast.Name)
+                    ):
+                        src = _st.value.id
+                        break
+                if src is None:
+                    return None
+                cur = src
+            return None
+
         for _n in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
             if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == cb):
                 continue
@@ -31629,6 +31661,10 @@ def _emit_local_function(
                 _k = tr._expr_kind(_a)
                 if _k in {"int", "real", "logical", "char", "complex"}:
                     cb_arg_kinds[_i] = _merge_cb_kind(cb_arg_kinds.get(_i), _k)
+                if isinstance(_a, ast.Name):
+                    _ak = _simple_alias_kind(_a.id)
+                    if _ak in {"int", "real", "logical", "char", "complex"}:
+                        cb_arg_kinds[_i] = _merge_cb_kind(cb_arg_kinds.get(_i), _ak)
             if _n.args:
                 try:
                     in_rank = max(in_rank, int(tr._rank_expr(_n.args[0])))
@@ -31692,6 +31728,32 @@ def _emit_local_function(
                 break
             if tnm in tr.alloc_reals or tnm in tr.reals:
                 ret_kind = "real"
+        actual_cb = (local_callback_actual_specs or {}).get((fn.name, cb), {})
+        actual_ret_kind = actual_cb.get("ret_kind")
+        if actual_ret_kind in {"int", "real", "complex", "logical", "char"}:
+            # Actual procedure return declarations are stronger evidence than
+            # the default scalar-real fallback assigned to callback results,
+            # but not stronger than concrete local assignment targets.
+            if not (actual_ret_kind == "real" and ret_kind in {"int", "complex", "logical", "char"}):
+                ret_kind = actual_ret_kind
+        actual_ret_rank = max(0, int(actual_cb.get("ret_rank", 0) or 0))
+        if actual_ret_rank > 0:
+            ret_rank = max(ret_rank, actual_ret_rank)
+        for _ia, _ak in dict(actual_cb.get("arg_kinds", {})).items():
+            if _ak in {"int", "real", "complex", "logical", "char"}:
+                # Actual callback procedure dummies are stronger evidence than
+                # fallback inference from a wrapper's temporary variables.
+                cb_arg_kinds[int(_ia)] = _ak
+        _first_arg_kind = cb_arg_kinds.get(0)
+        if _first_arg_kind in {"int", "real", "complex", "logical", "char"}:
+            _assigned = set(callback_assign_targets.get(cb, set()))
+            if _assigned:
+                for _n in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
+                    if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == cb):
+                        continue
+                    if any(isinstance(_a, ast.Name) and _a.id in _assigned for _a in _n.args):
+                        ret_kind = _first_arg_kind
+                        break
         callback_specs[cb] = {
             "in_rank": in_rank,
             "ret_rank": ret_rank,
@@ -31712,6 +31774,7 @@ def _emit_local_function(
 
     # Propagate inferred callback return shape/kind to assigned locals.
     callback_complex_targets = set()
+    callback_forced_scalar_kinds = {}
     for cb, info in callback_specs.items():
         rk = str(info.get("ret_kind", "real"))
         for tnm in callback_assign_targets.get(cb, set()):
@@ -31757,6 +31820,25 @@ def _emit_local_function(
                     tr._mark_char(tnm)
                 else:
                     tr._mark_real(tnm)
+                if rk in {"int", "real", "complex", "logical", "char"}:
+                    callback_forced_scalar_kinds[tnm] = rk
+    if callback_forced_scalar_kinds:
+        for _line, _items in list(tr.type_rebind_events.items()):
+            _kept = [
+                (_nm, _k, _r)
+                for (_nm, _k, _r) in _items
+                if _nm not in callback_forced_scalar_kinds
+            ]
+            if _kept:
+                tr.type_rebind_events[_line] = _kept
+            else:
+                tr.type_rebind_events.pop(_line, None)
+        tr.type_rebind_targets.difference_update(callback_forced_scalar_kinds)
+        for _nm, _k in callback_forced_scalar_kinds.items():
+            _fam = tr._kind_family(_k)
+            if _fam is not None:
+                tr.var_type_first_seen[_nm] = (_k, _fam, 0, None, None)
+                tr.var_type_initial_spec[_nm] = (_k, 0)
     # Second-pass local promotion after callback kind propagation.
     # This fixes cases where an argument kind is learned late (e.g. callback
     # actual forced to complex) and dependent locals were initially typed as real.
@@ -32321,6 +32403,19 @@ def _emit_local_function(
         return out
     _apply_strong_scalar_local_specs()
     strong_scalar_local_kinds = _strong_scalar_local_kind_map()
+    for _nm, _k in callback_forced_scalar_kinds.items():
+        if _k in {"int", "real", "complex", "logical", "char"}:
+            strong_scalar_local_kinds[_nm] = _k
+            if _k != "real":
+                tr.reals.discard(_nm)
+            if _k != "int":
+                tr.ints.discard(_nm)
+            if _k != "complex":
+                tr.complexes.discard(_nm)
+            if _k != "logical":
+                tr.logs.discard(_nm)
+            if _k != "char":
+                tr.chars.discard(_nm)
     _c8_noncomplex_returns_decl = {
         "c8_abs", "c8_arg", "c8_imag", "c8_mag", "c8_norm_l1",
         "c8_norm_l2", "c8_norm_li", "c8_real", "c8_le_l1",
@@ -36229,6 +36324,43 @@ def generate_flat(
         local_func_callback_params[fn.name] = cb_args
         local_func_rng_params[fn.name] = rng_args
     if local_funcs:
+        changed_callbacks = True
+        while changed_callbacks:
+            changed_callbacks = False
+            for fn in (local_funcs or []):
+                fn_arg_names = [a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))]
+                cb_args = set(local_func_callback_params.get(fn.name, set()))
+                for st in fn.body:
+                    for n in ast.walk(st):
+                        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
+                            continue
+                        callee = n.func.id
+                        callee_cb = set(local_func_callback_params.get(callee, set()))
+                        if not callee_cb:
+                            continue
+                        callee_args = list(local_arg_names_map.get(callee, []))
+                        for i, a in enumerate(n.args):
+                            if i >= len(callee_args):
+                                break
+                            if (
+                                callee_args[i] in callee_cb
+                                and isinstance(a, ast.Name)
+                                and a.id in fn_arg_names
+                                and a.id not in cb_args
+                            ):
+                                cb_args.add(a.id)
+                                changed_callbacks = True
+                        for kw in getattr(n, "keywords", []):
+                            if (
+                                kw.arg in callee_cb
+                                and isinstance(kw.value, ast.Name)
+                                and kw.value.id in fn_arg_names
+                                and kw.value.id not in cb_args
+                            ):
+                                cb_args.add(kw.value.id)
+                                changed_callbacks = True
+                local_func_callback_params[fn.name] = cb_args
+    if local_funcs:
         changed_rng = True
         while changed_rng:
             changed_rng = False
@@ -36602,8 +36734,23 @@ def generate_flat(
         ]
         merged_kinds = []
         def _arg_has_explicit_real_evidence(_arg_name):
+            _aliases = {_arg_name}
+            _changed_alias = True
+            while _changed_alias:
+                _changed_alias = False
+                for _st_alias in ast.walk(fn):
+                    if not (
+                        isinstance(_st_alias, ast.Assign)
+                        and len(_st_alias.targets) == 1
+                        and isinstance(_st_alias.targets[0], ast.Name)
+                        and isinstance(_st_alias.value, ast.Name)
+                    ):
+                        continue
+                    if _st_alias.value.id in _aliases and _st_alias.targets[0].id not in _aliases:
+                        _aliases.add(_st_alias.targets[0].id)
+                        _changed_alias = True
             for _st in ast.walk(fn):
-                if not any(isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(_st)):
+                if not any(isinstance(_x, ast.Name) and _x.id in _aliases for _x in ast.walk(_st)):
                     continue
                 for _x in ast.walk(_st):
                     if isinstance(_x, ast.Constant) and isinstance(_x.value, (float, complex)):
@@ -36640,6 +36787,8 @@ def generate_flat(
                 merged_kinds.append(hk)
             elif hk == "int" and bk != "int":
                 merged_kinds.append(bk)
+            elif hk == "real" and bk == "int" and _arg_has_explicit_real_evidence(arg_nm):
+                merged_kinds.append(hk)
             elif hk == "real" and bk in {"int", "logical", "char", "complex"}:
                 merged_kinds.append(bk)
             elif hk == "complex" and bk in {"int", "logical", "char", "real"}:
@@ -36676,6 +36825,57 @@ def generate_flat(
                 and hint_rank == 0
             ):
                 local_func_arg_ranks[fn.name][i] = 0
+
+    def _force_rng_param_kinds():
+        for _fn_name, _rng_names in dict(local_func_rng_params).items():
+            _arg_names = list(local_func_arg_names.get(_fn_name, []))
+            if not _arg_names:
+                continue
+            _kinds = local_func_arg_kinds.get(_fn_name)
+            _ranks = local_func_arg_ranks.get(_fn_name)
+            if _kinds is None:
+                continue
+            for _rng_name in set(_rng_names):
+                if _rng_name not in _arg_names:
+                    continue
+                _idx = _arg_names.index(_rng_name)
+                if _idx < len(_kinds):
+                    _kinds[_idx] = "int"
+                if _ranks is not None and _idx < len(_ranks):
+                    _ranks[_idx] = 0
+
+    _force_rng_param_kinds()
+    if local_funcs:
+        _early_global_decls = collect_top_level_shared_decls(tree, local_funcs=local_funcs, params=params)
+        _early_global_decls.update(collect_module_global_decls(local_funcs))
+        for _fn in (local_funcs or []):
+            if not isinstance(_fn, ast.FunctionDef):
+                continue
+            _names = list(local_func_arg_names.get(_fn.name, []))
+            _idx = {nm: i for i, nm in enumerate(_names)}
+            _global_names = set()
+            for _g in ast.walk(_fn):
+                if isinstance(_g, ast.Global):
+                    _global_names.update(_g.names)
+            for _st in ast.walk(_fn):
+                if not (
+                    isinstance(_st, ast.Assign)
+                    and len(_st.targets) == 1
+                    and isinstance(_st.targets[0], ast.Name)
+                    and isinstance(_st.value, ast.Name)
+                    and _st.value.id in _idx
+                ):
+                    continue
+                _target = _st.targets[0].id
+                if _target not in _global_names:
+                    continue
+                _gk, _gr = _early_global_decls.get(_target, (None, 0))
+                if _gk in {"real", "complex", "logical", "char", "int"}:
+                    _i = _idx[_st.value.id]
+                    if _i < len(local_func_arg_kinds.get(_fn.name, [])):
+                        local_func_arg_kinds[_fn.name][_i] = _promote_kind_hint(
+                            local_func_arg_kinds[_fn.name][_i], _gk
+                        )
     # Propagate callback-parameter signatures from callees to passed-in local
     # function actuals. Example:
     #   def arclength_x(..., dydx, ...): fx = dydx(t)   ! t rank-1
@@ -36735,6 +36935,36 @@ def generate_flat(
             if not _cb_params:
                 continue
             _cb_tr = _callback_scan_tr(_callee)
+            _callee_arg_kind_by_name = {}
+            if local_func_arg_kinds is not None and _callee.name in local_func_arg_kinds:
+                _kinds = list(local_func_arg_kinds.get(_callee.name, []))
+                for _i, _arg_name in enumerate(local_func_arg_names.get(_callee.name, [])):
+                    if _i < len(_kinds) and _kinds[_i] in {"int", "real", "complex", "logical", "char"}:
+                        _callee_arg_kind_by_name[_arg_name] = _kinds[_i]
+
+            def _callee_simple_alias_kind(name):
+                seen = set()
+                cur = name
+                while cur not in seen:
+                    seen.add(cur)
+                    if cur in _callee_arg_kind_by_name:
+                        return _callee_arg_kind_by_name[cur]
+                    src = None
+                    for _st in _callee.body:
+                        if (
+                            isinstance(_st, ast.Assign)
+                            and len(_st.targets) == 1
+                            and isinstance(_st.targets[0], ast.Name)
+                            and _st.targets[0].id == cur
+                            and isinstance(_st.value, ast.Name)
+                        ):
+                            src = _st.value.id
+                            break
+                    if src is None:
+                        return None
+                    cur = src
+                return None
+
             for _cbp in _cb_params:
                 _inr = 0
                 _outr = 0
@@ -36756,6 +36986,7 @@ def generate_flat(
                             except Exception:
                                 pass
                             _ak = _promote_kind_hint(_ak, _scan_name_kind(_cb_tr, _arg.id))
+                            _ak = _promote_kind_hint(_ak, _callee_simple_alias_kind(_arg.id))
                         if _ak in {"int", "real", "complex", "logical", "char"}:
                             _arg_kinds[_ia] = _promote_kind_hint(_arg_kinds.get(_ia), _ak)
                     if _n.args:
@@ -36776,6 +37007,7 @@ def generate_flat(
                             except Exception:
                                 pass
                             _ink = _promote_kind_hint(_ink, _scan_name_kind(_cb_tr, _a0.id))
+                            _ink = _promote_kind_hint(_ink, _callee_simple_alias_kind(_a0.id))
                 for _st in _callee.body:
                     if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name)):
                         continue
@@ -36798,6 +37030,51 @@ def generate_flat(
                         _outr = max(_outr, int(tr_seed._rank_expr(_st.targets[0])))
                     except Exception:
                         pass
+                for _call in ast.walk(_callee):
+                    if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
+                        continue
+                    _target_name = _call.func.id
+                    _target_cb_params = set(local_func_callback_params.get(_target_name, set()))
+                    if not _target_cb_params:
+                        continue
+                    _target_arg_names = list(local_func_arg_names.get(_target_name, []))
+                    for _j, _arg in enumerate(_call.args):
+                        if _j >= len(_target_arg_names):
+                            break
+                        if not (isinstance(_arg, ast.Name) and _arg.id == _cbp):
+                            continue
+                        _target_cbp = _target_arg_names[_j]
+                        if _target_cbp not in _target_cb_params:
+                            continue
+                        _target_sig = cb_sig.get((_target_name, _target_cbp))
+                        if _target_sig is None:
+                            continue
+                        _tinr, _toutr, _tink, _toutk = _target_sig[:4]
+                        _targ_kinds = _target_sig[4] if len(_target_sig) > 4 else {}
+                        _inr = max(int(_inr), int(_tinr))
+                        _outr = max(int(_outr), int(_toutr))
+                        _ink = _promote_kind_hint(_ink, _tink)
+                        _outk = _promote_kind_hint(_outk, _toutk)
+                        for _ia, _ak in dict(_targ_kinds).items():
+                            if _ak in {"int", "real", "complex", "logical", "char"}:
+                                _arg_kinds[int(_ia)] = _promote_kind_hint(_arg_kinds.get(int(_ia)), _ak)
+                    for _kw in getattr(_call, "keywords", []):
+                        if _kw.arg not in _target_cb_params:
+                            continue
+                        if not (isinstance(_kw.value, ast.Name) and _kw.value.id == _cbp):
+                            continue
+                        _target_sig = cb_sig.get((_target_name, _kw.arg))
+                        if _target_sig is None:
+                            continue
+                        _tinr, _toutr, _tink, _toutk = _target_sig[:4]
+                        _targ_kinds = _target_sig[4] if len(_target_sig) > 4 else {}
+                        _inr = max(int(_inr), int(_tinr))
+                        _outr = max(int(_outr), int(_toutr))
+                        _ink = _promote_kind_hint(_ink, _tink)
+                        _outk = _promote_kind_hint(_outk, _toutk)
+                        for _ia, _ak in dict(_targ_kinds).items():
+                            if _ak in {"int", "real", "complex", "logical", "char"}:
+                                _arg_kinds[int(_ia)] = _promote_kind_hint(_arg_kinds.get(int(_ia)), _ak)
                 if _outk is None and _ink == "complex":
                     _outk = "complex"
                 cb_sig[(_callee.name, _cbp)] = (_inr, _outr, _ink, _outk, _arg_kinds)
@@ -36900,6 +37177,434 @@ def generate_flat(
                             local_return_specs[_kw.value.id] = _alloc_map.get(_outk, _outk)
                         else:
                             local_return_specs[_kw.value.id] = _outk
+
+        def _ret_spec_kind_rank(_fn_name):
+            _spec = local_return_specs.get(_fn_name)
+            _rank = max(0, int(local_return_ranks.get(_fn_name, 0) or 0))
+            _kind_map = {
+                "alloc_int": "int",
+                "alloc_real": "real",
+                "alloc_complex": "complex",
+                "alloc_log": "logical",
+                "alloc_char": "char",
+                "int": "int",
+                "real": "real",
+                "complex": "complex",
+                "logical": "logical",
+                "char": "char",
+            }
+            _kind = _kind_map.get(_spec)
+            if isinstance(_spec, str) and _spec.startswith("alloc_"):
+                _rank = max(_rank, 1)
+            _fn_node = fn_map.get(_fn_name)
+            if _fn_node is not None:
+                try:
+                    _tr_body = _callback_scan_tr(_fn_node)
+                    _body_kinds = set()
+                    _body_ranks = []
+                    for _ret in [n for n in ast.walk(_fn_node) if isinstance(n, ast.Return) and n.value is not None]:
+                        _rv = _ret.value
+                        _rk = None
+                        if isinstance(_rv, ast.Name):
+                            _rk = _scan_name_kind(_tr_body, _rv.id)
+                        if _rk is None:
+                            _rk = _tr_body._expr_kind(_rv)
+                        if _rk in {"int", "real", "complex", "logical", "char"}:
+                            _body_kinds.add(_rk)
+                        try:
+                            _body_ranks.append(max(0, int(_tr_body._rank_expr(_rv))))
+                        except Exception:
+                            pass
+                    if len(_body_kinds) == 1:
+                        _body_kind = next(iter(_body_kinds))
+                        # A direct body-derived kind is stronger than the
+                        # scalar-real default that callback cycles can create.
+                        _kind = _body_kind
+                    if _body_ranks:
+                        _rank = max(_rank, max(_body_ranks))
+                except Exception:
+                    pass
+            return _kind, _rank
+
+        def _merge_actual_cb_spec(_callee_name, _cbp, _actual_name):
+            if _actual_name not in fn_map:
+                return
+            _ret_kind, _ret_rank = _ret_spec_kind_rank(_actual_name)
+            def _fn_has_real_evidence(_fn_actual):
+                if _fn_actual is None:
+                    return False
+                for _x in ast.walk(_fn_actual):
+                    if isinstance(_x, ast.Constant) and isinstance(_x.value, (float, complex)):
+                        return True
+                    if isinstance(_x, ast.BinOp) and isinstance(_x.op, ast.Div):
+                        return True
+                    if isinstance(_x, ast.Call):
+                        if isinstance(_x.func, ast.Name) and _x.func.id in {"float", "complex"}:
+                            return True
+                        if (
+                            isinstance(_x.func, ast.Attribute)
+                            and isinstance(_x.func.value, ast.Name)
+                            and _x.func.value.id in {"math", "cmath", "np", "numpy"}
+                        ):
+                            return True
+                return False
+            def _fn_has_logical_evidence(_fn_actual):
+                if _fn_actual is None:
+                    return False
+                for _x in ast.walk(_fn_actual):
+                    if isinstance(_x, ast.BoolOp) or isinstance(_x, ast.UnaryOp) and isinstance(_x.op, ast.Not):
+                        return True
+                    if isinstance(_x, ast.Constant) and isinstance(_x.value, bool):
+                        return True
+                return False
+            def _arg_has_logical_evidence(_fn_actual, _arg_name):
+                if _fn_actual is None:
+                    return False
+                for _x in ast.walk(_fn_actual):
+                    if isinstance(_x, ast.BoolOp):
+                        for _v in _x.values:
+                            if any(
+                                isinstance(_n, ast.Name) and _n.id == _arg_name
+                                for _n in ast.walk(_v)
+                            ):
+                                return True
+                    if isinstance(_x, ast.UnaryOp) and isinstance(_x.op, ast.Not):
+                        if any(
+                            isinstance(_n, ast.Name) and _n.id == _arg_name
+                            for _n in ast.walk(_x.operand)
+                        ):
+                            return True
+                return False
+            _fn_actual = fn_map.get(_actual_name)
+            _has_real_evidence = _fn_has_real_evidence(_fn_actual)
+            _callee_has_real_evidence = _fn_has_real_evidence(fn_map.get(_callee_name))
+            _has_logical_evidence = _fn_has_logical_evidence(_fn_actual)
+            if _ret_kind == "real":
+                if not _has_real_evidence and not _callee_has_real_evidence and not _has_logical_evidence:
+                    _ret_kind = "int"
+            elif _ret_kind == "int" and _callee_has_real_evidence:
+                _ret_kind = "real"
+            if _ret_kind not in {"int", "real", "complex", "logical", "char"}:
+                return
+            _force_integer_actual = (
+                _ret_kind == "int"
+                and not _has_real_evidence
+                and not _callee_has_real_evidence
+                and not _has_logical_evidence
+            )
+            if _force_integer_actual:
+                local_return_specs[_actual_name] = _ret_kind
+                if _ret_rank <= 0:
+                    local_return_ranks[_actual_name] = 0
+            _key = (_callee_name, _cbp)
+            _info = local_callback_actual_specs.setdefault(
+                _key,
+                {"ret_kind": None, "ret_rank": 0, "arg_kinds": {}, "arg_ranks": {}},
+            )
+            _info["ret_kind"] = _promote_kind_hint(_info.get("ret_kind"), _ret_kind)
+            _info["ret_rank"] = max(int(_info.get("ret_rank", 0) or 0), int(_ret_rank))
+            _akinds = list(local_func_arg_kinds.get(_actual_name, []))
+            _aranks = list(local_func_arg_ranks.get(_actual_name, []))
+            _actual_arg_names = list(local_func_arg_names.get(_actual_name, []))
+            _cb_sig = cb_sig.get((_callee_name, _cbp))
+            _wrapper_arg_kinds = dict(_cb_sig[4]) if _cb_sig is not None and len(_cb_sig) > 4 else {}
+            _passthrough_arg_kinds = {}
+            _passthrough_ret_kind = None
+            _callee_node = fn_map.get(_callee_name)
+            if _callee_node is not None:
+                for _call in ast.walk(_callee_node):
+                    if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
+                        continue
+                    _target_name = _call.func.id
+                    _target_cb_params = set(local_func_callback_params.get(_target_name, set()))
+                    if not _target_cb_params:
+                        continue
+                    _target_arg_names = list(local_func_arg_names.get(_target_name, []))
+                    _target_cbp = None
+                    for _j, _arg_node in enumerate(_call.args):
+                        if _j >= len(_target_arg_names):
+                            break
+                        if isinstance(_arg_node, ast.Name) and _arg_node.id == _cbp:
+                            _candidate = _target_arg_names[_j]
+                            if _candidate in _target_cb_params:
+                                _target_cbp = _candidate
+                                break
+                    if _target_cbp is None:
+                        for _kw in getattr(_call, "keywords", []):
+                            if (
+                                _kw.arg in _target_cb_params
+                                and isinstance(_kw.value, ast.Name)
+                                and _kw.value.id == _cbp
+                            ):
+                                _target_cbp = _kw.arg
+                                break
+                    if _target_cbp is None:
+                        continue
+                    _target_sig = cb_sig.get((_target_name, _target_cbp))
+                    if _target_sig is None:
+                        continue
+                    _tinr, _toutr, _tink, _toutk = _target_sig[:4]
+                    _target_arg_kinds = _target_sig[4] if len(_target_sig) > 4 else {}
+                    _passthrough_ret_kind = _promote_kind_hint(_passthrough_ret_kind, _toutk)
+                    if _passthrough_ret_kind is None and _tink in {"int", "real", "complex", "logical", "char"}:
+                        _passthrough_ret_kind = _tink
+                    for _ia, _ak in dict(_target_arg_kinds).items():
+                        if _ak in {"int", "real", "complex", "logical", "char"}:
+                            _passthrough_arg_kinds[int(_ia)] = _promote_kind_hint(
+                                _passthrough_arg_kinds.get(int(_ia)), _ak
+                            )
+            for _ia, _ak in _passthrough_arg_kinds.items():
+                _wrapper_arg_kinds[_ia] = _promote_kind_hint(_wrapper_arg_kinds.get(_ia), _ak)
+            _iterative_int_callback = False
+            if dict(_wrapper_arg_kinds).get(0) == "int":
+                _callee_node_for_iter = fn_map.get(_callee_name)
+                if _callee_node_for_iter is not None:
+                    _assigned_to_cb = set()
+                    for _st in ast.walk(_callee_node_for_iter):
+                        if (
+                            isinstance(_st, ast.Assign)
+                            and len(_st.targets) == 1
+                            and isinstance(_st.targets[0], ast.Name)
+                        ):
+                            if any(
+                                isinstance(_n, ast.Call)
+                                and isinstance(_n.func, ast.Name)
+                                and _n.func.id == _cbp
+                                for _n in ast.walk(_st.value)
+                            ):
+                                _assigned_to_cb.add(_st.targets[0].id)
+                    if _assigned_to_cb:
+                        for _call in ast.walk(_callee_node_for_iter):
+                            if not (
+                                isinstance(_call, ast.Call)
+                                and isinstance(_call.func, ast.Name)
+                                and _call.func.id == _cbp
+                            ):
+                                continue
+                            if any(isinstance(_a, ast.Name) and _a.id in _assigned_to_cb for _a in _call.args):
+                                _iterative_int_callback = True
+                                break
+            if _iterative_int_callback:
+                _ret_kind = "int"
+                if _actual_name in local_return_specs:
+                    local_return_specs[_actual_name] = "int"
+                    local_return_ranks[_actual_name] = 0
+                _info["ret_kind"] = _ret_kind
+            if any(_ak == "complex" for _ak in _wrapper_arg_kinds.values()):
+                _ret_kind = "complex"
+                if _actual_name in local_return_specs:
+                    local_return_specs[_actual_name] = "complex"
+                    local_return_ranks[_actual_name] = 0
+                _info["ret_kind"] = _promote_kind_hint(_info.get("ret_kind"), _ret_kind)
+            elif _passthrough_ret_kind in {"real", "complex", "logical", "char"}:
+                _ret_kind = _passthrough_ret_kind
+                if _actual_name in local_return_specs:
+                    local_return_specs[_actual_name] = _ret_kind
+                    local_return_ranks[_actual_name] = 0
+                _info["ret_kind"] = _promote_kind_hint(_info.get("ret_kind"), _ret_kind)
+            elif (
+                _ret_kind == "int"
+                and any(_ak == "real" for _ak in _wrapper_arg_kinds.values())
+                and not _has_logical_evidence
+            ):
+                _ret_kind = "real"
+                if _actual_name in local_return_specs:
+                    local_return_specs[_actual_name] = "real"
+                    local_return_ranks[_actual_name] = 0
+                _info["ret_kind"] = _promote_kind_hint(_info.get("ret_kind"), _ret_kind)
+            for _ia, _ak in enumerate(_akinds):
+                if _ia in _wrapper_arg_kinds:
+                    _ak = _wrapper_arg_kinds[_ia]
+                if _ia < len(_actual_arg_names) and _arg_has_logical_evidence(_fn_actual, _actual_arg_names[_ia]):
+                    _ak = "logical"
+                if _ak == "real" and _force_integer_actual:
+                    _ak = "int"
+                if _ak in {"int", "real", "complex", "logical", "char"}:
+                    _info["arg_kinds"][_ia] = _promote_kind_hint(_info["arg_kinds"].get(_ia), _ak)
+                    if _force_integer_actual and _actual_name in local_func_arg_kinds and _ia < len(local_func_arg_kinds[_actual_name]):
+                        local_func_arg_kinds[_actual_name][_ia] = _ak
+            for _ia, _ar in enumerate(_aranks):
+                _info["arg_ranks"][_ia] = max(int(_info["arg_ranks"].get(_ia, 0)), int(_ar))
+
+        local_callback_actual_specs = {}
+        _all_call_nodes = ast.walk(ast.Module(body=list(local_funcs or []) + list(getattr(tree, "body", [])), type_ignores=[]))
+        for _n in _all_call_nodes:
+            if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)):
+                continue
+            _callee_name = _n.func.id
+            _cb_params = set(local_func_callback_params.get(_callee_name, set()))
+            if not _cb_params:
+                continue
+            _arg_names = local_func_arg_names.get(_callee_name, [])
+            for _j, _a in enumerate(_n.args):
+                if _j >= len(_arg_names):
+                    break
+                _cbp = _arg_names[_j]
+                if _cbp in _cb_params and isinstance(_a, ast.Name):
+                    _merge_actual_cb_spec(_callee_name, _cbp, _a.id)
+            if getattr(_n, "keywords", None):
+                for _kw in _n.keywords:
+                    if _kw.arg in _cb_params and isinstance(_kw.value, ast.Name):
+                        _merge_actual_cb_spec(_callee_name, _kw.arg, _kw.value.id)
+
+        for _fn_node in local_funcs or []:
+            if not isinstance(_fn_node, ast.FunctionDef):
+                continue
+            _callee_name = _fn_node.name
+            _arg_names = list(local_func_arg_names.get(_callee_name, []))
+            _arg_index = {nm: i for i, nm in enumerate(_arg_names)}
+            def _formal_alias_index(_name):
+                seen = set()
+                cur = _name
+                while cur not in seen:
+                    seen.add(cur)
+                    if cur in _arg_index:
+                        return _arg_index[cur]
+                    src = None
+                    for _st in _fn_node.body:
+                        if (
+                            isinstance(_st, ast.Assign)
+                            and len(_st.targets) == 1
+                            and isinstance(_st.targets[0], ast.Name)
+                            and _st.targets[0].id == cur
+                            and isinstance(_st.value, ast.Name)
+                        ):
+                            src = _st.value.id
+                            break
+                    if src is None:
+                        return None
+                    cur = src
+                return None
+
+            for _call in ast.walk(_fn_node):
+                if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
+                    continue
+                _cbp = _call.func.id
+                _spec = local_callback_actual_specs.get((_callee_name, _cbp))
+                if not _spec:
+                    continue
+                _akinds = dict(_spec.get("arg_kinds", {}))
+                for _ia, _arg_node in enumerate(_call.args):
+                    _ak = _akinds.get(_ia)
+                    if _ak not in {"int", "real", "complex", "logical", "char"}:
+                        continue
+                    if not isinstance(_arg_node, ast.Name):
+                        continue
+                    _idx = _formal_alias_index(_arg_node.id)
+                    if _idx is None:
+                        continue
+                    if _callee_name in local_func_arg_kinds and _idx < len(local_func_arg_kinds[_callee_name]):
+                        local_func_arg_kinds[_callee_name][_idx] = _ak
+
+        _actuals_by_callback_formal = {}
+        _all_call_nodes = ast.walk(ast.Module(body=list(local_funcs or []) + list(getattr(tree, "body", [])), type_ignores=[]))
+        for _n in _all_call_nodes:
+            if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)):
+                continue
+            _callee_name = _n.func.id
+            _cb_params = set(local_func_callback_params.get(_callee_name, set()))
+            if not _cb_params:
+                continue
+            _arg_names = list(local_func_arg_names.get(_callee_name, []))
+            for _j, _a in enumerate(_n.args):
+                if _j >= len(_arg_names):
+                    break
+                _cbp = _arg_names[_j]
+                if _cbp in _cb_params and isinstance(_a, ast.Name) and _a.id in fn_map:
+                    _actuals_by_callback_formal.setdefault((_callee_name, _cbp), set()).add(_a.id)
+            for _kw in getattr(_n, "keywords", []):
+                if _kw.arg in _cb_params and isinstance(_kw.value, ast.Name) and _kw.value.id in fn_map:
+                    _actuals_by_callback_formal.setdefault((_callee_name, _kw.arg), set()).add(_kw.value.id)
+        for _key, _actuals in _actuals_by_callback_formal.items():
+            if len(_actuals) < 2:
+                continue
+            _formal_sig = cb_sig.get(_key)
+            _formal_arg_kinds = _formal_sig[4] if _formal_sig is not None and len(_formal_sig) > 4 else {}
+            if dict(_formal_arg_kinds).get(0) == "int":
+                continue
+            _common_ret = None
+            _common_arg0 = None
+            for _actual_name in sorted(_actuals):
+                _rk, _rr = _ret_spec_kind_rank(_actual_name)
+                if _rk in {"int", "real", "complex", "logical", "char"}:
+                    _common_ret = _promote_kind_hint(_common_ret, _rk)
+                _akinds = list(local_func_arg_kinds.get(_actual_name, []))
+                if _akinds and _akinds[0] in {"int", "real", "complex", "logical", "char"}:
+                    _common_arg0 = _promote_kind_hint(_common_arg0, _akinds[0])
+            if _common_ret not in {"real", "complex", "logical", "char"} and _common_arg0 not in {"real", "complex", "logical", "char"}:
+                continue
+            _target_kind = _common_ret if _common_ret in {"real", "complex", "logical", "char"} else _common_arg0
+            for _actual_name in sorted(_actuals):
+                _rk, _rr = _ret_spec_kind_rank(_actual_name)
+                if _rk == "int" and _target_kind in {"real", "complex", "logical", "char"}:
+                    local_return_specs[_actual_name] = _target_kind
+                    if _rr <= 0:
+                        local_return_ranks[_actual_name] = 0
+                if (
+                    _target_kind in {"real", "complex", "logical", "char"}
+                    and _actual_name in local_func_arg_kinds
+                    and local_func_arg_kinds[_actual_name]
+                    and local_func_arg_kinds[_actual_name][0] == "int"
+                ):
+                    local_func_arg_kinds[_actual_name][0] = _target_kind
+
+        for (_callee_name, _cbp), _actuals in _actuals_by_callback_formal.items():
+            _callee_node = fn_map.get(_callee_name)
+            if _callee_node is None:
+                continue
+            _callee_args = list(local_func_arg_names.get(_callee_name, []))
+            _callee_arg_index = {nm: i for i, nm in enumerate(_callee_args)}
+            _cb_input_kind = None
+            _assigned_to_cb = set()
+            for _st in ast.walk(_callee_node):
+                if (
+                    isinstance(_st, ast.Assign)
+                    and len(_st.targets) == 1
+                    and isinstance(_st.targets[0], ast.Name)
+                ):
+                    if any(
+                        isinstance(_n, ast.Call)
+                        and isinstance(_n.func, ast.Name)
+                        and _n.func.id == _cbp
+                        for _n in ast.walk(_st.value)
+                    ):
+                        _assigned_to_cb.add(_st.targets[0].id)
+            if not _assigned_to_cb:
+                continue
+            for _call in ast.walk(_callee_node):
+                if not (
+                    isinstance(_call, ast.Call)
+                    and isinstance(_call.func, ast.Name)
+                    and _call.func.id == _cbp
+                    and _call.args
+                ):
+                    continue
+                _arg0 = _call.args[0]
+                if isinstance(_arg0, ast.Name) and _arg0.id in _callee_arg_index:
+                    _idx = _callee_arg_index[_arg0.id]
+                    _kinds = list(local_func_arg_kinds.get(_callee_name, []))
+                    if _idx < len(_kinds):
+                        _cb_input_kind = _promote_kind_hint(_cb_input_kind, _kinds[_idx])
+            if _cb_input_kind != "int":
+                continue
+            _iterative = False
+            for _call in ast.walk(_callee_node):
+                if not (
+                    isinstance(_call, ast.Call)
+                    and isinstance(_call.func, ast.Name)
+                    and _call.func.id == _cbp
+                ):
+                    continue
+                if any(isinstance(_a, ast.Name) and _a.id in _assigned_to_cb for _a in _call.args):
+                    _iterative = True
+                    break
+            if not _iterative:
+                continue
+            for _actual_name in sorted(_actuals):
+                local_return_specs[_actual_name] = "int"
+                local_return_ranks[_actual_name] = 0
+                if _actual_name in local_func_arg_kinds and local_func_arg_kinds[_actual_name]:
+                    local_func_arg_kinds[_actual_name][0] = "int"
     # Propagate argument-rank requirements across local wrapper calls, e.g.:
     #   def outer(x): return inner(x, ...)
     # so inner's dummy rank can be learned from outer's call-site rank.
@@ -37137,8 +37842,23 @@ def generate_flat(
         _fn_by_name_kind = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
 
         def _callee_arg_has_explicit_real_evidence(_fn_node, _arg_name):
+            _aliases = {_arg_name}
+            _changed_alias = True
+            while _changed_alias:
+                _changed_alias = False
+                for _st_alias in ast.walk(_fn_node):
+                    if not (
+                        isinstance(_st_alias, ast.Assign)
+                        and len(_st_alias.targets) == 1
+                        and isinstance(_st_alias.targets[0], ast.Name)
+                        and isinstance(_st_alias.value, ast.Name)
+                    ):
+                        continue
+                    if _st_alias.value.id in _aliases and _st_alias.targets[0].id not in _aliases:
+                        _aliases.add(_st_alias.targets[0].id)
+                        _changed_alias = True
             for _st in ast.walk(_fn_node):
-                if not any(isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(_st)):
+                if not any(isinstance(_x, ast.Name) and _x.id in _aliases for _x in ast.walk(_st)):
                     continue
                 if isinstance(_st, ast.Call):
                     if isinstance(_st.func, ast.Name) and _st.func.id in {"float", "complex"}:
@@ -37164,6 +37884,24 @@ def generate_flat(
                                 _txt = ast.unparse(_kw.value).lower()
                             if "float" in _txt or "complex" in _txt:
                                 return True
+            return False
+
+        def _callee_arg_has_integer_only_evidence(_fn_node, _arg_name):
+            for _st in ast.walk(_fn_node):
+                if isinstance(_st, ast.Call) and isinstance(_st.func, ast.Name):
+                    if _st.func.id in {"range", "int"} and any(
+                        isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(_st)
+                    ):
+                        return True
+                if isinstance(_st, ast.Subscript):
+                    _slice = _st.slice
+                    if isinstance(_slice, ast.Name) and _slice.id == _arg_name:
+                        return True
+                    if any(isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(_slice)):
+                        return True
+                if isinstance(_st, ast.BinOp) and isinstance(_st.op, (ast.FloorDiv, ast.Mod, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor)):
+                    if any(isinstance(_x, ast.Name) and _x.id == _arg_name for _x in ast.walk(_st)):
+                        return True
             return False
 
         for _ in range(max(1, len(local_funcs)) + 2):
@@ -37194,6 +37932,14 @@ def generate_flat(
                         if i_src >= len(caller_kinds):
                             continue
                         actual_kind = caller_kinds[i_src]
+                        if (
+                            actual_kind == "real"
+                            and callee_kinds[j] == "int"
+                            and _callee_arg_has_explicit_real_evidence(callee_fn, callee_args[j])
+                        ):
+                            callee_kinds[j] = "real"
+                            changed_k = True
+                            continue
                         if actual_kind not in {"int", "logical", "char", "complex"}:
                             continue
                         cur = callee_kinds[j]
@@ -37216,6 +37962,14 @@ def generate_flat(
                         if i_src >= len(caller_kinds):
                             continue
                         actual_kind = caller_kinds[i_src]
+                        if (
+                            actual_kind == "real"
+                            and callee_kinds[j] == "int"
+                            and _callee_arg_has_explicit_real_evidence(callee_fn, callee_args[j])
+                        ):
+                            callee_kinds[j] = "real"
+                            changed_k = True
+                            continue
                         if actual_kind not in {"int", "logical", "char", "complex"}:
                             continue
                         cur = callee_kinds[j]
@@ -37227,6 +37981,58 @@ def generate_flat(
                         changed_k = True
             if not changed_k:
                 break
+        for _fn_node in local_funcs or []:
+            if not isinstance(_fn_node, ast.FunctionDef):
+                continue
+            _callee_name = _fn_node.name
+            _arg_names = list(local_func_arg_names.get(_callee_name, []))
+            _arg_index = {nm: i for i, nm in enumerate(_arg_names)}
+
+            def _formal_alias_index_late(_name):
+                seen = set()
+                cur = _name
+                while cur not in seen:
+                    seen.add(cur)
+                    if cur in _arg_index:
+                        return _arg_index[cur]
+                    src = None
+                    for _st_alias in _fn_node.body:
+                        if (
+                            isinstance(_st_alias, ast.Assign)
+                            and len(_st_alias.targets) == 1
+                            and isinstance(_st_alias.targets[0], ast.Name)
+                            and _st_alias.targets[0].id == cur
+                            and isinstance(_st_alias.value, ast.Name)
+                        ):
+                            src = _st_alias.value.id
+                            break
+                    if src is None:
+                        return None
+                    cur = src
+                return None
+
+            for _call in ast.walk(_fn_node):
+                if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
+                    continue
+                _spec = local_callback_actual_specs.get((_callee_name, _call.func.id))
+                if not _spec:
+                    _sig = cb_sig.get((_callee_name, _call.func.id))
+                    if _sig is not None:
+                        _spec = {"arg_kinds": _sig[4] if len(_sig) > 4 else {}}
+                if not _spec:
+                    continue
+                _akinds = dict(_spec.get("arg_kinds", {}))
+                for _ia, _arg_node in enumerate(_call.args):
+                    _ak = _akinds.get(_ia)
+                    if _ak not in {"int", "real", "complex", "logical", "char"}:
+                        continue
+                    if not isinstance(_arg_node, ast.Name):
+                        continue
+                    _idx = _formal_alias_index_late(_arg_node.id)
+                    if _idx is None:
+                        continue
+                    if _callee_name in local_func_arg_kinds and _idx < len(local_func_arg_kinds[_callee_name]):
+                        local_func_arg_kinds[_callee_name][_idx] = _promote_kind_hint(local_func_arg_kinds[_callee_name][_idx], _ak)
         # Recompute local return and tuple-return metadata with propagated
         # wrapper argument ranks so chained wrappers preserve array outputs.
         local_return_specs, local_return_ranks, tuple_return_out_kinds, tuple_return_out_ranks = _local_return_maps(
@@ -37236,6 +38042,7 @@ def generate_flat(
             arg_kind_hints=local_func_arg_kinds,
         )
         _apply_c8_container_return_hints(local_return_specs)
+        _force_rng_param_kinds()
     local_func_defaults = {}
     for fn in (local_funcs or []):
         fn_args_all = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -38253,6 +39060,8 @@ def generate_flat(
             ):
                 _ranks[_i] = 0
 
+    _force_rng_param_kinds()
+
     module_text = ""
     module_global_decls = collect_module_global_decls(local_funcs)
     module_global_inits = collect_module_global_initializers(local_funcs)
@@ -38476,6 +39285,7 @@ def generate_flat(
                         module_global_decls=module_global_decls,
                         local_proc_name_aliases=fn_alias_map,
                         callback_scalar_actuals=callback_scalar_actuals,
+                        local_callback_actual_specs=local_callback_actual_specs,
                     )
             else:
                 _emit_local_function(
@@ -38514,6 +39324,7 @@ def generate_flat(
                     proc_name_override=fn_alias_map.get(fn.name, fn.name),
                     local_proc_name_aliases=fn_alias_map,
                     callback_scalar_actuals=callback_scalar_actuals,
+                    local_callback_actual_specs=local_callback_actual_specs,
                 )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
@@ -38827,6 +39638,7 @@ def generate_flat(
                 local_tuple_return_out_names=local_tuple_return_out_names,
                 module_global_decls=module_global_decls,
                 callback_scalar_actuals=callback_scalar_actuals,
+                local_callback_actual_specs=local_callback_actual_specs,
             )
 
     o.pop()
