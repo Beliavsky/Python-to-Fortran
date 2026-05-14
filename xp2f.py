@@ -13779,6 +13779,10 @@ class translator(ast.NodeVisitor):
                         if not parts:
                             return fstr("")
                         return " // ".join(parts)
+                if lk0 == "real" and rk0 in {"int", "logical"}:
+                    b = f"real({b}, kind=dp)"
+                elif rk0 == "real" and lk0 in {"int", "logical"}:
+                    a = f"real({a}, kind=dp)"
                 return f"modulo({a}, {b})"
             if op is ast.LShift:
                 return f"ishft({a}, int({b}))"
@@ -18900,6 +18904,13 @@ class translator(ast.NodeVisitor):
                     return f"(({a0}) / ({b0}))"
                 if node.func.attr in {"power", "pow", "float_power"}:
                     return f"(({a0}) ** ({b0}))"
+                if node.func.attr in {"fmod", "remainder"}:
+                    ak = self._expr_kind(node.args[0])
+                    bk = self._expr_kind(node.args[1])
+                    if ak == "real" and bk in {"int", "logical"}:
+                        b0 = f"real({b0}, kind=dp)"
+                    elif bk == "real" and ak in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
                 if node.func.attr == "fmod":
                     return f"mod({a0}, {b0})"
                 return f"modulo({a0}, {b0})"
@@ -26678,6 +26689,10 @@ class translator(ast.NodeVisitor):
             elif isinstance(node.op, ast.FloorDiv):
                 upd = f"{base} / {rhs}"
             elif isinstance(node.op, ast.Mod):
+                bk = self._expr_kind(node.target.value)
+                rk = self._expr_kind(node.value)
+                if bk == "real" and rk in {"int", "logical"}:
+                    rhs = f"real({rhs}, kind=dp)"
                 upd = f"mod({base}, {rhs})"
             else:
                 raise NotImplementedError("unsupported augassign op")
@@ -26711,6 +26726,10 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{lhs} = {lhs} / {rhs}")
             return
         if isinstance(node.op, ast.Mod):
+            lk = self._expr_kind(node.target)
+            rk = self._expr_kind(node.value)
+            if lk == "real" and rk in {"int", "logical"}:
+                rhs = f"real({rhs}, kind=dp)"
             self.o.w(f"{lhs} = mod({lhs}, {rhs})")
             return
         raise NotImplementedError("unsupported augassign op")
