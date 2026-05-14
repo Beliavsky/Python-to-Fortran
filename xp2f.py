@@ -13018,6 +13018,16 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError(
                     "mixed-type list/tuple literals are unsupported (logical mixed with non-logical)"
                 )
+            if "complex" in kinds:
+                vals = ", ".join(
+                    (
+                        self.expr(e)
+                        if self._expr_kind(e) == "complex"
+                        else f"cmplx({self.expr(e)}, kind=dp)"
+                    )
+                    for e in elts
+                )
+                return f"[complex(kind=dp) :: {vals}]"
             mixed_real_int = ("int" in kinds and "real" in kinds)
             if kinds == {"char"}:
                 if elts and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in elts):
@@ -13037,7 +13047,7 @@ class translator(ast.NodeVisitor):
                     (f"real({self.expr(e)}, kind=dp)" if self._expr_kind(e) == "int" else self.expr(e))
                     for e in elts
                 )
-                return f"[{vals}]"
+                return f"[real(kind=dp) :: {vals}]"
             vals = ", ".join(self.expr(e) for e in elts)
             return f"[{vals}]"
 
@@ -15828,19 +15838,18 @@ class translator(ast.NodeVisitor):
                     flat_nodes = []
                     for r in elts:
                         flat_nodes.extend(r.elts)
-                    force_complex = ("complex" in dtype_txt) or any(self._expr_kind(e) == "complex" for e in flat_nodes)
-                    vals = ", ".join(
-                        (
-                            self.expr(e)
-                            if not force_complex or self._expr_kind(e) == "complex"
-                            else f"cmplx({self.expr(e)}, kind=dp)"
-                        )
-                        for e in flat_nodes
-                    )
-                    if force_complex:
-                        vals = f"cmplx([{vals}], kind=dp)"
+                    if "complex" in dtype_txt:
+                        vals = "[complex(kind=dp) :: " + ", ".join(
+                            self.expr(e) if self._expr_kind(e) == "complex" else f"cmplx({self.expr(e)}, kind=dp)"
+                            for e in flat_nodes
+                        ) + "]"
+                    elif "float" in dtype_txt or "real" in dtype_txt:
+                        vals = "[real(kind=dp) :: " + ", ".join(
+                            f"real({self.expr(e)}, kind=dp)" if self._expr_kind(e) == "int" else self.expr(e)
+                            for e in flat_nodes
+                        ) + "]"
                     else:
-                        vals = f"[{vals}]"
+                        vals = _array_constructor(flat_nodes)
                     return f"transpose(reshape({vals}, [{ncol}, {nrow}]))"
                 if elts and all(self._rank_expr(e) == 1 for e in elts):
                     first = self.expr(elts[0])
@@ -15860,18 +15869,19 @@ class translator(ast.NodeVisitor):
                     if "str" in dtype_txt or "char" in dtype_txt or "unicode" in dtype_txt:
                         return "[character(len=1) ::]"
                     return "[integer ::]"
-                force_complex = ("complex" in dtype_txt) or any(self._expr_kind(e) == "complex" for e in elts)
-                vals = ", ".join(
-                    (
-                        self.expr(e)
-                        if not force_complex or self._expr_kind(e) == "complex"
-                        else f"cmplx({self.expr(e)}, kind=dp)"
+                if "complex" in dtype_txt:
+                    vals = ", ".join(
+                        self.expr(e) if self._expr_kind(e) == "complex" else f"cmplx({self.expr(e)}, kind=dp)"
+                        for e in elts
                     )
-                    for e in elts
-                )
-                if force_complex:
-                    return f"cmplx([{vals}], kind=dp)"
-                return f"[{vals}]"
+                    return f"[complex(kind=dp) :: {vals}]"
+                if "float" in dtype_txt or "real" in dtype_txt:
+                    vals = ", ".join(
+                        f"real({self.expr(e)}, kind=dp)" if self._expr_kind(e) == "int" else self.expr(e)
+                        for e in elts
+                    )
+                    return f"[real(kind=dp) :: {vals}]"
+                return _array_constructor(elts)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -21084,8 +21094,8 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_int(t.id, rank=rank_hint)
                     else:
                         flat_elts = self._literal_flatten_nodes(v.args[0])
-                        has_complex = any(isinstance(e, ast.Constant) and isinstance(e.value, complex) for e in flat_elts)
-                        has_float = any(isinstance(e, ast.Constant) and isinstance(e.value, float) for e in flat_elts)
+                        has_complex = any(self._expr_kind(e) == "complex" for e in flat_elts)
+                        has_float = any(self._expr_kind(e) == "real" for e in flat_elts)
                         has_bool = any(is_bool_const(e) for e in flat_elts)
                         if has_complex:
                             self._mark_alloc_complex(t.id, rank=rank_hint)
@@ -22538,7 +22548,18 @@ class translator(ast.NodeVisitor):
                 k_rhs0 = self._expr_kind(v)
                 r_rhs0 = max(0, int(self._rank_expr(v)))
                 if (
-                    k_vis0 is not None
+                    k_vis0 == "logical"
+                    and int(_r_vis0) == 0
+                    and k_rhs0 == "int"
+                    and r_rhs0 == 0
+                    and isinstance(v, ast.Constant)
+                    and isinstance(v.value, int)
+                    and int(v.value) in {0, 1}
+                ):
+                    rk = None
+                if (
+                    rk is not None
+                    and k_vis0 is not None
                     and k_rhs0 is not None
                     and k_vis0 == k_rhs0
                     and int(_r_vis0) == int(r_rhs0)
@@ -22587,7 +22608,16 @@ class translator(ast.NodeVisitor):
                         and (not _stack_array_assign)
                         and (not _expr_uses_name(v, t.id))
                     ):
-                        self._open_type_rebind_block(t.id, k_rhs, r_rhs)
+                        if not (
+                            k_vis == "logical"
+                            and int(r_vis) == 0
+                            and k_rhs == "int"
+                            and r_rhs == 0
+                            and isinstance(v, ast.Constant)
+                            and isinstance(v.value, int)
+                            and int(v.value) in {0, 1}
+                        ):
+                            self._open_type_rebind_block(t.id, k_rhs, r_rhs)
         if isinstance(t, ast.Name):
             # Python list aliasing semantics: x = v binds to same list object.
             if isinstance(v, ast.Name) and self._is_python_list_expr(v):
@@ -23158,7 +23188,7 @@ class translator(ast.NodeVisitor):
                     (rk is None or target_aliases_input)
                     and k_vis0 is not None
                     and r_vis0 is not None
-                    and not matched_overload_profile
+                    and (target_aliases_input or not matched_overload_profile)
                 ):
                     # Prefer the already-visible target declaration when there
                     # is no explicit rebind event on this line. Tuple-return
@@ -23223,6 +23253,13 @@ class translator(ast.NodeVisitor):
                     and _have_k == "int"
                 ):
                     return f"real({_txt}, kind=dp)"
+                if (
+                    _want_k == "logical"
+                    and _want_r == 0
+                    and _have_r == 0
+                    and _have_k == "int"
+                ):
+                    return f"({_txt} /= 0)"
                 return _txt
             vec_rank = 0
             vec_idx = -1
@@ -25855,6 +25892,20 @@ class translator(ast.NodeVisitor):
                     mlen = max(len(e.value) for e in nodes)
                     vals0 = ", ".join(self.expr(e) for e in nodes)
                     return f"[character(len={mlen}) :: {vals0}]"
+                kinds0 = {self._expr_kind(e) for e in nodes}
+                kinds0.discard(None)
+                if "complex" in dtype_txt or "complex" in kinds0:
+                    vals0 = ", ".join(
+                        self.expr(e) if self._expr_kind(e) == "complex" else f"cmplx({self.expr(e)}, kind=dp)"
+                        for e in nodes
+                    )
+                    return f"[complex(kind=dp) :: {vals0}]"
+                if "float" in dtype_txt or "real" in dtype_txt or ("int" in kinds0 and "real" in kinds0):
+                    vals0 = ", ".join(
+                        f"real({self.expr(e)}, kind=dp)" if self._expr_kind(e) == "int" else self.expr(e)
+                        for e in nodes
+                    )
+                    return f"[real(kind=dp) :: {vals0}]"
                 vals0 = ", ".join(self.expr(e) for e in nodes)
                 return f"[{vals0}]"
             self.o.w(f"if (allocated({name})) deallocate({name})")
@@ -26544,6 +26595,15 @@ class translator(ast.NodeVisitor):
                         return
                     raise NotImplementedError("dict comprehension values currently support np.empty/zeros/ones with explicit tuple shape")
             rhs_txt = self.expr(v)
+            k_lhs_final, r_lhs_final = self._visible_kind_rank(t.id)
+            if (
+                k_lhs_final == "logical"
+                and int(r_lhs_final or 0) == 0
+                and isinstance(v, ast.Constant)
+                and isinstance(v.value, int)
+                and int(v.value) in {0, 1}
+            ):
+                rhs_txt = ".true." if int(v.value) == 1 else ".false."
             tgt_rank = max(
                 int(self.alloc_real_rank.get(lname, 0)),
                 int(self.alloc_int_rank.get(lname, 0)),
@@ -28501,6 +28561,12 @@ class translator(ast.NodeVisitor):
                     or name in self.alloc_complexes
                 )
             )
+            val_ctor = val
+            val_kind = self._expr_kind(c.args[0])
+            if name in self.alloc_reals and val_kind == "int":
+                val_ctor = f"real({val}, kind=dp)"
+            elif name in self.alloc_complexes and val_kind != "complex":
+                val_ctor = f"cmplx({val}, kind=dp)"
             if arg_rank > 0 and (name in self.python_list_vars):
                 k_arg = self._expr_kind(c.args[0])
                 if k_arg == "char" and name not in self.alloc_chars:
@@ -28587,7 +28653,7 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{cnt} = {cnt} + 1")
                 if name_is_alloc:
                     self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
-                    self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {val}]")
+                    self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {val_ctor}]")
                 self.o.w(f"{name}({cnt}) = {val}")
                 return
             # Fallback for list-like allocatable rank-1 arrays that are not using
@@ -28604,7 +28670,7 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("append without count mapping")
             self.o.w(f"if (allocated({name})) then")
             self.o.push()
-            self.o.w(f"{name} = [{name}, {val}]")
+            self.o.w(f"{name} = [{name}, {val_ctor}]")
             self.o.pop()
             self.o.w("else")
             self.o.push()
@@ -37645,6 +37711,23 @@ def generate_flat(
         local_func_arg_kinds[fn.name][0] = None
     # Generic overloads for tuple-return and multi-argument local procedures
     # when exactly one dummy varies by observed kind/rank across call sites.
+    def _fn_arg_used_in_logical_ops(fn_node, arg_name):
+        def _direct_truth_mentions(node):
+            if isinstance(node, ast.Name):
+                return node.id == arg_name
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                return _direct_truth_mentions(node.operand)
+            if isinstance(node, ast.BoolOp):
+                return any(_direct_truth_mentions(_v) for _v in node.values)
+            return False
+
+        for _n in ast.walk(fn_node):
+            if isinstance(_n, ast.BoolOp) and _direct_truth_mentions(_n):
+                return True
+            if isinstance(_n, ast.UnaryOp) and isinstance(_n.op, ast.Not) and _direct_truth_mentions(_n):
+                return True
+        return False
+
     for fn in (local_funcs or []):
         if fn.name in local_overload_specs:
             continue
@@ -37664,6 +37747,13 @@ def generate_flat(
             prs |= set(obs_pair_lists[i])
             trs |= set(obs_triad_lists[i])
             prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
+            try:
+                inferred_arg_kind = _infer_arg_kind_in_fn(fn, arg_nm)
+            except Exception:
+                inferred_arg_kind = None
+            if inferred_arg_kind == "logical" or _fn_arg_used_in_logical_ops(fn, arg_nm):
+                prs = {("logical", r) if k == "int" and int(r) == 0 else (k, r) for (k, r) in prs}
+                trs = {("logical", r, is_list) if k == "int" and int(r) == 0 else (k, r, is_list) for (k, r, is_list) in trs}
             if _char_scalar_arg_pattern(fn, arg_nm):
                 prs = {("char", 0)}
                 trs = {("char", 0, False)}
