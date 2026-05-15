@@ -22602,6 +22602,18 @@ class translator(ast.NodeVisitor):
                     rk = None
                 if (
                     rk is not None
+                    and k_vis0 == "int"
+                    and k_rhs0 == "real"
+                    and int(_r_vis0) == int(r_rhs0)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"np", "numpy"}
+                    and v.func.attr == "zeros"
+                ):
+                    rk = None
+                if (
+                    rk is not None
                     and k_vis0 is not None
                     and k_rhs0 is not None
                     and k_vis0 == k_rhs0
@@ -22660,7 +22672,17 @@ class translator(ast.NodeVisitor):
                             and isinstance(v.value, int)
                             and int(v.value) in {0, 1}
                         ):
-                            self._open_type_rebind_block(t.id, k_rhs, r_rhs)
+                            if not (
+                                k_vis == "int"
+                                and k_rhs == "real"
+                                and int(r_vis) == int(r_rhs)
+                                and isinstance(v, ast.Call)
+                                and isinstance(v.func, ast.Attribute)
+                                and isinstance(v.func.value, ast.Name)
+                                and v.func.value.id in {"np", "numpy"}
+                                and v.func.attr == "zeros"
+                            ):
+                                self._open_type_rebind_block(t.id, k_rhs, r_rhs)
         if isinstance(t, ast.Name):
             # Python list aliasing semantics: x = v binds to same list object.
             if isinstance(v, ast.Name) and self._is_python_list_expr(v):
@@ -23212,6 +23234,13 @@ class translator(ast.NodeVisitor):
                         # assignment line.
                         raw_want_kind = tuple_hint_kind
                         want_kind = raw_want_kind
+                    if out_name_pos < len(out_ranks_hint):
+                        try:
+                            tuple_hint_rank = int(out_ranks_hint[out_name_pos])
+                        except Exception:
+                            tuple_hint_rank = 0
+                        if tuple_hint_rank > 0:
+                            want_rank = max(int(want_rank or 0), tuple_hint_rank)
                 if want_kind == "alloc_real":
                     want_kind = "real"
                     want_rank = max(1, int(want_rank)) if want_rank is not None else (
@@ -29207,11 +29236,11 @@ class translator(ast.NodeVisitor):
                     arg_rank = self._rank_expr(arg_node)
                     if desc.lower().startswith("a") and arg_rank == 0 and arg_kind == "logical":
                         expr_txt = f"trim(merge('True ', 'False', {expr_txt}))"
-                    if desc.lower().startswith("i") and arg_rank == 0:
-                        if arg_kind == "real":
-                            expr_txt = f"int({expr_txt})"
-                        elif arg_kind == "logical":
+                    if desc.lower().startswith("i"):
+                        if arg_kind == "logical" and arg_rank == 0:
                             expr_txt = f"merge(1, 0, {expr_txt})"
+                        elif not re.match(r"^\s*int\s*\(", expr_txt, re.IGNORECASE):
+                            expr_txt = f"int({expr_txt})"
                     if len(ent) >= 4 and bool(ent[3]):
                         expr_txt = f"real({expr_txt}, kind=dp)"
                     write_args.append(expr_txt)
@@ -29990,6 +30019,40 @@ def _emit_local_function(
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
     args = [a.arg for a in arg_nodes]
     arg_emit_map = {a: (f"{a}_v" if a in {"dp", "eye"} else a) for a in args}
+    def _comment_arg_spec_hint_for_emit(_fn, _nm):
+        start = max(1, int(getattr(_fn, "lineno", 1)))
+        end = int(getattr(_fn, "end_lineno", start))
+        for _ln in range(start, end + 1):
+            for _comment in (comment_map or {}).get(_ln, []):
+                m = re.match(
+                    r"^\s*(integer|int|real|float|logical|bool|complex|character|string|str)\s+(.+)$",
+                    _comment,
+                    re.IGNORECASE,
+                )
+                if not m:
+                    continue
+                k = m.group(1).lower()
+                rest = m.group(2).split(":", 1)[0]
+                if k in {"integer", "int"}:
+                    kind = "int"
+                elif k in {"real", "float"}:
+                    kind = "real"
+                elif k in {"logical", "bool"}:
+                    kind = "logical"
+                elif k == "complex":
+                    kind = "complex"
+                elif k in {"character", "string", "str"}:
+                    kind = "char"
+                else:
+                    continue
+                for part in rest.split(","):
+                    token = part.strip()
+                    if not token:
+                        continue
+                    mtok = re.match(r"^" + re.escape(_nm) + r"(\s*\(|\s|$)", token, re.IGNORECASE)
+                    if mtok:
+                        return kind, (1 if "(" in mtok.group(1) else 0)
+        return None, None
     def _char_scalar_arg_pattern_local(arg_name):
         saw_len = False
         saw_subscript_char_call = False
@@ -33474,6 +33537,7 @@ def _emit_local_function(
         hint_kind = None
         decl_kind = None
         idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
+        comment_arg_kind, comment_arg_rank = _comment_arg_spec_hint_for_emit(fn, arg)
         forced_arg_kind = force_arg_kinds is not None and arg in force_arg_kinds
         if force_arg_kinds is not None and arg in force_arg_kinds:
             hint_kind = force_arg_kinds[arg]
@@ -33495,10 +33559,16 @@ def _emit_local_function(
             if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
                 if hint_kind is None:
                     hint_kind = local_func_arg_kinds[fn.name][idx]
+        if comment_arg_kind in {"int", "real", "logical", "char", "complex"}:
+            hint_kind = comment_arg_kind
         inferred_hint_kind = hint_kind
         _self_norm_kind = _arg_self_normalized_kind(arg)
         _self_norm_rank = _arg_self_normalized_rank(arg)
-        if _self_norm_kind is not None and (inferred_hint_kind is None or forced_arg_kind):
+        if (
+            _self_norm_kind is not None
+            and comment_arg_kind is None
+            and (inferred_hint_kind is None or forced_arg_kind)
+        ):
             hint_kind = _self_norm_kind
         if hint_kind is None and arg in defaults_map and (not is_none(defaults_map[arg])):
             _dk = tr._expr_kind(defaults_map[arg])
@@ -33552,6 +33622,8 @@ def _emit_local_function(
             arr_rank = int(force_arg_ranks[arg])
         elif _self_norm_rank == 1:
             arr_rank = 1
+        if comment_arg_rank is not None:
+            arr_rank = max(arr_rank, int(comment_arg_rank))
         if (hint_kind == "char" or arg in tr.char_scalar_names) and _char_scalar_arg_pattern_local(arg):
             arr_rank = 0
         if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_real_rank:
@@ -33603,7 +33675,11 @@ def _emit_local_function(
                 arg_kind = "logical"
             elif ann_is_int or hint_kind == "int":
                 arg_kind = "integer"
-            elif hint_kind == "complex" or ((not forced_arg_kind) and (arg in tr.complexes or _arg_complex_context(arg))):
+            elif hint_kind == "complex" or (
+                hint_kind not in {"real", "int", "logical", "char"}
+                and (not forced_arg_kind)
+                and (arg in tr.complexes or _arg_complex_context(arg))
+            ):
                 arg_kind = "complex(kind=dp)"
             elif ann_is_float or hint_kind == "real" or arg in tr.reals or _arg_real_context(arg):
                 arg_kind = "real(kind=dp)"
@@ -33634,7 +33710,7 @@ def _emit_local_function(
             else:
                 arg_decl = f"logical, intent({intent_txt}) :: {arg_emit}"
             decl_kind = "logical"
-        elif arg in tr.alloc_complexes:
+        elif arg in tr.alloc_complexes and hint_kind not in {"real", "int", "logical", "char"}:
             if arr_rank > 0:
                 dims = ",".join(":" for _ in range(arr_rank))
                 if is_count_mapped_output_array or is_alloc_rebind_output_array:
@@ -33663,7 +33739,11 @@ def _emit_local_function(
                 arg_kind = "logical"
             elif hint_kind == "int" or ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
                 arg_kind = "integer"
-            elif hint_kind == "complex" or ((not forced_arg_kind) and (arg in tr.alloc_complexes or _arg_complex_context(arg))):
+            elif hint_kind == "complex" or (
+                hint_kind not in {"real", "int", "logical", "char"}
+                and (not forced_arg_kind)
+                and (arg in tr.alloc_complexes or _arg_complex_context(arg))
+            ):
                 arg_kind = "complex(kind=dp)"
             elif (
                 (hint_kind == "real" or ann_is_float or arg in tr.reals or arg in tr.alloc_reals)
@@ -33700,7 +33780,11 @@ def _emit_local_function(
                 arg_kind = "logical"
             elif hint_kind == "int" or ann_is_int or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, int)):
                 arg_kind = "integer"
-            elif hint_kind == "complex" or ((not forced_arg_kind) and (arg in tr.complexes or _arg_complex_context(arg))):
+            elif hint_kind == "complex" or (
+                hint_kind not in {"real", "int", "logical", "char"}
+                and (not forced_arg_kind)
+                and (arg in tr.complexes or _arg_complex_context(arg))
+            ):
                 arg_kind = "complex(kind=dp)"
             elif (
                 (hint_kind == "real" or ann_is_float or arg in tr.reals)
@@ -33928,6 +34012,8 @@ def _emit_local_function(
             kind_hint = None
             rank_hint = 0
             forced_tuple_rank = None
+            comment_kind_hint = None
+            comment_rank_hint = None
             if tuple_return_out_kinds is not None:
                 kh = tuple_return_out_kinds.get(fn.name, [])
                 if idx_out < len(kh):
@@ -33938,6 +34024,12 @@ def _emit_local_function(
                     rank_hint = max(0, int(rh[idx_out]))
             if idx_out < len(tuple_ret_src_names):
                 _src0 = tuple_ret_src_names[idx_out]
+                if isinstance(_src0, str):
+                    comment_kind_hint, comment_rank_hint = _comment_arg_spec_hint_for_emit(fn, _src0)
+                    if comment_kind_hint in {"int", "real", "logical", "char", "complex"}:
+                        kind_hint = comment_kind_hint
+                        if comment_rank_hint is not None:
+                            rank_hint = max(rank_hint, int(comment_rank_hint))
                 if isinstance(_src0, str) and _src0 in arg_meta:
                     _decl0, _rank0, _intent0 = arg_meta.get(_src0, (None, 0, None))
                     _src_norm_kind = _arg_self_normalized_kind(_src0)
@@ -33966,64 +34058,65 @@ def _emit_local_function(
                         elif "integer" in _decl0s:
                             kind_hint = "alloc_int" if int(_rank0) > 0 else "int"
                 elif isinstance(_src0, str):
-                    _best_kind0 = None
-                    _best_rank0 = 0
-                    for _st0 in ast.walk(fn):
-                        if not (
-                            isinstance(_st0, ast.Assign)
-                            and len(_st0.targets) == 1
-                            and isinstance(_st0.targets[0], ast.Name)
-                            and _st0.targets[0].id == _src0
-                        ):
-                            continue
-                        try:
-                            _dr0 = int(tr._rank_expr(_st0.value))
-                        except Exception:
-                            _dr0 = 0
-                        try:
-                            _dk0 = tr._expr_kind(_st0.value)
-                        except Exception:
-                            _dk0 = None
-                        if _dk0 in {None, "int"}:
-                            if isinstance(_st0.value, ast.BinOp) and isinstance(_st0.value.op, ast.Div):
-                                _dk0 = "real"
-                            elif (
-                                isinstance(_st0.value, ast.Call)
-                                and (
-                                    (isinstance(_st0.value.func, ast.Name) and _st0.value.func.id in {"float", "real"})
-                                    or (
-                                        isinstance(_st0.value.func, ast.Attribute)
-                                        and isinstance(_st0.value.func.value, ast.Name)
-                                        and _st0.value.func.value.id in {"np", "numpy"}
-                                        and _st0.value.func.attr in {"float64", "float32"}
-                                    )
-                                )
+                    if kind_hint not in {"int", "logical", "char", "complex"}:
+                        _best_kind0 = None
+                        _best_rank0 = 0
+                        for _st0 in ast.walk(fn):
+                            if not (
+                                isinstance(_st0, ast.Assign)
+                                and len(_st0.targets) == 1
+                                and isinstance(_st0.targets[0], ast.Name)
+                                and _st0.targets[0].id == _src0
                             ):
-                                _dk0 = "real"
-                        if _dk0 not in {"real", "complex", "logical", "char", "int"}:
-                            continue
-                        if _dr0 > _best_rank0:
-                            _best_rank0 = _dr0
-                            _best_kind0 = _dk0
-                        elif _dr0 == _best_rank0:
-                            if "complex" in {_best_kind0, _dk0}:
-                                _best_kind0 = "complex"
-                            elif "real" in {_best_kind0, _dk0} and "logical" not in {_best_kind0, _dk0}:
-                                _best_kind0 = "real"
-                            elif _best_kind0 is None:
+                                continue
+                            try:
+                                _dr0 = int(tr._rank_expr(_st0.value))
+                            except Exception:
+                                _dr0 = 0
+                            try:
+                                _dk0 = tr._expr_kind(_st0.value)
+                            except Exception:
+                                _dk0 = None
+                            if _dk0 in {None, "int"}:
+                                if isinstance(_st0.value, ast.BinOp) and isinstance(_st0.value.op, ast.Div):
+                                    _dk0 = "real"
+                                elif (
+                                    isinstance(_st0.value, ast.Call)
+                                    and (
+                                        (isinstance(_st0.value.func, ast.Name) and _st0.value.func.id in {"float", "real"})
+                                        or (
+                                            isinstance(_st0.value.func, ast.Attribute)
+                                            and isinstance(_st0.value.func.value, ast.Name)
+                                            and _st0.value.func.value.id in {"np", "numpy"}
+                                            and _st0.value.func.attr in {"float64", "float32"}
+                                        )
+                                    )
+                                ):
+                                    _dk0 = "real"
+                            if _dk0 not in {"real", "complex", "logical", "char", "int"}:
+                                continue
+                            if _dr0 > _best_rank0:
+                                _best_rank0 = _dr0
                                 _best_kind0 = _dk0
-                    _dk0, _dr0 = _best_kind0, _best_rank0
-                    if _dk0 in {"real", "complex", "logical", "char", "int"} and int(_dr0) == 0:
-                        if _dk0 == "real":
-                            kind_hint = "real"
-                        elif _dk0 == "complex":
-                            kind_hint = "complex"
-                        elif _dk0 == "logical":
-                            kind_hint = "logical"
-                        elif _dk0 == "char":
-                            kind_hint = "char"
-                        elif _dk0 == "int":
-                            kind_hint = "int"
+                            elif _dr0 == _best_rank0:
+                                if "complex" in {_best_kind0, _dk0}:
+                                    _best_kind0 = "complex"
+                                elif "real" in {_best_kind0, _dk0} and "logical" not in {_best_kind0, _dk0}:
+                                    _best_kind0 = "real"
+                                elif _best_kind0 is None:
+                                    _best_kind0 = _dk0
+                        _dk0, _dr0 = _best_kind0, _best_rank0
+                        if _dk0 in {"real", "complex", "logical", "char", "int"} and int(_dr0) == 0:
+                            if _dk0 == "real":
+                                kind_hint = "real"
+                            elif _dk0 == "complex":
+                                kind_hint = "complex"
+                            elif _dk0 == "logical":
+                                kind_hint = "logical"
+                            elif _dk0 == "char":
+                                kind_hint = "char"
+                            elif _dk0 == "int":
+                                kind_hint = "int"
             if (
                 force_arg_ranks is not None
                 and local_overload_dispatch is not None
@@ -34093,7 +34186,18 @@ def _emit_local_function(
                         kind_hint = "alloc_complex" if src_rank > 0 else "complex"
                     elif kind_hint in {"char", "alloc_char"} or src_nm in tr.alloc_chars or src_nm in tr.chars:
                         kind_hint = "alloc_char" if src_rank > 0 else "char"
-                    elif kind_hint in {"real", "alloc_real"} or src_nm in tr.alloc_reals or src_nm in tr.reals or (src_nm in arg_meta and "real" in str(arg_meta.get(src_nm, ("",0,""))[0]).lower()):
+                    elif (
+                        kind_hint not in {"int", "alloc_int", "logical", "alloc_log", "char", "alloc_char", "complex", "alloc_complex"}
+                        and (
+                            kind_hint in {"real", "alloc_real"}
+                            or src_nm in tr.alloc_reals
+                            or src_nm in tr.reals
+                            or (
+                                src_nm in arg_meta
+                                and "real" in str(arg_meta.get(src_nm, ("", 0, ""))[0]).lower()
+                            )
+                        )
+                    ):
                         kind_hint = "alloc_real" if src_rank > 0 else "real"
             if (
                 forced_tuple_rank is None
@@ -34291,6 +34395,10 @@ def _emit_local_function(
                     rank_hint = _body_rank
                 if _body_kind is not None and kind_hint in {None, "real", "int", "logical", "complex", "char"}:
                     kind_hint = _body_kind
+            if comment_kind_hint in {"int", "real", "logical", "char", "complex"}:
+                kind_hint = comment_kind_hint
+                if comment_rank_hint is not None:
+                    rank_hint = max(rank_hint, int(comment_rank_hint))
             if kind_hint in {"int", "alloc_int"}:
                 for _st in fn.body:
                     for _n in ast.walk(_st):
@@ -36061,32 +36169,43 @@ def generate_flat(
 
     _infer_arg_kind_tr_cache = {}
     _infer_arg_kind_result_cache = {}
-    def _comment_arg_kind_hint_for_fn(fn, nm):
+    def _comment_arg_spec_hint_for_fn(fn, nm):
         start = max(1, int(getattr(fn, "lineno", 1)))
         end = int(getattr(fn, "end_lineno", start))
-        pat = re.compile(
-            r"^\s*#\s*(integer|int|real|float|logical|bool|complex|character|string|str)\s+"
-            + re.escape(nm)
-            + r"(\s*(?:\(|:|,|\s|$))",
-            re.IGNORECASE,
-        )
         for _ln in range(start, end + 1):
             for _comment in (comment_map or {}).get(_ln, []):
-                m = pat.search("# " + _comment)
+                m = re.match(
+                    r"^\s*(integer|int|real|float|logical|bool|complex|character|string|str)\s+(.+)$",
+                    _comment,
+                    re.IGNORECASE,
+                )
                 if not m:
                     continue
                 k = m.group(1).lower()
+                rest = m.group(2).split(":", 1)[0]
                 if k in {"integer", "int"}:
-                    return "int"
-                if k in {"real", "float"}:
-                    return "real"
-                if k in {"logical", "bool"}:
-                    return "logical"
-                if k == "complex":
-                    return "complex"
-                if k in {"character", "string", "str"}:
-                    return "char"
-        return None
+                    kind = "int"
+                elif k in {"real", "float"}:
+                    kind = "real"
+                elif k in {"logical", "bool"}:
+                    kind = "logical"
+                elif k == "complex":
+                    kind = "complex"
+                elif k in {"character", "string", "str"}:
+                    kind = "char"
+                else:
+                    continue
+                for part in rest.split(","):
+                    token = part.strip()
+                    if not token:
+                        continue
+                    mtok = re.match(r"^" + re.escape(nm) + r"(\s*\(|\s|$)", token, re.IGNORECASE)
+                    if mtok:
+                        return kind, (1 if "(" in mtok.group(1) else 0)
+        return None, None
+
+    def _comment_arg_kind_hint_for_fn(fn, nm):
+        return _comment_arg_spec_hint_for_fn(fn, nm)[0]
 
     def _infer_arg_kind_in_fn(fn, nm):
         cache_key = (id(fn), nm)
@@ -38504,11 +38623,11 @@ def generate_flat(
         for _i, _nm in enumerate(src_names):
             if not isinstance(_nm, str):
                 continue
-            _ck = _comment_arg_kind_hint_for_fn(fn, _nm)
+            _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _nm)
             if _ck in {"int", "real", "logical", "char", "complex"}:
                 base_kinds[_i] = _ck
-                if _ck in {"int", "real", "logical", "char", "complex"} and int(base_ranks[_i]) < 0:
-                    base_ranks[_i] = 0
+                if _cr is not None:
+                    base_ranks[_i] = max(int(base_ranks[_i]), int(_cr))
                 refined_any = True
                 continue
             if _nm in _arg_kind_by_name:
@@ -38860,6 +38979,15 @@ def generate_flat(
         triads = set(call_kind_rank_islist.get(fn.name, [set()])[0]) | set(obs_triad_lists[0])
         pairs = set(pairs) | set(obs_pair_lists[0])
         pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
+        _comment_kind0, _comment_rank0 = _comment_arg_spec_hint_for_fn(fn, arg0)
+        if _comment_kind0 in {"int", "real", "logical", "char", "complex"}:
+            _want_comment_rank0 = int(_comment_rank0 or 0)
+            pairs = {(_comment_kind0, r) for (_k, r) in pairs if _comment_rank0 is None or int(r) == _want_comment_rank0}
+            triads = {
+                (_comment_kind0, r, is_list)
+                for (_k, r, is_list) in triads
+                if _comment_rank0 is None or int(r) == _want_comment_rank0
+            }
         if _char_scalar_arg_pattern(fn, arg0):
             pairs = {("char", 0)}
             triads = {("char", 0, False)}
@@ -38963,6 +39091,19 @@ def generate_flat(
             prs |= set(obs_pair_lists[i])
             trs |= set(obs_triad_lists[i])
             prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
+            _comment_kind_i, _comment_rank_i = _comment_arg_spec_hint_for_fn(fn, arg_nm)
+            if _comment_kind_i in {"int", "real", "logical", "char", "complex"}:
+                _want_comment_rank_i = int(_comment_rank_i or 0)
+                prs = {
+                    (_comment_kind_i, r)
+                    for (_k, r) in prs
+                    if _comment_rank_i is None or int(r) == _want_comment_rank_i
+                }
+                trs = {
+                    (_comment_kind_i, r, is_list)
+                    for (_k, r, is_list) in trs
+                    if _comment_rank_i is None or int(r) == _want_comment_rank_i
+                }
             try:
                 inferred_arg_kind = _infer_arg_kind_in_fn(fn, arg_nm)
             except Exception:
@@ -39192,11 +39333,7 @@ def generate_flat(
         _comment_kinds = comment_func_arg_kinds.get(_fn_name, [])
         for _i, _bk in enumerate(_base_kinds):
             _ck = _comment_kinds[_i] if _i < len(_comment_kinds) else None
-            if (
-                _ck in {"int", "logical", "char", "complex"}
-                and _i < len(_curr_kinds)
-                and _curr_kinds[_i] in {None, "real"}
-            ):
+            if _ck in {"int", "real", "logical", "char", "complex"} and _i < len(_curr_kinds):
                 _curr_kinds[_i] = _ck
                 continue
             if (
@@ -39615,6 +39752,28 @@ def generate_flat(
                                 arg_rank_hints={fn.name: _rank_hints},
                                 arg_kind_hints={fn.name: _kind_hints},
                             )
+                            if fn.name in tuple_return_funcs:
+                                _ret_src_names = list(local_tuple_return_src_names.get(fn.name, []))
+                                if _ret_src_names:
+                                    _ok_comment = list(_to_k.get(fn.name, tuple_return_out_kinds.get(fn.name, [])))
+                                    _or_comment = list(_to_r.get(fn.name, tuple_return_out_ranks.get(fn.name, [])))
+                                    if len(_ok_comment) < len(_ret_src_names):
+                                        _ok_comment.extend([None] * (len(_ret_src_names) - len(_ok_comment)))
+                                    if len(_or_comment) < len(_ret_src_names):
+                                        _or_comment.extend([0] * (len(_ret_src_names) - len(_or_comment)))
+                                    _changed_comment = False
+                                    for _j_comment, _src_comment in enumerate(_ret_src_names):
+                                        if not isinstance(_src_comment, str):
+                                            continue
+                                        _ck_comment, _cr_comment = _comment_arg_spec_hint_for_fn(fn, _src_comment)
+                                        if _ck_comment in {"int", "real", "logical", "char", "complex"}:
+                                            _ok_comment[_j_comment] = _ck_comment
+                                            if _cr_comment is not None:
+                                                _or_comment[_j_comment] = max(int(_or_comment[_j_comment]), int(_cr_comment))
+                                            _changed_comment = True
+                                    if _changed_comment:
+                                        _to_k[fn.name] = _ok_comment
+                                        _to_r[fn.name] = _or_comment
                             if (
                                 isinstance(next((r for r in ast.walk(fn) if isinstance(r, ast.Return) and isinstance(getattr(r, "value", None), ast.Tuple)), None), ast.Return)
                                 and any(int(_rr) == 0 for _rr in forced_ranks.values())
