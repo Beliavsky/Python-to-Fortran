@@ -30049,9 +30049,9 @@ def _emit_local_function(
                     token = part.strip()
                     if not token:
                         continue
-                    mtok = re.match(r"^" + re.escape(_nm) + r"(\s*\(|\s|$)", token, re.IGNORECASE)
+                    mtok = re.match(r"^" + re.escape(_nm) + r"(\s*[\(\[]|$)", token, re.IGNORECASE)
                     if mtok:
-                        return kind, (1 if "(" in mtok.group(1) else 0)
+                        return kind, (1 if ("(" in mtok.group(1) or "[" in mtok.group(1)) else 0)
         return None, None
     def _char_scalar_arg_pattern_local(arg_name):
         saw_len = False
@@ -33622,7 +33622,11 @@ def _emit_local_function(
             arr_rank = int(force_arg_ranks[arg])
         elif _self_norm_rank == 1:
             arr_rank = 1
-        if comment_arg_rank is not None:
+        if (
+            comment_arg_rank is not None
+            and not is_elemental_fn
+            and fn.name not in set(force_non_elemental_funcs or set())
+        ):
             arr_rank = max(arr_rank, int(comment_arg_rank))
         if (hint_kind == "char" or arg in tr.char_scalar_names) and _char_scalar_arg_pattern_local(arg):
             arr_rank = 0
@@ -33647,6 +33651,91 @@ def _emit_local_function(
                     continue
                 if _n.args and isinstance(_n.args[0], ast.Name) and (_n.args[0].id == arg):
                     arr_rank = max(arr_rank, int(callback_specs[_n.func.id].get("in_rank", 0)))
+        _single_scalar_return_func = (
+            any(isinstance(_ret, ast.Return) and getattr(_ret, "value", None) is not None for _ret in ast.walk(fn))
+            and not any(
+                isinstance(_ret, ast.Return)
+                and isinstance(getattr(_ret, "value", None), (ast.Tuple, ast.List))
+                for _ret in ast.walk(fn)
+            )
+            and int((local_return_ranks or {}).get(fn.name, 0) or 0) <= 0
+        )
+        if (
+            comment_arg_rank is not None
+            and arr_rank > 0
+            and (fn.name in set(force_non_elemental_funcs or set()) or _single_scalar_return_func)
+        ):
+            def _arg_has_array_evidence(_arg_name):
+                for _node in ast.walk(fn):
+                    if (
+                        isinstance(_node, ast.Subscript)
+                        and isinstance(_node.value, ast.Name)
+                        and _node.value.id == _arg_name
+                    ):
+                        return True
+                    if (
+                        isinstance(_node, ast.Attribute)
+                        and isinstance(_node.value, ast.Name)
+                        and _node.value.id == _arg_name
+                        and _node.attr in {"shape", "size", "ndim"}
+                    ):
+                        return True
+                    if isinstance(_node, ast.Call):
+                        if isinstance(_node.func, ast.Name):
+                            _callee_args = list((local_func_arg_names or {}).get(_node.func.id, []))
+                            _callee_ranks = list((local_func_arg_ranks or {}).get(_node.func.id, []))
+                            for _ia, _actual in enumerate(getattr(_node, "args", [])):
+                                if (
+                                    isinstance(_actual, ast.Name)
+                                    and _actual.id == _arg_name
+                                    and _ia < len(_callee_args)
+                                    and _ia < len(_callee_ranks)
+                                    and int(_callee_ranks[_ia]) > 0
+                                ):
+                                    return True
+                        if (
+                            isinstance(_node.func, ast.Name)
+                            and _node.func.id in {"len", "enumerate"}
+                            and _node.args
+                            and isinstance(_node.args[0], ast.Name)
+                            and _node.args[0].id == _arg_name
+                        ):
+                            return True
+                        if (
+                            isinstance(_node.func, ast.Attribute)
+                            and isinstance(_node.func.value, ast.Name)
+                            and _node.func.value.id == _arg_name
+                        ):
+                            return True
+                        if (
+                            isinstance(_node.func, ast.Attribute)
+                            and _node.func.attr in {"mean", "sum", "prod", "max", "min", "std", "var"}
+                            and any(isinstance(_a, ast.Name) and _a.id == _arg_name for _a in ast.walk(_node.func.value))
+                        ):
+                            return True
+                        if (
+                            isinstance(_node.func, ast.Attribute)
+                            and _node.func.attr in {"mean", "sum", "prod", "max", "min", "std", "var", "dot", "matmul"}
+                            and isinstance(_node.func.value, ast.Name)
+                            and _node.func.value.id in {"np", "numpy"}
+                            and any(isinstance(_a, ast.Name) and _a.id == _arg_name for _a in ast.walk(_node))
+                        ):
+                            return True
+                return False
+            if (
+                not _arg_has_array_evidence(arg)
+                and any(
+                    isinstance(_n, ast.Name)
+                    and _n.id == arg
+                    and isinstance(getattr(_n, "ctx", None), ast.Load)
+                    for _n in ast.walk(fn)
+                )
+                and _arg_array_rank(arg) == 0
+                and _local_rank_hint == 0
+                and _self_norm_rank != 1
+                and not _arg_needs_allocatable_rebind(arg)
+            ):
+                arr_rank = 0
         needs_alloc_rebind = arr_rank > 0 and _arg_needs_allocatable_rebind(arg)
         if needs_alloc_rebind:
             intent_txt = "inout"
@@ -36199,13 +36288,72 @@ def generate_flat(
                     token = part.strip()
                     if not token:
                         continue
-                    mtok = re.match(r"^" + re.escape(nm) + r"(\s*\(|\s|$)", token, re.IGNORECASE)
+                    mtok = re.match(r"^" + re.escape(nm) + r"(\s*[\(\[]|$)", token, re.IGNORECASE)
                     if mtok:
-                        return kind, (1 if "(" in mtok.group(1) else 0)
+                        return kind, (1 if ("(" in mtok.group(1) or "[" in mtok.group(1)) else 0)
         return None, None
 
     def _comment_arg_kind_hint_for_fn(fn, nm):
         return _comment_arg_spec_hint_for_fn(fn, nm)[0]
+
+    def _arg_has_array_body_evidence_for_fn(fn, nm):
+        for _node in ast.walk(fn):
+            if (
+                isinstance(_node, ast.Subscript)
+                and isinstance(_node.value, ast.Name)
+                and _node.value.id == nm
+            ):
+                return True
+            if (
+                isinstance(_node, ast.Attribute)
+                and isinstance(_node.value, ast.Name)
+                and _node.value.id == nm
+                and _node.attr in {"shape", "size", "ndim"}
+            ):
+                return True
+            if isinstance(_node, ast.Call):
+                if isinstance(_node.func, ast.Name):
+                    _callee_args = list(local_arg_names_map.get(_node.func.id, []))
+                    _callee_fn = local_fn_map.get(_node.func.id)
+                    for _ia, _actual in enumerate(getattr(_node, "args", [])):
+                        if (
+                            isinstance(_actual, ast.Name)
+                            and _actual.id == nm
+                            and _callee_fn is not None
+                            and _ia < len(_callee_args)
+                        ):
+                            _ck, _cr = _comment_arg_spec_hint_for_fn(_callee_fn, _callee_args[_ia])
+                            if _cr is not None and int(_cr) > 0:
+                                return True
+                if (
+                    isinstance(_node.func, ast.Name)
+                    and _node.func.id in {"len", "enumerate"}
+                    and _node.args
+                    and isinstance(_node.args[0], ast.Name)
+                    and _node.args[0].id == nm
+                ):
+                    return True
+                if (
+                    isinstance(_node.func, ast.Attribute)
+                    and isinstance(_node.func.value, ast.Name)
+                    and _node.func.value.id == nm
+                ):
+                    return True
+                if (
+                    isinstance(_node.func, ast.Attribute)
+                    and _node.func.attr in {"mean", "sum", "prod", "max", "min", "std", "var"}
+                    and any(isinstance(_a, ast.Name) and _a.id == nm for _a in ast.walk(_node.func.value))
+                ):
+                    return True
+                if (
+                    isinstance(_node.func, ast.Attribute)
+                    and _node.func.attr in {"mean", "sum", "prod", "max", "min", "std", "var", "dot", "matmul"}
+                    and isinstance(_node.func.value, ast.Name)
+                    and _node.func.value.id in {"np", "numpy"}
+                    and any(isinstance(_a, ast.Name) and _a.id == nm for _a in ast.walk(_node))
+                ):
+                    return True
+        return False
 
     def _infer_arg_kind_in_fn(fn, nm):
         cache_key = (id(fn), nm)
@@ -37089,6 +37237,19 @@ def generate_flat(
             )
             for i in range(len(base_ranks))
         ]
+        _rank_sets = call_rank_sets.get(fn.name, [])
+        for _i, _arg_nm in enumerate(local_func_arg_names[fn.name]):
+            if _i >= len(local_func_arg_ranks[fn.name]) or _i >= len(_rank_sets):
+                continue
+            _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _arg_nm)
+            if (
+                _cr is not None
+                and int(_cr) > 0
+                and _rank_sets[_i]
+                and 0 in {int(_r) for _r in _rank_sets[_i]}
+                and not _arg_has_array_body_evidence_for_fn(fn, _arg_nm)
+            ):
+                local_func_arg_ranks[fn.name][_i] = 0
         merged_kinds = []
         def _arg_has_explicit_real_evidence(_arg_name):
             _aliases = {_arg_name}
@@ -39377,6 +39538,8 @@ def generate_flat(
                 passed_as_actual.add(_kw.value.id)
             elif isinstance(_kw.value, ast.Name) and _kw.value.id in alias_to_local_fn:
                 passed_as_actual.update(alias_to_local_fn[_kw.value.id])
+    for _actuals in _actuals_by_callback_formal.values():
+        passed_as_actual.update(_actuals)
     if AUTO_ELEMENTAL:
         elemental_targets = set(translator.global_vectorize_aliases.values())
         for fn in (local_funcs or []):
