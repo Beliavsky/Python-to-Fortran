@@ -30019,23 +30019,66 @@ def _comment_decl_tokens(text):
 
 
 def _comment_token_rank_for_name(token, name):
-    mtok = re.match(
-        r"^" + re.escape(name) + r"(?:\s*([\(\[])([^\)\]]*)[\)\]]|$)",
-        token,
-        re.IGNORECASE,
-    )
+    mtok = re.match(r"^" + re.escape(name) + r"(?P<rest>\s*[\(\[]|\s*$)", token, re.IGNORECASE)
     if not mtok:
         return None
-    if not mtok.group(1):
+    rest = mtok.group("rest") or ""
+    if not any(ch in rest for ch in "(["):
         return 0
-    dims = (mtok.group(2) or "").strip()
+    opener_pos = token.find("(")
+    bracket_pos = token.find("[")
+    if opener_pos < 0 or (0 <= bracket_pos < opener_pos):
+        opener_pos = bracket_pos
+    if opener_pos < 0:
+        return 0
+    opener = token[opener_pos]
+    closer = ")" if opener == "(" else "]"
+    depth = 0
+    dims_chars = []
+    for ch in token[opener_pos + 1:]:
+        if ch == opener:
+            depth += 1
+            dims_chars.append(ch)
+        elif ch == closer:
+            if depth == 0:
+                break
+            depth -= 1
+            dims_chars.append(ch)
+        else:
+            dims_chars.append(ch)
+    dims = "".join(dims_chars).strip()
     if not dims:
         return 1
-    dim_parts = [d.strip() for d in dims.split(",") if d.strip()]
+    dim_parts = _comment_decl_tokens(dims)
     non_singleton_dims = [d for d in dim_parts if d not in {"1", "1:"}]
     if dim_parts and len(non_singleton_dims) == 1:
         return 1
     return max(1, len(dim_parts))
+
+
+def _arg_has_rank1_subscript_use(fn, name):
+    saw_rank1 = False
+    for node in ast.walk(fn):
+        if not (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == name
+        ):
+            continue
+        if isinstance(node.slice, ast.Tuple):
+            consumed = sum(
+                0 if is_none(elt) or (isinstance(elt, ast.Constant) and elt.value is Ellipsis) else 1
+                for elt in node.slice.elts
+            )
+        elif is_none(node.slice) or (isinstance(node.slice, ast.Constant) and node.slice.value is Ellipsis):
+            consumed = 0
+        else:
+            consumed = 1
+        if consumed >= 2:
+            return False
+        if consumed == 1:
+            saw_rank1 = True
+    return saw_rank1
 
 
 def _emit_local_function(
@@ -33691,7 +33734,12 @@ def _emit_local_function(
             and not is_elemental_fn
             and fn.name not in set(force_non_elemental_funcs or set())
         ):
-            arr_rank = max(arr_rank, int(comment_arg_rank))
+            if not (
+                arr_rank == 1
+                and int(comment_arg_rank) > 1
+                and _arg_has_rank1_subscript_use(fn, arg)
+            ):
+                arr_rank = max(arr_rank, int(comment_arg_rank))
         if (hint_kind == "char" or arg in tr.char_scalar_names) and _char_scalar_arg_pattern_local(arg):
             arr_rank = 0
         if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_real_rank:
@@ -37301,6 +37349,18 @@ def generate_flat(
             )
             for i in range(len(base_ranks))
         ]
+        for _i, _arg_nm in enumerate(local_func_arg_names[fn.name]):
+            if _i >= len(local_func_arg_ranks[fn.name]):
+                continue
+            _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _arg_nm)
+            if _cr is not None and int(_cr) > 0:
+                _curr_rank = int(local_func_arg_ranks[fn.name][_i])
+                if not (
+                    _curr_rank == 1
+                    and int(_cr) > 1
+                    and _arg_has_rank1_subscript_use(fn, _arg_nm)
+                ):
+                    local_func_arg_ranks[fn.name][_i] = max(_curr_rank, int(_cr))
         _rank_sets = call_rank_sets.get(fn.name, [])
         for _i, _arg_nm in enumerate(local_func_arg_names[fn.name]):
             if _i >= len(local_func_arg_ranks[fn.name]) or _i >= len(_rank_sets):
