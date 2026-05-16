@@ -11305,6 +11305,14 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "emath"
+                and is_numpy_name_node(node.func.value.value)
+                and node.func.attr == "sqrt"
+            ):
+                return "complex"
             if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
                 if node.func.attr == "copy" and len(node.args) == 0:
                     return self._expr_kind(node.func.value)
@@ -18041,6 +18049,18 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 return f"reshape({a0}, [size({a0})])"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "emath"
+                and is_numpy_name_node(node.func.value.value)
+                and node.func.attr == "sqrt"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) != "complex":
+                    a0 = f"cmplx({a0}, kind=dp)"
+                return f"sqrt({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -29974,6 +29994,50 @@ def _analyze_dict_return_spec(
     }
 
 
+def _comment_decl_tokens(text):
+    parts = []
+    cur = []
+    depth = 0
+    pairs = {"(": ")", "[": "]"}
+    closing = {")", "]"}
+    for ch in text:
+        if ch in pairs:
+            depth += 1
+        elif ch in closing and depth > 0:
+            depth -= 1
+        if ch == "," and depth == 0:
+            tok = "".join(cur).strip()
+            if tok:
+                parts.append(tok)
+            cur = []
+            continue
+        cur.append(ch)
+    tok = "".join(cur).strip()
+    if tok:
+        parts.append(tok)
+    return parts
+
+
+def _comment_token_rank_for_name(token, name):
+    mtok = re.match(
+        r"^" + re.escape(name) + r"(?:\s*([\(\[])([^\)\]]*)[\)\]]|$)",
+        token,
+        re.IGNORECASE,
+    )
+    if not mtok:
+        return None
+    if not mtok.group(1):
+        return 0
+    dims = (mtok.group(2) or "").strip()
+    if not dims:
+        return 1
+    dim_parts = [d.strip() for d in dims.split(",") if d.strip()]
+    non_singleton_dims = [d for d in dim_parts if d not in {"1", "1:"}]
+    if dim_parts and len(non_singleton_dims) == 1:
+        return 1
+    return max(1, len(dim_parts))
+
+
 def _emit_local_function(
     o,
     fn,
@@ -30045,13 +30109,13 @@ def _emit_local_function(
                     kind = "char"
                 else:
                     continue
-                for part in rest.split(","):
+                for part in _comment_decl_tokens(rest):
                     token = part.strip()
                     if not token:
                         continue
-                    mtok = re.match(r"^" + re.escape(_nm) + r"(\s*[\(\[]|$)", token, re.IGNORECASE)
-                    if mtok:
-                        return kind, (1 if ("(" in mtok.group(1) or "[" in mtok.group(1)) else 0)
+                    rank = _comment_token_rank_for_name(token, _nm)
+                    if rank is not None:
+                        return kind, rank
         return None, None
     def _char_scalar_arg_pattern_local(arg_name):
         saw_len = False
@@ -36284,13 +36348,13 @@ def generate_flat(
                     kind = "char"
                 else:
                     continue
-                for part in rest.split(","):
+                for part in _comment_decl_tokens(rest):
                     token = part.strip()
                     if not token:
                         continue
-                    mtok = re.match(r"^" + re.escape(nm) + r"(\s*[\(\[]|$)", token, re.IGNORECASE)
-                    if mtok:
-                        return kind, (1 if ("(" in mtok.group(1) or "[" in mtok.group(1)) else 0)
+                    rank = _comment_token_rank_for_name(token, nm)
+                    if rank is not None:
+                        return kind, rank
         return None, None
 
     def _comment_arg_kind_hint_for_fn(fn, nm):
@@ -39538,7 +39602,7 @@ def generate_flat(
                 passed_as_actual.add(_kw.value.id)
             elif isinstance(_kw.value, ast.Name) and _kw.value.id in alias_to_local_fn:
                 passed_as_actual.update(alias_to_local_fn[_kw.value.id])
-    for _actuals in _actuals_by_callback_formal.values():
+    for _actuals in locals().get("_actuals_by_callback_formal", {}).values():
         passed_as_actual.update(_actuals)
     if AUTO_ELEMENTAL:
         elemental_targets = set(translator.global_vectorize_aliases.values())
