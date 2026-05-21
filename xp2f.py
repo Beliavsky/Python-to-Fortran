@@ -405,6 +405,10 @@ def default_compiler_command():
     return "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -Wfatal-errors"
 
 
+def default_time_both_compiler_command():
+    return "gfortran -O3 -march=native -Wfatal-errors"
+
+
 def _compiler_parts_with_debug_flags(compiler_parts):
     parts = list(compiler_parts or [])
     existing = set(parts)
@@ -7974,6 +7978,23 @@ def normalize_globals_membership_state(exec_body, local_funcs):
                 top_level_assigned.add(tn.id)
 
     known_global_names = explicit_globals | top_level_assigned
+
+    queried_global_names = set()
+    for _st in list(exec_body) + list(local_funcs or []):
+        for _node in ast.walk(_st):
+            if (
+                isinstance(_node, ast.Compare)
+                and len(_node.ops) == 1
+                and len(_node.comparators) == 1
+                and isinstance(_node.ops[0], (ast.In, ast.NotIn))
+                and isinstance(_node.left, ast.Constant)
+                and isinstance(_node.left.value, str)
+                and _globals_membership_rhs(_node.comparators[0])
+            ):
+                queried_global_names.add(_node.left.value)
+    if not queried_global_names:
+        return
+
     used_flags_by_fn = {}
 
     class _Rewriter(ast.NodeTransformer):
@@ -8016,6 +8037,7 @@ def normalize_globals_membership_state(exec_body, local_funcs):
                     isinstance(tn, ast.Name)
                     and isinstance(getattr(tn, "ctx", None), ast.Store)
                     and tn.id in known_global_names
+                    and tn.id in queried_global_names
                     and (self.fn_name is None or tn.id in self.fn_globals)
                 ):
                     out.add(tn.id)
@@ -8079,6 +8101,15 @@ def normalize_globals_membership_state(exec_body, local_funcs):
     rw = _Rewriter(None)
     mod = ast.Module(body=list(exec_body), type_ignores=[])
     new_body = rw.visit(mod).body
+    if rw.used_flags:
+        init_flags = [
+            ast.Assign(
+                targets=[ast.Name(id=flag, ctx=ast.Store())],
+                value=ast.Constant(value=False),
+            )
+            for flag in sorted(rw.used_flags)
+        ]
+        new_body = init_flags + new_body
     exec_body[:] = new_body
     ast.fix_missing_locations(ast.Module(body=exec_body, type_ignores=[]))
 
@@ -40226,8 +40257,20 @@ def generate_flat(
     if use_proc_module:
         prog_name_conflicts |= set(proc_public_syms)
     prog_name_conflicts |= {fn.name for fn in (local_funcs or [])}
-    if prog_name in prog_name_conflicts:
-        prog_name = f"{stem}_prog"
+    for _stmt in tree.body:
+        if isinstance(_stmt, (ast.ImportFrom, ast.Import, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for _node in ast.walk(_stmt):
+            if isinstance(_node, ast.Name) and isinstance(getattr(_node, "ctx", None), ast.Store):
+                prog_name_conflicts.add(_node.id)
+    _prog_conflicts_lower = {str(_nm).lower() for _nm in prog_name_conflicts}
+    if prog_name.lower() in _prog_conflicts_lower:
+        _base_prog_name = f"{stem}_prog"
+        prog_name = _base_prog_name
+        _suffix = 2
+        while prog_name.lower() in _prog_conflicts_lower:
+            prog_name = f"{_base_prog_name}_{_suffix}"
+            _suffix += 1
 
     helper_uses_main = helper_uses
     proc_main_syms = []
@@ -41917,6 +41960,10 @@ def main():
             return 1
         args.input_py = matches[0]
     raw_argv = list(sys.argv[1:])
+    saw_compiler = any(
+        _arg == "--compiler" or _arg.startswith("--compiler=")
+        for _arg in raw_argv
+    )
     saw_numeric_diff_tol = any(
         _arg == "--numeric-diff-tol" or _arg.startswith("--numeric-diff-tol=")
         for _arg in raw_argv
@@ -41935,6 +41982,8 @@ def main():
         args.run = True
     if args.time_both:
         args.time = True
+        if not saw_compiler:
+            args.compiler = default_time_both_compiler_command()
     if args.time:
         args.run = True
 
