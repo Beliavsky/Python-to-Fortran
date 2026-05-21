@@ -8871,6 +8871,9 @@ class translator(ast.NodeVisitor):
         self.argparse_specs = {}
         self.argparse_namespaces = {}
 
+    def _list_capacity_var(self, name):
+        return f"xp2f_cap_{name}"
+
     def _resolve_list_alias(self, name):
         cur = name
         seen = set()
@@ -22749,9 +22752,11 @@ class translator(ast.NodeVisitor):
                         return
                     cnt_lhs = self.list_counts[t.id]
                     cnt_rhs = self.list_counts[root]
+                    cap_lhs = self._list_capacity_var(t.id)
                     self.list_aliases.pop(t.id, None)
                     self.python_list_vars.add(t.id)
                     self.o.w(f"{cnt_lhs} = {cnt_rhs}")
+                    self.o.w(f"{cap_lhs} = {cnt_lhs}")
                     self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
                     self.o.w(f"if ({cnt_lhs} > 0) then")
                     self.o.push()
@@ -25841,6 +25846,7 @@ class translator(ast.NodeVisitor):
             if cnt is not None:
                 self.o.w(f"if (allocated({name})) deallocate({name})")
                 self.o.w(f"{cnt} = 0")
+                self.o.w(f"{self._list_capacity_var(name)} = 0")
                 return
             rank = 0
             kind = None
@@ -28872,8 +28878,23 @@ class translator(ast.NodeVisitor):
             if cnt is not None:
                 self.o.w(f"{cnt} = {cnt} + 1")
                 if name_is_alloc:
-                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
-                    self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {val_ctor}]")
+                    if name in self.alloc_chars:
+                        self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
+                        self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {val_ctor}]")
+                    else:
+                        cap = self._list_capacity_var(name)
+                        self.o.w(f"if (.not. allocated({name})) then")
+                        self.o.push()
+                        self.o.w(f"{cap} = max(16, {cnt})")
+                        self.o.w(f"allocate({name}({cap}))")
+                        self.o.pop()
+                        self.o.w("end if")
+                        self.o.w(f"if ({cnt} > {cap}) then")
+                        self.o.push()
+                        self.o.w(f"{cap} = max({cnt}, 2 * max(1, {cap}))")
+                        self.o.w(f"{name} = [{name}, spread({val_ctor}, 1, {cap} - size({name}))]")
+                        self.o.pop()
+                        self.o.w("end if")
                 self.o.w(f"{name}({cnt}) = {val}")
                 return
             # Fallback for list-like allocatable rank-1 arrays that are not using
@@ -28928,8 +28949,23 @@ class translator(ast.NodeVisitor):
                 self.o.push()
                 self.o.w(f"{cnt} = {cnt} + 1")
                 if name_is_alloc:
-                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
-                    self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {vals}(i_ext)]")
+                    if name in self.alloc_chars:
+                        self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
+                        self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {vals}(i_ext)]")
+                    else:
+                        cap = self._list_capacity_var(name)
+                        self.o.w(f"if (.not. allocated({name})) then")
+                        self.o.push()
+                        self.o.w(f"{cap} = max(16, {cnt})")
+                        self.o.w(f"allocate({name}({cap}))")
+                        self.o.pop()
+                        self.o.w("end if")
+                        self.o.w(f"if ({cnt} > {cap}) then")
+                        self.o.push()
+                        self.o.w(f"{cap} = max({cnt}, 2 * max(1, {cap}))")
+                        self.o.w(f"{name} = [{name}, spread({vals}(i_ext), 1, {cap} - size({name}))]")
+                        self.o.pop()
+                        self.o.w("end if")
                 self.o.w(f"{name}({cnt}) = {vals}(i_ext)")
                 self.o.pop()
                 self.o.w("end do")
@@ -32942,7 +32978,15 @@ def _emit_local_function(
     remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names)) | module_global_names
     rng_scalar_names = set(getattr(tr, "rng_vars", set())) - remove_names
     complexes = sorted(((tr.complexes | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "complex"}) - remove_names - polyroots_targets) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
-    ints = sorted((((({*tr.ints, *set(local_list_counts.values())} | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "int"}) | rng_scalar_names) - remove_names)) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    local_list_capacity_names = {tr._list_capacity_var(_nm) for _nm in local_list_counts}
+    int_candidates = (
+        set(tr.ints)
+        | set(local_list_counts.values())
+        | local_list_capacity_names
+        | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "int"}
+        | rng_scalar_names
+    )
+    ints = sorted((int_candidates - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     reals = sorted((((tr.reals | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "real"}) - rng_scalar_names) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     logs = sorted(((tr.logs | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "logical"}) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     chars = sorted((((getattr(tr, "chars", set())) | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "char"}) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
@@ -40460,8 +40504,9 @@ def generate_flat(
     chars_set -= module_global_names
     complexes_set -= module_global_names
     rng_scalar_names = set(getattr(tr, "rng_vars", set())) - module_global_names
+    main_list_capacity_names = {tr._list_capacity_var(_nm) for _nm in list_counts}
     ints = sorted(
-        ((({*tr.ints, *set(list_counts.values())} | rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set
+        ((({*tr.ints, *set(list_counts.values()), *main_list_capacity_names} | rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set
     )
     reals = sorted((((tr.reals - rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
     complexes = sorted(((complexes_set - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
