@@ -41752,9 +41752,11 @@ def transpile_file(
         f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
     else:
         # Default path prioritizes semantic stability over stylistic rewrites.
-        # Keep only compile-safety wrapping, import pruning, and basic comment spacing.
+        # Keep only compile-safety wrapping, dead constant/import pruning, and
+        # basic comment spacing.
         f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
         f90_lines = normalize_split_relational_operators(f90_lines)
+        f90_lines = remove_unused_named_constants(f90_lines)
         f90_lines = remove_unused_use_only_imports(f90_lines)
         f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
     if list_directed_io:
