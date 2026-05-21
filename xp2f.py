@@ -15760,20 +15760,23 @@ class translator(ast.NodeVisitor):
                                 if key in dmap:
                                     disp_name = dmap[key]
                     return f"{disp_name}({args})"
+                _cb_specs = getattr(self, "callback_specs", {})
                 if (
-                    node.func.id in self.dummy_arg_names
-                    and node.func.id not in self.reals
-                    and node.func.id not in self.ints
-                    and node.func.id not in self.logs
-                    and node.func.id not in self.chars
-                    and node.func.id not in self.complexes
-                    and node.func.id not in self.alloc_reals
-                    and node.func.id not in self.alloc_ints
-                    and node.func.id not in self.alloc_logs
-                    and node.func.id not in self.alloc_chars
-                    and node.func.id not in self.alloc_complexes
+                    node.func.id in _cb_specs
+                    or (
+                        node.func.id in self.dummy_arg_names
+                        and node.func.id not in self.reals
+                        and node.func.id not in self.ints
+                        and node.func.id not in self.logs
+                        and node.func.id not in self.chars
+                        and node.func.id not in self.complexes
+                        and node.func.id not in self.alloc_reals
+                        and node.func.id not in self.alloc_ints
+                        and node.func.id not in self.alloc_logs
+                        and node.func.id not in self.alloc_chars
+                        and node.func.id not in self.alloc_complexes
+                    )
                 ):
-                    _cb_specs = getattr(self, "callback_specs", {})
                     _cb_info = _cb_specs.get(node.func.id, {})
                     if bool(_cb_info.get("scalarize_vector_call", False)):
                         if getattr(node, "keywords", []):
@@ -32091,6 +32094,7 @@ def _emit_local_function(
         actual_ret_rank = max(0, int(actual_cb.get("ret_rank", 0) or 0))
         if actual_ret_rank > 0:
             ret_rank = max(ret_rank, actual_ret_rank)
+        cb_nargs = max(cb_nargs, int(actual_cb.get("nargs", 0) or 0))
         for _ia, _ak in dict(actual_cb.get("arg_kinds", {})).items():
             if _ak in {"int", "real", "complex", "logical", "char"}:
                 # Actual callback procedure dummies are stronger evidence than
@@ -37570,7 +37574,7 @@ def generate_flat(
                 return "real"
             return None
 
-        cb_sig = {}  # (callee_name, cb_param_name) -> (in_rank, ret_rank, in_kind, out_kind, arg_kinds)
+        cb_sig = {}  # (callee_name, cb_param_name) -> (in_rank, ret_rank, in_kind, out_kind, arg_kinds, nargs)
         for _callee in local_funcs:
             if not isinstance(_callee, ast.FunctionDef):
                 continue
@@ -37614,9 +37618,11 @@ def generate_flat(
                 _ink = None
                 _outk = None
                 _arg_kinds = {}
+                _nargs = 0
                 for _n in ast.walk(_callee):
                     if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == _cbp):
                         continue
+                    _nargs = max(_nargs, len(_n.args))
                     for _ia, _arg in enumerate(_n.args):
                         _ak = None
                         try:
@@ -37694,8 +37700,10 @@ def generate_flat(
                             continue
                         _tinr, _toutr, _tink, _toutk = _target_sig[:4]
                         _targ_kinds = _target_sig[4] if len(_target_sig) > 4 else {}
+                        _tnargs = int(_target_sig[5]) if len(_target_sig) > 5 else 0
                         _inr = max(int(_inr), int(_tinr))
                         _outr = max(int(_outr), int(_toutr))
+                        _nargs = max(int(_nargs), int(_tnargs))
                         _ink = _promote_kind_hint(_ink, _tink)
                         _outk = _promote_kind_hint(_outk, _toutk)
                         for _ia, _ak in dict(_targ_kinds).items():
@@ -37711,8 +37719,10 @@ def generate_flat(
                             continue
                         _tinr, _toutr, _tink, _toutk = _target_sig[:4]
                         _targ_kinds = _target_sig[4] if len(_target_sig) > 4 else {}
+                        _tnargs = int(_target_sig[5]) if len(_target_sig) > 5 else 0
                         _inr = max(int(_inr), int(_tinr))
                         _outr = max(int(_outr), int(_toutr))
+                        _nargs = max(int(_nargs), int(_tnargs))
                         _ink = _promote_kind_hint(_ink, _tink)
                         _outk = _promote_kind_hint(_outk, _toutk)
                         for _ia, _ak in dict(_targ_kinds).items():
@@ -37720,7 +37730,7 @@ def generate_flat(
                                 _arg_kinds[int(_ia)] = _promote_kind_hint(_arg_kinds.get(int(_ia)), _ak)
                 if _outk is None and _ink == "complex":
                     _outk = "complex"
-                cb_sig[(_callee.name, _cbp)] = (_inr, _outr, _ink, _outk, _arg_kinds)
+                cb_sig[(_callee.name, _cbp)] = (_inr, _outr, _ink, _outk, _arg_kinds, _nargs)
         for _caller in local_funcs:
             if not isinstance(_caller, ast.FunctionDef):
                 continue
@@ -37942,7 +37952,7 @@ def generate_flat(
             _key = (_callee_name, _cbp)
             _info = local_callback_actual_specs.setdefault(
                 _key,
-                {"ret_kind": None, "ret_rank": 0, "arg_kinds": {}, "arg_ranks": {}},
+                {"ret_kind": None, "ret_rank": 0, "arg_kinds": {}, "arg_ranks": {}, "nargs": 0},
             )
             _info["ret_kind"] = _promote_kind_hint(_info.get("ret_kind"), _ret_kind)
             _info["ret_rank"] = max(int(_info.get("ret_rank", 0) or 0), int(_ret_rank))
@@ -37951,8 +37961,17 @@ def generate_flat(
             _actual_arg_names = list(local_func_arg_names.get(_actual_name, []))
             _cb_sig = cb_sig.get((_callee_name, _cbp))
             _wrapper_arg_kinds = dict(_cb_sig[4]) if _cb_sig is not None and len(_cb_sig) > 4 else {}
+            _wrapper_nargs = int(_cb_sig[5]) if _cb_sig is not None and len(_cb_sig) > 5 else 0
+            _info["nargs"] = max(
+                int(_info.get("nargs", 0) or 0),
+                int(_wrapper_nargs),
+                len(_actual_arg_names),
+                len(_akinds),
+                len(_aranks),
+            )
             _passthrough_arg_kinds = {}
             _passthrough_ret_kind = None
+            _passthrough_nargs = 0
             _callee_node = fn_map.get(_callee_name)
             if _callee_node is not None:
                 for _call in ast.walk(_callee_node):
@@ -37988,6 +38007,8 @@ def generate_flat(
                         continue
                     _tinr, _toutr, _tink, _toutk = _target_sig[:4]
                     _target_arg_kinds = _target_sig[4] if len(_target_sig) > 4 else {}
+                    _target_nargs = int(_target_sig[5]) if len(_target_sig) > 5 else 0
+                    _passthrough_nargs = max(int(_passthrough_nargs), int(_target_nargs))
                     _passthrough_ret_kind = _promote_kind_hint(_passthrough_ret_kind, _toutk)
                     if _passthrough_ret_kind is None and _tink in {"int", "real", "complex", "logical", "char"}:
                         _passthrough_ret_kind = _tink
@@ -37998,6 +38019,7 @@ def generate_flat(
                             )
             for _ia, _ak in _passthrough_arg_kinds.items():
                 _wrapper_arg_kinds[_ia] = _promote_kind_hint(_wrapper_arg_kinds.get(_ia), _ak)
+            _info["nargs"] = max(int(_info.get("nargs", 0) or 0), int(_passthrough_nargs))
             _iterative_int_callback = False
             if dict(_wrapper_arg_kinds).get(0) == "int":
                 _callee_node_for_iter = fn_map.get(_callee_name)
@@ -41334,6 +41356,7 @@ def transpile_file(
     helper_paths,
     flat,
     no_comment=False,
+    ignore_comments=False,
     out_path=None,
     postprocess=False,
     list_directed_io=False,
@@ -41362,7 +41385,7 @@ def transpile_file(
     translator.global_sys_func_aliases = {}
     translator.global_math_aliases = set()
     translator.global_math_func_aliases = {}
-    comment_map = extract_python_comments(src)
+    comment_map = {} if ignore_comments else extract_python_comments(src)
 
     exec_nodes = [
         s
@@ -41873,6 +41896,7 @@ def main():
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original Python run and transpiled Fortran run (implies --run)")
     ap.add_argument("--comment", action="store_true", help="emit generated procedure/argument comments")
+    ap.add_argument("--ignore-comments", action="store_true", help="ignore source comments as type/rank inference hints")
     ap.add_argument(
         "--compiler",
         default=default_compiler_command(),
@@ -42226,6 +42250,7 @@ def main():
             args.helpers,
             args.flat,
             no_comment=(not args.comment),
+            ignore_comments=args.ignore_comments,
             out_path=args.out,
             postprocess=args.postprocess,
             list_directed_io=args.list_directed_io,
