@@ -405,7 +405,7 @@ def default_compiler_command():
     return "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -Wfatal-errors"
 
 
-def default_time_both_compiler_command():
+def default_timing_compiler_command():
     return "gfortran -O3 -march=native -Wfatal-errors"
 
 
@@ -15430,6 +15430,19 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"np", "numpy"}
+                and node.func.attr == "nan"
+                and len(node.args) == 0
+                and not node.keywords
+            ):
+                # Some legacy numerical sources accidentally write np.nan().
+                # NumPy exposes nan as a scalar constant, so lower the
+                # zero-argument call like the constant form rather than treating
+                # it as an unsupported function call.
+                return "ieee_value(0.0_dp, ieee_quiet_nan)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr in {"float32", "float64"}
                 and len(node.args) == 1
@@ -26619,6 +26632,66 @@ class translator(ast.NodeVisitor):
                 return
             self.o.w(f"{self.expr(t)} = {self.expr(v)}")
             return
+
+        # x = np.append(x, row_or_rows, axis=0) for rank-2 arrays.
+        #
+        # NumPy reallocates and appends along the first dimension. In Fortran
+        # this requires statement-level lowering rather than an expression
+        # constructor, so keep this case narrow and explicit.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"np", "numpy"}
+            and v.func.attr == "append"
+            and len(v.args) >= 2
+        ):
+            axis_node = None
+            if len(v.args) >= 3:
+                axis_node = v.args[2]
+            for kw in v.keywords:
+                if kw.arg == "axis":
+                    axis_node = kw.value
+                    break
+            if isinstance(axis_node, ast.Constant) and axis_node.value == 0:
+                name = self._aliased_name(t.id)
+                arr_node = v.args[0]
+                add_node = v.args[1]
+                arr_rank = max(0, int(self._rank_expr(arr_node)))
+                add_rank = max(0, int(self._rank_expr(add_node)))
+                if isinstance(arr_node, ast.Name) and self._aliased_name(arr_node.id) == name and arr_rank == 2 and add_rank == 2:
+                    kind = self._expr_kind(arr_node)
+                    if kind == "int":
+                        decl = "integer"
+                        self._mark_alloc_int(name, rank=2)
+                    elif kind == "logical":
+                        decl = "logical"
+                        self._mark_alloc_log(name, rank=2)
+                    elif kind == "complex":
+                        decl = "complex(kind=dp)"
+                        self._mark_alloc_complex(name, rank=2)
+                    else:
+                        decl = "real(kind=dp)"
+                        self._mark_alloc_real(name, rank=2)
+
+                    tmp = f"xp2f_append_tmp_{getattr(v, 'lineno', 0)}"
+                    add_tmp = f"xp2f_append_add_{getattr(v, 'lineno', 0)}"
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w(f"{decl}, allocatable :: {tmp}(:,:)")
+                    self.o.w(f"{decl}, allocatable :: {add_tmp}(:,:)")
+                    self.o.w(f"{tmp} = {self.expr(arr_node)}")
+                    self.o.w(f"{add_tmp} = {self.expr(add_node)}")
+                    self.o.w(f"if (allocated({name})) deallocate({name})")
+                    self.o.w(f"allocate({name}(size({tmp}, 1) + size({add_tmp}, 1), size({tmp}, 2)))")
+                    self.o.w(f"{name}(1:size({tmp}, 1), :) = {tmp}")
+                    self.o.w(
+                        f"{name}(size({tmp}, 1) + 1:size({tmp}, 1) + size({add_tmp}, 1), :) = {add_tmp}"
+                    )
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
 
         # NEW: fallback for name = <simple expr>  (e.g., largest = i)
         if isinstance(t, ast.Name):
@@ -41811,6 +41884,9 @@ def transpile_file(
     f90_lines = reconcile_allocatable_decl_ranks(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
+    # Apply final structural whitespace consistently for default and
+    # postprocessed output.
+    f90_lines = fpost.ensure_blank_lines_around_units_and_procedures(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     out_path = Path(out_path) if out_path else Path(py_path).with_name(f"{Path(py_path).stem}_p.f90")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -42033,10 +42109,10 @@ def main():
         args.run = True
     if args.time_both:
         args.time = True
-        if not saw_compiler:
-            args.compiler = default_time_both_compiler_command()
     if args.time:
         args.run = True
+        if not saw_compiler:
+            args.compiler = default_timing_compiler_command()
 
     if args.strict_fix_inplace and (not args.strict_fix):
         print("Strict-fix: FAIL (--strict-fix-inplace requires --strict-fix)")
