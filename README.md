@@ -10,6 +10,8 @@ This transpiler is useful on a substantial subset of numerical Python, but it is
 
 Known limitations include dynamic Python features, complex duck typing, irregular containers, reflection, and parts of NumPy that do not map directly to static Fortran. When a program does not transpile, a small reproducer is usually the best starting point for improving `xp2f.py`.
 
+See [Timing Results](TIMING_RESULTS.md) for runtime measurements on fully passing translated numerical programs.
+
 ## Requirements
 
 - Python 3.11 or newer.
