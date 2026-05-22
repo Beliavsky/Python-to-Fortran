@@ -23748,6 +23748,32 @@ class translator(ast.NodeVisitor):
             and isinstance(v.func, ast.Attribute)
             and self._is_linalg_module_attr(v.func.value)
         ):
+            if v.func.attr == "lstsq" and len(v.args) >= 2 and len(t.elts) >= 1:
+                first_t = t.elts[0]
+                if not isinstance(first_t, (ast.Name, ast.Subscript)):
+                    raise NotImplementedError("np.linalg.lstsq first tuple target must be a name or subscript")
+                a0 = self.expr(v.args[0])
+                b0 = self.expr(v.args[1])
+                sol = (
+                    f"linalg_solve(matmul(transpose({a0}), {a0}), "
+                    f"matmul(transpose({a0}), {b0}))"
+                )
+                # NumPy lstsq returns (x, residuals, rank, s).  Lower x via
+                # normal equations for this subset and ignore the remaining
+                # tuple items.
+                if isinstance(first_t, ast.Name):
+                    self._mark_alloc_real(first_t.id, 1)
+                    self.o.w(f"{first_t.id} = {sol}")
+                else:
+                    tmp = f"xp2f_lstsq_x_{getattr(node, 'lineno', 0)}"
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w(f"real(kind=dp), allocatable :: {tmp}(:)")
+                    self.o.w(f"{tmp} = {sol}")
+                    self.o.w(f"{self.expr(first_t)} = {tmp}")
+                    self.o.pop()
+                    self.o.w("end block")
+                return
             outs = []
             for e in t.elts:
                 if isinstance(e, ast.Name):
