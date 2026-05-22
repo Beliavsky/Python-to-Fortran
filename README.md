@@ -12,6 +12,8 @@ Known limitations include dynamic Python features, complex duck typing, irregula
 
 See [Timing Results](TIMING_RESULTS.md) for runtime measurements on fully passing translated numerical programs.
 
+See [Comparison with Pyccel](PYCCEL_COMPARISON.md) for how this project differs from Pyccel.
+
 ## Requirements
 
 - Python 3.11 or newer.
