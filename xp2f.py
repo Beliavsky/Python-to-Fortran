@@ -2928,10 +2928,6 @@ def remove_unused_named_constants(lines):
         r"^\s*(module|program|subroutine|function)\b(?!\s+procedure\b)",
         flags=re.IGNORECASE,
     )
-    unit_end_re = re.compile(
-        r"^\s*end\s+(module|program|subroutine|function)\b",
-        flags=re.IGNORECASE,
-    )
     decl_re = re.compile(
         r"^\s*([A-Za-z_]\w*(?:\s*\([^)]*\))?(?:\s*,\s*[A-Za-z_]\w*(?:\s*\([^)]*\))?)*)\s*::\s*(.+)$",
         flags=re.IGNORECASE,
@@ -2973,9 +2969,15 @@ def remove_unused_named_constants(lines):
     i = 0
     n = len(out)
     while i < n:
-        if not unit_start_re.match(out[i]):
+        m_unit = unit_start_re.match(out[i])
+        if not m_unit:
             i += 1
             continue
+        unit_kind = m_unit.group(1).lower()
+        unit_end_re = re.compile(
+            rf"^\s*end\s+{re.escape(unit_kind)}\b",
+            flags=re.IGNORECASE,
+        )
         j = i + 1
         while j < n and not unit_end_re.match(out[j]):
             j += 1
