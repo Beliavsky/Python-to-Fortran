@@ -1,6 +1,6 @@
 # Python-to-Fortran
 
-Python-to-Fortran is an experimental Python and NumPy to Fortran transpiler centered on `xp2f.py`.
+Python-to-Fortran is an experimental Python and NumPy to Fortran transpiler created using OpenAI Codex centered on `xp2f.py`.
 
 The project is intended for numerical Python programs that use a Fortran-friendly subset of Python. It can infer many scalar, array, and string cases, emit Fortran source, optionally compile it with `gfortran`, and compare Python and Fortran output for regression testing.
 
