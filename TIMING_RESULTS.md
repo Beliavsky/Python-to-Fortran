@@ -1,6 +1,6 @@
 # Timing Results
 
-`xp2f.py` was timed on a set of [Burkardt numerical Python programs](https://people.sc.fsu.edu/~jburkardt/py_src/py_src.html) that fully passed the pipeline:
+`xp2f.py` was timed on a set of [John Burkardt numerical Python programs](https://people.sc.fsu.edu/~jburkardt/py_src/py_src.html) that fully passed the pipeline:
 
 1. Run the original Python program.
 2. Transpile it to Fortran.
