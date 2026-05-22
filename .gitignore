@@ -16,6 +16,7 @@ __pycache__/
 
 # xp2f generated files and temporary build directories.
 *_p.f90
+!examples/xprime_p.f90
 temp*.*
 tmp*.*
 .xbuild_*/

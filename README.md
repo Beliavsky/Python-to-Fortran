@@ -60,6 +60,30 @@ Summarize historical batch progress files:
 python xsummarize_xp2f_progress.py
 ```
 
+## Small Example
+
+The file [examples/xprime.py](examples/xprime.py) counts primes up to one million. Running:
+
+```console
+python xp2f.py examples\xprime.py --time-both
+```
+
+emits, compiles, and runs the translated Fortran program. The generated Fortran output is shown in [examples/xprime_p.f90](examples/xprime_p.f90).
+
+One run gave:
+
+```text
+Timing summary (seconds):
+  stage         seconds    ratio(vs python run)
+  python run   2.434409                1.000000
+  transpile    0.028275                0.011615
+  compile      0.341000                0.140075
+  fortran run  0.253106                0.103970
+  total        0.622381                0.255660
+```
+
+In this example, the generated Fortran executable ran about 9.6 times faster than the original Python script. Timings are machine, compiler, and workload dependent.
+
 ## Optional Type and Rank Hints in Comments
 
 `xp2f.py` can translate many unannotated Python programs, but Python does not always expose enough static type and rank information for reliable Fortran generation. As an optional aid, the transpiler recognizes simple declaration-style comments near function arguments.
