@@ -7671,6 +7671,98 @@ def normalize_csv_reader_list_calls(exec_body, local_funcs):
             ast.fix_missing_locations(fn)
 
 
+def normalize_numpy_shape_assignments(exec_body, local_funcs):
+    """Lower x.shape = (...) into a local reshape alias for later uses."""
+
+    class _ReplaceNameLoads(ast.NodeTransformer):
+        def __init__(self, aliases):
+            self.aliases = aliases
+
+        def visit_FunctionDef(self, node):
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            return node
+
+        def visit_ClassDef(self, node):
+            return node
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and node.id in self.aliases:
+                return ast.copy_location(ast.Name(id=self.aliases[node.id], ctx=node.ctx), node)
+            return node
+
+    def _shape_assign(st):
+        if not (
+            isinstance(st, ast.Assign)
+            and len(st.targets) == 1
+            and isinstance(st.targets[0], ast.Attribute)
+            and st.targets[0].attr == "shape"
+            and isinstance(st.targets[0].value, ast.Name)
+            and isinstance(st.value, (ast.Tuple, ast.List))
+            and len(st.value.elts) >= 1
+        ):
+            return None
+        src = st.targets[0].value.id
+        alias = f"{src}_shape_{getattr(st, 'lineno', 0)}"
+        shape_elts = [copy.deepcopy(e) for e in st.value.elts]
+        call = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="np", ctx=ast.Load()),
+                attr="reshape",
+                ctx=ast.Load(),
+            ),
+            args=[
+                ast.Name(id=src, ctx=ast.Load()),
+                ast.Tuple(
+                    elts=(list(reversed(shape_elts)) if len(shape_elts) == 2 else shape_elts),
+                    ctx=ast.Load(),
+                ),
+            ],
+            keywords=[],
+        )
+        if len(shape_elts) == 2:
+            call = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="np", ctx=ast.Load()),
+                    attr="transpose",
+                    ctx=ast.Load(),
+                ),
+                args=[call],
+                keywords=[],
+            )
+        return src, alias, ast.copy_location(
+            ast.Assign(targets=[ast.Name(id=alias, ctx=ast.Store())], value=call),
+            st,
+        )
+
+    def _rewrite_stmt_list(stmts):
+        aliases = {}
+        out = []
+        for st in stmts:
+            repl = _shape_assign(st)
+            if repl is not None:
+                src, alias, new_st = repl
+                if aliases:
+                    new_st = _ReplaceNameLoads(aliases).visit(new_st)
+                aliases[src] = alias
+                out.append(ast.fix_missing_locations(new_st))
+                continue
+            if aliases:
+                st = _ReplaceNameLoads(aliases).visit(st)
+                st = ast.fix_missing_locations(st)
+            out.append(st)
+        return out
+
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn.body = _rewrite_stmt_list(list(fn.body))
+            ast.fix_missing_locations(fn)
+    if exec_body:
+        new_body = _rewrite_stmt_list(list(exec_body))
+        exec_body[:] = [ast.fix_missing_locations(st) for st in new_body]
+
+
 def normalize_inline_dict_literal_call_args(exec_body, local_funcs):
     existing = {fn.name for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)}
     counter = 0
@@ -41675,6 +41767,7 @@ def transpile_file(
     normalize_date_column_price_csv_reader(effective_tree.body, local_funcs)
     normalize_no_dates_price_csv_reader(effective_tree.body, local_funcs)
     normalize_csv_reader_list_calls(effective_tree.body, local_funcs)
+    normalize_numpy_shape_assignments(effective_tree.body, local_funcs)
     normalize_inline_dict_literal_call_args(effective_tree.body, local_funcs)
     normalize_generator_call_args(effective_tree.body, local_funcs)
     normalize_function_attribute_state(effective_tree.body, local_funcs)
