@@ -41374,6 +41374,26 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
     needed = sorted(used - defined)
 
     helper_files = [str(Path(h)) for h in explicit_helpers]
+    helper_by_name = {Path(h).name.lower(): str(Path(h)) for h in helper_files}
+
+    def _ensure_lapack_helper():
+        for candidate in (
+            helper_by_name.get("lapack_d.f90"),
+            str(Path("lapack_d.f90")),
+            str(Path(__file__).resolve().with_name("lapack_d.f90")),
+        ):
+            if not candidate:
+                continue
+            lapack_src = Path(candidate)
+            if not lapack_src.exists():
+                continue
+            lapack_s = str(lapack_src)
+            if lapack_s not in helper_files:
+                helper_files.append(lapack_s)
+                auto_added.append(lapack_s)
+            return True, lapack_s
+        return False, "lapack_d.f90"
+
     provided = set()
     for hp in helper_files:
         mod = _module_name_from_helper_file(hp)
@@ -41401,23 +41421,14 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
 
     # LAPACK linkage support for numpy.linalg wrappers in python_mod.
     if re.search(r"\b(linalg_(solve|cholesky|det|inv|cond|eig|eigh|svd|qr)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
-        lapack_src = Path("lapack_d.f90")
-        lapack_s = str(lapack_src)
-        if lapack_src.exists():
-            if lapack_s not in helper_files:
-                helper_files.append(lapack_s)
-                auto_added.append(lapack_s)
-        else:
+        found_lapack, lapack_s = _ensure_lapack_helper()
+        if not found_lapack:
             missing_modules.append(("lapack_d_external", lapack_s))
     # When linking with cached python.o, LAPACK references inside python_mod
     # may still need lapack_d at link time even if current source doesn't call
     # linalg wrappers directly.
     if any(Path(h).name.lower() == "python.f90" for h in helper_files):
-        lapack_src = Path("lapack_d.f90")
-        lapack_s = str(lapack_src)
-        if lapack_src.exists() and lapack_s not in helper_files:
-            helper_files.append(lapack_s)
-            auto_added.append(lapack_s)
+        _ensure_lapack_helper()
     return helper_files, auto_added, missing_modules
 
 
