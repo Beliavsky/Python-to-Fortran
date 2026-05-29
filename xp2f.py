@@ -31360,6 +31360,7 @@ def _emit_local_function(
     module_global_decls=None,
     local_proc_name_aliases=None,
     callback_scalar_actuals=None,
+    callback_scalar_actual_names=None,
     local_callback_actual_specs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
@@ -32174,14 +32175,27 @@ def _emit_local_function(
 
     def _arg_whole_array_arith_rank(_nm):
         rr = 0
+        _scalar_callback_fn = any(
+            _cb_name == fn.name and bool(_is_scalar)
+            for (_caller_name, _cb_name), _is_scalar in (callback_scalar_actuals or {}).items()
+        )
         for _st in fn.body:
             for _n in ast.walk(_st):
-                if not (isinstance(_n, ast.BinOp) and isinstance(_n.op, (ast.Add, ast.Sub))):
+                if not (
+                    isinstance(_n, ast.BinOp)
+                    and isinstance(_n.op, (ast.Add, ast.Sub, ast.Pow))
+                ):
                     continue
                 if isinstance(_n.left, ast.Name) and _n.left.id == _nm:
-                    rr = max(rr, int(tr._rank_expr(_n.right)))
+                    if isinstance(_n.op, ast.Pow):
+                        _ck_pow, _cr_pow = _comment_arg_spec_hint_for_emit(fn, _nm)
+                        if (not _scalar_callback_fn) and _cr_pow is not None and int(_cr_pow) > 0:
+                            rr = max(rr, int(_cr_pow))
+                    else:
+                        rr = max(rr, int(tr._rank_expr(_n.right)))
                 elif isinstance(_n.right, ast.Name) and _n.right.id == _nm:
-                    rr = max(rr, int(tr._rank_expr(_n.left)))
+                    if not isinstance(_n.op, ast.Pow):
+                        rr = max(rr, int(tr._rank_expr(_n.left)))
         return rr
 
     def _arg_integer_seed_recurrence(_nm):
@@ -34830,6 +34844,12 @@ def _emit_local_function(
     optional_none_aliases = []
     optional_none_copyback = []
     ret_spec_hint = local_return_specs.get(fn.name) if (local_return_specs is not None) else None
+    if fn.name in set(callback_scalar_actual_names or set()):
+        if local_return_ranks is not None and fn.name in local_return_ranks:
+            local_return_ranks[fn.name] = 0
+        if local_return_specs is not None and fn.name in local_return_specs and isinstance(local_return_specs[fn.name], str) and local_return_specs[fn.name].startswith("alloc_"):
+            local_return_specs[fn.name] = local_return_specs[fn.name][6:]
+        ret_spec_hint = local_return_specs.get(fn.name) if (local_return_specs is not None) else ret_spec_hint
     prefer_real_unknown_args = (ret_spec_hint in {"real", "alloc_real"}) and (force_arg_kinds is None)
     for arg in args:
         arg_emit = arg_emit_map.get(arg, arg)
@@ -37606,6 +37626,21 @@ def generate_flat(
                 ):
                     axis_present = any(kw.arg == "axis" for kw in n.keywords)
                     rr = max(rr, 2 if axis_present else 1)
+                if isinstance(n, ast.Call):
+                    _matmul_name = None
+                    if isinstance(n.func, ast.Name) and n.func.id == "matmul":
+                        _matmul_name = "matmul"
+                    elif (
+                        isinstance(n.func, ast.Attribute)
+                        and is_numpy_name_node(n.func.value)
+                        and n.func.attr == "matmul"
+                    ):
+                        _matmul_name = "matmul"
+                    if _matmul_name and len(n.args) >= 2:
+                        if isinstance(n.args[0], ast.Name) and n.args[0].id == nm:
+                            rr = max(rr, 2)
+                        elif isinstance(n.args[1], ast.Name) and n.args[1].id == nm:
+                            rr = max(rr, 1)
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
                     callee = n.func.id
                     callee_fn = local_fn_map.get(callee)
@@ -38806,6 +38841,7 @@ def generate_flat(
     #   arclength_x(..., dydx1, ...)
     # => infer dydx1 takes rank-1 and returns rank-1.
     callback_scalar_actuals = {}
+    callback_scalar_actual_names = set()
     if local_funcs:
         fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
         cb_scan_cache = {}
@@ -39038,11 +39074,28 @@ def generate_flat(
                         )
                         _key = (_callee_name, _cbp)
                         callback_scalar_actuals[_key] = _actual_scalar if (_key not in callback_scalar_actuals) else (callback_scalar_actuals[_key] and _actual_scalar)
+                        if _actual_scalar:
+                            callback_scalar_actual_names.add(_a.id)
                     _sig = cb_sig.get((_callee_name, _cbp), None)
                     if _sig is None:
                         continue
                     _inr, _outr, _ink, _outk = _sig[:4]
                     _arg_kinds = _sig[4] if len(_sig) > 4 else {}
+                    if (
+                        _cbp in set(local_func_callback_params.get(_callee_name, set()))
+                        and int(_inr) == 0
+                        and int(_outr) == 0
+                    ):
+                        _actual_scalar = True
+                        if local_func_arg_ranks.get(_a.id):
+                            local_func_arg_ranks[_a.id][0] = 0
+                        if _a.id in local_return_ranks:
+                            local_return_ranks[_a.id] = 0
+                        if _a.id in local_return_specs and isinstance(local_return_specs[_a.id], str) and local_return_specs[_a.id].startswith("alloc_"):
+                            local_return_specs[_a.id] = local_return_specs[_a.id][6:]
+                        _key = (_callee_name, _cbp)
+                        callback_scalar_actuals[_key] = True if (_key not in callback_scalar_actuals) else (callback_scalar_actuals[_key] and True)
+                        callback_scalar_actual_names.add(_a.id)
                     if (not _actual_scalar) and local_func_arg_ranks[_a.id]:
                         local_func_arg_ranks[_a.id][0] = max(int(local_func_arg_ranks[_a.id][0]), int(_inr))
                     if local_func_arg_kinds.get(_a.id):
@@ -39082,11 +39135,28 @@ def generate_flat(
                         )
                         _key = (_callee_name, _cbp)
                         callback_scalar_actuals[_key] = _actual_scalar if (_key not in callback_scalar_actuals) else (callback_scalar_actuals[_key] and _actual_scalar)
+                        if _actual_scalar:
+                            callback_scalar_actual_names.add(_kw.value.id)
                     _sig = cb_sig.get((_callee_name, _cbp), None)
                     if _sig is None:
                         continue
                     _inr, _outr, _ink, _outk = _sig[:4]
                     _arg_kinds = _sig[4] if len(_sig) > 4 else {}
+                    if (
+                        _cbp in set(local_func_callback_params.get(_callee_name, set()))
+                        and int(_inr) == 0
+                        and int(_outr) == 0
+                    ):
+                        _actual_scalar = True
+                        if local_func_arg_ranks.get(_kw.value.id):
+                            local_func_arg_ranks[_kw.value.id][0] = 0
+                        if _kw.value.id in local_return_ranks:
+                            local_return_ranks[_kw.value.id] = 0
+                        if _kw.value.id in local_return_specs and isinstance(local_return_specs[_kw.value.id], str) and local_return_specs[_kw.value.id].startswith("alloc_"):
+                            local_return_specs[_kw.value.id] = local_return_specs[_kw.value.id][6:]
+                        _key = (_callee_name, _cbp)
+                        callback_scalar_actuals[_key] = True if (_key not in callback_scalar_actuals) else (callback_scalar_actuals[_key] and True)
+                        callback_scalar_actual_names.add(_kw.value.id)
                     if (not _actual_scalar) and local_func_arg_ranks[_kw.value.id]:
                         local_func_arg_ranks[_kw.value.id][0] = max(int(local_func_arg_ranks[_kw.value.id][0]), int(_inr))
                     if local_func_arg_kinds.get(_kw.value.id):
@@ -40010,6 +40080,11 @@ def generate_flat(
             arg_rank_hints=local_func_arg_ranks,
             arg_kind_hints=local_func_arg_kinds,
         )
+        for _cb_actual in callback_scalar_actual_names:
+            if _cb_actual in local_return_ranks:
+                local_return_ranks[_cb_actual] = 0
+            if _cb_actual in local_return_specs and isinstance(local_return_specs[_cb_actual], str) and local_return_specs[_cb_actual].startswith("alloc_"):
+                local_return_specs[_cb_actual] = local_return_specs[_cb_actual][6:]
         _apply_c8_container_return_hints(local_return_specs)
         _force_rng_param_kinds()
     local_func_defaults = {}
@@ -41454,6 +41529,7 @@ def generate_flat(
                         module_global_decls=module_global_decls,
                         local_proc_name_aliases=fn_alias_map,
                         callback_scalar_actuals=callback_scalar_actuals,
+                        callback_scalar_actual_names=callback_scalar_actual_names,
                         local_callback_actual_specs=local_callback_actual_specs,
                     )
             else:
@@ -41493,6 +41569,7 @@ def generate_flat(
                     proc_name_override=fn_alias_map.get(fn.name, fn.name),
                     local_proc_name_aliases=fn_alias_map,
                     callback_scalar_actuals=callback_scalar_actuals,
+                    callback_scalar_actual_names=callback_scalar_actual_names,
                     local_callback_actual_specs=local_callback_actual_specs,
                 )
         om.w(f"end module {proc_mod_name}")
@@ -41820,6 +41897,7 @@ def generate_flat(
                 local_tuple_return_out_names=local_tuple_return_out_names,
                 module_global_decls=module_global_decls,
                 callback_scalar_actuals=callback_scalar_actuals,
+                callback_scalar_actual_names=callback_scalar_actual_names,
                 local_callback_actual_specs=local_callback_actual_specs,
             )
 
