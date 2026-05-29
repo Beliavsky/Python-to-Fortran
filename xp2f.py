@@ -3020,6 +3020,9 @@ def remove_unused_named_constants(lines):
                     tl = tok.lower()
                     if tl in reads:
                         reads[tl] += 1
+                for nm in reads:
+                    if re.search(rf"_{re.escape(nm)}\b", code, flags=re.IGNORECASE):
+                        reads[nm] += 1
             for nm, cnt in reads.items():
                 if cnt == 0:
                     out[cand_line_by_name[nm]] = ""
@@ -4207,18 +4210,23 @@ def detect_needed_helpers(tree):
                 if sf in {"mean", "fmean"}:
                     needed.add("mean_1d")
                     needed.add("weighted_mean_1d")
+                elif sf == "geometric_mean":
+                    needed.add("mean_1d")
                 elif sf in {"variance", "pvariance"}:
                     needed.add("var_1d")
                 elif sf in {"stdev", "pstdev"}:
                     needed.add("std")
                 elif sf in {"median", "median_grouped"}:
                     needed.add("median_1d_real")
+                elif sf == "quantiles":
+                    needed.add("statistics_quantiles_real")
                 elif sf == "median_low":
                     needed.add("median_low_int")
                 elif sf == "median_high":
                     needed.add("median_high_int")
                 elif sf == "mode":
                     needed.add("mode_int")
+                    needed.add("mode_real")
                 elif sf == "multimode":
                     needed.add("multimode_int")
             if (
@@ -4230,18 +4238,23 @@ def detect_needed_helpers(tree):
                 if sf in {"mean", "fmean"}:
                     needed.add("mean_1d")
                     needed.add("weighted_mean_1d")
+                elif sf == "geometric_mean":
+                    needed.add("mean_1d")
                 elif sf in {"variance", "pvariance"}:
                     needed.add("var_1d")
                 elif sf in {"stdev", "pstdev"}:
                     needed.add("std")
                 elif sf in {"median", "median_grouped"}:
                     needed.add("median_1d_real")
+                elif sf == "quantiles":
+                    needed.add("statistics_quantiles_real")
                 elif sf == "median_low":
                     needed.add("median_low_int")
                 elif sf == "median_high":
                     needed.add("median_high_int")
                 elif sf == "mode":
                     needed.add("mode_int")
+                    needed.add("mode_real")
                 elif sf == "multimode":
                     needed.add("multimode_int")
             if isinstance(node.func, ast.Name) and node.func.id in self.scipy_special_func_aliases:
@@ -4356,6 +4369,8 @@ def detect_needed_helpers(tree):
                 needed.add("unique_int")
             if isinstance(node.func, ast.Name) and node.func.id == "sorted":
                 needed.add("sort_vec")
+            if isinstance(node.func, ast.Name) and node.func.id == "pow" and len(node.args) == 3:
+                needed.add("mod_pow_int")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -4431,6 +4446,28 @@ def detect_needed_helpers(tree):
                 and node.func.attr == "random"
             ):
                 needed.add("runif")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr == "randrange"
+            ):
+                needed.add("random_randrange_int")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+            ):
+                if node.func.attr == "choice":
+                    needed.add("random_choice_char")
+                elif node.func.attr == "choices":
+                    needed.add("random_choices_char")
+                elif node.func.attr == "sample":
+                    needed.add("random_sample_char")
+                elif node.func.attr == "gauss":
+                    needed.add("rnorm")
+                elif node.func.attr == "randint":
+                    needed.add("runif")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -5344,6 +5381,9 @@ def collect_statistics_aliases(tree):
         "pvariance",
         "pstdev",
         "median_grouped",
+        "quantiles",
+        "geometric_mean",
+        "harmonic_mean",
         "mode",
         "multimode",
     }
@@ -5996,6 +6036,31 @@ def runtime_helper_templates():
          isqrt_int = r
       end function isqrt_int"""
 
+    mod_pow_pub = (
+        "public :: mod_pow_int !@pyapi kind=function ret=integer "
+        "args=base:integer:intent(in),exp:integer:intent(in),modulus:integer:intent(in) "
+        "desc=\"modular exponentiation: pow(base, exp, modulus) for integer inputs\""
+    )
+
+    mod_pow_blk = """      integer function mod_pow_int(base, exp, modulus)
+         integer, intent(in) :: base, exp, modulus
+         integer(kind=int64) :: b, e, m, res
+         if (modulus == 0) then
+            mod_pow_int = 0
+            return
+         end if
+         m = int(modulus, kind=int64)
+         b = modulo(int(base, kind=int64), m)
+         e = int(exp, kind=int64)
+         res = 1_int64
+         do while (e > 0_int64)
+            if (modulo(e, 2_int64) == 1_int64) res = modulo(res * b, m)
+            e = e / 2_int64
+            if (e > 0_int64) b = modulo(b * b, m)
+         end do
+         mod_pow_int = int(res)
+      end function mod_pow_int"""
+
     pil_pub = (
         "public :: print_int_list  !@pyapi kind=subroutine "
         "args=a:integer(:):intent(in),n:integer:intent(in) "
@@ -6052,6 +6117,92 @@ def runtime_helper_templates():
          call random_number(r)
          random_uniform = r
       end function random_uniform"""
+
+    randrange_pub = (
+        "public :: random_randrange_int !@pyapi kind=function ret=integer "
+        "args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) "
+        "desc=\"random integer from range(start, stop, step)\""
+    )
+    randrange_blk = """      integer function random_randrange_int(start, stop, step)
+         integer, intent(in) :: start, stop, step
+         integer :: n
+         real(kind=dp) :: u
+         if (step == 0) error stop "randrange: step must not be zero"
+         if (step > 0) then
+            if (start >= stop) error stop "randrange: empty range"
+            n = 1 + (stop - 1 - start) / step
+         else
+            if (start <= stop) error stop "randrange: empty range"
+            n = 1 + (start - 1 - stop) / (-step)
+         end if
+         call random_number(u)
+         random_randrange_int = start + step * int(u * real(n, kind=dp))
+      end function random_randrange_int"""
+
+    random_choice_char_pub = (
+        "public :: random_choice_char !@pyapi kind=function ret=character "
+        "args=a:character(:):intent(in) desc=\"choose one string from a character vector\""
+    )
+    random_choice_char_blk = """      function random_choice_char(a) result(x)
+         character(len=*), intent(in) :: a(:)
+         character(len=len(a)) :: x
+         real(kind=dp) :: u
+         integer :: j
+         if (size(a) <= 0) error stop "random.choice: empty sequence"
+         call random_number(u)
+         j = 1 + int(u * real(size(a), kind=dp))
+         if (j < 1) j = 1
+         if (j > size(a)) j = size(a)
+         x = a(j)
+      end function random_choice_char"""
+
+    random_choices_char_pub = (
+        "public :: random_choices_char !@pyapi kind=function ret=character(:) "
+        "args=a:character(:):intent(in),k:integer:intent(in) desc=\"choose k strings with replacement\""
+    )
+    random_choices_char_blk = """      function random_choices_char(a, k) result(x)
+         character(len=*), intent(in) :: a(:)
+         integer, intent(in) :: k
+         character(len=len(a)), allocatable :: x(:)
+         integer :: i
+         if (size(a) <= 0 .and. k > 0) error stop "random.choices: empty sequence"
+         if (k < 0) error stop "random.choices: k must be nonnegative"
+         allocate(x(k))
+         do i = 1, k
+            x(i) = random_choice_char(a)
+         end do
+      end function random_choices_char"""
+
+    random_sample_char_pub = (
+        "public :: random_sample_char !@pyapi kind=function ret=character(:) "
+        "args=a:character(:):intent(in),k:integer:intent(in) desc=\"choose k unique strings without replacement\""
+    )
+    random_sample_char_blk = """      function random_sample_char(a, k) result(x)
+         character(len=*), intent(in) :: a(:)
+         integer, intent(in) :: k
+         character(len=len(a)), allocatable :: x(:)
+         integer, allocatable :: idx(:)
+         integer :: i, j, tmp
+         real(kind=dp) :: u
+         if (k < 0 .or. k > size(a)) error stop "random.sample: invalid sample size"
+         allocate(x(k))
+         allocate(idx(size(a)))
+         do i = 1, size(a)
+            idx(i) = i
+         end do
+         do i = size(idx), 2, -1
+            call random_number(u)
+            j = 1 + int(u * real(i, kind=dp))
+            if (j < 1) j = 1
+            if (j > i) j = i
+            tmp = idx(i)
+            idx(i) = idx(j)
+            idx(j) = tmp
+         end do
+         do i = 1, k
+            x(i) = a(idx(i))
+         end do
+      end function random_sample_char"""
 
     seed_rng_pub = (
         "public :: seed_rng !@pyapi kind=subroutine "
@@ -6241,6 +6392,27 @@ def runtime_helper_templates():
          end do
       end subroutine sort_int_vec"""
 
+    srt_c_pub = (
+        "public :: sort_char_vec !@pyapi kind=subroutine "
+        "args=x:character(:)(:):intent(inout) desc=\"sort character vector x in ascending order\""
+    )
+    srt_c_blk = """      subroutine sort_char_vec(x)
+         character(len=*), intent(inout) :: x(:)
+         integer :: i, j, n
+         character(len=len(x)) :: key
+         n = size(x)
+         do i = 2, n
+            key = x(i)
+            j = i - 1
+            do while (j >= 1)
+               if (x(j) <= key) exit
+               x(j+1) = x(j)
+               j = j - 1
+            end do
+            x(j+1) = key
+         end do
+      end subroutine sort_char_vec"""
+
     asrt_pub = (
         "public :: argsort_real !@pyapi kind=subroutine "
         "args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) desc=\"argsort indices (0-based) of real vector\""
@@ -6315,7 +6487,7 @@ def runtime_helper_templates():
 
     sort_vec_pub = "public :: sort_vec"
     sort_vec_blk = """      interface sort_vec
-         module procedure sort_real_vec, sort_int_vec
+         module procedure sort_real_vec, sort_int_vec, sort_char_vec
       end interface sort_vec"""
 
     argsort_pub = "public :: argsort"
@@ -6340,6 +6512,67 @@ def runtime_helper_templates():
             mean_1d = sum(x) / real(size(x), kind=dp)
          end if
       end function mean_1d"""
+
+    stat_quant_pub = (
+        "public :: statistics_quantiles_real !@pyapi kind=function ret=real(dp)(:) "
+        "args=x:real(dp)(:):intent(in),n:integer:intent(in) "
+        "desc=\"statistics.quantiles default exclusive method for 1D real vector\""
+    )
+    stat_quant_blk = """      function statistics_quantiles_real(x, n) result(q)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: q(:)
+         real(kind=dp), allocatable :: xs(:)
+         real(kind=dp) :: h, frac
+         integer :: m, nq, i, lo, hi
+
+         nq = max(0, n - 1)
+         allocate(q(nq), source=0.0_dp)
+         m = size(x)
+         if (m <= 0 .or. n <= 1) return
+         allocate(xs(m), source=x)
+         call sort_real_vec(xs)
+         do i = 1, nq
+            h = real(i * (m + 1), kind=dp) / real(n, kind=dp)
+            if (h <= 1.0_dp) then
+               q(i) = xs(1)
+            else if (h >= real(m, kind=dp)) then
+               q(i) = xs(m)
+            else
+               lo = int(floor(h))
+               hi = lo + 1
+               frac = h - real(lo, kind=dp)
+               q(i) = (1.0_dp - frac) * xs(lo) + frac * xs(hi)
+            end if
+         end do
+      end function statistics_quantiles_real"""
+
+    mode_real_pub = (
+        "public :: mode_real !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp)(:):intent(in) desc=\"mode of 1D real vector\""
+    )
+    mode_real_blk = """      function mode_real(x) result(m)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp) :: m
+         integer :: i, j, cnt, best_c
+
+         if (size(x) <= 0) then
+            m = 0.0_dp
+            return
+         end if
+         m = x(1)
+         best_c = 0
+         do i = 1, size(x)
+            cnt = 0
+            do j = 1, size(x)
+               if (x(j) == x(i)) cnt = cnt + 1
+            end do
+            if (cnt > best_c) then
+               best_c = cnt
+               m = x(i)
+            end if
+         end do
+      end function mode_real"""
 
     var_pub = (
         "public :: var_1d !@pyapi kind=function ret=real(dp) "
@@ -6712,9 +6945,14 @@ def runtime_helper_templates():
 
     return {
         "isqrt_int": (isqrt_pub, isqrt_blk),
+        "mod_pow_int": (mod_pow_pub, mod_pow_blk),
         "print_int_list": (pil_pub, pil_blk),
         "str_int_list": (sil_pub, sil_blk),
         "random_uniform": (ru_pub, ru_blk),
+        "random_randrange_int": (randrange_pub, randrange_blk),
+        "random_choice_char": (random_choice_char_pub, random_choice_char_blk),
+        "random_choices_char": (random_choices_char_pub, random_choices_char_blk),
+        "random_sample_char": (random_sample_char_pub, random_sample_char_blk),
         "seed_rng": (seed_rng_pub, seed_rng_blk),
         "random_normal_vec": (rnv_pub, rnv_blk),
         "random_choice2": (rc2_pub, rc2_blk),
@@ -6722,6 +6960,7 @@ def runtime_helper_templates():
         "random_choice_prob": (rcp_pub, rcp_blk),
         "sort_real_vec": (srt_pub, srt_blk),
         "sort_int_vec": (srt_i_pub, srt_i_blk),
+        "sort_char_vec": (srt_c_pub, srt_c_blk),
         "sort_vec": (sort_vec_pub, sort_vec_blk),
         "argsort_real": (asrt_pub, asrt_blk),
         "argsort_int": (asrt_i_pub, asrt_i_blk),
@@ -6730,6 +6969,8 @@ def runtime_helper_templates():
         "argsort_idx_int": (asrt_idx_i_pub, asrt_idx_i_blk),
         "argsort_idx": (argsort_idx_pub, argsort_idx_blk),
         "mean_1d": (mean_pub, mean_blk),
+        "statistics_quantiles_real": (stat_quant_pub, stat_quant_blk),
+        "mode_real": (mode_real_pub, mode_real_blk),
         "var_1d": (var_pub, var_blk),
         "bincount_int": (bcnt_pub, bcnt_blk),
         "searchsorted_left_int": (ssl_pub, ssl_blk),
@@ -6752,9 +6993,11 @@ def runtime_helper_templates():
 def ensure_runtime_helpers(runtime_path, needed_helpers):
     helper_templates = runtime_helper_templates()
     helper_deps = {
-        "sort_vec": ["sort_real_vec", "sort_int_vec"],
+        "sort_vec": ["sort_real_vec", "sort_int_vec", "sort_char_vec"],
         "argsort": ["argsort_real", "argsort_int"],
         "argsort_idx": ["argsort_idx_real", "argsort_idx_int", "argsort_real", "argsort_int"],
+        "random_choices_char": ["random_choice_char"],
+        "statistics_quantiles_real": ["sort_real_vec"],
         "nanstd": ["nanvar", "nanmean"],
         "nanvar": ["nanmean"],
     }
@@ -9096,7 +9339,7 @@ class translator(ast.NodeVisitor):
             "read", "real", "recursive", "repeat", "reshape", "return", "rewind",
             "save", "scan", "select", "sequence", "sign", "sin", "size", "sqrt",
             "stop", "subroutine", "sum",
-            "tan", "tanh", "target", "then", "tiny", "transfer", "transpose", "trim",
+            "tan", "tanh", "then", "tiny", "transfer", "transpose", "trim",
             "type",
             "ubound", "use",
             "where", "write",
@@ -9119,6 +9362,7 @@ class translator(ast.NodeVisitor):
         self.csv_reader_vars = set()
         self.csv_reader_specs = {}
         self.file_handle_vars = set()
+        self.file_handle_paths = {}
         self.with_open_paths = {}
         self.argparse_parsers = set()
         self.argparse_specs = {}
@@ -10836,6 +11080,22 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr == "randrange"
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+            ):
+                if node.func.attr in {"choice", "choices", "sample"} and len(node.args) >= 1:
+                    return self._expr_kind(node.args[0])
+                if node.func.attr == "gauss":
+                    return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "platform"
                 and node.func.attr == "python_version"
                 and len(node.args) == 0
@@ -10994,6 +11254,10 @@ class translator(ast.NodeVisitor):
                         return "int"
                 if node.func.id in {"open", "len", "ord", "int", "isqrt", "size"}:
                     return "int"
+                if node.func.id == "isinstance":
+                    return "logical"
+                if node.func.id == "list" and len(node.args) >= 1:
+                    return self._expr_kind(node.args[0])
                 if node.func.id in {"str", "repr", "chr"}:
                     return "char"
                 if node.func.id == "pow" and len(node.args) >= 2:
@@ -11025,6 +11289,12 @@ class translator(ast.NodeVisitor):
                     return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Name) and node.func.id == "sorted" and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "index"
+                and len(node.args) >= 1
+            ):
+                return "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -11868,7 +12138,11 @@ class translator(ast.NodeVisitor):
             if stat_fn is not None:
                 if stat_fn == "multimode":
                     return "int"
-                if stat_fn in {"mode", "median_low", "median_high"}:
+                if stat_fn == "mode":
+                    if len(node.args) >= 1 and self._expr_kind(node.args[0]) == "int":
+                        return "int"
+                    return "real"
+                if stat_fn in {"median_low", "median_high"}:
                     return "int"
                 return "real"
             if isinstance(node.func, ast.Name) and node.func.id == "norm" and len(node.args) >= 1:
@@ -12581,6 +12855,24 @@ class translator(ast.NodeVisitor):
                 return 0
             if isinstance(node.func, ast.Attribute) and node.func.attr == "split":
                 return 1
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr in {"choices", "sample"}
+            ):
+                return 1
+            stat_fn = None
+            if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
+                stat_fn = self.statistics_func_aliases[node.func.id]
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.statistics_aliases
+            ):
+                stat_fn = node.func.attr
+            if stat_fn == "quantiles":
+                return 1
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "join"}:
                 return 0
             if (
@@ -12713,6 +13005,7 @@ class translator(ast.NodeVisitor):
                 "tile",
                 "unique",
                 "arange_int",
+                "list",
                 "sorted",
             } and len(node.args) >= 1:
                 return 1
@@ -15079,6 +15372,29 @@ class translator(ast.NodeVisitor):
                         and isinstance(it.func, ast.Name)
                         and it.func.id == "range"
                     ):
+                        if (
+                            isinstance(node.elt, ast.Call)
+                            and isinstance(node.elt.func, ast.Attribute)
+                            and isinstance(node.elt.func.value, ast.Name)
+                            and node.elt.func.value.id == "random"
+                        ):
+                            if node.elt.func.attr == "gauss":
+                                mu_node = None
+                                sig_node = None
+                                if len(node.elt.args) >= 1:
+                                    mu_node = node.elt.args[0]
+                                if len(node.elt.args) >= 2:
+                                    sig_node = node.elt.args[1]
+                                for kw in node.elt.keywords:
+                                    if kw.arg == "mu":
+                                        mu_node = kw.value
+                                    elif kw.arg in {"sigma", "sig"}:
+                                        sig_node = kw.value
+                                mu_expr = self.expr(mu_node) if mu_node is not None else "0.0_dp"
+                                sig_expr = self.expr(sig_node) if sig_node is not None else "1.0_dp"
+                                return f"({mu_expr}) + ({sig_expr}) * rnorm(size({base}))"
+                            if node.elt.func.attr == "random" and len(node.elt.args) == 0:
+                                return f"runif(size({base}))"
                         return f"spread({self.expr(node.elt)}, dim=1, ncopies=size({base}))"
 
                 def _map_expr(n):
@@ -15561,6 +15877,24 @@ class translator(ast.NodeVisitor):
                 x_real = x_expr if xk == "real" else f"real({x_expr}, kind=dp)"
                 if stat_fn in {"mean", "median", "median_grouped"}:
                     return f"mean_1d({x_real})" if stat_fn == "mean" else f"median_1d_real({x_real})"
+                if stat_fn == "quantiles":
+                    n_node = stat_args[1] if len(stat_args) >= 2 else None
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg == "n":
+                            n_node = kw.value
+                        elif kw.arg == "method":
+                            if not (
+                                isinstance(kw.value, ast.Constant)
+                                and isinstance(kw.value.value, str)
+                                and kw.value.value == "exclusive"
+                            ):
+                                raise NotImplementedError("statistics.quantiles currently supports only method='exclusive'")
+                    n_expr = self.expr(n_node) if n_node is not None else "4"
+                    return f"statistics_quantiles_real({x_real}, int({n_expr}))"
+                if stat_fn == "geometric_mean":
+                    return f"exp(mean_1d(log({x_real})))"
+                if stat_fn == "harmonic_mean":
+                    return f"(real(size({x_real}), kind=dp) / sum(1.0_dp / {x_real}))"
                 if stat_fn == "fmean":
                     w_node = stat_args[1] if len(stat_args) >= 2 else None
                     for kw in getattr(node, "keywords", []):
@@ -15589,9 +15923,9 @@ class translator(ast.NodeVisitor):
                         raise NotImplementedError("statistics.median_high currently supports integer iterables")
                     return f"median_high_int({x_expr})"
                 if stat_fn == "mode":
-                    if xk != "int":
-                        raise NotImplementedError("statistics.mode currently supports integer iterables")
-                    return f"mode_int({x_expr})"
+                    if xk == "int":
+                        return f"mode_int({x_expr})"
+                    return f"mode_real({x_real})"
                 if stat_fn == "multimode":
                     if xk != "int":
                         raise NotImplementedError("statistics.multimode currently supports integer iterables")
@@ -15624,6 +15958,11 @@ class translator(ast.NodeVisitor):
             ):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
+                if attr == "index" and len(node.args) == 1:
+                    arg0 = self.expr(node.args[0])
+                    if self._rank_expr(node.func.value) == 0 and self._expr_kind(node.func.value) == "char":
+                        return f"(index({base_expr}, {arg0}) - 1)"
+                    return f"(findloc({base_expr}, {arg0}, dim=1) - 1)"
                 if attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}:
                     if attr in {"replace"} and len(node.args) not in {2, 3}:
                         raise NotImplementedError("replace() expects 2 or 3 arguments")
@@ -15817,6 +16156,36 @@ class translator(ast.NodeVisitor):
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 return f"isqrt_int({self.expr(node.args[0])})"
+            if isinstance(node.func, ast.Name) and node.func.id == "pow" and len(node.args) == 3:
+                return f"mod_pow_int({self.expr(node.args[0])}, {self.expr(node.args[1])}, {self.expr(node.args[2])})"
+            if isinstance(node.func, ast.Name) and node.func.id == "isinstance" and len(node.args) == 2:
+                if isinstance(node.args[1], ast.Name):
+                    type_name = node.args[1].id
+                elif (
+                    isinstance(node.args[1], ast.Tuple)
+                    and all(isinstance(e, ast.Name) for e in node.args[1].elts)
+                ):
+                    type_names = {e.id for e in node.args[1].elts}
+                    kind0 = self._expr_kind(node.args[0])
+                    ok = (
+                        ("int" in type_names and kind0 == "int")
+                        or ("float" in type_names and kind0 == "real")
+                        or ("complex" in type_names and kind0 == "complex")
+                        or ("str" in type_names and kind0 == "char")
+                        or ("bool" in type_names and kind0 == "logical")
+                    )
+                    return ".true." if ok else ".false."
+                else:
+                    raise NotImplementedError("isinstance currently supports builtin type names")
+                kind0 = self._expr_kind(node.args[0])
+                ok = (
+                    (type_name == "int" and kind0 == "int")
+                    or (type_name == "float" and kind0 == "real")
+                    or (type_name == "complex" and kind0 == "complex")
+                    or (type_name == "str" and kind0 == "char")
+                    or (type_name == "bool" and kind0 == "logical")
+                )
+                return ".true." if ok else ".false."
             if isinstance(node.func, ast.Name) and node.func.id in self.math_func_aliases:
                 mfn = self.math_func_aliases[node.func.id]
                 if isinstance(mfn, str) and mfn.startswith("cmath:") and len(node.args) == 1:
@@ -18498,7 +18867,13 @@ class translator(ast.NodeVisitor):
                 else:
                     helper_base = "loadtxt_real"
                 scalar_usecols = scalar_usecol_txt is not None
-                parts = [self.expr(node.args[0])]
+                if isinstance(node.args[0], ast.Name) and node.args[0].id in self.file_handle_paths:
+                    path_expr = self.file_handle_paths[node.args[0].id]
+                elif isinstance(node.args[0], ast.Name) and node.args[0].id in self.with_open_paths:
+                    path_expr = self.with_open_paths[node.args[0].id]
+                else:
+                    path_expr = self.expr(node.args[0])
+                parts = [path_expr]
                 if scalar_usecols:
                     parts.append(scalar_usecol_txt)
                 if skiprows_txt is not None:
@@ -18968,6 +19343,71 @@ class translator(ast.NodeVisitor):
                 return "runif()"
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr == "randrange"
+            ):
+                if len(node.args) == 1:
+                    start_expr = "0"
+                    stop_expr = self.expr(node.args[0])
+                    step_expr = "1"
+                elif len(node.args) >= 2:
+                    start_expr = self.expr(node.args[0])
+                    stop_expr = self.expr(node.args[1])
+                    step_expr = self.expr(node.args[2]) if len(node.args) >= 3 else "1"
+                else:
+                    raise NotImplementedError("random.randrange expects at least one argument")
+                return f"random_randrange_int(int({start_expr}), int({stop_expr}), int({step_expr}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr == "choice"
+                and len(node.args) >= 1
+            ):
+                if self._expr_kind(node.args[0]) == "char":
+                    return f"random_choice_char({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr in {"choices", "sample"}
+                and len(node.args) >= 1
+            ):
+                k_node = None
+                if len(node.args) >= 2:
+                    k_node = node.args[1]
+                for kw in node.keywords:
+                    if kw.arg == "k":
+                        k_node = kw.value
+                        break
+                if k_node is None:
+                    k_node = ast.Constant(value=1)
+                if self._expr_kind(node.args[0]) == "char":
+                    helper = "random_choices_char" if node.func.attr == "choices" else "random_sample_char"
+                    return f"{helper}({self.expr(node.args[0])}, int({self.expr(k_node)}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr == "gauss"
+            ):
+                mu_node = None
+                sig_node = None
+                if len(node.args) >= 1:
+                    mu_node = node.args[0]
+                if len(node.args) >= 2:
+                    sig_node = node.args[1]
+                for kw in node.keywords:
+                    if kw.arg == "mu":
+                        mu_node = kw.value
+                    elif kw.arg in {"sigma", "sig"}:
+                        sig_node = kw.value
+                mu_expr = self.expr(mu_node) if mu_node is not None else "0.0_dp"
+                sig_expr = self.expr(sig_node) if sig_node is not None else "1.0_dp"
+                return f"({mu_expr}) + ({sig_expr}) * rnorm()"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and (
                     isinstance(node.func.value, ast.Name)
                     or (
@@ -19044,6 +19484,11 @@ class translator(ast.NodeVisitor):
                     or node.func.attr in {"randint", "integers"}
                 )
             ):
+                is_python_random_randint = (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "random"
+                    and node.func.attr == "randint"
+                )
                 low_node = None
                 high_node = None
                 size_node = None
@@ -19060,8 +19505,9 @@ class translator(ast.NodeVisitor):
                         high_node = kw.value
                     elif kw.arg == "size":
                         size_node = kw.value
-                # NumPy randint(low, high=None) => [0, low)
-                if node.func.attr == "randint" and high_node is None:
+                # NumPy randint(low, high=None) => [0, low).  Python
+                # random.randint(a, b) is inclusive and requires both bounds.
+                if node.func.attr == "randint" and high_node is None and not is_python_random_randint:
                     high_node = low_node
                     low_node = ast.Constant(value=0)
                 if low_node is None:
@@ -19072,8 +19518,11 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("randint/integers expression form currently supports only scalar output")
                 low_expr = self.expr(low_node)
                 high_expr = self.expr(high_node)
+                span_expr = f"int({high_expr}) - int({low_expr})"
+                if is_python_random_randint:
+                    span_expr = f"{span_expr} + 1"
                 return (
-                    f"(int({low_expr}) + int(runif() * real(max(1, int({high_expr}) - int({low_expr})), kind=dp)))"
+                    f"(int({low_expr}) + int(runif() * real(max(1, {span_expr}), kind=dp)))"
                 )
             if (
                 isinstance(node.func, ast.Name)
@@ -22568,6 +23017,7 @@ class translator(ast.NodeVisitor):
                 if path_node is None:
                     raise NotImplementedError("open() requires file path")
                 path_txt = self.expr(path_node)
+                self.file_handle_paths[opt.id] = path_txt
                 mode_txt = "r"
                 if isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str):
                     mode_txt = str(mode_node.value)
@@ -22585,6 +23035,7 @@ class translator(ast.NodeVisitor):
             self.o.w(f"close({nm})")
         for nm in pushed:
             self.with_open_paths.pop(nm, None)
+            self.file_handle_paths.pop(nm, None)
 
     def visit_Delete(self, node):
         self._emit_comments_for(node)
@@ -22784,6 +23235,7 @@ class translator(ast.NodeVisitor):
             else:
                 self.o.w(f"open(newunit={t.id}, file=trim({path_txt}), status='old', action='read')")
             self.file_handle_vars.add(t.id)
+            self.file_handle_paths[t.id] = path_txt
             return
         if (
             isinstance(t, ast.Name)
