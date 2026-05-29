@@ -37640,7 +37640,11 @@ def generate_flat(
                         if isinstance(n.args[0], ast.Name) and n.args[0].id == nm:
                             rr = max(rr, 2)
                         elif isinstance(n.args[1], ast.Name) and n.args[1].id == nm:
-                            rr = max(rr, 1)
+                            _ck_mm, _cr_mm = _comment_arg_spec_hint_for_fn(fn, nm)
+                            if _cr_mm is not None and int(_cr_mm) > 1:
+                                rr = max(rr, int(_cr_mm))
+                            else:
+                                rr = max(rr, 1)
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
                     callee = n.func.id
                     callee_fn = local_fn_map.get(callee)
