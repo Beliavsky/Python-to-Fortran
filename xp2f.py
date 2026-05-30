@@ -4100,6 +4100,22 @@ def detect_needed_helpers(tree):
 
         def visit_ListComp(self, node):
             if (
+                len(node.generators) == 1
+                and isinstance(node.generators[0].target, ast.Name)
+                and isinstance(node.generators[0].iter, ast.Call)
+                and isinstance(node.generators[0].iter.func, ast.Name)
+                and node.generators[0].iter.func.id == "str"
+                and len(node.generators[0].iter.args) == 1
+                and isinstance(node.elt, ast.Call)
+                and isinstance(node.elt.func, ast.Name)
+                and node.elt.func.id == "int"
+                and len(node.elt.args) == 1
+                and isinstance(node.elt.args[0], ast.Name)
+                and node.elt.args[0].id == node.generators[0].target.id
+            ):
+                needed.add("digits_of_str")
+                needed.add("py_str")
+            if (
                 len(node.generators) == 2
                 and all(isinstance(g.target, ast.Name) for g in node.generators)
                 and all(
@@ -5613,11 +5629,12 @@ def validate_imports_supported(tree, py_path):
 
 
 def inline_local_from_imports(tree, py_path):
-    """Inline simple `from sibling import name` functions/constants."""
+    """Inline simple sibling-module functions/constants imported by name or module."""
     base_dir = Path(py_path).resolve().parent
     new_body = []
     changed = False
     module_cache = {}
+    module_attr_renames = {}
 
     def _module_path(mod_name):
         parts = [p for p in (mod_name or "").split(".") if p]
@@ -5658,43 +5675,96 @@ def inline_local_from_imports(tree, py_path):
         module_cache[key] = exports
         return exports
 
+    def _safe_import_prefix(name):
+        return re.sub(r"\W+", "_", name).strip("_") or "mod"
+
     for st in tree.body:
-        if not (
-            isinstance(st, ast.ImportFrom)
-            and not getattr(st, "level", 0)
-            and st.module
-        ):
-            new_body.append(st)
-            continue
-        exports = _load_exports(st.module)
-        if exports is None:
-            new_body.append(st)
-            continue
-        imported = []
-        for al in st.names:
-            if al.name == "*":
-                continue
-            local_name = al.asname or al.name
-            if al.name in exports["funcs"]:
-                fn = copy.deepcopy(exports["funcs"][al.name])
-                fn.name = local_name
-                imported.append(fn)
-            elif al.name in exports["assigns"]:
-                imported.append(
-                    ast.Assign(
-                        targets=[ast.Name(id=local_name, ctx=ast.Store())],
-                        value=copy.deepcopy(exports["assigns"][al.name]),
+        if isinstance(st, ast.Import):
+            imported = []
+            keep_aliases = []
+            for al in st.names:
+                exports = _load_exports(al.name)
+                if exports is None:
+                    keep_aliases.append(al)
+                    continue
+                alias_name = al.asname or al.name.split(".", 1)[0]
+                prefix = _safe_import_prefix(alias_name)
+                for nm, fn_src in exports["funcs"].items():
+                    local_name = f"{prefix}_{nm}"
+                    module_attr_renames[(alias_name, nm)] = local_name
+                    fn = copy.deepcopy(fn_src)
+                    fn.name = local_name
+                    imported.append(fn)
+                for nm, val_src in exports["assigns"].items():
+                    local_name = f"{prefix}_{nm}"
+                    module_attr_renames[(alias_name, nm)] = local_name
+                    imported.append(
+                        ast.Assign(
+                            targets=[ast.Name(id=local_name, ctx=ast.Store())],
+                            value=copy.deepcopy(val_src),
+                        )
                     )
-                )
-        if imported:
-            new_body.extend(imported)
-            changed = True
-        else:
-            new_body.append(st)
-    if not changed:
-        return tree
-    out = ast.Module(body=new_body, type_ignores=getattr(tree, "type_ignores", []))
-    return ast.fix_missing_locations(out)
+            if keep_aliases:
+                kept = copy.copy(st)
+                kept.names = keep_aliases
+                new_body.append(kept)
+            if imported:
+                new_body.extend(imported)
+                changed = True
+            elif not keep_aliases:
+                changed = True
+            continue
+        if isinstance(st, ast.ImportFrom) and not getattr(st, "level", 0) and st.module:
+            exports = _load_exports(st.module)
+            if exports is None:
+                new_body.append(st)
+                continue
+            imported = []
+            for al in st.names:
+                if al.name == "*":
+                    continue
+                local_name = al.asname or al.name
+                if al.name in exports["funcs"]:
+                    fn = copy.deepcopy(exports["funcs"][al.name])
+                    fn.name = local_name
+                    imported.append(fn)
+                elif al.name in exports["assigns"]:
+                    imported.append(
+                        ast.Assign(
+                            targets=[ast.Name(id=local_name, ctx=ast.Store())],
+                            value=copy.deepcopy(exports["assigns"][al.name]),
+                        )
+                    )
+            if imported:
+                new_body.extend(imported)
+                changed = True
+            else:
+                new_body.append(st)
+            continue
+        new_body.append(st)
+
+    if module_attr_renames:
+        class _LocalModuleAttrRewriter(ast.NodeTransformer):
+            def visit_Attribute(self, node):
+                node = self.generic_visit(node)
+                if (
+                    isinstance(node.ctx, ast.Load)
+                    and isinstance(node.value, ast.Name)
+                    and (node.value.id, node.attr) in module_attr_renames
+                ):
+                    return ast.copy_location(
+                        ast.Name(id=module_attr_renames[(node.value.id, node.attr)], ctx=ast.Load()),
+                        node,
+                    )
+                return node
+
+        new_body = [_LocalModuleAttrRewriter().visit(st) for st in new_body]
+        changed = True
+
+    if changed:
+        out = ast.Module(body=new_body, type_ignores=getattr(tree, "type_ignores", []))
+        return ast.fix_missing_locations(out)
+    return tree
 
 
 def collect_structured_dtype_info(tree):
@@ -9793,6 +9863,35 @@ class translator(ast.NodeVisitor):
         if have is None or have == want:
             return arg_expr
         if want == "char":
+            if isinstance(arg_node, ast.BinOp) and isinstance(arg_node.op, ast.Mult):
+                def _int_of_char_expr(n):
+                    if (
+                        isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Name)
+                        and n.func.id == "int"
+                        and len(n.args) == 1
+                        and self._expr_kind(n.args[0]) == "char"
+                    ):
+                        return self.expr(n.args[0])
+                    return None
+
+                def _power_of_ten_zeros(n):
+                    if isinstance(n, ast.Constant) and isinstance(n.value, int) and n.value > 0:
+                        txt = str(int(n.value))
+                        if txt == "1" + ("0" * (len(txt) - 1)):
+                            return "0" * (len(txt) - 1)
+                    return None
+
+                left_char = _int_of_char_expr(arg_node.left)
+                right_zeros = _power_of_ten_zeros(arg_node.right)
+                if left_char is not None and right_zeros:
+                    return f"({left_char} // {fstr(right_zeros)})"
+                right_char = _int_of_char_expr(arg_node.right)
+                left_zeros = _power_of_ten_zeros(arg_node.left)
+                if right_char is not None and left_zeros:
+                    return f"({right_char} // {fstr(left_zeros)})"
+            if have in {"int", "real", "logical", "complex"}:
+                return f"py_str({arg_expr})"
             return arg_expr
         if want == "complex":
             if have == "real":
@@ -15311,6 +15410,21 @@ class translator(ast.NodeVisitor):
 
         if isinstance(node, ast.ListComp):
             # Support simple 1-generator comprehensions with elementwise lowering.
+            if (
+                len(node.generators) == 1
+                and isinstance(node.generators[0].target, ast.Name)
+                and isinstance(node.generators[0].iter, ast.Call)
+                and isinstance(node.generators[0].iter.func, ast.Name)
+                and node.generators[0].iter.func.id == "str"
+                and len(node.generators[0].iter.args) == 1
+                and isinstance(node.elt, ast.Call)
+                and isinstance(node.elt.func, ast.Name)
+                and node.elt.func.id == "int"
+                and len(node.elt.args) == 1
+                and isinstance(node.elt.args[0], ast.Name)
+                and node.elt.args[0].id == node.generators[0].target.id
+            ):
+                return f"digits_of_str(py_str({self.expr(node.generators[0].iter.args[0])}))"
             if (
                 len(node.generators) == 2
                 and all(isinstance(g.target, ast.Name) for g in node.generators)
