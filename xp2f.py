@@ -7303,6 +7303,64 @@ def _subst_lambda_expr_body(lam_node, call_node):
     return out
 
 
+def _simple_function_as_lambda(fn_node):
+    """Represent a simple nested ``def`` with one return statement as a lambda."""
+    if not isinstance(fn_node, ast.FunctionDef):
+        return None
+    if fn_node.decorator_list:
+        return None
+    args = fn_node.args
+    if args.vararg is not None or args.kwarg is not None:
+        return None
+    if args.kwonlyargs or args.defaults or args.kw_defaults:
+        return None
+    body = list(fn_node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Return) or body[0].value is None:
+        return None
+    out = ast.Lambda(args=copy.deepcopy(args), body=copy.deepcopy(body[0].value))
+    return ast.copy_location(out, fn_node)
+
+
+def _value_returns_excluding_nested(fn_node):
+    """Return value-return nodes in fn_node, ignoring nested scopes."""
+    if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return []
+
+    class _ReturnVisitor(ast.NodeVisitor):
+        def __init__(self, root):
+            self.root = root
+            self.returns = []
+
+        def visit_FunctionDef(self, node):
+            if node is self.root:
+                self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            if node is self.root:
+                self.generic_visit(node)
+
+        def visit_Lambda(self, node):
+            return None
+
+        def visit_ClassDef(self, node):
+            return None
+
+        def visit_Return(self, node):
+            if node.value is not None:
+                self.returns.append(node)
+
+    visitor = _ReturnVisitor(fn_node)
+    visitor.visit(fn_node)
+    return visitor.returns
+
+
 def _specialize_local_fn_with_lambda(fn_node, arg_index, lam_node, new_name):
     """Clone fn_node, remove arg_index, and inline calls to removed callable arg."""
     if not isinstance(fn_node, ast.FunctionDef):
@@ -11229,7 +11287,7 @@ class translator(ast.NodeVisitor):
                 if node.func.id in self.lambda_vars:
                     repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
                     if repl is not None:
-                        return self.expr(repl)
+                        return self._expr_kind(repl)
                 if node.func.id in self.user_class_types:
                     return None
                 if node.func.id in self.local_func_arg_ranks:
@@ -31546,7 +31604,7 @@ def _emit_local_function(
     # lowering inside procedure bodies.
     none_optional_args = {nm for nm, dv in defaults_map.items() if is_none(dv)}
     if dict_return_spec is None:
-        ret_vals = [s.value for s in ast.walk(fn) if isinstance(s, ast.Return) and s.value is not None]
+        ret_vals = [s.value for s in _value_returns_excluding_nested(fn)]
         if ret_vals and all(isinstance(v, ast.Name) and v.id == ret_vals[0].id for v in ret_vals):
             cand = ret_vals[0].id
             if cand not in args:
@@ -31704,6 +31762,11 @@ def _emit_local_function(
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
+    for _st_nested_fn in fn.body:
+        if isinstance(_st_nested_fn, ast.FunctionDef):
+            _nested_lam = _simple_function_as_lambda(_st_nested_fn)
+            if _nested_lam is not None:
+                tr.lambda_vars[_st_nested_fn.name] = _nested_lam
     for _arg in args:
         if _char_scalar_arg_pattern_local(_arg):
             tr.alloc_char_rank.pop(_arg, None)
@@ -33532,7 +33595,7 @@ def _emit_local_function(
                 tr.local_elemental_funcs.discard(fn.name)
                 break
 
-    returns = [s for s in ast.walk(fn) if isinstance(s, ast.Return) and s.value is not None]
+    returns = _value_returns_excluding_nested(fn)
     tuple_return = False
     out_names = []
     dict_return = dict_return_spec is not None
@@ -36458,6 +36521,8 @@ def _emit_local_function(
     if keep_decl_blank:
         o.w("")
     for i, s in enumerate(fn.body):
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
         if (
             dict_return
             and isinstance(s, ast.Assign)
