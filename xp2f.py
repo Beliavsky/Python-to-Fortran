@@ -48,6 +48,23 @@ AUTO_ELEMENTAL = False
 SHOW_NOOP_NOTES = False
 PERCENT_FLOAT_INT_FORMAT = False
 
+_ROUND_FLOAT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
+)
+
+
+def _round_float_token(token: str, digits: int) -> str:
+    try:
+        val = float(token.replace("d", "e").replace("D", "E"))
+    except ValueError:
+        return token
+    return f"{val:.{digits}f}"
+
+
+def _round_output_text(text: str, digits: int) -> str:
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _ROUND_FLOAT_TOKEN_RE.sub(lambda m: _round_float_token(m.group(1), digits), s)
+
 
 def normalize_numpy_removed_aliases(src_text):
     """Canonicalize removed NumPy scalar aliases to supported forms."""
@@ -66,6 +83,32 @@ def normalize_numpy_removed_aliases(src_text):
         return alias_map[attr].format(root=root)
 
     return pat.sub(_repl, src_text)
+
+
+def remove_allocatable_shadow_decls(lines):
+    """Drop scalar block declarations that shadow an existing allocatable target."""
+    alloc_names = set()
+    decl_re = re.compile(r"\ballocatable\s*::\s*(.+)$", re.IGNORECASE)
+    name_re = re.compile(r"\b([A-Za-z]\w*)\s*\(")
+    for line in lines:
+        m = decl_re.search(line)
+        if not m:
+            continue
+        for nm in name_re.findall(m.group(1)):
+            alloc_names.add(nm.lower())
+
+    out = []
+    scalar_decl_re = re.compile(r"^(\s*)integer\s*::\s*([A-Za-z]\w*)\s*$", re.IGNORECASE)
+    for i, line in enumerate(lines):
+        m = scalar_decl_re.match(line)
+        if m and m.group(2).lower() in alloc_names:
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == "":
+                j += 1
+            if j < len(lines) and re.search(rf"\ballocated\s*\(\s*{re.escape(m.group(2))}\s*\)", lines[j], re.IGNORECASE):
+                continue
+        out.append(line)
+    return out
 
 
 def run_capture(cmd, tee=False, stream_line_filter=None, env=None):
@@ -4142,6 +4185,12 @@ def detect_needed_helpers(tree):
                 return [cur.id] + list(reversed(parts))
 
             if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "print"
+                and any(kw.arg == "sep" for kw in getattr(node, "keywords", []))
+            ):
+                needed.add("py_str")
+            if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "csv"
@@ -7431,12 +7480,24 @@ def _value_returns_excluding_nested(fn_node):
     return visitor.returns
 
 
-def _specialize_local_fn_with_lambda(fn_node, arg_index, lam_node, new_name):
+def _specialize_local_fn_with_lambda(
+    fn_node,
+    arg_index,
+    lam_node,
+    new_name,
+    fn_map=None,
+    specialized=None,
+    name_factory=None,
+    stack=None,
+):
     """Clone fn_node, remove arg_index, and inline calls to removed callable arg."""
     if not isinstance(fn_node, ast.FunctionDef):
         return None
     if not (0 <= arg_index < len(fn_node.args.args)):
         return None
+    fn_map = fn_map or {}
+    stack = set(stack or set())
+    stack.add((fn_node.name, arg_index))
     param = fn_node.args.args[arg_index].arg
     # Ensure removed parameter is only used as call target.
     for n in ast.walk(fn_node):
@@ -7449,7 +7510,14 @@ def _specialize_local_fn_with_lambda(fn_node, arg_index, lam_node, new_name):
                         break
                 if p is not None:
                     break
-            if not (isinstance(p, ast.Call) and p.func is n):
+            ok_direct_call = isinstance(p, ast.Call) and p.func is n
+            ok_forward_arg = (
+                isinstance(p, ast.Call)
+                and isinstance(p.func, ast.Name)
+                and p.func.id in fn_map
+                and any(ch is n for ch in p.args)
+            )
+            if not (ok_direct_call or ok_forward_arg):
                 return None
 
     new_fn = copy.deepcopy(fn_node)
@@ -7470,6 +7538,40 @@ def _specialize_local_fn_with_lambda(fn_node, arg_index, lam_node, new_name):
                 if repl is None:
                     raise NotImplementedError("lambda specialization failed for call shape")
                 return repl
+            if isinstance(node.func, ast.Name) and node.func.id in fn_map:
+                for i, a in enumerate(list(node.args)):
+                    if not (isinstance(a, ast.Name) and a.id == param):
+                        continue
+                    callee = fn_map.get(node.func.id)
+                    if not isinstance(callee, ast.FunctionDef):
+                        continue
+                    if i >= len(callee.args.args):
+                        continue
+                    if (callee.name, i) in stack:
+                        continue
+                    if name_factory is None:
+                        continue
+                    callee_name = name_factory(callee.name)
+                    new_callee = _specialize_local_fn_with_lambda(
+                        callee,
+                        i,
+                        lam_node,
+                        callee_name,
+                        fn_map=fn_map,
+                        specialized=specialized,
+                        name_factory=name_factory,
+                        stack=set(stack),
+                    )
+                    if new_callee is None:
+                        continue
+                    fn_map[callee_name] = new_callee
+                    if specialized is not None:
+                        specialized.append(new_callee)
+                    node.func = ast.Name(id=callee_name, ctx=ast.Load())
+                    del node.args[i]
+                    pname = callee.args.args[i].arg
+                    node.keywords = [kw for kw in node.keywords if kw.arg != pname]
+                    return node
             return node
 
     try:
@@ -7504,6 +7606,11 @@ def specialize_lambda_function_args(exec_body, local_funcs):
         def visit_Call(self, node):
             nonlocal counter
             self.generic_visit(node)
+            def _new_lambda_special_name(base):
+                nonlocal counter
+                counter += 1
+                return f"{base}_lam_{counter}"
+
             while True:
                 if not (isinstance(node.func, ast.Name) and node.func.id in fn_map):
                     return node
@@ -7520,9 +7627,16 @@ def specialize_lambda_function_args(exec_body, local_funcs):
                         continue
                     if i >= len(fn.args.args):
                         continue
-                    counter += 1
-                    new_name = f"{fn.name}_lam_{counter}"
-                    new_fn = _specialize_local_fn_with_lambda(fn, i, lam, new_name)
+                    new_name = _new_lambda_special_name(fn.name)
+                    new_fn = _specialize_local_fn_with_lambda(
+                        fn,
+                        i,
+                        lam,
+                        new_name,
+                        fn_map=fn_map,
+                        specialized=specialized,
+                        name_factory=_new_lambda_special_name,
+                    )
                     if new_fn is None:
                         continue
                     fn_map[new_name] = new_fn
@@ -7544,9 +7658,16 @@ def specialize_lambda_function_args(exec_body, local_funcs):
                     idx = next((j for j, aa in enumerate(fn.args.args) if aa.arg == kw.arg), -1)
                     if idx < 0:
                         continue
-                    counter += 1
-                    new_name = f"{fn.name}_lam_{counter}"
-                    new_fn = _specialize_local_fn_with_lambda(fn, idx, kw.value, new_name)
+                    new_name = _new_lambda_special_name(fn.name)
+                    new_fn = _specialize_local_fn_with_lambda(
+                        fn,
+                        idx,
+                        kw.value,
+                        new_name,
+                        fn_map=fn_map,
+                        specialized=specialized,
+                        name_factory=_new_lambda_special_name,
+                    )
                     if new_fn is None:
                         continue
                     fn_map[new_name] = new_fn
@@ -8235,22 +8356,12 @@ def normalize_numpy_shape_assignments(exec_body, local_funcs):
             args=[
                 ast.Name(id=src, ctx=ast.Load()),
                 ast.Tuple(
-                    elts=(list(reversed(shape_elts)) if len(shape_elts) == 2 else shape_elts),
+                    elts=shape_elts,
                     ctx=ast.Load(),
                 ),
             ],
             keywords=[],
         )
-        if len(shape_elts) == 2:
-            call = ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="np", ctx=ast.Load()),
-                    attr="transpose",
-                    ctx=ast.Load(),
-                ),
-                args=[call],
-                keywords=[],
-            )
         return src, alias, ast.copy_location(
             ast.Assign(targets=[ast.Name(id=alias, ctx=ast.Store())], value=call),
             st,
@@ -10368,8 +10479,6 @@ class translator(ast.NodeVisitor):
 
     def _mark_real(self, name, kind_tag=None):
         if name == "_":
-            return
-        if name in self.reserved_names:
             return
         if name in self.params:
             return
@@ -17391,6 +17500,13 @@ class translator(ast.NodeVisitor):
                     fn = "zeros_logical" if node.func.attr == "zeros" else "ones_logical"
                 else:
                     fn = "zeros_real" if node.func.attr == "zeros" else "ones_real"
+                dims_list = self._shape_dim_exprs(node.args[0])
+                if len(dims_list) > 1:
+                    total_expr = " * ".join(f"({d})" for d in dims_list)
+                    dims = ", ".join(dims_list)
+                    if len(dims_list) == 2:
+                        return f"reshape({fn}(int({total_expr})), [{dims}], order=[2, 1])"
+                    return f"reshape({fn}(int({total_expr})), [{dims}])"
                 return f"{fn}(int({n_expr}))"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -23789,6 +23905,12 @@ class translator(ast.NodeVisitor):
                 and len(v.args) >= 1
                 and isinstance(v.args[0], (ast.Tuple, ast.List))
             )
+            _argsort_assign = (
+                isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Attribute)
+                and is_numpy_name_node(v.func.value)
+                and v.func.attr == "argsort"
+            )
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
             _tuple_out_or_src_names = set(self.tuple_return_out_names or []) | set(getattr(self, "tuple_return_src_names", []) or [])
             if rk is not None and t.id in _tuple_out_or_src_names:
@@ -23796,6 +23918,15 @@ class translator(ast.NodeVisitor):
             if is_function_result_target:
                 rk = None
             if _stack_array_assign:
+                rk = None
+            if _argsort_assign:
+                rk = None
+            if (
+                rk is not None
+                and self._aliased_name(t.id) in self.alloc_ints
+                and rk[0] == "int"
+                and int(rk[1]) > 0
+            ):
                 rk = None
             if rk is not None:
                 k_vis0, _r_vis0 = self._visible_kind_rank(t.id)
@@ -24949,7 +25080,7 @@ class translator(ast.NodeVisitor):
             outs = []
             for e in t.elts:
                 if isinstance(e, ast.Name):
-                    outs.append(e.id)
+                    outs.append(self._aliased_name(e.id))
                 elif isinstance(e, ast.Starred):
                     outs.append("_")
                 else:
@@ -27583,10 +27714,11 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "argsort"
             and len(v.args) >= 1
         ):
-            name = t.id
+            name = self._aliased_name(t.id)
             a0 = self.expr(v.args[0])
-            self.o.w(f"if (allocated({name})) deallocate({name})")
-            self.o.w(f"allocate({name}(1:size({a0})))")
+            if name in self.alloc_ints:
+                self.o.w(f"if (allocated({name})) deallocate({name})")
+                self.o.w(f"allocate({name}(1:size({a0})))")
             self.o.w(f"call argsort({a0}, {name})")
             return
 
@@ -28917,6 +29049,95 @@ class translator(ast.NodeVisitor):
                     enum_start_node = kw.value
             enum_start_txt = "0" if enum_start_node is None else self.expr(enum_start_node)
             _emit_for_over_rank1_iter(seq_node, t_val.id, idx_name=t_idx.id, enum_start_txt=enum_start_txt)
+            return
+
+        # for a, b in zip(seq_a, seq_b, ...):
+        if (
+            isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "zip"
+            and isinstance(node.target, (ast.Tuple, ast.List))
+            and len(node.iter.args) == len(node.target.elts)
+            and len(node.iter.args) >= 1
+            and all(isinstance(t, ast.Name) for t in node.target.elts)
+        ):
+            seq_nodes = list(node.iter.args)
+            tgt_names = [t.id for t in node.target.elts]
+            if any(self._rank_expr(s) < 1 for s in seq_nodes):
+                raise NotImplementedError("zip loop currently expects rank-1 iterables")
+            kinds = [self._expr_kind(s) or "int" for s in seq_nodes]
+            supported = {"int", "real", "logical", "char"}
+            if any(k not in supported for k in kinds):
+                raise NotImplementedError("zip loop kind unsupported")
+            iz = "i_zip"
+            n_zip_name = "n_zip"
+            self._mark_int(iz)
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {iz}, {n_zip_name}")
+            zip_arr_names = []
+            for j, (s, k) in enumerate(zip(seq_nodes, kinds)):
+                arr = f"zip_arr_{node.lineno}_{j}"
+                if isinstance(s, ast.Name):
+                    zip_arr_names.append(self._aliased_name(self._resolve_list_alias(s.id)))
+                else:
+                    zip_arr_names.append(arr)
+                    if k == "real":
+                        self.o.w(f"real(kind=dp), allocatable :: {arr}(:)")
+                    elif k == "logical":
+                        self.o.w(f"logical, allocatable :: {arr}(:)")
+                    elif k == "char":
+                        self.o.w(f"character(len=:), allocatable :: {arr}(:)")
+                    else:
+                        self.o.w(f"integer, allocatable :: {arr}(:)")
+            for arr, s in zip(zip_arr_names, seq_nodes):
+                if not isinstance(s, ast.Name):
+                    self.o.w(f"{arr} = {self.expr(s)}")
+            size_terms = [f"size({arr})" for arr in zip_arr_names]
+            if len(size_terms) == 1:
+                n_expr = size_terms[0]
+            else:
+                n_expr = f"min({', '.join(size_terms)})"
+            self.o.w(f"{n_zip_name} = {n_expr}")
+            self.o.w(f"do {iz} = 1, {n_zip_name}")
+            self.o.push()
+            class _ZipTargetRewriter(ast.NodeTransformer):
+                def __init__(self, target_to_seq):
+                    self.target_to_seq = target_to_seq
+
+                def visit_Name(self, n):
+                    if isinstance(n.ctx, ast.Load) and n.id in self.target_to_seq:
+                        seq_name = self.target_to_seq[n.id]
+                        idx = ast.BinOp(
+                            left=ast.Name(id=iz, ctx=ast.Load()),
+                            op=ast.Sub(),
+                            right=ast.Constant(value=1),
+                        )
+                        return ast.copy_location(
+                            ast.Subscript(
+                                value=ast.Name(id=seq_name, ctx=ast.Load()),
+                                slice=idx,
+                                ctx=ast.Load(),
+                            ),
+                            n,
+                        )
+                    return n
+
+            _target_map = {
+                tgt: arr
+                for tgt, arr in zip(tgt_names, zip_arr_names)
+                if tgt != "_"
+            }
+            _old_body = node.body
+            try:
+                node.body = [_ZipTargetRewriter(_target_map).visit(copy.deepcopy(s)) for s in _old_body]
+                _visit_loop_body_and_close_rebinds()
+            finally:
+                node.body = _old_body
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         # for i, j in itertools.product(a, b):
@@ -30582,7 +30803,7 @@ class translator(ast.NodeVisitor):
                 cl = code.lower()
                 if cl in {"d", "i", "o", "u", "x"}:
                     if width is not None:
-                        _iw = max(int(width), 4)
+                        _iw = int(width)
                         items.append(("desc", f"i{_iw}", an, False))
                     else:
                         items.append(("desc", "i0", an, False))
@@ -30596,13 +30817,13 @@ class translator(ast.NodeVisitor):
                         continue
                     if int_scalar and PERCENT_FLOAT_INT_FORMAT:
                         if width is not None:
-                            _iw = max(int(width), 4)
+                            _iw = int(width)
                             items.append(("desc", f"i{_iw}", an, False))
                         else:
                             items.append(("desc", "i0", an, False))
                     else:
                         if width is not None and prec is not None:
-                            _fw = max(int(width), int(prec) + 8)
+                            _fw = int(width)
                             items.append(("desc", f"{cl}{_fw}.{prec}", an, int_scalar))
                         elif width is not None:
                             # Width-only float descriptors are not directly portable
@@ -30687,12 +30908,18 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"write({unit_txt},{fstr(ffmt)}{adv})")
 
         end_txt = None
+        sep_txt = " "
         for kw in getattr(call, "keywords", []):
             if kw.arg == "end":
                 if is_const_str(kw.value):
                     end_txt = kw.value.value
                 else:
                     raise NotImplementedError("print(end=...) currently supports only string literals")
+            elif kw.arg == "sep":
+                if is_const_str(kw.value):
+                    sep_txt = kw.value.value
+                else:
+                    raise NotImplementedError("print(sep=...) currently supports only string literals")
             elif kw.arg == "file":
                 unit_txt = self.expr(kw.value)
         advance_no = (end_txt == "")
@@ -30813,13 +31040,18 @@ class translator(ast.NodeVisitor):
                             self.o.w(f"write({unit_txt},*) {self.expr(a)}")
                 return
             parts = []
-            for a in call.args:
+            for i_arg, a in enumerate(call.args):
+                if i_arg > 0 and sep_txt != "":
+                    parts.append(fstr(sep_txt))
                 if is_const_str(a):
                     parts.append(fstr(a.value))
                 elif isinstance(a, ast.JoinedStr):
                     raise NotImplementedError("f-string in multi-argument print not supported")
                 else:
-                    parts.append(self.expr(a))
+                    expr_txt = self.expr(a)
+                    if sep_txt != " " and self._rank_expr(a) == 0 and self._expr_kind(a) not in {"char", "str"}:
+                        expr_txt = f"py_str({expr_txt})"
+                    parts.append(expr_txt)
             if unit_txt == "*":
                 self.o.w("print *, " + ", ".join(parts))
             else:
@@ -32437,12 +32669,15 @@ def _emit_local_function(
             continue
         if a.arg in dict_arg_names:
             continue
+        forced_scalar_args_for_emit = set(getattr(fn, "_xp2f_force_scalar_args", set()))
         _force_rr1 = (
             a.arg in shape_assigned_args_for_emit
             or any(_assign_self_vectorizes_to_rank1(_st, a.arg) for _st in fn.body)
         )
-        rr = 0 if is_elemental_fn else _pre_arg_rank(a.arg)
-        if _force_rr1:
+        rr = 0 if is_elemental_fn or a.arg in forced_scalar_args_for_emit else _pre_arg_rank(a.arg)
+        if a.arg in forced_scalar_args_for_emit:
+            rr = 0
+        elif _force_rr1:
             rr = 1
         else:
             rr = max(rr, _arg_self_normalized_rank(a.arg))
@@ -32485,7 +32720,7 @@ def _emit_local_function(
             and _arg_used_as_index_or_range(a.arg)
         ):
             rk_hint = "int"
-        if (not _force_rr1) and (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
+        if (a.arg not in forced_scalar_args_for_emit) and (not _force_rr1) and (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
@@ -35116,6 +35351,7 @@ def _emit_local_function(
         hint_kind = None
         decl_kind = None
         idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
+        forced_scalar_args_for_emit = set(getattr(fn, "_xp2f_force_scalar_args", set()))
         comment_arg_kind, comment_arg_rank = _comment_arg_spec_hint_for_emit(fn, arg)
         forced_arg_kind = force_arg_kinds is not None and arg in force_arg_kinds
         if force_arg_kinds is not None and arg in force_arg_kinds:
@@ -35181,7 +35417,7 @@ def _emit_local_function(
                 and idx < len(local_func_arg_kinds[fn.name])
             ):
                 local_func_arg_kinds[fn.name][idx] = "logical"
-        arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
+        arr_rank = 0 if is_elemental_fn or arg in forced_scalar_args_for_emit else _arg_array_rank(arg)
         _local_rank_hint = 0
         if not is_elemental_fn:
             for _st in fn.body:
@@ -35196,10 +35432,11 @@ def _emit_local_function(
                         and _n.value.attr == "shape"
                     ):
                         _local_rank_hint = max(_local_rank_hint, len(_n.targets[0].elts))
-        arr_rank = max(arr_rank, _self_norm_rank)
+        if arg not in forced_scalar_args_for_emit:
+            arr_rank = max(arr_rank, _self_norm_rank)
         if force_arg_ranks is not None and arg in force_arg_ranks:
             arr_rank = int(force_arg_ranks[arg])
-        elif _self_norm_rank == 1:
+        elif arg not in forced_scalar_args_for_emit and _self_norm_rank == 1:
             arr_rank = 1
         if (
             comment_arg_rank is not None
@@ -35214,20 +35451,22 @@ def _emit_local_function(
                 arr_rank = max(arr_rank, int(comment_arg_rank))
         if (hint_kind == "char" or arg in tr.char_scalar_names) and _char_scalar_arg_pattern_local(arg):
             arr_rank = 0
-        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_real_rank:
+        if arg in forced_scalar_args_for_emit:
+            arr_rank = 0
+        if _self_norm_rank != 1 and arg not in forced_scalar_args_for_emit and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_real_rank:
             arr_rank = max(arr_rank, int(tr.alloc_real_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_int_rank:
+        if _self_norm_rank != 1 and arg not in forced_scalar_args_for_emit and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_int_rank:
             arr_rank = max(arr_rank, int(tr.alloc_int_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_log_rank:
+        if _self_norm_rank != 1 and arg not in forced_scalar_args_for_emit and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_log_rank:
             arr_rank = max(arr_rank, int(tr.alloc_log_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_complex_rank:
+        if _self_norm_rank != 1 and arg not in forced_scalar_args_for_emit and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_complex_rank:
             arr_rank = max(arr_rank, int(tr.alloc_complex_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_char_rank:
+        if _self_norm_rank != 1 and arg not in forced_scalar_args_for_emit and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_char_rank:
             arr_rank = max(arr_rank, int(tr.alloc_char_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
+        if _self_norm_rank != 1 and arg not in forced_scalar_args_for_emit and (force_arg_ranks is None or arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 arr_rank = max(arr_rank, int(local_func_arg_ranks[fn.name][idx]))
-        if not is_elemental_fn:
+        if not is_elemental_fn and arg not in forced_scalar_args_for_emit:
             arr_rank = max(arr_rank, _local_rank_hint)
         for _st in fn.body:
             for _n in ast.walk(_st):
@@ -38857,18 +39096,28 @@ def generate_flat(
                 ):
                     local_func_arg_ranks[fn.name][_i] = max(_curr_rank, int(_cr))
         _rank_sets = call_rank_sets.get(fn.name, [])
+        _force_scalar_args = set(getattr(fn, "_xp2f_force_scalar_args", set()))
         for _i, _arg_nm in enumerate(local_func_arg_names[fn.name]):
             if _i >= len(local_func_arg_ranks[fn.name]) or _i >= len(_rank_sets):
                 continue
             _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _arg_nm)
+            _seen_ranks = {int(_r) for _r in _rank_sets[_i]}
             if (
                 _cr is not None
                 and int(_cr) > 0
                 and _rank_sets[_i]
-                and 0 in {int(_r) for _r in _rank_sets[_i]}
+                and 0 in _seen_ranks
                 and not _arg_has_array_body_evidence_for_fn(fn, _arg_nm)
             ):
                 local_func_arg_ranks[fn.name][_i] = 0
+            if (
+                _seen_ranks == {0}
+                and not _arg_has_array_body_evidence_for_fn(fn, _arg_nm)
+            ):
+                local_func_arg_ranks[fn.name][_i] = 0
+                _force_scalar_args.add(_arg_nm)
+        if _force_scalar_args:
+            setattr(fn, "_xp2f_force_scalar_args", _force_scalar_args)
         _shape_assigned_names = set(getattr(fn, "_xp2f_shape_assigned_names", set()))
         for _i, _arg_nm in enumerate(local_func_arg_names[fn.name]):
             if _arg_nm in _shape_assigned_names and _i < len(local_func_arg_ranks[fn.name]):
@@ -39459,14 +39708,44 @@ def generate_flat(
                             return True
                 return False
             _fn_actual = fn_map.get(_actual_name)
+            _cb_sig_pre = cb_sig.get((_callee_name, _cbp))
+            _wrapper_arg_kinds_pre = dict(_cb_sig_pre[4]) if _cb_sig_pre is not None and len(_cb_sig_pre) > 4 else {}
+            _actual_arg_names_pre = list(local_func_arg_names.get(_actual_name, []))
+            def _return_uses_arg_with_wrapper_kind(*wanted_kinds):
+                if _fn_actual is None:
+                    return None
+                for _ret in ast.walk(_fn_actual):
+                    if not (isinstance(_ret, ast.Return) and _ret.value is not None):
+                        continue
+                    for _ia, _arg_name in enumerate(_actual_arg_names_pre):
+                        _wk = _wrapper_arg_kinds_pre.get(_ia)
+                        if _wk not in wanted_kinds:
+                            continue
+                        if any(isinstance(_n, ast.Name) and _n.id == _arg_name for _n in ast.walk(_ret.value)):
+                            return _wk
+                return None
             _has_real_evidence = _fn_has_real_evidence(_fn_actual)
             _callee_has_real_evidence = _fn_has_real_evidence(fn_map.get(_callee_name))
             _has_logical_evidence = _fn_has_logical_evidence(_fn_actual)
+            _arg_real_kind = _return_uses_arg_with_wrapper_kind("real", "complex")
             if _ret_kind == "real":
-                if not _has_real_evidence and not _callee_has_real_evidence and not _has_logical_evidence:
+                if _arg_real_kind in {"real", "complex"}:
+                    _ret_kind = _arg_real_kind
+                elif not _has_real_evidence and not _callee_has_real_evidence and not _has_logical_evidence:
                     _ret_kind = "int"
             elif _ret_kind == "int" and _callee_has_real_evidence:
                 _ret_kind = "real"
+            elif _ret_kind == "int" and _arg_real_kind in {"real", "complex"}:
+                _ret_kind = _arg_real_kind
+            if _arg_real_kind in {"real", "complex"}:
+                local_return_specs[_actual_name] = _arg_real_kind
+                _actual_kinds_for_cb = local_func_arg_kinds.setdefault(
+                    _actual_name,
+                    [None for _ in local_func_arg_names.get(_actual_name, [])],
+                )
+                for _ia, _arg_name in enumerate(_actual_arg_names_pre):
+                    if _ia < len(_actual_kinds_for_cb) and _wrapper_arg_kinds_pre.get(_ia) == _arg_real_kind:
+                        _actual_kinds_for_cb[_ia] = _arg_real_kind
             if _ret_kind not in {"int", "real", "complex", "logical", "char"}:
                 return
             _force_integer_actual = (
@@ -39958,8 +40237,13 @@ def generate_flat(
                 break
         for _fn_name, _base_ranks in base_func_arg_ranks.items():
             _curr_ranks = local_func_arg_ranks.get(_fn_name, [])
+            _call_sets_for_fn = call_rank_sets.get(_fn_name, [])
             for _i, _br in enumerate(_base_ranks):
-                if _br > 0 and _i < len(_curr_ranks) and int(_curr_ranks[_i]) > int(_br):
+                _has_higher_call_rank = (
+                    _i < len(_call_sets_for_fn)
+                    and any(int(_r) > int(_br) for _r in _call_sets_for_fn[_i])
+                )
+                if (not _has_higher_call_rank) and _br > 0 and _i < len(_curr_ranks) and int(_curr_ranks[_i]) > int(_br):
                     _curr_ranks[_i] = int(_br)
         for _fn in local_funcs:
             _ranks = local_func_arg_ranks.get(_fn.name, [])
@@ -43286,6 +43570,7 @@ def transpile_file(
         f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
     if list_directed_io:
         f90_lines = rewrite_to_list_directed_io(f90_lines)
+    f90_lines = remove_allocatable_shadow_decls(f90_lines)
     f90_lines = reconcile_allocatable_decl_ranks(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
@@ -43450,6 +43735,12 @@ def main():
     ap.add_argument("--list-directed-io", action="store_true", help="rewrite formatted write/print to list-directed output")
     ap.add_argument("--compile", action="store_true", help="compile transpiled source with helper files")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
+    ap.add_argument("--check-fortran", action="store_true", help="run fast generated-Fortran preflight diagnostics")
+    ap.add_argument(
+        "--compile-fast-fail",
+        action="store_true",
+        help="with --compile/--run, skip the compiler when generated-Fortran preflight diagnostics fail",
+    )
     ap.add_argument("--run-both", action="store_true", help="run original Python and transpiled Fortran (no timing)")
     ap.add_argument("--run-diff", action="store_true", help="run Python and Fortran and compare outputs")
     ap.add_argument("--run-diff-display-tol", type=float, help="with --run-diff, use a looser display-oriented relative tolerance for formatted numeric output")
@@ -43459,6 +43750,20 @@ def main():
     ap.add_argument("--tee-rng-replay", action="store_true", help="print the generated Python RNG-replay wrapper source")
     ap.add_argument("--out-rng-replay-python", help="write the generated Python RNG-replay wrapper to this path and keep it")
     ap.add_argument("--pretty", action="store_true", help="pretty-format Fortran runtime output")
+    ap.add_argument(
+        "--round",
+        type=int,
+        default=None,
+        metavar="N",
+        help="round floating-point data in displayed Fortran runtime output to N decimal places",
+    )
+    ap.add_argument(
+        "--round-both",
+        type=int,
+        default=None,
+        metavar="N",
+        help="round floating-point data in displayed Python and Fortran runtime output to N decimal places",
+    )
     ap.add_argument("--tee", action="store_true", help="stream output while running transpiled Fortran")
     ap.add_argument("--tee-orig", action="store_true", help="print original input source text")
     ap.add_argument("--tee-both", action="store_true", help="stream output while running both Python and Fortran")
@@ -43478,6 +43783,15 @@ def main():
         help='compiler command; default is debug/checking flags, e.g. "gfortran -O3 -march=native -Wfatal-errors"',
     )
     args = ap.parse_args()
+    if args.round is not None and args.round < 0:
+        print("Option error: --round requires a nonnegative integer.")
+        return 1
+    if args.round_both is not None and args.round_both < 0:
+        print("Option error: --round-both requires a nonnegative integer.")
+        return 1
+    if args.round is not None and args.round_both is not None:
+        print("Options conflict: --round and --round-both cannot be used together.")
+        return 1
     global PERCENT_FLOAT_INT_FORMAT
     PERCENT_FLOAT_INT_FORMAT = bool(args.percent_float_int_format)
     if any(ch in args.input_py for ch in "*?[]"):
@@ -43518,6 +43832,8 @@ def main():
         args.run = True
         if not saw_compiler:
             args.compiler = default_timing_compiler_command()
+    if args.compile_fast_fail:
+        args.check_fortran = True
 
     if args.strict_fix_inplace and (not args.strict_fix):
         print("Strict-fix: FAIL (--strict-fix-inplace requires --strict-fix)")
@@ -43600,11 +43916,22 @@ def main():
         inferred_path.write_text(inferred_text, encoding="utf-8")
         print(f"Inferred: wrote {inferred_path}")
 
-    def _pretty_text(text):
-        return fout.pretty_output_text(text, float_digits=None, trim=True) if args.pretty else text
+    python_round_digits = args.round_both
+    fortran_round_digits = args.round if args.round is not None else args.round_both
 
-    def _pretty_line(line):
-        return fout.pretty_output_line(line, float_digits=None, trim=True) if args.pretty else line
+    def _display_text(text, *, pretty=False, round_digits=None):
+        if pretty:
+            text = fout.pretty_output_text(text, float_digits=None, trim=True)
+        if round_digits is not None:
+            text = _round_output_text(text, round_digits)
+        return text
+
+    def _display_line(line, *, pretty=False, round_digits=None):
+        if pretty:
+            line = fout.pretty_output_line(line, float_digits=None, trim=True)
+        if round_digits is not None:
+            line = _round_output_text(line, round_digits)
+        return line
 
     timings = {}
     t0_total = time.perf_counter()
@@ -43739,7 +44066,16 @@ def main():
             replay_env["XP2F_RNG_REPLAY_STEM"] = str(replay_stem)
             print(f"RNG replay: {replay_stem}.meta {replay_stem}.bin")
         t0_py = time.perf_counter() if args.time_both else None
-        py_rc, py_out, py_err, py_live = run_capture(py_cmd, tee=args.tee_both, env=py_env)
+        py_rc, py_out, py_err, py_live = run_capture(
+            py_cmd,
+            tee=args.tee_both,
+            stream_line_filter=(
+                (lambda line: _display_line(line, round_digits=python_round_digits))
+                if python_round_digits is not None
+                else None
+            ),
+            env=py_env,
+        )
         if wrapper_path is not None and (not wrapper_keep):
             try:
                 wrapper_path.unlink(missing_ok=True)
@@ -43756,17 +44092,17 @@ def main():
         if py_rc != 0:
             print(f"Run (python): FAIL (exit {py_rc})")
             if (not py_live) and py_out.strip():
-                print(py_out.rstrip())
+                print(_display_text(py_out, round_digits=python_round_digits).rstrip())
             if (not py_live) and py_err.strip():
-                print(py_err.rstrip())
+                print(_display_text(py_err, round_digits=python_round_digits).rstrip())
             _emit_timing_summary()
             _emit_autofix_report()
             return py_rc
         print("Run (python): PASS")
         if (not py_live) and py_out.strip():
-            print(py_out.rstrip())
+            print(_display_text(py_out, round_digits=python_round_digits).rstrip())
         if (not py_live) and py_err.strip():
-            print(py_err.rstrip())
+            print(_display_text(py_err, round_digits=python_round_digits).rstrip())
         py_run = subprocess.CompletedProcess(py_cmd, py_rc, py_out, py_err)
 
     def _format_transpile_error(exc, src_text):
@@ -43887,6 +44223,33 @@ def main():
         except Exception:
             pass
 
+    fortran_check_failed = False
+    if args.check_fortran:
+        try:
+            from fortran_check import check_fortran_text, format_diagnostics
+
+            out_text = Path(out).read_text(encoding="utf-8", errors="ignore")
+            fortran_diags = check_fortran_text(out_text)
+        except Exception as e:
+            print(f"Fortran check: ERROR ({e})")
+            if args.compile_fast_fail:
+                _emit_timing_summary()
+                _emit_autofix_report()
+                return 1
+        else:
+            if fortran_diags:
+                fortran_check_failed = True
+                print(f"Fortran check: FAIL ({len(fortran_diags)} issue(s))")
+                for line in format_diagnostics(fortran_diags):
+                    print(line)
+            else:
+                print("Fortran check: PASS")
+
+    if args.compile_fast_fail and fortran_check_failed:
+        _emit_timing_summary()
+        _emit_autofix_report()
+        return 1
+
     if args.compile or args.run:
         compiler_parts = shlex.split(args.compiler)
         if args.time:
@@ -43919,9 +44282,9 @@ def main():
             _emit_timing_summary()
             _emit_autofix_report()
             return helper_cp.returncode
+        exe = out.with_suffix(".exe")
         cmd = compiler_parts + [*(helper_link_inputs or []), str(out)]
-        if args.run:
-            exe = out.with_suffix(".exe")
+        if args.run or args.compile:
             cmd = cmd + ["-o", str(exe)]
         print("Build:", " ".join(cmd))
         cp = subprocess.run(cmd, capture_output=True, text=True)
@@ -43970,16 +44333,27 @@ def main():
         if args.run:
             t0_run = time.perf_counter()
             rp_rc, rp_out, rp_err, rp_live = run_capture(
-                [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None, env=replay_env
+                [str(exe)],
+                tee=args.tee,
+                stream_line_filter=(
+                    lambda line: _display_line(
+                        line,
+                        pretty=args.pretty,
+                        round_digits=fortran_round_digits,
+                    )
+                )
+                if (args.pretty or fortran_round_digits is not None)
+                else None,
+                env=replay_env,
             )
             timings["fortran_run"] = time.perf_counter() - t0_run
             if rp_rc != 0:
                 raw_run_status = "fail"
                 print(f"Run: FAIL (exit {rp_rc})")
                 if (not rp_live) and rp_out.strip():
-                    print(_pretty_text(rp_out).rstrip())
+                    print(_display_text(rp_out, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                 if (not rp_live) and rp_err.strip():
-                    print(_pretty_text(rp_err).rstrip())
+                    print(_display_text(rp_err, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                 if args.autofix:
                     autofix_runtime_status = "attempted"
                     af_rc = _run_xautofix([*helper_files, out], runtime=True)
@@ -44003,16 +44377,27 @@ def main():
                         print("Build: PASS")
                         t0_run_retry = time.perf_counter()
                         rp_rc, rp_out, rp_err, rp_live = run_capture(
-                            [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None, env=replay_env
+                            [str(exe)],
+                            tee=args.tee,
+                            stream_line_filter=(
+                                lambda line: _display_line(
+                                    line,
+                                    pretty=args.pretty,
+                                    round_digits=fortran_round_digits,
+                                )
+                            )
+                            if (args.pretty or fortran_round_digits is not None)
+                            else None,
+                            env=replay_env,
                         )
                         timings["fortran_run"] = timings.get("fortran_run", 0.0) + (time.perf_counter() - t0_run_retry)
                         if rp_rc != 0:
                             final_run_status = "fail"
                             print(f"Run: FAIL (exit {rp_rc})")
                             if (not rp_live) and rp_out.strip():
-                                print(_pretty_text(rp_out).rstrip())
+                                print(_display_text(rp_out, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                             if (not rp_live) and rp_err.strip():
-                                print(_pretty_text(rp_err).rstrip())
+                                print(_display_text(rp_err, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                             _emit_timing_summary()
                             _emit_autofix_report()
                             return rp_rc
@@ -44037,16 +44422,27 @@ def main():
                     else:
                         print("Debug rebuild: PASS")
                         dbg_rc, dbg_out, dbg_err, dbg_live = run_capture(
-                            [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None, env=replay_env
+                            [str(exe)],
+                            tee=args.tee,
+                            stream_line_filter=(
+                                lambda line: _display_line(
+                                    line,
+                                    pretty=args.pretty,
+                                    round_digits=fortran_round_digits,
+                                )
+                            )
+                            if (args.pretty or fortran_round_digits is not None)
+                            else None,
+                            env=replay_env,
                         )
                         if dbg_rc != 0:
                             print(f"Debug run: FAIL (exit {dbg_rc})")
                         else:
                             print("Debug run: PASS")
                         if (not dbg_live) and dbg_out.strip():
-                            print(_pretty_text(dbg_out).rstrip())
+                            print(_display_text(dbg_out, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                         if (not dbg_live) and dbg_err.strip():
-                            print(_pretty_text(dbg_err).rstrip())
+                            print(_display_text(dbg_err, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                     _emit_timing_summary()
                     _emit_autofix_report()
                     return rp_rc
@@ -44055,9 +44451,9 @@ def main():
                 final_run_status = "pass"
             print("Run: PASS")
             if (not rp_live) and rp_out.strip():
-                print(_pretty_text(rp_out).rstrip())
+                print(_display_text(rp_out, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
             if (not rp_live) and rp_err.strip():
-                print(_pretty_text(rp_err).rstrip())
+                print(_display_text(rp_err, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
             rp = subprocess.CompletedProcess([str(exe)], rp_rc, rp_out, rp_err)
             if args.run_diff and py_run is not None:
                 compare_tol = float(args.run_diff_display_tol) if args.run_diff_display_tol is not None else 1.0e-12
@@ -44254,8 +44650,6 @@ def main():
                         ls = line.lstrip().lower()
                         if (
                             ls.startswith("elapsed_time_seconds:")
-                            or ls.startswith("python version:")
-                            or ls.startswith("numpy version:")
                         ):
                             return True
                         # Timestamp-only lines from Python helpers like timestamp()
@@ -44403,6 +44797,10 @@ def main():
 
                 py_raw_text = (py_run.stdout or "") + (("\n" + py_run.stderr) if py_run.stderr else "")
                 ft_raw_text = (rp.stdout or "") + (("\n" + rp.stderr) if rp.stderr else "")
+                if python_round_digits is not None:
+                    py_raw_text = _round_output_text(py_raw_text, python_round_digits)
+                if fortran_round_digits is not None:
+                    ft_raw_text = _round_output_text(ft_raw_text, fortran_round_digits)
                 py_lines = _norm(py_raw_text)
                 ft_lines = _norm(ft_raw_text)
                 run_diff_display_match = False
