@@ -111,6 +111,164 @@ def remove_allocatable_shadow_decls(lines):
     return out
 
 
+def scalarize_do_loop_variable_decls(lines):
+    """Ensure Fortran DO loop control variables are scalar integers."""
+    loop_vars = set()
+    do_re = re.compile(r"^\s*do\s+([A-Za-z]\w*)\s*=", re.IGNORECASE)
+    for line in lines:
+        m = do_re.match(line)
+        if m:
+            loop_vars.add(m.group(1).lower())
+    if not loop_vars:
+        return lines
+
+    def _split_entities(rhs):
+        parts = []
+        cur = []
+        depth = 0
+        for ch in rhs:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                item = "".join(cur).strip()
+                if item:
+                    parts.append(item)
+                cur = []
+                continue
+            cur.append(ch)
+        item = "".join(cur).strip()
+        if item:
+            parts.append(item)
+        return parts
+
+    decl_re = re.compile(r"^(\s*)integer\s*,\s*allocatable\s*::\s*(.+?)\s*$", re.IGNORECASE)
+    ent_re = re.compile(r"^\s*([A-Za-z]\w*)\s*\(")
+    out = []
+    for line in lines:
+        m = decl_re.match(line.rstrip("\r\n"))
+        if not m:
+            out.append(line)
+            continue
+        indent = m.group(1)
+        eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+        kept = []
+        scalarized = []
+        for ent in _split_entities(m.group(2)):
+            em = ent_re.match(ent)
+            if em and em.group(1).lower() in loop_vars:
+                scalarized.append(em.group(1))
+            else:
+                kept.append(ent)
+        if kept:
+            out.append(f"{indent}integer, allocatable :: {', '.join(kept)}{eol}")
+        for nm in scalarized:
+            out.append(f"{indent}integer :: {nm}{eol}")
+    return out
+
+
+def collapse_redundant_integer_rebind_blocks(lines):
+    """Remove generated integer rebind blocks that only shadow an existing scalar."""
+    scalar_ints = set()
+    int_decl_re = re.compile(r"^\s*integer\s*::\s*([A-Za-z]\w*)\s*$", re.IGNORECASE)
+    block_re = re.compile(r"^(\s*)block\s*$", re.IGNORECASE)
+    assign_re = re.compile(r"^\s*([A-Za-z]\w*)\s*=", re.IGNORECASE)
+    end_block_re = re.compile(r"^\s*end\s+block\s*$", re.IGNORECASE)
+    flow_re = re.compile(r"^\s*(?:exit|cycle)(?:\s+[A-Za-z]\w*)?\s*$", re.IGNORECASE)
+
+    out = []
+    i = 0
+    while i < len(lines):
+        raw = lines[i].rstrip("\r\n")
+        if block_re.match(raw) and i + 3 < len(lines):
+            decl = lines[i + 1].rstrip("\r\n")
+            dm = int_decl_re.match(decl)
+            if dm:
+                name = dm.group(1)
+                lname = name.lower()
+                am = assign_re.match(lines[i + 2].rstrip("\r\n"))
+                next_idx = i + 3
+                flow_line = None
+                if next_idx < len(lines) and flow_re.match(lines[next_idx].rstrip("\r\n")):
+                    flow_line = lines[next_idx]
+                    next_idx += 1
+                if (
+                    lname in scalar_ints
+                    and am
+                    and am.group(1).lower() == lname
+                    and next_idx < len(lines)
+                    and end_block_re.match(lines[next_idx].rstrip("\r\n"))
+                ):
+                    out.append(lines[i + 2])
+                    if flow_line is not None:
+                        out.append(flow_line)
+                    i = next_idx + 1
+                    continue
+        m = int_decl_re.match(raw)
+        if m:
+            scalar_ints.add(m.group(1).lower())
+        out.append(lines[i])
+        i += 1
+    return out
+
+
+def enforce_comment_array_dummy_decls(lines):
+    """Use emitted Burkardt-style comments to keep array dummies ranked."""
+    comment_re = re.compile(
+        r"^\s*!\s*(?:integer|int|real|float|logical|bool|complex|character|string|str)\s+([A-Za-z]\w*)\s*[\(\[]",
+        re.IGNORECASE,
+    )
+    decl_re = re.compile(
+        r"^(\s*)((?:real\s*\(kind=dp\)|integer|logical|complex\s*\(kind=dp\)|character\s*\(len=:\))\s*,\s*[^:]*\bintent\s*\([^)]*\)[^:]*)::\s*([A-Za-z]\w*)\s*$",
+        re.IGNORECASE,
+    )
+    proc_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+
+    def _apply_block(block):
+        hinted_arrays = set()
+        for line in block:
+            m = comment_re.match(line)
+            if m:
+                hinted_arrays.add(m.group(1).lower())
+        if not hinted_arrays:
+            return block
+        out_block = []
+        for line in block:
+            raw = line.rstrip("\r\n")
+            eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+            m = decl_re.match(raw)
+            if not m or m.group(3).lower() not in hinted_arrays:
+                out_block.append(line)
+                continue
+            out_block.append(f"{m.group(1)}{m.group(2).rstrip()} :: {m.group(3)}(:){eol}")
+        return out_block
+
+    out = []
+    block = []
+    in_proc = False
+    for line in lines:
+        if (not in_proc) and proc_start_re.match(line):
+            in_proc = True
+            block = [line]
+            continue
+        if not in_proc:
+            out.append(line)
+            continue
+        block.append(line)
+        if proc_end_re.match(line):
+            out.extend(_apply_block(block))
+            block = []
+            in_proc = False
+    if block:
+        out.extend(_apply_block(block))
+    return out
+
+
 def run_capture(cmd, tee=False, stream_line_filter=None, env=None):
     """
     Run command and capture output.
@@ -39112,6 +39270,7 @@ def generate_flat(
                 local_func_arg_ranks[fn.name][_i] = 0
             if (
                 _seen_ranks == {0}
+                and not (_cr is not None and int(_cr) > 0)
                 and not _arg_has_array_body_evidence_for_fn(fn, _arg_nm)
             ):
                 local_func_arg_ranks[fn.name][_i] = 0
@@ -40238,11 +40397,25 @@ def generate_flat(
         for _fn_name, _base_ranks in base_func_arg_ranks.items():
             _curr_ranks = local_func_arg_ranks.get(_fn_name, [])
             _call_sets_for_fn = call_rank_sets.get(_fn_name, [])
+            _arg_names_for_fn = local_func_arg_names.get(_fn_name, [])
+            _fn_node_for_rank = local_fn_map.get(_fn_name)
             for _i, _br in enumerate(_base_ranks):
                 _has_higher_call_rank = (
                     _i < len(_call_sets_for_fn)
                     and any(int(_r) > int(_br) for _r in _call_sets_for_fn[_i])
                 )
+                _comment_rank_cap = None
+                if _fn_node_for_rank is not None and _i < len(_arg_names_for_fn):
+                    _ck_cap, _cr_cap = _comment_arg_spec_hint_for_fn(_fn_node_for_rank, _arg_names_for_fn[_i])
+                    if _cr_cap is not None and int(_cr_cap) > 0:
+                        _comment_rank_cap = int(_cr_cap)
+                if (
+                    _comment_rank_cap is not None
+                    and _i < len(_curr_ranks)
+                    and int(_curr_ranks[_i]) > _comment_rank_cap
+                ):
+                    _curr_ranks[_i] = _comment_rank_cap
+                    continue
                 if (not _has_higher_call_rank) and _br > 0 and _i < len(_curr_ranks) and int(_curr_ranks[_i]) > int(_br):
                     _curr_ranks[_i] = int(_br)
         for _fn in local_funcs:
@@ -41048,6 +41221,27 @@ def generate_flat(
     def _fn_requires_rank1_arg(fn_node, arg_name):
         if _char_scalar_arg_pattern(fn_node, arg_name):
             return False
+        def _assigned_target_rank(_target):
+            if not isinstance(_target, ast.Name):
+                return 0
+            _nm = _target.id
+            for _use in ast.walk(fn_node):
+                if not isinstance(_use, ast.Call):
+                    continue
+                if (
+                    isinstance(_use.func, ast.Attribute)
+                    and is_numpy_name_node(_use.func.value)
+                    and _use.func.attr in {"dot", "sum", "mean", "std", "var", "prod", "max", "min"}
+                    and any(isinstance(_n, ast.Name) and _n.id == _nm for _n in ast.walk(_use))
+                ):
+                    return 1
+                if (
+                    isinstance(_use.func, ast.Name)
+                    and _use.func.id in {"dot", "sum", "mean", "std", "var", "prod", "max", "min"}
+                    and any(isinstance(_n, ast.Name) and _n.id == _nm for _n in ast.walk(_use))
+                ):
+                    return 1
+            return 0
         for st in ast.walk(fn_node):
             if (
                 isinstance(st, ast.Assign)
@@ -41058,6 +41252,14 @@ def generate_flat(
             ):
                 return True
             if isinstance(st, ast.Subscript) and isinstance(st.value, ast.Name) and st.value.id == arg_name:
+                return True
+            if (
+                isinstance(st, ast.Assign)
+                and len(st.targets) == 1
+                and _assigned_target_rank(st.targets[0]) > 0
+                and any(isinstance(_n, ast.Name) and _n.id == arg_name for _n in ast.walk(st.value))
+                and isinstance(st.value, (ast.BinOp, ast.UnaryOp, ast.Compare))
+            ):
                 return True
             if (
                 isinstance(st, ast.Call)
@@ -41077,6 +41279,15 @@ def generate_flat(
             ):
                 return True
         return False
+
+    for _fn_rank_fix in (local_funcs or []):
+        _arg_names_rank_fix = list(local_func_arg_names.get(_fn_rank_fix.name, []))
+        _ranks_rank_fix = local_func_arg_ranks.get(_fn_rank_fix.name)
+        if not _arg_names_rank_fix or _ranks_rank_fix is None:
+            continue
+        for _i_rank_fix, _arg_rank_fix in enumerate(_arg_names_rank_fix):
+            if _i_rank_fix < len(_ranks_rank_fix) and _fn_requires_rank1_arg(_fn_rank_fix, _arg_rank_fix):
+                _ranks_rank_fix[_i_rank_fix] = max(int(_ranks_rank_fix[_i_rank_fix]), 1)
 
     for fn in (local_funcs or []):
         if fn.name in local_overload_specs:
@@ -43571,6 +43782,9 @@ def transpile_file(
     if list_directed_io:
         f90_lines = rewrite_to_list_directed_io(f90_lines)
     f90_lines = remove_allocatable_shadow_decls(f90_lines)
+    f90_lines = scalarize_do_loop_variable_decls(f90_lines)
+    f90_lines = collapse_redundant_integer_rebind_blocks(f90_lines)
+    f90_lines = enforce_comment_array_dummy_decls(f90_lines)
     f90_lines = reconcile_allocatable_decl_ranks(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
