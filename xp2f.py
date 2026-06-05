@@ -181,6 +181,130 @@ def enforce_comment_array_dummy_decls(lines):
     return out
 
 
+def _source_comment_inference_hints(tree, comment_map):
+    """Return comment-derived argument hints keyed by procedure and argument."""
+    hints = {}
+    if not comment_map:
+        return hints
+
+    def _kind_from_token(token):
+        token = token.lower()
+        if token in {"integer", "int"}:
+            return "int"
+        if token in {"real", "float"}:
+            return "real"
+        if token in {"logical", "bool"}:
+            return "logical"
+        if token == "complex":
+            return "complex"
+        if token in {"character", "string", "str"}:
+            return "char"
+        return None
+
+    type_re = re.compile(
+        r"^\s*(integer|int|real|float|logical|bool|complex|character|string|str)\s+(.+)$",
+        re.IGNORECASE,
+    )
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        start = max(1, int(getattr(fn, "lineno", 1)))
+        end = int(getattr(fn, "end_lineno", start))
+        args = [a.arg for a in list(fn.args.args) + list(fn.args.kwonlyargs)]
+        if not args:
+            continue
+        proc_hints = hints.setdefault(fn.name.lower(), {})
+        for ln in range(start, end + 1):
+            for comment in comment_map.get(ln, []):
+                m = type_re.match(comment)
+                if not m:
+                    continue
+                kind = _kind_from_token(m.group(1))
+                if kind is None:
+                    continue
+                rest = m.group(2).split(":", 1)[0]
+                for token in _comment_decl_tokens(rest):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    for arg in args:
+                        rank = _comment_token_rank_for_name(token, arg)
+                        if rank is not None:
+                            proc_hints[arg.lower()] = {
+                                "kind": kind,
+                                "rank": int(rank),
+                                "line": ln,
+                            }
+    return {k: v for k, v in hints.items() if v}
+
+
+def _split_fortran_decl_entities(rhs):
+    parts = []
+    cur = []
+    depth = 0
+    for ch in rhs:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            item = "".join(cur).strip()
+            if item:
+                parts.append(item)
+            cur = []
+            continue
+        cur.append(ch)
+    item = "".join(cur).strip()
+    if item:
+        parts.append(item)
+    return parts
+
+
+def add_inference_explanation_comments(lines, tree, comment_map):
+    """Annotate generated Fortran declarations with non-semantic inference notes."""
+    hints = _source_comment_inference_hints(tree, comment_map)
+    if not hints:
+        return lines
+    proc_start_re = re.compile(
+        r"^(\s*)(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:function|subroutine)\s+([A-Za-z]\w*)\b",
+        re.IGNORECASE,
+    )
+    proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+    decl_re = re.compile(r"^(\s*)[^!]*\bintent\s*\([^)]*\)[^!]*::\s*([^!]+)", re.IGNORECASE)
+    name_re = re.compile(r"^\s*([A-Za-z]\w*)")
+
+    out = []
+    current_proc = None
+    for line in lines:
+        sm = proc_start_re.match(line)
+        if sm:
+            current_proc = sm.group(2).lower()
+            out.append(line)
+            continue
+        if current_proc and proc_end_re.match(line):
+            current_proc = None
+            out.append(line)
+            continue
+        proc_hints = hints.get(current_proc or "")
+        dm = decl_re.match(line)
+        if proc_hints and dm:
+            notes = []
+            for ent in _split_fortran_decl_entities(dm.group(2)):
+                nm = name_re.match(ent)
+                if not nm:
+                    continue
+                hint = proc_hints.get(nm.group(1).lower())
+                if not hint:
+                    continue
+                notes.append(
+                    f"{nm.group(1)} kind={hint['kind']} rank={hint['rank']} "
+                    f"from Python comment line {hint['line']}"
+                )
+            if notes:
+                out.append(f"{dm.group(1)}! xp2f inference: {'; '.join(notes)}")
+        out.append(line)
+    return out
+
+
 def run_capture(cmd, tee=False, stream_line_filter=None, env=None):
     """
     Run command and capture output.
@@ -43273,6 +43397,7 @@ def transpile_file(
     flat,
     no_comment=False,
     ignore_comments=False,
+    explain_inference=False,
     out_path=None,
     postprocess=False,
     list_directed_io=False,
@@ -43645,6 +43770,8 @@ def transpile_file(
     f90_lines = reconcile_allocatable_decl_ranks(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
+    if explain_inference:
+        f90_lines = add_inference_explanation_comments(f90_lines, tree, comment_map)
     # Apply final structural whitespace consistently for default and
     # postprocessed output.
     f90_lines = fpost.ensure_blank_lines_around_units_and_procedures(f90_lines)
@@ -43848,6 +43975,7 @@ def main():
     ap.add_argument("--time-both", action="store_true", help="time both original Python run and transpiled Fortran run (implies --run)")
     ap.add_argument("--comment", action="store_true", help="emit generated procedure/argument comments")
     ap.add_argument("--ignore-comments", action="store_true", help="ignore source comments as type/rank inference hints")
+    ap.add_argument("--explain-inference", action="store_true", help="emit non-semantic Fortran comments explaining weak/comment-derived inference hints")
     ap.add_argument(
         "--compiler",
         default=default_compiler_command(),
@@ -44239,6 +44367,7 @@ def main():
             args.flat,
             no_comment=(not args.comment),
             ignore_comments=args.ignore_comments,
+            explain_inference=args.explain_inference,
             out_path=args.out,
             postprocess=args.postprocess,
             list_directed_io=args.list_directed_io,
