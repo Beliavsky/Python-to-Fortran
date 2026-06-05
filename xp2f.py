@@ -111,360 +111,15 @@ def remove_allocatable_shadow_decls(lines):
     return out
 
 
-def scalarize_do_loop_variable_decls(lines):
-    """Ensure Fortran DO loop control variables are scalar integers."""
-    def _split_entities(rhs):
-        parts = []
-        cur = []
-        depth = 0
-        for ch in rhs:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth = max(0, depth - 1)
-            if ch == "," and depth == 0:
-                item = "".join(cur).strip()
-                if item:
-                    parts.append(item)
-                cur = []
-                continue
-            cur.append(ch)
-        item = "".join(cur).strip()
-        if item:
-            parts.append(item)
-        return parts
-
-    def _scalarize_block(block):
-        loop_vars = set()
-        do_re = re.compile(r"^\s*do\s+([A-Za-z]\w*)\s*=", re.IGNORECASE)
-        for line in block:
-            m = do_re.match(line)
-            if m:
-                loop_vars.add(m.group(1).lower())
-        if not loop_vars:
-            return block
-
-        decl_re = re.compile(r"^(\s*)integer\s*,\s*allocatable\s*::\s*(.+?)\s*$", re.IGNORECASE)
-        ent_re = re.compile(r"^\s*([A-Za-z]\w*)\s*\(")
-        out_block = []
-        for line in block:
-            m = decl_re.match(line.rstrip("\r\n"))
-            if not m:
-                out_block.append(line)
-                continue
-            indent = m.group(1)
-            eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
-            kept = []
-            scalarized = []
-            for ent in _split_entities(m.group(2)):
-                em = ent_re.match(ent)
-                if em and em.group(1).lower() in loop_vars:
-                    scalarized.append(em.group(1))
-                else:
-                    kept.append(ent)
-            if kept:
-                out_block.append(f"{indent}integer, allocatable :: {', '.join(kept)}{eol}")
-            for nm in scalarized:
-                out_block.append(f"{indent}integer :: {nm}{eol}")
-        return out_block
-
-    unit_start_re = re.compile(
-        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:program|function|subroutine)\b",
-        re.IGNORECASE,
-    )
-    unit_end_re = re.compile(r"^\s*end\s+(?:program|function|subroutine)\b", re.IGNORECASE)
-    out = []
-    block = []
-    in_unit = False
-    for line in lines:
-        if (not in_unit) and unit_start_re.match(line):
-            in_unit = True
-            block = [line]
-            continue
-        if not in_unit:
-            out.append(line)
-            continue
-        block.append(line)
-        if unit_end_re.match(line):
-            out.extend(_scalarize_block(block))
-            block = []
-            in_unit = False
-    if block:
-        out.extend(_scalarize_block(block))
-    return out
-
-
-def collapse_redundant_integer_rebind_blocks(lines):
-    """Remove generated integer rebind blocks that only shadow an existing scalar."""
-    scalar_ints = set()
-    int_decl_re = re.compile(r"^\s*integer\s*::\s*([A-Za-z]\w*)\s*$", re.IGNORECASE)
-    block_re = re.compile(r"^(\s*)block\s*$", re.IGNORECASE)
-    assign_re = re.compile(r"^\s*([A-Za-z]\w*)\s*=", re.IGNORECASE)
-    end_block_re = re.compile(r"^\s*end\s+block\s*$", re.IGNORECASE)
-    flow_re = re.compile(r"^\s*(?:exit|cycle)(?:\s+[A-Za-z]\w*)?\s*$", re.IGNORECASE)
-
-    out = []
-    i = 0
-    while i < len(lines):
-        raw = lines[i].rstrip("\r\n")
-        if block_re.match(raw) and i + 3 < len(lines):
-            decl = lines[i + 1].rstrip("\r\n")
-            dm = int_decl_re.match(decl)
-            if dm:
-                name = dm.group(1)
-                lname = name.lower()
-                am = assign_re.match(lines[i + 2].rstrip("\r\n"))
-                next_idx = i + 3
-                flow_line = None
-                if next_idx < len(lines) and flow_re.match(lines[next_idx].rstrip("\r\n")):
-                    flow_line = lines[next_idx]
-                    next_idx += 1
-                if (
-                    lname in scalar_ints
-                    and am
-                    and am.group(1).lower() == lname
-                    and next_idx < len(lines)
-                    and end_block_re.match(lines[next_idx].rstrip("\r\n"))
-                ):
-                    out.append(lines[i + 2])
-                    if flow_line is not None:
-                        out.append(flow_line)
-                    i = next_idx + 1
-                    continue
-        m = int_decl_re.match(raw)
-        if m:
-            scalar_ints.add(m.group(1).lower())
-        out.append(lines[i])
-        i += 1
-    return out
-
-
-def scalarize_unused_rank1_decls(lines):
-    """Undo rank-1 declarations for names that are never used as arrays."""
-
-    def _split_entities(rhs):
-        parts = []
-        cur = []
-        depth = 0
-        for ch in rhs:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth = max(0, depth - 1)
-            if ch == "," and depth == 0:
-                item = "".join(cur).strip()
-                if item:
-                    parts.append(item)
-                cur = []
-                continue
-            cur.append(ch)
-        item = "".join(cur).strip()
-        if item:
-            parts.append(item)
-        return parts
-
-    unit_start_re = re.compile(
-        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:program|function|subroutine)\b",
-        re.IGNORECASE,
-    )
-    unit_end_re = re.compile(r"^\s*end\s+(?:program|function|subroutine)\b", re.IGNORECASE)
-    local_int_decl_re = re.compile(r"^(\s*)integer\s*,\s*allocatable\s*::\s*(.+?)\s*$", re.IGNORECASE)
-    intent_out_real_re = re.compile(
-        r"^(\s*)real\s*\(kind=dp\)\s*,\s*allocatable\s*,\s*intent\s*\(out\)\s*::\s*([A-Za-z]\w*)\s*\(:\)\s*$",
-        re.IGNORECASE,
-    )
-    intent_in_int_re = re.compile(
-        r"^(\s*)integer\s*,\s*intent\s*\(in\)\s*::\s*([A-Za-z]\w*)\s*\(:\)\s*$",
-        re.IGNORECASE,
-    )
-    ent_re = re.compile(r"^\s*([A-Za-z]\w*)\s*\(:\)\s*$", re.IGNORECASE)
-    alloc_or_dealloc_re = lambda nm: re.compile(
-        rf"^\s*(?:if\s*\(\s*allocated\s*\(\s*{re.escape(nm)}\s*\)\s*\)\s*deallocate\s*\(\s*{re.escape(nm)}\s*\)|allocate\s*\(\s*{re.escape(nm)}\s*\([^)]*\)\s*\))\s*$",
-        re.IGNORECASE,
-    )
-
-    def _used_as_array(block, nm):
-        pat = re.compile(rf"\b{re.escape(nm)}\s*\(", re.IGNORECASE)
-        constructor_assign_re = re.compile(
-            rf"^\s*{re.escape(nm)}\s*=\s*(?:\[|arange_int|reshape|zeros_|ones_|empty_|full_|loadtxt_|pack\s*\()",
-            re.IGNORECASE,
-        )
-        declared_arrays = set()
-        decl_array_re = re.compile(r"\ballocatable\b.*::\s*(.+)$", re.IGNORECASE)
-        for decl_line in block:
-            if decl_line.lstrip().startswith("!") and re.search(rf"\b{re.escape(nm)}\s*[\(\[]", decl_line, re.IGNORECASE):
-                return True
-            dm = decl_array_re.search(decl_line.rstrip("\r\n"))
-            if not dm:
-                continue
-            for arr_nm in re.findall(r"\b([A-Za-z]\w*)\s*\(", dm.group(1)):
-                declared_arrays.add(arr_nm.lower())
-        for line in block:
-            raw = line.strip()
-            if raw.startswith("!") or "::" in raw:
-                continue
-            if constructor_assign_re.match(raw):
-                return True
-            if re.search(rf"\b(?:reshape|print_matrix)\s*\(\s*{re.escape(nm)}\b", raw, re.IGNORECASE):
-                return True
-            copy_m = re.match(rf"^{re.escape(nm)}\s*=\s*([A-Za-z]\w*)\s*$", raw, re.IGNORECASE)
-            if copy_m and copy_m.group(1).lower() != nm.lower() and copy_m.group(1).lower() in declared_arrays:
-                return True
-            if re.search(rf"\ballocated\s*\(\s*{re.escape(nm)}\s*\)", raw, re.IGNORECASE):
-                continue
-            if re.match(rf"^allocate\s*\(\s*{re.escape(nm)}\s*\(", raw, re.IGNORECASE):
-                return True
-            if pat.search(raw):
-                return True
-        return False
-
-    def _has_scalar_assignment(block, nm):
-        assign_re = re.compile(rf"^\s*{re.escape(nm)}\s*=\s*(.+?)\s*$", re.IGNORECASE)
-        for line in block:
-            raw = line.strip()
-            if raw.startswith("!") or "::" in raw:
-                continue
-            m = assign_re.match(raw)
-            if not m:
-                continue
-            rhs = m.group(1)
-            if re.match(r"^(?:\[|arange_int|reshape|zeros_|ones_|empty_|full_|loadtxt_|pack\s*\()", rhs, re.IGNORECASE):
-                continue
-            if re.match(r"^[A-Za-z]\w*\s*\(", rhs):
-                continue
-            return True
-        return False
-
-    def _has_scalar_comment(block, nm):
-        return any(
-            line.lstrip().startswith("!")
-            and re.search(rf"\binteger\s+{re.escape(nm)}\s*(?::|,|$)", line, re.IGNORECASE)
-            for line in block
-        )
-
-    def _apply_block(block):
-        scalarized = set()
-        out_block = []
-        for line in block:
-            raw = line.rstrip("\r\n")
-            eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
-            m_int = local_int_decl_re.match(raw)
-            if m_int:
-                kept = []
-                scalars = []
-                for ent in _split_entities(m_int.group(2)):
-                    em = ent_re.match(ent)
-                    if em and em.group(1).lower().startswith("tmp_out_"):
-                        kept.append(ent)
-                    elif em and _has_scalar_assignment(block, em.group(1)) and not _used_as_array(block, em.group(1)):
-                        scalars.append(em.group(1))
-                        scalarized.add(em.group(1).lower())
-                    else:
-                        kept.append(ent)
-                if kept:
-                    out_block.append(f"{m_int.group(1)}integer, allocatable :: {', '.join(kept)}{eol}")
-                for nm in scalars:
-                    out_block.append(f"{m_int.group(1)}integer :: {nm}{eol}")
-                continue
-            m_real = intent_out_real_re.match(raw)
-            if m_real and not _used_as_array(block, m_real.group(2)):
-                scalarized.add(m_real.group(2).lower())
-                out_block.append(f"{m_real.group(1)}real(kind=dp), intent(out) :: {m_real.group(2)}{eol}")
-                continue
-            m_int_in = intent_in_int_re.match(raw)
-            if m_int_in and _has_scalar_comment(block, m_int_in.group(2)) and not _used_as_array(block, m_int_in.group(2)):
-                scalarized.add(m_int_in.group(2).lower())
-                out_block.append(f"{m_int_in.group(1)}integer, intent(in) :: {m_int_in.group(2)}{eol}")
-                continue
-            out_block.append(line)
-        if not scalarized:
-            return out_block
-        filtered = []
-        skip_res = {nm: alloc_or_dealloc_re(nm) for nm in scalarized}
-        for line in out_block:
-            raw = line.rstrip("\r\n")
-            if any(rx.match(raw) for rx in skip_res.values()):
-                continue
-            filtered.append(line)
-        return filtered
-
-    out = []
-    block = []
-    in_unit = False
-    for line in lines:
-        if (not in_unit) and unit_start_re.match(line):
-            in_unit = True
-            block = [line]
-            continue
-        if not in_unit:
-            out.append(line)
-            continue
-        block.append(line)
-        if unit_end_re.match(line):
-            out.extend(_apply_block(block))
-            block = []
-            in_unit = False
-    if block:
-        out.extend(_apply_block(block))
-    return out
-
-
-def collapse_scalar_pairwise_index_blocks(lines):
-    """Collapse generated elementwise index blocks after scalar rank correction."""
-    scalar_ints = set()
-    int_decl_re = re.compile(r"^\s*integer(?:\s*,\s*intent\s*\([^)]*\))?\s*::\s*(.+?)\s*$", re.IGNORECASE)
-    block_re = re.compile(r"^(\s*)block\s*$", re.IGNORECASE)
-    n_pw_re = re.compile(r"^\s*n_pw\s*=\s*min\s*\(\s*size\s*\((.+)\)\s*,\s*size\s*\((.+)\)\s*\)\s*$", re.IGNORECASE)
-    do_re = re.compile(r"^\s*do\s+i_pw\s*=\s*1\s*,\s*n_pw\s*$", re.IGNORECASE)
-    end_do_re = re.compile(r"^\s*end\s+do\s*$", re.IGNORECASE)
-    end_block_re = re.compile(r"^\s*end\s+block\s*$", re.IGNORECASE)
-
-    def _expr_scalar(expr):
-        names = re.findall(r"\b[A-Za-z]\w*\b", expr)
-        keywords = {"size", "min", "max", "real", "int"}
-        return all((nm.lower() in scalar_ints or nm.lower() in keywords) for nm in names)
-
-    out = []
-    i = 0
-    while i < len(lines):
-        raw = lines[i].rstrip("\r\n")
-        dm = int_decl_re.match(raw)
-        if dm and "(" not in dm.group(1):
-            for _nm in re.findall(r"\b[A-Za-z]\w*\b", dm.group(1)):
-                scalar_ints.add(_nm.lower())
-        if block_re.match(raw) and i + 5 < len(lines):
-            decl_raw = lines[i + 1].rstrip("\r\n")
-            n_raw = lines[i + 2].rstrip("\r\n")
-            assign_line = lines[i + 4]
-            nm = n_pw_re.match(n_raw)
-            if (
-                re.match(r"^\s*integer\s*::\s*i_pw\s*,\s*n_pw\s*$", decl_raw, re.IGNORECASE)
-                and nm
-                and do_re.match(lines[i + 3].rstrip("\r\n"))
-                and end_do_re.match(lines[i + 5].rstrip("\r\n"))
-                and i + 6 < len(lines)
-                and end_block_re.match(lines[i + 6].rstrip("\r\n"))
-                and _expr_scalar(nm.group(1))
-                and _expr_scalar(nm.group(2))
-            ):
-                collapsed = assign_line
-                collapsed = collapsed.replace("(i_pw)", "")
-                out.append(collapsed)
-                i += 7
-                continue
-        out.append(lines[i])
-        i += 1
-    return out
-
-
 def enforce_comment_array_dummy_decls(lines):
-    """Use emitted Burkardt-style comments to keep array dummies ranked."""
+    """Promote scalar intent(in) dummies documented as arrays in comments."""
+
     comment_re = re.compile(
-        r"^\s*!\s*(?:integer|int|real|float|logical|bool|complex|character|string|str)\s+([A-Za-z]\w*)\s*[\(\[]",
+        r"^\s*!\s*(?:integer|int|real|float|logical|bool|complex|character|string|str)\s+(.+)$",
         re.IGNORECASE,
     )
     decl_re = re.compile(
-        r"^(\s*)((?:real\s*\(kind=dp\)|integer|logical|complex\s*\(kind=dp\)|character\s*\(len=:\))\s*,\s*[^:]*\bintent\s*\([^)]*\)[^:]*)::\s*([A-Za-z]\w*)\s*$",
+        r"^(\s*)((?:real\s*\(kind=dp\)|integer|logical|complex\s*\(kind=dp\)|character\s*\(len=:\))\s*,\s*[^:]*\bintent\s*\(\s*in\s*\)[^:]*)::\s*([A-Za-z]\w*)\s*$",
         re.IGNORECASE,
     )
     proc_start_re = re.compile(
@@ -473,62 +128,44 @@ def enforce_comment_array_dummy_decls(lines):
     )
     proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
 
-    def _apply_block(block, proc_kind):
-        hinted_arrays = set()
+    def _apply_block(block):
+        hinted_ranks = {}
         for line in block:
             m = comment_re.match(line)
-            if m:
-                hinted_arrays.add(m.group(1).lower())
-        if not hinted_arrays:
+            if not m:
+                continue
+            # Only the type-spec side is structured; prose after ":" may contain
+            # mathematical notation such as f(z), which is not a dummy rank hint.
+            spec = m.group(1).split(":", 1)[0]
+            for nm, dims in re.findall(r"\b([A-Za-z]\w*)\s*[\(\[]\s*([^\)\]]*)\s*[\)\]]", spec):
+                rank = len([part.strip() for part in dims.split(",") if part.strip()])
+                if rank > 0:
+                    hinted_ranks[nm.lower()] = max(hinted_ranks.get(nm.lower(), 0), rank)
+        if not hinted_ranks:
             return block
-        body_uses = set()
-        for line in block:
-            raw = line.rstrip("\r\n")
-            if raw.lstrip().startswith("!"):
-                continue
-            if "::" in raw:
-                continue
-            for nm in hinted_arrays:
-                if re.search(rf"\b{re.escape(nm)}\s*\(", raw, re.IGNORECASE):
-                    body_uses.add(nm)
-        if proc_kind == "function":
-            derived = {}
-            for line in block:
-                raw = line.rstrip("\r\n")
-                if raw.lstrip().startswith("!") or "::" in raw:
-                    continue
-                for nm in hinted_arrays:
-                    dm = re.match(rf"\s*([A-Za-z]\w*)\s*=\s*.*\b{re.escape(nm)}\b", raw, re.IGNORECASE)
-                    if dm:
-                        derived.setdefault(dm.group(1).lower(), set()).add(nm)
-            if derived:
-                for line in block:
-                    raw = line.rstrip("\r\n")
-                    if "dot_product" not in raw.lower():
-                        continue
-                    for tmp, names in derived.items():
-                        if re.search(rf"\bdot_product\s*\([^)]*\b{re.escape(tmp)}\b", raw, re.IGNORECASE):
-                            body_uses.update(names)
-        out_block = []
+        out = []
         for line in block:
             raw = line.rstrip("\r\n")
             eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
             m = decl_re.match(raw)
-            if not m or m.group(3).lower() not in hinted_arrays or m.group(3).lower() not in body_uses:
-                out_block.append(line)
+            if not m:
+                out.append(line)
                 continue
-            out_block.append(f"{m.group(1)}{m.group(2).rstrip()} :: {m.group(3)}(:){eol}")
-        return out_block
+            name = m.group(3)
+            rank = hinted_ranks.get(name.lower(), 0)
+            if rank <= 0:
+                out.append(line)
+                continue
+            dims = ",".join(":" for _ in range(rank))
+            out.append(f"{m.group(1)}{m.group(2).rstrip()} :: {name}({dims}){eol}")
+        return out
 
     out = []
     block = []
     in_proc = False
-    proc_kind = None
     for line in lines:
-        pm = proc_start_re.match(line)
-        if (not in_proc) and pm:
+        if not in_proc and proc_start_re.match(line):
             in_proc = True
-            proc_kind = pm.group(1).lower()
             block = [line]
             continue
         if not in_proc:
@@ -536,12 +173,11 @@ def enforce_comment_array_dummy_decls(lines):
             continue
         block.append(line)
         if proc_end_re.match(line):
-            out.extend(_apply_block(block, proc_kind))
+            out.extend(_apply_block(block))
             block = []
             in_proc = False
-            proc_kind = None
     if block:
-        out.extend(_apply_block(block, proc_kind))
+        out.extend(_apply_block(block))
     return out
 
 
@@ -38577,40 +38213,6 @@ def generate_flat(
         return _comment_arg_spec_hint_for_fn(fn, nm)[0]
 
     def _arg_has_array_body_evidence_for_fn(fn, nm):
-        def _is_data_use(expr):
-            if isinstance(expr, ast.Name) and expr.id == nm:
-                return True
-            if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Name) and expr.value.id == nm:
-                return True
-            if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name) and expr.value.id == nm:
-                return True
-            return False
-
-        derived_from_arg = set()
-        for _st in ast.walk(fn):
-            if (
-                isinstance(_st, ast.Assign)
-                and len(_st.targets) == 1
-                and isinstance(_st.targets[0], ast.Name)
-                and any(isinstance(_n, ast.Name) and _n.id == nm for _n in ast.walk(_st.value))
-            ):
-                derived_from_arg.add(_st.targets[0].id)
-        if derived_from_arg:
-            for _node in ast.walk(fn):
-                if not isinstance(_node, ast.Call):
-                    continue
-                _is_dot = False
-                if isinstance(_node.func, ast.Name) and _node.func.id in {"dot", "dot_product"}:
-                    _is_dot = True
-                elif (
-                    isinstance(_node.func, ast.Attribute)
-                    and is_numpy_name_node(_node.func.value)
-                    and _node.func.attr == "dot"
-                ):
-                    _is_dot = True
-                if _is_dot and any(isinstance(_n, ast.Name) and _n.id in derived_from_arg for _n in ast.walk(_node)):
-                    return True
-
         for _node in ast.walk(fn):
             if (
                 isinstance(_node, ast.Subscript)
@@ -38656,7 +38258,7 @@ def generate_flat(
                 if (
                     isinstance(_node.func, ast.Attribute)
                     and _node.func.attr in {"mean", "sum", "prod", "max", "min", "std", "var"}
-                    and _is_data_use(_node.func.value)
+                    and any(isinstance(_a, ast.Name) and _a.id == nm for _a in ast.walk(_node.func.value))
                 ):
                     return True
                 if (
@@ -38664,8 +38266,7 @@ def generate_flat(
                     and _node.func.attr in {"mean", "sum", "prod", "max", "min", "std", "var", "dot", "matmul"}
                     and isinstance(_node.func.value, ast.Name)
                     and _node.func.value.id in {"np", "numpy"}
-                    and len(_node.args) >= 1
-                    and _is_data_use(_node.args[0])
+                    and any(isinstance(_a, ast.Name) and _a.id == nm for _a in ast.walk(_node))
                 ):
                     return True
         return False
@@ -39556,27 +39157,7 @@ def generate_flat(
             if _i >= len(local_func_arg_ranks[fn.name]):
                 continue
             _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _arg_nm)
-            if _cr is not None and int(_cr) == 0:
-                if not _arg_has_array_body_evidence_for_fn(fn, _arg_nm):
-                    local_func_arg_ranks[fn.name][_i] = 0
-                    _force_scalar_args = set(getattr(fn, "_xp2f_force_scalar_args", set()))
-                    _force_scalar_args.add(_arg_nm)
-                    setattr(fn, "_xp2f_force_scalar_args", _force_scalar_args)
-                    continue
             if _cr is not None and int(_cr) > 0:
-                _rank_sets_for_arg = call_rank_sets.get(fn.name, [])
-                _seen_ranks_for_arg = (
-                    {int(_r) for _r in _rank_sets_for_arg[_i]}
-                    if _i < len(_rank_sets_for_arg)
-                    else set()
-                )
-                _has_array_evidence = _arg_has_array_body_evidence_for_fn(fn, _arg_nm)
-                _has_nonscalar_call_evidence = any(_r > 0 for _r in _seen_ranks_for_arg)
-                if (
-                    not _has_array_evidence
-                    and not _has_nonscalar_call_evidence
-                ):
-                    continue
                 _curr_rank = int(local_func_arg_ranks[fn.name][_i])
                 if not (
                     _curr_rank == 1
@@ -40727,25 +40308,11 @@ def generate_flat(
         for _fn_name, _base_ranks in base_func_arg_ranks.items():
             _curr_ranks = local_func_arg_ranks.get(_fn_name, [])
             _call_sets_for_fn = call_rank_sets.get(_fn_name, [])
-            _arg_names_for_fn = local_func_arg_names.get(_fn_name, [])
-            _fn_node_for_rank = local_fn_map.get(_fn_name)
             for _i, _br in enumerate(_base_ranks):
                 _has_higher_call_rank = (
                     _i < len(_call_sets_for_fn)
                     and any(int(_r) > int(_br) for _r in _call_sets_for_fn[_i])
                 )
-                _comment_rank_cap = None
-                if _fn_node_for_rank is not None and _i < len(_arg_names_for_fn):
-                    _ck_cap, _cr_cap = _comment_arg_spec_hint_for_fn(_fn_node_for_rank, _arg_names_for_fn[_i])
-                    if _cr_cap is not None and int(_cr_cap) > 0:
-                        _comment_rank_cap = int(_cr_cap)
-                if (
-                    _comment_rank_cap is not None
-                    and _i < len(_curr_ranks)
-                    and int(_curr_ranks[_i]) > _comment_rank_cap
-                ):
-                    _curr_ranks[_i] = _comment_rank_cap
-                    continue
                 if (not _has_higher_call_rank) and _br > 0 and _i < len(_curr_ranks) and int(_curr_ranks[_i]) > int(_br):
                     _curr_ranks[_i] = int(_br)
         for _fn in local_funcs:
@@ -41551,27 +41118,6 @@ def generate_flat(
     def _fn_requires_rank1_arg(fn_node, arg_name):
         if _char_scalar_arg_pattern(fn_node, arg_name):
             return False
-        def _assigned_target_rank(_target):
-            if not isinstance(_target, ast.Name):
-                return 0
-            _nm = _target.id
-            for _use in ast.walk(fn_node):
-                if not isinstance(_use, ast.Call):
-                    continue
-                if (
-                    isinstance(_use.func, ast.Attribute)
-                    and is_numpy_name_node(_use.func.value)
-                    and _use.func.attr in {"dot", "sum", "mean", "std", "var", "prod", "max", "min"}
-                    and any(isinstance(_n, ast.Name) and _n.id == _nm for _n in ast.walk(_use))
-                ):
-                    return 1
-                if (
-                    isinstance(_use.func, ast.Name)
-                    and _use.func.id in {"dot", "dot_product", "sum", "mean", "std", "var", "prod"}
-                    and any(isinstance(_n, ast.Name) and _n.id == _nm for _n in ast.walk(_use))
-                ):
-                    return 1
-            return 0
         for st in ast.walk(fn_node):
             if (
                 isinstance(st, ast.Assign)
@@ -41582,14 +41128,6 @@ def generate_flat(
             ):
                 return True
             if isinstance(st, ast.Subscript) and isinstance(st.value, ast.Name) and st.value.id == arg_name:
-                return True
-            if (
-                isinstance(st, ast.Assign)
-                and len(st.targets) == 1
-                and _assigned_target_rank(st.targets[0]) > 0
-                and any(isinstance(_n, ast.Name) and _n.id == arg_name for _n in ast.walk(st.value))
-                and isinstance(st.value, (ast.BinOp, ast.UnaryOp, ast.Compare))
-            ):
                 return True
             if (
                 isinstance(st, ast.Call)
@@ -41609,15 +41147,6 @@ def generate_flat(
             ):
                 return True
         return False
-
-    for _fn_rank_fix in (local_funcs or []):
-        _arg_names_rank_fix = list(local_func_arg_names.get(_fn_rank_fix.name, []))
-        _ranks_rank_fix = local_func_arg_ranks.get(_fn_rank_fix.name)
-        if not _arg_names_rank_fix or _ranks_rank_fix is None:
-            continue
-        for _i_rank_fix, _arg_rank_fix in enumerate(_arg_names_rank_fix):
-            if _i_rank_fix < len(_ranks_rank_fix) and _fn_requires_rank1_arg(_fn_rank_fix, _arg_rank_fix):
-                _ranks_rank_fix[_i_rank_fix] = max(int(_ranks_rank_fix[_i_rank_fix]), 1)
 
     for fn in (local_funcs or []):
         if fn.name in local_overload_specs:
@@ -44112,14 +43641,8 @@ def transpile_file(
     if list_directed_io:
         f90_lines = rewrite_to_list_directed_io(f90_lines)
     f90_lines = remove_allocatable_shadow_decls(f90_lines)
-    f90_lines = scalarize_do_loop_variable_decls(f90_lines)
-    f90_lines = collapse_redundant_integer_rebind_blocks(f90_lines)
     f90_lines = enforce_comment_array_dummy_decls(f90_lines)
-    f90_lines = scalarize_unused_rank1_decls(f90_lines)
-    f90_lines = collapse_scalar_pairwise_index_blocks(f90_lines)
     f90_lines = reconcile_allocatable_decl_ranks(f90_lines)
-    f90_lines = scalarize_unused_rank1_decls(f90_lines)
-    f90_lines = collapse_scalar_pairwise_index_blocks(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
     # Apply final structural whitespace consistently for default and
