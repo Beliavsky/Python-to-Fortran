@@ -13183,6 +13183,10 @@ class translator(ast.NodeVisitor):
                 base_r = self._rank_expr(node.value)
                 if base_r > 1:
                     return base_r
+                # Slicing a scalar string is a substring operation and stays
+                # a scalar character, not a rank-1 array.
+                if base_r == 0 and self._expr_kind(node.value) == "char":
+                    return 0
                 return 1
             # Vector subscript: x(idx_vec) is array-valued.
             sr = self._rank_expr(node.slice)
@@ -13597,7 +13601,7 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient", "ascontiguousarray", "asfortranarray"} and len(node.args) >= 1:
+                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient", "ascontiguousarray", "asfortranarray", "diff"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "atleast_1d" and len(node.args) >= 1:
                     return max(1, self._rank_expr(node.args[0]))
@@ -13622,22 +13626,6 @@ class translator(ast.NodeVisitor):
                     if self._loadtxt_usecols_scalar(node):
                         return 1
                     return 2
-            if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in {"array", "asarray"}
-                and len(node.args) >= 1
-            ):
-                a0 = node.args[0]
-                if isinstance(a0, ast.List):
-                    lit_shape = self._literal_nested_shape(a0)
-                    if lit_shape is not None:
-                        return max(1, len(lit_shape))
-                    if a0.elts and all(isinstance(e, ast.List) for e in a0.elts):
-                        return 2
-                    return 1
-                if isinstance(a0, ast.ListComp):
-                    return 1
-                return self._rank_expr(a0)
                 if node.func.attr == "append" and len(node.args) >= 2:
                     axis_node = None
                     if len(node.args) >= 3:
@@ -13651,7 +13639,11 @@ class translator(ast.NodeVisitor):
                     return max(1, self._rank_expr(node.args[0]))
                 if node.func.attr == "where":
                     if len(node.args) == 3:
-                        return max(self._rank_expr(node.args[1]), self._rank_expr(node.args[2]))
+                        return max(
+                            self._rank_expr(node.args[0]),
+                            self._rank_expr(node.args[1]),
+                            self._rank_expr(node.args[2]),
+                        )
                     if len(node.args) == 1:
                         return 1
                 if (
@@ -13890,6 +13882,22 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         return 0
                     return r0 if keepdims else max(0, r0 - 1)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"array", "asarray"}
+                and len(node.args) >= 1
+            ):
+                a0 = node.args[0]
+                if isinstance(a0, ast.List):
+                    lit_shape = self._literal_nested_shape(a0)
+                    if lit_shape is not None:
+                        return max(1, len(lit_shape))
+                    if a0.elts and all(isinstance(e, ast.List) for e in a0.elts):
+                        return 2
+                    return 1
+                if isinstance(a0, ast.ListComp):
+                    return 1
+                return self._rank_expr(a0)
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"ravel", "flatten", "squeeze", "argmin", "argmax", "min", "max", "copy"}
@@ -19426,6 +19434,17 @@ class translator(ast.NodeVisitor):
                     cond = self.expr(node.args[0])
                     a1 = self.expr(node.args[1])
                     a2 = self.expr(node.args[2])
+                    cond_rank = int(self._rank_expr(node.args[0]))
+                    if cond_rank > 0:
+                        def _spread_to_cond_shape(scalar_expr):
+                            e = scalar_expr
+                            for d in range(1, cond_rank + 1):
+                                e = f"spread({e}, {d}, size({cond},{d}))"
+                            return e
+                        if int(self._rank_expr(node.args[1])) == 0:
+                            a1 = _spread_to_cond_shape(a1)
+                        if int(self._rank_expr(node.args[2])) == 0:
+                            a2 = _spread_to_cond_shape(a2)
                     return f"merge({a1}, {a2}, {cond})"
                 if len(node.args) == 1:
                     cond = self.expr(node.args[0])
@@ -19784,6 +19803,10 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}
+                and not (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in {"np", "numpy"}
+                )
             ):
                 base = self.expr(node.func.value)
                 if node.func.attr in {"replace"} and len(node.args) not in {2, 3}:
@@ -23724,6 +23747,10 @@ class translator(ast.NodeVisitor):
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
             and v.func.attr == "split"
+            and not (
+                isinstance(v.func.value, ast.Name)
+                and v.func.value.id in {"np", "numpy"}
+            )
         ):
             t_name = self._aliased_name(t.id)
             self.o.w("block")
@@ -27975,6 +28002,17 @@ class translator(ast.NodeVisitor):
             cond = self.expr(v.args[0])
             a1 = self.expr(v.args[1])
             a2 = self.expr(v.args[2])
+            cond_rank = int(self._rank_expr(v.args[0]))
+            if cond_rank > 0:
+                def _spread_to_cond_shape(scalar_expr):
+                    e = scalar_expr
+                    for d in range(1, cond_rank + 1):
+                        e = f"spread({e}, {d}, size({cond},{d}))"
+                    return e
+                if int(self._rank_expr(v.args[1])) == 0:
+                    a1 = _spread_to_cond_shape(a1)
+                if int(self._rank_expr(v.args[2])) == 0:
+                    a2 = _spread_to_cond_shape(a2)
             self.o.w(f"{name} = merge({a1}, {a2}, {cond})")
             return
 
@@ -31235,7 +31273,17 @@ class translator(ast.NodeVisitor):
                 return
             parts = []
             for i_arg, a in enumerate(call.args):
-                if i_arg > 0 and sep_txt != "":
+                # Fortran list-directed output already prefixes numeric
+                # values (scalar or array) with a sign/space column, so an
+                # explicit default (" ") separator before one would double
+                # the gap. Only skip it for the default separator; a
+                # user-supplied sep must still be emitted literally.
+                _arg_is_numeric = (
+                    not is_const_str(a)
+                    and not isinstance(a, ast.JoinedStr)
+                    and self._expr_kind(a) not in {"char", "str"}
+                )
+                if i_arg > 0 and sep_txt != "" and not (sep_txt == " " and _arg_is_numeric):
                     parts.append(fstr(sep_txt))
                 if is_const_str(a):
                     parts.append(fstr(a.value))
@@ -36169,6 +36217,7 @@ def _emit_local_function(
                     if kind_hint not in {"int", "logical", "char", "complex"}:
                         _best_kind0 = None
                         _best_rank0 = 0
+                        _best_is_sentinel0 = False
                         for _st0 in ast.walk(fn):
                             if not (
                                 isinstance(_st0, ast.Assign)
@@ -36203,16 +36252,33 @@ def _emit_local_function(
                                     _dk0 = "real"
                             if _dk0 not in {"real", "complex", "logical", "char", "int"}:
                                 continue
+                            # A bare whole-number float literal is weak
+                            # "real" evidence and shouldn't outrank genuine
+                            # int evidence from another branch.
+                            _is_sentinel0 = (
+                                isinstance(_st0.value, ast.Constant)
+                                and isinstance(_st0.value.value, float)
+                                and float(_st0.value.value).is_integer()
+                            )
                             if _dr0 > _best_rank0:
                                 _best_rank0 = _dr0
                                 _best_kind0 = _dk0
+                                _best_is_sentinel0 = _is_sentinel0
                             elif _dr0 == _best_rank0:
                                 if "complex" in {_best_kind0, _dk0}:
                                     _best_kind0 = "complex"
+                                    _best_is_sentinel0 = False
+                                elif _best_kind0 == "real" and _best_is_sentinel0 and _dk0 == "int":
+                                    _best_kind0 = "int"
+                                    _best_is_sentinel0 = False
+                                elif _dk0 == "real" and _is_sentinel0 and _best_kind0 == "int":
+                                    pass
                                 elif "real" in {_best_kind0, _dk0} and "logical" not in {_best_kind0, _dk0}:
                                     _best_kind0 = "real"
+                                    _best_is_sentinel0 = False
                                 elif _best_kind0 is None:
                                     _best_kind0 = _dk0
+                                    _best_is_sentinel0 = _is_sentinel0
                         _dk0, _dr0 = _best_kind0, _best_rank0
                         if _dk0 in {"real", "complex", "logical", "char", "int"} and int(_dr0) == 0:
                             if _dk0 == "real":
@@ -36466,6 +36532,7 @@ def _emit_local_function(
             if rank_hint <= 0 and force_arg_ranks is None:
                 _body_rank = 0
                 _body_kind = None
+                _body_is_sentinel = False
                 for _st in fn.body:
                     for _n in ast.walk(_st):
                         if (
@@ -36476,11 +36543,28 @@ def _emit_local_function(
                         ):
                             _rr = max(0, int(tr._rank_expr(_n.value)))
                             _kk = tr._expr_kind(_n.value)
+                            # A bare whole-number float literal (e.g. an
+                            # early-exit placeholder `d = 0.0`) is weak
+                            # evidence for "real" and shouldn't outrank
+                            # genuine int evidence from another branch.
+                            _is_sentinel = (
+                                isinstance(_n.value, ast.Constant)
+                                and isinstance(_n.value.value, float)
+                                and float(_n.value.value).is_integer()
+                            )
                             if _rr > _body_rank:
                                 _body_rank = _rr
                                 _body_kind = _kk
+                                _body_is_sentinel = _is_sentinel
                             elif _body_kind is None and _kk is not None:
                                 _body_kind = _kk
+                                _body_is_sentinel = _is_sentinel
+                            elif _rr == _body_rank and _kk is not None and _kk != _body_kind:
+                                if _body_kind == "real" and _body_is_sentinel and _kk == "int":
+                                    _body_kind = "int"
+                                    _body_is_sentinel = False
+                                elif _kk == "real" and _is_sentinel and _body_kind == "int":
+                                    pass
                         elif (
                             isinstance(_n, ast.Assign)
                             and len(_n.targets) == 1
@@ -38989,6 +39073,7 @@ def generate_flat(
                 _seen.add(_name)
                 best_kind = None
                 best_rank = 0
+                best_is_sentinel = False
                 saw = False
                 for _st in ast.walk(fn_node):
                     if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _name):
@@ -39010,20 +39095,47 @@ def generate_flat(
                         if _bk in {"int", "real", "logical", "char", "complex"}:
                             _kk = _bk
                             _rr = int(tr_ctx._rank_expr(_st.value))
+                    # A bare whole-number float literal (e.g. `d = 0.0` used
+                    # as a placeholder in an early-exit branch) is weak
+                    # evidence for "real" and shouldn't outrank genuine int
+                    # evidence (e.g. `d = int_array[i]`) from another branch.
+                    _is_sentinel = (
+                        isinstance(_st.value, ast.Constant)
+                        and isinstance(_st.value.value, float)
+                        and float(_st.value.value).is_integer()
+                    )
                     if _kk in {"int", "real", "logical", "char", "complex"}:
                         if _rr > best_rank:
                             best_rank = _rr
                             best_kind = _kk
+                            best_is_sentinel = _is_sentinel
                         elif best_kind is None:
                             best_kind = _kk
+                            best_is_sentinel = _is_sentinel
                         elif _rr == best_rank and _kk != best_kind:
                             if "complex" in {best_kind, _kk}:
                                 best_kind = "complex"
+                                best_is_sentinel = False
+                            elif best_kind == "real" and best_is_sentinel and _kk == "int":
+                                best_kind = "int"
+                                best_is_sentinel = False
+                            elif _kk == "real" and _is_sentinel and best_kind == "int":
+                                pass
                             elif "real" in {best_kind, _kk} and "logical" not in {best_kind, _kk}:
                                 best_kind = "real"
+                                best_is_sentinel = False
                             elif "int" in {best_kind, _kk} and "logical" not in {best_kind, _kk} and "char" not in {best_kind, _kk}:
                                 best_kind = "int"
+                                best_is_sentinel = False
                 if not saw:
+                    # Not assigned locally in this function: fall back to a
+                    # module-level constant of the same name (e.g. a
+                    # default/actual argument referencing a global like
+                    # `rho=pairwise_corr`), which only tr_seed has scanned.
+                    _global_specs = _name_possible_specs(tr_seed, _name)
+                    if _global_specs:
+                        _gk, _gr = sorted(_global_specs, key=lambda kr: -kr[1])[0]
+                        return (_gk, _gr)
                     return (None, 0)
                 return (best_kind, best_rank)
             return _infer(name_nm)
@@ -39270,6 +39382,13 @@ def generate_flat(
                             default_kinds[_idx] = "char"
                     elif isinstance(_dv, ast.Constant) and _dv.value is None:
                         pass
+                    elif isinstance(_dv, ast.Name):
+                        # Default references a module-level constant, e.g.
+                        # `rho=pairwise_corr`; tr_seed already prescanned
+                        # top-level assignments and knows its kind.
+                        _dk = tr_seed._expr_kind(_dv)
+                        if _dk in {"int", "real", "logical", "char", "complex"}:
+                            default_kinds[_idx] = _dk
         local_func_arg_ranks[fn.name] = [
             max(
                 int(base_ranks[i]),
@@ -40429,6 +40548,23 @@ def generate_flat(
                                 changed_rr = True
             if not changed_rr:
                 break
+        # An earlier pass may have marked an arg "force scalar" from
+        # call-site ranks observed before reverse rank propagation (above)
+        # discovered the true (array) rank via a transitive call chain.
+        # Un-force any arg whose rank was subsequently raised above 0.
+        for fn in local_funcs:
+            _fscalar = getattr(fn, "_xp2f_force_scalar_args", None)
+            if not _fscalar:
+                continue
+            _ranks_now = local_func_arg_ranks.get(fn.name, [])
+            _names_now = local_func_arg_names.get(fn.name, [])
+            _still_scalar = set()
+            for _nm in _fscalar:
+                _idx = _names_now.index(_nm) if _nm in _names_now else -1
+                if _idx >= 0 and _idx < len(_ranks_now) and int(_ranks_now[_idx]) > 0:
+                    continue
+                _still_scalar.add(_nm)
+            fn._xp2f_force_scalar_args = _still_scalar
         for _fn_name, _base_ranks in base_func_arg_ranks.items():
             _curr_ranks = local_func_arg_ranks.get(_fn_name, [])
             _call_sets_for_fn = call_rank_sets.get(_fn_name, [])
@@ -41618,7 +41754,21 @@ def generate_flat(
                     ):
                         return True
                 if isinstance(_n, ast.Subscript):
-                    if any(isinstance(_x, ast.Name) and _x.id == _arg_nm for _x in ast.walk(_n.slice)):
+                    # A boolean mask (e.g. `arr[prices > ma]`) is not an
+                    # integer index even though the arg name appears inside
+                    # the slice expression, so don't descend into
+                    # Compare/BoolOp subtrees when looking for direct index
+                    # usage.
+                    def _name_used_as_index(_node):
+                        if isinstance(_node, (ast.Compare, ast.BoolOp)):
+                            return False
+                        if isinstance(_node, ast.Name) and _node.id == _arg_nm:
+                            return True
+                        return any(
+                            _name_used_as_index(_child)
+                            for _child in ast.iter_child_nodes(_node)
+                        )
+                    if _name_used_as_index(_n.slice):
                         return True
                 if (
                     isinstance(_n, ast.Call)
@@ -41795,7 +41945,11 @@ def generate_flat(
                 return True
         return False
     if use_proc_module:
-        proc_tree = ast.Module(body=list(local_funcs), type_ignores=[])
+        # Module-alias helpers (time.perf_counter, math.X, sys.exit, ...) are
+        # only detected when the import statement is visible in the scanned
+        # tree, so carry the original imports along with the function bodies.
+        _proc_tree_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+        proc_tree = ast.Module(body=_proc_tree_imports + list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
         for mod, syms in helper_uses.items():
             keep = sorted([s for s in syms if s in proc_needed])
