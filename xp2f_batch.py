@@ -466,6 +466,11 @@ def main() -> int:
     ap.add_argument("--ignore-comments", action="store_true", help="Forward --ignore-comments to xp2f.py.")
     ap.add_argument("--run-diff", action="store_true", help="Forward --run-diff to xp2f.py.")
     ap.add_argument("--run-both", action="store_true", help="Forward --run-both to xp2f.py.")
+    ap.add_argument(
+        "--run",
+        action="store_true",
+        help="Explicitly run the transpiled Fortran program. With --time-summary, skip the extra Python baseline run.",
+    )
     ap.add_argument("--autofix", action="store_true", help="Forward --autofix to xp2f.py.")
     ap.add_argument("--no-run", action="store_true", help="Transpile (and compile unless --no-compile), but do not run Fortran executables.")
     ap.add_argument("--no-compile", action="store_true", help="Transpile only (implies --no-run).")
@@ -557,6 +562,18 @@ def main() -> int:
         return 1
     if args.no_compile:
         args.no_run = True
+    if args.run and args.no_run:
+        print("Invalid options: --run cannot be combined with --no-run.")
+        return 1
+    if args.run and args.run_both:
+        print("Invalid options: --run and --run-both are mutually exclusive.")
+        return 1
+    if args.run and args.run_diff:
+        print("Invalid options: --run and --run-diff are mutually exclusive.")
+        return 1
+    if args.run and args.time_both:
+        print("Invalid options: --run and --time-both are mutually exclusive.")
+        return 1
     if args.run_both and args.no_run:
         print("Invalid options: --run-both cannot be combined with --no-run.")
         return 1
@@ -744,6 +761,7 @@ def main() -> int:
             and not args.run_both
             and not args.run_diff
             and not args.time_both
+            and not args.run
         ):
             t_py = time.perf_counter()
             try:
@@ -847,9 +865,13 @@ def main() -> int:
         listed_stages = ("python run", "transpile", "compile", "fortran run")
         total = None
         if r.stage_times:
-            vals = [r.stage_times.get(stage) for stage in listed_stages]
-            if all(v is not None for v in vals):
-                total = sum(float(v) for v in vals if v is not None)
+            if "total" in r.stage_times:
+                total = float(r.stage_times["total"])
+            else:
+                vals = [r.stage_times.get(stage) for stage in listed_stages]
+                present = [float(v) for v in vals if v is not None]
+                if present:
+                    total = sum(present)
         ratio = None
         if r.stage_times:
             py_t = r.stage_times.get("python run")
@@ -858,15 +880,22 @@ def main() -> int:
                 ratio = ft_t / py_t
         total_s = f"{total:8.3f}" if total is not None else "       -"
         ratio_s = f"{ratio:8.3f}" if ratio is not None else "       -"
-        return (
+        parts = [
             "  times:"
-            f" total={total_s}s"
-            f" python={fmt('python run')}s"
-            f" transpile={fmt('transpile')}s"
-            f" compile={fmt('compile')}s"
-            f" fortran_run={fmt('fortran run')}s"
-            f" fortran/python={ratio_s}"
+            f" total={total_s}s",
+        ]
+        if not args.run:
+            parts.append(f" python={fmt('python run')}s")
+        parts.extend(
+            [
+                f" transpile={fmt('transpile')}s",
+                f" compile={fmt('compile')}s",
+                f" fortran_run={fmt('fortran run')}s",
+            ]
         )
+        if not args.run:
+            parts.append(f" fortran/python={ratio_s}")
+        return "".join(parts)
 
     def _record_result(r: CaseResult) -> bool:
         nonlocal failures, strict_files_created
