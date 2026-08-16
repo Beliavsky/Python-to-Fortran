@@ -36723,6 +36723,12 @@ def _emit_local_function(
                                     _body_is_sentinel = False
                                 elif _kk == "real" and _is_sentinel and _body_kind == "int":
                                     pass
+                                elif "complex" in {_body_kind, _kk}:
+                                    _body_kind = "complex"
+                                    _body_is_sentinel = False
+                                elif "real" in {_body_kind, _kk} and "logical" not in {_body_kind, _kk}:
+                                    _body_kind = "real"
+                                    _body_is_sentinel = False
                         elif (
                             isinstance(_n, ast.Assign)
                             and len(_n.targets) == 1

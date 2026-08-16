@@ -3517,6 +3517,45 @@ def test_xp2f_keeps_scalar_integer_tuple_output_despite_real_sentinel(tmp_path: 
     assert "integer, intent(out) :: d" in out_text
 
 
+def test_xp2f_promotes_int_seeded_tuple_output_to_real_when_accumulated_from_real_array(
+    tmp_path: Path,
+) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xaccumulate_real_from_int_seed.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def total_value(n, v):",
+                "    vmax = 0",
+                "    for i in range(n):",
+                "        vmax = vmax + v[i]",
+                "    return n, vmax",
+                "",
+                "v = np.array([1.5, 2.5, 3.5])",
+                "n, vmax = total_value(3, v)",
+                "print(n, vmax)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_f90 = tmp_path / "xaccumulate_real_from_int_seed_p.f90"
+    out_text = out_f90.read_text(encoding="utf-8")
+    assert "real(kind=dp), intent(out) :: vmax" in out_text
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"
