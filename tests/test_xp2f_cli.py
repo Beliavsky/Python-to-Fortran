@@ -13,6 +13,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 import fortran_output as fout
+import fortran_post as fpost
+import xp2f
 
 XP2F_PATH = REPO_ROOT / "xp2f.py"
 PYTHON_HELPER_PATH = REPO_ROOT / "python.f90"
@@ -34,6 +36,27 @@ def _run_xp2f_compile(tmp_path: Path, example_name: str) -> subprocess.Completed
         text=True,
         check=False,
     )
+
+
+def test_fortran_post_spaces_units_and_procedures() -> None:
+    lines = [
+        "module m",
+        "contains",
+        "subroutine a()",
+        "end subroutine a",
+        "real(kind=dp) function b()",
+        "end function b",
+        "end module m",
+        "program p",
+        "end program p",
+    ]
+
+    text = "\n".join(fpost.ensure_blank_lines_around_units_and_procedures(lines))
+
+    assert "contains\n\nsubroutine a()" in text
+    assert "end subroutine a\n\nreal(kind=dp) function b()" in text
+    assert "end function b\n\nend module m" in text
+    assert "end module m\n\nprogram p" in text
 
 
 @pytest.mark.parametrize("example_name", SUPPORTED_PY_COMPILE_CASES)
@@ -79,6 +102,99 @@ def test_xp2f_compiles_function_result_subscript_with_local_proc_module(tmp_path
     out_text = out_f90.read_text(encoding="utf-8")
     assert "use xfunc_subscript_small_proc_mod, only: dp, stats" in out_text
     assert "print *, index1(stats(x)," in out_text
+
+
+def test_xp2f_avoids_program_name_variable_collision(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xsum.py"
+    src.write_text(
+        "\n".join(
+            [
+                "xsum = 0.0",
+                "for i in range(10):",
+                "    xsum = xsum + i",
+                "print(xsum)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    out_text = (tmp_path / "xsum_p.f90").read_text(encoding="utf-8")
+    assert "program xsum_prog" in out_text
+    assert "end program xsum_prog" in out_text
+    assert "real(kind=dp) :: xsum" in out_text
+    assert "use python_mod" not in out_text
+    assert "use, intrinsic :: ieee_arithmetic" not in out_text
+    assert "integer, parameter :: sp = real32" not in out_text
+    assert "real32" not in out_text
+
+
+def test_xp2f_keeps_module_parameter_used_by_later_procedure() -> None:
+    lines = [
+        "module m",
+        "   use, intrinsic :: iso_fortran_env, only: real32, real64",
+        "   implicit none",
+        "   integer, parameter :: sp = real32",
+        "   integer, parameter :: dp = real64",
+        "contains",
+        "subroutine a()",
+        "end subroutine a",
+        "subroutine b()",
+        "   real(kind=sp) :: x",
+        "   x = 1.0_sp",
+        "end subroutine b",
+        "end module m",
+    ]
+
+    out = xp2f.remove_unused_named_constants(lines)
+
+    assert "   integer, parameter :: sp = real32" in out
+    assert "   integer, parameter :: dp = real64" not in out
+
+
+def test_xp2f_time_uses_optimized_compiler_unless_explicit(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xtime_small.py"
+    src.write_text("print(42)\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--time"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Compile options: -O3 -march=native -Wfatal-errors" in proc.stdout
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(XP2F_PATH),
+            str(src),
+            "--time",
+            "--compiler",
+            "gfortran -O0 -Wfatal-errors",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Compile options: -O0 -Wfatal-errors" in proc.stdout
+    assert "Compile options: -O3 -march=native -Wfatal-errors" not in proc.stdout
 
 
 def test_xp2f_compiles_print_of_np_random_uniform_expr(tmp_path: Path) -> None:
@@ -487,10 +603,23 @@ def test_xp2f_axis_reduction_temporaries_promote_to_vectors(tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     out_text = (tmp_path / "xaxis_reduce_small_p.f90").read_text(encoding="utf-8")
-    assert "real(kind=dp), allocatable :: amax(:)" in out_text
-    assert "real(kind=dp), allocatable :: s(:)" in out_text
-    assert "real(kind=dp), allocatable :: log_norm(:)" in out_text
-    assert "real(kind=dp), allocatable :: nk(:)" in out_text
+    # Declarations of the same type/rank may be coalesced onto one line
+    # (e.g. "real(kind=dp), allocatable :: nk(:), amax(:), log_norm(:)"),
+    # so check each name is declared real(kind=dp) allocatable rank-1
+    # rather than requiring it alone on its own declaration line.
+    rank1_real_alloc_names = set()
+    for line in out_text.splitlines():
+        line = line.strip()
+        if not line.startswith("real(kind=dp), allocatable ::"):
+            continue
+        for entity in line.split("::", 1)[1].split(","):
+            entity = entity.strip()
+            if entity.endswith("(:)"):
+                rank1_real_alloc_names.add(entity[: -len("(:)")])
+    for name in ("amax", "s", "log_norm", "nk"):
+        assert name in rank1_real_alloc_names, (
+            f"{name} not declared real(kind=dp), allocatable, rank-1 in:\n{out_text}"
+        )
     assert "real(kind=dp) :: amax" not in out_text
     assert "real(kind=dp) :: nk" not in out_text
 
@@ -527,6 +656,102 @@ def test_xp2f_compiles_reserved_name_slogdet_tuple_unpack(tmp_path: Path) -> Non
     out_text = (tmp_path / "xslogdet_sign_small_p.f90").read_text(encoding="utf-8")
     assert "real(kind=dp) :: logdet, xsign" in out_text or "real(kind=dp) :: xsign, logdet" in out_text
     assert "xsign = merge(" in out_text
+
+
+def test_xp2f_runs_lstsq_tuple_assignment_to_section(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
+    src = tmp_path / "xlstsq_section_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "q = np.zeros((2, 3))",
+                "q[0:2, 0:2] = np.array([[2.0, 0.0], [0.0, 4.0]])",
+                "q[0:2, 2] = np.array([4.0, 8.0])",
+                "q[0:2, 2], res, rank, s = np.linalg.lstsq(q[0:2, 0:2], q[0:2, 2], rcond=None)",
+                "print(q[:, 2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+
+
+def test_xp2f_runs_numpy_shape_assignment_as_reshape_alias(tmp_path: Path) -> None:
+    src = tmp_path / "xshape_assign_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def f(x, m, n):",
+                "    x.shape = (m, n)",
+                "    return x[1, 0]",
+                "",
+                "print(f(np.array([1.0, 2.0, 3.0, 4.0]), 2, 2))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+
+
+def test_xp2f_shape_assignment_overrides_comment_rank_for_dummy(tmp_path: Path) -> None:
+    src = tmp_path / "xshape_comment_rank_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def p00_f(m, n, x):",
+                "    # real x(m,n)",
+                "    x.shape = (m, n)",
+                "    return x[1, 0]",
+                "",
+                "x = np.array([1.0, 2.0, 3.0, 4.0])",
+                "print(p00_f(2, 2, x))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+    out_text = (tmp_path / "xshape_comment_rank_small_p.f90").read_text(encoding="utf-8")
+    assert "real(kind=dp), intent(in) :: x(:)" in out_text
 
 
 def test_xp2f_tuple_output_rank_preserved_by_top_level_usage(tmp_path: Path) -> None:
@@ -719,6 +944,490 @@ def test_xp2f_keeps_scalar_broadcast_args_scalar(tmp_path: Path) -> None:
     out_text = out_f90.read_text(encoding="utf-8")
     assert "real(kind=dp), intent(in) :: scale" in out_text
     assert "real(kind=dp), intent(in) :: shift" in out_text
+
+
+def test_xp2f_runs_direct_numpy_array_import_with_integer_norm(tmp_path: Path) -> None:
+    src = tmp_path / "xnorm_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy.linalg import norm",
+                "from numpy import array",
+                "",
+                "arr1 = array([1, 2, 3, 4])",
+                "nrm = norm(arr1)",
+                "print(nrm)",
+                "",
+                "arr2 = array([[1, 2, 3, 4], [4, 3, 2, 1]])",
+                "nrm2 = norm(arr2, axis=1)",
+                "print(nrm2)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xnorm_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "integer, allocatable :: arr2(:,:)" in out_text
+    assert "real(arr1, kind=dp)" in out_text
+    assert "real(arr2, kind=dp)" in out_text
+
+
+def test_xp2f_runs_direct_numpy_prod_import(tmp_path: Path) -> None:
+    src = tmp_path / "xprod_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, prod",
+                "",
+                "arr = array([1, 2, 3, 4])",
+                "prd = prod(arr)",
+                "print('prd: ', prd)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xprod_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "prd = product(arr)" in out_text
+
+
+def test_xp2f_runs_direct_numpy_mod_import(tmp_path: Path) -> None:
+    src = tmp_path / "xmod_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, mod",
+                "",
+                "arr = array([1, 2, 3, 4])",
+                "res = mod(arr, arr)",
+                "print('res: ', res)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xmod_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "res = mod(arr, arr)" in out_text
+
+
+def test_xp2f_runs_direct_numpy_empty_import(tmp_path: Path) -> None:
+    src = tmp_path / "xempty_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, empty",
+                "",
+                "a = array([1, 2, 3, 4])",
+                "b = empty(4)",
+                "for i in range(len(a)):",
+                "    b[i] = a[i] + 1",
+                "print('b =', b)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xempty_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "real(kind=dp), allocatable :: b(:)" in out_text
+    assert "allocate(b(4))" in out_text
+
+
+def test_xp2f_runs_direct_numpy_ones_import_with_string_dtype(tmp_path: Path) -> None:
+    src = tmp_path / "xones_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, ones, size, sum",
+                "",
+                "a = array([1, 2, 3, 4, 5])",
+                "o = ones(size(a), dtype='int')",
+                "print(sum(o[(a > 2) & (a < 5)]))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xones_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "integer, allocatable :: a(:), o(:)" in out_text
+    assert "o = 1" in out_text
+
+
+def test_xp2f_runs_direct_numpy_dot_import_for_matrices(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xdot_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, dot",
+                "",
+                "a = array([[1, 2], [3, 4]])",
+                "b = array([[2, 3], [4, 5]])",
+                "print(a * b)",
+                "print(dot(a, b))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xdot_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "call print_matrix(matmul(a, b))" in out_text
+
+
+def test_xp2f_runs_numpy_array_listcomps_with_direct_pi(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xarray_listcomp_direct_pi.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, pi",
+                "",
+                "a = array([i for i in range(1, 7)])",
+                "b = array([(2 * i * pi + 1) / 2 for i in range(1, 7)])",
+                "c = array([i for i in range(1, 7) for j in range(1, 4)])",
+                "print('a =', a)",
+                "print('b =', b)",
+                "print('c =', c)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xarray_listcomp_direct_pi_p.f90").read_text(encoding="utf-8")
+    assert "a = arange_int(1, 7, 1)" in out_text
+    assert "acos(-1.0_dp)" in out_text
+    assert "c = repeat_int(arange_int(1, 7, 1), size(arange_int(1, 4, 1)))" in out_text
+
+
+def test_xp2f_runs_masked_assignment_into_numpy_empty_array(tmp_path: Path) -> None:
+    src = tmp_path / "xmasked_empty_assign.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, empty",
+                "",
+                "a = array([1, 2, 3, 4, 5, 6])",
+                "b = empty(6)",
+                "b[:] = 0",
+                "b[a > 2] = 1",
+                "b[a > 5] = a[a > 5] - 3",
+                "print('b =', b)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xmasked_empty_assign_p.f90").read_text(encoding="utf-8")
+    assert "merge(real(1, kind=dp), b, (a > 2))" in out_text
+    assert "b = a - 3" in out_text
+    assert "pack(a, (a > 5))" not in out_text
+
+
+def test_xp2f_runs_direct_numpy_shape_size_min_max_sum_imports(tmp_path: Path) -> None:
+    src = tmp_path / "xshape_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array, max, min, shape, size, sum",
+                "",
+                "a = array([1, 2, 3])",
+                "print(shape(a))",
+                "print(size(a))",
+                "print(max(a))",
+                "print(min(a))",
+                "print(sum(a))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xshape_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "shape(a)" in out_text
+    assert "size(a)" in out_text
+    assert "maxval(a)" in out_text
+    assert "minval(a)" in out_text
+    assert "sum(a)" in out_text
+
+
+def test_xp2f_uses_allocation_assignment_for_numeric_array_literals(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xarray_literal_alloc_assign.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import array",
+                "",
+                "a = array([1, 2, 3])",
+                "b = array([[1.0, 2.0], [3.0, 4.0]])",
+                "print(a)",
+                "print(b)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    out_text = (tmp_path / "xarray_literal_alloc_assign_p.f90").read_text(encoding="utf-8")
+    assert "if (allocated(a)) deallocate(a)" not in out_text
+    assert "allocate(a(1:3))" not in out_text
+    assert "a = [1, 2, 3]" in out_text
+    assert "if (allocated(b)) deallocate(b)" not in out_text
+    assert "allocate(b(1:2,1:2))" not in out_text
+    assert "b = reshape([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], [2, 2], order=[2, 1])" in out_text
+
+
+def test_xp2f_runs_direct_numpy_reshape_import_with_order(tmp_path: Path) -> None:
+    src = tmp_path / "xreshape_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import reshape",
+                "",
+                "a = reshape([1, 2, 3, 4, 5, 6], (2, 3))",
+                "b = reshape([1, 2, 3, 4, 5, 6], (2, 3), order='F')",
+                "print(a[0, :])",
+                "print(a[1, :])",
+                "print()",
+                "print(b[0, :])",
+                "print(b[1, :])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xreshape_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "a = reshape([1, 2, 3, 4, 5, 6], [2, 3], order=[2, 1])" in out_text
+    assert "b = reshape([1, 2, 3, 4, 5, 6], [2, 3])" in out_text
+    assert "real(kind=dp), allocatable :: a(:,:), b(:,:)" in out_text
+    assert "real(kind=dp), allocatable :: a(:,:)\n   real(kind=dp), allocatable :: b(:,:)" not in out_text
+    assert "a(1, :)" in out_text
+    assert "a((1), :)" not in out_text
+
+
+def test_xp2f_simplifies_all_any_reduction_parentheses(tmp_path: Path) -> None:
+    src = tmp_path / "xall_any_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import all, any, array",
+                "",
+                "i = array([1, 2, 3])",
+                "print(all(i == [1, 2, 3]))",
+                "print(any(i == [2, 2, 3]))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xall_any_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "print *, all(i == [1, 2, 3])" in out_text
+    assert "print *, any(i == [2, 2, 3])" in out_text
+    assert "all((i ==" not in out_text
+    assert "any((i ==" not in out_text
+
+
+def test_xp2f_runs_direct_numpy_real_imag_imports(tmp_path: Path) -> None:
+    src = tmp_path / "xreal_imag_direct_import.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from numpy import imag, real, array",
+                "",
+                "arr1 = array([1 + 1j, 2 + 1j, 3 + 1j, 4 + 1j])",
+                "real_part = real(arr1)",
+                "imag_part = imag(arr1)",
+                "print(real_part)",
+                "print(imag_part)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xreal_imag_direct_import_p.f90").read_text(encoding="utf-8")
+    assert "complex(kind=dp), allocatable :: arr1(:)" in out_text
+    assert "real_part = real(arr1, kind=dp)" in out_text
+    assert "imag_part = aimag(arr1)" in out_text
+
+
+def test_xp2f_resolves_explicit_lapack_helper_from_other_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = tmp_path / "xneeds_lapack_p.f90"
+    src.write_text(
+        "\n".join(
+            [
+                "program xneeds_lapack",
+                "   use python_mod, only: linalg_cond",
+                "   implicit none",
+                "   print *, linalg_cond(reshape([1.0d0], [1, 1]))",
+                "end program xneeds_lapack",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+    helpers, _auto_added, missing = xp2f.resolve_helper_files_for_build(
+        src,
+        [str(PYTHON_HELPER_PATH), str(REPO_ROOT / "lapack_d.f90")],
+    )
+
+    assert not missing
+    assert str(REPO_ROOT / "lapack_d.f90") in helpers
 
 
 def test_xp2f_lowers_logical_method_sum_to_count(tmp_path: Path) -> None:
@@ -2010,6 +2719,141 @@ def test_xp2f_numeric_diff_ignores_version_lines(tmp_path: Path) -> None:
     assert "Run numeric diff: MATCH" in proc.stdout
 
 
+def test_xp2f_keeps_dp_parameter_for_real_literal_kind_suffix(tmp_path: Path) -> None:
+    src = tmp_path / "xmath_kind_suffix.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import math",
+                "print(math.sqrt(1.44))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = (tmp_path / "xmath_kind_suffix_p.f90").read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "integer, parameter :: dp = real64" in out_text
+    assert "sqrt(1.44_dp)" in out_text
+
+
+def test_xp2f_runs_statistics_quantiles_and_means(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xstats_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import statistics as stats",
+                "",
+                "x = [12, 15, 15, 18, 20, 22, 25, 25, 25, 30]",
+                "print('quartiles:', stats.quantiles(x, n=4))",
+                "print('geometric mean:', stats.geometric_mean(x))",
+                "print('harmonic mean:', stats.harmonic_mean(x))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = (tmp_path / "xstats_small_p.f90").read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    assert "statistics_quantiles_real(real(x, kind=dp), int(4))" in out_text
+    assert "exp(mean_1d(log(real(x, kind=dp))))" in out_text
+    assert "sum(1.0_dp / real(x, kind=dp))" in out_text
+
+
+def test_xp2f_runs_statistics_mode_for_real_data(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xstats_real_mode.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import statistics as stats",
+                "",
+                "x = [1.5, 2.5, 3.5]",
+                "print('mode:', stats.mode(x))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = (tmp_path / "xstats_real_mode_p.f90").read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+    assert "mode_real(x)" in out_text
+
+
+def test_xp2f_compiles_random_module_sequence_helpers(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xrandom_sequence_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import random",
+                "",
+                "random.seed(12345)",
+                "colors = ['red', 'green', 'blue', 'yellow']",
+                "print(random.randint(1, 10))",
+                "print(random.randrange(0, 100, 5))",
+                "print(random.choice(colors))",
+                "print(random.choices(colors, k=5))",
+                "print(random.sample(colors, k=3))",
+                "normal_values = [random.gauss(mu=0.0, sigma=1.0) for _ in range(5)]",
+                "print(normal_values)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_text = (tmp_path / "xrandom_sequence_small_p.f90").read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "random_randrange_int(int(0), int(100), int(5))" in out_text
+    assert "random_choice_char(colors)" in out_text
+    assert "random_choices_char(colors, int(5))" in out_text
+    assert "random_sample_char(colors, int(3))" in out_text
+    assert "rnorm(size(arange_int(0, 5, 1)))" in out_text
+    assert "int(10) - int(1) + 1" in out_text
+
+
 def test_xp2f_numeric_diff_tol_implies_run_both(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
@@ -2272,6 +3116,52 @@ def test_xp2f_allows_local_sibling_import(tmp_path: Path) -> None:
     assert "Build: PASS" in proc.stdout
 
 
+def test_xp2f_inlines_local_sibling_from_import_function_and_constant(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text(
+        "\n".join(
+            [
+                "i = 5",
+                "",
+                "def f(x):",
+                "    return x + 5",
+                "",
+                "def g(x):",
+                "    return x - 5",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    src = tmp_path / "xa.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from a import f, i",
+                "",
+                "print(f(3))",
+                "print(i)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xa_p.f90").read_text(encoding="utf-8")
+    assert "function f" in out_text
+    assert "print" in out_text
+
+
 def test_xp2f_does_not_force_real_compare_arg_complex_via_numpy_sqrt(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
@@ -2525,7 +3415,11 @@ def test_xp2f_preserves_integer_tuple_output_from_local_scalar_helper(tmp_path: 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out_f90 = tmp_path / "xlocal_tuple_int_from_helper_p.f90"
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "integer, intent(out) :: make_rule_out_1" in out_text
+    # "n" doesn't collide with make_rule's own parameter names, so it keeps
+    # its natural name as the intent(out) dummy rather than being renamed to
+    # a synthetic make_rule_out_1 (that renaming only happens to avoid a
+    # collision with a parameter name).
+    assert "integer, intent(out) :: n" in out_text
 
 
 def test_xp2f_keeps_nested_integer_array_state_in_local_tuple_subroutine(tmp_path: Path) -> None:
@@ -2863,6 +3757,67 @@ def test_xp2f_normalizes_removed_numpy_scalar_aliases_for_run_both(tmp_path: Pat
     assert "ieee_value(0.0_dp, ieee_quiet_nan)" in out_text
 
 
+def test_xp2f_lowers_legacy_np_nan_call_as_constant(tmp_path: Path) -> None:
+    src = tmp_path / "xnp_nan_call.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "x = np.nan()",
+                "print(x)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    out_text = (tmp_path / "xnp_nan_call_p.f90").read_text(encoding="utf-8")
+    assert "ieee_value(0.0_dp, ieee_quiet_nan)" in out_text
+
+
+def test_xp2f_runs_np_append_axis0_rank2_rows(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xappend_axis0_rank2.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "x = np.empty((0, 2), dtype=int)",
+                "x = np.append(x, [[1, 2]], axis=0)",
+                "x = np.append(x, [[3, 4], [5, 6]], axis=0)",
+                "print(x)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+    out_text = (tmp_path / "xappend_axis0_rank2_p.f90").read_text(encoding="utf-8")
+    assert "xp2f_append_tmp_" in out_text
+
+
 def test_xp2f_lowers_function_attribute_state_via_module_globals(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
@@ -2902,3 +3857,65 @@ def test_xp2f_lowers_function_attribute_state_via_module_globals(tmp_path: Path)
     assert "logical :: fisher_parameters_has_a_default = .false." in out_text
     assert "real(kind=dp) :: fisher_parameters_a_default" in out_text
     assert "pure function fisher_parameters" not in out_text
+
+
+def test_xp2f_does_not_emit_unused_global_presence_flags(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xsum_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "ysum = 0.0",
+                "for i in range(10):",
+                "    ysum = ysum + i",
+                "print(ysum)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_text = (tmp_path / "xsum_small_p.f90").read_text(encoding="utf-8")
+    assert "xp2f_has_global_ysum" not in out_text
+
+
+def test_xp2f_initializes_top_level_globals_membership_flags(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xglobals_membership_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "if 'x' in globals():",
+                "    print(1)",
+                "else:",
+                "    print(0)",
+                "x = 2",
+                "if 'x' in globals():",
+                "    print(x)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+    out_text = (tmp_path / "xglobals_membership_small_p.f90").read_text(encoding="utf-8")
+    assert "xp2f_has_global_x = .false." in out_text
