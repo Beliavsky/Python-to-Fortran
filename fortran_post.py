@@ -124,6 +124,70 @@ def ensure_blank_line_between_program_units(lines: List[str]) -> List[str]:
     return out
 
 
+def ensure_blank_lines_around_units_and_procedures(lines: List[str]) -> List[str]:
+    """Ensure readable blank-line spacing around Fortran program structure.
+
+    This is deliberately stylistic and should be applied late, after code
+    generation and indentation:
+    - at least one blank line before and after subroutines/functions
+    - at least one blank line between modules/programs
+    - at least one blank line between a module and a main program
+    """
+    out: List[str] = []
+
+    unit_start_re = re.compile(r"^\s*(?:module\b(?!\s+procedure\b)|program\b)", re.IGNORECASE)
+    unit_end_re = re.compile(r"^\s*end\s+(?:module|program)\b", re.IGNORECASE)
+    proc_start_re = re.compile(
+        r"^\s*(?!end\b)(?!module\s+procedure\b)"
+        r"(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:(?:[a-z][a-z0-9_]*(?:\([^)]*\))?\s+)+)?"
+        r"(?:function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+
+    def _code(ln: str) -> str:
+        return fscan.strip_comment(ln).strip()
+
+    def _is_blank(ln: str) -> bool:
+        return not ln.strip()
+
+    def _append_blank_if_needed() -> None:
+        if out and not _is_blank(out[-1]):
+            out.append("")
+
+    n = len(lines)
+    for i, ln in enumerate(lines):
+        code = _code(ln)
+        if code and (unit_start_re.match(code) or proc_start_re.match(code)):
+            _append_blank_if_needed()
+
+        out.append(ln)
+
+        if not code or not (unit_end_re.match(code) or proc_end_re.match(code)):
+            continue
+
+        # Add a blank after the end line unless the remaining input already has
+        # one or there is no more nonblank content.
+        j = i + 1
+        saw_blank = False
+        while j < n:
+            if _is_blank(lines[j]):
+                saw_blank = True
+                break
+            if not _code(lines[j]):
+                j += 1
+                continue
+            break
+        if j < n and not saw_blank:
+            out.append("")
+
+    # Avoid a leading blank before the first generated line.
+    while out and _is_blank(out[0]):
+        out.pop(0)
+    return out
+
+
 def simplify_norm2_patterns(lines: List[str]) -> List[str]:
     """Rewrite simple Euclidean norm patterns to `norm2(...)`.
 

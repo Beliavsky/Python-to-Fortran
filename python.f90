@@ -17,6 +17,7 @@ type :: strvec_t
 end type strvec_t
 
 public :: isqrt_int       !@pyapi kind=function ret=integer args=x:integer:intent(in) desc="integer square root: return floor(sqrt(x)) for x >= 0"
+public :: mod_pow_int !@pyapi kind=function ret=integer args=base:integer:intent(in),exp:integer:intent(in),modulus:integer:intent(in) desc="modular exponentiation: pow(base, exp, modulus) for integer inputs"
 public :: factorial_int !@pyapi kind=function ret=integer args=x:integer:intent(in) desc="factorial for nonnegative integers"
 public :: comb_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in) desc="binomial coefficient for integer inputs"
 public :: perm_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in):optional desc="permutations nPk for integer inputs"
@@ -26,6 +27,7 @@ public :: seed_rng !@pyapi kind=subroutine args=seed:integer:intent(in):optional
 public :: random_normal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out) desc="fill x with N(0,1) variates using Box-Muller"
 public :: runif !@pyapi kind=function ret=real(dp) args=n:integer:intent(in):optional,m:integer:intent(in):optional desc="uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)"
 public :: rnorm !@pyapi kind=function ret=real(dp) args=n:integer:intent(in):optional,m:integer:intent(in):optional desc="normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)"
+public :: random_randrange_int !@pyapi kind=function ret=integer args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="random integer from range(start, stop, step)"
 public :: random_exponential !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional desc="sample scalar exponential with scale (default 1)"
 public :: random_exponential_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional desc="fill x with exponential samples with scale (default 1)"
 public :: random_gamma !@pyapi kind=function ret=real(dp) args=shape:real(dp):intent(in),scale:real(dp):intent(in):optional desc="sample scalar gamma(shape, scale), shape>0"
@@ -90,8 +92,12 @@ public :: random_mvn_samples !@pyapi kind=subroutine args=mean:real(dp)(:):inten
 public :: random_choice2 !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in {0,1} with probabilities p(1:2)"
 public :: random_choice_norep !@pyapi kind=subroutine args=npop:integer:intent(in),nsamp:integer:intent(in),z:integer(:):intent(out) desc="sample nsamp unique labels from 0..npop-1 without replacement"
 public :: random_choice_prob !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in 0..size(p)-1 with probabilities p"
+public :: random_choice_char !@pyapi kind=function ret=character args=a:character(:):intent(in) desc="choose one string from a character vector"
+public :: random_choices_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),k:integer:intent(in) desc="choose k strings with replacement"
+public :: random_sample_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),k:integer:intent(in) desc="choose k unique strings without replacement"
 public :: sort_real_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(inout) desc="sort real vector x in ascending order"
 public :: sort_int_vec !@pyapi kind=subroutine args=x:integer(:):intent(inout) desc="sort integer vector x in ascending order"
+public :: sort_char_vec !@pyapi kind=subroutine args=x:character(:)(:):intent(inout) desc="sort character vector x in ascending order"
 public :: argsort_real !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of real vector"
 public :: argsort_int !@pyapi kind=subroutine args=x:integer(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of integer vector"
 public :: argsort_idx_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in) desc="argsort indices (0-based) of real vector"
@@ -104,10 +110,12 @@ public :: geomspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):in
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
 public :: weighted_mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),w:real(dp)(:):intent(in) desc="weighted mean of 1D real vector"
 public :: var_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
+public :: statistics_quantiles_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in) desc="statistics.quantiles default exclusive method for 1D real vector"
 public :: median_1d_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="median of 1D real vector"
 public :: median_low_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="median_low of 1D integer vector"
 public :: median_high_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="median_high of 1D integer vector"
 public :: mode_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="mode of 1D integer vector"
+public :: mode_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mode of 1D real vector"
 public :: multimode_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="multimode of 1D integer vector"
 public :: zeros_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 0"
 public :: ones_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 1"
@@ -127,6 +135,7 @@ public :: str_concat
 public :: str_format_real_fixed !@pyapi kind=function ret=character args=x:real(dp):intent(in),prec:integer:intent(in) desc="format real with fixed decimal places"
 public :: py_float !@pyapi kind=function ret=real(dp) args=s:character:intent(in) desc="parse string to real(dp), NaN on read failure"
 public :: py_int !@pyapi kind=function ret=integer args=s:character:intent(in) desc="parse string to integer, 0 on read failure"
+public :: digits_of_str !@pyapi kind=function ret=integer(:) args=s:character:intent(in) desc="return decimal digits in a string as an integer vector"
 public :: special_factorial !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial approximation via gamma(x+1)"
 public :: special_factorial2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial2 for integer-like x"
 public :: special_binom !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in) desc="binomial coefficient via gamma"
@@ -353,7 +362,7 @@ interface unique
 end interface unique
 
 interface sort_vec
-   module procedure sort_real_vec, sort_int_vec
+   module procedure sort_real_vec, sort_int_vec, sort_char_vec
 end interface sort_vec
 
 interface argsort
@@ -489,6 +498,27 @@ contains
          end do
          isqrt_int = r
       end function isqrt_int
+
+      pure integer function mod_pow_int(base, exp, modulus)
+         ! modular exponentiation: pow(base, exp, modulus)
+         implicit none
+         integer, intent(in) :: base, exp, modulus
+         integer(kind=int64) :: b, e, m, res
+         if (modulus == 0) then
+            mod_pow_int = 0
+            return
+         end if
+         m = int(modulus, kind=int64)
+         b = modulo(int(base, kind=int64), m)
+         e = int(exp, kind=int64)
+         res = 1_int64
+         do while (e > 0_int64)
+            if (modulo(e, 2_int64) == 1_int64) res = modulo(res * b, m)
+            e = e / 2_int64
+            if (e > 0_int64) b = modulo(b * b, m)
+         end do
+         mod_pow_int = int(res)
+      end function mod_pow_int
 
       pure integer function factorial_int(x) result(v)
          integer, intent(in) :: x
@@ -866,6 +896,23 @@ contains
          character(len=len(x)), allocatable :: y(:)
          y = x(lo:hi:step)
       end function slice1_char
+
+      pure function digits_of_str(s) result(digits)
+         character(len=*), intent(in) :: s
+         integer, allocatable :: digits(:)
+         character(len=:), allocatable :: t
+         integer :: i, n
+         t = trim(s)
+         n = len(t)
+         allocate(digits(n))
+         do i = 1, n
+            if (t(i:i) >= "0" .and. t(i:i) <= "9") then
+               digits(i) = iachar(t(i:i)) - iachar("0")
+            else
+               digits(i) = 0
+            end if
+         end do
+      end function digits_of_str
 
       subroutine print_matrix_label_real_2d(label, a)
          character(len=*), intent(in) :: label
@@ -1478,6 +1525,75 @@ contains
             if (n > 0 .and. m > 0) call random_number(x)
          end if
       end function runif2
+
+      integer function random_randrange_int(start, stop, step)
+         integer, intent(in) :: start, stop, step
+         integer :: n
+         real(kind=dp) :: u
+         if (step == 0) error stop "randrange: step must not be zero"
+         if (step > 0) then
+            if (start >= stop) error stop "randrange: empty range"
+            n = 1 + (stop - 1 - start) / step
+         else
+            if (start <= stop) error stop "randrange: empty range"
+            n = 1 + (start - 1 - stop) / (-step)
+         end if
+         call random_number(u)
+         random_randrange_int = start + step * int(u * real(n, kind=dp))
+      end function random_randrange_int
+
+      function random_choice_char(a) result(x)
+         character(len=*), intent(in) :: a(:)
+         character(len=len(a)) :: x
+         real(kind=dp) :: u
+         integer :: j
+         if (size(a) <= 0) error stop "random.choice: empty sequence"
+         call random_number(u)
+         j = 1 + int(u * real(size(a), kind=dp))
+         if (j < 1) j = 1
+         if (j > size(a)) j = size(a)
+         x = a(j)
+      end function random_choice_char
+
+      function random_choices_char(a, k) result(x)
+         character(len=*), intent(in) :: a(:)
+         integer, intent(in) :: k
+         character(len=len(a)), allocatable :: x(:)
+         integer :: i
+         if (size(a) <= 0 .and. k > 0) error stop "random.choices: empty sequence"
+         if (k < 0) error stop "random.choices: k must be nonnegative"
+         allocate(x(k))
+         do i = 1, k
+            x(i) = random_choice_char(a)
+         end do
+      end function random_choices_char
+
+      function random_sample_char(a, k) result(x)
+         character(len=*), intent(in) :: a(:)
+         integer, intent(in) :: k
+         character(len=len(a)), allocatable :: x(:)
+         integer, allocatable :: idx(:)
+         integer :: i, j, tmp
+         real(kind=dp) :: u
+         if (k < 0 .or. k > size(a)) error stop "random.sample: invalid sample size"
+         allocate(x(k))
+         allocate(idx(size(a)))
+         do i = 1, size(a)
+            idx(i) = i
+         end do
+         do i = size(idx), 2, -1
+            call random_number(u)
+            j = 1 + int(u * real(i, kind=dp))
+            if (j < 1) j = 1
+            if (j > i) j = i
+            tmp = idx(i)
+            idx(i) = idx(j)
+            idx(j) = tmp
+         end do
+         do i = 1, k
+            x(i) = a(idx(i))
+         end do
+      end function random_sample_char
 
       function rnorm0() result(x)
          real(kind=dp) :: x
@@ -2544,6 +2660,25 @@ contains
          end do
       end subroutine sort_int_vec
 
+      pure subroutine sort_char_vec(x)
+         ! sort character vector x in ascending order
+         implicit none
+         character(len=*), intent(inout) :: x(:)
+         integer :: i, j, n
+         character(len=len(x)) :: key
+         n = size(x)
+         do i = 2, n
+            key = x(i)
+            j = i - 1
+            do while (j >= 1)
+               if (x(j) <= key) exit
+               x(j+1) = x(j)
+               j = j - 1
+            end do
+            x(j+1) = key
+         end do
+      end subroutine sort_char_vec
+
       subroutine argsort_real(x, idx)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(out) :: idx(:)
@@ -3452,6 +3587,29 @@ contains
          m = u(best_i)
       end function mode_int
 
+      function mode_real(x) result(m)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp) :: m
+         integer :: i, j, cnt, best_c
+
+         if (size(x) <= 0) then
+            m = 0.0_dp
+            return
+         end if
+         m = x(1)
+         best_c = 0
+         do i = 1, size(x)
+            cnt = 0
+            do j = 1, size(x)
+               if (x(j) == x(i)) cnt = cnt + 1
+            end do
+            if (cnt > best_c) then
+               best_c = cnt
+               m = x(i)
+            end if
+         end do
+      end function mode_real
+
       function multimode_int(x) result(mm)
          integer, intent(in) :: x(:)
          integer, allocatable :: mm(:)
@@ -4088,12 +4246,19 @@ contains
          end do
          m = 0
          do i = 1, n
-            if (i == 1 .or. tmp(i) /= tmp(i-1)) m = m + 1
+            if (i == 1) then
+               m = m + 1
+            else if (tmp(i) /= tmp(i-1)) then
+               m = m + 1
+            end if
          end do
          allocate(y(1:m))
          m = 0
          do i = 1, n
-            if (i == 1 .or. tmp(i) /= tmp(i-1)) then
+            if (i == 1) then
+               m = m + 1
+               y(m) = tmp(i)
+            else if (tmp(i) /= tmp(i-1)) then
                m = m + 1
                y(m) = tmp(i)
             end if
@@ -4572,12 +4737,19 @@ contains
          call sort_real_vec(tmp)
          m = 0
          do i = 1, n
-            if (i == 1 .or. tmp(i) /= tmp(i-1)) m = m + 1
+            if (i == 1) then
+               m = m + 1
+            else if (tmp(i) /= tmp(i-1)) then
+               m = m + 1
+            end if
          end do
          allocate(y(1:m))
          m = 0
          do i = 1, n
-            if (i == 1 .or. tmp(i) /= tmp(i-1)) then
+            if (i == 1) then
+               m = m + 1
+               y(m) = tmp(i)
+            else if (tmp(i) /= tmp(i-1)) then
                m = m + 1
                y(m) = tmp(i)
             end if
@@ -5186,6 +5358,35 @@ contains
          frac = pos - real(lo, kind=dp)
          quantile_linear = (1.0_dp - frac) * xs(lo) + frac * xs(hi)
       end function quantile_linear
+
+      function statistics_quantiles_real(x, n) result(q)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: q(:)
+         real(kind=dp), allocatable :: xs(:)
+         real(kind=dp) :: h, frac
+         integer :: m, nq, i, lo, hi
+
+         nq = max(0, n - 1)
+         allocate(q(nq), source=0.0_dp)
+         m = size(x)
+         if (m <= 0 .or. n <= 1) return
+         allocate(xs(m), source=x)
+         call sort_real_vec(xs)
+         do i = 1, nq
+            h = real(i * (m + 1), kind=dp) / real(n, kind=dp)
+            if (h <= 1.0_dp) then
+               q(i) = xs(1)
+            else if (h >= real(m, kind=dp)) then
+               q(i) = xs(m)
+            else
+               lo = int(floor(h))
+               hi = lo + 1
+               frac = h - real(lo, kind=dp)
+               q(i) = (1.0_dp - frac) * xs(lo) + frac * xs(hi)
+            end if
+         end do
+      end function statistics_quantiles_real
 
       pure real(kind=dp) function var(x, ddof)
          real(kind=dp), intent(in) :: x(:)

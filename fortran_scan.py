@@ -1763,6 +1763,14 @@ def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[st
         indent = m.group(1)
         spec = m.group(2).strip()
         entity = m.group(3).strip()
+        def _shape_sig(ent: str) -> str:
+            mm = re.match(r"\s*[a-z][a-z0-9_]*(.*)\s*$", ent, re.IGNORECASE)
+            return (mm.group(1).strip() if mm else "").lower()
+        shape_sig = _shape_sig(entity)
+        if re.search(r"\bintent\s*\(", spec, re.IGNORECASE):
+            out.append(line)
+            i += 1
+            continue
         # Skip initialized declarations.
         # Note: entity may legally contain commas inside shape, e.g. a(:,:).
         if "=" in entity:
@@ -1784,6 +1792,8 @@ def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[st
             if mj.group(1) != indent or mj.group(2).strip().lower() != spec.lower():
                 break
             entj = mj.group(3).strip()
+            if _shape_sig(entj) != shape_sig:
+                break
             if "=" in entj:
                 break
             names.append(entj)

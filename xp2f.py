@@ -4242,10 +4242,40 @@ def detect_needed_helpers(tree):
         "logical_or": {"reduceat_logical_or"},
     }
 
+    def _prescan_rng_names(_tree):
+        # A full-tree pre-pass so a later-defined driver function's
+        # `rng = default_rng(...)` is known before scanning an
+        # earlier-defined helper function's `rng.random(...)` call site
+        # (the single interleaved NodeVisitor pass below visits functions
+        # in file order, not call order).
+        names = set()
+        for _n in ast.walk(_tree):
+            if not (
+                isinstance(_n, ast.Assign)
+                and len(_n.targets) == 1
+                and isinstance(_n.targets[0], ast.Name)
+                and isinstance(_n.value, ast.Call)
+            ):
+                continue
+            _v = _n.value
+            if (
+                (
+                    isinstance(_v.func, ast.Attribute)
+                    and isinstance(_v.func.value, ast.Attribute)
+                    and isinstance(_v.func.value.value, ast.Name)
+                    and _v.func.value.value.id == "np"
+                    and _v.func.value.attr == "random"
+                    and _v.func.attr == "default_rng"
+                )
+                or (isinstance(_v.func, ast.Name) and _v.func.id == "default_rng")
+            ):
+                names.add(_n.targets[0].id)
+        return names
+
     class scan(ast.NodeVisitor):
         def __init__(self):
             super().__init__()
-            self.rng_names = set()
+            self.rng_names = _prescan_rng_names(tree)
             self.scipy_special_aliases, self.scipy_special_func_aliases = collect_scipy_special_aliases(tree)
             self.statistics_aliases, self.statistics_func_aliases = collect_statistics_aliases(tree)
             self.time_aliases, self.time_func_aliases = time_aliases, time_func_aliases
@@ -4926,6 +4956,7 @@ def detect_needed_helpers(tree):
                     needed.add("random_choice_norep")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "permutation":
                 needed.add("random_choice_norep")
+                needed.add("arange_int")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "mean":
                 needed.add("mean_1d")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "var":
@@ -5606,6 +5637,33 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None):
                 if n.args and isinstance(n.args[0], (ast.List, ast.Tuple)):
                     return k, max(1, len(n.args[0].elts))
                 return k, 1
+        if (
+            isinstance(n, ast.Call)
+            and (
+                (
+                    isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Attribute)
+                    and isinstance(n.func.value.value, ast.Name)
+                    and n.func.value.value.id in {"np", "numpy"}
+                    and n.func.value.attr == "random"
+                    and n.func.attr == "default_rng"
+                )
+                or (isinstance(n.func, ast.Name) and n.func.id == "default_rng")
+                or (isinstance(n.func, ast.Name) and n.func.id == "Random")
+                or (
+                    isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "random"
+                    and n.func.attr == "Random"
+                )
+            )
+        ):
+            # rng = np.random.default_rng(seed) / random.Random(seed): the
+            # transpiler keeps a scalar int placeholder for the RNG object
+            # (actual randomness routes through global runif()/rnorm()
+            # state), so its shared module declaration must match that,
+            # not fall through to the generic real-valued-call default.
+            return "int", 0
         return "real", 0
 
     decls = {}
@@ -11111,6 +11169,8 @@ class translator(ast.NodeVisitor):
                     return "char"
             if node.attr == "size" and isinstance(node.value, ast.Name):
                 return "int"
+            if node.attr == "shape":
+                return "int"
             if node.attr in {"c_contiguous", "f_contiguous"}:
                 if isinstance(node.value, ast.Attribute) and node.value.attr == "flags":
                     return "logical"
@@ -13252,6 +13312,10 @@ class translator(ast.NodeVisitor):
             and isinstance(node.value, ast.Name)
             and node.value.id in self.broadcast_object_args
         ):
+            return 1
+        if isinstance(node, ast.Attribute) and node.attr == "shape":
+            # x.shape is always a rank-1 tuple of dimension sizes,
+            # regardless of x's own rank.
             return 1
         if (
             isinstance(node, ast.Attribute)
@@ -19124,19 +19188,26 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr == "flip"
+                and node.func.attr in {"flip", "flipud"}
                 and len(node.args) >= 1
             ):
-                a0 = self.expr(node.args[0])
-                return f"{a0}(size({a0}):1:-1)"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and is_numpy_name_node(node.func.value)
-                and node.func.attr == "flipud"
-                and len(node.args) >= 1
-            ):
-                a0 = self.expr(node.args[0])
-                r0 = self._rank_expr(node.args[0])
+                arg0 = node.args[0]
+                # arr(lo:hi) is a section, not a variable, so it can't be
+                # subscripted again directly (arr(lo:hi)(size(...):1:-1) is
+                # invalid Fortran); reverse the section's own bounds instead.
+                if (
+                    isinstance(arg0, ast.Subscript)
+                    and isinstance(arg0.slice, ast.Slice)
+                    and int(self._rank_expr(arg0.value)) <= 1
+                ):
+                    base_expr = self.expr(arg0.value)
+                    lb, ub, step_val = self._slice_bounds_fortran(arg0.slice, f"size({base_expr})")
+                    if step_val == 1:
+                        return f"{base_expr}({ub}:{lb}:-1)"
+                a0 = self.expr(arg0)
+                if node.func.attr == "flip":
+                    return f"{a0}(size({a0}):1:-1)"
+                r0 = self._rank_expr(arg0)
                 if r0 <= 1:
                     return f"{a0}(size({a0}):1:-1)"
                 return f"{a0}(size({a0},1):1:-1, :)"
@@ -26037,9 +26108,11 @@ class translator(ast.NodeVisitor):
                         self.o.w("complex(kind=dp), allocatable :: pool_ch(:)")
                     else:
                         self.o.w("character(len=:), allocatable :: pool_ch(:)")
+                else:
+                    # Declaration must precede the allocate() below it.
+                    self.o.w("integer, allocatable :: idx_ch(:)")
                 self.o.w(f"allocate({tmp_name}(1:{k_expr}))")
                 if replace_false:
-                    self.o.w("integer, allocatable :: idx_ch(:)")
                     self.o.w(f"allocate(idx_ch(1:{k_expr}))")
                     self.o.w(f"call random_choice_norep(size({arr_expr}), {k_expr}, idx_ch)")
                     self.o.w(f"{tmp_name} = {arr_expr}(idx_ch + 1)")
@@ -27252,16 +27325,36 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "permutation"
             and len(v.args) >= 1
         ):
-            arr_expr = self.expr(v.args[0])
+            # rng.permutation(n) with a scalar int permutes arange(n);
+            # rng.permutation(arr) permutes an existing array's elements.
+            if int(self._rank_expr(v.args[0])) == 0 and self._expr_kind(v.args[0]) == "int":
+                arr_expr = f"arange_int(0, int({self.expr(v.args[0])}), 1)"
+            else:
+                arr_expr = self.expr(v.args[0])
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
-            self.o.w(f"allocate({t.id}(1:size({arr_expr})))")
             self.o.w("block")
             self.o.push()
+            # A call-result (e.g. arange_int(...)) can't be subscripted
+            # directly in Fortran, so materialize it into a local array
+            # before indexing it with the shuffled positions.
             self.o.w("integer, allocatable :: idx_ch(:)")
-            self.o.w(f"allocate(idx_ch(1:size({arr_expr})))")
-            self.o.w(f"call random_choice_norep(size({arr_expr}), size({arr_expr}), idx_ch)")
-            self.o.w(f"{t.id} = {arr_expr}(idx_ch + 1)")
+            self.o.w("integer, allocatable :: perm_base_ch(:)")
+            self.o.w(f"perm_base_ch = {arr_expr}")
+            self.o.w("allocate(idx_ch(1:size(perm_base_ch)))")
+            self.o.w("call random_choice_norep(size(perm_base_ch), size(perm_base_ch), idx_ch)")
+            # If t.id's final rank (from later reshaping/usage) exceeds this
+            # rank-1 permutation result, pad it into a column so the
+            # allocatable assignment's rank matches (as with any other
+            # first-assignment-is-1D-then-reshaped-later variable); a later
+            # explicit reshape() in the source narrows it to the real shape.
+            _target_rank = int(self._rank_expr(ast.Name(id=t.id, ctx=ast.Load())))
+            if _target_rank > 1:
+                _extra_dims = ", ".join(["1"] * (_target_rank - 1))
+                self.o.w(f"{t.id} = reshape(perm_base_ch(idx_ch + 1), [size(perm_base_ch), {_extra_dims}])")
+            else:
+                self.o.w(f"{t.id} = perm_base_ch(idx_ch + 1)")
             self.o.w("if (allocated(idx_ch)) deallocate(idx_ch)")
+            self.o.w("if (allocated(perm_base_ch)) deallocate(perm_base_ch)")
             self.o.pop()
             self.o.w("end block")
             return
@@ -32620,7 +32713,7 @@ def _emit_local_function(
                 recv = n.func.value
                 if not (isinstance(recv, ast.Name) and recv.id == nm):
                     continue
-                if n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice"}:
+                if n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice", "permutation", "shuffle"}:
                     return True
         return False
 
@@ -35635,10 +35728,19 @@ def _emit_local_function(
             _dk = tr._expr_kind(defaults_map[arg])
             if _dk in {"char", "logical", "complex"}:
                 hint_kind = _dk
-        if arg in getattr(tr, "rng_vars", set()):
+        if arg in getattr(tr, "rng_vars", set()) or _arg_used_as_rng_receiver(arg):
             hint_kind = "int"
-        if _arg_used_as_rng_receiver(arg):
-            hint_kind = "int"
+            # Persist to the shared map too: callers coerce actual argument
+            # kinds against local_func_arg_kinds[callee], and without this
+            # they'd still see the stale (pre-override) guess and insert a
+            # wrong real()/int() cast around the rng placeholder actual.
+            if (
+                local_func_arg_kinds is not None
+                and fn.name in local_func_arg_kinds
+                and idx >= 0
+                and idx < len(local_func_arg_kinds[fn.name])
+            ):
+                local_func_arg_kinds[fn.name][idx] = "int"
         if _arg_integer_seed_recurrence(arg):
             hint_kind = "int"
         if _self_norm_kind is None and _arg_used_as_index_or_range(arg):
@@ -38515,7 +38617,7 @@ def generate_flat(
                     and isinstance(n.func, ast.Attribute)
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == nm
-                    and n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice"}
+                    and n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice", "permutation", "shuffle"}
                 ):
                     return _ret("int")
 
@@ -39452,7 +39554,20 @@ def generate_flat(
                     if _st_alias.value.id in _aliases and _st_alias.targets[0].id not in _aliases:
                         _aliases.add(_st_alias.targets[0].id)
                         _changed_alias = True
+            # Only look at leaf (non-compound) statements: a compound
+            # statement (the function itself, an if/for/while/... block)
+            # trivially "contains" the arg name whenever it's used anywhere
+            # in its body, which would make ast.walk(_st) below scan the
+            # entire nested block (or even the whole function) for
+            # unrelated real-number evidence instead of evidence tied to
+            # this specific statement's use of the name.
+            _compound_stmt_types = (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.If, ast.For, ast.AsyncFor,
+                ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Module,
+            )
             for _st in ast.walk(fn):
+                if isinstance(_st, _compound_stmt_types):
+                    continue
                 if not any(isinstance(_x, ast.Name) and _x.id in _aliases for _x in ast.walk(_st)):
                     continue
                 for _x in ast.walk(_st):
@@ -41280,7 +41395,13 @@ def generate_flat(
                 if st_alias.value.id in aliases and st_alias.targets[0].id not in aliases:
                     aliases.add(st_alias.targets[0].id)
                     changed_alias = True
+        _compound_stmt_types = (
+            ast.FunctionDef, ast.AsyncFunctionDef, ast.If, ast.For, ast.AsyncFor,
+            ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Module,
+        )
         for st in ast.walk(fn_node):
+            if isinstance(st, _compound_stmt_types):
+                continue
             if not any(isinstance(x, ast.Name) and x.id in aliases for x in ast.walk(st)):
                 continue
             if (
@@ -41945,11 +42066,47 @@ def generate_flat(
                 return True
         return False
     if use_proc_module:
-        # Module-alias helpers (time.perf_counter, math.X, sys.exit, ...) are
-        # only detected when the import statement is visible in the scanned
-        # tree, so carry the original imports along with the function bodies.
-        _proc_tree_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
-        proc_tree = ast.Module(body=_proc_tree_imports + list(local_funcs), type_ignores=[])
+        # Module-alias/object helpers (time.perf_counter, math.X, sys.exit,
+        # rng.random() where `rng = np.random.default_rng(...)`, ...) are
+        # only detected when the defining import/assignment is visible in
+        # the scanned tree, so carry those specific top-level statements
+        # along with the function bodies. Deliberately narrower than "all
+        # non-def top-level statements": a bare top-level call (e.g.
+        # print(rnorm()) where rnorm is the user's own same-named local
+        # function) would otherwise trigger the unrelated
+        # local-vs-runtime-helper-name ambiguity checks below.
+        def _is_rng_ctor_assign(_n):
+            if not (
+                isinstance(_n, ast.Assign)
+                and len(_n.targets) == 1
+                and isinstance(_n.targets[0], ast.Name)
+                and isinstance(_n.value, ast.Call)
+            ):
+                return False
+            _v = _n.value
+            return (
+                (
+                    isinstance(_v.func, ast.Attribute)
+                    and isinstance(_v.func.value, ast.Attribute)
+                    and isinstance(_v.func.value.value, ast.Name)
+                    and _v.func.value.value.id in {"np", "numpy"}
+                    and _v.func.value.attr == "random"
+                    and _v.func.attr == "default_rng"
+                )
+                or (isinstance(_v.func, ast.Name) and _v.func.id == "default_rng")
+                or (isinstance(_v.func, ast.Name) and _v.func.id == "Random")
+                or (
+                    isinstance(_v.func, ast.Attribute)
+                    and isinstance(_v.func.value, ast.Name)
+                    and _v.func.value.id == "random"
+                    and _v.func.attr == "Random"
+                )
+            )
+        _proc_tree_top_level = [
+            n for n in tree.body
+            if isinstance(n, (ast.Import, ast.ImportFrom)) or _is_rng_ctor_assign(n)
+        ]
+        proc_tree = ast.Module(body=_proc_tree_top_level + list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
         for mod, syms in helper_uses.items():
             keep = sorted([s for s in syms if s in proc_needed])
