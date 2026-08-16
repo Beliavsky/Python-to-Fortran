@@ -9820,15 +9820,15 @@ class translator(ast.NodeVisitor):
             "data", "dimension", "do", "dot_product", "double", "elemental", "else",
             "elseif", "end", "entry", "equivalence", "exit", "exp", "external",
             "floor", "format", "function",
-            "go", "goto", "if", "implicit", "in", "integer", "interface", "intrinsic",
+            "go", "goto", "if", "implicit", "in", "index", "integer", "interface", "intrinsic",
             "int", "len", "len_trim", "log", "log10", "logical",
-            "lbound", "max", "maxval", "merge", "min", "minval", "mod", "module",
+            "lbound", "matmul", "max", "maxval", "merge", "min", "minval", "mod", "module",
             "modulo",
             "namelist", "none", "nint", "open", "optional",
             "pack", "parameter", "pointer", "present", "print", "private", "procedure",
             "product", "program", "public", "pure",
-            "read", "real", "recursive", "repeat", "reshape", "return", "rewind",
-            "save", "scan", "select", "sequence", "sign", "sin", "size", "sqrt",
+            "rank", "read", "real", "recursive", "repeat", "reshape", "return", "rewind",
+            "save", "scan", "select", "sequence", "shape", "sign", "sin", "size", "spread", "sqrt",
             "stop", "subroutine", "sum",
             "tan", "tanh", "then", "tiny", "transfer", "transpose", "trim",
             "type",
@@ -21101,33 +21101,38 @@ class translator(ast.NodeVisitor):
                 elif isinstance(_m, ast.AnnAssign) and isinstance(_m.target, ast.Name) and _m.value is not None:
                     _mark_name_from_expr(_m.target.id, _m.value)
             if isinstance(_n, ast.For) and isinstance(_n.target, ast.Name) and _n.target.id != "_":
+                # _mark_* silently no-ops on a raw reserved-word name (the
+                # caller is expected to pre-alias it, e.g. "dim" -> "xdim"),
+                # so alias here or a colliding loop variable never gets
+                # declared at all.
+                _target_nm = self._aliased_name(_n.target.id)
                 if isinstance(_n.iter, ast.Name) and _n.iter.id in self.file_handle_vars:
-                    self._mark_char(_n.target.id)
+                    self._mark_char(_target_nm)
                     continue
                 _rr_iter = max(0, int(self._rank_expr(_n.iter)))
                 _kk_iter = self._expr_kind(_n.iter)
                 if _rr_iter >= 2:
                     if _kk_iter == "complex":
-                        self._mark_alloc_complex(_n.target.id, rank=1)
+                        self._mark_alloc_complex(_target_nm, rank=1)
                     elif _kk_iter == "logical":
-                        self._mark_alloc_log(_n.target.id, rank=1)
+                        self._mark_alloc_log(_target_nm, rank=1)
                     elif _kk_iter == "char":
-                        self._mark_alloc_char(_n.target.id, rank=1)
+                        self._mark_alloc_char(_target_nm, rank=1)
                     elif _kk_iter == "int":
-                        self._mark_alloc_int(_n.target.id, rank=1)
+                        self._mark_alloc_int(_target_nm, rank=1)
                     else:
-                        self._mark_alloc_real(_n.target.id, rank=1)
+                        self._mark_alloc_real(_target_nm, rank=1)
                 elif _rr_iter == 1:
                     if _kk_iter == "complex":
-                        self._mark_complex(_n.target.id)
+                        self._mark_complex(_target_nm)
                     elif _kk_iter == "logical":
-                        self._mark_log(_n.target.id)
+                        self._mark_log(_target_nm)
                     elif _kk_iter == "char":
-                        self._mark_char(_n.target.id)
+                        self._mark_char(_target_nm)
                     elif _kk_iter == "int":
-                        self._mark_int(_n.target.id)
+                        self._mark_int(_target_nm)
                     elif _kk_iter == "real":
-                        self._mark_real(_n.target.id)
+                        self._mark_real(_target_nm)
             for _c in ast.walk(_n):
                 if not (
                     isinstance(_c, ast.Call)
@@ -27962,6 +27967,48 @@ class translator(ast.NodeVisitor):
                 return
             raise NotImplementedError("np.repeat axis out of range for 2D arrays")
 
+        # y = np.flip(EXPR) / y = np.flipud(EXPR) where EXPR isn't a simple
+        # designator (e.g. np.flipud(np.transpose(x))): the generic
+        # expression-level codegen for flip/flipud would otherwise chain a
+        # reversed section directly onto the call result
+        # (transpose(x)(size(...):1:-1, :)), which isn't valid Fortran.
+        # Materialize EXPR into a local array first.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and is_numpy_name_node(v.func.value)
+            and v.func.attr in {"flip", "flipud"}
+            and len(v.args) >= 1
+            and not (
+                isinstance(v.args[0], ast.Name)
+                or (isinstance(v.args[0], ast.Subscript) and isinstance(v.args[0].slice, ast.Slice))
+            )
+        ):
+            name = t.id
+            r0 = int(self._rank_expr(v.args[0]))
+            src_expr = self.expr(v.args[0])
+            kind0 = self._expr_kind(v.args[0]) or "real"
+            decl = {
+                "real": "real(kind=dp), allocatable",
+                "int": "integer, allocatable",
+                "logical": "logical, allocatable",
+                "complex": "complex(kind=dp), allocatable",
+                "char": "character(len=:), allocatable",
+            }[kind0]
+            dims = ":,:" if r0 >= 2 else ":"
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"{decl} :: flip_tmp({dims})")
+            self.o.w(f"flip_tmp = {src_expr}")
+            if r0 >= 2 and v.func.attr == "flipud":
+                self.o.w(f"{name} = flip_tmp(size(flip_tmp,1):1:-1, :)")
+            else:
+                self.o.w(f"{name} = flip_tmp(size(flip_tmp):1:-1)")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
@@ -27980,9 +28027,15 @@ class translator(ast.NodeVisitor):
                     axis_node = kw.value
                     break
             if r0 <= 1:
-                self.o.w(f"if (allocated({name})) deallocate({name})")
-                self.o.w(f"allocate({name}(1:size({a0})))")
-                self.o.w(f"{name} = {a0}")
+                if a0 != name:
+                    # x = np.sort(y): size/copy y into x first. When x and y
+                    # are the same variable (x = np.sort(x)), x is already
+                    # allocated with the right size, and deallocating it
+                    # first would make the size(x) just below reference a
+                    # deallocated array.
+                    self.o.w(f"if (allocated({name})) deallocate({name})")
+                    self.o.w(f"allocate({name}(1:size({a0})))")
+                    self.o.w(f"{name} = {a0}")
                 self.o.w(f"call sort_vec({name})")
                 return
             if r0 == 2:
@@ -27991,9 +28044,10 @@ class translator(ast.NodeVisitor):
                     if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)):
                         raise NotImplementedError("np.sort axis must be a constant integer")
                     axis = int(axis_node.value)
-                self.o.w(f"if (allocated({name})) deallocate({name})")
-                self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)))")
-                self.o.w(f"{name} = {a0}")
+                if a0 != name:
+                    self.o.w(f"if (allocated({name})) deallocate({name})")
+                    self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)))")
+                    self.o.w(f"{name} = {a0}")
                 self.o.w("block")
                 self.o.push()
                 if axis in {0, -2}:
@@ -29986,6 +30040,8 @@ class translator(ast.NodeVisitor):
         var = node.target.id
         if var == "_":
             var = "i_"
+        else:
+            var = self._aliased_name(var)
         self._mark_int(var)
         start, stop, step = self._range_parts(node.iter)
         f_start = self._as_integer_loop_expr(start)

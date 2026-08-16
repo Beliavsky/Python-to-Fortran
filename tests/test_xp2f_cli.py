@@ -3919,3 +3919,149 @@ def test_xp2f_initializes_top_level_globals_membership_flags(tmp_path: Path) -> 
     assert "Run diff: MATCH" in proc.stdout
     out_text = (tmp_path / "xglobals_membership_small_p.f90").read_text(encoding="utf-8")
     assert "xp2f_has_global_x = .false." in out_text
+
+
+def test_xp2f_declares_reserved_word_for_loop_variable(tmp_path: Path) -> None:
+    # "dim" is a Fortran intrinsic; the for-loop header, the loop body, and
+    # the declaration list must all agree on the aliased name ("xdim") or
+    # the variable ends up used but never declared.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xreserved_loop_var_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def f(dim_num):",
+                "    total = 0",
+                "    for dim in range(0, dim_num):",
+                "        total = total + dim",
+                "    return total",
+                "",
+                "print(f(5))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+
+
+def test_xp2f_avoids_intrinsic_name_collision_for_local_variables(tmp_path: Path) -> None:
+    # "index" and "shape" are Fortran intrinsics but extremely common
+    # variable names in numerical Python; both must be usable as plain
+    # local scalars/arrays without colliding with the intrinsic.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xreserved_var_names_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def f(a, target):",
+                "    index = 0",
+                "    for i in range(len(a)):",
+                "        if a[i] == target:",
+                "            index = i",
+                "    shape = a.shape",
+                "    return index + shape[0]",
+                "",
+                "a = np.array([3, 1, 4, 1, 5])",
+                "print(f(a, 4))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+
+
+def test_xp2f_handles_self_referential_np_sort(tmp_path: Path) -> None:
+    # x = np.sort(x): x is already allocated at the right size, so
+    # deallocating it before sizing the new allocation from size(x) would
+    # reference an already-deallocated array.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
+    src = tmp_path / "xself_sort_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def f(x):",
+                "    x = np.sort(x)",
+                "    return x",
+                "",
+                "a = np.array([3.0, 1.0, 4.0, 1.0, 5.0])",
+                "print(f(a))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
+
+
+def test_xp2f_flips_result_of_nested_numpy_call(tmp_path: Path) -> None:
+    # np.flipud(np.transpose(x)): the argument isn't a simple name or
+    # slice, so it must be materialized into a temporary before being
+    # reversed -- chaining a reversed section directly onto the
+    # transpose() call result (transpose(x)(size(...):1:-1, :)) isn't
+    # valid Fortran.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xflip_nested_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def f(x):",
+                "    y = np.flipud(np.transpose(x))",
+                "    return y",
+                "",
+                "x = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])",
+                "print(f(x))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout
