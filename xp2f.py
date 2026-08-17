@@ -4117,12 +4117,18 @@ def is_numpy_name_node(node):
 
 
 def fortran_safe_stem(stem):
-    """Fortran identifiers cannot start with a digit; the input filename
-    stem can (e.g. Rosetta Code scripts like "10001th_prime.py"). Prefix
-    with a letter when needed so the stem is safe to use as a module or
-    program name; leave it untouched (and thus untouched in filenames)
-    everywhere else."""
-    return f"m_{stem}" if stem and stem[0].isdigit() else stem
+    """Fortran identifiers must start with a letter and contain only
+    letters/digits/underscores; the input filename stem can violate both
+    (e.g. Rosetta Code scripts like "10001th_prime.py" or
+    "Case-sensitivity_of_identifiers.py"). Sanitize so the stem is safe to
+    use as a module or program name; leave it untouched (and thus untouched
+    in filenames) everywhere else."""
+    if not stem:
+        return stem
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", stem)
+    if not safe or not safe[0].isalpha():
+        safe = f"m_{safe}"
+    return safe
 
 
 def is_numpy_sliding_window_view_axis0_call(node):
@@ -38618,6 +38624,14 @@ def generate_flat(
             ):
                 return True
             if (
+                isinstance(_node, ast.Assign)
+                and len(_node.targets) == 1
+                and isinstance(_node.targets[0], (ast.Tuple, ast.List))
+                and isinstance(_node.value, ast.Name)
+                and _node.value.id == nm
+            ):
+                return True
+            if (
                 isinstance(_node, ast.Attribute)
                 and isinstance(_node.value, ast.Name)
                 and _node.value.id == nm
@@ -39208,6 +39222,14 @@ def generate_flat(
     call_rank_sets = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_pairs = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
     call_kind_rank_islist = {fn.name: [set() for _ in local_arg_names_map.get(fn.name, [])] for fn in (local_funcs or [])}
+
+    def _safe_idx(_lst, _i):
+        # local_arg_names_map (used to size these per-function lists) can
+        # disagree in length with fn.args.args for a given function, so an
+        # index that should be in range isn't always. Treat out-of-range the
+        # same as "no observed pairs/triads for this argument" rather than
+        # crashing.
+        return _lst[_i] if 0 <= _i < len(_lst) else set()
     _prov_scalar_specs, _prov_scalar_ranks, _prov_tuple_out, _prov_tuple_out_ranks = _local_return_maps(
         local_funcs,
         params,
@@ -41399,8 +41421,8 @@ def generate_flat(
         obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
         pair_lists = []
         for i in range(len(arg_names)):
-            prs = set(call_kind_rank_pairs.get(fn.name, [set() for _ in arg_names])[i])
-            prs |= set(obs_pair_lists[i])
+            prs = set(_safe_idx(call_kind_rank_pairs.get(fn.name, [set() for _ in arg_names]), i))
+            prs |= set(_safe_idx(obs_pair_lists, i))
             prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
             pair_lists.append(prs)
         if any((not prs) for prs in pair_lists):
@@ -41409,7 +41431,7 @@ def generate_flat(
         if len(varying) != 1:
             continue
         iv = varying[0]
-        triads_v = set(call_kind_rank_islist.get(fn.name, [set() for _ in arg_names])[iv])
+        triads_v = set(_safe_idx(call_kind_rank_islist.get(fn.name, [set() for _ in arg_names]), iv))
         # Keep scope tight: only one dynamic argument; all others must be fixed.
         fixed = {}
         ok = True
@@ -41638,10 +41660,10 @@ def generate_flat(
             req_rank = int(base_func_arg_ranks[fn.name][0])
         if _fn_requires_rank1_arg(fn, arg0):
             req_rank = max(req_rank, 1)
-        pairs = set(call_kind_rank_pairs.get(fn.name, [set()])[0])
+        pairs = set(_safe_idx(call_kind_rank_pairs.get(fn.name, [set()]), 0))
         obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
-        triads = set(call_kind_rank_islist.get(fn.name, [set()])[0]) | set(obs_triad_lists[0])
-        pairs = set(pairs) | set(obs_pair_lists[0])
+        triads = set(_safe_idx(call_kind_rank_islist.get(fn.name, [set()]), 0)) | set(_safe_idx(obs_triad_lists, 0))
+        pairs = set(pairs) | set(_safe_idx(obs_pair_lists, 0))
         pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
         _comment_kind0, _comment_rank0 = _comment_arg_spec_hint_for_fn(fn, arg0)
         if _comment_kind0 in {"int", "real", "logical", "char", "complex"}:
@@ -41750,10 +41772,10 @@ def generate_flat(
         pair_lists = []
         triad_lists = []
         for i, arg_nm in enumerate(arg_names):
-            prs = set(call_kind_rank_pairs.get(fn.name, [set() for _ in arg_names])[i])
-            trs = set(call_kind_rank_islist.get(fn.name, [set() for _ in arg_names])[i])
-            prs |= set(obs_pair_lists[i])
-            trs |= set(obs_triad_lists[i])
+            prs = set(_safe_idx(call_kind_rank_pairs.get(fn.name, [set() for _ in arg_names]), i))
+            trs = set(_safe_idx(call_kind_rank_islist.get(fn.name, [set() for _ in arg_names]), i))
+            prs |= set(_safe_idx(obs_pair_lists, i))
+            trs |= set(_safe_idx(obs_triad_lists, i))
             prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
             _comment_kind_i, _comment_rank_i = _comment_arg_spec_hint_for_fn(fn, arg_nm)
             if _comment_kind_i in {"int", "real", "logical", "char", "complex"}:

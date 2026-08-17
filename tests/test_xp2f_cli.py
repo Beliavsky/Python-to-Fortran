@@ -3721,6 +3721,93 @@ def test_xp2f_sanitizes_module_and_program_names_starting_with_a_digit(tmp_path:
     assert "program m_10001th_prime" in out_text
 
 
+def test_xp2f_does_not_crash_on_duplicate_def_with_mismatched_arity(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xduplicate_def_arity.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def bellTriangle(n):",
+                "    tri = [0] * n",
+                "    tri[0] = 1",
+                "    for i in range(1, n):",
+                "        tri[i] = tri[i - 1] + i",
+                "    return tri",
+                "",
+                "def main():",
+                "    bt = bellTriangle(5)",
+                "    print(bt[0])",
+                "",
+                "main()",
+                "",
+                "def bellTriangle():",
+                "    return 0",
+                "",
+                "def main():",
+                "    print(bellTriangle())",
+                "",
+                "main()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--flat"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "Traceback (most recent call last)" not in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_xp2f_treats_tuple_unpacked_param_as_array_across_sibling_functions(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xtuple_unpack_param.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def monomial_to_bernstein_degree2(monomial_coefficients):",
+                "    (a0, a1, a2) = monomial_coefficients",
+                "    return (a0, a0 + (0.5 * a1), a0 + a1 + a2)",
+                "",
+                "def evaluate_bernstein_degree2(bernstein_coefficients, t):",
+                "    (b0, b1, b2) = bernstein_coefficients",
+                "    s = 1 - t",
+                "    b01 = (s * b0) + (t * b1)",
+                "    b12 = (s * b1) + (t * b2)",
+                "    return (s * b01) + (t * b12)",
+                "",
+                "def bernstein_degree2_to_degree3(bernstein_coefficients):",
+                "    (b0, b1, b2) = bernstein_coefficients",
+                "    return (b0, b1, b2, b0 + b1 + b2)",
+                "",
+                "pmono2 = (1.0, 0.0, 0.0)",
+                "pbern2 = monomial_to_bernstein_degree2(pmono2)",
+                "print(evaluate_bernstein_degree2(pbern2, 0.25))",
+                "print(bernstein_degree2_to_degree3(pbern2))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    out_f90 = tmp_path / "xtuple_unpack_param_p.f90"
+    out_text = out_f90.read_text(encoding="utf-8")
+    assert "bernstein_coefficients(:)" in out_text, proc.stdout + proc.stderr
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"
