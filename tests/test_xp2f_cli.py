@@ -3556,6 +3556,94 @@ def test_xp2f_promotes_int_seeded_tuple_output_to_real_when_accumulated_from_rea
     assert "real(kind=dp), intent(out) :: vmax" in out_text
 
 
+def test_xp2f_infers_rank_one_for_rng_permutation_result(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xrng_permutation_best.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "from numpy.random import default_rng",
+                "",
+                "def f(n):",
+                "    rng = default_rng()",
+                "    p_best = np.zeros(n)",
+                "    cost_best = 0.0",
+                "    for k in range(3):",
+                "        p = rng.permutation(n)",
+                "        cost = float(k)",
+                "        if cost < cost_best:",
+                "            p_best = p.copy()",
+                "            cost_best = cost",
+                "    print(p_best)",
+                "",
+                "f(5)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_xp2f_does_not_guess_local_call_return_rank_from_first_argument(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xlocal_call_return_rank_guess.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def triangle_xsi_to_xy(t, xsi):",
+                "    p = np.zeros(2)",
+                "    p[0] = t[0,0] * xsi[0] + t[0,1] * xsi[1] + t[0,2] * xsi[2]",
+                "    p[1] = t[1,0] * xsi[0] + t[1,1] * xsi[1] + t[1,2] * xsi[2]",
+                "    return p",
+                "",
+                "def triangle_xy_to_xsi(t, p):",
+                "    xsi = np.zeros(3)",
+                "    xsi[0] = (t[1,1] - t[1,2]) * (p[0] - t[0,2])",
+                "    xsi[1] = (t[1,0] - t[1,2]) * (p[0] - t[0,2])",
+                "    xsi[2] = 1.0 - xsi[0] - xsi[1]",
+                "    return xsi",
+                "",
+                "def triangle_xsi_to_xy_test():",
+                "    t = np.array([[4.0, 1.0, -2.0],[2.0, 5.0, 2.0]])",
+                "    n = 1",
+                "    p = np.zeros((2, n))",
+                "    p[0,0] = 3.0",
+                "    p[1,0] = 0.0",
+                "    xsi = triangle_xy_to_xsi(t, p[:,0])",
+                "    p2 = triangle_xsi_to_xy(t, xsi)",
+                "    print('%8g %8g %8g %8g %8g' % (p[0,0], p[1,0], xsi[0], xsi[1], xsi[2]))",
+                "",
+                "triangle_xsi_to_xy_test()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"

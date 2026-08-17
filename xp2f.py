@@ -13508,6 +13508,14 @@ class translator(ast.NodeVisitor):
                     return max(1, len(size_node.elts))
                 return 1
 
+            if (
+                isinstance(node.func, ast.Attribute)
+                and _is_rng_rank_source(node.func.value)
+                and node.func.attr == "permutation"
+                and len(node.args) >= 1
+            ):
+                return 1
+
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 if len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -13575,8 +13583,14 @@ class translator(ast.NodeVisitor):
                     rr_hint = int(self.local_return_ranks.get(node.func.id, 0))
                     if rr_hint > 0:
                         return rr_hint
-                    if len(node.args) >= 1:
-                        return max(1, self._rank_expr(node.args[0]))
+                    # The true return rank isn't resolved yet (this runs before
+                    # the fixed-point pass over local functions). Guess the
+                    # floor of 1 rather than borrowing arg0's rank: rank facts
+                    # recorded from this guess only ever ratchet upward later
+                    # (_mark_alloc_real takes a max), so an under-guess here
+                    # self-corrects once the real rank is known, but an
+                    # over-guess (e.g. from a coincidentally higher-rank first
+                    # argument) would stick permanently.
                     return 1
             if (
                 isinstance(node.func, ast.Attribute)
