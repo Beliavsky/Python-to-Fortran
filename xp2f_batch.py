@@ -505,6 +505,7 @@ def main() -> int:
         help="Output directory root for strict-fixed Python files (requires --strict-fix, non-inplace only).",
     )
     ap.add_argument("--maxfail", type=int, default=0, help="Stop after this many failures (0 = no limit).")
+    ap.add_argument("--skip", type=int, default=0, help="Skip this many matched files from the start before applying --limit (0 = skip none).")
     ap.add_argument("--limit", type=int, default=0, help="Process at most this many matched files (0 = no limit).")
     ap.add_argument("--jobs", type=int, default=1, help="Run up to this many independent xp2f.py jobs concurrently (default: 1).")
     ap.add_argument("--timeout", type=float, default=0.0, help="Per-file timeout in seconds (0 = no timeout).")
@@ -655,6 +656,12 @@ def main() -> int:
         if not py_files:
             print("Resume: no remaining files to process.")
             return 0
+
+    if args.skip < 0:
+        print("Invalid options: --skip must be >= 0.")
+        return 1
+    if args.skip > 0:
+        py_files = py_files[args.skip :]
 
     if args.limit < 0:
         print("Invalid options: --limit must be >= 0.")
