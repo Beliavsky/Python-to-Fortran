@@ -4116,6 +4116,15 @@ def is_numpy_name_node(node):
     return isinstance(node, ast.Name) and node.id in {"np", "numpy"}
 
 
+def fortran_safe_stem(stem):
+    """Fortran identifiers cannot start with a digit; the input filename
+    stem can (e.g. Rosetta Code scripts like "10001th_prime.py"). Prefix
+    with a letter when needed so the stem is safe to use as a module or
+    program name; leave it untouched (and thus untouched in filenames)
+    everywhere else."""
+    return f"m_{stem}" if stem and stem[0].isdigit() else stem
+
+
 def is_numpy_sliding_window_view_axis0_call(node):
     if not isinstance(node, ast.Call):
         return False
@@ -13093,6 +13102,8 @@ class translator(ast.NodeVisitor):
         if not node.elts:
             return [0]
         child_shapes = [self._literal_nested_shape(e) for e in node.elts]
+        if any(sh is None for sh in child_shapes):
+            return None
         if all(sh == [] for sh in child_shapes):
             return [len(node.elts)]
         if any(sh == [] for sh in child_shapes):
@@ -42099,7 +42110,7 @@ def generate_flat(
         elemental_targets.discard(gname)
 
     use_proc_module = bool(local_funcs)
-    proc_mod_name = f"{stem}_proc_mod"
+    proc_mod_name = f"{fortran_safe_stem(stem)}_proc_mod"
     proc_public_syms = []
     helper_uses_proc = {}
     force_complex_funcs = set()
@@ -42623,7 +42634,7 @@ def generate_flat(
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
 
-    prog_name = stem
+    prog_name = fortran_safe_stem(stem)
     prog_name_conflicts = set()
     if use_proc_module:
         prog_name_conflicts |= set(proc_public_syms)
@@ -42636,7 +42647,7 @@ def generate_flat(
                 prog_name_conflicts.add(_node.id)
     _prog_conflicts_lower = {str(_nm).lower() for _nm in prog_name_conflicts}
     if prog_name.lower() in _prog_conflicts_lower:
-        _base_prog_name = f"{stem}_prog"
+        _base_prog_name = f"{fortran_safe_stem(stem)}_prog"
         prog_name = _base_prog_name
         _suffix = 2
         while prog_name.lower() in _prog_conflicts_lower:
@@ -43253,7 +43264,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     o.w("")
 
     # program
-    o.w(f"program {stem}")
+    o.w(f"program {fortran_safe_stem(stem)}")
     o.push()
     o.w(f"use main_mod, only: {run_name}")
     o.w("implicit none")
@@ -43269,7 +43280,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     if rng_replay_path:
         o.w("call rng_replay_close()")
     o.pop()
-    o.w(f"end program {stem}")
+    o.w(f"end program {fortran_safe_stem(stem)}")
 
     return o.text()
 

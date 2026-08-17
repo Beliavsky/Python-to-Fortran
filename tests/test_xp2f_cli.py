@@ -3644,6 +3644,83 @@ def test_xp2f_does_not_guess_local_call_return_rank_from_first_argument(tmp_path
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_xp2f_reports_unsupported_literal_instead_of_crashing_on_nested_none_shape(
+    tmp_path: Path,
+) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xnested_none_shape.py"
+    src.write_text(
+        "\n".join(
+            [
+                "x = [1, 2, 3]",
+                "test_cases = [",
+                '    ("a", x, [1, 2, 3], 1),',
+                '    ("b", x, [4, 5], 2),',
+                "]",
+                "for case in test_cases:",
+                "    print(case[0])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "Traceback (most recent call last)" not in proc.stderr, proc.stdout + proc.stderr
+    assert "Transpile: FAIL" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_sanitizes_module_and_program_names_starting_with_a_digit(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "10001th_prime.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def is_prime(n):",
+                "    if n < 2:",
+                "        return False",
+                "    i = 2",
+                "    while i * i <= n:",
+                "        if n % i == 0:",
+                "            return False",
+                "        i = i + 1",
+                "    return True",
+                "",
+                "count = 0",
+                "n = 1",
+                "while count < 5:",
+                "    n = n + 1",
+                "    if is_prime(n):",
+                "        count = count + 1",
+                "print(n)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_f90 = tmp_path / "10001th_prime_p.f90"
+    out_text = out_f90.read_text(encoding="utf-8")
+    assert "module m_10001th_prime_proc_mod" in out_text
+    assert "program m_10001th_prime" in out_text
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"
