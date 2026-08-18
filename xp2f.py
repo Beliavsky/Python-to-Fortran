@@ -4101,14 +4101,21 @@ def is_main_guard_if(node):
     if not isinstance(node, ast.If):
         return False
     t = node.test
-    if not (isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq) and len(t.comparators) == 1):
+    if not (isinstance(t, ast.Compare) and len(t.ops) == 1 and len(t.comparators) == 1):
         return False
     a = t.left
     b = t.comparators[0]
-    if isinstance(a, ast.Name) and a.id == "__name__" and is_const_str(b) and b.value == "__main__":
-        return True
-    if isinstance(b, ast.Name) and b.id == "__name__" and is_const_str(a) and a.value == "__main__":
-        return True
+    if isinstance(t.ops[0], ast.Eq):
+        if isinstance(a, ast.Name) and a.id == "__name__" and is_const_str(b) and b.value == "__main__":
+            return True
+        if isinstance(b, ast.Name) and b.id == "__name__" and is_const_str(a) and a.value == "__main__":
+            return True
+    if isinstance(t.ops[0], ast.In):
+        # `__name__ in "__main__"` is a substring-membership idiom some
+        # Rosetta Code scripts use as a (loose) equivalent of the usual
+        # `__name__ == "__main__"` guard.
+        if isinstance(a, ast.Name) and a.id == "__name__" and is_const_str(b) and b.value == "__main__":
+            return True
     return False
 
 
@@ -44330,6 +44337,20 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
 
 
 def main():
+    # Source scripts (or their error messages) can contain non-ASCII text
+    # (e.g. Chinese_zodiac.py). Windows consoles often default stdout/stderr
+    # to a legacy codepage (cp1252) that can't encode such characters,
+    # crashing with UnicodeEncodeError instead of reporting the failure.
+    # Only the error-handling policy is changed (not the encoding itself),
+    # so callers capturing output (e.g. subprocess with text=True, which
+    # decodes on their own side using their own default encoding) still see
+    # bytes valid in the original encoding -- just with unencodable
+    # characters escaped instead of raising.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="partial python -> fortran transpiler")
     ap.add_argument("input_py", help="input python source")
     ap.add_argument("helpers", nargs="*", help="zero or more helper .f90 module files")

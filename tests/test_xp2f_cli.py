@@ -3808,6 +3808,62 @@ def test_xp2f_treats_tuple_unpacked_param_as_array_across_sibling_functions(tmp_
     assert "bernstein_coefficients(:)" in out_text, proc.stdout + proc.stderr
 
 
+def test_xp2f_does_not_crash_printing_non_ascii_transpile_error(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xunicode_error.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def f():",
+                "    return dict(zip(['a'], [('甲乙丙丁', 'jiǎ yǐ')]))",
+                "",
+                "print(f())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "UnicodeEncodeError" not in proc.stderr, proc.stdout + proc.stderr
+    assert "Transpile: FAIL" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_recognizes_name_in_main_guard_idiom(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xname_in_main.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def main():",
+                "    print('hello')",
+                "",
+                "if __name__ in \"__main__\":",
+                "    main()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"
