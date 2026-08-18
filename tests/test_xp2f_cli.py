@@ -3864,6 +3864,39 @@ def test_xp2f_recognizes_name_in_main_guard_idiom(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_xp2f_reports_duplicate_top_level_function_definition(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xduplicate_top_level_def.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def f():",
+                "    return 1",
+                "",
+                "print(f())",
+                "",
+                "def f():",
+                "    return 2",
+                "",
+                "print(f())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "Traceback (most recent call last)" not in proc.stderr, proc.stdout + proc.stderr
+    assert "duplicate top-level function definition: f" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"

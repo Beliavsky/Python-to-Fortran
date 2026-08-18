@@ -5951,6 +5951,21 @@ def validate_imports_supported(tree, py_path):
                 raise NotImplementedError(msg)
 
 
+def validate_no_duplicate_top_level_defs(tree):
+    """Fail early, with a clear message, on top-level functions redefined
+    under the same name (a common artifact of Rosetta Code pages that
+    concatenate multiple alternate solutions). Python's last-definition-wins
+    shadowing has no equivalent in Fortran, where two procedures can't share
+    a module-level name -- left unchecked, this surfaces later as a
+    confusing gfortran "already defined" error instead."""
+    seen = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in seen:
+                raise NotImplementedError(f"duplicate top-level function definition: {node.name}")
+            seen.add(node.name)
+
+
 def inline_local_from_imports(tree, py_path):
     """Inline simple sibling-module functions/constants imported by name or module."""
     base_dir = Path(py_path).resolve().parent
@@ -43839,6 +43854,7 @@ def transpile_file(
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     validate_imports_supported(tree, py_path)
+    validate_no_duplicate_top_level_defs(tree)
     tree = inline_local_from_imports(tree, py_path)
     translator.global_synthetic_slices = {}
     translator.global_synthetic_slice_meta = {}
