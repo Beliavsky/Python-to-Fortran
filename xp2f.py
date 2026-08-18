@@ -5697,7 +5697,7 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None):
         ):
             continue
         nm = st.targets[0].id
-        if nm in params or (needed_names and nm not in needed_names):
+        if nm in params or nm not in needed_names:
             continue
         k, r = _infer_from_node(st.value)
         old = decls.get(nm, (None, 0))

@@ -3897,6 +3897,46 @@ def test_xp2f_reports_duplicate_top_level_function_definition(tmp_path: Path) ->
     assert "duplicate top-level function definition: f" in proc.stdout, proc.stdout + proc.stderr
 
 
+def test_xp2f_gives_local_variable_its_own_declaration_despite_module_level_name_collision(
+    tmp_path: Path,
+) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xgcd.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def Gcd(v1, v2):",
+                "    a, b = v1, v2",
+                "    if a < b:",
+                "        a, b = v2, v1",
+                "    r = 1",
+                "    while r != 0:",
+                "        r = a % b",
+                "        if r != 0:",
+                "            a = b",
+                "            b = r",
+                "    return b",
+                "",
+                "a = [1, 2]",
+                "print(Gcd(12, 18))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"
