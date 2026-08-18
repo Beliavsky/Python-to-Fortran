@@ -15638,7 +15638,19 @@ class translator(ast.NodeVisitor):
                         raise NotImplementedError("character slicing with step is not supported")
                     if node.slice.lower is None and node.slice.upper is None:
                         return base
-                    lo_expr = "1" if node.slice.lower is None else f"({self.expr(node.slice.lower)} + 1)"
+                    if node.slice.lower is None:
+                        lo_expr = "1"
+                    elif (
+                        isinstance(node.slice.lower, ast.UnaryOp)
+                        and isinstance(node.slice.lower.op, ast.USub)
+                        and isinstance(node.slice.lower.operand, ast.Constant)
+                        and isinstance(node.slice.lower.operand.value, int)
+                        and node.slice.lower.operand.value >= 1
+                    ):
+                        k = int(node.slice.lower.operand.value)
+                        lo_expr = char_len_expr if k == 1 else f"({char_len_expr} - {k - 1})"
+                    else:
+                        lo_expr = f"({self.expr(node.slice.lower)} + 1)"
                     if node.slice.upper is None:
                         hi_expr = char_len_expr
                     elif (
@@ -32273,6 +32285,20 @@ def _emit_local_function(
                     and _n.args[0].id == arg_name
                 ):
                     saw_len = True
+                if isinstance(_n, ast.Compare) and len(_n.ops) == 1 and isinstance(_n.ops[0], (ast.Eq, ast.NotEq)):
+                    # A slice of arg_name (a substring) compared directly
+                    # against a string literal only makes sense if arg_name
+                    # is a character scalar -- Python string slicing yields
+                    # another string, not an array.
+                    _sides = [_n.left, _n.comparators[0]]
+                    if any(is_const_str(_s) for _s in _sides) and any(
+                        isinstance(_s, ast.Subscript)
+                        and isinstance(_s.value, ast.Name)
+                        and _s.value.id == arg_name
+                        and isinstance(_s.slice, ast.Slice)
+                        for _s in _sides
+                    ):
+                        return True
                 if not (
                     isinstance(_n, ast.Call)
                     and isinstance(_n.func, ast.Name)
@@ -35395,6 +35421,31 @@ def _emit_local_function(
                     break
             if char_scalar_usage:
                 break
+        if not char_scalar_usage:
+            # A slice of nm (e.g. nm[-3:], a substring) compared directly
+            # against a string literal is only meaningful if nm is a
+            # character scalar -- Python string slicing yields another
+            # string, not an array. Without this, subscripting alone (below)
+            # is read as array evidence and nm gets wrongly promoted to a
+            # character array, breaking the substring/comparison codegen.
+            for _st in fn.body:
+                for _n in ast.walk(_st):
+                    if not (isinstance(_n, ast.Compare) and len(_n.ops) == 1 and isinstance(_n.ops[0], (ast.Eq, ast.NotEq))):
+                        continue
+                    _sides = [_n.left, _n.comparators[0]]
+                    _has_str_const = any(is_const_str(_s) for _s in _sides)
+                    _has_nm_slice = any(
+                        isinstance(_s, ast.Subscript)
+                        and isinstance(_s.value, ast.Name)
+                        and _s.value.id == nm
+                        and isinstance(_s.slice, ast.Slice)
+                        for _s in _sides
+                    )
+                    if _has_str_const and _has_nm_slice:
+                        char_scalar_usage = True
+                        break
+                if char_scalar_usage:
+                    break
         rr = max(rr, _loop_iter_rank_hint(nm))
         for st in fn.body:
             for n in ast.walk(st):

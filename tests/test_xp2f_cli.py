@@ -3937,6 +3937,39 @@ def test_xp2f_gives_local_variable_its_own_declaration_despite_module_level_name
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
 
+def test_xp2f_slices_negative_lower_bound_on_char_scalar_argument(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xstring_negative_slice.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def conjugate(infinitive):",
+                "    if not infinitive[-3:] == 'are':",
+                "        print(infinitive, 'non prima coniugatio verbi.')",
+                "        return False",
+                "    print(infinitive, 'is prima coniugatio verbi.')",
+                "    return True",
+                "",
+                "conjugate('amare')",
+                "conjugate('videre')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"
