@@ -31338,6 +31338,27 @@ class translator(ast.NodeVisitor):
             ):
                 self._emit_pandas_df_corr_print(c.args[0])
                 return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "round"
+                and isinstance(c.args[0].func.value, ast.Call)
+                and isinstance(c.args[0].func.value.func, ast.Attribute)
+                and c.args[0].func.value.func.attr == "corr"
+                and len(c.args[0].func.value.args) == 0
+                and isinstance(c.args[0].func.value.func.value, ast.Name)
+                and c.args[0].func.value.func.value.id in self.pandas_df_vars
+            ):
+                ndigits = 6
+                if (
+                    c.args[0].args
+                    and isinstance(c.args[0].args[0], ast.Constant)
+                    and isinstance(c.args[0].args[0].value, int)
+                ):
+                    ndigits = int(c.args[0].args[0].value)
+                self._emit_pandas_df_corr_print(c.args[0].func.value, ndigits=ndigits)
+                return
             self._emit_print_call(c)
             return
         if (
@@ -32043,7 +32064,7 @@ class translator(ast.NodeVisitor):
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
-    def _emit_pandas_df_corr_print(self, corr_call):
+    def _emit_pandas_df_corr_print(self, corr_call, ndigits=6):
         df_id = corr_call.func.value.id
         df_expr = self._aliased_name(df_id)
         col_names = self.pandas_df_columns.get(df_id)
@@ -32051,7 +32072,6 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError(
                 "df.corr() printing requires statically known column names"
             )
-        ndigits = 6
         col_width = max(10, ndigits + 8)
         n_cols = len(col_names)
         max_len = max(len(c) for c in col_names)
