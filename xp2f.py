@@ -9872,6 +9872,8 @@ class translator(ast.NodeVisitor):
         self.pandas_date_arrays = set()
         self.pandas_str_list_values = {}
         self.pandas_stats_table_vars = {}
+        self.pandas_df_select_indices = {}
+        self.pandas_df_columns_snapshot = {}
         self.dict_aliases = {}
         self.dict_type_components = dict(dict_type_components or {})
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
@@ -13385,6 +13387,213 @@ class translator(ast.NodeVisitor):
         if name_id in self.pandas_date_arrays:
             return self._aliased_name(name_id)
         return None
+
+    def _pandas_df_match(self, node):
+        # Classify a DataFrame reference expression into one of:
+        #   {"kind": "name", "df_id": ...}
+        #   {"kind": "select_names", "df_id": ..., "names": [...]}          -- df[["A","B"]] / df.loc[:, ["A","B"]]
+        #   {"kind": "iloc", "df_id": ..., "row_slice": Slice, "col_slice": Slice}
+        # or None if node doesn't match any recognized DataFrame reference shape.
+        if isinstance(node, ast.Name) and node.id in self.pandas_df_vars:
+            return {"kind": "name", "df_id": node.id}
+        _is_str_list = lambda n: (
+            isinstance(n, ast.List)
+            and n.elts
+            and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in n.elts)
+        )
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.pandas_df_vars
+            and _is_str_list(node.slice)
+        ):
+            return {
+                "kind": "select_names",
+                "df_id": node.value.id,
+                "names": [e.value for e in node.slice.elts],
+            }
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "loc"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in self.pandas_df_vars
+            and isinstance(node.slice, ast.Tuple)
+            and len(node.slice.elts) == 2
+            and isinstance(node.slice.elts[0], ast.Slice)
+            and node.slice.elts[0].lower is None
+            and node.slice.elts[0].upper is None
+            and node.slice.elts[0].step is None
+            and _is_str_list(node.slice.elts[1])
+        ):
+            return {
+                "kind": "select_names",
+                "df_id": node.value.value.id,
+                "names": [e.value for e in node.slice.elts[1].elts],
+            }
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "iloc"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in self.pandas_df_vars
+            and isinstance(node.slice, ast.Tuple)
+            and len(node.slice.elts) == 2
+            and isinstance(node.slice.elts[0], ast.Slice)
+            and isinstance(node.slice.elts[1], ast.Slice)
+            and node.slice.elts[0].step is None
+            and node.slice.elts[1].step is None
+        ):
+            col_slice = node.slice.elts[1]
+            col_ok = (
+                col_slice.lower is None
+                or (isinstance(col_slice.lower, ast.Constant) and isinstance(col_slice.lower.value, int))
+            ) and (
+                col_slice.upper is None
+                or (isinstance(col_slice.upper, ast.Constant) and isinstance(col_slice.upper.value, int))
+            )
+            if col_ok:
+                return {
+                    "kind": "iloc",
+                    "df_id": node.value.value.id,
+                    "row_slice": node.slice.elts[0],
+                    "col_slice": col_slice,
+                }
+        return None
+
+    def _pandas_df_root_id(self, node):
+        # The pandas_df_vars name whose (possibly stale-by-reassignment)
+        # column list a DataFrame reference node needs.
+        m = self._pandas_df_match(node)
+        return m["df_id"] if m else None
+
+    def _pandas_print_df_id(self, c):
+        # Identify the pandas_df_vars name driving `print(...)`, unwrapping
+        # the same no-op `.to_string()` / `.round(n)` / `.corr()` /
+        # `.describe()` chains recognized in the print codegen dispatch.
+        if len(c.args) != 1:
+            return None
+        a0 = c.args[0]
+        if (
+            isinstance(a0, ast.Call)
+            and isinstance(a0.func, ast.Attribute)
+            and a0.func.attr == "to_string"
+            and len(a0.args) == 0
+        ):
+            a0 = a0.func.value
+        root = self._pandas_df_root_id(a0)
+        if root is not None:
+            return root
+        if (
+            isinstance(a0, ast.Call)
+            and isinstance(a0.func, ast.Attribute)
+            and a0.func.attr in {"corr", "describe"}
+            and len(a0.args) == 0
+        ):
+            root = self._pandas_df_root_id(a0.func.value)
+            if root is not None:
+                return root
+        if (
+            isinstance(a0, ast.Call)
+            and isinstance(a0.func, ast.Attribute)
+            and a0.func.attr == "round"
+            and isinstance(a0.func.value, ast.Call)
+            and isinstance(a0.func.value.func, ast.Attribute)
+            and a0.func.value.func.attr == "corr"
+            and len(a0.func.value.args) == 0
+        ):
+            root = self._pandas_df_root_id(a0.func.value.func.value)
+            if root is not None:
+                return root
+        return None
+
+    def _pandas_df_columns_at(self, df_id, context_node):
+        snap = self.pandas_df_columns_snapshot.get(id(context_node))
+        if snap is not None:
+            return snap
+        return self.pandas_df_columns.get(df_id)
+
+    def _is_pandas_df_ref_node(self, node):
+        return self._pandas_df_match(node) is not None
+
+    def _pandas_df_ref(self, node, context_node):
+        # Resolve a DataFrame reference expression (bare Name,
+        # `df[["A","B"]]`, `df.loc[:, ["A","B"]]`, or `df.iloc[rows, cols]`)
+        # into (fortran_expr, column_names). Returns (None, None) if node
+        # doesn't match any recognized shape or column names aren't known.
+        m = self._pandas_df_match(node)
+        if m is None:
+            return None, None
+        df_id = m["df_id"]
+        src_cols = self._pandas_df_columns_at(df_id, context_node)
+        src_expr = self._aliased_name(df_id)
+        if m["kind"] == "name":
+            return src_expr, src_cols
+        if src_cols is None:
+            return None, None
+        if m["kind"] == "select_names":
+            selected = m["names"]
+            idxs = [src_cols.index(nm) + 1 for nm in selected]
+            idx_txt = ", ".join(str(i) for i in idxs)
+            return f"{src_expr}%icol([{idx_txt}])", selected
+        if m["kind"] == "iloc":
+            row_slice = m["row_slice"]
+            col_slice = m["col_slice"]
+            row_full = row_slice.lower is None and row_slice.upper is None
+            col_full = col_slice.lower is None and col_slice.upper is None
+            args = []
+            if not row_full:
+                lo = f"({self.expr(row_slice.lower)} + 1)" if row_slice.lower is not None else "1"
+                hi = self.expr(row_slice.upper) if row_slice.upper is not None else f"nrow({src_expr})"
+                args.append(f"rows=[(i_iloc_r, i_iloc_r = {lo}, {hi})]")
+            new_cols = src_cols
+            if not col_full:
+                lo_c = int(col_slice.lower.value) + 1 if col_slice.lower is not None else 1
+                hi_c = int(col_slice.upper.value) if col_slice.upper is not None else len(src_cols)
+                args.append(f"cols=[(i_iloc_c, i_iloc_c = {lo_c}, {hi_c})]")
+                new_cols = src_cols[lo_c - 1 : hi_c]
+            if not args:
+                return src_expr, new_cols
+            return f"{src_expr}%iloc(" + ", ".join(args) + ")", new_cols
+        return None, None
+
+    def _pandas_df_materialize_decl(self, df_expr):
+        # gfortran rejects `%component` chained directly onto a
+        # type-bound-procedure function reference (e.g. `df%icol([1,2])%values`:
+        # "leftmost part-ref in a data-ref cannot be a function reference").
+        # When df_expr is such a call (as opposed to a bare variable name),
+        # declare a block-scoped temp for it. Call this among the block's
+        # other declarations; call _pandas_df_materialize_assign afterward,
+        # once all declarations are emitted (Fortran forbids executable
+        # statements before declarations in the same scoping unit).
+        # Returns (new_df_expr, needs_assign).
+        if "(" not in df_expr:
+            return df_expr, False
+        self.o.w("type(DataFrame_index_date) :: pdf_src")
+        if "i_iloc_r" in df_expr:
+            self.o.w("integer :: i_iloc_r")
+        if "i_iloc_c" in df_expr:
+            self.o.w("integer :: i_iloc_c")
+        return "pdf_src", True
+
+    def _pandas_df_materialize_assign(self, orig_df_expr, needs_assign):
+        if needs_assign:
+            self.o.w(f"pdf_src = {orig_df_expr}")
+
+    def _pandas_df_simple_method_spec(self, v):
+        # X = df.pct_change([periods]) / df.shift(periods[, fill_value=...])
+        # / df.sort_index([ascending=...]) -- DataFrame-returning methods
+        # already implemented by the vendored DataFrame_index_date type,
+        # applied to a bare DataFrame Name (result has the same columns).
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"pct_change", "shift", "sort_index"}
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        return {"method": v.func.attr, "df_id": v.func.value.id, "call": v}
 
     def _pandas_df_construct_spec(self, v):
         # pd.DataFrame(matrix, index=date_array, columns=str_list) -- build
@@ -21658,6 +21867,17 @@ class translator(ast.NodeVisitor):
             return None
 
         for node in nodes:
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "print"
+            ):
+                _pdf_id = self._pandas_print_df_id(node.value)
+                if _pdf_id is not None:
+                    self.pandas_df_columns_snapshot[id(node.value)] = list(
+                        self.pandas_df_columns.get(_pdf_id, [])
+                    )
             if isinstance(node, ast.With):
                 for it in getattr(node, "items", []):
                     ctx = getattr(it, "context_expr", None)
@@ -22465,6 +22685,97 @@ class translator(ast.NodeVisitor):
                     self.alloc_chars.discard(t.id)
                     self.alloc_complexes.discard(t.id)
                     continue
+
+                # X = df[["colA", "colB"]] -- select a literal list of
+                # columns by name into a new (sub-)DataFrame.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Subscript)
+                    and isinstance(v.value, ast.Name)
+                    and v.value.id in self.pandas_df_vars
+                    and isinstance(v.slice, ast.List)
+                    and v.slice.elts
+                    and all(
+                        isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        for e in v.slice.elts
+                    )
+                ):
+                    _src_id = v.value.id
+                    _src_cols = self.pandas_df_columns.get(_src_id)
+                    if _src_cols is not None:
+                        _selected = [e.value for e in v.slice.elts]
+                        self.pandas_df_select_indices[t.id] = [
+                            _src_cols.index(_nm) + 1 for _nm in _selected
+                        ]
+                        self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                        self.pandas_df_columns[t.id] = _selected
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = df.pct_change()/.shift(n)/.sort_index() -- same columns as df.
+                if isinstance(t, ast.Name):
+                    _m_spec = self._pandas_df_simple_method_spec(v)
+                    if _m_spec is not None:
+                        _src_cols = self.pandas_df_columns.get(_m_spec["df_id"])
+                        if _src_cols is not None:
+                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_columns[t.id] = list(_src_cols)
+                            self.ints.discard(t.id)
+                            self.reals.discard(t.id)
+                            self.logs.discard(t.id)
+                            self.chars.discard(t.id)
+                            self.complexes.discard(t.id)
+                            self.alloc_ints.discard(t.id)
+                            self.alloc_reals.discard(t.id)
+                            self.alloc_logs.discard(t.id)
+                            self.alloc_chars.discard(t.id)
+                            self.alloc_complexes.discard(t.id)
+                            continue
+
+                # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
+                if isinstance(t, ast.Name) and isinstance(v, ast.Subscript):
+                    _m = self._pandas_df_match(v)
+                    if _m is not None and _m["kind"] in {"iloc", "select_names"}:
+                        _src_cols = self.pandas_df_columns.get(_m["df_id"])
+                        if _src_cols is not None:
+                            if _m["kind"] == "iloc":
+                                _row_slice = _m["row_slice"]
+                                if not (_row_slice.lower is None and _row_slice.upper is None):
+                                    self._mark_int("i_iloc_r")
+                                if not (_m["col_slice"].lower is None and _m["col_slice"].upper is None):
+                                    self._mark_int("i_iloc_c")
+                            if _m["kind"] == "select_names":
+                                _new_cols = _m["names"]
+                            else:
+                                _col_slice = _m["col_slice"]
+                                if _col_slice.lower is None and _col_slice.upper is None:
+                                    _new_cols = _src_cols
+                                else:
+                                    _lo_c = int(_col_slice.lower.value) + 1 if _col_slice.lower is not None else 1
+                                    _hi_c = int(_col_slice.upper.value) if _col_slice.upper is not None else len(_src_cols)
+                                    _new_cols = _src_cols[_lo_c - 1 : _hi_c]
+                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_columns[t.id] = list(_new_cols)
+                            self.ints.discard(t.id)
+                            self.reals.discard(t.id)
+                            self.logs.discard(t.id)
+                            self.chars.discard(t.id)
+                            self.complexes.discard(t.id)
+                            self.alloc_ints.discard(t.id)
+                            self.alloc_reals.discard(t.id)
+                            self.alloc_logs.discard(t.id)
+                            self.alloc_chars.discard(t.id)
+                            self.alloc_complexes.discard(t.id)
+                            continue
 
                 # X = pd.DataFrame(matrix, index=date_array, columns=names)
                 if isinstance(t, ast.Name):
@@ -28591,6 +28902,64 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{name} = {rhs}")
                 return
 
+        # X = df[["colA", "colB"]] -- select a literal list of columns.
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.pandas_df_select_indices
+            and isinstance(v, ast.Subscript)
+            and isinstance(v.value, ast.Name)
+            and v.value.id in self.pandas_df_vars
+        ):
+            name = self._aliased_name(t.id)
+            src_expr = self._aliased_name(v.value.id)
+            idxs = self.pandas_df_select_indices[t.id]
+            idx_txt = ", ".join(str(i) for i in idxs)
+            self.o.w(f"{name} = {src_expr}%icol([{idx_txt}])")
+            return
+
+        # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars and isinstance(v, ast.Subscript):
+            _m = self._pandas_df_match(v)
+            if _m is not None and _m["kind"] in {"iloc", "select_names"}:
+                _df_expr, _ = self._pandas_df_ref(v, v)
+                if _df_expr is not None:
+                    name = self._aliased_name(t.id)
+                    self.o.w(f"{name} = {_df_expr}")
+                    return
+
+        # X = df.pct_change()/.shift(n)/.sort_index()
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _m_spec = self._pandas_df_simple_method_spec(v)
+            if _m_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_m_spec["df_id"])
+                method = _m_spec["method"]
+                kwargs = {kw.arg: kw.value for kw in v.keywords}
+                if method == "pct_change":
+                    periods_node = v.args[0] if v.args else kwargs.get("periods")
+                    arg_txt = f"({self.expr(periods_node)})" if periods_node is not None else "()"
+                    self.o.w(f"{name} = {src_expr}%pct_change{arg_txt}")
+                    return
+                if method == "shift":
+                    periods_node = v.args[0] if v.args else kwargs.get("periods")
+                    fill_node = kwargs.get("fill_value")
+                    parts = []
+                    if periods_node is not None:
+                        parts.append(self.expr(periods_node))
+                    if fill_node is not None:
+                        parts.append(f"fill_value={self.expr(fill_node)}")
+                    arg_txt = "(" + ", ".join(parts) + ")" if parts else "()"
+                    self.o.w(f"{name} = {src_expr}%shift{arg_txt}")
+                    return
+                if method == "sort_index":
+                    self.o.w(f"{name} = {src_expr}")
+                    ascending_node = kwargs.get("ascending")
+                    if ascending_node is not None:
+                        self.o.w(f"call {name}%sort_index(ascending={self.expr(ascending_node)})")
+                    else:
+                        self.o.w(f"call {name}%sort_index()")
+                    return
+
         # X = pd.DataFrame(matrix, index=date_array, columns=names)
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
             _dfc_spec = self._pandas_df_construct_spec(v)
@@ -31350,6 +31719,11 @@ class translator(ast.NodeVisitor):
         if isinstance(c.func, ast.Name) and c.func.id == "print":
             if self.context == "compute":
                 raise NotImplementedError("print not allowed in compute procedure")
+            # The original print(...) call node -- used to key the
+            # pandas_df_columns_snapshot recorded during prescan, since a
+            # pandas_df_vars name's column list can change over the
+            # program's dataflow (e.g. reassigned via `df = df[[...]]`).
+            orig_call = c
             if (
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
@@ -31378,10 +31752,9 @@ class translator(ast.NodeVisitor):
                 and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "corr"
                 and len(c.args[0].args) == 0
-                and isinstance(c.args[0].func.value, ast.Name)
-                and c.args[0].func.value.id in self.pandas_df_vars
+                and self._is_pandas_df_ref_node(c.args[0].func.value)
             ):
-                self._emit_pandas_df_corr_print(c.args[0])
+                self._emit_pandas_df_corr_print(c.args[0], context_node=orig_call)
                 return
             if (
                 len(c.args) == 1
@@ -31389,10 +31762,12 @@ class translator(ast.NodeVisitor):
                 and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "describe"
                 and len(c.args[0].args) == 0
-                and isinstance(c.args[0].func.value, ast.Name)
-                and c.args[0].func.value.id in self.pandas_df_vars
+                and self._is_pandas_df_ref_node(c.args[0].func.value)
             ):
-                self._emit_pandas_df_describe_print(c.args[0])
+                self._emit_pandas_df_describe_print(c.args[0], context_node=orig_call)
+                return
+            if len(c.args) == 1 and self._is_pandas_df_ref_node(c.args[0]):
+                self._emit_pandas_df_print(c.args[0], context_node=orig_call)
                 return
             if (
                 len(c.args) == 1
@@ -31415,8 +31790,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(c.args[0].func.value.func, ast.Attribute)
                 and c.args[0].func.value.func.attr == "corr"
                 and len(c.args[0].func.value.args) == 0
-                and isinstance(c.args[0].func.value.func.value, ast.Name)
-                and c.args[0].func.value.func.value.id in self.pandas_df_vars
+                and self._is_pandas_df_ref_node(c.args[0].func.value.func.value)
             ):
                 ndigits = 6
                 if (
@@ -31425,7 +31799,9 @@ class translator(ast.NodeVisitor):
                     and isinstance(c.args[0].args[0].value, int)
                 ):
                     ndigits = int(c.args[0].args[0].value)
-                self._emit_pandas_df_corr_print(c.args[0].func.value, ndigits=ndigits)
+                self._emit_pandas_df_corr_print(
+                    c.args[0].func.value, ndigits=ndigits, context_node=orig_call
+                )
                 return
             self._emit_print_call(c)
             return
@@ -32132,10 +32508,8 @@ class translator(ast.NodeVisitor):
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
-    def _emit_pandas_df_corr_print(self, corr_call, ndigits=6):
-        df_id = corr_call.func.value.id
-        df_expr = self._aliased_name(df_id)
-        col_names = self.pandas_df_columns.get(df_id)
+    def _emit_pandas_df_corr_print(self, corr_call, ndigits=6, context_node=None):
+        df_expr, col_names = self._pandas_df_ref(corr_call.func.value, context_node or corr_call)
         if not col_names:
             raise NotImplementedError(
                 "df.corr() printing requires statically known column names"
@@ -32145,9 +32519,12 @@ class translator(ast.NodeVisitor):
         max_len = max(len(c) for c in col_names)
         self.o.w("block")
         self.o.push()
+        orig_df_expr = df_expr
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
         self.o.w("real(kind=dp), allocatable :: corr_mat(:,:)")
         self.o.w("integer :: corr_i")
         self.o.w(f"character(len={max_len}), allocatable :: corr_labels(:)")
+        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
         # cov_matrix_rows_real/corrcoef_matrix_rows_real treat columns of
         # their argument as variables (rows as observations) -- the same
         # convention pandas DataFrame.corr() uses for a DataFrame's
@@ -32167,10 +32544,67 @@ class translator(ast.NodeVisitor):
         self.o.pop()
         self.o.w("end block")
 
-    def _emit_pandas_df_describe_print(self, describe_call, ndigits=6):
-        df_id = describe_call.func.value.id
-        df_expr = self._aliased_name(df_id)
-        col_names = self.pandas_df_columns.get(df_id)
+    def _emit_pandas_df_print(self, df_node, ndigits=6, context_node=None):
+        df_expr, col_names = self._pandas_df_ref(df_node, context_node)
+        if not col_names:
+            raise NotImplementedError(
+                "printing a DataFrame requires statically known column names"
+            )
+        col_width = max(10, ndigits + 8)
+        n_cols = len(col_names)
+        header_fmt = f"'(A10,{n_cols}A{col_width})'"
+        header_args = ", ".join(fstr(c) for c in col_names)
+        row_fmt = f"'(A10,{n_cols}F{col_width}.{ndigits})'"
+        dots_args = ", ".join(fstr("...") for _ in col_names)
+        self.o.w("block")
+        self.o.push()
+        orig_df_expr = df_expr
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+        self.o.w("integer :: pdf_n, pdf_i")
+        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
+        self.o.w(f"pdf_n = nrow({df_expr})")
+        self.o.w(f"write(*,{header_fmt}) '', {header_args}")
+        self.o.w("if (pdf_n <= 10) then")
+        self.o.push()
+        self.o.w("do pdf_i = 1, pdf_n")
+        self.o.push()
+        self.o.w(
+            f"write(*,{row_fmt}) trim({df_expr}%index(pdf_i)%to_str()), "
+            f"{df_expr}%values(pdf_i, :)"
+        )
+        self.o.pop()
+        self.o.w("end do")
+        self.o.pop()
+        self.o.w("else")
+        self.o.push()
+        self.o.w("do pdf_i = 1, 5")
+        self.o.push()
+        self.o.w(
+            f"write(*,{row_fmt}) trim({df_expr}%index(pdf_i)%to_str()), "
+            f"{df_expr}%values(pdf_i, :)"
+        )
+        self.o.pop()
+        self.o.w("end do")
+        self.o.w(f"write(*,{header_fmt}) '...', {dots_args}")
+        self.o.w("do pdf_i = pdf_n - 4, pdf_n")
+        self.o.push()
+        self.o.w(
+            f"write(*,{row_fmt}) trim({df_expr}%index(pdf_i)%to_str()), "
+            f"{df_expr}%values(pdf_i, :)"
+        )
+        self.o.pop()
+        self.o.w("end do")
+        self.o.pop()
+        self.o.w("end if")
+        self.o.w("write(*,*)")
+        self.o.w(f"write(*,'(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', {n_cols}, ' columns]'")
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_describe_print(self, describe_call, ndigits=6, context_node=None):
+        df_expr, col_names = self._pandas_df_ref(
+            describe_call.func.value, context_node or describe_call
+        )
         if not col_names:
             raise NotImplementedError(
                 "df.describe() printing requires statically known column names"
@@ -32180,8 +32614,11 @@ class translator(ast.NodeVisitor):
         stat_labels = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
         self.o.w("block")
         self.o.push()
+        orig_df_expr = df_expr
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
         self.o.w("real(kind=dp), allocatable :: desc_mat(:,:)")
         self.o.w("integer :: desc_j")
+        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
         self.o.w(f"allocate(desc_mat({len(stat_labels)}, {n_cols}))")
         self.o.w(f"do desc_j = 1, {n_cols}")
         self.o.push()
