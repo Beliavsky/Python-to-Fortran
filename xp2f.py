@@ -5062,6 +5062,13 @@ def detect_needed_helpers(tree):
                 needed.update(np_helper_map[node.func.attr])
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "corr"
+                and len(node.args) == 0
+            ):
+                # pandas DataFrame.corr() lowers to corrcoef_matrix_rows_real.
+                needed.add("corrcoef_matrix_rows_real")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
@@ -13361,6 +13368,37 @@ class translator(ast.NodeVisitor):
         if name_id in self.pandas_date_arrays:
             return self._aliased_name(name_id)
         return None
+
+    def _pandas_df_construct_spec(self, v):
+        # pd.DataFrame(matrix, index=date_array, columns=str_list) -- build
+        # a DataFrame_index_date directly from an in-memory real matrix.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and len(v.args) >= 1
+            and not isinstance(v.args[0], ast.ListComp)
+        ):
+            return None
+        idx_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+        cols_kw = next((kw for kw in v.keywords if kw.arg == "columns"), None)
+        if idx_kw is None or cols_kw is None:
+            return None
+        if not isinstance(idx_kw.value, ast.Name):
+            return None
+        idx_id = idx_kw.value.id
+        if not (
+            idx_id in self.pandas_date_array_aliases
+            or idx_id in self.pandas_date_arrays
+        ):
+            return None
+        return {
+            "values_node": v.args[0],
+            "index_id": idx_id,
+            "columns_node": cols_kw.value,
+        }
 
     def _pandas_stats_table_spec(self, v):
         # pd.DataFrame([fn(col_expr) for LOOPVAR in range(N)], index=row_labels)
@@ -22395,6 +22433,26 @@ class translator(ast.NodeVisitor):
                     self.alloc_complexes.discard(t.id)
                     continue
 
+                # X = pd.DataFrame(matrix, index=date_array, columns=names)
+                if isinstance(t, ast.Name):
+                    _dfc_spec = self._pandas_df_construct_spec(v)
+                    if _dfc_spec is not None:
+                        self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                        cols_node = _dfc_spec["columns_node"]
+                        if isinstance(cols_node, ast.Name) and cols_node.id in self.pandas_str_list_values:
+                            self.pandas_df_columns[t.id] = list(self.pandas_str_list_values[cols_node.id])
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
                 # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
                 # -- materialize one real array per dict-return-type component.
                 if isinstance(t, ast.Name):
@@ -28500,6 +28558,20 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{name} = {rhs}")
                 return
 
+        # X = pd.DataFrame(matrix, index=date_array, columns=names)
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _dfc_spec = self._pandas_df_construct_spec(v)
+            if _dfc_spec is not None:
+                name = self._aliased_name(t.id)
+                values_expr = self.expr(_dfc_spec["values_node"])
+                index_expr = self._pandas_date_array_base_expr(_dfc_spec["index_id"])
+                columns_expr = self.expr(_dfc_spec["columns_node"])
+                self.o.w(
+                    f"{name} = DataFrame_index_date(index={index_expr}, "
+                    f"columns={columns_expr}, values={values_expr})"
+                )
+                return
+
         # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
         if isinstance(t, ast.Name) and t.id in self.pandas_stats_table_vars:
             spec = self.pandas_stats_table_vars[t.id]
@@ -31255,6 +31327,17 @@ class translator(ast.NodeVisitor):
             ):
                 self._emit_pandas_stats_table_print(c.args[0])
                 return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "corr"
+                and len(c.args[0].args) == 0
+                and isinstance(c.args[0].func.value, ast.Name)
+                and c.args[0].func.value.id in self.pandas_df_vars
+            ):
+                self._emit_pandas_df_corr_print(c.args[0])
+                return
             self._emit_print_call(c)
             return
         if (
@@ -31960,6 +32043,42 @@ class translator(ast.NodeVisitor):
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
+    def _emit_pandas_df_corr_print(self, corr_call):
+        df_id = corr_call.func.value.id
+        df_expr = self._aliased_name(df_id)
+        col_names = self.pandas_df_columns.get(df_id)
+        if not col_names:
+            raise NotImplementedError(
+                "df.corr() printing requires statically known column names"
+            )
+        ndigits = 6
+        col_width = max(10, ndigits + 8)
+        n_cols = len(col_names)
+        max_len = max(len(c) for c in col_names)
+        self.o.w("block")
+        self.o.push()
+        self.o.w("real(kind=dp), allocatable :: corr_mat(:,:)")
+        self.o.w("integer :: corr_i")
+        self.o.w(f"character(len={max_len}), allocatable :: corr_labels(:)")
+        # cov_matrix_rows_real/corrcoef_matrix_rows_real treat columns of
+        # their argument as variables (rows as observations) -- the same
+        # convention pandas DataFrame.corr() uses for a DataFrame's
+        # columns, so no transpose is needed here.
+        self.o.w(f"corr_mat = corrcoef_matrix_rows_real({df_expr}%values)")
+        labels_txt = ", ".join(fstr(c) for c in col_names)
+        self.o.w(f"corr_labels = [character(len={max_len}) :: {labels_txt}]")
+        header_fmt = f"'(A10,{n_cols}A{col_width})'"
+        header_args = ", ".join(fstr(c) for c in col_names)
+        self.o.w(f"write(*,{header_fmt}) '', {header_args}")
+        row_fmt = f"'(A10,{n_cols}F{col_width}.{ndigits})'"
+        self.o.w(f"do corr_i = 1, {n_cols}")
+        self.o.push()
+        self.o.w(f"write(*,{row_fmt}) trim(corr_labels(corr_i)), corr_mat(corr_i, :)")
+        self.o.pop()
+        self.o.w("end do")
+        self.o.pop()
+        self.o.w("end block")
+
     def _emit_pandas_stats_table_print(self, round_call):
         stats_id = round_call.func.value.id
         spec = self.pandas_stats_table_vars[stats_id]
@@ -32304,6 +32423,56 @@ class translator(ast.NodeVisitor):
                             self.o.w(f"print *, {self.expr(a)}")
                         else:
                             self.o.w(f"write({unit_txt},*) {self.expr(a)}")
+                return
+            # Fortran list-directed output concatenates adjacent elements of
+            # a character array with no separator, so a rank-1 char-array
+            # argument needs an explicit per-element write loop rather than
+            # being folded into a single `print *, ...` item list.
+            has_char_array = any(
+                not is_const_str(a)
+                and not isinstance(a, ast.JoinedStr)
+                and self._expr_kind(a) == "char"
+                and self._rank_expr(a) == 1
+                for a in call.args
+            )
+            if has_char_array:
+                _tmp_counter = 0
+                for i_arg, a in enumerate(call.args):
+                    _arg_is_numeric = (
+                        not is_const_str(a)
+                        and not isinstance(a, ast.JoinedStr)
+                        and self._expr_kind(a) not in {"char", "str"}
+                    )
+                    if i_arg > 0 and sep_txt != "" and not (sep_txt == " " and _arg_is_numeric):
+                        self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(sep_txt)}")
+                    if is_const_str(a):
+                        self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(a.value)}")
+                    elif isinstance(a, ast.JoinedStr):
+                        raise NotImplementedError("f-string in multi-argument print not supported")
+                    elif self._expr_kind(a) == "char" and self._rank_expr(a) == 1:
+                        arr_txt = self.expr(a)
+                        _tmp_counter += 1
+                        lv = f"print_multi_i{_tmp_counter}"
+                        self.o.w("block")
+                        self.o.push()
+                        self.o.w(f"integer :: {lv}")
+                        self.o.w("character(len=:), allocatable :: print_multi_tmp(:)")
+                        self.o.w(f"print_multi_tmp = {arr_txt}")
+                        self.o.w(f"do {lv} = 1, size(print_multi_tmp)")
+                        self.o.push()
+                        self.o.w(f"if ({lv} > 1) write({unit_txt},{fstr('(a)')}, advance='no') {fstr(' ')}")
+                        self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') trim(print_multi_tmp({lv}))")
+                        self.o.pop()
+                        self.o.w("end do")
+                        self.o.pop()
+                        self.o.w("end block")
+                    else:
+                        expr_txt = self.expr(a)
+                        if sep_txt != " " and self._rank_expr(a) == 0 and self._expr_kind(a) not in {"char", "str"}:
+                            expr_txt = f"py_str({expr_txt})"
+                        self.o.w(f"write({unit_txt},*, advance='no') {expr_txt}")
+                if not advance_no:
+                    self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr('')}")
                 return
             parts = []
             for i_arg, a in enumerate(call.args):
