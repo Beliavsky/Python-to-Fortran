@@ -326,6 +326,9 @@ public :: reduceat_max
 public :: polyval
 public :: polyder
 
+public :: rolling_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in) desc="rolling mean over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
+public :: rolling_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in),ddof:integer:intent(in) desc="rolling sample standard deviation over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
+
 interface cumsum
    module procedure cumsum_real, cumsum_int
 end interface cumsum
@@ -6559,5 +6562,70 @@ contains
          if (idx1 < n) tmp(idx1:n - 1) = argv(idx1 + 1:n)
          call move_alloc(tmp, argv)
       end subroutine sys_argv_delete
+
+      pure function rolling_mean_1d(x, window) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: window
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: mean, sumsq, dev, dev_old
+         integer :: n, i, cnt
+
+         n = size(x)
+         allocate(y(n))
+         y = ieee_value(0.0_dp, ieee_quiet_nan)
+         if (window <= 0 .or. window > n) return
+
+         mean = 0.0_dp
+         sumsq = 0.0_dp
+         cnt = 0
+         do i = 1, n
+            cnt = cnt + 1
+            dev = x(i) - mean
+            mean = mean + dev / real(cnt, kind=dp)
+            sumsq = sumsq + dev * (x(i) - mean)
+            if (cnt > window) then
+               cnt = cnt - 1
+               dev_old = x(i - window) - mean
+               mean = mean - dev_old / real(cnt, kind=dp)
+               sumsq = sumsq - dev_old * (x(i - window) - mean)
+            end if
+            if (cnt >= window) y(i) = mean
+         end do
+      end function rolling_mean_1d
+
+      pure function rolling_std_1d(x, window, ddof) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: window
+         integer, intent(in), optional :: ddof
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: mean, sumsq, dev, dev_old
+         integer :: n, i, cnt, d
+
+         d = 1
+         if (present(ddof)) d = ddof
+         n = size(x)
+         allocate(y(n))
+         y = ieee_value(0.0_dp, ieee_quiet_nan)
+         if (window <= 0 .or. window > n) return
+
+         mean = 0.0_dp
+         sumsq = 0.0_dp
+         cnt = 0
+         do i = 1, n
+            cnt = cnt + 1
+            dev = x(i) - mean
+            mean = mean + dev / real(cnt, kind=dp)
+            sumsq = sumsq + dev * (x(i) - mean)
+            if (cnt > window) then
+               cnt = cnt - 1
+               dev_old = x(i - window) - mean
+               mean = mean - dev_old / real(cnt, kind=dp)
+               sumsq = sumsq - dev_old * (x(i - window) - mean)
+            end if
+            if (cnt >= window .and. cnt > d) then
+               y(i) = sqrt(max(sumsq, 0.0_dp) / real(cnt - d, kind=dp))
+            end if
+         end do
+      end function rolling_std_1d
 
 end module python_mod

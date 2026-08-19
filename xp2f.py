@@ -13587,6 +13587,14 @@ class translator(ast.NodeVisitor):
             and len(a0.args) == 0
         ):
             a0 = a0.func.value
+        if (
+            isinstance(a0, ast.Attribute)
+            and a0.attr == "T"
+            and isinstance(a0.value, ast.Call)
+            and isinstance(a0.value.func, ast.Attribute)
+            and a0.value.func.attr == "describe"
+        ):
+            a0 = a0.value
         root = self._pandas_df_root_id(a0)
         if root is not None:
             return root
@@ -32025,6 +32033,19 @@ class translator(ast.NodeVisitor):
                 # is a no-op wrapper (print() already stringifies); unwrap
                 # it so the patterns below still match.
                 c = ast.Call(func=c.func, args=[c.args[0].func.value], keywords=c.keywords)
+            df_transposed = False
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Attribute)
+                and c.args[0].attr == "T"
+                and isinstance(c.args[0].value, ast.Call)
+                and isinstance(c.args[0].value.func, ast.Attribute)
+                and c.args[0].value.func.attr == "describe"
+            ):
+                # `.describe().T` -- unwrap the transpose, remembering to
+                # print stats-as-columns/labels-as-rows instead.
+                df_transposed = True
+                c = ast.Call(func=c.func, args=[c.args[0].value], keywords=c.keywords)
             if (
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
@@ -32053,7 +32074,9 @@ class translator(ast.NodeVisitor):
                 and len(c.args[0].args) == 0
                 and self._is_pandas_df_ref_node(c.args[0].func.value)
             ):
-                self._emit_pandas_df_describe_print(c.args[0], context_node=orig_call)
+                self._emit_pandas_df_describe_print(
+                    c.args[0], context_node=orig_call, transposed=df_transposed
+                )
                 return
             if (
                 len(c.args) == 1
@@ -32747,6 +32770,26 @@ class translator(ast.NodeVisitor):
                 return cur.id if isinstance(cur, ast.Name) else None
 
             attr = c.func.attr
+            if (
+                attr == "to_csv"
+                and len(c.args) == 1
+                and self._is_pandas_df_ref_node(c.func.value)
+            ):
+                df_expr, _cols = self._pandas_df_ref(c.func.value, c)
+                if df_expr is not None:
+                    path_expr = self.expr(c.args[0])
+                    if "(" in df_expr:
+                        orig_df_expr = df_expr
+                        self.o.w("block")
+                        self.o.push()
+                        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+                        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
+                        self.o.w(f"call {df_expr}%write_csv({path_expr})")
+                        self.o.pop()
+                        self.o.w("end block")
+                    else:
+                        self.o.w(f"call {df_expr}%write_csv({path_expr})")
+                    return
             vis_noop = {
                 "plot", "scatter", "hist", "bar", "imshow", "contour", "contourf",
                 "figure", "subplots", "subplot", "show", "savefig", "close", "clf",
@@ -32936,7 +32979,7 @@ class translator(ast.NodeVisitor):
         self.o.pop()
         self.o.w("end block")
 
-    def _emit_pandas_df_describe_print(self, describe_call, ndigits=6, context_node=None):
+    def _emit_pandas_df_describe_print(self, describe_call, ndigits=6, context_node=None, transposed=False):
         df_expr, col_names = self._pandas_df_ref(
             describe_call.func.value, context_node or describe_call
         )
@@ -32967,16 +33010,28 @@ class translator(ast.NodeVisitor):
         self.o.w(f"desc_mat(8, desc_j) = maxval({df_expr}%values(:, desc_j))")
         self.o.pop()
         self.o.w("end do")
-        header_fmt = f"'(A10,{n_cols}A{col_width})'"
-        header_args = ", ".join(fstr(c) for c in col_names)
-        self.o.w(f"write(*,{header_fmt}) '', {header_args}")
-        row_fmt = f"'(A10,{n_cols}F{col_width}.{ndigits})'"
-        count_fmt = f"'(A10,{n_cols}I{col_width})'"
-        for i, lbl in enumerate(stat_labels, start=1):
-            if lbl == "count":
-                self.o.w(f"write(*,{count_fmt}) {fstr(lbl)}, nint(desc_mat({i}, :))")
-            else:
-                self.o.w(f"write(*,{row_fmt}) {fstr(lbl)}, desc_mat({i}, :)")
+        n_stats = len(stat_labels)
+        if not transposed:
+            header_fmt = f"'(A10,{n_cols}A{col_width})'"
+            header_args = ", ".join(fstr(c) for c in col_names)
+            self.o.w(f"write(*,{header_fmt}) '', {header_args}")
+            row_fmt = f"'(A10,{n_cols}F{col_width}.{ndigits})'"
+            count_fmt = f"'(A10,{n_cols}I{col_width})'"
+            for i, lbl in enumerate(stat_labels, start=1):
+                if lbl == "count":
+                    self.o.w(f"write(*,{count_fmt}) {fstr(lbl)}, nint(desc_mat({i}, :))")
+                else:
+                    self.o.w(f"write(*,{row_fmt}) {fstr(lbl)}, desc_mat({i}, :)")
+        else:
+            # .T: rows become the original columns, columns become the stats.
+            header_fmt = f"'(A10,{n_stats}A{col_width})'"
+            header_args = ", ".join(fstr(lbl) for lbl in stat_labels)
+            self.o.w(f"write(*,{header_fmt}) '', {header_args}")
+            row_fmt = f"'(A10,I{col_width},{n_stats - 1}F{col_width}.{ndigits})'"
+            for j, cname in enumerate(col_names, start=1):
+                self.o.w(
+                    f"write(*,{row_fmt}) {fstr(cname)}, nint(desc_mat(1, {j})), desc_mat(2:, {j})"
+                )
         self.o.pop()
         self.o.w("end block")
 
