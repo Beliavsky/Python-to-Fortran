@@ -5078,6 +5078,26 @@ def detect_needed_helpers(tree):
                 needed.add("quantile_linear")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "rolling"
+            ):
+                # pandas DataFrame.rolling(w).mean()/.std() lowers to
+                # rolling_mean_1d/rolling_std_1d.
+                needed.add("rolling_mean_1d")
+                needed.add("rolling_std_1d")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "median"
+                and len(node.args) == 0
+            ):
+                needed.add("quantile_linear")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "std"
+                and len(node.args) == 0
+            ):
+                needed.add("std")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
@@ -6981,6 +7001,83 @@ def runtime_helper_templates():
          module procedure argsort_idx_real, argsort_idx_int
       end interface argsort_idx"""
 
+    rolling_mean_pub = (
+        "public :: rolling_mean_1d !@pyapi kind=function ret=real(dp)(:) "
+        "args=x:real(dp)(:):intent(in),window:integer:intent(in) "
+        "desc=\"rolling mean over a trailing window (NaN until the window fills), "
+        "Alan Miller's online update/downdate algorithm\""
+    )
+    rolling_mean_blk = """      pure function rolling_mean_1d(x, window) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: window
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: mean, sumsq, dev, dev_old
+         integer :: n, i, cnt
+
+         n = size(x)
+         allocate(y(n))
+         y = ieee_value(0.0_dp, ieee_quiet_nan)
+         if (window <= 0 .or. window > n) return
+
+         mean = 0.0_dp
+         sumsq = 0.0_dp
+         cnt = 0
+         do i = 1, n
+            cnt = cnt + 1
+            dev = x(i) - mean
+            mean = mean + dev / real(cnt, kind=dp)
+            sumsq = sumsq + dev * (x(i) - mean)
+            if (cnt > window) then
+               cnt = cnt - 1
+               dev_old = x(i - window) - mean
+               mean = mean - dev_old / real(cnt, kind=dp)
+               sumsq = sumsq - dev_old * (x(i - window) - mean)
+            end if
+            if (cnt >= window) y(i) = mean
+         end do
+      end function rolling_mean_1d"""
+
+    rolling_std_pub = (
+        "public :: rolling_std_1d !@pyapi kind=function ret=real(dp)(:) "
+        "args=x:real(dp)(:):intent(in),window:integer:intent(in),ddof:integer:intent(in) "
+        "desc=\"rolling sample standard deviation over a trailing window (NaN until the "
+        "window fills), Alan Miller's online update/downdate algorithm\""
+    )
+    rolling_std_blk = """      pure function rolling_std_1d(x, window, ddof) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: window
+         integer, intent(in), optional :: ddof
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: mean, sumsq, dev, dev_old
+         integer :: n, i, cnt, d
+
+         d = 1
+         if (present(ddof)) d = ddof
+         n = size(x)
+         allocate(y(n))
+         y = ieee_value(0.0_dp, ieee_quiet_nan)
+         if (window <= 0 .or. window > n) return
+
+         mean = 0.0_dp
+         sumsq = 0.0_dp
+         cnt = 0
+         do i = 1, n
+            cnt = cnt + 1
+            dev = x(i) - mean
+            mean = mean + dev / real(cnt, kind=dp)
+            sumsq = sumsq + dev * (x(i) - mean)
+            if (cnt > window) then
+               cnt = cnt - 1
+               dev_old = x(i - window) - mean
+               mean = mean - dev_old / real(cnt, kind=dp)
+               sumsq = sumsq - dev_old * (x(i - window) - mean)
+            end if
+            if (cnt >= window .and. cnt > d) then
+               y(i) = sqrt(max(sumsq, 0.0_dp) / real(cnt - d, kind=dp))
+            end if
+         end do
+      end function rolling_std_1d"""
+
     mean_pub = (
         "public :: mean_1d !@pyapi kind=function ret=real(dp) "
         "args=x:real(dp)(:):intent(in) desc=\"mean of 1D real vector\""
@@ -7450,6 +7547,8 @@ def runtime_helper_templates():
         "argsort_idx_int": (asrt_idx_i_pub, asrt_idx_i_blk),
         "argsort_idx": (argsort_idx_pub, argsort_idx_blk),
         "mean_1d": (mean_pub, mean_blk),
+        "rolling_mean_1d": (rolling_mean_pub, rolling_mean_blk),
+        "rolling_std_1d": (rolling_std_pub, rolling_std_blk),
         "statistics_quantiles_real": (stat_quant_pub, stat_quant_blk),
         "mode_real": (mode_real_pub, mode_real_blk),
         "var_1d": (var_pub, var_blk),
@@ -13494,7 +13593,7 @@ class translator(ast.NodeVisitor):
         if (
             isinstance(a0, ast.Call)
             and isinstance(a0.func, ast.Attribute)
-            and a0.func.attr in {"corr", "describe"}
+            and a0.func.attr in {"corr", "describe", "mean", "median", "std", "min", "max", "sum"}
             and len(a0.args) == 0
         ):
             root = self._pandas_df_root_id(a0.func.value)
@@ -13650,6 +13749,38 @@ class translator(ast.NodeVisitor):
             return None
         mapping = {k.value: val.value for k, val in zip(cols_node.keys, cols_node.values)}
         return {"kind": "rename_cols", "df_id": v.func.value.id, "mapping": mapping}
+
+    def _pandas_df_rolling_spec(self, v):
+        # X = df.rolling(window).mean() / df.rolling(window).std([ddof=])
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"mean", "std"}
+            and len(v.args) == 0
+            and isinstance(v.func.value, ast.Call)
+            and isinstance(v.func.value.func, ast.Attribute)
+            and v.func.value.func.attr == "rolling"
+            and isinstance(v.func.value.func.value, ast.Name)
+            and v.func.value.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        rolling_call = v.func.value
+        window_node = (
+            rolling_call.args[0]
+            if rolling_call.args
+            else next((kw.value for kw in rolling_call.keywords if kw.arg == "window"), None)
+        )
+        if window_node is None:
+            return None
+        ddof_node = None
+        if v.func.attr == "std":
+            ddof_node = next((kw.value for kw in v.keywords if kw.arg == "ddof"), None)
+        return {
+            "method": v.func.attr,
+            "df_id": rolling_call.func.value.id,
+            "window_node": window_node,
+            "ddof_node": ddof_node,
+        }
 
     def _pandas_df_construct_spec(self, v):
         # pd.DataFrame(matrix, index=date_array, columns=str_list) -- build
@@ -22823,6 +22954,27 @@ class translator(ast.NodeVisitor):
                             self.alloc_complexes.discard(t.id)
                             continue
 
+                # X = df.rolling(window).mean()/.std() -- same columns as df.
+                if isinstance(t, ast.Name):
+                    _r_spec = self._pandas_df_rolling_spec(v)
+                    if _r_spec is not None:
+                        _src_cols = self.pandas_df_columns.get(_r_spec["df_id"])
+                        if _src_cols is not None:
+                            self._mark_int("rw_j")
+                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_columns[t.id] = list(_src_cols)
+                            self.ints.discard(t.id)
+                            self.reals.discard(t.id)
+                            self.logs.discard(t.id)
+                            self.chars.discard(t.id)
+                            self.complexes.discard(t.id)
+                            self.alloc_ints.discard(t.id)
+                            self.alloc_reals.discard(t.id)
+                            self.alloc_logs.discard(t.id)
+                            self.alloc_chars.discard(t.id)
+                            self.alloc_complexes.discard(t.id)
+                            continue
+
                 # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
                 if isinstance(t, ast.Name) and isinstance(v, ast.Subscript):
                     _m = self._pandas_df_match(v)
@@ -29026,6 +29178,30 @@ class translator(ast.NodeVisitor):
                 )
                 return
 
+        # X = df.rolling(window).mean()/.std()
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _r_spec = self._pandas_df_rolling_spec(v)
+            if _r_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_r_spec["df_id"])
+                window_expr = self.expr(_r_spec["window_node"])
+                self.o.w(f"{name} = {src_expr}")
+                self.o.w(f"do rw_j = 1, ncol({name})")
+                self.o.push()
+                if _r_spec["method"] == "mean":
+                    self.o.w(
+                        f"{name}%values(:, rw_j) = rolling_mean_1d({src_expr}%values(:, rw_j), int({window_expr}))"
+                    )
+                else:
+                    ddof_txt = f", {self.expr(_r_spec['ddof_node'])}" if _r_spec["ddof_node"] is not None else ""
+                    self.o.w(
+                        f"{name}%values(:, rw_j) = rolling_std_1d({src_expr}%values(:, rw_j), "
+                        f"int({window_expr}){ddof_txt})"
+                    )
+                self.o.pop()
+                self.o.w("end do")
+                return
+
         # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars and isinstance(v, ast.Subscript):
             _m = self._pandas_df_match(v)
@@ -29077,10 +29253,14 @@ class translator(ast.NodeVisitor):
                 values_expr = self.expr(_dfc_spec["values_node"])
                 index_expr = self._pandas_date_array_base_expr(_dfc_spec["index_id"])
                 columns_expr = self.expr(_dfc_spec["columns_node"])
-                self.o.w(
-                    f"{name} = DataFrame_index_date(index={index_expr}, "
-                    f"columns={columns_expr}, values={values_expr})"
-                )
+                # Component-wise assignment, not the DataFrame_index_date(...)
+                # structure constructor: this gfortran mis-pads a
+                # character(len=N) columns actual argument (N < 100) into the
+                # len=100 columns component, corrupting entries with
+                # uninitialized memory beyond the raw N*count bytes copied.
+                self.o.w(f"{name}%index = {index_expr}")
+                self.o.w(f"{name}%columns = {columns_expr}")
+                self.o.w(f"{name}%values = {values_expr}")
                 return
 
         # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
@@ -31875,6 +32055,18 @@ class translator(ast.NodeVisitor):
             ):
                 self._emit_pandas_df_describe_print(c.args[0], context_node=orig_call)
                 return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr in {"mean", "median", "std", "min", "max", "sum"}
+                and len(c.args[0].args) == 0
+                and self._is_pandas_df_ref_node(c.args[0].func.value)
+            ):
+                self._emit_pandas_df_series_reduction_print(
+                    c.args[0], c.args[0].func.attr, context_node=orig_call
+                )
+                return
             if len(c.args) == 1 and self._is_pandas_df_ref_node(c.args[0]):
                 self._emit_pandas_df_print(c.args[0], context_node=orig_call)
                 return
@@ -32616,6 +32808,40 @@ class translator(ast.NodeVisitor):
 
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
+
+    def _emit_pandas_df_series_reduction_print(self, call, method, context_node=None):
+        df_expr, col_names = self._pandas_df_ref(call.func.value, context_node or call)
+        if not col_names:
+            raise NotImplementedError(
+                f"df.{method}() printing requires statically known column names"
+            )
+        self.o.w("block")
+        self.o.push()
+        orig_df_expr = df_expr
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
+        name_width = max(len(c) for c in col_names)
+        for j, cname in enumerate(col_names, start=1):
+            col_expr = f"{df_expr}%values(:, {j})"
+            if method == "mean":
+                val_expr = f"mean_1d({col_expr})"
+            elif method == "median":
+                val_expr = f"quantile_linear({col_expr}, 0.5_dp)"
+            elif method == "std":
+                val_expr = f"std({col_expr}, 1)"
+            elif method == "min":
+                val_expr = f"minval({col_expr})"
+            elif method == "max":
+                val_expr = f"maxval({col_expr})"
+            elif method == "sum":
+                val_expr = f"sum({col_expr})"
+            else:
+                raise NotImplementedError(f"df.{method}() printing not supported")
+            pad = name_width - len(cname) + 4
+            self.o.w(f"write(*,'(A,{pad}X,F12.6)') {fstr(cname)}, {val_expr}")
+        self.o.w(f"write(*,{fstr('(A)')}) 'dtype: float64'")
+        self.o.pop()
+        self.o.w("end block")
 
     def _emit_pandas_df_corr_print(self, corr_call, ndigits=6, context_node=None):
         df_expr, col_names = self._pandas_df_ref(corr_call.func.value, context_node or corr_call)
