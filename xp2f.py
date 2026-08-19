@@ -31372,6 +31372,18 @@ class translator(ast.NodeVisitor):
                 return
             if (
                 len(c.args) == 1
+                and isinstance(c.args[0], ast.Attribute)
+                and c.args[0].attr == "shape"
+                and isinstance(c.args[0].value, ast.Name)
+                and c.args[0].value.id in self.pandas_df_vars
+            ):
+                df_expr = self._aliased_name(c.args[0].value.id)
+                self.o.w(
+                    f"write(*,'(A,I0,A,I0,A)') '(', nrow({df_expr}), ', ', ncol({df_expr}), ')'"
+                )
+                return
+            if (
+                len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "round"

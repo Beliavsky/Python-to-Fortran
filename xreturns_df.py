@@ -42,5 +42,7 @@ print("Number of columns:", rets.shape[1])
 print("Columns:", price_names)
 print("First date:", str(ret_dates.iloc[0].date()))
 print("Last date :", str(ret_dates.iloc[-1].date()))
-print(returns_df.corr().round(3))
+print(returns_df.corr().round(3).to_string())
+print(returns_df.describe().to_string())
+print(returns_df.shape)
 
