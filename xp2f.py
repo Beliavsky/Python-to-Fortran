@@ -5069,6 +5069,15 @@ def detect_needed_helpers(tree):
                 needed.add("corrcoef_matrix_rows_real")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "describe"
+                and len(node.args) == 0
+            ):
+                # pandas DataFrame.describe() lowers to mean_1d/std/quantile_linear.
+                needed.add("mean_1d")
+                needed.add("std")
+                needed.add("quantile_linear")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
@@ -31354,6 +31363,17 @@ class translator(ast.NodeVisitor):
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "describe"
+                and len(c.args[0].args) == 0
+                and isinstance(c.args[0].func.value, ast.Name)
+                and c.args[0].func.value.id in self.pandas_df_vars
+            ):
+                self._emit_pandas_df_describe_print(c.args[0])
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "round"
                 and isinstance(c.args[0].func.value, ast.Call)
                 and isinstance(c.args[0].func.value.func, ast.Attribute)
@@ -32108,6 +32128,47 @@ class translator(ast.NodeVisitor):
         self.o.w(f"write(*,{row_fmt}) trim(corr_labels(corr_i)), corr_mat(corr_i, :)")
         self.o.pop()
         self.o.w("end do")
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_describe_print(self, describe_call, ndigits=6):
+        df_id = describe_call.func.value.id
+        df_expr = self._aliased_name(df_id)
+        col_names = self.pandas_df_columns.get(df_id)
+        if not col_names:
+            raise NotImplementedError(
+                "df.describe() printing requires statically known column names"
+            )
+        col_width = max(10, ndigits + 8)
+        n_cols = len(col_names)
+        stat_labels = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
+        self.o.w("block")
+        self.o.push()
+        self.o.w("real(kind=dp), allocatable :: desc_mat(:,:)")
+        self.o.w("integer :: desc_j")
+        self.o.w(f"allocate(desc_mat({len(stat_labels)}, {n_cols}))")
+        self.o.w(f"do desc_j = 1, {n_cols}")
+        self.o.push()
+        self.o.w(f"desc_mat(1, desc_j) = real(size({df_expr}%values, 1), kind=dp)")
+        self.o.w(f"desc_mat(2, desc_j) = mean_1d({df_expr}%values(:, desc_j))")
+        self.o.w(f"desc_mat(3, desc_j) = std({df_expr}%values(:, desc_j), 1)")
+        self.o.w(f"desc_mat(4, desc_j) = minval({df_expr}%values(:, desc_j))")
+        self.o.w(f"desc_mat(5, desc_j) = quantile_linear({df_expr}%values(:, desc_j), 0.25_dp)")
+        self.o.w(f"desc_mat(6, desc_j) = quantile_linear({df_expr}%values(:, desc_j), 0.5_dp)")
+        self.o.w(f"desc_mat(7, desc_j) = quantile_linear({df_expr}%values(:, desc_j), 0.75_dp)")
+        self.o.w(f"desc_mat(8, desc_j) = maxval({df_expr}%values(:, desc_j))")
+        self.o.pop()
+        self.o.w("end do")
+        header_fmt = f"'(A10,{n_cols}A{col_width})'"
+        header_args = ", ".join(fstr(c) for c in col_names)
+        self.o.w(f"write(*,{header_fmt}) '', {header_args}")
+        row_fmt = f"'(A10,{n_cols}F{col_width}.{ndigits})'"
+        count_fmt = f"'(A10,{n_cols}I{col_width})'"
+        for i, lbl in enumerate(stat_labels, start=1):
+            if lbl == "count":
+                self.o.w(f"write(*,{count_fmt}) {fstr(lbl)}, nint(desc_mat({i}, :))")
+            else:
+                self.o.w(f"write(*,{row_fmt}) {fstr(lbl)}, desc_mat({i}, :)")
         self.o.pop()
         self.o.w("end block")
 
