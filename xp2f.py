@@ -31321,6 +31321,18 @@ class translator(ast.NodeVisitor):
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "to_string"
+                and len(c.args[0].args) == 0
+                and not getattr(c.args[0], "keywords", [])
+            ):
+                # `.to_string()` on our synthesized DataFrame-print helpers
+                # is a no-op wrapper (print() already stringifies); unwrap
+                # it so the patterns below still match.
+                c = ast.Call(func=c.func, args=[c.args[0].func.value], keywords=c.keywords)
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "round"
                 and isinstance(c.args[0].func.value, ast.Name)
                 and c.args[0].func.value.id in self.pandas_stats_table_vars
