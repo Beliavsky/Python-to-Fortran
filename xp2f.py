@@ -4153,6 +4153,15 @@ def _tree_uses_pandas_read_csv(tree):
     return False
 
 
+def _tree_uses_scipy_fsolve(tree):
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
+            for _al in _n.names:
+                if (_al.name or "").strip() == "fsolve":
+                    return True
+    return False
+
+
 def is_main_guard_if(node):
     if not isinstance(node, ast.If):
         return False
@@ -5493,6 +5502,32 @@ def collect_scipy_special_aliases(tree):
                     if nm in supported:
                         func_aliases[asn or nm] = nm
     return module_aliases, func_aliases
+
+
+def collect_scipy_stats_norm_aliases(tree):
+    """Collect local names bound to scipy.stats.norm (standard normal distribution)."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.stats":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "norm":
+                    aliases.add(asn or nm)
+    return aliases
+
+
+def collect_scipy_optimize_fsolve_aliases(tree):
+    """Collect local names bound to scipy.optimize.fsolve."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "fsolve":
+                    aliases.add(asn or nm)
+    return aliases
 
 
 def collect_module_global_decls(local_funcs):
@@ -10020,6 +10055,8 @@ class translator(ast.NodeVisitor):
         self.linalg_aliases = set(translator.global_linalg_aliases)
         self.scipy_special_aliases = set(translator.global_scipy_special_aliases)
         self.scipy_special_func_aliases = dict(translator.global_scipy_special_func_aliases)
+        self.scipy_stats_norm_aliases = set(translator.global_scipy_stats_norm_aliases)
+        self.scipy_optimize_fsolve_aliases = set(translator.global_scipy_optimize_fsolve_aliases)
         self.statistics_aliases = set(translator.global_statistics_aliases)
         self.statistics_func_aliases = dict(translator.global_statistics_func_aliases)
         self.time_aliases = set(translator.global_time_aliases)
@@ -11627,6 +11664,14 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 0
             ):
                 return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"cdf", "pdf"}
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.scipy_stats_norm_aliases
+                and len(node.args) >= 1
+            ):
+                return "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "isna"
@@ -13761,6 +13806,22 @@ class translator(ast.NodeVisitor):
         mapping = {k.value: val.value for k, val in zip(cols_node.keys, cols_node.values)}
         return {"kind": "rename_cols", "df_id": v.func.value.id, "mapping": mapping}
 
+    def _scipy_fsolve_spec(self, v):
+        # sol = fsolve(equations, x0) -- equations must already translate to
+        # `function equations(x) result(y)` with x(:) real(dp) intent(in)
+        # and y an allocatable real(dp) result of the same length (i.e. a
+        # local function classified as "alloc_real"; see local_return_specs).
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_fsolve_aliases
+            and len(v.args) >= 2
+            and isinstance(v.args[0], ast.Name)
+            and self.local_return_specs.get(v.args[0].id) == "alloc_real"
+        ):
+            return None
+        return {"fn_name": v.args[0].id, "x0_node": v.args[1]}
+
     def _pandas_df_rolling_spec(self, v):
         # X = df.rolling(window).mean() / df.rolling(window).std([ddof=])
         if not (
@@ -13881,6 +13942,15 @@ class translator(ast.NodeVisitor):
         }
 
     def _rank_expr(self, node):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"cdf", "pdf"}
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in self.scipy_stats_norm_aliases
+            and len(node.args) >= 1
+        ):
+            return self._rank_expr(node.args[0])
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -17363,6 +17433,40 @@ class translator(ast.NodeVisitor):
             ):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
+                if (
+                    attr in {"cdf", "pdf"}
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.scipy_stats_norm_aliases
+                    and len(node.args) >= 1
+                ):
+                    x_txt = self.expr(node.args[0])
+                    xk = self._expr_kind(node.args[0])
+                    if xk in {"int", "logical"}:
+                        x_txt = f"real({x_txt}, kind=dp)"
+                    loc_node = next((kw.value for kw in node.keywords if kw.arg == "loc"), None)
+                    if loc_node is None and len(node.args) >= 2:
+                        loc_node = node.args[1]
+                    scale_node = next((kw.value for kw in node.keywords if kw.arg == "scale"), None)
+                    if scale_node is None and len(node.args) >= 3:
+                        scale_node = node.args[2]
+                    z_txt = x_txt
+                    if loc_node is not None:
+                        loc_txt = self.expr(loc_node)
+                        if self._expr_kind(loc_node) in {"int", "logical"}:
+                            loc_txt = f"real({loc_txt}, kind=dp)"
+                        z_txt = f"({z_txt} - {loc_txt})"
+                    scale_txt = None
+                    if scale_node is not None:
+                        scale_txt = self.expr(scale_node)
+                        if self._expr_kind(scale_node) in {"int", "logical"}:
+                            scale_txt = f"real({scale_txt}, kind=dp)"
+                        z_txt = f"({z_txt} / {scale_txt})"
+                    if attr == "cdf":
+                        return f"(0.5_dp * (1.0_dp + erf({z_txt} / sqrt(2.0_dp))))"
+                    pdf_txt = f"(exp(-0.5_dp * ({z_txt})**2) / sqrt(2.0_dp * acos(-1.0_dp)))"
+                    if scale_txt is not None:
+                        pdf_txt = f"({pdf_txt} / {scale_txt})"
+                    return pdf_txt
                 if (
                     attr == "isna"
                     and len(node.args) == 0
@@ -22989,6 +23093,13 @@ class translator(ast.NodeVisitor):
                             self.alloc_chars.discard(t.id)
                             self.alloc_complexes.discard(t.id)
                             continue
+
+                # sol = fsolve(equations, x0)
+                if isinstance(t, ast.Name):
+                    _fs_spec = self._scipy_fsolve_spec(v)
+                    if _fs_spec is not None:
+                        self._mark_alloc_real(t.id, rank=1)
+                        continue
 
                 # X = df.rolling(window).mean()/.std() -- same columns as df.
                 if isinstance(t, ast.Name):
@@ -29212,6 +29323,33 @@ class translator(ast.NodeVisitor):
                     f"call {name}%rename_cols([character(len={max_len_old}) :: {old_txt}], "
                     f"[character(len={max_len_new}) :: {new_txt}])"
                 )
+                return
+
+        # sol = fsolve(equations, x0)
+        if isinstance(t, ast.Name):
+            _fs_spec = self._scipy_fsolve_spec(v)
+            if _fs_spec is not None:
+                name = self._aliased_name(t.id)
+                fn_name = _fs_spec["fn_name"]
+                x0_expr = self.expr(_fs_spec["x0_node"])
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: n_fsolve, info_fsolve, lwa_fsolve")
+                self.o.w("real(kind=dp) :: tol_fsolve")
+                self.o.w("real(kind=dp), allocatable :: fvec_fsolve(:), wa_fsolve(:)")
+                self.o.w(f"{name} = {x0_expr}")
+                self.o.w(f"n_fsolve = size({name})")
+                self.o.w("tol_fsolve = 1.49012e-8_dp")
+                self.o.w("lwa_fsolve = (n_fsolve * (3 * n_fsolve + 13)) / 2")
+                self.o.w("allocate(fvec_fsolve(n_fsolve))")
+                self.o.w("allocate(wa_fsolve(lwa_fsolve))")
+                self.o.w(f"fsolve_user_fn => {fn_name}")
+                self.o.w(
+                    f"call hybrd1(fsolve_generic_wrapper, n_fsolve, {name}, fvec_fsolve, "
+                    "tol_fsolve, info_fsolve, wa_fsolve, lwa_fsolve)"
+                )
+                self.o.pop()
+                self.o.w("end block")
                 return
 
         # X = df.rolling(window).mean()/.std()
@@ -36437,7 +36575,12 @@ def _emit_local_function(
             ),
             None,
         )
-    elif returns and isinstance(returns[0].value, (ast.Tuple, ast.List)):
+    elif returns and isinstance(returns[0].value, ast.Tuple):
+        # A bare `return [a, b]` (list literal) is ambiguous -- it's also the
+        # natural way to return a single array/sequence result -- so only
+        # treat it as a multi-output return when the caller-evidenced
+        # `tuple_return_funcs` classification above says so. A genuine
+        # `return a, b` tuple has no such ambiguity.
         tuple_return_seed = returns[0].value
     if tuple_return_seed is not None:
         tuple_return = True
@@ -43243,6 +43386,17 @@ def generate_flat(
         arity = len(tuple_rets[0].value.elts)
         if any(len(st.value.elts) != arity for st in tuple_rets):
             continue
+        # `return [a, b]` (a list literal) is ambiguous: Python code uses it
+        # both for multi-value tuple-unpack returns (`a, b = f(...)`) and as
+        # a single sequence/array result (`y = f(...); y[0]`). Only treat an
+        # all-list-literal function as a multi-output (tuple-style) return
+        # when a call site actually unpacks it with matching arity;
+        # otherwise leave it alone so it's inferred as an array-valued
+        # return instead. `return a, b` (a genuine tuple) has no such
+        # ambiguity and keeps the existing lenient rule.
+        all_list_literals = all(isinstance(st.value, ast.List) for st in tuple_rets)
+        if all_list_literals and arity not in observed_unpack_arities.get(fn.name, set()):
+            continue
         if len(tuple_rets) != len(rets) and arity not in observed_unpack_arities.get(fn.name, set()):
             continue
         st = tuple_rets[0]
@@ -44799,6 +44953,9 @@ def generate_flat(
             "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
             "operator(>), operator(>=)"
         )
+    if _tree_uses_scipy_fsolve(tree):
+        o.w("use minpack_module, only: hybrd1")
+        o.w("use fsolve_bridge_mod, only: fsolve_user_fn, fsolve_generic_wrapper")
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
@@ -45481,7 +45638,21 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
     for mod in needed:
         if mod in provided:
             continue
-        if mod.endswith("_mod"):
+        if mod.endswith("_module"):
+            # Some vendored libraries (e.g. minpack_module) use the
+            # "_module" naming convention instead of this project's usual
+            # "_mod" suffix.
+            base = mod[: -len("_module")]
+            cand = Path(f"{base}.f90")
+            if cand.exists():
+                cand_s = str(cand)
+                if cand_s not in helper_files:
+                    helper_files.append(cand_s)
+                    auto_added.append(cand_s)
+                provided.add(mod)
+            else:
+                missing_modules.append((mod, str(cand)))
+        elif mod.endswith("_mod"):
             base = mod[: -len("_mod")]
             cand = Path(f"{base}.f90")
             if cand.exists():
@@ -45903,6 +46074,8 @@ def transpile_file(
     translator.global_linalg_aliases = set()
     translator.global_scipy_special_aliases = set()
     translator.global_scipy_special_func_aliases = {}
+    translator.global_scipy_stats_norm_aliases = set()
+    translator.global_scipy_optimize_fsolve_aliases = set()
     translator.global_statistics_aliases = set()
     translator.global_statistics_func_aliases = {}
     translator.global_time_aliases = set()
@@ -46042,6 +46215,8 @@ def transpile_file(
         translator.global_scipy_special_aliases,
         translator.global_scipy_special_func_aliases,
     ) = collect_scipy_special_aliases(tree)
+    translator.global_scipy_stats_norm_aliases = collect_scipy_stats_norm_aliases(tree)
+    translator.global_scipy_optimize_fsolve_aliases = collect_scipy_optimize_fsolve_aliases(tree)
     (
         translator.global_statistics_aliases,
         translator.global_statistics_func_aliases,
