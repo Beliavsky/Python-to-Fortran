@@ -2206,8 +2206,38 @@ def rename_conflicting_identifiers(src_text):
             continue
         code, bang, comment = ln.partition("!")
 
+        def _string_literal_spans(s):
+            spans = []
+            i = 0
+            n = len(s)
+            while i < n:
+                ch = s[i]
+                if ch in "'\"":
+                    q = ch
+                    start = i
+                    i += 1
+                    while i < n:
+                        if s[i] == q:
+                            if i + 1 < n and s[i + 1] == q:
+                                i += 2
+                                continue
+                            i += 1
+                            break
+                        i += 1
+                    spans.append((start, i))
+                else:
+                    i += 1
+            return spans
+
+        str_spans = _string_literal_spans(code)
+
+        def _in_string_literal(pos):
+            return any(s0 <= pos < s1 for s0, s1 in str_spans)
+
         def _repl(m):
             nm = m.group(1)
+            if _in_string_literal(m.start()):
+                return nm
             new = rename_map.get(nm)
             if not new:
                 return nm
@@ -2978,6 +3008,19 @@ def remove_unused_use_only_imports(lines):
                     check = lhs
                 else:
                     check = it
+                op_m = re.fullmatch(r"operator\s*\(\s*(.+?)\s*\)", check, flags=re.IGNORECASE)
+                if op_m:
+                    # A user-defined operator import (e.g. `operator(<=)`)
+                    # enables infix usage like `a <= b`, which never spells
+                    # out the literal text "operator(<=)" anywhere in the
+                    # generated code -- word-boundary matching can't see it.
+                    # Just check the bare operator symbol appears at all;
+                    # over-keeping a possibly-unused operator import is
+                    # harmless, but dropping a needed one breaks the build.
+                    op_sym = op_m.group(1)
+                    if op_sym in body_txt:
+                        kept.append(it)
+                    continue
                 used_word = bool(check and re.search(rf"\b{re.escape(check)}\b", body_txt, flags=re.IGNORECASE))
                 # Kind suffix usage like 1.0_dp does not satisfy word-boundary checks.
                 used_kind_suffix = bool(check and re.search(rf"_{re.escape(check)}\b", body_txt, flags=re.IGNORECASE))
@@ -4095,6 +4138,19 @@ def top_level_if(tree):
         if isinstance(node, ast.If) and not is_main_guard_if(node):
             return node
     return None
+
+
+def _tree_uses_pandas_read_csv(tree):
+    for _n in ast.walk(tree):
+        if (
+            isinstance(_n, ast.Call)
+            and isinstance(_n.func, ast.Attribute)
+            and isinstance(_n.func.value, ast.Name)
+            and _n.func.value.id in {"pd", "pandas"}
+            and _n.func.attr in {"read_csv", "Timestamp"}
+        ):
+            return True
+    return False
 
 
 def is_main_guard_if(node):
@@ -5883,10 +5939,11 @@ SUPPORTED_IMPORT_ROOTS = {
     "itertools", "statistics", "csv", "pprint", "subprocess", "os",
     "pathlib", "argparse", "shlex", "difflib", "io", "tokenize",
     "datetime", "copy", "glob", "traceback", "tempfile", "re",
+    "pandas",
 }
 
 KNOWN_UNSUPPORTED_IMPORT_PREFIXES = {
-    "PIL", "matplotlib", "pandas", "mpi4py", "graphviz", "tkinter",
+    "PIL", "matplotlib", "mpi4py", "graphviz", "tkinter",
     "cv2", "skimage", "seaborn", "requests", "bs4",
 }
 
@@ -9791,6 +9848,14 @@ class translator(ast.NodeVisitor):
         self.tuple_return_out_ranks = dict(tuple_return_out_ranks or {})
         self.dict_return_types = dict(dict_return_types or {})
         self.dict_typed_vars = {}
+        self.pandas_df_vars = {}
+        self.pandas_df_index_label = {}
+        self.pandas_df_columns = {}
+        self.pandas_date_vars = set()
+        self.pandas_date_array_aliases = {}
+        self.pandas_date_arrays = set()
+        self.pandas_str_list_values = {}
+        self.pandas_stats_table_vars = {}
         self.dict_aliases = {}
         self.dict_type_components = dict(dict_type_components or {})
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
@@ -11013,6 +11078,14 @@ class translator(ast.NodeVisitor):
         return False
 
     def _expr_kind(self, node):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.pandas_df_vars
+            and is_const_str(node.slice)
+            and node.slice.value != self.pandas_df_index_label.get(node.value.id)
+        ):
+            return "real"
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
                 return "logical"
@@ -11026,6 +11099,8 @@ class translator(ast.NodeVisitor):
                 return "char"
             return None
         if isinstance(node, ast.Name):
+            if node.id in self.pandas_date_array_aliases:
+                return None
             np_const = self.numpy_const_aliases.get(node.id)
             if np_const in {"e", "inf", "nan", "pi", "tau"}:
                 return "real"
@@ -11425,6 +11500,24 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 0
             ):
                 return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "isna"
+                and len(node.args) == 0
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.pandas_date_array_aliases
+            ):
+                return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_numpy"
+                and isinstance(node.func.value, ast.Subscript)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id in self.pandas_df_vars
+                and isinstance(node.func.value.slice, ast.Name)
+                and node.func.value.slice.id in self.pandas_str_list_values
+            ):
+                return "real"
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}:
                 return "char"
             if is_numpy_sliding_window_view_axis0_call(node) and len(node.args) >= 1:
@@ -13165,8 +13258,201 @@ class translator(ast.NodeVisitor):
             out.extend(self._literal_indexed_nodes(e, prefix + (i,)))
         return out
 
+    def _pandas_columns_listcomp_literal(self, node):
+        # Resolve `[c for c in df.columns if c != "X" ...]` to a literal
+        # list of strings at transpile time -- df.columns is statically
+        # known from the CSV header peeked during prescan.
+        if not isinstance(node, ast.ListComp) or len(node.generators) != 1:
+            return None
+        gen = node.generators[0]
+        if not isinstance(gen.target, ast.Name):
+            return None
+        it = gen.iter
+        if not (
+            isinstance(it, ast.Attribute)
+            and it.attr == "columns"
+            and isinstance(it.value, ast.Name)
+            and it.value.id in self.pandas_df_vars
+        ):
+            return None
+        cols = self.pandas_df_columns.get(it.value.id)
+        if cols is None:
+            return None
+        if not (isinstance(node.elt, ast.Name) and node.elt.id == gen.target.id):
+            return None
+        tgt = gen.target.id
+        out = []
+        for col in cols:
+            keep = True
+            for cond in gen.ifs:
+                if not (
+                    isinstance(cond, ast.Compare)
+                    and len(cond.ops) == 1
+                    and isinstance(cond.left, ast.Name)
+                    and cond.left.id == tgt
+                    and isinstance(cond.comparators[0], ast.Constant)
+                    and isinstance(cond.comparators[0].value, str)
+                    and isinstance(cond.ops[0], (ast.Eq, ast.NotEq))
+                ):
+                    return None
+                rhs = cond.comparators[0].value
+                match = col == rhs
+                keep = keep and (not match if isinstance(cond.ops[0], ast.NotEq) else match)
+            if keep:
+                out.append(col)
+        return out
+
+    def _pandas_date_scalar_expr(self, node):
+        # Resolve an expression built from a date-array alias down to a
+        # scalar type(date) Fortran expression, or None if not such a chain.
+        # Handles `dates.iloc[i]` (positional, negative indices allowed) and
+        # a trailing no-op `.date()` call (our date type has no separate
+        # datetime/date distinction).
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "date"
+            and len(node.args) == 0
+        ):
+            return self._pandas_date_scalar_expr(node.func.value)
+        _slice_int = None
+        if isinstance(node, ast.Subscript):
+            _sl = node.slice
+            if isinstance(_sl, ast.Constant) and isinstance(_sl.value, int):
+                _slice_int = _sl.value
+            elif (
+                isinstance(_sl, ast.UnaryOp)
+                and isinstance(_sl.op, ast.USub)
+                and isinstance(_sl.operand, ast.Constant)
+                and isinstance(_sl.operand.value, int)
+            ):
+                _slice_int = -_sl.operand.value
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "iloc"
+            and isinstance(node.value.value, ast.Name)
+            and _slice_int is not None
+            and (
+                node.value.value.id in self.pandas_date_array_aliases
+                or node.value.value.id in self.pandas_date_arrays
+            )
+        ):
+            base_id = node.value.value.id
+            if base_id in self.pandas_date_array_aliases:
+                arr_expr = f"{self._aliased_name(self.pandas_date_array_aliases[base_id])}%index"
+            else:
+                arr_expr = self._aliased_name(base_id)
+            idx = _slice_int
+            if idx >= 0:
+                fidx = str(idx + 1)
+            elif idx == -1:
+                fidx = f"size({arr_expr})"
+            else:
+                fidx = f"size({arr_expr}) + {idx + 1}"
+            return f"{arr_expr}({fidx})"
+        return None
+
+    def _pandas_date_array_base_expr(self, name_id):
+        # Fortran expression for the full type(date) array behind a date
+        # alias (`dates` -> `dat%index`) or a materialized date array.
+        if name_id in self.pandas_date_array_aliases:
+            return f"{self._aliased_name(self.pandas_date_array_aliases[name_id])}%index"
+        if name_id in self.pandas_date_arrays:
+            return self._aliased_name(name_id)
+        return None
+
+    def _pandas_stats_table_spec(self, v):
+        # pd.DataFrame([fn(col_expr) for LOOPVAR in range(N)], index=row_labels)
+        # where fn is a local function returning a dict literal (already
+        # lowered to a synthesized derived type via dict_return_types).
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.ListComp)
+        ):
+            return None
+        lc = v.args[0]
+        if len(lc.generators) != 1:
+            return None
+        gen = lc.generators[0]
+        if not isinstance(gen.target, ast.Name) or gen.ifs:
+            return None
+        it = gen.iter
+        if not (
+            isinstance(it, ast.Call)
+            and isinstance(it.func, ast.Name)
+            and it.func.id == "range"
+            and len(it.args) == 1
+        ):
+            return None
+        elt = lc.elt
+        if not (
+            isinstance(elt, ast.Call)
+            and isinstance(elt.func, ast.Name)
+            and elt.func.id in self.dict_return_types
+            and len(elt.args) == 1
+        ):
+            return None
+        idx_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+        if idx_kw is None or not isinstance(idx_kw.value, ast.Name):
+            return None
+        row_labels_id = idx_kw.value.id
+        if not (row_labels_id in self.alloc_chars or row_labels_id in self.pandas_str_list_values):
+            return None
+        type_name = self.dict_return_types[elt.func.id]
+        comps = self.dict_type_components.get(type_name)
+        if not comps:
+            return None
+        return {
+            "loop_var": gen.target.id,
+            "n_node": it.args[0],
+            "col_node": elt.args[0],
+            "fn_name": elt.func.id,
+            "type_name": type_name,
+            "comps": list(comps.items()),
+            "row_labels_id": row_labels_id,
+        }
+
     def _rank_expr(self, node):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "isna"
+            and len(node.args) == 0
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in self.pandas_date_array_aliases
+        ):
+            return 1
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to_numpy"
+            and isinstance(node.func.value, ast.Subscript)
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id in self.pandas_df_vars
+            and isinstance(node.func.value.slice, ast.Name)
+            and node.func.value.slice.id in self.pandas_str_list_values
+        ):
+            return 2
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.pandas_df_vars
+            and is_const_str(node.slice)
+        ):
+            if node.slice.value == self.pandas_df_index_label.get(node.value.id):
+                raise NotImplementedError(
+                    "assigning a pandas DataFrame date-index column to a plain variable is not yet supported"
+                )
+            return 1
         if isinstance(node, ast.Name):
+            if node.id in self.pandas_date_array_aliases:
+                return 1
             nm = self._aliased_name(self._resolve_list_alias(node.id))
             if nm in self.char_scalar_names:
                 return 0
@@ -14646,6 +14932,9 @@ class translator(ast.NodeVisitor):
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
             if np_const == "inf":
                 return "huge(1.0_dp)"
+            if node.id in self.pandas_date_array_aliases:
+                df_name = self._aliased_name(self.pandas_date_array_aliases[node.id])
+                return f"{df_name}%index"
             if node.id in self.callable_aliases:
                 return self.callable_aliases[node.id]
             known_names = (
@@ -15360,6 +15649,21 @@ class translator(ast.NodeVisitor):
             if op is ast.In or op is ast.NotIn:
                 lhs_node = node.left
                 rhs_node = node.comparators[0]
+                if (
+                    isinstance(rhs_node, ast.Attribute)
+                    and rhs_node.attr == "columns"
+                    and isinstance(rhs_node.value, ast.Name)
+                    and rhs_node.value.id in self.pandas_df_vars
+                    and is_const_str(lhs_node)
+                ):
+                    df_id = rhs_node.value.id
+                    col_name = lhs_node.value
+                    df_expr = self.expr(rhs_node.value)
+                    if col_name == self.pandas_df_index_label.get(df_id):
+                        mem = ".true."
+                    else:
+                        mem = f"{df_expr}%has_col({fstr(col_name)})"
+                    return f"(.not. {mem})" if op is ast.NotIn else mem
                 lhs = self.expr(lhs_node)
                 rhs = self.expr(rhs_node)
                 rr = self._rank_expr(rhs_node)
@@ -15400,6 +15704,17 @@ class translator(ast.NodeVisitor):
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in self.pandas_df_vars
+                and is_const_str(node.slice)
+            ):
+                df_id = node.value.id
+                col_name = node.slice.value
+                df_expr = self.expr(node.value)
+                if col_name == self.pandas_df_index_label.get(df_id):
+                    return f"{df_expr}%index"
+                return f"{df_expr}%values(:, {df_expr}%col_pos({fstr(col_name)}))"
             # NumPy row-wise concatenation helper: np.r_[...]
             if (
                 isinstance(node.value, ast.Attribute)
@@ -16570,6 +16885,28 @@ class translator(ast.NodeVisitor):
             ):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
+                if (
+                    attr == "isna"
+                    and len(node.args) == 0
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.pandas_date_array_aliases
+                ):
+                    return f"(.not. valid({base_expr}))"
+                if (
+                    attr == "to_numpy"
+                    and isinstance(node.func.value, ast.Subscript)
+                    and isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id in self.pandas_df_vars
+                    and isinstance(node.func.value.slice, ast.Name)
+                    and node.func.value.slice.id in self.pandas_str_list_values
+                ):
+                    _df_id = node.func.value.value.id
+                    _df_expr = self.expr(node.func.value.value)
+                    _names = self.pandas_str_list_values[node.func.value.slice.id]
+                    _col_list = self.pandas_df_columns.get(_df_id, [])
+                    _idxs = [_col_list.index(_nm) + 1 for _nm in _names]
+                    _idx_txt = ", ".join(str(_i) for _i in _idxs)
+                    return f"{_df_expr}%values(:, [{_idx_txt}])"
                 if attr == "index" and len(node.args) == 1:
                     arg0 = self.expr(node.args[0])
                     if self._rank_expr(node.func.value) == 0 and self._expr_kind(node.func.value) == "char":
@@ -17060,6 +17397,9 @@ class translator(ast.NodeVisitor):
                 idx = f"int({self.expr(node.args[1])})"
                 return f"[{a0}(:{idx}), {a0}(({idx}) + 2:)]"
             if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
+                _date_expr = self._pandas_date_scalar_expr(node.args[0])
+                if _date_expr is not None:
+                    return f"{_date_expr}%to_str()"
                 return f"py_str({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id == "bytearray":
                 if len(node.args) == 1:
@@ -17119,6 +17459,8 @@ class translator(ast.NodeVisitor):
                 a0 = node.args[0]
                 if isinstance(a0, ast.Name) and a0.id in self.list_counts:
                     return self.list_counts[a0.id]
+                if isinstance(a0, ast.Name) and a0.id in self.pandas_df_vars:
+                    return f"nrow({self.expr(a0)})"
                 if self._expr_kind(a0) == "char" and self._rank_expr(a0) == 0:
                     return f"len({self.expr(a0)})"
                 return f"size({self.expr(a0)})"
@@ -20937,6 +21279,20 @@ class translator(ast.NodeVisitor):
 
         _record_real_assignment_exprs_in_order(nodes)
 
+        def _resolve_str_literal(enode):
+            if isinstance(enode, ast.Constant) and isinstance(enode.value, str):
+                return enode.value
+            if isinstance(enode, ast.Name):
+                assigns = self.real_assignment_exprs.get(enode.id)
+                if (
+                    assigns
+                    and len(assigns) == 1
+                    and isinstance(assigns[0], ast.Constant)
+                    and isinstance(assigns[0].value, str)
+                ):
+                    return assigns[0].value
+            return None
+
         def _names_in_expr(enode):
             out = set()
             if enode is None:
@@ -21983,6 +22339,102 @@ class translator(ast.NodeVisitor):
                 t = node.targets[0]
                 v = node.value
 
+                # df.columns list comprehensions resolve to a compile-time
+                # literal (df.columns is statically known from the CSV
+                # header); handle before the generic ListComp fallback below
+                # -- which defaults unknown-element-kind comprehensions to
+                # a real array and `continue`s, pre-empting this case.
+                if isinstance(t, ast.Name) and isinstance(v, ast.ListComp):
+                    _cols_literal = self._pandas_columns_listcomp_literal(v)
+                    if _cols_literal is not None:
+                        self.pandas_str_list_values[t.id] = _cols_literal
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        self.alloc_chars.add(t.id)
+                        self.alloc_char_rank[t.id] = 1
+                        continue
+
+                # X = Y.iloc[lo:hi].reset_index(drop=True) -- materialize a
+                # slice of a date-array alias/array into a real type(date)
+                # array. Handle before the generic fallback below, which
+                # would otherwise `continue` on any rank>0 RHS first.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "reset_index"
+                    and any(kw.arg == "drop" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in v.keywords)
+                    and isinstance(v.func.value, ast.Subscript)
+                    and isinstance(v.func.value.value, ast.Attribute)
+                    and v.func.value.value.attr == "iloc"
+                    and isinstance(v.func.value.value.value, ast.Name)
+                    and (
+                        v.func.value.value.value.id in self.pandas_date_array_aliases
+                        or v.func.value.value.value.id in self.pandas_date_arrays
+                    )
+                    and isinstance(v.func.value.slice, ast.Slice)
+                    and v.func.value.slice.step is None
+                ):
+                    self.pandas_date_arrays.add(t.id)
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
+                    continue
+
+                # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
+                # -- materialize one real array per dict-return-type component.
+                if isinstance(t, ast.Name):
+                    _stats_spec = self._pandas_stats_table_spec(v)
+                    if _stats_spec is not None:
+                        self._mark_int(_stats_spec["loop_var"])
+                        self._mark_int(f"{t.id}_i")
+                        tmp_var = f"{t.id}_tmp"
+                        self.dict_typed_vars[tmp_var] = _stats_spec["type_name"]
+                        comp_arrays = {}
+                        for cname, (ckind, _crank) in _stats_spec["comps"]:
+                            arr_name = f"{t.id}_{cname}"
+                            comp_arrays[cname] = arr_name
+                            if ckind == "int":
+                                self.alloc_ints.add(arr_name)
+                                self.alloc_int_rank[arr_name] = 1
+                            elif ckind == "logical":
+                                self.alloc_logs.add(arr_name)
+                                self.alloc_log_rank[arr_name] = 1
+                            elif ckind == "char":
+                                self.alloc_chars.add(arr_name)
+                                self.alloc_char_rank[arr_name] = 1
+                            else:
+                                self.alloc_reals.add(arr_name)
+                                self.alloc_real_rank[arr_name] = 1
+                        _stats_spec["tmp_var"] = tmp_var
+                        _stats_spec["comp_arrays"] = comp_arrays
+                        self.pandas_stats_table_vars[t.id] = _stats_spec
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
                 # No-op self-casts/normalizations should not force type/rank
                 # changes during prescan.
                 if (
@@ -22337,6 +22789,166 @@ class translator(ast.NodeVisitor):
                     self.alloc_ints.discard(t.id)
                     self.alloc_reals.discard(t.id)
                     self.alloc_logs.discard(t.id)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"pd", "pandas"}
+                    and v.func.attr == "read_csv"
+                ):
+                    self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
+                    _csv_path = _resolve_str_literal(v.args[0]) if v.args else None
+                    if _csv_path is not None:
+                        try:
+                            with open(_csv_path, encoding="utf-8-sig") as _csv_f:
+                                _header = _csv_f.readline().rstrip("\r\n").split(",")
+                        except OSError:
+                            _header = []
+                        if len(_header) >= 2:
+                            self.pandas_df_index_label[t.id] = _header[0].strip()
+                            self.pandas_df_columns[t.id] = [h.strip() for h in _header[1:]]
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"pd", "pandas"}
+                    and v.func.attr == "Series"
+                    and len(v.args) >= 1
+                ):
+                    _idx_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+                    if (
+                        _idx_kw is not None
+                        and isinstance(_idx_kw.value, ast.Attribute)
+                        and _idx_kw.value.attr == "index"
+                        and isinstance(_idx_kw.value.value, ast.Name)
+                        and _idx_kw.value.value.id in self.pandas_df_vars
+                    ):
+                        _series_kind = self._expr_kind(v.args[0])
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        if _series_kind == "real":
+                            self.alloc_reals.add(t.id)
+                            self.alloc_real_rank[t.id] = 1
+                        elif _series_kind == "int":
+                            self.alloc_ints.add(t.id)
+                            self.alloc_int_rank[t.id] = 1
+                        elif _series_kind == "char":
+                            self.alloc_chars.add(t.id)
+                            self.alloc_char_rank[t.id] = 1
+                        else:
+                            self.alloc_logs.add(t.id)
+                            self.alloc_log_rank[t.id] = 1
+
+                def _is_bool_mask_node(n):
+                    return (
+                        isinstance(n, ast.Name)
+                        and self._expr_kind(n) == "logical"
+                        and self._rank_expr(n) >= 1
+                    )
+
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "reset_index"
+                    and any(kw.arg == "drop" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in v.keywords)
+                    and isinstance(v.func.value, ast.Subscript)
+                    and isinstance(v.func.value.value, ast.Name)
+                    and _is_bool_mask_node(v.func.value.slice)
+                ):
+                    _src_id = v.func.value.value.id
+                    if _src_id in self.pandas_df_vars and t.id != _src_id:
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_src_id]
+                        self.pandas_df_index_label[t.id] = self.pandas_df_index_label.get(_src_id)
+                        self.pandas_df_columns[t.id] = list(self.pandas_df_columns.get(_src_id, []))
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                    elif _src_id in self.pandas_date_array_aliases and t.id != _src_id:
+                        self.pandas_date_array_aliases[t.id] = self.pandas_date_array_aliases[_src_id]
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"pd", "pandas"}
+                    and v.func.attr == "Timestamp"
+                    and len(v.args) >= 1
+                    and is_const_str(v.args[0])
+                ):
+                    self.pandas_date_vars.add(t.id)
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"pd", "pandas"}
+                    and v.func.attr == "to_datetime"
+                    and len(v.args) >= 1
+                    and isinstance(v.args[0], ast.Subscript)
+                    and isinstance(v.args[0].value, ast.Name)
+                    and v.args[0].value.id in self.pandas_df_vars
+                    and is_const_str(v.args[0].slice)
+                    and v.args[0].slice.value == self.pandas_df_index_label.get(v.args[0].value.id)
+                ):
+                    self.pandas_date_array_aliases[t.id] = v.args[0].value.id
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.DictComp)
@@ -23467,6 +24079,18 @@ class translator(ast.NodeVisitor):
                                 else:
                                     self._mark_alloc_int(c.func.value.id, rank=max(1, rr + 1))
         for _nm in index_name_hits:
+            # A name already known to be a non-integer-typed array (e.g. a
+            # boolean mask used for `arr[mask]`-style filtering, or a list
+            # of column-name strings used for `df[names]`-style selection)
+            # is not an integer subscript index; don't clobber that
+            # classification.
+            if (
+                _nm in self.logs or _nm in self.alloc_logs
+                or _nm in self.reals or _nm in self.alloc_reals
+                or _nm in self.chars or _nm in self.alloc_chars
+                or _nm in self.complexes or _nm in self.alloc_complexes
+            ):
+                continue
             self._force_int_name(_nm, rank_hint=0)
 
     def validate_unsafe_if_type_merges(self, nodes):
@@ -23755,6 +24379,46 @@ class translator(ast.NodeVisitor):
             return
         t = node.targets[0]
         v = node.value
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.pandas_df_vars
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "read_csv"
+            and len(v.args) >= 1
+        ):
+            name = self._aliased_name(t.id)
+            path_expr = self.expr(v.args[0])
+            self.o.w(f"call {name}%read_csv({path_expr})")
+            return
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.pandas_date_vars
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "Timestamp"
+            and len(v.args) >= 1
+            and is_const_str(v.args[0])
+        ):
+            name = self._aliased_name(t.id)
+            self.o.w(f"{name} = date_from_iso({fstr(v.args[0].value)})")
+            return
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.pandas_date_array_aliases
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "to_datetime"
+        ):
+            # `dates` is tracked as a compile-time alias to the DataFrame's
+            # date index (see pandas_date_array_aliases); no statement needed.
+            return
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
@@ -27746,6 +28410,118 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{name} = {a0}")
             return
 
+        # pd.Series(value, index=df.index) -- broadcast scalar over a DataFrame's row count
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "Series"
+            and len(v.args) >= 1
+        ):
+            _idx_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+            if (
+                _idx_kw is not None
+                and isinstance(_idx_kw.value, ast.Attribute)
+                and _idx_kw.value.attr == "index"
+                and isinstance(_idx_kw.value.value, ast.Name)
+                and _idx_kw.value.value.id in self.pandas_df_vars
+            ):
+                name = self._aliased_name(t.id)
+                df_name = self._aliased_name(_idx_kw.value.value.id)
+                fill_expr = self.expr(v.args[0])
+                self.o.w(f"if (allocated({name})) deallocate({name})")
+                self.o.w(f"allocate({name}(nrow({df_name})))")
+                self.o.w(f"{name} = {fill_expr}")
+                return
+
+        # X = df[bool_mask].reset_index(drop=True) -- boolean-mask row filtering
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "reset_index"
+            and any(kw.arg == "drop" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in v.keywords)
+            and isinstance(v.func.value, ast.Subscript)
+            and isinstance(v.func.value.value, ast.Name)
+            and isinstance(v.func.value.slice, ast.Name)
+            and self._expr_kind(v.func.value.slice) == "logical"
+            and self._rank_expr(v.func.value.slice) >= 1
+        ):
+            src_id = v.func.value.value.id
+            mask_expr = self.expr(v.func.value.slice)
+            if src_id in self.pandas_df_vars:
+                name = self._aliased_name(t.id)
+                src_name = self._aliased_name(src_id)
+                self.o.w(f"{name} = {src_name}%where({mask_expr}, spread(.true., 1, ncol({src_name})))")
+                return
+            if src_id in self.pandas_date_array_aliases:
+                # `dates` remains a compile-time alias to its DataFrame's
+                # index; the underlying rows are filtered by the sibling
+                # `dat = dat[mask].reset_index(drop=True)` statement.
+                return
+
+        # X = Y.iloc[lo:hi].reset_index(drop=True) -- materialize a date-array
+        # slice into a real type(date) array.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "reset_index"
+            and any(kw.arg == "drop" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in v.keywords)
+            and isinstance(v.func.value, ast.Subscript)
+            and isinstance(v.func.value.value, ast.Attribute)
+            and v.func.value.value.attr == "iloc"
+            and isinstance(v.func.value.value.value, ast.Name)
+            and isinstance(v.func.value.slice, ast.Slice)
+            and v.func.value.slice.step is None
+        ):
+            _src_base_id = v.func.value.value.value.id
+            _arr_expr = self._pandas_date_array_base_expr(_src_base_id)
+            if _arr_expr is not None:
+                sl = v.func.value.slice
+                lo = f"({self.expr(sl.lower)} + 1)" if sl.lower is not None else "1"
+                hi = self.expr(sl.upper) if sl.upper is not None else f"size({_arr_expr})"
+                name = self._aliased_name(t.id)
+                self.o.w(f"{name} = {_arr_expr}({lo}:{hi})")
+                return
+
+        # X = [c for c in df.columns if c != "..."] -- resolved at transpile
+        # time to a literal character array (df.columns is statically known).
+        if isinstance(t, ast.Name) and isinstance(v, ast.ListComp):
+            _cols_literal = self._pandas_columns_listcomp_literal(v)
+            if _cols_literal is not None:
+                name = self._aliased_name(t.id)
+                lit_list = ast.List(
+                    elts=[ast.Constant(value=s) for s in _cols_literal], ctx=ast.Load()
+                )
+                rhs = self.expr(lit_list)
+                self.o.w(f"{name} = {rhs}")
+                return
+
+        # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
+        if isinstance(t, ast.Name) and t.id in self.pandas_stats_table_vars:
+            spec = self.pandas_stats_table_vars[t.id]
+            n_expr = self.expr(spec["n_node"])
+            loop_var = spec["loop_var"]
+            col_expr = self.expr(spec["col_node"])
+            fn_name = spec["fn_name"]
+            tmp_var = spec["tmp_var"]
+            for arr_name in spec["comp_arrays"].values():
+                self.o.w(f"if (allocated({arr_name})) deallocate({arr_name})")
+                self.o.w(f"allocate({arr_name}({n_expr}))")
+            # col_expr was lowered via self.expr() on the original Python
+            # subscript, which adds +1 to variable indices assuming a
+            # 0-based loop variable (matching Python's own range(N)); keep
+            # the loop 0-based here and shift only the 1-based array stores.
+            self.o.w(f"do {loop_var} = 0, {n_expr} - 1")
+            self.o.w(f"{tmp_var} = {fn_name}({col_expr})")
+            for cname, arr_name in spec["comp_arrays"].items():
+                self.o.w(f"{arr_name}({loop_var} + 1) = {tmp_var}%{cname}")
+            self.o.w("end do")
+            return
+
         # np.full(shape, value, dtype=...)
         if (
             isinstance(t, ast.Name)
@@ -29016,8 +29792,16 @@ class translator(ast.NodeVisitor):
                     return any(vals)
                 return None
             if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
-                ltxt = self.expr(test.left)
-                rtxt = self.expr(test.comparators[0])
+                # This is a best-effort constant-fold optimization; an
+                # expression that self.expr() can't lower yet (e.g. because
+                # full Compare-level lowering, not reachable from here,
+                # would have handled it) just means "not foldable", not a
+                # hard failure.
+                try:
+                    ltxt = self.expr(test.left)
+                    rtxt = self.expr(test.comparators[0])
+                except NotImplementedError:
+                    return None
                 lv = _num_lit_from_expr(ltxt)
                 rv = _num_lit_from_expr(rtxt)
                 if lv is None or rv is None:
@@ -30461,6 +31245,16 @@ class translator(ast.NodeVisitor):
         if isinstance(c.func, ast.Name) and c.func.id == "print":
             if self.context == "compute":
                 raise NotImplementedError("print not allowed in compute procedure")
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "round"
+                and isinstance(c.args[0].func.value, ast.Name)
+                and c.args[0].func.value.id in self.pandas_stats_table_vars
+            ):
+                self._emit_pandas_stats_table_print(c.args[0])
+                return
             self._emit_print_call(c)
             return
         if (
@@ -31165,6 +31959,32 @@ class translator(ast.NodeVisitor):
 
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
+
+    def _emit_pandas_stats_table_print(self, round_call):
+        stats_id = round_call.func.value.id
+        spec = self.pandas_stats_table_vars[stats_id]
+        ndigits = 6
+        if (
+            round_call.args
+            and isinstance(round_call.args[0], ast.Constant)
+            and isinstance(round_call.args[0].value, int)
+        ):
+            ndigits = int(round_call.args[0].value)
+        comp_names = [cname for cname, _ in spec["comps"]]
+        row_labels_expr = self._aliased_name(spec["row_labels_id"])
+        n_expr = self.expr(spec["n_node"])
+        loop_var = f"{stats_id}_i"
+        col_width = max(10, ndigits + 8)
+        header_fmt = f"'(A10,{len(comp_names)}A{col_width})'"
+        # Field names may carry a trailing "_" to dodge a Fortran intrinsic
+        # collision (e.g. "min" -> "min_"); display the original dict key.
+        header_args = ", ".join(f"'{name.rstrip('_')}'" for name in comp_names)
+        self.o.w(f"write(*,{header_fmt}) '', {header_args}")
+        row_fmt = f"'(A10,{len(comp_names)}F{col_width}.{ndigits})'"
+        row_args = ", ".join(f"{spec['comp_arrays'][name]}({loop_var})" for name in comp_names)
+        self.o.w(f"do {loop_var} = 1, {n_expr}")
+        self.o.w(f"write(*,{row_fmt}) trim({row_labels_expr}({loop_var})), {row_args}")
+        self.o.w("end do")
 
     def _emit_print_call(self, call):
         unit_txt = "*"
@@ -32078,7 +32898,12 @@ def _analyze_dict_return_spec(
                     ckind = "real_array"
                 crank = max(1, vrank)
             else:
-                ckind = "real_scalar" if ek == "real" else ("int_scalar" if ek == "int" else "int_scalar")
+                # Unknown scalar kinds in dict returns are more often REAL
+                # in numerical code (e.g. np.min(x)/np.max(x) where x's
+                # kind isn't resolvable in this isolated analysis pass);
+                # prefer REAL over INTEGER fallback, matching the Name-value
+                # branch above.
+                ckind = "int_scalar" if ek == "int" else "real_scalar"
         if ckind == "real_array" and crank <= 0:
             crank = max(1, tr0._rank_expr(v))
         if ckind in {"int_array", "logical_array"} and crank <= 0:
@@ -42815,6 +43640,12 @@ def generate_flat(
     for mod, syms in helper_uses_main.items():
         if syms:
             o.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
+    if _tree_uses_pandas_read_csv(tree):
+        o.w(
+            "use dataframe_index_date_mod, only: DataFrame_index_date, nrow, ncol, date, "
+            "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
+            "operator(>), operator(>=)"
+        )
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
@@ -42963,6 +43794,12 @@ def generate_flat(
         o.w("character(len=:), allocatable :: " + ", ".join(chars))
     for vname, tname in dict_type_vars:
         o.w(f"type({tname}) :: {vname}")
+    for vname, tname in sorted(tr.pandas_df_vars.items()):
+        o.w(f"type({tname}) :: {vname}")
+    for vname in sorted(tr.pandas_date_vars):
+        o.w(f"type(date) :: {vname}")
+    for vname in sorted(tr.pandas_date_arrays):
+        o.w(f"type(date), allocatable :: {vname}(:)")
     for vname, tname in sorted((structured_array_types or {}).items()):
         o.w(f"type({tname}), allocatable :: {vname}(:)")
     for name in sorted(alloc_logs_set):

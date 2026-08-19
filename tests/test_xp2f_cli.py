@@ -18,6 +18,7 @@ import xp2f
 
 XP2F_PATH = REPO_ROOT / "xp2f.py"
 PYTHON_HELPER_PATH = REPO_ROOT / "python.f90"
+DATAFRAME_HELPER_PATH = REPO_ROOT / "dataframe_index_date.f90"
 
 SUPPORTED_PY_COMPILE_CASES = [
     "xoptions_pde.py",
@@ -3952,6 +3953,145 @@ def test_xp2f_slices_negative_lower_bound_on_char_scalar_argument(tmp_path: Path
                 "",
                 "conjugate('amare')",
                 "conjugate('videre')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+_PANDAS_TEST_CSV_ROWS = [
+    "Date,SPY,EFA",
+    "2007-12-19,103.6241,44.6112",
+    "2007-12-20,104.2776,44.9292",
+    "2007-12-21,105.5,45.1",
+]
+
+
+def test_xp2f_pandas_read_csv_len_matches_python(tmp_path: Path) -> None:
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    src = tmp_path / "xpandas_read_csv_len.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "dat = pd.read_csv('prices.csv')",
+                "print(len(dat))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_column_membership_check(tmp_path: Path) -> None:
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    src = tmp_path / "xpandas_column_membership.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "dat = pd.read_csv('prices.csv')",
+                "if 'Date' not in dat.columns:",
+                "    print('no date column')",
+                "else:",
+                "    print('has date column')",
+                "if 'SPY' not in dat.columns:",
+                "    print('no SPY column')",
+                "else:",
+                "    print('has SPY column')",
+                "if 'ZZZ' not in dat.columns:",
+                "    print('no ZZZ column')",
+                "else:",
+                "    print('has ZZZ column')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_value_column_access(tmp_path: Path) -> None:
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    src = tmp_path / "xpandas_value_column.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "dat = pd.read_csv('prices.csv')",
+                "spy = dat['SPY']",
+                "print(len(spy))",
+                "print(spy[0])",
+                "print(spy[2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_timestamp_construction_and_comparison(tmp_path: Path) -> None:
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    src = tmp_path / "xpandas_timestamp.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "date_min = pd.Timestamp('2010-01-01')",
+                "date_max = pd.Timestamp('2024-12-31')",
+                "print(date_min <= date_max)",
+                "print(date_max <= date_min)",
                 "",
             ]
         ),
