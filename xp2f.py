@@ -5465,7 +5465,10 @@ def collect_scipy_special_aliases(tree):
     """Collect aliases for scipy.special module and directly imported functions."""
     module_aliases = set()
     func_aliases = {}
-    supported = {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom"}
+    supported = {
+        "gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom",
+        "j0", "j1", "jn", "jv",
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for al in node.names:
@@ -11985,7 +11988,7 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id in self.scipy_special_func_aliases and len(node.args) >= 1:
                     fnm = self.scipy_special_func_aliases[node.func.id]
-                    if fnm in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom"}:
+                    if fnm in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom", "j0", "j1", "jn", "jv"}:
                         return "real"
                 if node.func.id in {"gammaln", "lgamma"} and len(node.args) == 1:
                     return "real"
@@ -14316,10 +14319,17 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id in self.scipy_special_func_aliases
-                and self.scipy_special_func_aliases[node.func.id] in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2"}
+                and self.scipy_special_func_aliases[node.func.id] in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "j0", "j1"}
                 and len(node.args) >= 1
             ):
                 return self._rank_expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.scipy_special_func_aliases
+                and self.scipy_special_func_aliases[node.func.id] in {"jn", "jv"}
+                and len(node.args) >= 2
+            ):
+                return self._rank_expr(node.args[1])
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id in self.scipy_special_func_aliases
@@ -17997,6 +18007,20 @@ class translator(ast.NodeVisitor):
                         if rep_txt is not None:
                             parts.append(f"repetition={rep_txt}")
                         return "special_comb(" + ", ".join(parts) + ")"
+                    if fnm in {"jn", "jv"} and len(node.args) >= 2:
+                        n_txt = self.expr(node.args[0])
+                        nk = self._expr_kind(node.args[0])
+                        x_txt = self.expr(node.args[1])
+                        if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                            x_txt = f"real({x_txt}, kind=dp)"
+                        if fnm == "jv" and nk != "int":
+                            raise NotImplementedError(
+                                "scipy.special.jv(...) is currently only supported for "
+                                "integer-valued orders (lowered to the Fortran BESSEL_JN "
+                                "intrinsic, which requires an integer order)"
+                            )
+                        n_int_txt = n_txt if nk == "int" else f"nint({n_txt})"
+                        return f"bessel_jn(int({n_int_txt}), {x_txt})"
                     a0 = self.expr(node.args[0])
                     k0 = self._expr_kind(node.args[0])
                     if k0 in {"int", "logical"}:
@@ -18009,6 +18033,10 @@ class translator(ast.NodeVisitor):
                         return f"erf({a0})"
                     if fnm == "erfc":
                         return f"erfc({a0})"
+                    if fnm == "j0":
+                        return f"bessel_j0({a0})"
+                    if fnm == "j1":
+                        return f"bessel_j1({a0})"
                     if fnm == "factorial":
                         return f"special_factorial({a0})"
                     if fnm == "factorial2":
