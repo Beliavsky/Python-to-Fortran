@@ -8817,10 +8817,17 @@ def normalize_inline_dict_literal_call_args(exec_body, local_funcs):
     class _Rewriter(ast.NodeTransformer):
         def visit_Call(self, node):
             self.generic_visit(node)
-            node.args = [_make_helper(a) if isinstance(a, ast.Dict) else a for a in node.args]
-            for kw in node.keywords:
-                if kw.arg is not None and isinstance(kw.value, ast.Dict):
-                    kw.value = _make_helper(kw.value)
+            # `df.rename(columns={"old": "new"})` is a recognized pandas
+            # idiom lowered directly from its literal dict keyword-arg
+            # elsewhere; leave it alone so that special-case can still see it.
+            is_pandas_rename = (
+                isinstance(node.func, ast.Attribute) and node.func.attr == "rename"
+            )
+            if not is_pandas_rename:
+                node.args = [_make_helper(a) if isinstance(a, ast.Dict) else a for a in node.args]
+                for kw in node.keywords:
+                    if kw.arg is not None and isinstance(kw.value, ast.Dict):
+                        kw.value = _make_helper(kw.value)
             return node
 
     rw = _Rewriter()
@@ -13594,6 +13601,55 @@ class translator(ast.NodeVisitor):
         ):
             return None
         return {"method": v.func.attr, "df_id": v.func.value.id, "call": v}
+
+    def _pandas_df_drop_spec(self, v):
+        # X = df.drop(columns=["A", "B"]) / df.drop(["A", "B"], axis=1)
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "drop"
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        kwargs = {kw.arg: kw.value for kw in v.keywords}
+        cols_node = kwargs.get("columns")
+        if cols_node is None and v.args:
+            axis_node = kwargs.get("axis")
+            if isinstance(axis_node, ast.Constant) and axis_node.value == 1:
+                cols_node = v.args[0]
+        if not (
+            isinstance(cols_node, ast.List)
+            and cols_node.elts
+            and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in cols_node.elts)
+        ):
+            return None
+        return {
+            "kind": "drop_cols",
+            "df_id": v.func.value.id,
+            "names": [e.value for e in cols_node.elts],
+        }
+
+    def _pandas_df_rename_spec(self, v):
+        # X = df.rename(columns={"old": "new", ...})
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "rename"
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        cols_node = next((kw.value for kw in v.keywords if kw.arg == "columns"), None)
+        if not (
+            isinstance(cols_node, ast.Dict)
+            and cols_node.keys
+            and all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in cols_node.keys)
+            and all(isinstance(val, ast.Constant) and isinstance(val.value, str) for val in cols_node.values)
+        ):
+            return None
+        mapping = {k.value: val.value for k, val in zip(cols_node.keys, cols_node.values)}
+        return {"kind": "rename_cols", "df_id": v.func.value.id, "mapping": mapping}
 
     def _pandas_df_construct_spec(self, v):
         # pd.DataFrame(matrix, index=date_array, columns=str_list) -- build
@@ -22741,6 +22797,32 @@ class translator(ast.NodeVisitor):
                             self.alloc_complexes.discard(t.id)
                             continue
 
+                # X = df.drop(columns=[...]) / X = df.rename(columns={...})
+                if isinstance(t, ast.Name):
+                    _d_spec = self._pandas_df_drop_spec(v) or self._pandas_df_rename_spec(v)
+                    if _d_spec is not None:
+                        _src_cols = self.pandas_df_columns.get(_d_spec["df_id"])
+                        if _src_cols is not None:
+                            if _d_spec["kind"] == "drop_cols":
+                                _dropped = set(_d_spec["names"])
+                                _new_cols = [c for c in _src_cols if c not in _dropped]
+                            else:
+                                _mapping = _d_spec["mapping"]
+                                _new_cols = [_mapping.get(c, c) for c in _src_cols]
+                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_columns[t.id] = _new_cols
+                            self.ints.discard(t.id)
+                            self.reals.discard(t.id)
+                            self.logs.discard(t.id)
+                            self.chars.discard(t.id)
+                            self.complexes.discard(t.id)
+                            self.alloc_ints.discard(t.id)
+                            self.alloc_reals.discard(t.id)
+                            self.alloc_logs.discard(t.id)
+                            self.alloc_chars.discard(t.id)
+                            self.alloc_complexes.discard(t.id)
+                            continue
+
                 # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
                 if isinstance(t, ast.Name) and isinstance(v, ast.Subscript):
                     _m = self._pandas_df_match(v)
@@ -28916,6 +28998,33 @@ class translator(ast.NodeVisitor):
             idx_txt = ", ".join(str(i) for i in idxs)
             self.o.w(f"{name} = {src_expr}%icol([{idx_txt}])")
             return
+
+        # X = df.drop(columns=[...]) / X = df.rename(columns={...})
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _drop_spec = self._pandas_df_drop_spec(v)
+            if _drop_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_drop_spec["df_id"])
+                drop_names = _drop_spec["names"]
+                max_len = max(len(nm) for nm in drop_names)
+                names_txt = ", ".join(fstr(nm) for nm in drop_names)
+                self.o.w(f"{name} = {src_expr}%drop_cols([character(len={max_len}) :: {names_txt}])")
+                return
+            _rename_spec = self._pandas_df_rename_spec(v)
+            if _rename_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_rename_spec["df_id"])
+                mapping = _rename_spec["mapping"]
+                max_len_old = max(len(k) for k in mapping.keys())
+                max_len_new = max(len(v2) for v2 in mapping.values())
+                old_txt = ", ".join(fstr(k) for k in mapping.keys())
+                new_txt = ", ".join(fstr(v2) for v2 in mapping.values())
+                self.o.w(f"{name} = {src_expr}")
+                self.o.w(
+                    f"call {name}%rename_cols([character(len={max_len_old}) :: {old_txt}], "
+                    f"[character(len={max_len_new}) :: {new_txt}])"
+                )
+                return
 
         # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars and isinstance(v, ast.Subscript):

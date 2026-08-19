@@ -16,3 +16,12 @@ sorted_sub = sub.sort_index(ascending=False)
 sorted_arr = sorted_sub.to_numpy()
 print("sort_index(ascending=False) row 0:", sorted_arr[0, 0], sorted_arr[0, 1])
 print("sort_index(ascending=False) row 9:", sorted_arr[9, 0], sorted_arr[9, 1])
+
+sub3 = dat[["SPY", "EFA", "EEM"]]
+dropped = sub3.drop(columns=["EFA"])
+print("\ndropped columns.corr():")
+print(dropped.corr().round(3))
+
+renamed = sub3.rename(columns={"SPY": "SPX"})
+print("\nrenamed.describe():")
+print(renamed.describe().to_string())
