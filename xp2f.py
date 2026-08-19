@@ -11534,6 +11534,14 @@ class translator(ast.NodeVisitor):
                 and node.func.value.slice.id in self.pandas_str_list_values
             ):
                 return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_numpy"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.pandas_df_vars
+                and len(node.args) == 0
+            ):
+                return "real"
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}:
                 return "char"
             if is_numpy_sliding_window_view_axis0_call(node) and len(node.args) >= 1:
@@ -13484,6 +13492,15 @@ class translator(ast.NodeVisitor):
             and node.func.value.value.id in self.pandas_df_vars
             and isinstance(node.func.value.slice, ast.Name)
             and node.func.value.slice.id in self.pandas_str_list_values
+        ):
+            return 2
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to_numpy"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in self.pandas_df_vars
+            and len(node.args) == 0
         ):
             return 2
         if (
@@ -16954,6 +16971,13 @@ class translator(ast.NodeVisitor):
                     _idxs = [_col_list.index(_nm) + 1 for _nm in _names]
                     _idx_txt = ", ".join(str(_i) for _i in _idxs)
                     return f"{_df_expr}%values(:, [{_idx_txt}])"
+                if (
+                    attr == "to_numpy"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.pandas_df_vars
+                    and len(node.args) == 0
+                ):
+                    return f"{base_expr}%values"
                 if attr == "index" and len(node.args) == 1:
                     arg0 = self.expr(node.args[0])
                     if self._rank_expr(node.func.value) == 0 and self._expr_kind(node.func.value) == "char":
