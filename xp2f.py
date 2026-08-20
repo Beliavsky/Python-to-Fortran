@@ -4162,6 +4162,24 @@ def _tree_uses_scipy_fsolve(tree):
     return False
 
 
+def _tree_uses_scipy_minimize(tree):
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
+            for _al in _n.names:
+                if (_al.name or "").strip() == "minimize":
+                    return True
+    return False
+
+
+def _tree_uses_scipy_brentq(tree):
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
+            for _al in _n.names:
+                if (_al.name or "").strip() == "brentq":
+                    return True
+    return False
+
+
 def is_main_guard_if(node):
     if not isinstance(node, ast.If):
         return False
@@ -5526,6 +5544,32 @@ def collect_scipy_optimize_fsolve_aliases(tree):
                 nm = (al.name or "").strip()
                 asn = (al.asname or "").strip()
                 if nm == "fsolve":
+                    aliases.add(asn or nm)
+    return aliases
+
+
+def collect_scipy_optimize_minimize_aliases(tree):
+    """Collect local names bound to scipy.optimize.minimize."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "minimize":
+                    aliases.add(asn or nm)
+    return aliases
+
+
+def collect_scipy_optimize_brentq_aliases(tree):
+    """Collect local names bound to scipy.optimize.brentq."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "brentq":
                     aliases.add(asn or nm)
     return aliases
 
@@ -8897,6 +8941,74 @@ def normalize_numpy_shape_assignments(exec_body, local_funcs):
         exec_body[:] = [ast.fix_missing_locations(st) for st in new_body]
 
 
+def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
+    """Rewrite `res = minimize(f, x0)` and later `res.x` / `res.fun` /
+    `res.success` / `res.nit` attribute reads into plain flat names, since
+    xp2f has no general OptimizeResult derived-type support -- the BFGS
+    codegen path declares `res` (the solution array) plus `res_fun` /
+    `res_success` / `res_nit` scalars directly (see _scipy_minimize_spec)."""
+    minimize_aliases = set()
+    for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                if (al.name or "").strip() == "minimize":
+                    minimize_aliases.add((al.asname or al.name or "").strip())
+    if not minimize_aliases:
+        return
+
+    def _is_minimize_call(node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in minimize_aliases
+        )
+
+    result_names = set()
+    for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and _is_minimize_call(node.value)
+        ):
+            result_names.add(node.targets[0].id)
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and _is_minimize_call(node.value)
+                ):
+                    result_names.add(node.targets[0].id)
+    if not result_names:
+        return
+
+    attr_suffix_map = {"x": None, "fun": "fun", "success": "success", "nit": "nit"}
+
+    class _ResultAttrRewriter(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in result_names
+                and node.attr in attr_suffix_map
+            ):
+                suffix = attr_suffix_map[node.attr]
+                new_id = node.value.id if suffix is None else f"{node.value.id}_{suffix}"
+                return ast.copy_location(ast.Name(id=new_id, ctx=node.ctx), node)
+            return node
+
+    rewriter = _ResultAttrRewriter()
+    if exec_body:
+        for i, st in enumerate(list(exec_body)):
+            exec_body[i] = ast.fix_missing_locations(rewriter.visit(st))
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn.body = [ast.fix_missing_locations(rewriter.visit(st)) for st in fn.body]
+
+
 def normalize_inline_dict_literal_call_args(exec_body, local_funcs):
     existing = {fn.name for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)}
     counter = 0
@@ -10057,6 +10169,8 @@ class translator(ast.NodeVisitor):
         self.scipy_special_func_aliases = dict(translator.global_scipy_special_func_aliases)
         self.scipy_stats_norm_aliases = set(translator.global_scipy_stats_norm_aliases)
         self.scipy_optimize_fsolve_aliases = set(translator.global_scipy_optimize_fsolve_aliases)
+        self.scipy_optimize_minimize_aliases = set(translator.global_scipy_optimize_minimize_aliases)
+        self.scipy_optimize_brentq_aliases = set(translator.global_scipy_optimize_brentq_aliases)
         self.statistics_aliases = set(translator.global_statistics_aliases)
         self.statistics_func_aliases = dict(translator.global_statistics_func_aliases)
         self.time_aliases = set(translator.global_time_aliases)
@@ -13821,6 +13935,44 @@ class translator(ast.NodeVisitor):
         ):
             return None
         return {"fn_name": v.args[0].id, "x0_node": v.args[1]}
+
+    def _scipy_minimize_spec(self, v):
+        # res = minimize(objective, x0[, method="BFGS"]) -- objective must
+        # already translate to `function objective(x) result(y)` with x(:)
+        # real(dp) intent(in) and a scalar real(dp) result (a local function
+        # classified as plain "real"; see local_return_specs). Uses bfgs_mod's
+        # finite-difference BFGS (bfgs_minimize_fd) since xp2f objective
+        # callbacks don't carry an analytic-gradient counterpart.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_minimize_aliases
+            and len(v.args) >= 2
+            and isinstance(v.args[0], ast.Name)
+            and self.local_return_specs.get(v.args[0].id) == "real"
+            and list(self.local_func_arg_ranks.get(v.args[0].id, [1]))[:1] != [0]
+        ):
+            return None
+        return {"fn_name": v.args[0].id, "x0_node": v.args[1]}
+
+    def _scipy_brentq_spec(self, v):
+        # root = brentq(f, a, b) -- f must already translate to
+        # `function f(x) result(y)` with a scalar real(dp) x and a scalar
+        # real(dp) result y (a local function classified as plain "real"
+        # with a single scalar/rank-0 argument; see local_return_specs /
+        # local_func_arg_ranks). Uses Jacob Williams' roots-fortran
+        # root_scalar('brentq', ...), a direct port of scipy's brentq.c.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_brentq_aliases
+            and len(v.args) >= 3
+            and isinstance(v.args[0], ast.Name)
+            and self.local_return_specs.get(v.args[0].id) == "real"
+            and list(self.local_func_arg_ranks.get(v.args[0].id, [0]))[:1] == [0]
+        ):
+            return None
+        return {"fn_name": v.args[0].id, "a_node": v.args[1], "b_node": v.args[2]}
 
     def _pandas_df_rolling_spec(self, v):
         # X = df.rolling(window).mean() / df.rolling(window).std([ddof=])
@@ -23101,6 +23253,23 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(t.id, rank=1)
                         continue
 
+                # res = minimize(objective, x0)
+                if isinstance(t, ast.Name):
+                    _mz_spec = self._scipy_minimize_spec(v)
+                    if _mz_spec is not None:
+                        self._mark_alloc_real(t.id, rank=1)
+                        self._mark_real(f"{t.id}_fun")
+                        self._mark_int(f"{t.id}_nit")
+                        self._mark_log(f"{t.id}_success")
+                        continue
+
+                # root = brentq(f, a, b)
+                if isinstance(t, ast.Name):
+                    _bq_spec = self._scipy_brentq_spec(v)
+                    if _bq_spec is not None:
+                        self._mark_real(t.id)
+                        continue
+
                 # X = df.rolling(window).mean()/.std() -- same columns as df.
                 if isinstance(t, ast.Name):
                     _r_spec = self._pandas_df_rolling_spec(v)
@@ -29347,6 +29516,52 @@ class translator(ast.NodeVisitor):
                 self.o.w(
                     f"call hybrd1(fsolve_generic_wrapper, n_fsolve, {name}, fvec_fsolve, "
                     "tol_fsolve, info_fsolve, wa_fsolve, lwa_fsolve)"
+                )
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # res = minimize(objective, x0)
+        if isinstance(t, ast.Name):
+            _mz_spec = self._scipy_minimize_spec(v)
+            if _mz_spec is not None:
+                name = self._aliased_name(t.id)
+                fn_name = _mz_spec["fn_name"]
+                x0_expr = self.expr(_mz_spec["x0_node"])
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: n_bfgs, max_iter_bfgs")
+                self.o.w("real(kind=dp) :: gtol_bfgs")
+                self.o.w(f"{name} = {x0_expr}")
+                self.o.w(f"n_bfgs = size({name})")
+                self.o.w("gtol_bfgs = 1.0e-5_dp")
+                self.o.w("max_iter_bfgs = 1000")
+                self.o.w(f"bfgs_user_fn => {fn_name}")
+                self.o.w(
+                    f"call bfgs_minimize_fd(bfgs_generic_wrapper, {name}, n_bfgs, max_iter_bfgs, "
+                    f"gtol_bfgs, {name}_fun, {name}_nit, {name}_success)"
+                )
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # root = brentq(f, a, b)
+        if isinstance(t, ast.Name):
+            _bq_spec = self._scipy_brentq_spec(v)
+            if _bq_spec is not None:
+                name = self._aliased_name(t.id)
+                fn_name = _bq_spec["fn_name"]
+                a_expr = self.expr(_bq_spec["a_node"])
+                b_expr = self.expr(_bq_spec["b_node"])
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: iflag_brentq")
+                self.o.w("real(kind=dp) :: fzero_brentq")
+                self.o.w(f"brentq_user_fn => {fn_name}")
+                self.o.w(
+                    f"call root_scalar('brentq', brentq_generic_wrapper, real({a_expr}, kind=dp), "
+                    f"real({b_expr}, kind=dp), {name}, fzero_brentq, iflag_brentq, "
+                    "rtol=8.881784197001252e-16_dp, atol=2.0e-12_dp, maxiter=100)"
                 )
                 self.o.pop()
                 self.o.w("end block")
@@ -44956,6 +45171,12 @@ def generate_flat(
     if _tree_uses_scipy_fsolve(tree):
         o.w("use minpack_module, only: hybrd1")
         o.w("use fsolve_bridge_mod, only: fsolve_user_fn, fsolve_generic_wrapper")
+    if _tree_uses_scipy_minimize(tree):
+        o.w("use bfgs_mod, only: bfgs_minimize_fd")
+        o.w("use bfgs_bridge_mod, only: bfgs_user_fn, bfgs_generic_wrapper")
+    if _tree_uses_scipy_brentq(tree):
+        o.w("use root_module, only: root_scalar")
+        o.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
@@ -46076,6 +46297,8 @@ def transpile_file(
     translator.global_scipy_special_func_aliases = {}
     translator.global_scipy_stats_norm_aliases = set()
     translator.global_scipy_optimize_fsolve_aliases = set()
+    translator.global_scipy_optimize_minimize_aliases = set()
+    translator.global_scipy_optimize_brentq_aliases = set()
     translator.global_statistics_aliases = set()
     translator.global_statistics_func_aliases = {}
     translator.global_time_aliases = set()
@@ -46188,6 +46411,7 @@ def transpile_file(
     normalize_no_dates_price_csv_reader(effective_tree.body, local_funcs)
     normalize_csv_reader_list_calls(effective_tree.body, local_funcs)
     normalize_numpy_shape_assignments(effective_tree.body, local_funcs)
+    normalize_scipy_minimize_result_attrs(effective_tree.body, local_funcs)
     normalize_inline_dict_literal_call_args(effective_tree.body, local_funcs)
     normalize_generator_call_args(effective_tree.body, local_funcs)
     normalize_function_attribute_state(effective_tree.body, local_funcs)
@@ -46217,6 +46441,8 @@ def transpile_file(
     ) = collect_scipy_special_aliases(tree)
     translator.global_scipy_stats_norm_aliases = collect_scipy_stats_norm_aliases(tree)
     translator.global_scipy_optimize_fsolve_aliases = collect_scipy_optimize_fsolve_aliases(tree)
+    translator.global_scipy_optimize_minimize_aliases = collect_scipy_optimize_minimize_aliases(tree)
+    translator.global_scipy_optimize_brentq_aliases = collect_scipy_optimize_brentq_aliases(tree)
     (
         translator.global_statistics_aliases,
         translator.global_statistics_func_aliases,
