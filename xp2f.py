@@ -4180,6 +4180,15 @@ def _tree_uses_scipy_brentq(tree):
     return False
 
 
+def _tree_uses_scipy_curve_fit(tree):
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
+            for _al in _n.names:
+                if (_al.name or "").strip() == "curve_fit":
+                    return True
+    return False
+
+
 def is_main_guard_if(node):
     if not isinstance(node, ast.If):
         return False
@@ -5570,6 +5579,19 @@ def collect_scipy_optimize_brentq_aliases(tree):
                 nm = (al.name or "").strip()
                 asn = (al.asname or "").strip()
                 if nm == "brentq":
+                    aliases.add(asn or nm)
+    return aliases
+
+
+def collect_scipy_optimize_curve_fit_aliases(tree):
+    """Collect local names bound to scipy.optimize.curve_fit."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "curve_fit":
                     aliases.add(asn or nm)
     return aliases
 
@@ -9009,6 +9031,88 @@ def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
             fn.body = [ast.fix_missing_locations(rewriter.visit(st)) for st in fn.body]
 
 
+def normalize_scipy_curve_fit_residual_helper(exec_body, local_funcs):
+    """Synthesize a residual-vector function for each
+    `popt, pcov = curve_fit(f, xdata, ydata, p0)` call site.
+
+    scipy's curve_fit calls the model as `f(x, *params)` -- the fit
+    parameters are separate scalar arguments, not a single array -- but
+    MINPACK (and xp2f's fsolve bridge) need a single `resid(p) -> array`
+    callback. Since f's parameter count is known statically, generate:
+
+        def _curvefit_resid_<f>_<lineno>(p):
+            _cf_r = np.zeros(len(<xdata>))
+            for _cf_i in range(len(<xdata>)):
+                _cf_r[_cf_i] = <f>(<xdata>[_cf_i], p[0], ..., p[n-1]) - <ydata>[_cf_i]
+            return _cf_r
+
+    as an ordinary local function (spliced into `local_funcs` so the normal
+    array-return codegen pipeline -- the same one fsolve uses -- lowers it),
+    and stash the synthesized name on the Call node for
+    `_scipy_curve_fit_spec` to pick up.
+    """
+    fn_map = {fn.name: fn for fn in (local_funcs or []) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    if not fn_map:
+        return
+
+    curve_fit_aliases = set()
+    for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                if (al.name or "").strip() == "curve_fit":
+                    curve_fit_aliases.add((al.asname or al.name or "").strip())
+    if not curve_fit_aliases:
+        return
+
+    new_funcs = []
+
+    def _handle_call(v):
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in curve_fit_aliases
+            and len(v.args) >= 4
+            and isinstance(v.args[0], ast.Name)
+            and v.args[0].id in fn_map
+            and isinstance(v.args[1], ast.Name)
+            and isinstance(v.args[2], ast.Name)
+        ):
+            return
+        model_fn = fn_map[v.args[0].id]
+        n_params = len(model_fn.args.args) - 1
+        if n_params < 1:
+            return
+        xdata_name = v.args[1].id
+        ydata_name = v.args[2].id
+        resid_name = f"curvefit_resid_{model_fn.name}_{getattr(v, 'lineno', 0)}"
+        if resid_name not in fn_map:
+            params_txt = ", ".join(f"p[{i}]" for i in range(n_params))
+            src = (
+                f"def {resid_name}(p):\n"
+                f"    cf_r = np.zeros(len({xdata_name}))\n"
+                f"    for cf_i in range(len({xdata_name})):\n"
+                f"        cf_r[cf_i] = {model_fn.name}({xdata_name}[cf_i], {params_txt}) - {ydata_name}[cf_i]\n"
+                f"    return cf_r\n"
+            )
+            new_fn = ast.parse(src).body[0]
+            ast.fix_missing_locations(new_fn)
+            fn_map[resid_name] = new_fn
+            new_funcs.append(new_fn)
+        setattr(v, "_xp2f_curvefit_resid_name", resid_name)
+
+    for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
+        if isinstance(node, ast.Assign):
+            _handle_call(node.value)
+    for fn in list(local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign):
+                    _handle_call(node.value)
+
+    if new_funcs:
+        local_funcs.extend(new_funcs)
+
+
 def normalize_inline_dict_literal_call_args(exec_body, local_funcs):
     existing = {fn.name for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)}
     counter = 0
@@ -10171,6 +10275,7 @@ class translator(ast.NodeVisitor):
         self.scipy_optimize_fsolve_aliases = set(translator.global_scipy_optimize_fsolve_aliases)
         self.scipy_optimize_minimize_aliases = set(translator.global_scipy_optimize_minimize_aliases)
         self.scipy_optimize_brentq_aliases = set(translator.global_scipy_optimize_brentq_aliases)
+        self.scipy_optimize_curve_fit_aliases = set(translator.global_scipy_optimize_curve_fit_aliases)
         self.statistics_aliases = set(translator.global_statistics_aliases)
         self.statistics_func_aliases = dict(translator.global_statistics_func_aliases)
         self.time_aliases = set(translator.global_time_aliases)
@@ -13973,6 +14078,24 @@ class translator(ast.NodeVisitor):
         ):
             return None
         return {"fn_name": v.args[0].id, "a_node": v.args[1], "b_node": v.args[2]}
+
+    def _scipy_curve_fit_spec(self, v):
+        # popt, pcov = curve_fit(f, xdata, ydata, p0) -- the residual
+        # function synthesized by normalize_scipy_curve_fit_residual_helper
+        # must have run successfully (stashed on the Call node) and already
+        # translate to `function resid(p) result(y)` with an allocatable
+        # real(dp) result (classified "alloc_real"; see local_return_specs).
+        resid_name = getattr(v, "_xp2f_curvefit_resid_name", None)
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_curve_fit_aliases
+            and len(v.args) >= 4
+            and resid_name is not None
+            and self.local_return_specs.get(resid_name) == "alloc_real"
+        ):
+            return None
+        return {"resid_fn_name": resid_name, "p0_node": v.args[3]}
 
     def _pandas_df_rolling_spec(self, v):
         # X = df.rolling(window).mean() / df.rolling(window).std([ddof=])
@@ -23270,6 +23393,18 @@ class translator(ast.NodeVisitor):
                         self._mark_real(t.id)
                         continue
 
+                # popt, pcov = curve_fit(f, xdata, ydata, p0)
+                if (
+                    isinstance(t, (ast.Tuple, ast.List))
+                    and len(t.elts) == 2
+                    and all(isinstance(e, ast.Name) for e in t.elts)
+                ):
+                    _cf_spec = self._scipy_curve_fit_spec(v)
+                    if _cf_spec is not None:
+                        self._mark_alloc_real(t.elts[0].id, rank=1)
+                        self._mark_alloc_real(t.elts[1].id, rank=2)
+                        continue
+
                 # X = df.rolling(window).mean()/.std() -- same columns as df.
                 if isinstance(t, ast.Name):
                     _r_spec = self._pandas_df_rolling_spec(v)
@@ -29563,6 +29698,44 @@ class translator(ast.NodeVisitor):
                     f"real({b_expr}, kind=dp), {name}, fzero_brentq, iflag_brentq, "
                     "rtol=8.881784197001252e-16_dp, atol=2.0e-12_dp, maxiter=100)"
                 )
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # popt, pcov = curve_fit(f, xdata, ydata, p0)
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and len(t.elts) == 2
+            and all(isinstance(e, ast.Name) for e in t.elts)
+        ):
+            _cf_spec = self._scipy_curve_fit_spec(v)
+            if _cf_spec is not None:
+                popt_name = self._aliased_name(t.elts[0].id)
+                pcov_name = self._aliased_name(t.elts[1].id)
+                resid_fn = _cf_spec["resid_fn_name"]
+                p0_expr = self.expr(_cf_spec["p0_node"])
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: m_cf, n_cf, info_cf, lwa_cf")
+                self.o.w("integer, allocatable :: iwa_cf(:)")
+                self.o.w("real(kind=dp) :: tol_cf")
+                self.o.w("real(kind=dp), allocatable :: fvec_cf(:), wa_cf(:), r0_cf(:)")
+                self.o.w(f"{popt_name} = {p0_expr}")
+                self.o.w(f"n_cf = size({popt_name})")
+                self.o.w(f"curvefit_user_fn => {resid_fn}")
+                self.o.w(f"r0_cf = {resid_fn}({popt_name})")
+                self.o.w("m_cf = size(r0_cf)")
+                self.o.w("tol_cf = 1.49012e-8_dp")
+                self.o.w("lwa_cf = m_cf * n_cf + 5 * n_cf + m_cf")
+                self.o.w("allocate(fvec_cf(m_cf))")
+                self.o.w("allocate(wa_cf(lwa_cf))")
+                self.o.w("allocate(iwa_cf(n_cf))")
+                self.o.w(
+                    f"call lmdif1(curvefit_generic_wrapper, m_cf, n_cf, {popt_name}, fvec_cf, "
+                    "tol_cf, info_cf, iwa_cf, wa_cf, lwa_cf)"
+                )
+                self.o.w(f"allocate({pcov_name}(n_cf, n_cf))")
+                self.o.w(f"call curvefit_covariance({popt_name}, m_cf, {pcov_name})")
                 self.o.pop()
                 self.o.w("end block")
                 return
@@ -45112,6 +45285,15 @@ def generate_flat(
             if _nm in fn_alias_map:
                 proc_main_needed.add(fn_alias_map[_nm])
         proc_main_needed |= module_global_names
+        # normalize_scipy_curve_fit_residual_helper synthesizes a residual
+        # function that's only referenced via a procedure pointer in
+        # generated Fortran text, never as an ast.Name Load in the Python
+        # source -- so _tree_loaded_names can't see it. Pick it up from the
+        # stashed Call-node attribute instead.
+        for _n in ast.walk(_main_tree):
+            _cf_resid_nm = getattr(_n, "_xp2f_curvefit_resid_name", None)
+            if _cf_resid_nm:
+                proc_main_needed.add(_cf_resid_nm)
         # Typed local-function returns can require derived types in main declarations.
         _main_called = _tree_called_names(_main_tree)
         for _fn_name in _main_called:
@@ -45177,6 +45359,12 @@ def generate_flat(
     if _tree_uses_scipy_brentq(tree):
         o.w("use root_module, only: root_scalar")
         o.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
+    if _tree_uses_scipy_curve_fit(tree):
+        o.w("use minpack_module, only: lmdif1")
+        o.w(
+            "use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper, "
+            "curvefit_covariance"
+        )
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
@@ -46299,6 +46487,7 @@ def transpile_file(
     translator.global_scipy_optimize_fsolve_aliases = set()
     translator.global_scipy_optimize_minimize_aliases = set()
     translator.global_scipy_optimize_brentq_aliases = set()
+    translator.global_scipy_optimize_curve_fit_aliases = set()
     translator.global_statistics_aliases = set()
     translator.global_statistics_func_aliases = {}
     translator.global_time_aliases = set()
@@ -46412,6 +46601,7 @@ def transpile_file(
     normalize_csv_reader_list_calls(effective_tree.body, local_funcs)
     normalize_numpy_shape_assignments(effective_tree.body, local_funcs)
     normalize_scipy_minimize_result_attrs(effective_tree.body, local_funcs)
+    normalize_scipy_curve_fit_residual_helper(effective_tree.body, local_funcs)
     normalize_inline_dict_literal_call_args(effective_tree.body, local_funcs)
     normalize_generator_call_args(effective_tree.body, local_funcs)
     normalize_function_attribute_state(effective_tree.body, local_funcs)
@@ -46443,6 +46633,7 @@ def transpile_file(
     translator.global_scipy_optimize_fsolve_aliases = collect_scipy_optimize_fsolve_aliases(tree)
     translator.global_scipy_optimize_minimize_aliases = collect_scipy_optimize_minimize_aliases(tree)
     translator.global_scipy_optimize_brentq_aliases = collect_scipy_optimize_brentq_aliases(tree)
+    translator.global_scipy_optimize_curve_fit_aliases = collect_scipy_optimize_curve_fit_aliases(tree)
     (
         translator.global_statistics_aliases,
         translator.global_statistics_func_aliases,
