@@ -4189,6 +4189,24 @@ def _tree_uses_scipy_curve_fit(tree):
     return False
 
 
+def _tree_uses_scipy_least_squares(tree):
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
+            for _al in _n.names:
+                if (_al.name or "").strip() == "least_squares":
+                    return True
+    return False
+
+
+def _tree_uses_scipy_minimize_scalar(tree):
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
+            for _al in _n.names:
+                if (_al.name or "").strip() == "minimize_scalar":
+                    return True
+    return False
+
+
 def is_main_guard_if(node):
     if not isinstance(node, ast.If):
         return False
@@ -5592,6 +5610,32 @@ def collect_scipy_optimize_curve_fit_aliases(tree):
                 nm = (al.name or "").strip()
                 asn = (al.asname or "").strip()
                 if nm == "curve_fit":
+                    aliases.add(asn or nm)
+    return aliases
+
+
+def collect_scipy_optimize_least_squares_aliases(tree):
+    """Collect local names bound to scipy.optimize.least_squares."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "least_squares":
+                    aliases.add(asn or nm)
+    return aliases
+
+
+def collect_scipy_optimize_minimize_scalar_aliases(tree):
+    """Collect local names bound to scipy.optimize.minimize_scalar."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "minimize_scalar":
                     aliases.add(asn or nm)
     return aliases
 
@@ -8964,25 +9008,28 @@ def normalize_numpy_shape_assignments(exec_body, local_funcs):
 
 
 def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
-    """Rewrite `res = minimize(f, x0)` and later `res.x` / `res.fun` /
-    `res.success` / `res.nit` attribute reads into plain flat names, since
-    xp2f has no general OptimizeResult derived-type support -- the BFGS
-    codegen path declares `res` (the solution array) plus `res_fun` /
-    `res_success` / `res_nit` scalars directly (see _scipy_minimize_spec)."""
-    minimize_aliases = set()
+    """Rewrite `res = minimize(f, x0)` / `res = least_squares(fun, x0)` /
+    `res = minimize_scalar(f, bounds=(a, b))` and later `res.x` / `res.fun`
+    / `res.success` / `res.nit` / `res.cost` attribute reads into plain flat
+    names, since xp2f has no general OptimizeResult derived-type support --
+    the BFGS/least_squares/minimize_scalar codegen paths declare `res` (the
+    solution array or scalar) plus `res_fun` / `res_success` / `res_nit` /
+    `res_cost` scalars directly (see _scipy_minimize_spec /
+    _scipy_least_squares_spec / _scipy_minimize_scalar_spec)."""
+    result_call_aliases = set()
     for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
         if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
             for al in node.names:
-                if (al.name or "").strip() == "minimize":
-                    minimize_aliases.add((al.asname or al.name or "").strip())
-    if not minimize_aliases:
+                if (al.name or "").strip() in ("minimize", "least_squares", "minimize_scalar"):
+                    result_call_aliases.add((al.asname or al.name or "").strip())
+    if not result_call_aliases:
         return
 
     def _is_minimize_call(node):
         return (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id in minimize_aliases
+            and node.func.id in result_call_aliases
         )
 
     result_names = set()
@@ -9007,7 +9054,7 @@ def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
     if not result_names:
         return
 
-    attr_suffix_map = {"x": None, "fun": "fun", "success": "success", "nit": "nit"}
+    attr_suffix_map = {"x": None, "fun": "fun", "success": "success", "nit": "nit", "cost": "cost"}
 
     class _ResultAttrRewriter(ast.NodeTransformer):
         def visit_Attribute(self, node):
@@ -10276,6 +10323,8 @@ class translator(ast.NodeVisitor):
         self.scipy_optimize_minimize_aliases = set(translator.global_scipy_optimize_minimize_aliases)
         self.scipy_optimize_brentq_aliases = set(translator.global_scipy_optimize_brentq_aliases)
         self.scipy_optimize_curve_fit_aliases = set(translator.global_scipy_optimize_curve_fit_aliases)
+        self.scipy_optimize_least_squares_aliases = set(translator.global_scipy_optimize_least_squares_aliases)
+        self.scipy_optimize_minimize_scalar_aliases = set(translator.global_scipy_optimize_minimize_scalar_aliases)
         self.statistics_aliases = set(translator.global_statistics_aliases)
         self.statistics_func_aliases = dict(translator.global_statistics_func_aliases)
         self.time_aliases = set(translator.global_time_aliases)
@@ -14096,6 +14145,49 @@ class translator(ast.NodeVisitor):
         ):
             return None
         return {"resid_fn_name": resid_name, "p0_node": v.args[3]}
+
+    def _scipy_least_squares_spec(self, v):
+        # result = least_squares(fun, x0) -- fun must already translate to
+        # `function fun(x) result(y)` with x(:) real(dp) intent(in) and an
+        # allocatable real(dp) result (a local function classified
+        # "alloc_real"; see local_return_specs) -- the same array-in,
+        # array-out shape fsolve's callback uses. Reuses curvefit_bridge_mod
+        # (built for curve_fit) since MINPACK's lmdif1 callback shape is
+        # identical either way.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_least_squares_aliases
+            and len(v.args) >= 2
+            and isinstance(v.args[0], ast.Name)
+            and self.local_return_specs.get(v.args[0].id) == "alloc_real"
+        ):
+            return None
+        return {"fn_name": v.args[0].id, "x0_node": v.args[1]}
+
+    def _scipy_minimize_scalar_spec(self, v):
+        # res = minimize_scalar(f, bounds=(a, b)) -- f must already translate
+        # to `function f(x) result(y)` with a scalar real(dp) x and a scalar
+        # real(dp) result y (a local function classified plain "real" with a
+        # single scalar/rank-0 argument, same check as brentq; see
+        # local_return_specs / local_func_arg_ranks). Only the bounds= form
+        # is supported (scipy's default method='bounded' whenever bounds is
+        # given) -- uses jacobwilliams/fmin's fmin(), a modern port of the
+        # same netlib fmin.f scipy's own 'bounded' method is derived from.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_minimize_scalar_aliases
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Name)
+            and self.local_return_specs.get(v.args[0].id) == "real"
+            and list(self.local_func_arg_ranks.get(v.args[0].id, [0]))[:1] == [0]
+        ):
+            return None
+        bounds_node = next((kw.value for kw in v.keywords if kw.arg == "bounds"), None)
+        if not (isinstance(bounds_node, (ast.Tuple, ast.List)) and len(bounds_node.elts) == 2):
+            return None
+        return {"fn_name": v.args[0].id, "a_node": bounds_node.elts[0], "b_node": bounds_node.elts[1]}
 
     def _pandas_df_rolling_spec(self, v):
         # X = df.rolling(window).mean() / df.rolling(window).std([ddof=])
@@ -23405,6 +23497,24 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(t.elts[1].id, rank=2)
                         continue
 
+                # result = least_squares(fun, x0)
+                if isinstance(t, ast.Name):
+                    _ls_spec = self._scipy_least_squares_spec(v)
+                    if _ls_spec is not None:
+                        self._mark_alloc_real(t.id, rank=1)
+                        self._mark_alloc_real(f"{t.id}_fun", rank=1)
+                        self._mark_real(f"{t.id}_cost")
+                        self._mark_log(f"{t.id}_success")
+                        continue
+
+                # res = minimize_scalar(f, bounds=(a, b))
+                if isinstance(t, ast.Name):
+                    _ms_spec = self._scipy_minimize_scalar_spec(v)
+                    if _ms_spec is not None:
+                        self._mark_real(t.id)
+                        self._mark_real(f"{t.id}_fun")
+                        continue
+
                 # X = df.rolling(window).mean()/.std() -- same columns as df.
                 if isinstance(t, ast.Name):
                     _r_spec = self._pandas_df_rolling_spec(v)
@@ -29736,6 +29846,58 @@ class translator(ast.NodeVisitor):
                 )
                 self.o.w(f"allocate({pcov_name}(n_cf, n_cf))")
                 self.o.w(f"call curvefit_covariance({popt_name}, m_cf, {pcov_name})")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # result = least_squares(fun, x0)
+        if isinstance(t, ast.Name):
+            _ls_spec = self._scipy_least_squares_spec(v)
+            if _ls_spec is not None:
+                name = self._aliased_name(t.id)
+                fn_name = _ls_spec["fn_name"]
+                x0_expr = self.expr(_ls_spec["x0_node"])
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: m_ls, n_ls, info_ls, lwa_ls")
+                self.o.w("integer, allocatable :: iwa_ls(:)")
+                self.o.w("real(kind=dp) :: tol_ls")
+                self.o.w("real(kind=dp), allocatable :: wa_ls(:)")
+                self.o.w(f"{name} = {x0_expr}")
+                self.o.w(f"n_ls = size({name})")
+                self.o.w(f"curvefit_user_fn => {fn_name}")
+                self.o.w(f"{name}_fun = {fn_name}({name})")
+                self.o.w(f"m_ls = size({name}_fun)")
+                self.o.w("tol_ls = 1.49012e-8_dp")
+                self.o.w("lwa_ls = m_ls * n_ls + 5 * n_ls + m_ls")
+                self.o.w("allocate(wa_ls(lwa_ls))")
+                self.o.w("allocate(iwa_ls(n_ls))")
+                self.o.w(
+                    f"call lmdif1(curvefit_generic_wrapper, m_ls, n_ls, {name}, {name}_fun, "
+                    "tol_ls, info_ls, iwa_ls, wa_ls, lwa_ls)"
+                )
+                self.o.w(f"{name}_cost = 0.5_dp * sum({name}_fun**2)")
+                self.o.w(f"{name}_success = (info_ls >= 1 .and. info_ls <= 4)")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # res = minimize_scalar(f, bounds=(a, b))
+        if isinstance(t, ast.Name):
+            _ms_spec = self._scipy_minimize_scalar_spec(v)
+            if _ms_spec is not None:
+                name = self._aliased_name(t.id)
+                fn_name = _ms_spec["fn_name"]
+                a_expr = self.expr(_ms_spec["a_node"])
+                b_expr = self.expr(_ms_spec["b_node"])
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"brentq_user_fn => {fn_name}")
+                self.o.w(
+                    f"{name} = fmin(brentq_generic_wrapper, real({a_expr}, kind=dp), "
+                    f"real({b_expr}, kind=dp), 1.0e-5_dp)"
+                )
+                self.o.w(f"{name}_fun = {fn_name}({name})")
                 self.o.pop()
                 self.o.w("end block")
                 return
@@ -45365,6 +45527,12 @@ def generate_flat(
             "use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper, "
             "curvefit_covariance"
         )
+    if _tree_uses_scipy_least_squares(tree):
+        o.w("use minpack_module, only: lmdif1")
+        o.w("use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper")
+    if _tree_uses_scipy_minimize_scalar(tree):
+        o.w("use fmin_module, only: fmin")
+        o.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
@@ -46488,6 +46656,8 @@ def transpile_file(
     translator.global_scipy_optimize_minimize_aliases = set()
     translator.global_scipy_optimize_brentq_aliases = set()
     translator.global_scipy_optimize_curve_fit_aliases = set()
+    translator.global_scipy_optimize_least_squares_aliases = set()
+    translator.global_scipy_optimize_minimize_scalar_aliases = set()
     translator.global_statistics_aliases = set()
     translator.global_statistics_func_aliases = {}
     translator.global_time_aliases = set()
@@ -46634,6 +46804,8 @@ def transpile_file(
     translator.global_scipy_optimize_minimize_aliases = collect_scipy_optimize_minimize_aliases(tree)
     translator.global_scipy_optimize_brentq_aliases = collect_scipy_optimize_brentq_aliases(tree)
     translator.global_scipy_optimize_curve_fit_aliases = collect_scipy_optimize_curve_fit_aliases(tree)
+    translator.global_scipy_optimize_least_squares_aliases = collect_scipy_optimize_least_squares_aliases(tree)
+    translator.global_scipy_optimize_minimize_scalar_aliases = collect_scipy_optimize_minimize_scalar_aliases(tree)
     (
         translator.global_statistics_aliases,
         translator.global_statistics_func_aliases,
