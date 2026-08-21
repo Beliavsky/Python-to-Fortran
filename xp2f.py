@@ -4153,6 +4153,23 @@ def _tree_uses_pandas_read_csv(tree):
     return False
 
 
+def _tree_uses_pandas_dict_dataframe(tree):
+    # pd.DataFrame({"col1": arr1, ...}, index=str_labels) -- the
+    # string-row-label DataFrame construct backed by dataframe_str_index_mod.
+    for _n in ast.walk(tree):
+        if (
+            isinstance(_n, ast.Call)
+            and isinstance(_n.func, ast.Attribute)
+            and isinstance(_n.func.value, ast.Name)
+            and _n.func.value.id in {"pd", "pandas"}
+            and _n.func.attr == "DataFrame"
+            and _n.args
+            and isinstance(_n.args[0], ast.Dict)
+        ):
+            return True
+    return False
+
+
 def _tree_uses_scipy_fsolve(tree):
     for _n in ast.walk(tree):
         if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
@@ -4204,6 +4221,24 @@ def _tree_uses_scipy_minimize_scalar(tree):
             for _al in _n.names:
                 if (_al.name or "").strip() == "minimize_scalar":
                     return True
+    return False
+
+
+def _tree_uses_scipy_minimize_lbfgsb(tree):
+    # minimize(f, x0, bounds=...) -- scipy defaults to method='L-BFGS-B'
+    # whenever bounds is given, so detect that call shape specifically
+    # (distinct from the unconstrained minimize()/BFGS path).
+    _aliases = collect_scipy_optimize_minimize_aliases(tree)
+    if not _aliases:
+        return False
+    for _n in ast.walk(tree):
+        if (
+            isinstance(_n, ast.Call)
+            and isinstance(_n.func, ast.Name)
+            and _n.func.id in _aliases
+            and any(_kw.arg == "bounds" for _kw in _n.keywords)
+        ):
+            return True
     return False
 
 
@@ -5258,6 +5293,7 @@ def detect_needed_helpers(tree):
                 and node.func.attr == "quantile"
             ):
                 needed.add("quantile_linear")
+                needed.add("quantile_linear_vec")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -9223,7 +9259,19 @@ def normalize_inline_dict_literal_call_args(exec_body, local_funcs):
             is_pandas_rename = (
                 isinstance(node.func, ast.Attribute) and node.func.attr == "rename"
             )
-            if not is_pandas_rename:
+            # pd.DataFrame({"col1": arr1, ...}, index=labels) is a recognized
+            # pandas idiom lowered directly from its literal dict positional
+            # arg elsewhere (see _pandas_dict_df_construct_spec) -- leave it
+            # alone so that special-case can still see the raw ast.Dict.
+            is_pandas_dataframe_dict = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "DataFrame"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"pd", "pandas"}
+                and node.args
+                and isinstance(node.args[0], ast.Dict)
+            )
+            if not (is_pandas_rename or is_pandas_dataframe_dict):
                 node.args = [_make_helper(a) if isinstance(a, ast.Dict) else a for a in node.args]
                 for kw in node.keywords:
                     if kw.arg is not None and isinstance(kw.value, ast.Dict):
@@ -11727,7 +11775,7 @@ class translator(ast.NodeVisitor):
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in {"pi", "nan", "inf", "NINF"}:
                 return "real"
             if (
-                node.attr == "max"
+                node.attr in {"max", "eps", "tiny"}
                 and isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
                 and isinstance(node.value.func.value, ast.Name)
@@ -12191,6 +12239,17 @@ class translator(ast.NodeVisitor):
                     return self._expr_kind(node.args[0])
                 if node.func.attr == "gauss":
                     return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "choice"
+                and isinstance(node.func.value, ast.Name)
+                and len(node.args) >= 1
+            ):
+                # rng.choice(a, ...) -- returns a's element dtype when a is
+                # array-like, or int indices (numpy default) when a is a
+                # scalar count.
+                a0_kind = self._expr_kind(node.args[0])
+                return a0_kind if a0_kind is not None else "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -14105,6 +14164,7 @@ class translator(ast.NodeVisitor):
             and isinstance(v.args[0], ast.Name)
             and self.local_return_specs.get(v.args[0].id) == "real"
             and list(self.local_func_arg_ranks.get(v.args[0].id, [1]))[:1] != [0]
+            and not any(kw.arg == "bounds" for kw in v.keywords)
         ):
             return None
         return {"fn_name": v.args[0].id, "x0_node": v.args[1]}
@@ -14188,6 +14248,51 @@ class translator(ast.NodeVisitor):
         if not (isinstance(bounds_node, (ast.Tuple, ast.List)) and len(bounds_node.elts) == 2):
             return None
         return {"fn_name": v.args[0].id, "a_node": bounds_node.elts[0], "b_node": bounds_node.elts[1]}
+
+    def _scipy_minimize_lbfgsb_spec(self, v):
+        # res = minimize(objective, x0, bounds=[(lo0, hi0), (lo1, hi1), ...])
+        # -- scipy defaults to method='L-BFGS-B' whenever bounds is given.
+        # objective must already translate to `function objective(x)
+        # result(y)` with x(:) real(dp) intent(in) and a scalar real(dp)
+        # result (same check as unconstrained minimize()). bounds must be a
+        # literal list/tuple of literal (lo, hi) pairs (lo/hi each either
+        # the constant None, for an unbounded side, or a numeric
+        # expression) -- its length is used directly as the parameter
+        # count, so it can't be a runtime-computed list.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_minimize_aliases
+            and len(v.args) >= 2
+            and isinstance(v.args[0], ast.Name)
+            and self.local_return_specs.get(v.args[0].id) == "real"
+            and list(self.local_func_arg_ranks.get(v.args[0].id, [1]))[:1] != [0]
+        ):
+            return None
+        method_node = next((kw.value for kw in v.keywords if kw.arg == "method"), None)
+        if (
+            isinstance(method_node, ast.Constant)
+            and isinstance(method_node.value, str)
+            and method_node.value.strip().lower() != "l-bfgs-b"
+        ):
+            return None
+        bounds_node = next((kw.value for kw in v.keywords if kw.arg == "bounds"), None)
+        if not (
+            isinstance(bounds_node, (ast.Tuple, ast.List))
+            and bounds_node.elts
+            and all(
+                isinstance(e, (ast.Tuple, ast.List)) and len(e.elts) == 2
+                for e in bounds_node.elts
+            )
+        ):
+            return None
+        pairs = []
+        for e in bounds_node.elts:
+            lo, hi = e.elts
+            lo_node = None if (isinstance(lo, ast.Constant) and lo.value is None) else lo
+            hi_node = None if (isinstance(hi, ast.Constant) and hi.value is None) else hi
+            pairs.append((lo_node, hi_node))
+        return {"fn_name": v.args[0].id, "x0_node": v.args[1], "bound_pairs": pairs}
 
     def _pandas_df_rolling_spec(self, v):
         # X = df.rolling(window).mean() / df.rolling(window).std([ddof=])
@@ -14306,6 +14411,37 @@ class translator(ast.NodeVisitor):
             "type_name": type_name,
             "comps": list(comps.items()),
             "row_labels_id": row_labels_id,
+        }
+
+    def _pandas_dict_df_construct_spec(self, v):
+        # X = pd.DataFrame({"col1": arr1, "col2": arr2, ...}, index=labels)
+        # -- a string-row-label DataFrame built directly from named real
+        # array columns (see dataframe_str_index_mod). Distinct from
+        # _pandas_df_construct_spec (matrix + date index) and
+        # _pandas_stats_table_spec (list-comp of dict-returning calls).
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Dict)
+        ):
+            return None
+        dict_node = v.args[0]
+        if not dict_node.keys or any(k is None or not is_const_str(k) for k in dict_node.keys):
+            return None
+        idx_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+        if idx_kw is None or not isinstance(idx_kw.value, ast.Name):
+            return None
+        idx_id = self._aliased_name(idx_kw.value.id)
+        if not (idx_id in self.alloc_chars or idx_id in self.chars):
+            return None
+        return {
+            "columns": [k.value for k in dict_node.keys],
+            "value_nodes": list(dict_node.values),
+            "index_id": idx_id,
         }
 
     def _rank_expr(self, node):
@@ -14713,7 +14849,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and _is_rng_rank_source(node.func.value)
-                and node.func.attr in {"random", "normal", "standard_normal", "rand", "randn", "randint", "integers"}
+                and node.func.attr in {"random", "normal", "standard_normal", "rand", "randn", "randint", "integers", "choice"}
             ):
                 size_node = None
                 if node.func.attr in {"rand", "randn"}:
@@ -14729,6 +14865,10 @@ class translator(ast.NodeVisitor):
                 elif node.func.attr in {"randint", "integers"}:
                     if len(node.args) >= 3:
                         size_node = node.args[2]
+                elif node.func.attr == "choice":
+                    # rng.choice(a, size=None, replace=True, p=None)
+                    if len(node.args) >= 2:
+                        size_node = node.args[1]
                 else:
                     if len(node.args) >= 3:
                         size_node = node.args[2]
@@ -17239,6 +17379,21 @@ class translator(ast.NodeVisitor):
                                 return f"runif(size({base}))"
                         return f"spread({self.expr(node.elt)}, dim=1, ncopies=size({base}))"
 
+                def _kind_with_loopvar(n):
+                    if isinstance(n, ast.Name) and n.id == loop_var:
+                        return base_kind
+                    if isinstance(n, ast.BinOp):
+                        lk = _kind_with_loopvar(n.left)
+                        rk = _kind_with_loopvar(n.right)
+                        if lk == "real" or rk == "real":
+                            return "real"
+                        if lk == "int" and rk == "int":
+                            return "int"
+                        return lk or rk
+                    if isinstance(n, ast.UnaryOp):
+                        return _kind_with_loopvar(n.operand)
+                    return self._expr_kind(n)
+
                 def _map_expr(n):
                     if isinstance(n, ast.JoinedStr):
                         def _joinedstr_const_spec(spec_node):
@@ -17296,9 +17451,7 @@ class translator(ast.NodeVisitor):
                                 continue
                             if not isinstance(part, ast.FormattedValue):
                                 raise NotImplementedError("unsupported f-string part in ListComp")
-                            pv_kind = self._expr_kind(part.value)
-                            if pv_kind is None and isinstance(part.value, ast.Name) and part.value.id == loop_var:
-                                pv_kind = base_kind
+                            pv_kind = _kind_with_loopvar(part.value)
                             expr_txt = _map_expr(part.value)
                             spec = _joinedstr_const_spec(part.format_spec)
                             align, width, prec, code = _joinedstr_parse_spec(spec)
@@ -18905,6 +19058,8 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 q0 = self.expr(node.args[1])
+                if int(self._rank_expr(node.args[1])) >= 1:
+                    return f"quantile_linear_vec(reshape({a0}, [size({a0})]), {q0})"
                 return f"quantile_linear(reshape({a0}, [size({a0})]), {q0})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -21378,24 +21533,37 @@ class translator(ast.NodeVisitor):
             ):
                 # RNG object method calls (e.g. rng = default_rng(); rng.random(...)).
                 # Lower to python_mod RNG helpers.
-                size_node = None
-                if node.func.attr in {"normal", "uniform"}:
-                    if len(node.args) >= 3:
-                        size_node = node.args[2]
-                elif len(node.args) >= 1:
-                    size_node = node.args[0]
-                for kw in node.keywords:
-                    if kw.arg == "size":
-                        size_node = kw.value
-                        break
+                def _pos_or_kw_arg(idx, argname):
+                    if len(node.args) > idx:
+                        return node.args[idx]
+                    for kw in node.keywords:
+                        if kw.arg == argname:
+                            return kw.value
+                    return None
+
+                def _loc_scl_exprs():
+                    loc_n = _pos_or_kw_arg(0, "loc")
+                    scl_n = _pos_or_kw_arg(1, "scale")
+                    return (
+                        self.expr(loc_n) if loc_n is not None else "0.0_dp",
+                        self.expr(scl_n) if scl_n is not None else "1.0_dp",
+                    )
+
+                def _lo_hi_exprs():
+                    lo_n = _pos_or_kw_arg(0, "low")
+                    hi_n = _pos_or_kw_arg(1, "high")
+                    return (
+                        self.expr(lo_n) if lo_n is not None else "0.0_dp",
+                        self.expr(hi_n) if hi_n is not None else "1.0_dp",
+                    )
+
+                size_node = _pos_or_kw_arg(2, "size") if node.func.attr in {"normal", "uniform"} else _pos_or_kw_arg(0, "size")
                 if size_node is None:
                     if node.func.attr == "normal":
-                        loc = self.expr(node.args[0]) if len(node.args) >= 1 else "0.0_dp"
-                        scl = self.expr(node.args[1]) if len(node.args) >= 2 else "1.0_dp"
+                        loc, scl = _loc_scl_exprs()
                         return f"({loc}) + ({scl}) * rnorm()"
                     if node.func.attr == "uniform":
-                        lo = self.expr(node.args[0]) if len(node.args) >= 1 else "0.0_dp"
-                        hi = self.expr(node.args[1]) if len(node.args) >= 2 else "1.0_dp"
+                        lo, hi = _lo_hi_exprs()
                         return f"({lo}) + (({hi}) - ({lo})) * runif()"
                     if node.func.attr == "standard_normal":
                         return "rnorm()"
@@ -21405,12 +21573,10 @@ class translator(ast.NodeVisitor):
                         n1 = self.expr(size_node.elts[0])
                         n2 = self.expr(size_node.elts[1])
                         if node.func.attr == "normal":
-                            loc = self.expr(node.args[0]) if len(node.args) >= 1 else "0.0_dp"
-                            scl = self.expr(node.args[1]) if len(node.args) >= 2 else "1.0_dp"
+                            loc, scl = _loc_scl_exprs()
                             return f"({loc}) + ({scl}) * rnorm(int({n1}), int({n2}))"
                         if node.func.attr == "uniform":
-                            lo = self.expr(node.args[0]) if len(node.args) >= 1 else "0.0_dp"
-                            hi = self.expr(node.args[1]) if len(node.args) >= 2 else "1.0_dp"
+                            lo, hi = _lo_hi_exprs()
                             return f"({lo}) + (({hi}) - ({lo})) * runif(int({n1}), int({n2}))"
                         if node.func.attr == "standard_normal":
                             return f"rnorm(int({n1}), int({n2}))"
@@ -21419,12 +21585,10 @@ class translator(ast.NodeVisitor):
                         size_node = size_node.elts[0]
                 n1 = self.expr(size_node)
                 if node.func.attr == "normal":
-                    loc = self.expr(node.args[0]) if len(node.args) >= 1 else "0.0_dp"
-                    scl = self.expr(node.args[1]) if len(node.args) >= 2 else "1.0_dp"
+                    loc, scl = _loc_scl_exprs()
                     return f"({loc}) + ({scl}) * rnorm(int({n1}))"
                 if node.func.attr == "uniform":
-                    lo = self.expr(node.args[0]) if len(node.args) >= 1 else "0.0_dp"
-                    hi = self.expr(node.args[1]) if len(node.args) >= 2 else "1.0_dp"
+                    lo, hi = _lo_hi_exprs()
                     return f"({lo}) + (({hi}) - ({lo})) * runif(int({n1}))"
                 if node.func.attr == "standard_normal":
                     return f"rnorm(int({n1}))"
@@ -22204,6 +22368,16 @@ class translator(ast.NodeVisitor):
             ):
                 # NumPy: np.finfo(float).eps
                 return "epsilon(1.0_dp)"
+            if (
+                node.attr == "tiny"
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id in {"np", "numpy"}
+                and node.value.func.attr == "finfo"
+            ):
+                # NumPy: np.finfo(float).tiny -- smallest positive normal number
+                return "tiny(1.0_dp)"
             if (
                 node.attr == "max"
                 and isinstance(node.value, ast.Call)
@@ -23478,6 +23652,14 @@ class translator(ast.NodeVisitor):
                         self._mark_log(f"{t.id}_success")
                         continue
 
+                # res = minimize(objective, x0, bounds=[(lo, hi), ...])
+                if isinstance(t, ast.Name):
+                    _lb_spec = self._scipy_minimize_lbfgsb_spec(v)
+                    if _lb_spec is not None:
+                        self._mark_alloc_real(t.id, rank=1)
+                        self._mark_real(f"{t.id}_fun")
+                        continue
+
                 # root = brentq(f, a, b)
                 if isinstance(t, ast.Name):
                     _bq_spec = self._scipy_brentq_spec(v)
@@ -23591,6 +23773,50 @@ class translator(ast.NodeVisitor):
                         self.alloc_chars.discard(t.id)
                         self.alloc_complexes.discard(t.id)
                         continue
+
+                # X = pd.DataFrame({"col1": arr1, ...}, index=str_labels)
+                if isinstance(t, ast.Name):
+                    _dictdf_spec = self._pandas_dict_df_construct_spec(v)
+                    if _dictdf_spec is not None:
+                        self.pandas_df_vars[t.id] = "DataFrame_str_index"
+                        self.pandas_df_columns[t.id] = list(_dictdf_spec["columns"])
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # diff_df = df1 - df2 -- two DataFrames of the same
+                # (str-indexed) kind subtracted elementwise.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.BinOp)
+                    and isinstance(v.op, ast.Sub)
+                    and isinstance(v.left, ast.Name)
+                    and isinstance(v.right, ast.Name)
+                    and v.left.id in self.pandas_df_vars
+                    and v.right.id in self.pandas_df_vars
+                    and self.pandas_df_vars[v.left.id] == self.pandas_df_vars[v.right.id]
+                ):
+                    self.pandas_df_vars[t.id] = self.pandas_df_vars[v.left.id]
+                    self.pandas_df_columns[t.id] = list(self.pandas_df_columns.get(v.left.id, []))
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
+                    continue
 
                 # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
                 # -- materialize one real array per dict-return-type component.
@@ -29790,6 +30016,49 @@ class translator(ast.NodeVisitor):
                 self.o.w("end block")
                 return
 
+        # res = minimize(objective, x0, bounds=[(lo, hi), ...])
+        if isinstance(t, ast.Name):
+            _lb_spec = self._scipy_minimize_lbfgsb_spec(v)
+            if _lb_spec is not None:
+                name = self._aliased_name(t.id)
+                fn_name = _lb_spec["fn_name"]
+                x0_expr = self.expr(_lb_spec["x0_node"])
+                pairs = _lb_spec["bound_pairs"]
+                n_lb = len(pairs)
+                l_items = []
+                u_items = []
+                nbd_items = []
+                for lo_node, hi_node in pairs:
+                    if lo_node is None and hi_node is None:
+                        nbd_items.append("0")
+                        l_items.append("0.0_dp")
+                        u_items.append("0.0_dp")
+                    elif lo_node is not None and hi_node is None:
+                        nbd_items.append("1")
+                        l_items.append(f"real({self.expr(lo_node)}, kind=dp)")
+                        u_items.append("0.0_dp")
+                    elif lo_node is not None and hi_node is not None:
+                        nbd_items.append("2")
+                        l_items.append(f"real({self.expr(lo_node)}, kind=dp)")
+                        u_items.append(f"real({self.expr(hi_node)}, kind=dp)")
+                    else:
+                        nbd_items.append("3")
+                        l_items.append("0.0_dp")
+                        u_items.append(f"real({self.expr(hi_node)}, kind=dp)")
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"real(kind=dp) :: l_lbfgsb({n_lb}), u_lbfgsb({n_lb})")
+                self.o.w(f"integer :: nbd_lbfgsb({n_lb})")
+                self.o.w(f"{name} = {x0_expr}")
+                self.o.w(f"l_lbfgsb = [{', '.join(l_items)}]")
+                self.o.w(f"u_lbfgsb = [{', '.join(u_items)}]")
+                self.o.w(f"nbd_lbfgsb = [{', '.join(nbd_items)}]")
+                self.o.w(f"lbfgsb_user_fn => {fn_name}")
+                self.o.w(f"call lbfgsb_minimize({name}, l_lbfgsb, u_lbfgsb, nbd_lbfgsb, {name}_fun)")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
         # root = brentq(f, a, b)
         if isinstance(t, ast.Name):
             _bq_spec = self._scipy_brentq_spec(v)
@@ -29986,6 +30255,39 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{name}%columns = {columns_expr}")
                 self.o.w(f"{name}%values = {values_expr}")
                 return
+
+        # X = pd.DataFrame({"col1": arr1, ...}, index=str_labels)
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _dictdf_spec = self._pandas_dict_df_construct_spec(v)
+            if _dictdf_spec is not None:
+                name = self._aliased_name(t.id)
+                cols = _dictdf_spec["columns"]
+                col_exprs = [self.expr(n) for n in _dictdf_spec["value_nodes"]]
+                idx_expr = self.expr(ast.Name(id=_dictdf_spec["index_id"], ctx=ast.Load()))
+                col_len = max(10, max(len(c) for c in cols))
+                columns_txt = ", ".join(fstr(c) for c in cols)
+                values_txt = ", ".join(col_exprs)
+                self.o.w(f"{name}%index = {idx_expr}")
+                self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
+                self.o.w(f"{name}%values = reshape([{values_txt}], [size({col_exprs[0]}), {len(cols)}])")
+                return
+
+        # diff_df = df1 - df2
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.pandas_df_vars
+            and isinstance(v, ast.BinOp)
+            and isinstance(v.op, ast.Sub)
+            and isinstance(v.left, ast.Name)
+            and isinstance(v.right, ast.Name)
+            and v.left.id in self.pandas_df_vars
+            and v.right.id in self.pandas_df_vars
+        ):
+            name = self._aliased_name(t.id)
+            lhs_expr = self._aliased_name(v.left.id)
+            rhs_expr = self._aliased_name(v.right.id)
+            self.o.w(f"{name} = {lhs_expr} - {rhs_expr}")
+            return
 
         # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
         if isinstance(t, ast.Name) and t.id in self.pandas_stats_table_vars:
@@ -33644,12 +33946,24 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError(
                 "printing a DataFrame requires statically known column names"
             )
+        df_id = self._pandas_df_root_id(df_node)
+        is_str_index = self.pandas_df_vars.get(df_id) == "DataFrame_str_index"
         col_width = max(10, ndigits + 8)
         n_cols = len(col_names)
-        header_fmt = f"'(A10,{n_cols}A{col_width})'"
+        # Date-index labels are always exactly 10 chars ("YYYY-MM-DD"), but
+        # str-index row labels are arbitrary-length runtime strings -- widen
+        # the field so longer labels aren't truncated by the A-edit descriptor.
+        idx_width = 24 if is_str_index else 10
+        header_fmt = f"'(A{idx_width},{n_cols}A{col_width})'"
         header_args = ", ".join(fstr(c) for c in col_names)
-        row_fmt = f"'(A10,{n_cols}F{col_width}.{ndigits})'"
+        row_fmt = f"'(A{idx_width},{n_cols}F{col_width}.{ndigits})'"
         dots_args = ", ".join(fstr("...") for _ in col_names)
+
+        def _index_txt(idx_expr):
+            if is_str_index:
+                return f"trim({idx_expr})"
+            return f"trim({idx_expr}%to_str())"
+
         self.o.w("block")
         self.o.push()
         orig_df_expr = df_expr
@@ -33663,7 +33977,7 @@ class translator(ast.NodeVisitor):
         self.o.w("do pdf_i = 1, pdf_n")
         self.o.push()
         self.o.w(
-            f"write(*,{row_fmt}) trim({df_expr}%index(pdf_i)%to_str()), "
+            f"write(*,{row_fmt}) {_index_txt(f'{df_expr}%index(pdf_i)')}, "
             f"{df_expr}%values(pdf_i, :)"
         )
         self.o.pop()
@@ -33674,7 +33988,7 @@ class translator(ast.NodeVisitor):
         self.o.w("do pdf_i = 1, 5")
         self.o.push()
         self.o.w(
-            f"write(*,{row_fmt}) trim({df_expr}%index(pdf_i)%to_str()), "
+            f"write(*,{row_fmt}) {_index_txt(f'{df_expr}%index(pdf_i)')}, "
             f"{df_expr}%values(pdf_i, :)"
         )
         self.o.pop()
@@ -33683,7 +33997,7 @@ class translator(ast.NodeVisitor):
         self.o.w("do pdf_i = pdf_n - 4, pdf_n")
         self.o.push()
         self.o.w(
-            f"write(*,{row_fmt}) trim({df_expr}%index(pdf_i)%to_str()), "
+            f"write(*,{row_fmt}) {_index_txt(f'{df_expr}%index(pdf_i)')}, "
             f"{df_expr}%values(pdf_i, :)"
         )
         self.o.pop()
@@ -45512,6 +45826,8 @@ def generate_flat(
             "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
             "operator(>), operator(>=)"
         )
+    if _tree_uses_pandas_dict_dataframe(tree):
+        o.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(-)")
     if _tree_uses_scipy_fsolve(tree):
         o.w("use minpack_module, only: hybrd1")
         o.w("use fsolve_bridge_mod, only: fsolve_user_fn, fsolve_generic_wrapper")
@@ -45533,6 +45849,8 @@ def generate_flat(
     if _tree_uses_scipy_minimize_scalar(tree):
         o.w("use fmin_module, only: fmin")
         o.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
+    if _tree_uses_scipy_minimize_lbfgsb(tree):
+        o.w("use lbfgsb_bridge_mod, only: lbfgsb_user_fn, lbfgsb_minimize")
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
@@ -46186,6 +46504,24 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
     helper_files = [str(Path(h)) for h in explicit_helpers]
     helper_by_name = {Path(h).name.lower(): str(Path(h)) for h in helper_files}
 
+    def _ensure_helper_by_filename(filename):
+        for candidate in (
+            helper_by_name.get(filename.lower()),
+            str(Path(filename)),
+            str(Path(__file__).resolve().with_name(filename)),
+        ):
+            if not candidate:
+                continue
+            src_path = Path(candidate)
+            if not src_path.exists():
+                continue
+            src_s = str(src_path)
+            if src_s not in helper_files:
+                helper_files.append(src_s)
+                auto_added.append(src_s)
+            return True, src_s
+        return False, filename
+
     def _ensure_lapack_helper():
         for candidate in (
             helper_by_name.get("lapack_d.f90"),
@@ -46253,6 +46589,16 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
     # linalg wrappers directly.
     if any(Path(h).name.lower() == "python.f90" for h in helper_files):
         _ensure_lapack_helper()
+
+    # lbfgsb_bridge_mod hides lbfgsb_module's reverse-communication setulb()
+    # loop behind lbfgsb_minimize(), so the generated program never `use`s
+    # lbfgsb_module directly -- the usual `use <mod>` text-scan above can't
+    # discover lbfgsb.f90. Detect the actual call site instead.
+    if re.search(r"\blbfgsb_minimize\s*\(", src):
+        found_lbfgsb, lbfgsb_s = _ensure_helper_by_filename("lbfgsb.f90")
+        if not found_lbfgsb:
+            missing_modules.append(("lbfgsb_module", lbfgsb_s))
+
     return helper_files, auto_added, missing_modules
 
 

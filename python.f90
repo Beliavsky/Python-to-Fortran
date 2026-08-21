@@ -254,6 +254,7 @@ public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:
 public :: linalg_qr_reduced !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),q:real(dp)(:,:):intent(out),r:real(dp)(:,:):intent(out) desc="reduced QR factorization using LAPACK DGEQRF/DORGQR"
 public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="full SVD using LAPACK DGESVD"
 public :: quantile_linear !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),q:real(dp):intent(in) desc="1D quantile with linear interpolation (NumPy-like default)"
+public :: quantile_linear_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),q:real(dp)(:):intent(in) desc="1D quantiles at multiple probabilities with linear interpolation (NumPy-like default)"
 public :: tri_int !@pyapi kind=function ret=integer(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
 public :: tri_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
 public :: moveaxis3_int !@pyapi kind=function ret=integer(:,:,:) args=a:integer(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 integer arrays (NumPy-style indices)"
@@ -2590,6 +2591,11 @@ contains
          if (allocated(pool)) deallocate(pool)
       end subroutine random_choice_norep
 
+      ! Inverse-CDF weighted sampling against Fortran's own random_number()
+      ! stream -- a different algorithm from numpy's Generator.choice(p=...),
+      ! so draws are NOT bit-identical to numpy for the same seed. Documented
+      ! approximation, same category as this project's BFGS/least_squares/
+      ! L-BFGS-B solvers: correct distributionally, not reproducible bit-for-bit.
       subroutine random_choice_prob(p, n, z)
          real(kind=dp), intent(in) :: p(:)
          integer, intent(in) :: n
@@ -5361,6 +5367,16 @@ contains
          frac = pos - real(lo, kind=dp)
          quantile_linear = (1.0_dp - frac) * xs(lo) + frac * xs(hi)
       end function quantile_linear
+
+      function quantile_linear_vec(x, q) result(out)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), intent(in) :: q(:)
+         real(kind=dp) :: out(size(q))
+         integer :: i
+         do i = 1, size(q)
+            out(i) = quantile_linear(x, q(i))
+         end do
+      end function quantile_linear_vec
 
       function statistics_quantiles_real(x, n) result(q)
          real(kind=dp), intent(in) :: x(:)
