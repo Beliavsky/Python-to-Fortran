@@ -29,11 +29,12 @@ module lbfgsb_bridge_mod
 
 contains
 
-   subroutine lbfgsb_minimize(x, l, u, nbd, f_opt)
+   subroutine lbfgsb_minimize(x, l, u, nbd, f_opt, success)
       real(kind=dp), intent(inout) :: x(:)
       real(kind=dp), intent(in) :: l(:), u(:)
       integer, intent(in) :: nbd(:)
       real(kind=dp), intent(out) :: f_opt
+      logical, intent(out), optional :: success
 
       integer, parameter :: mem = 10
       real(kind=dp), parameter :: factr = 1.0e7_dp
@@ -76,6 +77,7 @@ contains
          end if
       end do
       f_opt = f
+      if (present(success)) success = (task(1:4) == 'CONV')
    end subroutine lbfgsb_minimize
 
 end module lbfgsb_bridge_mod

@@ -9046,11 +9046,12 @@ def normalize_numpy_shape_assignments(exec_body, local_funcs):
 def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
     """Rewrite `res = minimize(f, x0)` / `res = least_squares(fun, x0)` /
     `res = minimize_scalar(f, bounds=(a, b))` and later `res.x` / `res.fun`
-    / `res.success` / `res.nit` / `res.cost` attribute reads into plain flat
-    names, since xp2f has no general OptimizeResult derived-type support --
-    the BFGS/least_squares/minimize_scalar codegen paths declare `res` (the
-    solution array or scalar) plus `res_fun` / `res_success` / `res_nit` /
-    `res_cost` scalars directly (see _scipy_minimize_spec /
+    / `res.success` / `res.nit` / `res.cost` / `res.message` attribute reads
+    into plain flat names, since xp2f has no general OptimizeResult
+    derived-type support -- the BFGS/L-BFGS-B/least_squares codegen paths
+    declare `res` (the solution array or scalar) plus `res_fun` /
+    `res_success` / `res_nit` / `res_cost` / `res_message` scalars directly
+    (see _scipy_minimize_spec / _scipy_minimize_lbfgsb_spec /
     _scipy_least_squares_spec / _scipy_minimize_scalar_spec)."""
     result_call_aliases = set()
     for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
@@ -9090,7 +9091,7 @@ def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
     if not result_names:
         return
 
-    attr_suffix_map = {"x": None, "fun": "fun", "success": "success", "nit": "nit", "cost": "cost"}
+    attr_suffix_map = {"x": None, "fun": "fun", "success": "success", "nit": "nit", "cost": "cost", "message": "message"}
 
     class _ResultAttrRewriter(ast.NodeTransformer):
         def visit_Attribute(self, node):
@@ -14148,6 +14149,28 @@ class translator(ast.NodeVisitor):
         ):
             return None
         return {"fn_name": v.args[0].id, "x0_node": v.args[1]}
+
+    def _emit_scipy_optimize_message(
+        self,
+        message_name,
+        success_name,
+        success_text="Optimization terminated successfully.",
+        failure_text="Desired error not necessarily achieved due to precision loss.",
+    ):
+        # res.message -- scipy's plain-English termination string. Our
+        # bridges only track a boolean success flag (no convergence-reason
+        # bookkeeping), so this emits scipy's most common messages for the
+        # given solver family keyed off it: exact match on the common
+        # successful-convergence path, a documented approximation otherwise.
+        self.o.w(f"if ({success_name}) then")
+        self.o.push()
+        self.o.w(f'{message_name} = "{success_text}"')
+        self.o.pop()
+        self.o.w("else")
+        self.o.push()
+        self.o.w(f'{message_name} = "{failure_text}"')
+        self.o.pop()
+        self.o.w("end if")
 
     def _scipy_minimize_spec(self, v):
         # res = minimize(objective, x0[, method="BFGS"]) -- objective must
@@ -23650,6 +23673,7 @@ class translator(ast.NodeVisitor):
                         self._mark_real(f"{t.id}_fun")
                         self._mark_int(f"{t.id}_nit")
                         self._mark_log(f"{t.id}_success")
+                        self._mark_char(f"{t.id}_message")
                         continue
 
                 # res = minimize(objective, x0, bounds=[(lo, hi), ...])
@@ -23658,6 +23682,8 @@ class translator(ast.NodeVisitor):
                     if _lb_spec is not None:
                         self._mark_alloc_real(t.id, rank=1)
                         self._mark_real(f"{t.id}_fun")
+                        self._mark_log(f"{t.id}_success")
+                        self._mark_char(f"{t.id}_message")
                         continue
 
                 # root = brentq(f, a, b)
@@ -23687,6 +23713,7 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(f"{t.id}_fun", rank=1)
                         self._mark_real(f"{t.id}_cost")
                         self._mark_log(f"{t.id}_success")
+                        self._mark_char(f"{t.id}_message")
                         continue
 
                 # res = minimize_scalar(f, bounds=(a, b))
@@ -30012,6 +30039,7 @@ class translator(ast.NodeVisitor):
                     f"call bfgs_minimize_fd(bfgs_generic_wrapper, {name}, n_bfgs, max_iter_bfgs, "
                     f"gtol_bfgs, {name}_fun, {name}_nit, {name}_success)"
                 )
+                self._emit_scipy_optimize_message(f"{name}_message", f"{name}_success")
                 self.o.pop()
                 self.o.w("end block")
                 return
@@ -30054,7 +30082,11 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"u_lbfgsb = [{', '.join(u_items)}]")
                 self.o.w(f"nbd_lbfgsb = [{', '.join(nbd_items)}]")
                 self.o.w(f"lbfgsb_user_fn => {fn_name}")
-                self.o.w(f"call lbfgsb_minimize({name}, l_lbfgsb, u_lbfgsb, nbd_lbfgsb, {name}_fun)")
+                self.o.w(
+                    f"call lbfgsb_minimize({name}, l_lbfgsb, u_lbfgsb, nbd_lbfgsb, "
+                    f"{name}_fun, {name}_success)"
+                )
+                self._emit_scipy_optimize_message(f"{name}_message", f"{name}_success")
                 self.o.pop()
                 self.o.w("end block")
                 return
@@ -30147,6 +30179,12 @@ class translator(ast.NodeVisitor):
                 )
                 self.o.w(f"{name}_cost = 0.5_dp * sum({name}_fun**2)")
                 self.o.w(f"{name}_success = (info_ls >= 1 .and. info_ls <= 4)")
+                self._emit_scipy_optimize_message(
+                    f"{name}_message",
+                    f"{name}_success",
+                    success_text="Both actual and predicted relative reductions in the sum of squares are at most 1.000000e-08",
+                    failure_text="Number of calls to function has reached or exceeded maxfev.",
+                )
                 self.o.pop()
                 self.o.w("end block")
                 return
