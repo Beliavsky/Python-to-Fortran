@@ -943,8 +943,9 @@ def test_xp2f_keeps_scalar_broadcast_args_scalar(tmp_path: Path) -> None:
     out_f90 = tmp_path / "xscalar_broadcast_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "real(kind=dp), intent(in) :: scale" in out_text
-    assert "real(kind=dp), intent(in) :: shift" in out_text
+    # scale and shift are both scalar real(kind=dp), intent(in) dummy args,
+    # so xp2f's declaration-coalescing pass merges them onto one line.
+    assert "real(kind=dp), intent(in) :: scale, shift" in out_text
 
 
 def test_xp2f_runs_direct_numpy_array_import_with_integer_norm(tmp_path: Path) -> None:
@@ -3467,9 +3468,11 @@ def test_xp2f_keeps_nested_integer_array_state_in_local_tuple_subroutine(tmp_pat
     out_f90 = tmp_path / "xnested_int_state_tuple_p.f90"
     out_text = out_f90.read_text(encoding="utf-8")
     assert "integer, intent(inout) :: a(:)" in out_text
-    assert "integer, intent(in) :: t" in out_text
+    # h and t are both scalar integer, intent(in) dummy args, so xp2f's
+    # declaration-coalescing pass merges them onto one line.
+    assert "integer, intent(in) :: h, t" in out_text
     assert "integer, allocatable, intent(out) :: step_out_1(:)" in out_text
-    assert "integer, intent(out) :: step_out_4" in out_text
+    assert "integer, intent(out) :: step_out_3, step_out_4" in out_text
 
 
 def test_xp2f_keeps_scalar_integer_tuple_output_despite_real_sentinel(tmp_path: Path) -> None:
@@ -3515,7 +3518,10 @@ def test_xp2f_keeps_scalar_integer_tuple_output_despite_real_sentinel(tmp_path: 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out_f90 = tmp_path / "xvalues_tuple_int_p.f90"
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "integer, intent(out) :: d" in out_text
+    # values_out_1 (n_data's tuple-output slot) and d are both scalar
+    # integer, intent(out), so xp2f's declaration-coalescing pass merges
+    # them onto one line.
+    assert "integer, intent(out) :: values_out_1, d" in out_text
 
 
 def test_xp2f_promotes_int_seeded_tuple_output_to_real_when_accumulated_from_real_array(
