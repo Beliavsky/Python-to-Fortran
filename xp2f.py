@@ -5782,7 +5782,7 @@ def collect_module_global_initializers(local_funcs):
     return inits
 
 
-def collect_top_level_shared_decls(tree, local_funcs=None, params=None):
+def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_return_out_kinds=None, tuple_return_out_ranks=None):
     """Collect top-level assigned names that should live in the proc module."""
     params = set((params or {}).keys())
     needed_names = set()
@@ -5964,13 +5964,43 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None):
             return "int", 0
         return "real", 0
 
+    def _spec_kind_rank(spec, rank):
+        alloc_map = {"alloc_int": "int", "alloc_real": "real", "alloc_log": "logical", "alloc_char": "char", "alloc_complex": "complex"}
+        if spec in alloc_map:
+            return alloc_map[spec], max(1, int(rank or 0))
+        if spec in {"int", "real", "logical", "char", "complex"}:
+            return spec, int(rank or 0)
+        return None, 0
+
     decls = {}
     for st in tree.body:
-        if not (
-            isinstance(st, ast.Assign)
-            and len(st.targets) == 1
-            and isinstance(st.targets[0], ast.Name)
+        if not isinstance(st, ast.Assign) or len(st.targets) != 1:
+            continue
+        # r, h = simulate(...) -- a tuple-unpacked name used by a local
+        # function needs its module-shared kind/rank looked up per unpacked
+        # position from the callee's own (already-computed) tuple-return
+        # spec, since it has no single self-contained RHS expression here.
+        if (
+            isinstance(st.targets[0], (ast.Tuple, ast.List))
+            and isinstance(st.value, ast.Call)
+            and isinstance(st.value.func, ast.Name)
+            and st.value.func.id in (tuple_return_out_kinds or {})
         ):
+            callee = st.value.func.id
+            klist = list((tuple_return_out_kinds or {}).get(callee, []))
+            rlist = list((tuple_return_out_ranks or {}).get(callee, []))
+            for j, t in enumerate(st.targets[0].elts):
+                if not (isinstance(t, ast.Name) and t.id in needed_names and t.id not in params):
+                    continue
+                spec = klist[j] if j < len(klist) else None
+                rank = rlist[j] if j < len(rlist) else 0
+                k, r = _spec_kind_rank(spec, rank)
+                if k is None:
+                    continue
+                old = decls.get(t.id, (None, 0))
+                decls[t.id] = (_merge_kind(old[0], k), max(int(old[1]), int(r)))
+            continue
+        if not isinstance(st.targets[0], ast.Name):
             continue
         nm = st.targets[0].id
         if nm in params or nm not in needed_names:
@@ -9183,6 +9213,117 @@ def normalize_scipy_curve_fit_residual_helper(exec_body, local_funcs):
             fn_map[resid_name] = new_fn
             new_funcs.append(new_fn)
         setattr(v, "_xp2f_curvefit_resid_name", resid_name)
+
+    for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
+        if isinstance(node, ast.Assign):
+            _handle_call(node.value)
+    for fn in list(local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign):
+                    _handle_call(node.value)
+
+    if new_funcs:
+        local_funcs.extend(new_funcs)
+
+
+def normalize_scipy_minimize_args_wrapper(exec_body, local_funcs):
+    """Synthesize a single-argument wrapper for
+    `minimize(f, x0, args=(extra0, extra1, ...))`.
+
+    scipy calls the objective as `f(x, *args)` when `args=` is given, but
+    xp2f's BFGS/L-BFGS-B bridges need a plain `f(x) -> scalar` callback
+    (see _scipy_minimize_spec / _scipy_minimize_lbfgsb_spec). Since args is
+    a fixed tuple of expressions known at the call site, generate:
+
+        def <f>_argswrap_<lineno>(x):
+            return <f>(x, <extra0>, <extra1>, ...)
+
+    as an ordinary local function, point the minimize() call at it instead
+    of `f`, and drop the now-baked-in args= keyword.
+
+    If an extra-arg is a bare top-level name (the common case: fixed data
+    passed to a log-likelihood/residual function) that happens to collide
+    with a parameter name somewhere else in the file (e.g. `args=(r,)`
+    while some function itself declares `def neg_loglik(params, r)`),
+    rename that colliding parameter (and its references) first. xp2f's
+    whole-file symbol classification is name-based, not properly scoped
+    per function, so a synthesized wrapper referencing `r` directly could
+    otherwise get misclassified as shadowing that other function's own
+    `r` parameter instead of resolving to the intended top-level global --
+    and a fresh local alias assignment (`tmp = r`) doesn't sidestep this:
+    xp2f's module-global type inference also fails to propagate array
+    rank through a simple name-to-name alias.
+    """
+    fn_map = {fn.name: fn for fn in (local_funcs or []) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    if not fn_map:
+        return
+
+    minimize_aliases = set()
+    for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy.optimize":
+            for al in node.names:
+                if (al.name or "").strip() == "minimize":
+                    minimize_aliases.add((al.asname or al.name or "").strip())
+    if not minimize_aliases:
+        return
+
+    new_funcs = []
+
+    def _rename_colliding_param(nm):
+        # Rename a parameter named `nm` (in any local function) to a fresh
+        # name, so a wrapper can reference the top-level global `nm`
+        # unambiguously. No-op if nothing collides.
+        for fn in fn_map.values():
+            arg_names = {a.arg for a in fn.args.args}
+            if nm not in arg_names:
+                continue
+            fresh = f"{nm}_fnarg"
+            while fresh in arg_names or fresh in fn_map:
+                fresh = f"{fresh}_"
+            for a in fn.args.args:
+                if a.arg == nm:
+                    a.arg = fresh
+            class _Renamer(ast.NodeTransformer):
+                def visit_Name(self, node):
+                    if node.id == nm:
+                        node.id = fresh
+                    return node
+            fn.body = [_Renamer().visit(st) for st in fn.body]
+            ast.fix_missing_locations(fn)
+
+    def _handle_call(v):
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in minimize_aliases
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Name)
+            and v.args[0].id in fn_map
+        ):
+            return
+        args_kw = next((kw for kw in v.keywords if kw.arg == "args"), None)
+        if args_kw is None or not isinstance(args_kw.value, (ast.Tuple, ast.List)) or not args_kw.value.elts:
+            return
+        fn_name = v.args[0].id
+        wrapper_name = f"{fn_name}_argswrap_{getattr(v, 'lineno', 0)}"
+        if wrapper_name not in fn_map:
+            for e in args_kw.value.elts:
+                if isinstance(e, ast.Name):
+                    _rename_colliding_param(e.id)
+            extra_txt = ", ".join(ast.unparse(e) for e in args_kw.value.elts)
+            # `x_probe = x[0]` is a no-op (unused) but establishes that `x`
+            # is subscripted -- xp2f's argument-rank inference only marks a
+            # bare pass-through parameter like `x` as an array by observing
+            # it indexed somewhere in the function body, and a plain
+            # `return f(x, ...)` gives it nothing to see.
+            src = f"def {wrapper_name}(x):\n    x_probe = x[0]\n    return {fn_name}(x, {extra_txt})\n"
+            new_fn = ast.parse(src).body[0]
+            ast.fix_missing_locations(new_fn)
+            fn_map[wrapper_name] = new_fn
+            new_funcs.append(new_fn)
+        v.args[0] = ast.copy_location(ast.Name(id=wrapper_name, ctx=ast.Load()), v.args[0])
+        v.keywords = [kw for kw in v.keywords if kw.arg != "args"]
 
     for node in ast.walk(ast.Module(body=list(exec_body or []), type_ignores=[])):
         if isinstance(node, ast.Assign):
@@ -16701,6 +16842,14 @@ class translator(ast.NodeVisitor):
                     if not comps:
                         return None
                     return f"(.not. allocated({name}%{comps[0]}))"
+                def _is_alloc_array_name(name):
+                    return (
+                        name in self.alloc_reals
+                        or name in self.alloc_ints
+                        or name in self.alloc_logs
+                        or name in self.alloc_complexes
+                        or name in self.alloc_chars
+                    )
                 if is_none(a):
                     if isinstance(b, ast.Name) and b.id in self.dict_typed_vars:
                         t = _dict_none_test(b.id)
@@ -16710,6 +16859,9 @@ class translator(ast.NodeVisitor):
                         return "(.not. present(" + b.id + "))" if op is ast.Is else "present(" + b.id + ")"
                     if isinstance(b, ast.Name) and b.id in self.callable_aliases:
                         return ".false." if op is ast.Is else ".true."
+                    if isinstance(b, ast.Name) and _is_alloc_array_name(self._aliased_name(b.id)):
+                        left = self.expr(b)
+                        return f"(.not. allocated({left}))" if op is ast.Is else f"allocated({left})"
                     left = self.expr(b)
                     return f"({left} == -1)" if op is ast.Is else f"({left} /= -1)"
                 if is_none(b):
@@ -16721,6 +16873,9 @@ class translator(ast.NodeVisitor):
                         return "(.not. present(" + a.id + "))" if op is ast.Is else "present(" + a.id + ")"
                     if isinstance(a, ast.Name) and a.id in self.callable_aliases:
                         return ".false." if op is ast.Is else ".true."
+                    if isinstance(a, ast.Name) and _is_alloc_array_name(self._aliased_name(a.id)):
+                        left = self.expr(a)
+                        return f"(.not. allocated({left}))" if op is ast.Is else f"allocated({left})"
                     left = self.expr(a)
                     return f"({left} == -1)" if op is ast.Is else f"({left} /= -1)"
                 raise NotImplementedError("is/is not supported only with None")
@@ -31512,6 +31667,22 @@ class translator(ast.NodeVisitor):
                 return
             if self.function_result_name is None:
                 raise NotImplementedError("return value only supported in function context")
+            # `return None` from a function that otherwise returns an array
+            # (e.g. a sentinel for "invalid input, bail out") -- an
+            # unallocated result stands in for None; see the matching
+            # `x is None` -> `.not. allocated(x)` codegen in Compare.
+            if isinstance(node.value, ast.Constant) and node.value.value is None:
+                res_nm = self.function_result_name
+                if (
+                    res_nm in self.alloc_reals
+                    or res_nm in self.alloc_ints
+                    or res_nm in self.alloc_logs
+                    or res_nm in self.alloc_complexes
+                    or res_nm in self.alloc_chars
+                ):
+                    self.o.w(f"if (allocated({res_nm})) deallocate({res_nm})")
+                    self.o.w("return")
+                    return
             # Mixed-rank Python returns (e.g., conditional x vs x.ravel()) cannot
             # be represented by a single Fortran function result rank. Keep rank
             # stable by returning the base array when flatten appears in return.
@@ -45476,7 +45647,13 @@ def generate_flat(
     module_global_decls = collect_module_global_decls(local_funcs)
     module_global_inits = collect_module_global_initializers(local_funcs)
     if use_proc_module:
-        for _gnm, (_gk, _gr) in collect_top_level_shared_decls(tree, local_funcs=local_funcs, params=params).items():
+        for _gnm, (_gk, _gr) in collect_top_level_shared_decls(
+            tree,
+            local_funcs=local_funcs,
+            params=params,
+            tuple_return_out_kinds=tuple_return_out_kinds,
+            tuple_return_out_ranks=tuple_return_out_ranks,
+        ).items():
             _oldk, _oldr = module_global_decls.get(_gnm, (None, 0))
             if _oldk is None or _oldk == _gk:
                 _mk = _gk
@@ -47154,6 +47331,7 @@ def transpile_file(
     normalize_no_dates_price_csv_reader(effective_tree.body, local_funcs)
     normalize_csv_reader_list_calls(effective_tree.body, local_funcs)
     normalize_numpy_shape_assignments(effective_tree.body, local_funcs)
+    normalize_scipy_minimize_args_wrapper(effective_tree.body, local_funcs)
     normalize_scipy_minimize_result_attrs(effective_tree.body, local_funcs)
     normalize_scipy_curve_fit_residual_helper(effective_tree.body, local_funcs)
     normalize_inline_dict_literal_call_args(effective_tree.body, local_funcs)
