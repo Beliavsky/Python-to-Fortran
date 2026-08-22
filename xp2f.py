@@ -4097,8 +4097,13 @@ def remove_redundant_first_guarded_deallocate(lines):
     when:
     - the next nonblank/non-comment line is allocate(x(...))
     - x has not appeared in prior executable statements
-    - and no executable statements appear before this guard in the procedure.
-      (Avoids deleting guards inside loops/branches where reallocation repeats.)
+    - and either no executable statements appear before this guard in the
+      procedure (avoids deleting guards inside loops/branches where
+      reallocation repeats), or x is itself an intent(out) allocatable
+      dummy argument of the enclosing procedure -- those are deallocated
+      by the Fortran standard on procedure entry regardless of what other
+      (unrelated) code ran first, so the stricter "nothing executable yet"
+      requirement isn't needed for them.
     """
     out = list(lines)
     re_guard = re.compile(
@@ -4114,6 +4119,7 @@ def remove_redundant_first_guarded_deallocate(lines):
         r"^\s*(?:(?:pure|impure|elemental|recursive)\s+)*(?:subroutine|function)\b",
         re.IGNORECASE,
     )
+    re_decl_entities = re.compile(r"^\s*([^:!]*)::\s*(.+)$")
 
     i = 0
     while i < len(out):
@@ -4141,6 +4147,7 @@ def remove_redundant_first_guarded_deallocate(lines):
 
         prior_use = False
         saw_exec_before_guard = False
+        is_intent_out_alloc = False
         tok_re = re.compile(rf"\b{re.escape(var)}\b", re.IGNORECASE)
         k0 = 0
         for k in range(i - 1, -1, -1):
@@ -4153,12 +4160,22 @@ def remove_redundant_first_guarded_deallocate(lines):
             if not ck:
                 continue
             if re_declish.match(ck):
+                me = re_decl_entities.match(ck)
+                if (
+                    me
+                    and re.search(r"\ballocatable\b", me.group(1), re.IGNORECASE)
+                    and re.search(r"\bintent\s*\(\s*out\s*\)", me.group(1), re.IGNORECASE)
+                ):
+                    for ent in me.group(2).split(","):
+                        nm = re.sub(r"\(.*\)$", "", ent.strip()).strip()
+                        if nm.lower() == var.lower():
+                            is_intent_out_alloc = True
                 continue
             saw_exec_before_guard = True
             if tok_re.search(ck):
                 prior_use = True
                 break
-        if (not prior_use) and (not saw_exec_before_guard):
+        if not prior_use and (not saw_exec_before_guard or is_intent_out_alloc):
             del out[i]
             # do not advance i; next line shifts into current slot
             continue
@@ -34206,6 +34223,14 @@ class translator(ast.NodeVisitor):
                 return f"trim({idx_expr})"
             return f"trim({idx_expr}%to_str())"
 
+        if is_str_index:
+            # DataFrame_str_index carries its column names as runtime data
+            # (%columns), so the whole header/row/truncation block below is
+            # unnecessary here -- a single call to its display() type-bound
+            # procedure (dataframe_str_index.f90) covers it generically.
+            self.o.w(f"call {df_expr}%display({ndigits})")
+            return
+
         self.o.w("block")
         self.o.push()
         orig_df_expr = df_expr
@@ -34772,10 +34797,26 @@ class translator(ast.NodeVisitor):
 
         # print("literal")
         if is_const_str(a):
+            val = a.value
+            # print("\nHeading") etc. -- leading newline(s) before plain text
+            # with no other embedded newline. Prefer Fortran's own "/" (skip
+            # a line) edit descriptor over concatenating a literal
+            # new_line('a') into the string value: same output, and the
+            # format expresses "blank line, then text" directly instead of
+            # building it as runtime string concatenation.
+            stripped = val.lstrip("\n")
+            n_leading = len(val) - len(stripped)
+            if n_leading and stripped and "\n" not in stripped:
+                fmt = "(" + "/" * n_leading + ",a)"
+                if advance_no:
+                    self.o.w(f"write({unit_txt},{fstr(fmt)}, advance='no') {fstr(stripped)}")
+                else:
+                    self.o.w(f"write({unit_txt},{fstr(fmt)}) {fstr(stripped)}")
+                return
             if advance_no:
-                self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(a.value)}")
+                self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(val)}")
             else:
-                self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr(a.value)}")
+                self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr(val)}")
             return
 
         # print(f"...{x}...")
@@ -34843,8 +34884,22 @@ class translator(ast.NodeVisitor):
 
             fmt_parts = []
             items = []
-            for part in a.values:
+            for idx, part in enumerate(a.values):
                 if is_const_str(part):
+                    # f"\nHeading {x}" etc. -- when the leading literal part
+                    # starts with newline(s) followed by plain text (no other
+                    # embedded newline), hoist them into leading "/" format
+                    # descriptors (skip a line) instead of baking
+                    # new_line('a') into the string value; see the
+                    # print("literal") case just above for the same idea.
+                    val = part.value
+                    stripped = val.lstrip("\n") if idx == 0 else val
+                    n_leading = len(val) - len(stripped) if idx == 0 else 0
+                    if n_leading and stripped and "\n" not in stripped:
+                        fmt_parts.extend(["/"] * n_leading)
+                        fmt_parts.append("a")
+                        items.append(fstr(stripped))
+                        continue
                     fmt_parts.append("a")
                     items.append(fstr(part.value))
                 elif isinstance(part, ast.FormattedValue):
@@ -38397,7 +38452,12 @@ def _emit_local_function(
     for a, dv in zip(fn.args.kwonlyargs, fn.args.kw_defaults):
         if dv is not None:
             defaults_map[a.arg] = dv
-    if any((not is_none(dv)) for dv in defaults_map.values()):
+    if defaults_map:
+        # optval is used both for ordinary-value defaults (`x=0`) and,
+        # since scalar None-defaults (`x=None`) now also lower to
+        # `x_opt = optval(x, ...)` rather than an if(present)/else block,
+        # for those too -- import it whenever any default exists rather
+        # than trying to predict which shape each default will need.
         o.w("use python_mod, only: optval")
     def _name_used(node, nm):
         def rec(x):
@@ -40625,23 +40685,25 @@ def _emit_local_function(
             o.pop()
             o.w("end if")
     for arg, alias, decl_kind, arr_rank, dflt_expr, intent_txt in optional_none_aliases:
-        o.w(f"if (present({arg})) then")
-        o.push()
-        o.w(f"{alias} = {arg}")
-        o.pop()
-        o.w("else")
-        o.push()
-        if int(arr_rank) > 0:
+        if int(arr_rank) == 0:
+            if needed_helpers is not None:
+                needed_helpers.add("optval")
+            o.w(f"{alias} = optval({arg}, {dflt_expr})")
+        else:
+            o.w(f"if (present({arg})) then")
+            o.push()
+            o.w(f"{alias} = {arg}")
+            o.pop()
+            o.w("else")
+            o.push()
             zext = ",".join("0" for _ in range(int(arr_rank)))
             lk = str(decl_kind).lower()
             if "character" in lk:
                 o.w(f"allocate(character(len=1) :: {alias}({zext}))")
             else:
                 o.w(f"allocate({alias}({zext}))")
-        else:
-            o.w(f"{alias} = {dflt_expr}")
-        o.pop()
-        o.w("end if")
+            o.pop()
+            o.w("end if")
         if intent_txt in {"inout", "out"}:
             optional_none_copyback.append((arg, alias))
     if keep_decl_blank:
@@ -47548,8 +47610,8 @@ def transpile_file(
     f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
     f90_lines = mark_recursive_procedures(f90_lines)
     f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
+    f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
     if postprocess:
-        f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
         f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
         f90_lines = collapse_allocate_before_array_constructor_assignment(f90_lines)
         f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
