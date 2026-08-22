@@ -39,6 +39,8 @@ from fortran_scan import (
     coalesce_simple_declarations,
     remove_empty_if_blocks,
     simplify_integer_arithmetic_in_lines,
+    simplify_negated_relational_conditions_in_lines,
+    simplify_real_int_casts_in_mixed_expr,
     strip_redundant_outer_parens_expr,
     wrap_long_declaration_lines,
 )
@@ -47557,10 +47559,17 @@ def transpile_file(
         f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
         f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
         f90_lines = fpost.rewrite_named_arguments(f90_lines)
+        # Ported from the R-to-Fortran sibling project's newer fortran_scan.py
+        # / fortran_post.py (this project's copies had drifted stale).
+        f90_lines = fpost.fold_simple_integer_intrinsics(f90_lines)
+        f90_lines = fpost.remove_redundant_int_casts_of_integer_intrinsics(f90_lines)
+        f90_lines = simplify_real_int_casts_in_mixed_expr(f90_lines)
+        f90_lines = simplify_negated_relational_conditions_in_lines(f90_lines)
         f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
         f90_lines = normalize_split_relational_operators(f90_lines)
         f90_lines = remove_unused_use_only_imports(f90_lines)
         f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
+        f90_lines = fpost.consolidate_use_only_imports(f90_lines)
         f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
         f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
         f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)

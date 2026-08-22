@@ -4240,3 +4240,322 @@ def _preferred_named_arg_break(body: str, start: int, end: int) -> Optional[int]
                 best = i + 1  # keep comma on the left line
         i += 1
     return best
+
+
+def simplify_negated_relational_conditions_in_line(line: str) -> str:
+    """Simplify IF/DO WHILE conditions of form `.not. (a <op> b)`."""
+    code, comment = _split_code_comment(line.rstrip("\r\n"))
+    eol = _line_eol(line)
+
+    def _rewrite_condition(cond: str) -> Optional[str]:
+        c = cond.strip()
+        m_not = re.match(r"^\s*\.not\.\s*\((.+)\)\s*$", c, re.IGNORECASE)
+        if not m_not:
+            return None
+        inner = strip_redundant_outer_parens_expr(m_not.group(1).strip())
+        if _has_top_level_logical_ops(inner):
+            return None
+        rel = _split_simple_relational(inner)
+        if rel is None:
+            return None
+        lhs, op, rhs = rel
+        nop = _negate_rel_op(op)
+        if nop is None:
+            return None
+        return f"{lhs} {nop} {rhs}"
+
+    def _find_matching_paren(text: str, open_idx: int) -> int:
+        in_single = False
+        in_double = False
+        depth = 0
+        for i in range(open_idx, len(text)):
+            ch = text[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+        return -1
+
+    m_if_head = re.match(r"^\s*if\s*\(", code, re.IGNORECASE)
+    if m_if_head:
+        open_idx = code.find("(", m_if_head.start())
+        close_idx = _find_matching_paren(code, open_idx)
+        if close_idx > open_idx:
+            cond = code[open_idx + 1 : close_idx]
+            new_cond = _rewrite_condition(cond)
+            if new_cond is not None:
+                rebuilt = code[: open_idx + 1] + new_cond + code[close_idx:]
+                return f"{rebuilt}{comment}{eol}"
+            return f"{code}{comment}{eol}"
+
+    m_do_head = re.match(r"^\s*do\s+while\s*\(", code, re.IGNORECASE)
+    if m_do_head:
+        open_idx = code.find("(", m_do_head.start())
+        close_idx = _find_matching_paren(code, open_idx)
+        if close_idx > open_idx:
+            cond = code[open_idx + 1 : close_idx]
+            new_cond = _rewrite_condition(cond)
+            if new_cond is not None:
+                rebuilt = code[: open_idx + 1] + new_cond + code[close_idx:]
+                return f"{rebuilt}{comment}{eol}"
+            return f"{code}{comment}{eol}"
+
+    return f"{code}{comment}{eol}"
+
+
+def simplify_negated_relational_conditions_in_lines(lines: List[str]) -> List[str]:
+    """Apply `.not.(relational)` simplification across source lines."""
+    return [simplify_negated_relational_conditions_in_line(ln) for ln in lines]
+
+
+def _has_top_level_logical_ops(expr: str) -> bool:
+    """Return True if expression has top-level logical operators."""
+    s = expr.strip().lower()
+    in_single = False
+    in_double = False
+    depth = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")" and depth > 0:
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0:
+                rest = s[i:]
+                if rest.startswith(".and.") or rest.startswith(".or.") or rest.startswith(".eqv.") or rest.startswith(".neqv."):
+                    return True
+        i += 1
+    return False
+
+
+def _split_simple_relational(expr: str) -> Optional[Tuple[str, str, str]]:
+    """Split a simple top-level relational expression into lhs/op/rhs."""
+    ops = [">=", "<=", "==", "/=", ">", "<", ".ge.", ".le.", ".eq.", ".ne.", ".gt.", ".lt."]
+    in_single = False
+    in_double = False
+    depth = 0
+    s = expr.strip()
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")" and depth > 0:
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0:
+                rest = s[i:].lower()
+                hit = None
+                for op in ops:
+                    if rest.startswith(op):
+                        hit = op
+                        break
+                if hit is not None:
+                    lhs = s[:i].strip()
+                    rhs = s[i + len(hit) :].strip()
+                    if lhs and rhs:
+                        return lhs, hit, rhs
+                    return None
+        i += 1
+    return None
+
+
+def _negate_rel_op(op: str) -> Optional[str]:
+    m = {
+        ">=": "<",
+        "<=": ">",
+        ">": "<=",
+        "<": ">=",
+        "==": "/=",
+        "/=": "==",
+        ".ge.": ".lt.",
+        ".le.": ".gt.",
+        ".gt.": ".le.",
+        ".lt.": ".ge.",
+        ".eq.": ".ne.",
+        ".ne.": ".eq.",
+    }
+    return m.get(op.lower())
+
+
+def simplify_real_int_casts_in_mixed_expr(lines: List[str]) -> List[str]:
+    """Drop `real(int_expr, kind=dp|real64)` where mixed arithmetic already promotes.
+
+    Safe conservative cases:
+    - `REAL_TERM op real(INT_EXPR, kind=dp|real64)` -> `REAL_TERM op INT_EXPR`
+    - `real(INT_EXPR, kind=dp|real64) op REAL_TERM` -> `INT_EXPR op REAL_TERM`
+    with `op` in `+ - * /`, `INT_EXPR` provably integer, and opposite term
+    provably real-like.
+    """
+    out = list(lines)
+    unit_start_re = re.compile(
+        r"^\s*(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    declish_re = re.compile(
+        r"^\s*(?:implicit\b|use\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
+        re.IGNORECASE,
+    )
+    i = 0
+    while i < len(out):
+        if not unit_start_re.match(out[i].strip()):
+            i += 1
+            continue
+        u_start = i
+        j = i + 1
+        while j < len(out) and not unit_end_re.match(out[j].strip()):
+            j += 1
+        u_end = j
+
+        k = u_start + 1
+        while k < u_end and (not out[k].strip() or out[k].lstrip().startswith("!")):
+            k += 1
+        while k < u_end:
+            s = out[k].strip()
+            if not s or s.startswith("!") or declish_re.match(s):
+                k += 1
+                continue
+            break
+        exec_start = k
+
+        int_names: Set[str] = set()
+        real_names: Set[str] = set()
+        for di in range(u_start + 1, exec_start):
+            code, _comment = _split_code_comment(out[di].rstrip("\r\n"))
+            if "::" not in code:
+                continue
+            lhs, rhs = code.split("::", 1)
+            lhs_low = lhs.lower()
+            if re.match(r"^\s*integer\b", lhs_low):
+                for ent in _split_top_level_commas(rhs):
+                    m = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
+                    if m:
+                        int_names.add(m.group(1).lower())
+            elif re.match(r"^\s*real\b", lhs_low):
+                for ent in _split_top_level_commas(rhs):
+                    m = re.match(r"^\s*([a-z_]\w*)", ent, re.IGNORECASE)
+                    if m:
+                        real_names.add(m.group(1).lower())
+
+        if int_names:
+            cast_pat = (
+                r"real\s*\(\s*(?P<inner>.+?)\s*,\s*kind\s*=\s*(?:dp|real64)\s*\)"
+            )
+            div_rhs_pat = re.compile(
+                rf"(?P<lhs>.+?)\s*/\s*{cast_pat}",
+                re.IGNORECASE,
+            )
+            div_lhs_pat = re.compile(
+                rf"{cast_pat}\s*/\s*(?P<rhs>.+)",
+                re.IGNORECASE,
+            )
+            lhs_pat = re.compile(
+                rf"(?P<lhs>[a-z_]\w*(?:\s*\([^)]*\))?)\s*(?P<op>[+\-*/])\s*{cast_pat}",
+                re.IGNORECASE,
+            )
+            rhs_pat = re.compile(
+                rf"{cast_pat}\s*(?P<op>[+\-*/])\s*(?P<rhs>[a-z_]\w*(?:\s*\([^)]*\))?)",
+                re.IGNORECASE,
+            )
+            for li in range(exec_start, u_end):
+                raw = out[li]
+                eol = _line_eol(raw) or "\n"
+                code, comment = _split_code_comment(raw.rstrip("\r\n"))
+
+                def _repl_lhs(m: re.Match[str]) -> str:
+                    lhs = m.group("lhs")
+                    op = m.group("op")
+                    inner = m.group("inner").strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(lhs, real_names):
+                        return f"{lhs} {op} {inner}"
+                    return m.group(0)
+
+                def _repl_rhs(m: re.Match[str]) -> str:
+                    rhs = m.group("rhs")
+                    op = m.group("op")
+                    inner = m.group("inner").strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(rhs, real_names):
+                        return f"{inner} {op} {rhs}"
+                    return m.group(0)
+
+                def _repl_div_rhs(m: re.Match[str]) -> str:
+                    lhs = m.group("lhs").strip()
+                    inner = m.group("inner").strip()
+                    lhs_expr = lhs.rsplit("=", 1)[-1].strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(lhs_expr, real_names):
+                        return f"{lhs} / {inner}"
+                    return m.group(0)
+
+                def _repl_div_lhs(m: re.Match[str]) -> str:
+                    rhs = m.group("rhs").strip()
+                    inner = m.group("inner").strip()
+                    if _expr_is_declared_integer(inner, int_names) and _expr_is_real_like(rhs, real_names):
+                        return f"{inner} / {rhs}"
+                    return m.group(0)
+
+                new_code = div_rhs_pat.sub(_repl_div_rhs, code)
+                new_code = div_lhs_pat.sub(_repl_div_lhs, new_code)
+                new_code = lhs_pat.sub(_repl_lhs, new_code)
+                new_code = rhs_pat.sub(_repl_rhs, new_code)
+                out[li] = f"{new_code}{comment}{eol}"
+
+        i = u_end + 1
+    return out
+
+
+def _expr_is_real_like(expr: str, real_names: Set[str]) -> bool:
+    """Conservative real-typed heuristic for local expression fragments."""
+    s = expr.strip()
+    if not s:
+        return False
+    if re.search(r"\b\d+\.\d*(?:[de][+\-]?\d+)?(?:_dp)?\b", s, re.IGNORECASE):
+        return True
+    if re.search(r"\b\d+[de][+\-]?\d+(?:_dp)?\b", s, re.IGNORECASE):
+        return True
+    m = re.match(r"^[a-z_]\w*(?:\s*\([^)]*\))?$", s, re.IGNORECASE)
+    if m:
+        base = re.match(r"^([a-z_]\w*)", s, re.IGNORECASE)
+        if base and base.group(1).lower() in real_names:
+            return True
+    # Common real-valued intrinsic calls / constructors.
+    if re.search(
+        r"\b(?:real|sqrt|log|exp|sin|cos|tan|asin|acos|atan|minval|maxval|sum|mean|dot_product)\s*\(",
+        s,
+        re.IGNORECASE,
+    ):
+        return True
+    return False

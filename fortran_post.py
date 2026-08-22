@@ -1979,3 +1979,343 @@ def promote_pure_scalar_subroutines_to_elemental(lines: List[str]) -> List[str]:
         line = out[i]
         out[i] = re.sub(r"\bpure\s+subroutine\b", "elemental subroutine", line, count=1, flags=re.IGNORECASE)
     return out
+
+
+def fold_simple_integer_intrinsics(lines: List[str]) -> List[str]:
+    """Fold tiny integer-only intrinsic calls such as `max(0, 3)` -> `3`.
+
+    This intentionally handles only literal integer arguments so expressions
+    involving variables or array sizes keep their runtime checks.
+    """
+    out: List[str] = []
+    pat = re.compile(
+        r"\b(?P<fn>max|min)\s*\(\s*(?P<args>[+-]?\d+(?:\s*,\s*[+-]?\d+)+)\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _fold_code(code: str) -> str:
+        prev = None
+        cur = code
+        while prev != cur:
+            prev = cur
+
+            def _repl(m: re.Match[str]) -> str:
+                vals = [int(x.strip()) for x in m.group("args").split(",")]
+                fn = m.group("fn").lower()
+                return str(max(vals) if fn == "max" else min(vals))
+
+            cur = pat.sub(_repl, cur)
+        return cur
+
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_fold_code(code)}{comment}{eol}")
+    return out
+
+
+def remove_redundant_int_casts_of_integer_intrinsics(lines: List[str]) -> List[str]:
+    """Remove `int(f(...))` when intrinsic `f` already returns integer.
+
+    This pass is intentionally conservative:
+    - only rewrites `int(<known-integer-intrinsic>(...))`
+    - does not rewrite `int(..., kind=...)`, since that can be a kind conversion
+    - handles nested parentheses inside the intrinsic call arguments
+    """
+
+    integer_intrinsics = {
+        "bit_size",
+        "count",
+        "digits",
+        "iachar",
+        "ichar",
+        "index",
+        "kind",
+        "lbound",
+        "len",
+        "len_trim",
+        "maxexponent",
+        "maxloc",
+        "minexponent",
+        "minloc",
+        "radix",
+        "range",
+        "scan",
+        "selected_char_kind",
+        "selected_int_kind",
+        "selected_real_kind",
+        "shape",
+        "size",
+        "storage_size",
+        "ubound",
+        "verify",
+    }
+
+    def _matching_paren(text: str, open_idx: int) -> int | None:
+        depth = 0
+        quote: str | None = None
+        i = open_idx
+        while i < len(text):
+            ch = text[i]
+            if quote is not None:
+                if ch == quote:
+                    if quote == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    if quote == '"' and i + 1 < len(text) and text[i + 1] == '"':
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return None
+
+    def _top_level_has_comma(text: str) -> bool:
+        depth = 0
+        quote: str | None = None
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote is not None:
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in {"'", '"'}:
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return True
+            i += 1
+        return False
+
+    def _rewrite_code(code: str) -> str:
+        out_parts: List[str] = []
+        i = 0
+        int_call_re = re.compile(r"\bint\s*\(", re.IGNORECASE)
+        while i < len(code):
+            m = int_call_re.search(code, i)
+            if m is None:
+                out_parts.append(code[i:])
+                break
+            out_parts.append(code[i : m.start()])
+            int_open = code.find("(", m.start())
+            int_close = _matching_paren(code, int_open)
+            if int_close is None:
+                out_parts.append(code[m.start() :])
+                break
+            inner = code[int_open + 1 : int_close].strip()
+            if _top_level_has_comma(inner):
+                out_parts.append(code[m.start() : int_close + 1])
+                i = int_close + 1
+                continue
+            c_intr = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(", inner)
+            if c_intr is None or c_intr.group(1).lower() not in integer_intrinsics:
+                out_parts.append(code[m.start() : int_close + 1])
+                i = int_close + 1
+                continue
+            intr_open = inner.find("(", c_intr.start())
+            intr_close = _matching_paren(inner, intr_open)
+            if intr_close is None or inner[intr_close + 1 :].strip():
+                out_parts.append(code[m.start() : int_close + 1])
+                i = int_close + 1
+                continue
+            out_parts.append(inner)
+            i = int_close + 1
+        return "".join(out_parts)
+
+    out: List[str] = []
+    for raw in lines:
+        code, comment = xunused.split_code_comment(raw.rstrip("\r\n"))
+        eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+        out.append(f"{_rewrite_code(code)}{comment}{eol}")
+    return out
+
+
+def consolidate_use_only_imports(lines: List[str]) -> List[str]:
+    """Merge repeated `use mod, only: ...` statements within each spec part.
+
+    Intrinsic/non-intrinsic forms are kept separate, and the rewrite is scoped
+    to a single program/module/function/subroutine specification part.
+    """
+
+    out: List[str] = []
+    i_join = 0
+    while i_join < len(lines):
+        raw = lines[i_join]
+        code = fscan.strip_comment(raw).rstrip("\r\n")
+        if re.match(r"^\s*use\b", code, re.IGNORECASE) and code.rstrip().endswith("&"):
+            eol = xunused.get_eol(raw) or ("\n" if raw.endswith("\n") else "")
+            merged = code.rstrip()[:-1].rstrip()
+            j_join = i_join + 1
+            while j_join < len(lines):
+                cont_code = fscan.strip_comment(lines[j_join]).strip().rstrip("\r\n")
+                if cont_code.startswith("&"):
+                    cont_code = cont_code[1:].lstrip()
+                more = cont_code.rstrip().endswith("&")
+                if more:
+                    cont_code = cont_code.rstrip()[:-1].rstrip()
+                merged = f"{merged} {cont_code}".rstrip()
+                j_join += 1
+                if not more:
+                    break
+            out.append(f"{merged}{eol}")
+            i_join = j_join
+            continue
+        out.append(raw)
+        i_join += 1
+    unit_start_re = re.compile(
+        r"^\s*(?:module\s+[A-Za-z]\w*\b(?!\s*procedure\b)|program\s+[A-Za-z]\w*\b|"
+        r"(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\b)",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:module|program|function|subroutine)\b", re.IGNORECASE)
+    spec_stop_re = re.compile(
+        r"^\s*(?:contains\b|implicit\s+none\b|integer\b|real\b|logical\b|character\b|complex\b|"
+        r"type\s*\(|class\s*\(|procedure\b|parameter\b|save\b|dimension\b|external\b|"
+        r"intrinsic\b|data\b|common\b|equivalence\b)",
+        re.IGNORECASE,
+    )
+    use_only_re = re.compile(
+        r"^(?P<indent>\s*)use\s*(?P<attr>,\s*(?P<intrinsic>intrinsic|non_intrinsic)\s*)?"
+        r"(?:::)?\s*(?P<mod>[A-Za-z]\w*)\s*,\s*only\s*:\s*(?P<syms>.+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    def _split_syms(s: str) -> List[str]:
+        parts: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        in_s = False
+        in_d = False
+        for ch in s:
+            if ch == "'" and not in_d:
+                in_s = not in_s
+            elif ch == '"' and not in_s:
+                in_d = not in_d
+            elif not in_s and not in_d:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")" and depth > 0:
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    part = "".join(cur).strip()
+                    if part:
+                        parts.append(part)
+                    cur = []
+                    continue
+            cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _sym_key(sym: str) -> str:
+        return re.sub(r"\s+", "", sym).lower()
+
+    def _format_use(indent: str, intrinsic: str | None, mod: str, syms: List[str], eol: str) -> str:
+        if intrinsic:
+            return f"{indent}use, {intrinsic} :: {mod}, only: {', '.join(syms)}{eol}"
+        return f"{indent}use {mod}, only: {', '.join(syms)}{eol}"
+
+    i = 0
+    while i < len(out):
+        if unit_start_re.match(fscan.strip_comment(out[i]).strip()) is None:
+            i += 1
+            continue
+        unit_start = i
+        unit_end = len(out)
+        j = i + 1
+        while j < len(out):
+            if unit_end_re.match(fscan.strip_comment(out[j]).strip()):
+                unit_end = j
+                break
+            j += 1
+
+        spec_end = unit_end
+        k = unit_start + 1
+        while k < unit_end:
+            code_k = fscan.strip_comment(out[k]).strip()
+            if not code_k:
+                k += 1
+                continue
+            if use_only_re.match(code_k):
+                k += 1
+                continue
+            if spec_stop_re.match(code_k):
+                spec_end = k
+            break
+
+        groups: dict[tuple[str | None, str], dict[str, object]] = {}
+        remove: set[int] = set()
+        for k in range(unit_start + 1, spec_end):
+            code, _comment = xunused.split_code_comment(out[k].rstrip("\r\n"))
+            m = use_only_re.match(code)
+            if m is None:
+                continue
+            intrinsic = m.group("intrinsic")
+            intrinsic_key = intrinsic.lower() if intrinsic else None
+            mod = m.group("mod")
+            key = (intrinsic_key, mod.lower())
+            syms = _split_syms(m.group("syms"))
+            if not syms:
+                continue
+            if key not in groups:
+                groups[key] = {
+                    "line": k,
+                    "indent": m.group("indent"),
+                    "intrinsic": intrinsic_key,
+                    "mod": mod,
+                    "syms": [],
+                    "seen": set(),
+                }
+            else:
+                remove.add(k)
+            g = groups[key]
+            seen = g["seen"]
+            assert isinstance(seen, set)
+            out_syms = g["syms"]
+            assert isinstance(out_syms, list)
+            for sym in syms:
+                sk = _sym_key(sym)
+                if sk in seen:
+                    continue
+                seen.add(sk)
+                out_syms.append(sym)
+
+        for g in groups.values():
+            line = g["line"]
+            assert isinstance(line, int)
+            if not any(idx in remove for idx in range(unit_start + 1, spec_end)):
+                continue
+            eol = xunused.get_eol(out[line]) or ("\n" if out[line].endswith("\n") else "")
+            out[line] = _format_use(
+                str(g["indent"]),
+                g["intrinsic"] if isinstance(g["intrinsic"], str) else None,
+                str(g["mod"]),
+                g["syms"] if isinstance(g["syms"], list) else [],
+                eol,
+            )
+
+        if remove:
+            out = [ln for idx, ln in enumerate(out) if idx not in remove]
+            i = unit_start + 1
+        else:
+            i = unit_end + 1
+    return out
