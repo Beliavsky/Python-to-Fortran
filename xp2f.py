@@ -2663,40 +2663,71 @@ def simplify_allocate_default_lower_bounds(lines):
 
 
 def simplify_redundant_int_casts(lines):
-    """Remove `int(...)` when argument is already an integer literal/symbol."""
-    int_names = set()
+    """Remove `int(...)` when argument is already an integer literal/symbol.
+
+    Scoped per program/function/subroutine unit: the same name (e.g. a
+    dummy argument) can be declared integer in one procedure and real in
+    another, so a whole-file `int_names` set would wrongly strip a
+    genuinely-needed `int(x)` cast at a call site where `x` is real just
+    because some *other* unit happens to declare a same-named integer.
+    """
     decl_re = re.compile(r"^\s*integer\b[^!]*::\s*([^!]+)$", flags=re.IGNORECASE)
     name_re = re.compile(r"^[A-Za-z_]\w*$")
-
-    for ln in lines:
-        code = ln.split("!", 1)[0]
-        m = decl_re.match(code)
-        if not m:
-            continue
-        rhs = m.group(1)
-        for part in rhs.split(","):
-            tok = part.strip()
-            if not tok:
-                continue
-            tok = tok.split("=", 1)[0].strip()
-            tok = re.sub(r"\(.*\)$", "", tok).strip()
-            if name_re.match(tok):
-                int_names.add(tok.lower())
-
-    out = []
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
     pat_lit = re.compile(r"\bint\(\s*([+-]?\d+)\s*\)", flags=re.IGNORECASE)
     pat_sym = re.compile(r"\bint\(\s*([A-Za-z_]\w*)\s*\)", flags=re.IGNORECASE)
-    for ln in lines:
-        code, bang, comment = ln.partition("!")
-        code = pat_lit.sub(r"\1", code)
-        code = pat_sym.sub(
-            lambda m: m.group(1) if m.group(1).lower() in int_names else m.group(0),
-            code,
-        )
-        if bang:
-            out.append(code + bang + comment)
-        else:
-            out.append(code)
+
+    def _collect_int_names(unit_lines):
+        int_names = set()
+        for ln in unit_lines:
+            code = ln.split("!", 1)[0]
+            m = decl_re.match(code)
+            if not m:
+                continue
+            rhs = m.group(1)
+            for part in rhs.split(","):
+                tok = part.strip()
+                if not tok:
+                    continue
+                tok = tok.split("=", 1)[0].strip()
+                tok = re.sub(r"\(.*\)$", "", tok).strip()
+                if name_re.match(tok):
+                    int_names.add(tok.lower())
+        return int_names
+
+    def _rewrite_unit(unit_lines, int_names):
+        out = []
+        for ln in unit_lines:
+            code, bang, comment = ln.partition("!")
+            code = pat_lit.sub(r"\1", code)
+            code = pat_sym.sub(
+                lambda m: m.group(1) if m.group(1).lower() in int_names else m.group(0),
+                code,
+            )
+            out.append(code + bang + comment if bang else code)
+        return out
+
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not unit_start_re.match(lines[i].split("!", 1)[0]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not unit_end_re.match(lines[j].split("!", 1)[0]):
+            j += 1
+        end = min(j + 1, n)
+        unit_lines = lines[i:end]
+        int_names = _collect_int_names(unit_lines)
+        out.extend(_rewrite_unit(unit_lines, int_names))
+        i = end
     return out
 
 
