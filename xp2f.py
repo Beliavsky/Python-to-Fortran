@@ -3891,6 +3891,323 @@ def mark_recursive_procedures(lines):
     return out
 
 
+def reorder_arg_decls_before_locals(lines):
+    """Group dummy-argument declarations (those with `intent(...)`) before
+    local-variable declarations within each procedure's declaration
+    section, e.g. so `_opt` locals materialized for optional arguments
+    don't end up sandwiched between the intent(in) and intent(out) groups.
+
+    `use` statements and named-constant (`parameter`) declarations keep
+    their existing relative order ahead of everything else: an argument's
+    shape expression can reference a parameter (e.g. `x(n)` with
+    `integer, parameter :: n = ...`), and Fortran requires that parameter
+    to be declared first, so parameters are never reordered past argument
+    or local declarations -- only args and locals are separated from each
+    other. A standalone comment/blank run is kept attached to whichever
+    declaration follows it (or, if nothing follows, stays put at the end
+    of the declaration section), so a docstring right after the signature
+    -- which precedes the first `use`/declaration entirely -- is untouched.
+    """
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+    declish_re = re.compile(
+        r"^\s*(?:use\b|implicit\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
+        re.IGNORECASE,
+    )
+    use_re = re.compile(r"^\s*use\b", re.IGNORECASE)
+    param_re = re.compile(r"^\s*[^:!]*\bparameter\b", re.IGNORECASE)
+    intent_re = re.compile(r"\bintent\s*\(", re.IGNORECASE)
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not unit_start_re.match(lines[i].split("!", 1)[0]):
+            out.append(lines[i])
+            i += 1
+            continue
+        sig_end = i + 1
+        while sig_end < n and _ends_continued(lines[sig_end - 1]):
+            sig_end += 1
+        j = sig_end
+        while j < n and not unit_end_re.match(lines[j].split("!", 1)[0]):
+            j += 1
+        end = min(j + 1, n)
+
+        body = lines[sig_end:j]
+
+        m = 0
+        decl_end = 0
+        while m < len(body):
+            code = body[m].split("!", 1)[0].strip()
+            if not code:
+                m += 1
+                continue
+            if not declish_re.match(code):
+                break
+            m += 1
+            while m < len(body) and _ends_continued(body[m - 1]):
+                m += 1
+            decl_end = m
+        decl_lines = body[:decl_end]
+
+        records = []
+        prefix = []
+        idx = 0
+        while idx < len(decl_lines):
+            code = decl_lines[idx].split("!", 1)[0].strip()
+            if not code:
+                prefix.append(decl_lines[idx])
+                idx += 1
+                continue
+            stmt = [decl_lines[idx]]
+            while _ends_continued(decl_lines[idx]) and idx + 1 < len(decl_lines):
+                idx += 1
+                stmt.append(decl_lines[idx])
+            records.append((prefix, stmt, code))
+            prefix = []
+            idx += 1
+        trailing_prefix = prefix
+
+        use_group, param_group, arg_group, local_group = [], [], [], []
+        for rec_prefix, stmt, code in records:
+            if use_re.match(code):
+                bucket = use_group
+            elif param_re.match(code):
+                bucket = param_group
+            elif intent_re.search(code):
+                bucket = arg_group
+            else:
+                bucket = local_group
+            bucket.extend(rec_prefix)
+            bucket.extend(stmt)
+
+        new_decl_lines = use_group + param_group + arg_group + local_group + trailing_prefix
+        out.extend(lines[i:sig_end])
+        out.extend(new_decl_lines)
+        out.extend(body[decl_end:])
+        out.extend(lines[j:end])
+        i = end
+    return out
+
+
+def coalesce_nonadjacent_declarations(lines, max_len=10**9):
+    """Merge declaration statements with identical type-spec within one
+    procedure's declaration section, even when they are not adjacent --
+    only separated by other, differently-typed declarations (e.g.
+    alternating `integer ::` / `real(kind=dp) ::` locals) -- and
+    regardless of how many entities each already declares or each
+    entity's own array shape, since that's per-entity in Fortran
+    (`real(kind=dp), allocatable :: a(:), b(:,:), c` is valid).
+    fortran_scan.coalesce_simple_declarations only merges immediately-
+    adjacent, single-entity, matching-shape lines; this runs first and
+    covers the common remaining case, scoped per procedure so
+    declarations from different functions can never be merged together.
+
+    Same conservative rule as coalesce_simple_declarations: skips any
+    statement with an inline comment or an initialized entity (`= ...`).
+    """
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    declish_re = re.compile(
+        r"^\s*(?:use\b|implicit\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
+        re.IGNORECASE,
+    )
+    decl_re = re.compile(r"^(\s*)([^:]+?)\s*::\s*(.+)$", re.IGNORECASE)
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def entity_has_parens_suffix(entity):
+        return "(" in entity
+
+    def _split_entities(text):
+        parts = []
+        depth = 0
+        cur = []
+        for ch in text:
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+            elif ch == ")":
+                depth -= 1
+                cur.append(ch)
+            elif ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _parse_stmt(stmt_lines):
+        # stmt_lines: one or more physical lines forming one (possibly
+        # "&"-continued) declaration statement. Returns None if any line
+        # carries an inline comment, or the statement isn't a plain
+        # `spec :: entity, entity, ...` declaration with no initializers.
+        joined_parts = []
+        for k, ln in enumerate(stmt_lines):
+            code, bang, _comment = ln.rstrip("\r\n").partition("!")
+            if bang:
+                return None
+            code = code.strip()
+            if k > 0 and code.startswith("&"):
+                code = code[1:].strip()
+            if code.endswith("&"):
+                code = code[:-1].rstrip()
+            joined_parts.append(code)
+        joined = " ".join(p for p in joined_parts if p)
+        if re.match(r"^\s*use\b", joined, re.IGNORECASE):
+            # `use mod, only: a, b` also contains "::" but isn't a
+            # type declaration -- its comma list is imported symbols, not
+            # declarable entities, and must never be merged with another
+            # use statement (let alone a real declaration).
+            return None
+        m = decl_re.match(joined)
+        if not m:
+            return None
+        indent = stmt_lines[0][: len(stmt_lines[0]) - len(stmt_lines[0].lstrip())]
+        spec = m.group(2).strip()
+        entities = _split_entities(m.group(3).strip())
+        if not entities or any("=" in e for e in entities):
+            return None
+        return indent, spec, entities
+
+    def _coalesce_section(decl_lines):
+        # Group decl_lines into records: a "stmt" record is one (possibly
+        # multi-line, "&"-continued) declaration statement; anything else
+        # (blank lines, whole-line comments) is a "keep" record passed
+        # through untouched, in its original position.
+        records = []
+        idx = 0
+        n_decl = len(decl_lines)
+        while idx < n_decl:
+            ln = decl_lines[idx]
+            code_only = ln.rstrip("\r\n").partition("!")[0]
+            if not code_only.strip():
+                records.append(("keep", [ln]))
+                idx += 1
+                continue
+            stmt_lines = [ln]
+            while _ends_continued(ln) and idx + 1 < n_decl:
+                idx += 1
+                ln = decl_lines[idx]
+                stmt_lines.append(ln)
+            records.append(("stmt", stmt_lines))
+            idx += 1
+
+        groups = {}
+        for ridx, (kind, stmt_lines) in enumerate(records):
+            if kind != "stmt":
+                continue
+            parsed = _parse_stmt(stmt_lines)
+            if parsed is None:
+                continue
+            indent, spec, entities = parsed
+            # Merge arrays with other arrays (any rank -- shape is
+            # per-entity) and scalars with other scalars, but never mix
+            # the two on one line: a dummy-argument list reads better with
+            # `x(:)` kept apart from `scale, shift`, even though Fortran
+            # itself would allow combining them. A statement whose own
+            # entities already mix scalars and arrays is left untouched
+            # rather than split apart.
+            is_array = [entity_has_parens_suffix(e) for e in entities]
+            if any(is_array) and not all(is_array):
+                continue
+            key = (indent, spec.lower(), is_array[0] if is_array else False)
+            eol = _line_eol(stmt_lines[-1])
+            g = groups.setdefault(key, {"indent": indent, "spec": spec, "names": [], "first_ridx": ridx, "eol": eol, "parsed_ridxs": []})
+            g["names"].extend(entities)
+            g["parsed_ridxs"].append(ridx)
+
+        merge_target = {}
+        for g in groups.values():
+            if len(g["names"]) <= 1:
+                continue
+            for ridx in g["parsed_ridxs"]:
+                merge_target[ridx] = g
+
+        out = []
+        for ridx, (kind, stmt_lines) in enumerate(records):
+            g = merge_target.get(ridx)
+            if g is None:
+                out.extend(stmt_lines)
+                continue
+            if ridx != g["first_ridx"]:
+                continue
+            indent, spec, names, eol = g["indent"], g["spec"], g["names"], g["eol"]
+            merged = f"{indent}{spec} :: {', '.join(names)}"
+            if len(merged) <= max_len:
+                out.append(f"{merged}{eol}")
+                continue
+            first = f"{indent}{spec} :: {names[0]}, &"
+            if len(first) <= max_len:
+                out.append(f"{first}{eol}")
+                start_idx = 1
+            else:
+                out.append(f"{indent}{spec} :: &{eol}")
+                start_idx = 0
+            for k in range(start_idx, len(names)):
+                is_last = k == len(names) - 1
+                out.append(f"{indent}   & {names[k]}{'' if is_last else ', &'}{eol}")
+        return out
+
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not unit_start_re.match(lines[i].split("!", 1)[0]):
+            out.append(lines[i])
+            i += 1
+            continue
+        sig_end = i + 1
+        while sig_end < n and _ends_continued(lines[sig_end - 1]):
+            sig_end += 1
+        j = sig_end
+        while j < n and not unit_end_re.match(lines[j].split("!", 1)[0]):
+            j += 1
+        end = min(j + 1, n)
+
+        body = lines[sig_end:j]
+        m = 0
+        decl_end = 0
+        while m < len(body):
+            code = body[m].split("!", 1)[0].strip()
+            if not code:
+                m += 1
+                continue
+            if not declish_re.match(code):
+                break
+            m += 1
+            while m < len(body) and _ends_continued(body[m - 1]):
+                m += 1
+            decl_end = m
+        decl_lines = body[:decl_end]
+
+        out.extend(lines[i:sig_end])
+        out.extend(_coalesce_section(decl_lines))
+        out.extend(body[decl_end:])
+        out.extend(lines[j:end])
+        i = end
+    return out
+
+
 def build_numpy_split_mapping(arr_expr, arr_rank, func_attr, split_node=None, axis_node=None):
     """Build compile-time slice aliases for NumPy split-family helpers."""
     if arr_rank <= 0:
@@ -47609,6 +47926,8 @@ def transpile_file(
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
     f90_lines = mark_recursive_procedures(f90_lines)
+    f90_lines = reorder_arg_decls_before_locals(f90_lines)
+    f90_lines = coalesce_nonadjacent_declarations(f90_lines, max_len=10**9)
     f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
     f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
     if postprocess:

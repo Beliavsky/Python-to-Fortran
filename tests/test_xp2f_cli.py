@@ -26,6 +26,30 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+def _join_fortran_continuations(text: str) -> str:
+    """Join "&"-continued declaration (or other) statements back onto one
+    logical line, so simple substring/per-line assertions don't need to
+    know whether xp2f's declaration-coalescing passes merged several
+    names onto a line long enough to trigger line-wrapping."""
+    out_lines = []
+    pending = None
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        cont = stripped[1:].strip() if stripped.startswith("&") else stripped
+        if pending is not None:
+            pending = f"{pending} {cont}"
+        else:
+            pending = raw
+        if pending.rstrip().endswith("&"):
+            pending = pending.rstrip()[:-1].rstrip()
+            continue
+        out_lines.append(pending)
+        pending = None
+    if pending is not None:
+        out_lines.append(pending)
+    return "\n".join(out_lines)
+
+
 def _run_xp2f_compile(tmp_path: Path, example_name: str) -> subprocess.CompletedProcess[str]:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     local_input = tmp_path / example_name
@@ -604,12 +628,15 @@ def test_xp2f_axis_reduction_temporaries_promote_to_vectors(tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     out_text = (tmp_path / "xaxis_reduce_small_p.f90").read_text(encoding="utf-8")
-    # Declarations of the same type/rank may be coalesced onto one line
-    # (e.g. "real(kind=dp), allocatable :: nk(:), amax(:), log_norm(:)"),
-    # so check each name is declared real(kind=dp) allocatable rank-1
-    # rather than requiring it alone on its own declaration line.
+    # Declarations of the same type/rank may be coalesced onto one line,
+    # and (mixed-rank) possibly line-wrapped with "&" continuations if
+    # that line got long (e.g.
+    # "real(kind=dp), allocatable :: nk(:), amax(:), log_norm(:), &\n
+    # & log_prob(:,:), resp(:,:), s(:)"), so join continuations first and
+    # check each name is declared real(kind=dp) allocatable rank-1 rather
+    # than requiring it alone on its own declaration line.
     rank1_real_alloc_names = set()
-    for line in out_text.splitlines():
+    for line in _join_fortran_continuations(out_text).splitlines():
         line = line.strip()
         if not line.startswith("real(kind=dp), allocatable ::"):
             continue
@@ -981,7 +1008,13 @@ def test_xp2f_runs_direct_numpy_array_import_with_integer_norm(tmp_path: Path) -
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xnorm_direct_import_p.f90").read_text(encoding="utf-8")
-    assert "integer, allocatable :: arr2(:,:)" in out_text
+    # arr1 and arr2 are both integer, allocatable (different rank), so
+    # xp2f's declaration-coalescing pass may merge them onto one line.
+    joined = _join_fortran_continuations(out_text)
+    assert any(
+        line.strip().startswith("integer, allocatable ::") and "arr2(:,:)" in line
+        for line in joined.splitlines()
+    )
     assert "real(arr1, kind=dp)" in out_text
     assert "real(arr2, kind=dp)" in out_text
 
@@ -1519,8 +1552,17 @@ def test_xp2f_compiles_count_mapped_integer_outputs_as_allocatable(tmp_path: Pat
     out_f90 = tmp_path / "xprime_factor_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "integer, allocatable, intent(out) :: factors(:)" in out_text
-    assert "integer, allocatable, intent(out) :: powers(:)" in out_text
+    # factors and powers are both integer, allocatable, intent(out), so
+    # xp2f's declaration-coalescing pass may merge them onto one line.
+    joined = _join_fortran_continuations(out_text)
+    assert any(
+        line.strip().startswith("integer, allocatable, intent(out) ::") and "factors(:)" in line
+        for line in joined.splitlines()
+    )
+    assert any(
+        line.strip().startswith("integer, allocatable, intent(out) ::") and "powers(:)" in line
+        for line in joined.splitlines()
+    )
 
 
 def test_xp2f_compiles_fstring_listcomp_over_range(tmp_path: Path) -> None:
@@ -3468,9 +3510,13 @@ def test_xp2f_keeps_nested_integer_array_state_in_local_tuple_subroutine(tmp_pat
     out_f90 = tmp_path / "xnested_int_state_tuple_p.f90"
     out_text = out_f90.read_text(encoding="utf-8")
     assert "integer, intent(inout) :: a(:)" in out_text
-    # h and t are both scalar integer, intent(in) dummy args, so xp2f's
-    # declaration-coalescing pass merges them onto one line.
-    assert "integer, intent(in) :: h, t" in out_text
+    # n, h and t are all scalar integer, intent(in) dummy args, so xp2f's
+    # declaration-coalescing pass merges them onto one line together.
+    joined = _join_fortran_continuations(out_text)
+    assert any(
+        line.strip().startswith("integer, intent(in) ::") and "h" in line and "t" in line
+        for line in joined.splitlines()
+    )
     assert "integer, allocatable, intent(out) :: step_out_1(:)" in out_text
     assert "integer, intent(out) :: step_out_3, step_out_4" in out_text
 
