@@ -2080,7 +2080,7 @@ def rename_conflicting_identifiers(src_text):
         "contains", "use", "implicit", "none", "integer", "real", "logical", "complex",
         "parameter", "allocatable", "intent", "in", "out", "inout", "call", "return",
         "stop", "select", "case", "where", "forall", "block", "interface", "type",
-        "public", "private", "only",
+        "public", "private", "only", "dimension",
         # readability
         "l",
         # common intrinsics that often collide with variable names
@@ -2244,6 +2244,7 @@ def rename_conflicting_identifiers(src_text):
             return spans
 
         str_spans = _string_literal_spans(code)
+        is_decl_line = bool(decl_re.match(code))
 
         def _in_string_literal(pos):
             return any(s0 <= pos < s1 for s0, s1 in str_spans)
@@ -2264,9 +2265,13 @@ def rename_conflicting_identifiers(src_text):
                     r"^\s*\)", tail
                 ):
                     return nm
-            # Keep function/intrinsic call forms untouched.
+            # Keep function/intrinsic call forms untouched -- but only
+            # outside a declaration line, where `name(` is always a
+            # dimension/shape spec (e.g. `mean(:,:)`), never a call, and
+            # would otherwise wrongly be left unrenamed while every other
+            # reference to the same declared array does get renamed.
             tail = code[m.end() :]
-            if re.match(r"^\s*\(", tail) and nm.lower() in callable_forbidden:
+            if not is_decl_line and re.match(r"^\s*\(", tail) and nm.lower() in callable_forbidden:
                 return nm
             return new
 
@@ -3401,17 +3406,27 @@ def remove_unused_named_constants(lines):
         if cand_line_by_name:
             reads = {nm: 0 for nm in cand_line_by_name}
             cand_lines = set(cand_line_by_name.values())
+            line_self_name = {kline: nm for nm, kline in cand_line_by_name.items()}
             for k in range(u0, u1 + 1):
-                if k in cand_lines:
-                    continue
                 code = out[k].split("!", 1)[0]
                 if not code.strip():
                     continue
+                # A candidate's own declaration line must still be scanned --
+                # its RHS may reference ANOTHER candidate constant (a chained
+                # definition like `b = a + 1`), and that reference is a real
+                # use. Only the name being DECLARED on this line is excluded,
+                # so a parameter doesn't count as "used" purely by naming
+                # itself on its own declaration line.
+                self_name = line_self_name.get(k)
                 for tok in tok_re.findall(code):
                     tl = tok.lower()
+                    if tl == self_name:
+                        continue
                     if tl in reads:
                         reads[tl] += 1
                 for nm in reads:
+                    if nm == self_name:
+                        continue
                     if re.search(rf"_{re.escape(nm)}\b", code, flags=re.IGNORECASE):
                         reads[nm] += 1
             for nm, cnt in reads.items():
@@ -10562,6 +10577,182 @@ def normalize_globals_membership_state(exec_body, local_funcs):
         new_body = init_flags + new_body
     exec_body[:] = new_body
     ast.fix_missing_locations(ast.Module(body=exec_body, type_ignores=[]))
+
+
+def inline_simple_value_returning_local_functions(exec_body, local_funcs):
+    """Inline a local function at each `target = func(args...)` call site
+    when its body is straight-line code (plain assignments, no control
+    flow) ending in a single `return EXPR` -- e.g. a small helper that
+    just builds and returns a value (a dict, a DataFrame, ...).
+
+    This exists so a helper's return value never has to be threaded
+    through an actual Fortran function-call boundary: after inlining,
+    `return EXPR` becomes `target = EXPR` at the call site, which the
+    rest of the pipeline already knows how to translate via its normal
+    assignment-statement codegen -- including return shapes (like a
+    pandas DataFrame built from a dict literal) that this transpiler
+    otherwise has no way to carry through a function's return type.
+
+    Conservative: only plain positional calls (no *args/**kwargs on the
+    function, no keyword arguments at the call site), only straight-line
+    `ast.Assign` statements ahead of the trailing return (no if/for/
+    while/try -- those can affect control flow in ways that aren't safe
+    to just splice in verbatim), and skips a function calling itself
+    (would recurse the inliner forever). Safe to duplicate the body per
+    call site since eligible functions can't have side effects beyond
+    their own local assignments (no print/write, no mutation of args).
+    """
+    eligible = {}
+    for fn in local_funcs or []:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        if fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs or fn.args.posonlyargs:
+            continue
+        if fn.decorator_list:
+            continue
+        body = [
+            st for st in fn.body
+            if not (
+                isinstance(st, ast.Expr)
+                and isinstance(st.value, ast.Constant)
+                and isinstance(st.value.value, str)
+            )
+        ]
+        if not body or not isinstance(body[-1], ast.Return) or body[-1].value is None:
+            continue
+        # Every leading statement must be a plain `name = expr` assignment
+        # -- never a subscript/attribute/tuple target. A subscript-assign
+        # like `p[0] = ...` mutates a specific element of an already-shaped
+        # array in place; duplicating and renaming that at each call site
+        # requires the renamed array to be correctly (re)shaped first, and
+        # this transpiler's rank/shape inference for a synthesized name
+        # doesn't reliably re-derive that -- it's what caused an inlined
+        # `ma_inl1` to end up declared rank-1 while allocated rank-2.
+        if any(
+            not (
+                isinstance(st, ast.Assign)
+                and len(st.targets) == 1
+                and isinstance(st.targets[0], ast.Name)
+            )
+            for st in body[:-1]
+        ):
+            continue
+        has_side_effect = any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id in {"print", "write", "open"}
+            for st in body
+            for n in ast.walk(st)
+        )
+        if has_side_effect:
+            continue
+        param_names = [a.arg for a in fn.args.args]
+        eligible[fn.name] = (param_names, body)
+
+    if not eligible:
+        return
+
+    counter = [0]
+
+    def _inline_one(target_node, fname, call_args):
+        param_names, body = eligible[fname]
+        if len(call_args) != len(param_names):
+            return None
+        counter[0] += 1
+        suffix = f"_inl{counter[0]}"
+        local_names = set()
+        for st in body[:-1]:
+            for tgt in st.targets:
+                for n in ast.walk(tgt):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                        local_names.add(n.id)
+        mapping = dict(zip(param_names, call_args))
+        local_rename = {nm: f"{nm}{suffix}" for nm in local_names}
+
+        class _Subst(ast.NodeTransformer):
+            def visit_Name(_self, node):
+                if isinstance(node.ctx, ast.Load) and node.id in mapping:
+                    return copy.deepcopy(mapping[node.id])
+                if node.id in local_rename:
+                    new_node = ast.Name(id=local_rename[node.id], ctx=node.ctx)
+                    return ast.copy_location(new_node, node)
+                return node
+
+        new_body = [copy.deepcopy(st) for st in body]
+        subst = _Subst()
+        new_body = [subst.visit(st) for st in new_body]
+        for st in new_body:
+            ast.fix_missing_locations(st)
+        ret_expr = new_body[-1].value
+        assign_stmt = ast.Assign(targets=[copy.deepcopy(target_node)], value=ret_expr)
+        ast.copy_location(assign_stmt, target_node)
+        ast.fix_missing_locations(assign_stmt)
+        return new_body[:-1] + [assign_stmt]
+
+    def _make_inliner(exclude_name=None):
+        class _Inliner(ast.NodeTransformer):
+            def visit_Assign(self, node):
+                self.generic_visit(node)
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in eligible
+                    and node.value.func.id != exclude_name
+                    and not node.value.keywords
+                ):
+                    result = _inline_one(node.targets[0], node.value.func.id, node.value.args)
+                    if result is not None:
+                        return result
+                return node
+
+        return _Inliner()
+
+    def _run(stmt_list, exclude_name=None):
+        inliner = _make_inliner(exclude_name)
+        new_stmts = []
+        for st in stmt_list:
+            result = inliner.visit(st)
+            if isinstance(result, list):
+                new_stmts.extend(result)
+            elif result is not None:
+                new_stmts.append(result)
+        stmt_list[:] = new_stmts
+
+    _run(exec_body)
+    for fn in local_funcs or []:
+        if isinstance(fn, ast.FunctionDef):
+            _run(fn.body, exclude_name=fn.name)
+
+    # Drop any eligible function that's now fully inlined away (no call
+    # sites left anywhere). Done directly here, rather than leaving it to
+    # prune_unreachable_local_functions: that pass conservatively keeps
+    # *everything* when it finds zero call references at all -- which is
+    # exactly what happens once the one function a file calls has been
+    # completely inlined, so it would never actually get pruned.
+    if local_funcs:
+        # Any Name reference at all, not just a direct Call -- a function
+        # can be passed by reference as a callback argument (e.g.
+        # `pass_func(twice, x)`), which never appears as `twice(...)`.
+        still_called = set()
+        for st in exec_body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name):
+                    still_called.add(n.id)
+        for fn in local_funcs:
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for st in fn.body:
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Name):
+                        still_called.add(n.id)
+        fully_inlined = set(eligible) - still_called
+        if fully_inlined:
+            local_funcs[:] = [
+                fn for fn in local_funcs
+                if not (isinstance(fn, ast.FunctionDef) and fn.name in fully_inlined)
+            ]
 
 
 def normalize_simple_record_output_helpers(exec_body, local_funcs):
@@ -28759,13 +28950,13 @@ class translator(ast.NodeVisitor):
             if isinstance(v, ast.Name):
                 base = self.expr(v)
                 for j, nm in enumerate(outs):
-                    self.o.w(f"{nm} = {base}({j + 1})")
+                    self.o.w(f"{self._aliased_name(nm)} = {base}({j + 1})")
                 return
             if isinstance(v, ast.Attribute) and v.attr == "shape":
                 base = self.expr(v.value)
                 for j, nm in enumerate(outs):
                     self._mark_int(nm)
-                    self.o.w(f"{nm} = size({base},{j + 1})")
+                    self.o.w(f"{self._aliased_name(nm)} = size({base},{j + 1})")
                 return
             if (
                 isinstance(v, ast.Call)
@@ -28778,11 +28969,11 @@ class translator(ast.NodeVisitor):
                 base = self.expr(v.args[0])
                 for j, nm in enumerate(outs):
                     self._mark_int(nm)
-                    self.o.w(f"{nm} = size({base},{j + 1})")
+                    self.o.w(f"{self._aliased_name(nm)} = size({base},{j + 1})")
                 return
             if isinstance(v, (ast.Tuple, ast.List)) and len(v.elts) == len(outs):
                 for nm, ve in zip(outs, v.elts):
-                    self.o.w(f"{nm} = {self.expr(ve)}")
+                    self.o.w(f"{self._aliased_name(nm)} = {self.expr(ve)}")
                 return
 
         # ignore module-level param assignment already emitted as parameter
@@ -46686,7 +46877,7 @@ def generate_flat(
         om.w("private")
         om.w("integer, parameter :: sp = real32")
         om.w("integer, parameter :: dp = real64")
-        for name, val in sorted(params.items()):
+        for name, val in params.items():  # insertion order = dependency order
             om.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
         for _gnm in sorted(module_global_decls):
             _gk, _gr = module_global_decls[_gnm]
@@ -47087,7 +47278,7 @@ def generate_flat(
     if not use_proc_module:
         _emit_type_defs(o)
 
-    for name, val in sorted(params.items()):
+    for name, val in params.items():  # insertion order = dependency order
         o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
 
     tr = translator(
@@ -47631,7 +47822,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     o.push()
     o.w(f"use main_mod, only: {run_name}")
     o.w("implicit none")
-    for name, val in sorted(params.items()):
+    for name, val in params.items():  # insertion order = dependency order
         o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
     o.w("")
     if rng_replay_path:
@@ -48330,6 +48521,8 @@ def transpile_file(
             and not is_main_guard_if(s)
         ]
 
+    local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
+    inline_simple_value_returning_local_functions(effective_tree.body, local_funcs)
     local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
 
     # Normalize mixed-type branch-merge prints (e.g. y changes type in if/elif/else
