@@ -248,7 +248,7 @@ def test_xp2f_compiles_print_of_np_random_uniform_expr(tmp_path: Path) -> None:
     out_f90 = tmp_path / "xprint_uniform_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "runif(int(3))" in out_text
+    assert "runif(3)" in out_text
 
 
 def test_xp2f_multiarg_print_inserts_default_space_separator(tmp_path: Path) -> None:
@@ -4021,6 +4021,52 @@ def test_xp2f_slices_negative_lower_bound_on_char_scalar_argument(tmp_path: Path
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_does_not_duplicate_local_function_comments_into_main_body(tmp_path: Path) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xcomment_dup_repro.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "",
+                "def helper(x):",
+                "    # step one",
+                "    y = x * 2",
+                "    # step two",
+                "    z = y + 1",
+                "    return z",
+                "",
+                "",
+                "# top level marker comment",
+                "result = helper(3)",
+                "print(result)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out_text = (tmp_path / "xcomment_dup_repro_p.f90").read_text(encoding="utf-8")
+    # `helper`'s own comments belong inside its module procedure body only --
+    # they must not also leak into the top-level program body (a bug where
+    # generate_flat's comment_map filtering didn't know about local_funcs'
+    # line ranges once they were pulled out of the top-level tree).
+    assert out_text.count("! step one") == 1
+    assert out_text.count("! step two") == 1
+    assert out_text.count("! top level marker comment") == 1
 
 
 _PANDAS_TEST_CSV_ROWS = [

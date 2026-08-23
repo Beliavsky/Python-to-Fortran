@@ -1610,12 +1610,24 @@ def extract_python_comments(src_text):
     return out
 
 
-def _comment_map_for_top_level(tree, comment_map):
-    """Keep only comments that are not inside nested def/class bodies."""
+def _comment_map_for_top_level(tree, comment_map, extra_def_nodes=None):
+    """Keep only comments that are not inside nested def/class bodies.
+
+    `extra_def_nodes` covers callers (e.g. generate_flat) whose `tree` has
+    already had its module-level function defs pulled out into a separate
+    `local_funcs` list -- without their line ranges here too, `blocked`
+    would stay empty for them and the (lo, hi) fallback window below would
+    span the whole file (since an import statement's line 1-2 drags `lo`
+    down), letting every comment inside those function bodies leak through
+    as if it were top-level.
+    """
     if not comment_map:
         return {}
     blocked = set()
-    for n in getattr(tree, "body", []):
+    def_nodes = list(getattr(tree, "body", []))
+    if extra_def_nodes:
+        def_nodes = def_nodes + list(extra_def_nodes)
+    for n in def_nodes:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             start = getattr(n, "lineno", None)
             end = getattr(n, "end_lineno", None)
@@ -2561,8 +2573,11 @@ def simplify_index_arithmetic_notation(lines):
         re.IGNORECASE,
     )
     # In index/arg-list contexts, (i + 1) -> i + 1 is safe and more readable.
+    # The leading whitespace is captured (not just consumed by a lookbehind)
+    # so it can be restored in the replacement -- otherwise a space after a
+    # preceding comma, e.g. `, (i + 1)`, silently disappears.
     re_idx_paren = re.compile(
-        r"(?<=[(:,])\s*\(\s*([a-z_]\w*(?:\s*[+\-]\s*\d+)?)\s*\)\s*(?=[,:)])",
+        r"(?<=[(:,])(\s*)\(\s*([a-z_]\w*(?:\s*[+\-]\s*\d+)?)\s*\)\s*(?=[,:)])",
         re.IGNORECASE,
     )
     re_idx_const_binop = re.compile(
@@ -2625,7 +2640,7 @@ def simplify_index_arithmetic_notation(lines):
             while prev != seg:
                 prev = seg
                 seg = re_nested_add1.sub(_nested_add_repl, seg)
-            seg = re_idx_paren.sub(r"\1", seg)
+            seg = re_idx_paren.sub(r"\1\2", seg)
 
             def _idx_const_binop_repl(m):
                 a = int(m.group(1))
@@ -3119,7 +3134,42 @@ def ensure_blank_line_between_program_units(lines):
 
 
 def remove_write_only_scalar_locals(lines):
-    """Remove scalar locals that are only assigned and never read."""
+    """Remove scalar locals that are only assigned and never read.
+
+    Scoped per procedure/program unit -- a variable name (e.g. a common
+    one like `k`) can be write-only in one subroutine and genuinely read
+    in another; scanning the whole file at once would let a read in one
+    unit mask a dead write in a different unit, or vice versa.
+    """
+    unit_start_re = re.compile(
+        r"^\s*(?:pure\s+|elemental\s+|impure\s+|recursive\s+|module\s+)*"
+        r"(?:function|subroutine|program)\b",
+        flags=re.IGNORECASE,
+    )
+    unit_end_re = re.compile(
+        r"^\s*end\s+(?:function|subroutine|program)\b",
+        flags=re.IGNORECASE,
+    )
+
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        code_i = lines[i].split("!", 1)[0]
+        if not unit_start_re.match(code_i):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not unit_end_re.match(lines[j].split("!", 1)[0]):
+            j += 1
+        end = min(j + 1, n)
+        out.extend(_strip_write_only_scalar_locals_in_unit(lines[i:end]))
+        i = end
+    return out
+
+
+def _strip_write_only_scalar_locals_in_unit(lines):
     decl_re = re.compile(
         r"^\s*(integer|real\(kind=dp\)|logical|complex\(kind=dp\))\s*::\s*(.+)$",
         flags=re.IGNORECASE,
@@ -3127,6 +3177,7 @@ def remove_write_only_scalar_locals(lines):
     name_re = re.compile(r"^[A-Za-z_]\w*$")
     tok_re = re.compile(r"\b[A-Za-z_]\w*\b")
     asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*.*$")
+    asn_rhs_re = re.compile(r"^\s*[A-Za-z_]\w*\s*=\s*(.*)$")
 
     decl_line_by_var = {}
     decl_vars_by_line = {}
@@ -3165,8 +3216,26 @@ def remove_write_only_scalar_locals(lines):
     if not candidates:
         return lines
 
+    # Intrinsics/keywords this pass knows are side-effect-free -- a call to
+    # anything else (a user-defined function/subroutine, possibly with I/O
+    # or other side effects) must not be silently dropped just because its
+    # return value goes unused. `size(x)` is safe to elide; `conjugate(x)`
+    # (a local function whose body prints) is not.
+    _pure_call_whitelist = {
+        "size", "len", "len_trim", "trim", "abs", "sqrt", "min", "max",
+        "real", "int", "dble", "present", "allocated", "associated",
+        "kind", "huge", "tiny", "epsilon", "count", "sum", "product",
+        "maxval", "minval", "index", "achar", "iachar", "ichar", "char",
+        "mod", "modulo", "sign", "nint", "floor", "ceiling", "merge",
+        "shape", "lbound", "ubound", "adjustl", "adjustr", "repeat",
+        "transpose", "reshape", "matmul", "dot_product", "norm2",
+        "log", "exp", "sin", "cos", "tan", "log10", "spread",
+    }
+    call_re = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
     read_count = {v: 0 for v in candidates}
     complex_use = {v: False for v in candidates}
+    unsafe_rhs = {v: False for v in candidates}
 
     for i, ln in enumerate(lines):
         if i in decl_vars_by_line:
@@ -3191,6 +3260,12 @@ def remove_write_only_scalar_locals(lines):
             lhs_occ = sum(1 for t in toks if t.lower() == lhs)
             if lhs_occ > 1:
                 complex_use[lhs] = True
+            m_rhs = asn_rhs_re.match(code)
+            rhs = m_rhs.group(1) if m_rhs else ""
+            for callee in call_re.findall(rhs):
+                if callee.lower() not in _pure_call_whitelist:
+                    unsafe_rhs[lhs] = True
+                    break
             continue
         for t in toks:
             tl = t.lower()
@@ -3198,7 +3273,10 @@ def remove_write_only_scalar_locals(lines):
                 read_count[tl] += 1
                 complex_use[tl] = True
 
-    dead = {v for v in candidates if read_count[v] == 0 and not complex_use[v]}
+    dead = {
+        v for v in candidates
+        if read_count[v] == 0 and not complex_use[v] and not unsafe_rhs[v]
+    }
     if not dead:
         return lines
 
@@ -3683,6 +3761,84 @@ def normalize_zero_based_unit_stride_loops(lines):
             )
             out[k] = code + (bang + comment if bang else "")
         i = j + 1
+    return out
+
+
+def rebase_argsort_output_to_one_based(lines):
+    """After `call argsort(x, idx)`, if every later use of `idx` in the
+    enclosing procedure is exactly `idx + 1` (i.e. `idx` is only ever
+    used to subscript another Fortran array), insert a single
+    `idx = idx + 1` right after the call and drop the redundant `+ 1`
+    everywhere else, e.g.:
+
+        call argsort(means, order)
+        weights = weights(order + 1)
+        means = means(order + 1)
+
+    becomes:
+
+        call argsort(means, order)
+        order = order + 1
+        weights = weights(order)
+        means = means(order)
+
+    argsort's own output stays numpy-compatible (0-based indices) at the
+    point it's produced -- this never changes argsort's documented
+    contract, only how a demonstrably subscript-only local variable is
+    consumed afterward. Conservative: skips entirely if `idx` is used
+    for anything else downstream (printed, compared, reassigned, etc.),
+    since that would need to see the original 0-based values.
+    """
+    unit_end_re = re.compile(
+        r"^\s*end\s+(?:function|subroutine|program)\b",
+        re.IGNORECASE,
+    )
+    re_call = re.compile(
+        r"^(\s*)call\s+argsort\s*\(\s*(.+?)\s*,\s*([a-z_]\w*)\s*\)\s*$",
+        re.IGNORECASE,
+    )
+
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        code_i = out[i].split("!", 1)[0].rstrip()
+        m = re_call.match(code_i)
+        if not m:
+            i += 1
+            continue
+        indent, _first_arg, var = m.groups()
+
+        j = i + 1
+        while j < len(out) and not unit_end_re.match(out[j].split("!", 1)[0].strip()):
+            j += 1
+        if j >= len(out):
+            i += 1
+            continue
+
+        tok_re = re.compile(rf"\b{re.escape(var)}\b", re.IGNORECASE)
+        allowed_re = re.compile(rf"\b{re.escape(var)}\b\s*\+\s*1\b(?!\d)", re.IGNORECASE)
+
+        total_hits = 0
+        allowed_hits = 0
+        for k in range(i + 1, j):
+            ck = out[k].split("!", 1)[0]
+            total_hits += len(tok_re.findall(ck))
+            allowed_hits += len(allowed_re.findall(ck))
+
+        if total_hits == 0 or total_hits != allowed_hits:
+            i += 1
+            continue
+
+        out.insert(i + 1, f"{indent}{var} = {var} + 1")
+        j += 1
+        for k in range(i + 2, j):
+            code, bang, comment = out[k].partition("!")
+            code = allowed_re.sub(var, code)
+            out[k] = code + (bang + comment if bang else "")
+        # Continue scanning from just past the inserted line -- there may
+        # be another `call argsort(...)` for a different variable later
+        # in the same procedure.
+        i += 2
     return out
 
 
@@ -4414,13 +4570,20 @@ def remove_redundant_first_guarded_deallocate(lines):
     when:
     - the next nonblank/non-comment line is allocate(x(...))
     - x has not appeared in prior executable statements
-    - and either no executable statements appear before this guard in the
-      procedure (avoids deleting guards inside loops/branches where
-      reallocation repeats), or x is itself an intent(out) allocatable
-      dummy argument of the enclosing procedure -- those are deallocated
-      by the Fortran standard on procedure entry regardless of what other
-      (unrelated) code ran first, so the stricter "nothing executable yet"
-      requirement isn't needed for them.
+    - and any of:
+      * no executable statements appear before this guard in the
+        procedure,
+      * x is itself an intent(out) allocatable dummy argument of the
+        enclosing procedure -- those are deallocated by the Fortran
+        standard on procedure entry regardless of what other (unrelated)
+        code ran first, or
+      * the guard itself is not nested inside any `do` loop -- a local
+        allocatable that hasn't been named yet is guaranteed unallocated
+        on entry to a fresh procedure call (F2008 5.4.3.4.2), and a
+        straight-line (non-looping) guard executes at most once per
+        call, so it can never observe a prior allocation from an earlier
+        pass through this same statement regardless of what unrelated
+        code ran first.
     """
     out = list(lines)
     re_guard = re.compile(
@@ -4437,6 +4600,8 @@ def remove_redundant_first_guarded_deallocate(lines):
         re.IGNORECASE,
     )
     re_decl_entities = re.compile(r"^\s*([^:!]*)::\s*(.+)$")
+    re_do_start = re.compile(r"^\s*do\b", re.IGNORECASE)
+    re_end_do = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
 
     i = 0
     while i < len(out):
@@ -4472,12 +4637,27 @@ def remove_redundant_first_guarded_deallocate(lines):
             if re_proc_start.match(ck0):
                 k0 = k + 1
                 break
+        # Join `&`-continued physical lines into logical statements first,
+        # so a declaration's continuation lines (e.g. the 2nd+ line of a
+        # multi-line `real(...), allocatable :: a, b, &  \n  & c, d`) are
+        # classified with the statement they belong to, not mistaken for
+        # an executable use of a variable named on that continuation line.
+        stmts = []
+        buf = []
         for k in range(k0, i):
             ck = out[k].split("!", 1)[0].strip()
             if not ck:
                 continue
-            if re_declish.match(ck):
-                me = re_decl_entities.match(ck)
+            buf.append(ck[:-1].strip() if ck.endswith("&") else ck)
+            if not ck.endswith("&"):
+                stmts.append(" ".join(buf))
+                buf = []
+        if buf:
+            stmts.append(" ".join(buf))
+
+        for stmt in stmts:
+            if re_declish.match(stmt):
+                me = re_decl_entities.match(stmt)
                 if (
                     me
                     and re.search(r"\ballocatable\b", me.group(1), re.IGNORECASE)
@@ -4489,14 +4669,229 @@ def remove_redundant_first_guarded_deallocate(lines):
                             is_intent_out_alloc = True
                 continue
             saw_exec_before_guard = True
-            if tok_re.search(ck):
+            if tok_re.search(stmt):
                 prior_use = True
                 break
-        if not prior_use and (not saw_exec_before_guard or is_intent_out_alloc):
+
+        loop_depth = 0
+        for k in range(k0, i):
+            ck = out[k].split("!", 1)[0].strip()
+            if re_do_start.match(ck):
+                loop_depth += 1
+            elif re_end_do.match(ck):
+                loop_depth = max(0, loop_depth - 1)
+
+        if not prior_use and (
+            not saw_exec_before_guard or is_intent_out_alloc or loop_depth == 0
+        ):
             del out[i]
             # do not advance i; next line shifts into current slot
             continue
         i += 1
+    return out
+
+
+def combine_parenthesized_integer_offset(lines):
+    """Combine `(EXPR + LIT1) - LIT2` (and the +/- variants) into
+    `(EXPR + LIT_combined)` when LIT1/LIT2 are plain integer literals --
+    integer arithmetic combines exactly, so e.g. `(n + 2) - 1` becomes
+    `(n + 1)`. This complements simplify_integer_arithmetic_in_lines,
+    which only folds a literal directly against another literal, not a
+    parenthesized `expr +/- literal` group against a following literal.
+
+    Conservative: the literals must be plain unsigned integer tokens (not
+    `2.0` or `2_dp`), and the parenthesized group's own contents must not
+    contain further parens (so this never reaches into an unrelated,
+    more deeply nested subexpression). The opening paren must not be
+    immediately preceded by an identifier character either -- otherwise
+    it's a subscript/call paren (e.g. `a(i + 1) + 1`, where the trailing
+    `+ 1` is unrelated arithmetic on the array element's VALUE, not part
+    of the index expression) rather than a bare grouping paren, and
+    folding the two together would silently corrupt the index.
+    """
+    pat = re.compile(r"(?<![\w])\(([^()]+?)\s*([+\-])\s*(\d+)\)\s*([+\-])\s*(\d+)(?!\.\d|_)")
+
+    def _repl(m):
+        inner, op1, lit1, op2, lit2 = m.groups()
+        v1 = int(lit1) if op1 == "+" else -int(lit1)
+        v2 = int(lit2) if op2 == "+" else -int(lit2)
+        total = v1 + v2
+        inner = inner.strip()
+        if total == 0:
+            body = inner
+        elif total > 0:
+            body = f"{inner} + {total}"
+        else:
+            body = f"{inner} - {-total}"
+
+        # If the whole matched group stands alone as a call argument (or as
+        # the entire content of an enclosing paren pair), the wrapping
+        # parens are redundant -- e.g. `slice1(..., (n + 2) - 1, ...)` ->
+        # `slice1(..., n + 1, ...)`.
+        s = m.string
+        p = m.start() - 1
+        while p >= 0 and s[p].isspace():
+            p -= 1
+        prev_ch = s[p] if p >= 0 else ""
+        q = m.end()
+        while q < len(s) and s[q].isspace():
+            q += 1
+        next_ch = s[q] if q < len(s) else ""
+        if prev_ch in "(," and next_ch in ",)":
+            return body
+        return f"({body})"
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        prev = None
+        while prev != code:
+            prev = code
+            code = pat.sub(_repl, code)
+        out.append(f"{code}{bang}{comment}" if bang else code)
+    return out
+
+
+def simplify_redundant_unary_minus_parens(lines):
+    """Drop redundant parens around a lone unary-minus term that already
+    stands alone as an array-constructor element or call argument, e.g.
+    `[(-3.0_dp), 0.5_dp]` -> `[-3.0_dp, 0.5_dp]`. A leading unary minus
+    never needs grouping parens when it's delimited by `[`, `(`, or `,`
+    on the left and `,`, `)`, or `]` on the right -- those delimiters
+    already terminate the term, so there's no adjacent operator it could
+    be misparsed against.
+
+    Conservative: the term inside the extra parens must not itself
+    contain further parens, so this never reaches into an unrelated,
+    more deeply nested subexpression.
+    """
+    pat = re.compile(r"(?<=[\[(,])(\s*)\(-([^()]+?)\)(\s*)(?=[,\)\]])")
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        prev = None
+        while prev != code:
+            prev = code
+            code = pat.sub(lambda m: f"{m.group(1)}-{m.group(2).strip()}{m.group(3)}", code)
+        out.append(f"{code}{bang}{comment}" if bang else code)
+    return out
+
+
+def hoist_loop_invariant_array_realloc(lines):
+    """Move `if (allocated(x)) deallocate(x)` + `allocate(x(shape))` out
+    of a `do` loop and to just before it, when `shape` doesn't depend on
+    the loop variable or anything else the loop assigns -- the array
+    would otherwise be reallocated to the exact same shape on every
+    iteration for no reason.
+
+    Conservative: only hoists a pair that's a *direct* statement of the
+    loop's own body (not nested inside an if/select/where/block/inner-do
+    within it), so hoisting can never change whether the allocation
+    actually happens on a given iteration. Only handles a single-entity
+    `allocate(name(shape))` (no `source=`/`mold=`, no multi-entity list).
+    """
+    do_start_re = re.compile(r"^\s*do\s+([a-z_]\w*)\s*=", re.IGNORECASE)
+    end_do_re = re.compile(r"^\s*end\s*do\b", re.IGNORECASE)
+    block_open_re = re.compile(
+        r"^\s*(?:if\s*\(.*\)\s*then\b|do\b|select\s*case\b|where\s*\(.*\)\s*$|block\b)",
+        re.IGNORECASE,
+    )
+    block_close_re = re.compile(r"^\s*end\s*(?:if|do|select|where|block)\b", re.IGNORECASE)
+    guard_re = re.compile(
+        r"^\s*if\s*\(\s*allocated\s*\(\s*([a-z_]\w*)\s*\)\s*\)\s*deallocate\s*\(\s*\1\s*\)\s*$",
+        re.IGNORECASE,
+    )
+    alloc_re = re.compile(r"^\s*allocate\s*\(\s*([a-z_]\w*)\s*\((.+)\)\s*\)\s*$", re.IGNORECASE)
+
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        code_i = out[i].split("!", 1)[0]
+        m = do_start_re.match(code_i)
+        if not m:
+            i += 1
+            continue
+        loop_var = m.group(1)
+
+        # Find this loop's own `end do`, tracking nested block depth.
+        depth = 0
+        end_idx = None
+        j = i + 1
+        while j < len(out):
+            cj = out[j].split("!", 1)[0]
+            if end_do_re.match(cj):
+                if depth == 0:
+                    end_idx = j
+                    break
+                depth -= 1
+            elif block_open_re.match(cj):
+                depth += 1
+            elif block_close_re.match(cj):
+                depth -= 1
+            j += 1
+        if end_idx is None:
+            i += 1
+            continue
+
+        # Look for a direct (depth-0) guard+allocate pair in the body.
+        depth = 0
+        found = None
+        k = i + 1
+        while k < end_idx:
+            ck = out[k].split("!", 1)[0]
+            if depth == 0:
+                gm = guard_re.match(ck.strip())
+                if gm:
+                    kk = k + 1
+                    while kk < end_idx and not out[kk].split("!", 1)[0].strip():
+                        kk += 1
+                    if kk < end_idx:
+                        am = alloc_re.match(out[kk].split("!", 1)[0].strip())
+                        if am and am.group(1).lower() == gm.group(1).lower():
+                            found = (k, kk, gm.group(1), am.group(2))
+                            break
+            if end_do_re.match(ck):
+                depth -= 1
+            elif block_open_re.match(ck):
+                depth += 1
+            elif block_close_re.match(ck):
+                depth -= 1
+            k += 1
+
+        if found is None:
+            i = end_idx + 1
+            continue
+
+        guard_idx, alloc_idx, name, shape_text = found
+        shape_idents = {s.lower() for s in re.findall(r"[a-z_]\w*", shape_text, re.IGNORECASE)}
+
+        unsafe = loop_var.lower() in shape_idents
+        if not unsafe and shape_idents:
+            assign_re = re.compile(
+                r"^\s*(" + "|".join(re.escape(s) for s in shape_idents) + r")\s*(?:\([^)]*\))?\s*=(?!=)",
+                re.IGNORECASE,
+            )
+            for k2 in range(i + 1, end_idx):
+                if assign_re.match(out[k2].split("!", 1)[0].strip()):
+                    unsafe = True
+                    break
+        if unsafe:
+            i = end_idx + 1
+            continue
+
+        do_indent = re.match(r"^(\s*)", out[i]).group(1)
+        eol = "\r\n" if out[guard_idx].endswith("\r\n") else ("\n" if out[guard_idx].endswith("\n") else "")
+        guard_text = out[guard_idx].split("!", 1)[0].strip()
+        alloc_text = out[alloc_idx].split("!", 1)[0].strip()
+        guard_line = f"{do_indent}{guard_text}{eol}"
+        alloc_line = f"{do_indent}{alloc_text}{eol}"
+        del out[alloc_idx]
+        del out[guard_idx]
+        out[i:i] = [guard_line, alloc_line]
+        # Line count is unchanged (2 removed from inside, 2 inserted
+        # before), so end_idx still numerically points at "end do".
+        i = end_idx + 1
     return out
 
 
@@ -13084,7 +13479,7 @@ class translator(ast.NodeVisitor):
                         and node.func.value.attr == "random"
                     )
                 )
-                and node.func.attr in {"random", "standard_normal", "normal", "uniform"}
+                and node.func.attr in {"random", "standard_normal", "normal", "uniform", "multivariate_normal"}
             ):
                 return "real"
             if (
@@ -15420,6 +15815,15 @@ class translator(ast.NodeVisitor):
             ):
                 return 1
 
+            if (
+                isinstance(node.func, ast.Attribute)
+                and _is_rng_rank_source(node.func.value)
+                and node.func.attr == "multivariate_normal"
+            ):
+                # (n_samples, dimension) -- xp2f only supports a scalar
+                # `size=` for multivariate_normal, never a size tuple.
+                return 2
+
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 if len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -16405,6 +16809,48 @@ class translator(ast.NodeVisitor):
                 )
                 return self.expr(lowered)
 
+            def _known_array_length_expr(call_node):
+                # For a recognized 1D array-constructor call, return a
+                # Fortran expression for its length derived directly from
+                # its own arguments. Used so slicing it doesn't need
+                # `size(...)` on the whole constructed expression -- which
+                # would otherwise mean embedding that (possibly long)
+                # expression's text a second time just to learn its length.
+                if not (isinstance(call_node, ast.Call) and isinstance(call_node.func, ast.Attribute)):
+                    return None
+                owner = call_node.func.value
+                if not (isinstance(owner, ast.Name) and owner.id in {"np", "numpy"}):
+                    return None
+                attr = call_node.func.attr
+                if attr == "linspace":
+                    num_node = call_node.args[2] if len(call_node.args) >= 3 else None
+                    for kw in call_node.keywords:
+                        if kw.arg == "num":
+                            num_node = kw.value
+                    if num_node is not None:
+                        num_txt = self.expr(num_node)
+                        if self._expr_kind(num_node) == "int":
+                            return num_txt
+                        return f"int({num_txt})"
+                    return "50"
+                def _int_arg_expr(n):
+                    txt = self.expr(n)
+                    return txt if self._expr_kind(n) == "int" else f"int({txt})"
+
+                if (
+                    attr in {"zeros", "ones", "empty"}
+                    and call_node.args
+                    and not isinstance(call_node.args[0], (ast.List, ast.Tuple))
+                ):
+                    return _int_arg_expr(call_node.args[0])
+                if (
+                    attr == "full"
+                    and call_node.args
+                    and not isinstance(call_node.args[0], (ast.List, ast.Tuple))
+                ):
+                    return _int_arg_expr(call_node.args[0])
+                return None
+
             if isinstance(base_node, ast.Call):
                 base_expr = self.expr(base_node)
                 if (
@@ -16439,7 +16885,9 @@ class translator(ast.NodeVisitor):
                     j_expr = _scalar_index_expr(idx_node.elts[1], 2)
                     return f"index2({base_expr}, {i_expr}, {j_expr})"
                 if isinstance(idx_node, ast.Slice):
-                    lb, ub, step_val = self._slice_bounds_fortran(idx_node, f"size({base_expr})")
+                    known_len = _known_array_length_expr(base_node)
+                    extent_expr = known_len if known_len is not None else f"size({base_expr})"
+                    lb, ub, step_val = self._slice_bounds_fortran(idx_node, extent_expr)
                     return f"slice1({base_expr}, {lb}, {ub}, {step_val})"
                 if self._rank_expr(idx_node) != 0:
                     return None
@@ -20524,13 +20972,41 @@ class translator(ast.NodeVisitor):
                         hi = self.expr(node.args[2])
                     return f"min(max({a0}, {lo}), {hi})"
                 if node.func.attr == "linspace" and len(node.args) >= 3:
-                    a0 = self.expr(node.args[0])
-                    a1 = self.expr(node.args[1])
+                    start_node = node.args[0]
+                    stop_node = node.args[1]
                     num = self.expr(node.args[2])
-                    return (
-                        f"({a0} + ({a1} - {a0}) * real(arange_int(0, int({num}), 1), kind=dp) / "
-                        f"real(max(1, int({num}) - 1), kind=dp))"
+                    num_i = num if self._expr_kind(node.args[2]) == "int" else f"int({num})"
+                    ramp = (
+                        f"real(arange_int(0, {num_i}, 1), kind=dp) / "
+                        f"real(max(1, {num_i} - 1), kind=dp)"
                     )
+
+                    def _const_float(n):
+                        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+                            return float(n.value)
+                        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+                            if isinstance(n.operand, ast.Constant) and isinstance(n.operand.value, (int, float)) and not isinstance(n.operand.value, bool):
+                                sign = -1.0 if isinstance(n.op, ast.USub) else 1.0
+                                return sign * float(n.operand.value)
+                        return None
+
+                    start_val = _const_float(start_node)
+                    stop_val = _const_float(stop_node)
+                    if start_val is not None and stop_val is not None:
+                        # linspace(start, stop, num) with literal endpoints --
+                        # fold the "start + (stop - start) * ..." formula's
+                        # trivial identity terms (e.g. linspace(0.0, 1.0, n)
+                        # has start=0, coefficient=1) instead of always
+                        # emitting the general form.
+                        coeff_val = stop_val - start_val
+                        term = ramp if coeff_val == 1.0 else f"({coeff_val!r}_dp * {ramp})"
+                        if start_val == 0.0:
+                            return f"({term})"
+                        return f"({start_val!r}_dp + {term})"
+
+                    a0 = self.expr(start_node)
+                    a1 = self.expr(stop_node)
+                    return f"({a0} + ({a1} - {a0}) * {ramp})"
                 if node.func.attr == "logspace" and len(node.args) >= 2:
                     start = self.expr(node.args[0])
                     stop = self.expr(node.args[1])
@@ -22086,58 +22562,69 @@ class translator(ast.NodeVisitor):
                             return kw.value
                     return None
 
+                def _is_atomic_term(n):
+                    # A primary expression with no top-level operator of its
+                    # own -- its rendered text never needs grouping parens
+                    # regardless of where it's spliced into a larger formula.
+                    return isinstance(n, (ast.Name, ast.Constant, ast.Subscript, ast.Attribute, ast.Call))
+
                 def _loc_scl_exprs():
                     loc_n = _pos_or_kw_arg(0, "loc")
                     scl_n = _pos_or_kw_arg(1, "scale")
-                    return (
-                        self.expr(loc_n) if loc_n is not None else "0.0_dp",
-                        self.expr(scl_n) if scl_n is not None else "1.0_dp",
-                    )
+                    loc_txt = self.expr(loc_n) if loc_n is not None else "0.0_dp"
+                    scl_txt = self.expr(scl_n) if scl_n is not None else "1.0_dp"
+                    if scl_n is not None and not _is_atomic_term(scl_n):
+                        scl_txt = f"({scl_txt})"
+                    return loc_txt, scl_txt
 
                 def _lo_hi_exprs():
                     lo_n = _pos_or_kw_arg(0, "low")
                     hi_n = _pos_or_kw_arg(1, "high")
-                    return (
-                        self.expr(lo_n) if lo_n is not None else "0.0_dp",
-                        self.expr(hi_n) if hi_n is not None else "1.0_dp",
-                    )
+                    lo_txt = self.expr(lo_n) if lo_n is not None else "0.0_dp"
+                    hi_txt = self.expr(hi_n) if hi_n is not None else "1.0_dp"
+                    lo_sub_txt = lo_txt if (lo_n is None or _is_atomic_term(lo_n)) else f"({lo_txt})"
+                    return lo_txt, hi_txt, lo_sub_txt
 
                 size_node = _pos_or_kw_arg(2, "size") if node.func.attr in {"normal", "uniform"} else _pos_or_kw_arg(0, "size")
                 if size_node is None:
                     if node.func.attr == "normal":
                         loc, scl = _loc_scl_exprs()
-                        return f"({loc}) + ({scl}) * rnorm()"
+                        return f"{loc} + {scl} * rnorm()"
                     if node.func.attr == "uniform":
-                        lo, hi = _lo_hi_exprs()
-                        return f"({lo}) + (({hi}) - ({lo})) * runif()"
+                        lo, hi, lo_sub = _lo_hi_exprs()
+                        return f"{lo} + ({hi} - {lo_sub}) * runif()"
                     if node.func.attr == "standard_normal":
                         return "rnorm()"
                     return "runif()"
+                def _int_arg_expr(n):
+                    txt = self.expr(n)
+                    return txt if self._expr_kind(n) == "int" else f"int({txt})"
+
                 if isinstance(size_node, (ast.Tuple, ast.List)):
                     if len(size_node.elts) >= 2:
-                        n1 = self.expr(size_node.elts[0])
-                        n2 = self.expr(size_node.elts[1])
+                        n1_i = _int_arg_expr(size_node.elts[0])
+                        n2_i = _int_arg_expr(size_node.elts[1])
                         if node.func.attr == "normal":
                             loc, scl = _loc_scl_exprs()
-                            return f"({loc}) + ({scl}) * rnorm(int({n1}), int({n2}))"
+                            return f"{loc} + {scl} * rnorm({n1_i}, {n2_i})"
                         if node.func.attr == "uniform":
-                            lo, hi = _lo_hi_exprs()
-                            return f"({lo}) + (({hi}) - ({lo})) * runif(int({n1}), int({n2}))"
+                            lo, hi, lo_sub = _lo_hi_exprs()
+                            return f"{lo} + ({hi} - {lo_sub}) * runif({n1_i}, {n2_i})"
                         if node.func.attr == "standard_normal":
-                            return f"rnorm(int({n1}), int({n2}))"
-                        return f"runif(int({n1}), int({n2}))"
+                            return f"rnorm({n1_i}, {n2_i})"
+                        return f"runif({n1_i}, {n2_i})"
                     if len(size_node.elts) == 1:
                         size_node = size_node.elts[0]
-                n1 = self.expr(size_node)
+                n1_i = _int_arg_expr(size_node)
                 if node.func.attr == "normal":
                     loc, scl = _loc_scl_exprs()
-                    return f"({loc}) + ({scl}) * rnorm(int({n1}))"
+                    return f"{loc} + {scl} * rnorm({n1_i})"
                 if node.func.attr == "uniform":
-                    lo, hi = _lo_hi_exprs()
-                    return f"({lo}) + (({hi}) - ({lo})) * runif(int({n1}))"
+                    lo, hi, lo_sub = _lo_hi_exprs()
+                    return f"{lo} + ({hi} - {lo_sub}) * runif({n1_i})"
                 if node.func.attr == "standard_normal":
-                    return f"rnorm(int({n1}))"
-                return f"runif(int({n1}))"
+                    return f"rnorm({n1_i})"
+                return f"runif({n1_i})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and (
@@ -25792,16 +26279,21 @@ class translator(ast.NodeVisitor):
                     else:
                         self._mark_alloc_int(t.id, rank=2)
 
-                # np.random.multivariate_normal(..., size=n)
+                # np.random.multivariate_normal(..., size=n) / rng.multivariate_normal(...)
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
                     and isinstance(v.func, ast.Attribute)
-                    and isinstance(v.func.value, ast.Attribute)
-                    and isinstance(v.func.value.value, ast.Name)
-                    and v.func.value.value.id == "np"
-                    and v.func.value.attr == "random"
                     and v.func.attr == "multivariate_normal"
+                    and (
+                        (isinstance(v.func.value, ast.Name) and v.func.value.id in self.rng_vars)
+                        or (
+                            isinstance(v.func.value, ast.Attribute)
+                            and isinstance(v.func.value.value, ast.Name)
+                            and v.func.value.value.id == "np"
+                            and v.func.value.attr == "random"
+                        )
+                    )
                 ):
                     self._mark_alloc_real(t.id, rank=2)
 
@@ -28984,22 +29476,26 @@ class translator(ast.NodeVisitor):
             if size_node is None and is_standard:
                 self.o.w(f"{t.id} = rnorm()")
                 return
+            def _int_arg_expr(n):
+                txt = self.expr(n)
+                return txt if self._expr_kind(n) == "int" else f"int({txt})"
+
             n_expr = None
             if isinstance(size_node, (ast.Tuple, ast.List)):
                 if len(size_node.elts) == 2:
-                    n0 = self.expr(size_node.elts[0])
-                    n1 = self.expr(size_node.elts[1])
-                    self.o.w(f"{t.id} = rnorm(int({n0}), int({n1}))")
+                    n0_i = _int_arg_expr(size_node.elts[0])
+                    n1_i = _int_arg_expr(size_node.elts[1])
+                    self.o.w(f"{t.id} = rnorm({n0_i}, {n1_i})")
                 elif len(size_node.elts) == 1:
                     n_expr = self.expr(size_node.elts[0])
-                    self.o.w(f"{t.id} = rnorm(int({n_expr}))")
+                    self.o.w(f"{t.id} = rnorm({_int_arg_expr(size_node.elts[0])})")
                 else:
                     if is_standard:
                         raise NotImplementedError("np.random.standard_normal size tuple rank > 2 not supported")
                     raise NotImplementedError("np.random.normal size tuple rank > 2 not supported")
             else:
                 n_expr = self.expr(size_node)
-                self.o.w(f"{t.id} = rnorm(int({n_expr}))")
+                self.o.w(f"{t.id} = rnorm({_int_arg_expr(size_node)})")
 
             # Special case: gather parameters by class labels, e.g.
             # rng.normal(loc=mu[z], scale=sigma[z], size=n)
@@ -29810,24 +30306,37 @@ class translator(ast.NodeVisitor):
             self.o.w(f"call random_multivariate_hypergeometric_samples({ngood_expr}, {ns_expr}, {t.id})")
             return
 
-        # x = np.random.multivariate_normal(mean, cov, size=n)
+        # x = np.random.multivariate_normal(mean, cov, size=n) / x = rng.multivariate_normal(...)
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Attribute)
-            and isinstance(v.func.value.value, ast.Name)
-            and v.func.value.value.id == "np"
-            and v.func.value.attr == "random"
             and v.func.attr == "multivariate_normal"
-            and len(v.args) >= 2
+            and (
+                (isinstance(v.func.value, ast.Name) and v.func.value.id in self.rng_vars)
+                or (
+                    isinstance(v.func.value, ast.Attribute)
+                    and isinstance(v.func.value.value, ast.Name)
+                    and v.func.value.value.id == "np"
+                    and v.func.value.attr == "random"
+                )
+            )
         ):
-            mean_expr = self.expr(v.args[0])
-            cov_expr = self.expr(v.args[1])
-            size_node = v.args[2] if len(v.args) >= 3 else None
-            for kw in v.keywords:
-                if kw.arg == "size":
-                    size_node = kw.value
+            def _mvn_arg(idx, name):
+                if len(v.args) > idx:
+                    return v.args[idx]
+                for kw in v.keywords:
+                    if kw.arg == name:
+                        return kw.value
+                return None
+
+            mean_node = _mvn_arg(0, "mean")
+            cov_node = _mvn_arg(1, "cov")
+            size_node = _mvn_arg(2, "size")
+            if mean_node is None or cov_node is None:
+                raise NotImplementedError("np.random.multivariate_normal requires mean and cov")
+            mean_expr = self.expr(mean_node)
+            cov_expr = self.expr(cov_node)
             if size_node is None:
                 raise NotImplementedError("np.random.multivariate_normal currently requires size=...")
             if isinstance(size_node, (ast.Tuple, ast.List)):
@@ -29856,20 +30365,24 @@ class translator(ast.NodeVisitor):
                 else:
                     self.o.w(f"{t.id} = rnorm()")
                 return
+            def _int_arg_expr(n):
+                txt = self.expr(n)
+                return txt if self._expr_kind(n) == "int" else f"int({txt})"
+
             if len(dims) == 1:
-                n0 = self.expr(dims[0])
+                n0_i = _int_arg_expr(dims[0])
                 if v.func.attr == "rand":
-                    self.o.w(f"{t.id} = runif(int({n0}))")
+                    self.o.w(f"{t.id} = runif({n0_i})")
                 else:
-                    self.o.w(f"{t.id} = rnorm(int({n0}))")
+                    self.o.w(f"{t.id} = rnorm({n0_i})")
                 return
             if len(dims) == 2:
-                n0 = self.expr(dims[0])
-                n1 = self.expr(dims[1])
+                n0_i = _int_arg_expr(dims[0])
+                n1_i = _int_arg_expr(dims[1])
                 if v.func.attr == "rand":
-                    self.o.w(f"{t.id} = runif(int({n0}), int({n1}))")
+                    self.o.w(f"{t.id} = runif({n0_i}, {n1_i})")
                 else:
-                    self.o.w(f"{t.id} = rnorm(int({n0}), int({n1}))")
+                    self.o.w(f"{t.id} = rnorm({n0_i}, {n1_i})")
                 return
             raise NotImplementedError("np.random.rand/randn supports up to 2 dimensions")
 
@@ -31386,7 +31899,11 @@ class translator(ast.NodeVisitor):
                     self.o.pop()
                     self.o.w("end where")
                     return
-                if self._expr_kind(a0) == "logical" and self._rank_expr(a1) == 0:
+                if (
+                    self._expr_kind(a0) == "logical"
+                    and not isinstance(a1, ast.Slice)
+                    and self._rank_expr(a1) == 0
+                ):
                     col_ref = self.expr(
                         ast.Subscript(
                             value=copy.deepcopy(t.value),
@@ -31401,12 +31918,85 @@ class translator(ast.NodeVisitor):
                     self.o.pop()
                     self.o.w("end where")
                     return
+                # x[mask, :] = rhs -- masked ROW selection with a full
+                # column slice, where rhs is a 2-D array whose row count
+                # equals count(mask) (numpy's compact masked-assignment
+                # semantics), e.g. x[selected, :] = rng.multivariate_normal(...).
+                # This can't be a `where`-construct: `where` requires the
+                # mask and the assigned expression to be the SAME shape as
+                # the target, but rhs here is only as long as count(mask),
+                # not len(mask) -- it must be scattered row-by-row instead.
+                if (
+                    self._expr_kind(a0) == "logical"
+                    and int(self._rank_expr(a0)) == 1
+                    and isinstance(a1, ast.Slice)
+                    and a1.lower is None and a1.upper is None and a1.step is None
+                    and int(self._rank_expr(v)) == 2
+                ):
+                    decl_kind = {
+                        "real": "real(kind=dp)",
+                        "int": "integer",
+                        "logical": "logical",
+                        "complex": "complex(kind=dp)",
+                    }.get(self._expr_kind(v))
+                    if decl_kind is not None:
+                        base_expr = self.expr(t.value)
+                        mask_expr = self.expr(a0)
+                        self.o.w("block")
+                        self.o.push()
+                        self.o.w(f"{decl_kind}, allocatable :: mask_scatter_tmp(:,:)")
+                        self.o.w("integer :: mask_scatter_i, mask_scatter_k")
+                        # A sample-generating call like rng.multivariate_normal(...)
+                        # is only ever lowered as a multi-statement block (allocate
+                        # + call random_mvn_samples), never as a bare expression --
+                        # self.expr() has no single-expression form for it, so it
+                        # must be special-cased here rather than materialized via
+                        # a plain `tmp = self.expr(v)` assignment.
+                        _is_mvn_call = (
+                            isinstance(v, ast.Call)
+                            and isinstance(v.func, ast.Attribute)
+                            and v.func.attr == "multivariate_normal"
+                        )
+                        if _is_mvn_call:
+                            def _mvn_arg(idx, name):
+                                if len(v.args) > idx:
+                                    return v.args[idx]
+                                for kw in v.keywords:
+                                    if kw.arg == name:
+                                        return kw.value
+                                return None
+
+                            mean_node = _mvn_arg(0, "mean")
+                            cov_node = _mvn_arg(1, "cov")
+                            size_node = _mvn_arg(2, "size")
+                            if mean_node is None or cov_node is None or size_node is None:
+                                raise NotImplementedError("rng.multivariate_normal requires mean, cov and size")
+                            mean_expr = self.expr(mean_node)
+                            cov_expr = self.expr(cov_node)
+                            n_expr = self.expr(size_node)
+                            self.o.w(f"allocate(mask_scatter_tmp(1:int({n_expr}),1:size({mean_expr})))")
+                            self.o.w(f"call random_mvn_samples({mean_expr}, {cov_expr}, mask_scatter_tmp)")
+                        else:
+                            self.o.w(f"mask_scatter_tmp = {self.expr(v)}")
+                        self.o.w("mask_scatter_k = 0")
+                        self.o.w(f"do mask_scatter_i = 1, size({base_expr}, 1)")
+                        self.o.push()
+                        self.o.w(f"if ({mask_expr}(mask_scatter_i)) then")
+                        self.o.push()
+                        self.o.w("mask_scatter_k = mask_scatter_k + 1")
+                        self.o.w(f"{base_expr}(mask_scatter_i, :) = mask_scatter_tmp(mask_scatter_k, :)")
+                        self.o.pop()
+                        self.o.w("end if")
+                        self.o.pop()
+                        self.o.w("end do")
+                        self.o.pop()
+                        self.o.w("end block")
+                        return
             # x[idx] = rng.multivariate_normal(mean, cov, size=n)
             if (
                 isinstance(v, ast.Call)
                 and isinstance(v.func, ast.Attribute)
                 and v.func.attr == "multivariate_normal"
-                and len(v.args) >= 2
                 and (
                     (isinstance(v.func.value, ast.Name) and v.func.value.id in self.rng_vars)
                     or (
@@ -31417,12 +32007,21 @@ class translator(ast.NodeVisitor):
                     )
                 )
             ):
-                mean_expr = self.expr(v.args[0])
-                cov_expr = self.expr(v.args[1])
-                size_node = v.args[2] if len(v.args) >= 3 else None
-                for kw in v.keywords:
-                    if kw.arg == "size":
-                        size_node = kw.value
+                def _mvn_arg(idx, name):
+                    if len(v.args) > idx:
+                        return v.args[idx]
+                    for kw in v.keywords:
+                        if kw.arg == name:
+                            return kw.value
+                    return None
+
+                mean_node = _mvn_arg(0, "mean")
+                cov_node = _mvn_arg(1, "cov")
+                size_node = _mvn_arg(2, "size")
+                if mean_node is None or cov_node is None:
+                    raise NotImplementedError("rng.multivariate_normal requires mean and cov")
+                mean_expr = self.expr(mean_node)
+                cov_expr = self.expr(cov_node)
                 if size_node is None:
                     raise NotImplementedError("rng.multivariate_normal currently requires size=...")
                 if isinstance(size_node, (ast.Tuple, ast.List)):
@@ -42007,7 +42606,7 @@ def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None
 ):
-    top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
+    top_level_comment_map = _comment_map_for_top_level(tree, comment_map, extra_def_nodes=local_funcs)
     def _tuple_subscript_base_rank(elts):
         # Base-array rank consumed by a tuple subscript.
         # `None`/`np.newaxis` inserts an axis and does not consume one.
@@ -47922,6 +48521,8 @@ def transpile_file(
     # output is readable even without full --postprocess rewrites.
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
+    f90_lines = combine_parenthesized_integer_offset(f90_lines)
+    f90_lines = simplify_redundant_unary_minus_parens(f90_lines)
     f90_lines = simplify_index_arithmetic_notation(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
@@ -47930,16 +48531,22 @@ def transpile_file(
     f90_lines = coalesce_nonadjacent_declarations(f90_lines, max_len=10**9)
     f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
     f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
+    f90_lines = hoist_loop_invariant_array_realloc(f90_lines)
+    # Re-run: hoisting can move a guard out of its enclosing loop, which
+    # makes it newly eligible (loop_depth == 0, no prior use) for removal.
+    f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
+    f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
+    f90_lines = rebase_argsort_output_to_one_based(f90_lines)
+    f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
+    f90_lines = remove_write_only_scalar_locals(f90_lines)
     if postprocess:
         f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
         f90_lines = collapse_allocate_before_array_constructor_assignment(f90_lines)
-        f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
         f90_lines = simplify_allocate_shape_to_mold(f90_lines)
         f90_lines = simplify_generated_parentheses(f90_lines)
         f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
         f90_lines = fpost.simplify_norm2_patterns(f90_lines)
         f90_lines = fpost.simplify_bfgs_rank1_update(f90_lines)
-        f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
         f90_lines = normalize_string_concat_operator(f90_lines)
         f90_lines = normalize_unary_minus_after_operator(f90_lines)
         f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
