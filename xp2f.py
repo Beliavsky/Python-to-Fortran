@@ -16632,6 +16632,22 @@ class translator(ast.NodeVisitor):
             if is_none(a0) and full1:
                 return True
         if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Tuple)
+            and len(node.slice.elts) == 3
+        ):
+            # `arr[None, j, :]`-shaped: exactly one None, exactly one full
+            # slice, one scalar index -- after the scalar reduces its
+            # dimension, this is a 1-D vector with the None-axis inserted
+            # BEFORE the kept (slice) dimension, i.e. a row vector (1, n).
+            elts = list(node.slice.elts)
+            none_idx = [i for i, e in enumerate(elts) if is_none(e)]
+            slice_idx = [i for i, e in enumerate(elts) if isinstance(e, ast.Slice) and e.lower is None and e.upper is None and e.step is None]
+            if len(none_idx) == 1 and len(slice_idx) == 1:
+                kept_before = sum(1 for i in slice_idx if i < none_idx[0])
+                if kept_before == 0:
+                    return True
+        if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "reshape"
@@ -16677,6 +16693,22 @@ class translator(ast.NodeVisitor):
             if full0 and is_none(a1):
                 return True
         if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Tuple)
+            and len(node.slice.elts) == 3
+        ):
+            # `arr[:, j, None]`-shaped: exactly one None, exactly one full
+            # slice, one scalar index -- after the scalar reduces its
+            # dimension, this is a 1-D vector with the None-axis inserted
+            # AFTER the kept (slice) dimension, i.e. a column vector (n, 1).
+            elts = list(node.slice.elts)
+            none_idx = [i for i, e in enumerate(elts) if is_none(e)]
+            slice_idx = [i for i, e in enumerate(elts) if isinstance(e, ast.Slice) and e.lower is None and e.upper is None and e.step is None]
+            if len(none_idx) == 1 and len(slice_idx) == 1:
+                kept_before = sum(1 for i in slice_idx if i < none_idx[0])
+                if kept_before == 1:
+                    return True
+        if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "reshape"
@@ -16706,6 +16738,14 @@ class translator(ast.NodeVisitor):
                 return b
             return self._shape_anchor_2d(node.orelse)
         if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.MatMult):
+                # A matmul's own shape is (left.rows, right.cols) -- a
+                # genuinely NEW shape combining both operands, not the
+                # shape of either one alone. Recursing into an operand
+                # (as done below for elementwise ops, where an operand's
+                # shape usually equals the result's) would silently
+                # anchor on the wrong array's extent.
+                return self.expr(node)
             cands = [node.left, node.right]
             for c in cands:
                 if self._rank_expr(c) == 2 and (not self._is_row2_expr(c)) and (not self._is_col2_expr(c)):
@@ -17614,6 +17654,31 @@ class translator(ast.NodeVisitor):
                     if self._decl_rank_expr(n) <= 1:
                         return f"size({self.expr(n)})"
                     return f"size({shape_expr},{dim})"
+                def _none_axis_source_expr(n):
+                    # For `arr[:, None]` / `arr[None, :]`, the array to
+                    # spread is simply arr itself (already the correct
+                    # rank once the None is dropped). For a 3-element
+                    # tuple mixing a scalar index alongside a full slice
+                    # and a None (e.g. `arr[:, j, None]`), it's the
+                    # SCALAR-INDEXED SLICE that must be spread, not the
+                    # raw un-subscripted base array -- using the base
+                    # array directly would spread the wrong (un-reduced)
+                    # shape.
+                    if isinstance(n.slice, ast.Tuple) and len(n.slice.elts) == 3:
+                        elts = list(n.slice.elts)
+                        none_idx = [i for i, e in enumerate(elts) if is_none(e)]
+                        if len(none_idx) == 1:
+                            kept = [e for i, e in enumerate(elts) if i != none_idx[0]]
+                            reduced_node = ast.Subscript(
+                                value=n.value,
+                                slice=ast.Tuple(elts=kept, ctx=ast.Load()),
+                                ctx=ast.Load(),
+                            )
+                            try:
+                                return self.expr(reduced_node)
+                            except Exception:
+                                pass
+                    return self.expr(n.value)
                 l_col = self._is_col2_expr(node.left)
                 l_row = self._is_row2_expr(node.left)
                 r_col = self._is_col2_expr(node.right)
@@ -17623,7 +17688,7 @@ class translator(ast.NodeVisitor):
                 if not ((l_row and r_row) or (l_col and r_col)):
                     if l_col and not r_col:
                         if isinstance(node.left, ast.Subscript):
-                            abase = self.expr(node.left.value)
+                            abase = _none_axis_source_expr(node.left)
                             a = f"spread({abase}, dim=2, ncopies={_size_dim(node.right, rshape, 2)})"
                         else:
                             if self._decl_rank_expr(node.left) <= 1:
@@ -17632,7 +17697,7 @@ class translator(ast.NodeVisitor):
                                 a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies={_size_dim(node.right, rshape, 2)})"
                     elif l_row and not r_row:
                         if isinstance(node.left, ast.Subscript):
-                            abase = self.expr(node.left.value)
+                            abase = _none_axis_source_expr(node.left)
                             a = f"spread({abase}, dim=1, ncopies={_size_dim(node.right, rshape, 1)})"
                         else:
                             if self._decl_rank_expr(node.left) <= 1:
@@ -17642,7 +17707,7 @@ class translator(ast.NodeVisitor):
 
                     if r_col and not l_col:
                         if isinstance(node.right, ast.Subscript):
-                            bbase = self.expr(node.right.value)
+                            bbase = _none_axis_source_expr(node.right)
                             b = f"spread({bbase}, dim=2, ncopies={_size_dim(node.left, lshape, 2)})"
                         else:
                             if self._decl_rank_expr(node.right) <= 1:
@@ -17651,7 +17716,7 @@ class translator(ast.NodeVisitor):
                                 b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies={_size_dim(node.left, lshape, 2)})"
                     elif r_row and not l_row:
                         if isinstance(node.right, ast.Subscript):
-                            bbase = self.expr(node.right.value)
+                            bbase = _none_axis_source_expr(node.right)
                             b = f"spread({bbase}, dim=1, ncopies={_size_dim(node.left, lshape, 1)})"
                         else:
                             if self._decl_rank_expr(node.right) <= 1:
@@ -18335,9 +18400,25 @@ class translator(ast.NodeVisitor):
                     else:
                         base_view = f"{base}({', '.join(comps)})"
                     out_expr = base_view
+                    # For each None's ORIGINAL tuple position, the correct
+                    # `spread` dim is 1 + however many SLICE (rank-kept)
+                    # elements precede it -- not the raw tuple position.
+                    # A scalar index like `j` in `[:, j, None]` consumes a
+                    # dimension without contributing one to the output, so
+                    # counting it toward the insertion position (as the raw
+                    # position would) overshoots the result's actual rank.
+                    kept_before = []
+                    running = 0
+                    for a in elts3:
+                        kept_before.append(running)
+                        if isinstance(a, ast.Slice):
+                            running += 1
+                    inserted = 0
                     for p0 in none_pos:
                         # Insert singleton axis for NumPy `None`/`newaxis`.
-                        out_expr = f"spread({out_expr}, dim={p0 + 1}, ncopies=1)"
+                        dim = kept_before[p0] + inserted + 1
+                        out_expr = f"spread({out_expr}, dim={dim}, ncopies=1)"
+                        inserted += 1
                     return out_expr
 
                 # General 3D scalar/slice indexing.
@@ -37577,7 +37658,21 @@ def _emit_local_function(
         if (a.arg not in forced_scalar_args_for_emit) and (not _force_rr1) and (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
-                rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
+                call_site_rr = int(local_func_arg_ranks[fn.name][idx])
+                if call_site_rr > 0:
+                    # A real call-site observation (rank actually seen in an
+                    # argument expression) is authoritative over the
+                    # arithmetic-usage guess above -- numpy broadcasting
+                    # means e.g. `x - mean` is perfectly valid with `mean`
+                    # at a LOWER rank than `x`, so blending via max() would
+                    # let that guess silently override a genuinely-correct,
+                    # lower, call-observed rank (e.g. multivariate_normal_
+                    # logpdf's `mean` parameter, always called with a 1-D
+                    # slice, getting bumped to rank 2 just because the body
+                    # does `x - mean`).
+                    rr = call_site_rr
+                else:
+                    rr = max(rr, call_site_rr)
                 if rr > int(local_func_arg_ranks[fn.name][idx]):
                     local_func_arg_ranks[fn.name][idx] = int(rr)
         if rr > 0:
@@ -44069,12 +44164,43 @@ def generate_flat(
                         _dk = tr_seed._expr_kind(_dv)
                         if _dk in {"int", "real", "logical", "char", "complex"}:
                             default_kinds[_idx] = _dk
-        local_func_arg_ranks[fn.name] = [
-            max(
-                int(base_ranks[i]),
-                int(hint_ranks[i]) if i < len(hint_ranks) else 0,
+        def _arg_has_direct_transpose_use(_arg_name):
+            return any(
+                isinstance(_node, ast.Attribute)
+                and isinstance(_node.value, ast.Name)
+                and _node.value.id == _arg_name
+                and _node.attr == "T"
+                for _node in ast.walk(fn)
             )
-            for i in range(len(base_ranks))
+
+        def _base_or_hint_rank(i):
+            _hr = int(hint_ranks[i]) if i < len(hint_ranks) else 0
+            if _hr > 0:
+                # A real call-site observation is authoritative over
+                # `_infer_arg_rank_in_fn`'s body-usage guess: that guess
+                # can assume a BinOp's two operands share a rank (e.g.
+                # `x - mean`), which is exactly wrong under numpy
+                # broadcasting, where `mean` may legitimately be a lower
+                # rank than `x`. Blending via max() let that wrong, higher
+                # guess silently override a correct, lower, call-observed
+                # rank.
+                #
+                # A direct `.T` use is different: xp2f lowers it as a matrix
+                # transpose and therefore emits a rank-2 dummy. Keep the
+                # shared call-site signature at rank 2 as well, or callers
+                # will flatten a matrix actual to rank 1 even though the
+                # emitted callee requires rank 2.
+                if (
+                    int(base_ranks[i]) > _hr
+                    and i < len(local_func_arg_names[fn.name])
+                    and _arg_has_direct_transpose_use(local_func_arg_names[fn.name][i])
+                ):
+                    return int(base_ranks[i])
+                return _hr
+            return int(base_ranks[i])
+
+        local_func_arg_ranks[fn.name] = [
+            _base_or_hint_rank(i) for i in range(len(base_ranks))
         ]
         for _i, _arg_nm in enumerate(local_func_arg_names[fn.name]):
             if _i >= len(local_func_arg_ranks[fn.name]):
