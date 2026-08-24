@@ -2691,44 +2691,108 @@ contains
       subroutine argsort_real(x, idx)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(out) :: idx(:)
-         integer :: i, j, n, key
+         integer :: i, n
+         integer, allocatable :: tmp(:)
          n = size(x)
          if (size(idx) < n) stop "argsort_real: output array too small"
          do i = 1, n
             idx(i) = i - 1
          end do
-         do i = 2, n
-            key = idx(i)
-            j = i - 1
-            do while (j >= 1)
-               if (x(idx(j)+1) <= x(key+1)) exit
-               idx(j+1) = idx(j)
-               j = j - 1
-            end do
-            idx(j+1) = key
-         end do
+         if (n > 1) then
+            allocate(tmp(n))
+            call argsort_msort_real(x, idx, tmp, 1, n)
+         end if
       end subroutine argsort_real
+
+      recursive subroutine argsort_msort_real(x, idx, tmp, lo, hi)
+         ! O(n log n) stable merge sort of idx by x(idx(:)+1); insertion
+         ! sort here previously made argsort O(n**2), catastrophic for
+         ! large n (e.g. sorting a 10**5-element array to seed EM means).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(inout) :: idx(:), tmp(:)
+         integer, intent(in) :: lo, hi
+         integer :: mid, i, j, k
+         if (hi - lo < 1) return
+         mid = (lo + hi) / 2
+         call argsort_msort_real(x, idx, tmp, lo, mid)
+         call argsort_msort_real(x, idx, tmp, mid + 1, hi)
+         i = lo
+         j = mid + 1
+         k = lo
+         do while (i <= mid .and. j <= hi)
+            if (x(idx(i)+1) <= x(idx(j)+1)) then
+               tmp(k) = idx(i)
+               i = i + 1
+            else
+               tmp(k) = idx(j)
+               j = j + 1
+            end if
+            k = k + 1
+         end do
+         do while (i <= mid)
+            tmp(k) = idx(i)
+            i = i + 1
+            k = k + 1
+         end do
+         do while (j <= hi)
+            tmp(k) = idx(j)
+            j = j + 1
+            k = k + 1
+         end do
+         idx(lo:hi) = tmp(lo:hi)
+      end subroutine argsort_msort_real
 
       subroutine argsort_int(x, idx)
          integer, intent(in) :: x(:)
          integer, intent(out) :: idx(:)
-         integer :: i, j, n, key
+         integer :: i, n
+         integer, allocatable :: tmp(:)
          n = size(x)
          if (size(idx) < n) stop "argsort_int: output array too small"
          do i = 1, n
             idx(i) = i - 1
          end do
-         do i = 2, n
-            key = idx(i)
-            j = i - 1
-            do while (j >= 1)
-               if (x(idx(j)+1) <= x(key+1)) exit
-               idx(j+1) = idx(j)
-               j = j - 1
-            end do
-            idx(j+1) = key
-         end do
+         if (n > 1) then
+            allocate(tmp(n))
+            call argsort_msort_int(x, idx, tmp, 1, n)
+         end if
       end subroutine argsort_int
+
+      recursive subroutine argsort_msort_int(x, idx, tmp, lo, hi)
+         ! O(n log n) stable merge sort -- see argsort_msort_real.
+         integer, intent(in) :: x(:)
+         integer, intent(inout) :: idx(:), tmp(:)
+         integer, intent(in) :: lo, hi
+         integer :: mid, i, j, k
+         if (hi - lo < 1) return
+         mid = (lo + hi) / 2
+         call argsort_msort_int(x, idx, tmp, lo, mid)
+         call argsort_msort_int(x, idx, tmp, mid + 1, hi)
+         i = lo
+         j = mid + 1
+         k = lo
+         do while (i <= mid .and. j <= hi)
+            if (x(idx(i)+1) <= x(idx(j)+1)) then
+               tmp(k) = idx(i)
+               i = i + 1
+            else
+               tmp(k) = idx(j)
+               j = j + 1
+            end if
+            k = k + 1
+         end do
+         do while (i <= mid)
+            tmp(k) = idx(i)
+            i = i + 1
+            k = k + 1
+         end do
+         do while (j <= hi)
+            tmp(k) = idx(j)
+            j = j + 1
+            k = k + 1
+         end do
+         idx(lo:hi) = tmp(lo:hi)
+      end subroutine argsort_msort_int
 
       function argsort_idx_real(x) result(idx)
          real(kind=dp), intent(in) :: x(:)
