@@ -2582,7 +2582,7 @@ def simplify_index_arithmetic_notation(lines):
     # so it can be restored in the replacement -- otherwise a space after a
     # preceding comma, e.g. `, (i + 1)`, silently disappears.
     re_idx_paren = re.compile(
-        r"(?<=[(:,])(\s*)\(\s*([a-z_]\w*(?:\s*[+\-]\s*\d+)?)\s*\)\s*(?=[,:)])",
+        r"(?<=[(:,])(\s*)\(\s*([a-z_]\w*(?:\s*[+\-]\s*\d+)?|\d+)\s*\)\s*(?=[,:)])",
         re.IGNORECASE,
     )
     re_idx_const_binop = re.compile(
@@ -17650,9 +17650,30 @@ class translator(ast.NodeVisitor):
             if lr == 2 and rr == 2:
                 lshape = self._shape_anchor_2d(node.left)
                 rshape = self._shape_anchor_2d(node.right)
+                def _matmul_dim_size(n, dim):
+                    # matmul(A, B) has shape (A.rows, B.cols) -- derive
+                    # the extent algebraically from the OPERAND shapes
+                    # instead of recomputing the whole matmul just to
+                    # read size() of its result.
+                    if not (isinstance(n, ast.BinOp) and isinstance(n.op, ast.MatMult)):
+                        return None
+                    if dim == 1:
+                        operand = n.left
+                    elif dim == 2:
+                        operand = n.right
+                    else:
+                        return None
+                    if self._rank_expr(operand) <= 1:
+                        return f"size({self.expr(operand)})"
+                    anchor = self._shape_anchor_2d(operand)
+                    query_dim = 1 if dim == 1 else 2
+                    return f"size({anchor},{query_dim})"
                 def _size_dim(n, shape_expr, dim):
                     if self._decl_rank_expr(n) <= 1:
                         return f"size({self.expr(n)})"
+                    mm_size = _matmul_dim_size(n, dim)
+                    if mm_size is not None:
+                        return mm_size
                     return f"size({shape_expr},{dim})"
                 def _none_axis_source_expr(n):
                     # For `arr[:, None]` / `arr[None, :]`, the array to
@@ -21386,15 +21407,18 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "eye"
                 and len(node.args) >= 1
             ):
-                n_expr = self.expr(node.args[0])
-                m_expr = n_expr
+                n_node = node.args[0]
+                m_node = n_node
                 if len(node.args) >= 2:
-                    m_expr = self.expr(node.args[1])
+                    m_node = node.args[1]
                 for kw in node.keywords:
                     if kw.arg in {"M", "m"}:
-                        m_expr = self.expr(kw.value)
+                        m_node = kw.value
                         break
-                return f"eye(int({n_expr}), int({m_expr}))"
+                def _int_arg_expr(n):
+                    txt = self.expr(n)
+                    return txt if self._expr_kind(n) == "int" else f"int({txt})"
+                return f"eye({_int_arg_expr(n_node)}, {_int_arg_expr(m_node)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -22111,26 +22135,34 @@ class translator(ast.NodeVisitor):
             ):
                 if len(node.args) == 1:
                     rowvar = True
-                    ddof = None
+                    ddof_node = None
                     bias = False
                     for kw in node.keywords:
                         if kw.arg == "rowvar" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
                             rowvar = bool(kw.value.value)
                         elif kw.arg == "ddof":
-                            ddof = self.expr(kw.value)
+                            ddof_node = kw.value
                         elif kw.arg == "bias" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
                             bias = bool(kw.value.value)
                     if rowvar:
                         raise NotImplementedError("np.cov(..., rowvar=True) not supported; use rowvar=False")
-                    if ddof is None:
-                        ddof = "0" if bias else "1"
-                    return f"cov_matrix_rows_real({self.expr(node.args[0])}, int({ddof}))"
-                ddof = "1"
+                    if ddof_node is None:
+                        ddof_txt = "0" if bias else "1"
+                    else:
+                        ddof_expr = self.expr(ddof_node)
+                        ddof_txt = ddof_expr if self._expr_kind(ddof_node) == "int" else f"int({ddof_expr})"
+                    return f"cov_matrix_rows_real({self.expr(node.args[0])}, {ddof_txt})"
+                ddof_node = None
                 for kw in node.keywords:
                     if kw.arg == "ddof":
-                        ddof = self.expr(kw.value)
+                        ddof_node = kw.value
                         break
-                return f"cov2_real({self.expr(node.args[0])}, {self.expr(node.args[1])}, int({ddof}))"
+                if ddof_node is None:
+                    ddof_txt = "1"
+                else:
+                    ddof_expr = self.expr(ddof_node)
+                    ddof_txt = ddof_expr if self._expr_kind(ddof_node) == "int" else f"int({ddof_expr})"
+                return f"cov2_real({self.expr(node.args[0])}, {self.expr(node.args[1])}, {ddof_txt})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -32245,8 +32277,9 @@ class translator(ast.NodeVisitor):
                                 raise NotImplementedError("rng.multivariate_normal requires mean, cov and size")
                             mean_expr = self.expr(mean_node)
                             cov_expr = self.expr(cov_node)
-                            n_expr = self.expr(size_node)
-                            self.o.w(f"allocate(mask_scatter_tmp(1:int({n_expr}),1:size({mean_expr})))")
+                            n_txt = self.expr(size_node)
+                            n_expr = n_txt if self._expr_kind(size_node) == "int" else f"int({n_txt})"
+                            self.o.w(f"allocate(mask_scatter_tmp(1:{n_expr},1:size({mean_expr})))")
                             self.o.w(f"call random_mvn_samples({mean_expr}, {cov_expr}, mask_scatter_tmp)")
                         else:
                             self.o.w(f"mask_scatter_tmp = {self.expr(v)}")
@@ -32298,12 +32331,13 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("rng.multivariate_normal currently requires size=...")
                 if isinstance(size_node, (ast.Tuple, ast.List)):
                     raise NotImplementedError("rng.multivariate_normal size tuple not supported")
-                n_expr = self.expr(size_node)
+                n_txt = self.expr(size_node)
+                n_expr = n_txt if self._expr_kind(size_node) == "int" else f"int({n_txt})"
                 lhs_expr = self.expr(t)
                 self.o.w("block")
                 self.o.push()
                 self.o.w("real(kind=dp), allocatable :: mvn_tmp(:,:)")
-                self.o.w(f"allocate(mvn_tmp(1:int({n_expr}),1:size({mean_expr})))")
+                self.o.w(f"allocate(mvn_tmp(1:{n_expr},1:size({mean_expr})))")
                 self.o.w(f"call random_mvn_samples({mean_expr}, {cov_expr}, mvn_tmp)")
                 self.o.w(f"{lhs_expr} = mvn_tmp")
                 self.o.pop()
