@@ -6915,6 +6915,18 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_re
             return _infer_from_literal_seq(n)
         if isinstance(n, ast.UnaryOp):
             return _infer_from_node(n.operand)
+        if isinstance(n, ast.Subscript):
+            # r = arr[j, :] / arr[:, j] / arr[i:j] -- count the surviving
+            # (sliced, not scalar-indexed) axes directly from the
+            # subscript shape. The base array's own kind isn't tracked
+            # here, but a slice result is virtually always real in this
+            # transpiler's numeric-code domain, matching the generic
+            # array-default used elsewhere absent other evidence.
+            slc = n.slice
+            parts = list(slc.elts) if isinstance(slc, ast.Tuple) else [slc]
+            rank = sum(1 for p in parts if isinstance(p, ast.Slice))
+            if rank > 0:
+                return "real", rank
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
             if (
                 isinstance(n.func.value, ast.Name)
@@ -6981,8 +6993,34 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_re
             return spec, int(rank or 0)
         return None, 0
 
+    def _iter_top_level_assigns(stmts):
+        # Top-level Assign nodes, including ones nested inside top-level
+        # control flow (for/if/while/with/try) -- those blocks don't
+        # introduce a new Python scope, so an assignment like `r = ...`
+        # inside a top-level `for` loop is still module/exec-body scope
+        # and must be visible to this scan the same as a bare top-level
+        # assignment. Never descend into a nested def -- that's a
+        # separate scope handled via local_funcs instead.
+        for st in stmts:
+            if isinstance(st, ast.Assign):
+                yield st
+            elif isinstance(st, (ast.For, ast.AsyncFor, ast.While)):
+                yield from _iter_top_level_assigns(st.body)
+                yield from _iter_top_level_assigns(st.orelse)
+            elif isinstance(st, ast.If):
+                yield from _iter_top_level_assigns(st.body)
+                yield from _iter_top_level_assigns(st.orelse)
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                yield from _iter_top_level_assigns(st.body)
+            elif isinstance(st, ast.Try):
+                yield from _iter_top_level_assigns(st.body)
+                for h in st.handlers:
+                    yield from _iter_top_level_assigns(h.body)
+                yield from _iter_top_level_assigns(st.orelse)
+                yield from _iter_top_level_assigns(st.finalbody)
+
     decls = {}
-    for st in tree.body:
+    for st in _iter_top_level_assigns(tree.body):
         if not isinstance(st, ast.Assign) or len(st.targets) != 1:
             continue
         # r, h = simulate(...) -- a tuple-unpacked name used by a local
@@ -11559,6 +11597,7 @@ class emit:
 class translator(ast.NodeVisitor):
     global_synthetic_slices = {}
     global_synthetic_slice_meta = {}
+    global_rng_vars = set()
     global_vectorize_aliases = {}
     global_linalg_aliases = set()
     global_scipy_special_aliases = set()
@@ -11751,7 +11790,7 @@ class translator(ast.NodeVisitor):
             if _src_name != _alias_name:
                 self.name_aliases[_src_name] = _alias_name
                 self.fortran_name_owner[_alias_name.lower()] = _src_name
-        self.rng_vars = set()
+        self.rng_vars = set(translator.global_rng_vars)
         self.python_list_vars = set()
         self.list_aliases = {}
         self.python_set_vars = set()
@@ -24385,6 +24424,7 @@ class translator(ast.NodeVisitor):
             ):
                 self._force_mark_int(node.targets[0].id)
                 self.rng_vars.add(node.targets[0].id)
+                translator.global_rng_vars.add(node.targets[0].id)
             if (
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
@@ -44714,6 +44754,41 @@ def generate_flat(
                         local_func_arg_kinds[_fn.name][_i] = _promote_kind_hint(
                             local_func_arg_kinds[_fn.name][_i], _gk
                         )
+        # A call `callee(..., name, ...)` anywhere in a local function's body,
+        # where `name` is a bare top-level/shared global (not one of the
+        # calling function's own formal parameters), tells us `callee`'s
+        # corresponding parameter has that global's kind/rank -- most
+        # notably the scipy.optimize.minimize args= wrapper synthesized by
+        # normalize_scipy_minimize_args_wrapper, e.g.
+        # `def f_argswrap(x): return f(x, r)` where `r` is a top-level
+        # array reassigned inside a `for` loop (so it never gets a hint
+        # from a literal top-level call to `f` itself).
+        _callee_names = set(local_func_arg_names.keys())
+        for _fn in (local_funcs or []):
+            if not isinstance(_fn, ast.FunctionDef):
+                continue
+            _own_params = {a.arg for a in (list(_fn.args.args) + list(_fn.args.kwonlyargs))}
+            for _call in ast.walk(_fn):
+                if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
+                    continue
+                _callee = _call.func.id
+                if _callee not in _callee_names or _callee == _fn.name:
+                    continue
+                _callee_arg_names = local_func_arg_names.get(_callee, [])
+                for _ai, _a in enumerate(_call.args):
+                    if _ai >= len(_callee_arg_names):
+                        break
+                    if not (isinstance(_a, ast.Name) and _a.id not in _own_params):
+                        continue
+                    _gk, _gr = _early_global_decls.get(_a.id, (None, 0))
+                    if _gk not in {"real", "complex", "logical", "char", "int"}:
+                        continue
+                    _ck = local_func_arg_kinds.get(_callee)
+                    _cr = local_func_arg_ranks.get(_callee)
+                    if _ck is not None and _ai < len(_ck):
+                        _ck[_ai] = _promote_kind_hint(_ck[_ai], _gk)
+                    if _cr is not None and _ai < len(_cr) and int(_gr) > int(_cr[_ai]):
+                        _cr[_ai] = int(_gr)
     # Propagate callback-parameter signatures from callees to passed-in local
     # function actuals. Example:
     #   def arclength_x(..., dydx, ...): fx = dydx(t)   ! t rank-1
@@ -48851,6 +48926,7 @@ def transpile_file(
     tree = inline_local_from_imports(tree, py_path)
     translator.global_synthetic_slices = {}
     translator.global_synthetic_slice_meta = {}
+    translator.global_rng_vars = set()
     translator.global_vectorize_aliases = {}
     translator.global_linalg_aliases = set()
     translator.global_scipy_special_aliases = set()
