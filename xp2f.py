@@ -2283,6 +2283,234 @@ def rename_conflicting_identifiers(src_text):
     return "\n".join(out_lines) + ("\n" if src_text.endswith("\n") else "")
 
 
+def simplify_redundant_nested_arith_parens(lines):
+    """Flatten redundant nested parens from generated arithmetic.
+
+    expr() always wraps a BinOp's own result in parens, and always
+    renders a call's argument via a fresh, independently-wrapped
+    self.expr() call. So a Python chain like `A + B + C` (parsed
+    left-associatively as `(A + B) + C`) emits as the needlessly
+    nested `((A + B) + C)` instead of `(A + B + C)`, and a call like
+    `sum(A + B)` emits as `sum((A + B))` since the argument's own
+    self-wrap duplicates the call's delimiting parens.
+
+    Both are safe to flatten unconditionally: parens around the LEFT
+    operand of a binary operator, or around a function call's sole
+    argument, are pure grouping -- the surrounding context never
+    depends on them, so dropping them can't change what the
+    expression means. Guarded against touching a group whose content
+    has a top-level logical/relational operator (never expected in an
+    arithmetic operand here, but kept as a safety margin).
+    """
+    def _find_matching_close(s, open_idx):
+        depth = 0
+        for i in range(open_idx, len(s)):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    # A leading `+`/`-` covers the left-chain flatten (`(A op) + C`);
+    # a leading `,` covers a redundantly-wrapped call argument that
+    # isn't the LAST one, e.g. `sum((A + B), dim=2)`.
+    chain_re = re.compile(r"^\s*([+\-]\s*\S|,)")
+    logical_guard_re = re.compile(
+        r"\.and\.|\.or\.|\.not\.|\.eqv\.|\.neqv\.|==|/=|<=|>=|(?<![</>=])[<>](?!=)"
+    )
+
+    def _has_top_level_comma(s):
+        # A top-level comma means `(inner_content)` is a Fortran complex
+        # literal `(re, im)` or some other multi-value grouped construct,
+        # not a single parenthesized value -- stripping its parens would
+        # turn one argument into two, changing what the call means.
+        depth = 0
+        for ch in s:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return True
+        return False
+
+    def _simplify_once(code):
+        i = 0
+        n = len(code)
+        while i < n - 1:
+            if code[i] == "(" and code[i + 1] == "(":
+                inner_close = _find_matching_close(code, i + 1)
+                if inner_close != -1:
+                    outer_close = _find_matching_close(code, i)
+                    if outer_close != -1:
+                        between = code[inner_close + 1:outer_close]
+                        if between == "" or chain_re.match(between):
+                            inner_content = code[i + 2:inner_close]
+                            if not logical_guard_re.search(inner_content) and not _has_top_level_comma(inner_content):
+                                new_code = code[:i + 1] + inner_content + between + code[outer_close:]
+                                return new_code, True
+            i += 1
+        return code, False
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        changed = True
+        while changed:
+            code, changed = _simplify_once(code)
+        out.append(f"{code}{bang}{comment}" if bang else code)
+    return out
+
+
+def combine_consecutive_axis_literal_assignments(lines):
+    """Combine a run of consecutive scalar element assignments to the
+    same array -- differing only in ONE index position that counts
+    consecutively (lo, lo+1, ..., hi), all other indices held fixed as
+    identical text -- into one array-slice assignment with a bracket
+    literal RHS. The varying index can be any axis, not just the last:
+
+        x(1,1) = 10.0
+        x(2,1) = 20.0
+
+    becomes:
+
+        x(1:2, 1) = [10.0, 20.0]
+
+    and
+
+        arr(1,1,1) = 0.64_dp
+        arr(1,1,2) = 0.2_dp
+
+    becomes:
+
+        arr(1,1,:) = [0.64_dp, 0.2_dp]
+
+    (using `:` instead of the equivalent `1:2` when the run starts at 1
+    and its length matches that dimension's extent from a matching
+    `allocate(name(...))` statement earlier in the same procedure/
+    program -- purely a readability upgrade, not required for safety).
+
+    An explicit `lo:hi` slice is always valid Fortran regardless of the
+    array's actual extent for that dimension (it only touches the
+    elements the original scalar assignments already touched), so no
+    shape verification is needed for that general form. The "other"
+    indices are matched by exact source text, not evaluated -- since
+    the run is a block of syntactically adjacent statements with
+    nothing between them, an identical text index necessarily holds
+    the same value at each one.
+    """
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    alloc_re = re.compile(r"^\s*allocate\s*\(\s*([a-z_]\w*)\s*\(([^()]+)\)\s*\)\s*$", re.IGNORECASE)
+    assign_re = re.compile(r"^(\s*)([a-z_]\w*)\(([^()]+)\)\s*=\s*(.+?)\s*$", re.IGNORECASE)
+    int_lit_re = re.compile(r"^[+-]?\d+$")
+
+    def _split_args(s):
+        return [p.strip() for p in s.split(",")]
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def _process_unit(unit_lines):
+        extents = {}
+        for ln in unit_lines:
+            code = ln.split("!", 1)[0]
+            m = alloc_re.match(code.strip())
+            if m:
+                extents[m.group(1).lower()] = _split_args(m.group(2))
+
+        out = list(unit_lines)
+        i = 0
+        while i < len(out):
+            code_i = out[i].split("!", 1)[0].rstrip("\r\n")
+            m = assign_re.match(code_i)
+            if not m:
+                i += 1
+                continue
+            indent, name, idx_text, rhs0 = m.groups()
+            idxs = _split_args(idx_text)
+            k = len(idxs)
+            # Every index must be a genuine scalar (no `:`) -- a slice
+            # index (e.g. `log_prob(:, 1)`) makes the LHS itself an
+            # array, and its RHS is then an array expression too, not a
+            # scalar value: combining those into a bracket literal is
+            # wrong (Fortran's `[A, B]` concatenates rank-1 arrays end
+            # to end, it doesn't stack them as columns).
+            if k < 1 or any(":" in ix for ix in idxs):
+                i += 1
+                continue
+
+            best = None  # (axis, run_vals, j_end, start_val)
+            for axis in range(k):
+                if not int_lit_re.match(idxs[axis]):
+                    continue
+                start_val = int(idxs[axis])
+                run_vals = [rhs0]
+                j = i + 1
+                expect = start_val + 1
+                while j < len(out):
+                    code_j = out[j].split("!", 1)[0].rstrip("\r\n")
+                    mj = assign_re.match(code_j)
+                    if not mj:
+                        break
+                    indent_j, name_j, idx_text_j, rhs_j = mj.groups()
+                    if name_j.lower() != name.lower() or indent_j != indent:
+                        break
+                    idxs_j = _split_args(idx_text_j)
+                    if len(idxs_j) != k or idxs_j[axis] != str(expect):
+                        break
+                    if any(idxs_j[p] != idxs[p] for p in range(k) if p != axis):
+                        break
+                    run_vals.append(rhs_j)
+                    j += 1
+                    expect += 1
+                if len(run_vals) >= 2 and (best is None or len(run_vals) > len(best[1])):
+                    best = (axis, run_vals, j, start_val)
+
+            if best is None:
+                i += 1
+                continue
+            axis, run_vals, j, start_val = best
+            hi = start_val + len(run_vals) - 1
+            slice_txt = f"{start_val}:{hi}"
+            dim_sizes = extents.get(name.lower())
+            if start_val == 1 and dim_sizes is not None and len(dim_sizes) == k:
+                n_text = dim_sizes[axis]
+                if re.match(r"^\d+$", n_text) and int(n_text) == len(run_vals):
+                    slice_txt = ":"
+            new_idxs = list(idxs)
+            new_idxs[axis] = slice_txt
+            eol = _line_eol(out[j - 1])
+            new_line = f"{indent}{name}({','.join(new_idxs)}) = [{', '.join(run_vals)}]"
+            out[i:j] = [new_line + eol]
+            i += 1
+        return out
+
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not unit_start_re.match(lines[i].split("!", 1)[0]):
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not unit_end_re.match(lines[j].split("!", 1)[0]):
+            j += 1
+        end = min(j + 1, n)
+        out.append(lines[i])
+        out.extend(_process_unit(lines[i + 1:j]))
+        out.extend(lines[j:end])
+        i = end
+    return out
+
+
 def simplify_generated_parentheses(lines):
     """Targeted paren cleanup that preserves indentation/layout."""
     def _split_top_level_commas(s):
@@ -4195,7 +4423,11 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
         r"^\s*(?:use\b|implicit\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
         re.IGNORECASE,
     )
-    decl_re = re.compile(r"^(\s*)([^:]+?)\s*::\s*(.+)$", re.IGNORECASE)
+    # Non-greedy `.+?` (not `[^:]+?`) so a spec containing its own colon,
+    # e.g. `character(len=:), allocatable`, still matches correctly --
+    # the pattern still finds the true `::` delimiter, since non-greedy
+    # matching only stops expanding once the rest of the pattern matches.
+    decl_re = re.compile(r"^(\s*)(.+?)\s*::\s*(.+)$", re.IGNORECASE)
 
     def _ends_continued(ln):
         return ln.rstrip("\r\n").rstrip().endswith("&")
@@ -21299,6 +21531,14 @@ class translator(ast.NodeVisitor):
 
                     a0 = self.expr(start_node)
                     a1 = self.expr(stop_node)
+                    if start_val == 0.0:
+                        # start is a literal 0 even though stop isn't
+                        # constant (e.g. linspace(0, n - 1, k)) -- drop
+                        # the "0 +" / "- 0" identity terms rather than
+                        # emitting them and relying on later constant-
+                        # folding passes, which don't fold across a
+                        # non-constant stop expression.
+                        return f"({a1} * {ramp})"
                     return f"({a0} + ({a1} - {a0}) * {ramp})"
                 if node.func.attr == "logspace" and len(node.args) >= 2:
                     start = self.expr(node.args[0])
@@ -48873,12 +49113,14 @@ def transpile_file(
     # Always apply a minimal set of semantics-preserving cleanups so default
     # output is readable even without full --postprocess rewrites.
     f90_lines = simplify_generated_parentheses(f90_lines)
+    f90_lines = simplify_redundant_nested_arith_parens(f90_lines)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
     f90_lines = combine_parenthesized_integer_offset(f90_lines)
     f90_lines = simplify_redundant_unary_minus_parens(f90_lines)
     f90_lines = simplify_index_arithmetic_notation(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
+    f90_lines = combine_consecutive_axis_literal_assignments(f90_lines)
     f90_lines = mark_recursive_procedures(f90_lines)
     f90_lines = reorder_arg_decls_before_locals(f90_lines)
     f90_lines = coalesce_nonadjacent_declarations(f90_lines, max_len=10**9)
@@ -48892,6 +49134,7 @@ def transpile_file(
     f90_lines = rebase_argsort_output_to_one_based(f90_lines)
     f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
     f90_lines = remove_write_only_scalar_locals(f90_lines)
+    f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
     if postprocess:
         f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
         f90_lines = collapse_allocate_before_array_constructor_assignment(f90_lines)
