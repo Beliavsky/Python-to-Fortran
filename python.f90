@@ -275,6 +275,10 @@ public :: sliding_window_view_axis0_real_2d !@pyapi kind=function ret=real(dp)(:
 public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional desc="1D integer convolution with mode full/same/valid"
 public :: correlate_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D cross-correlation with mode full/same/valid (scipy.signal.correlate)"
 public :: lfilter_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="1D IIR/FIR filter, zero initial conditions (scipy.signal.lfilter)"
+public :: filtfilt_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="zero-phase forward-backward filter, no edge padding (scipy.signal.filtfilt)"
+public :: lfilter_zi_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in) desc="steady-state IIR filter initial state for a unit step input (scipy.signal.lfilter_zi)"
+public :: detrend_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),dtype:character:intent(in):optional desc="remove linear or constant trend (scipy.signal.detrend)"
+public :: find_peaks_int !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),height:real(dp):intent(in):optional,distance:integer:intent(in):optional desc="0-based local-maxima indices (scipy.signal.find_peaks, indices only)"
 public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load real matrix text file with basic numpy-like options"
 public :: loadtxt_real_1d !@pyapi kind=function ret=real(dp)(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected real column as vector"
 public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load integer matrix from text file"
@@ -6085,13 +6089,14 @@ contains
          end if
       end function correlate_real
 
-      function lfilter_real(b, a, x) result(y)
-         ! scipy.signal.lfilter(b, a, x) with zero initial conditions:
-         ! Direct Form II Transposed IIR/FIR recursion (the same structure
-         ! scipy's own Fortran/C backend uses). b and a are zero-padded to
-         ! a common length k = max(size(b), size(a)) and normalized by
-         ! a(1); z holds the k-1 filter delay states.
+      function lfilter_real(b, a, x, zi) result(y)
+         ! scipy.signal.lfilter(b, a, x), zero initial conditions unless
+         ! zi is given: Direct Form II Transposed IIR/FIR recursion (the
+         ! same structure scipy's own Fortran/C backend uses). b and a
+         ! are zero-padded to a common length k = max(size(b), size(a))
+         ! and normalized by a(1); z holds the k-1 filter delay states.
          real(kind=dp), intent(in) :: b(:), a(:), x(:)
+         real(kind=dp), intent(in), optional :: zi(:)
          real(kind=dp), allocatable :: y(:)
          real(kind=dp), allocatable :: bn(:), an(:), z(:)
          integer :: nb, na, k, n, i, j
@@ -6111,6 +6116,7 @@ contains
          allocate(y(n))
          allocate(z(max(k - 1, 1)))
          z = 0.0_dp
+         if (present(zi)) z(1:size(zi)) = zi
 
          do i = 1, n
             y(i) = bn(1) * x(i) + z(1)
@@ -6120,6 +6126,161 @@ contains
             if (k >= 2) z(k - 1) = bn(k) * x(i) - an(k) * y(i)
          end do
       end function lfilter_real
+
+      function lfilter_zi_real(b, a) result(zi)
+         ! scipy.signal.lfilter_zi(b, a): steady-state initial filter
+         ! state for a unit step input, found by solving
+         ! (I - companion(a).T) @ zi = b(2:) - a(2:)*b(1) for normalized
+         ! b, a (a(1) = 1). Used by filtfilt_real to avoid startup
+         ! transients on both the forward and backward pass.
+         real(kind=dp), intent(in) :: b(:), a(:)
+         real(kind=dp), allocatable :: zi(:)
+         real(kind=dp), allocatable :: bn(:), an(:), iminusa(:,:), rhs(:)
+         integer :: nb, na, n, m, i
+         real(kind=dp) :: a0
+
+         nb = size(b)
+         na = size(a)
+         n = max(nb, na)
+         a0 = a(1)
+         allocate(bn(n), an(n))
+         bn = 0.0_dp
+         an = 0.0_dp
+         bn(1:nb) = b / a0
+         an(1:na) = a / a0
+
+         m = n - 1
+         if (m <= 0) then
+            allocate(zi(0))
+            return
+         end if
+
+         allocate(iminusa(m, m), rhs(m))
+         iminusa = 0.0_dp
+         do i = 1, m
+            iminusa(i, 1) = an(i + 1)
+            iminusa(i, i) = iminusa(i, i) + 1.0_dp
+            if (i < m) iminusa(i, i + 1) = iminusa(i, i + 1) - 1.0_dp
+            rhs(i) = bn(i + 1) - an(i + 1) * bn(1)
+         end do
+         zi = linalg_solve_vec(iminusa, rhs)
+      end function lfilter_zi_real
+
+      function filtfilt_real(b, a, x) result(y)
+         ! scipy.signal.filtfilt(b, a, x): zero-phase filtering, forward
+         ! pass then backward pass, each seeded with lfilter_zi-based
+         ! steady-state initial conditions scaled by the pass's first
+         ! sample -- this matches scipy's own filtfilt(..., padtype=None)
+         ! exactly. scipy's *default* additionally pads the signal
+         ! (padtype='odd', padlen=3*max(len(a),len(b))) before filtering
+         ! to further damp edge transients, which this does not
+         ! reproduce -- results match closely away from the signal's
+         ! edges, less so near them.
+         real(kind=dp), intent(in) :: b(:), a(:), x(:)
+         real(kind=dp), allocatable :: y(:), tmp(:), zi(:)
+         zi = lfilter_zi_real(b, a)
+         tmp = lfilter_real(b, a, x, zi * x(1))
+         tmp = tmp(size(tmp):1:-1)
+         tmp = lfilter_real(b, a, tmp, zi * tmp(1))
+         y = tmp(size(tmp):1:-1)
+      end function filtfilt_real
+
+      function detrend_real(x, dtype) result(y)
+         ! scipy.signal.detrend(x, type='linear'|'constant').
+         real(kind=dp), intent(in) :: x(:)
+         character(len=*), intent(in), optional :: dtype
+         real(kind=dp), allocatable :: y(:)
+         character(len=:), allocatable :: dt
+         integer :: n, i
+         real(kind=dp) :: mean_x, mean_t, sxt, stt, slope, intercept, t
+
+         n = size(x)
+         dt = "linear"
+         if (present(dtype)) dt = to_lower(trim(dtype))
+
+         if (dt == "constant") then
+            mean_x = sum(x) / real(n, kind=dp)
+            y = x - mean_x
+            return
+         end if
+
+         mean_t = real(n - 1, kind=dp) / 2.0_dp
+         mean_x = sum(x) / real(n, kind=dp)
+         sxt = 0.0_dp
+         stt = 0.0_dp
+         do i = 1, n
+            t = real(i - 1, kind=dp)
+            sxt = sxt + (t - mean_t) * (x(i) - mean_x)
+            stt = stt + (t - mean_t)**2
+         end do
+         if (stt <= 0.0_dp) then
+            slope = 0.0_dp
+         else
+            slope = sxt / stt
+         end if
+         intercept = mean_x - slope * mean_t
+         allocate(y(n))
+         do i = 1, n
+            t = real(i - 1, kind=dp)
+            y(i) = x(i) - (intercept + slope * t)
+         end do
+      end function detrend_real
+
+      function find_peaks_int(x, height, distance) result(peaks)
+         ! scipy.signal.find_peaks(x, height=None, distance=None), peak
+         ! indices only (0-based, numpy-compatible) -- the properties
+         ! dict scipy also returns is not reproduced. Peaks are strict
+         ! local maxima (x(i) > both neighbors); flat-top plateaus, which
+         ! scipy resolves to their midpoint, are not detected here.
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), intent(in), optional :: height
+         integer, intent(in), optional :: distance
+         integer, allocatable :: peaks(:)
+         integer, allocatable :: cand(:), kept(:)
+         logical, allocatable :: keep(:), alive(:)
+         integer :: n, i, nc, best
+         real(kind=dp) :: bestval
+
+         n = size(x)
+         allocate(cand(0))
+         do i = 2, n - 1
+            if (x(i) > x(i - 1) .and. x(i) > x(i + 1)) then
+               cand = [cand, i]
+            end if
+         end do
+
+         if (present(height)) then
+            kept = pack(cand, x(cand) >= height)
+            cand = kept
+         end if
+         nc = size(cand)
+
+         if (present(distance) .and. nc > 0) then
+            allocate(keep(nc), alive(nc))
+            keep = .false.
+            alive = .true.
+            do while (any(alive))
+               best = 0
+               bestval = -huge(1.0_dp)
+               do i = 1, nc
+                  if (alive(i) .and. x(cand(i)) > bestval) then
+                     bestval = x(cand(i))
+                     best = i
+                  end if
+               end do
+               keep(best) = .true.
+               alive(best) = .false.
+               do i = 1, nc
+                  if (alive(i) .and. abs(cand(i) - cand(best)) < distance) alive(i) = .false.
+               end do
+            end do
+            cand = pack(cand, keep)
+            call sort_int_vec(cand)
+         end if
+
+         allocate(peaks(size(cand)))
+         peaks = cand - 1
+      end function find_peaks_int
 
       pure real(kind=dp) function polyval_real_scalar(p, x) result(y)
          real(kind=dp), intent(in) :: p(:)

@@ -5188,6 +5188,18 @@ def _tree_uses_scipy_fsolve(tree):
     return False
 
 
+# Feature flag: minimize(f, x0, method="L-BFGS-B") with NO bounds= used to
+# fall through to the home-grown finite-difference BFGS bridge (bfgs.f90),
+# since only an explicit bounds= previously routed to the real vendored
+# L-BFGS-B solver (lbfgsb.f90). Since scipy's own L-BFGS-B handles the
+# unbounded case fine (and is generally faster/more robust there -- see
+# lbfgsb_bridge.f90's forward-difference gradient vs bfgs.f90's central-
+# difference one, and lbfgsb's Wolfe line search vs bfgs.f90's plain Armijo
+# backtracking), this now routes to the real L-BFGS-B backend by default.
+# Set to False to revert to the old behavior.
+ROUTE_UNBOUNDED_LBFGSB_TO_REAL_LBFGSB = True
+
+
 def _tree_uses_scipy_minimize(tree):
     for _n in ast.walk(tree):
         if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
@@ -5245,9 +5257,41 @@ def _tree_uses_scipy_minimize_lbfgsb(tree):
             isinstance(_n, ast.Call)
             and isinstance(_n.func, ast.Name)
             and _n.func.id in _aliases
-            and any(_kw.arg == "bounds" for _kw in _n.keywords)
         ):
-            return True
+            if any(_kw.arg == "bounds" for _kw in _n.keywords):
+                return True
+            if ROUTE_UNBOUNDED_LBFGSB_TO_REAL_LBFGSB:
+                for _kw in _n.keywords:
+                    if (
+                        _kw.arg == "method"
+                        and isinstance(_kw.value, ast.Constant)
+                        and isinstance(_kw.value.value, str)
+                        and _kw.value.value.strip().lower() == "l-bfgs-b"
+                    ):
+                        return True
+    return False
+
+
+def _tree_uses_scipy_minimize_powell(tree):
+    # minimize(f, x0, method="Powell") -- distinct from the unconstrained
+    # minimize()/BFGS path and the bounds=.../L-BFGS-B path.
+    _aliases = collect_scipy_optimize_minimize_aliases(tree)
+    if not _aliases:
+        return False
+    for _n in ast.walk(tree):
+        if (
+            isinstance(_n, ast.Call)
+            and isinstance(_n.func, ast.Name)
+            and _n.func.id in _aliases
+        ):
+            for _kw in _n.keywords:
+                if (
+                    _kw.arg == "method"
+                    and isinstance(_kw.value, ast.Constant)
+                    and isinstance(_kw.value.value, str)
+                    and _kw.value.value.strip().lower() == "powell"
+                ):
+                    return True
     return False
 
 
@@ -6158,20 +6202,20 @@ def detect_needed_helpers(tree):
                 and node.func.attr in np_helper_map
             ):
                 needed.update(np_helper_map[node.func.attr])
+            _signal_helper_map = {
+                "correlate": "correlate_real",
+                "lfilter": "lfilter_real",
+                "filtfilt": "filtfilt_real",
+                "detrend": "detrend_real",
+                "find_peaks": "find_peaks_int",
+            }
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "signal"
-                and node.func.attr == "correlate"
+                and node.func.attr in _signal_helper_map
             ):
-                needed.add("correlate_real")
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "signal"
-                and node.func.attr == "lfilter"
-            ):
-                needed.add("lfilter_real")
+                needed.add(_signal_helper_map[node.func.attr])
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "corr"
@@ -11903,6 +11947,14 @@ class translator(ast.NodeVisitor):
         self.pandas_df_select_indices = {}
         self.pandas_df_columns_snapshot = {}
         self.dict_aliases = {}
+        # Tracks names bound to a scipy.optimize.minimize-style result
+        # (bfgs/L-BFGS-B/Powell): maps the result's own name to the tuple
+        # of sibling-variable suffixes (`{name}_fun`, `{name}_success`,
+        # ...) that also need copying whenever `t = v` reassigns one
+        # whole result to another name (Fortran has no single result
+        # object bundling these, so a plain array-copy alone would leave
+        # the sibling scalars stale). See _scipy_minimize_result_siblings.
+        self.scipy_minimize_result_vars = {}
         self.dict_type_components = dict(dict_type_components or {})
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
         self.local_func_arg_kinds = dict(local_func_arg_kinds or {})
@@ -14067,9 +14119,16 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "signal"
-                and node.func.attr in {"correlate", "lfilter"}
+                and node.func.attr in {"correlate", "lfilter", "filtfilt", "detrend"}
             ):
                 return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "find_peaks"
+            ):
+                return "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -15767,6 +15826,12 @@ class translator(ast.NodeVisitor):
                 out[k.value] = val
         return out
 
+    def _scipy_minimize_method_name(self, v):
+        method_node = next((kw.value for kw in v.keywords if kw.arg == "method"), None)
+        if isinstance(method_node, ast.Constant) and isinstance(method_node.value, str):
+            return method_node.value.strip().lower()
+        return None
+
     def _scipy_minimize_spec(self, v):
         # res = minimize(objective, x0[, method="BFGS"]) -- objective must
         # already translate to `function objective(x) result(y)` with x(:)
@@ -15783,6 +15848,32 @@ class translator(ast.NodeVisitor):
             and self.local_return_specs.get(v.args[0].id) == "real"
             and list(self.local_func_arg_ranks.get(v.args[0].id, [1]))[:1] != [0]
             and not any(kw.arg == "bounds" for kw in v.keywords)
+            and self._scipy_minimize_method_name(v) != "powell"
+            and not (
+                self._scipy_minimize_method_name(v) == "l-bfgs-b"
+                and ROUTE_UNBOUNDED_LBFGSB_TO_REAL_LBFGSB
+            )
+        ):
+            return None
+        return {"fn_name": v.args[0].id, "x0_node": v.args[1], "options": self._scipy_minimize_options_nodes(v)}
+
+    def _scipy_minimize_powell_spec(self, v):
+        # res = minimize(objective, x0, method="Powell") -- objective must
+        # already translate to `function objective(x) result(y)` with x(:)
+        # real(dp) intent(in) and a scalar real(dp) result (a local function
+        # classified as plain "real"; see local_return_specs). Uses the
+        # classic Numerical Recipes direction-set method (powell_bridge_mod);
+        # bounds= is not supported for this method here.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.scipy_optimize_minimize_aliases
+            and len(v.args) >= 2
+            and isinstance(v.args[0], ast.Name)
+            and self.local_return_specs.get(v.args[0].id) == "real"
+            and list(self.local_func_arg_ranks.get(v.args[0].id, [1]))[:1] != [0]
+            and not any(kw.arg == "bounds" for kw in v.keywords)
+            and self._scipy_minimize_method_name(v) == "powell"
         ):
             return None
         return {"fn_name": v.args[0].id, "x0_node": v.args[1], "options": self._scipy_minimize_options_nodes(v)}
@@ -15823,6 +15914,29 @@ class translator(ast.NodeVisitor):
         ):
             return None
         return {"resid_fn_name": resid_name, "p0_node": v.args[3]}
+
+    def _scipy_signal_find_peaks_spec(self, v):
+        # peaks, _ = signal.find_peaks(x[, height=...][, distance=...]) --
+        # only the peak-indices array is reproduced (find_peaks_int); the
+        # properties dict scipy also returns is not, so this only matches
+        # when the second tuple target is discarded.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "signal"
+            and v.func.attr == "find_peaks"
+            and len(v.args) >= 1
+        ):
+            return None
+        height_node = v.args[1] if len(v.args) >= 2 else None
+        distance_node = v.args[2] if len(v.args) >= 3 else None
+        for kw in v.keywords:
+            if kw.arg == "height":
+                height_node = kw.value
+            elif kw.arg == "distance":
+                distance_node = kw.value
+        return {"x_node": v.args[0], "height_node": height_node, "distance_node": distance_node}
 
     def _scipy_least_squares_spec(self, v):
         # result = least_squares(fun, x0) -- fun must already translate to
@@ -15888,13 +16002,27 @@ class translator(ast.NodeVisitor):
         ):
             return None
         method_node = next((kw.value for kw in v.keywords if kw.arg == "method"), None)
-        if (
-            isinstance(method_node, ast.Constant)
-            and isinstance(method_node.value, str)
-            and method_node.value.strip().lower() != "l-bfgs-b"
-        ):
+        method_name = None
+        if isinstance(method_node, ast.Constant) and isinstance(method_node.value, str):
+            method_name = method_node.value.strip().lower()
+        if method_name is not None and method_name != "l-bfgs-b":
             return None
         bounds_node = next((kw.value for kw in v.keywords if kw.arg == "bounds"), None)
+        if bounds_node is None:
+            # No bounds= given: scipy only takes the L-BFGS-B path here if
+            # method= says so explicitly (otherwise it's the unconstrained
+            # BFGS default). See ROUTE_UNBOUNDED_LBFGSB_TO_REAL_LBFGSB --
+            # bound_pairs=None signals the codegen side to build wide-open
+            # (nbd=0) bound arrays sized at runtime from x0 instead of from
+            # a literal bounds= list.
+            if method_name != "l-bfgs-b" or not ROUTE_UNBOUNDED_LBFGSB_TO_REAL_LBFGSB:
+                return None
+            return {
+                "fn_name": v.args[0].id,
+                "x0_node": v.args[1],
+                "bound_pairs": None,
+                "options": self._scipy_minimize_options_nodes(v),
+            }
         if not (
             isinstance(bounds_node, (ast.Tuple, ast.List))
             and bounds_node.elts
@@ -16976,10 +17104,18 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "signal"
-                and node.func.attr in {"correlate", "lfilter"}
-                and len(node.args) >= 2
+                and node.func.attr in {"correlate", "lfilter", "filtfilt", "find_peaks"}
+                and len(node.args) >= 1
             ):
                 return 1
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "detrend"
+                and len(node.args) >= 1
+            ):
+                return self._rank_expr(node.args[0])
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id in {"array", "asarray"}
@@ -22764,6 +22900,30 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "filtfilt"
+                and len(node.args) >= 3
+            ):
+                return f"filtfilt_real({self.expr(node.args[0])}, {self.expr(node.args[1])}, {self.expr(node.args[2])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "detrend"
+                and len(node.args) >= 1
+            ):
+                type_txt = None
+                if len(node.args) >= 2 and is_const_str(node.args[1]):
+                    type_txt = str(node.args[1].value)
+                for kw in node.keywords:
+                    if kw.arg == "type" and is_const_str(kw.value):
+                        type_txt = str(kw.value.value)
+                        break
+                type_arg = f', "{type_txt}"' if type_txt is not None else ""
+                return f"detrend_real({self.expr(node.args[0])}{type_arg})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "append"
                 and len(node.args) >= 2
@@ -25569,6 +25729,16 @@ class translator(ast.NodeVisitor):
                         self._mark_char(f"{t.id}_message")
                         continue
 
+                # res = minimize(objective, x0, method="Powell")
+                if isinstance(t, ast.Name):
+                    _pw_spec = self._scipy_minimize_powell_spec(v)
+                    if _pw_spec is not None:
+                        self._mark_alloc_real(t.id, rank=1)
+                        self._mark_real(f"{t.id}_fun")
+                        self._mark_log(f"{t.id}_success")
+                        self._mark_char(f"{t.id}_message")
+                        continue
+
                 # res = minimize(objective, x0, bounds=[(lo, hi), ...])
                 if isinstance(t, ast.Name):
                     _lb_spec = self._scipy_minimize_lbfgsb_spec(v)
@@ -25596,6 +25766,17 @@ class translator(ast.NodeVisitor):
                     if _cf_spec is not None:
                         self._mark_alloc_real(t.elts[0].id, rank=1)
                         self._mark_alloc_real(t.elts[1].id, rank=2)
+                        continue
+
+                # peaks, _ = signal.find_peaks(x, ...)
+                if (
+                    isinstance(t, (ast.Tuple, ast.List))
+                    and len(t.elts) == 2
+                    and all(isinstance(e, ast.Name) for e in t.elts)
+                ):
+                    _fp_spec = self._scipy_signal_find_peaks_spec(v)
+                    if _fp_spec is not None:
+                        self._mark_alloc_int(t.elts[0].id, rank=1)
                         continue
 
                 # result = least_squares(fun, x0)
@@ -31938,6 +32119,27 @@ class translator(ast.NodeVisitor):
                 self.o.w("end block")
                 return
 
+        # result = other_result -- reassigning one whole scipy.optimize
+        # minimize() result to another name. Fortran has no single result
+        # object bundling the fitted array with its _fun/_success/[_nit/]
+        # _message scalars (see scipy_minimize_result_vars), so a plain
+        # array copy alone would leave those siblings stale; copy them
+        # alongside it and propagate the tracking to the new name too, so
+        # a further `x = result` chain keeps working.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Name)
+            and v.id in self.scipy_minimize_result_vars
+        ):
+            name = self._aliased_name(t.id)
+            src = self._aliased_name(v.id)
+            siblings = self.scipy_minimize_result_vars[v.id]
+            self.o.w(f"{name} = {src}")
+            for suf in siblings:
+                self.o.w(f"{name}{suf} = {src}{suf}")
+            self.scipy_minimize_result_vars[t.id] = siblings
+            return
+
         # res = minimize(objective, x0)
         if isinstance(t, ast.Name):
             _mz_spec = self._scipy_minimize_spec(v)
@@ -31966,6 +32168,40 @@ class translator(ast.NodeVisitor):
                     f"gtol_bfgs, {name}_fun, {name}_nit, {name}_success)"
                 )
                 self._emit_scipy_optimize_message(f"{name}_message", f"{name}_success")
+                self.scipy_minimize_result_vars[name] = ("_fun", "_nit", "_success", "_message")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # res = minimize(objective, x0, method="Powell")
+        if isinstance(t, ast.Name):
+            _pw_spec = self._scipy_minimize_powell_spec(v)
+            if _pw_spec is not None:
+                name = self._aliased_name(t.id)
+                fn_name = _pw_spec["fn_name"]
+                x0_expr = self.expr(_pw_spec["x0_node"])
+                options = _pw_spec.get("options") or {}
+                ftol_expr = f"real({self.expr(options['ftol'])}, kind=dp)" if "ftol" in options else "1.0e-11_dp"
+                if "maxiter" in options:
+                    _mi_txt = self.expr(options["maxiter"])
+                    maxiter_expr = _mi_txt if self._expr_kind(options["maxiter"]) == "int" else f"int({_mi_txt})"
+                else:
+                    maxiter_expr = "1000"
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: n_powell, maxiter_powell")
+                self.o.w("real(kind=dp) :: ftol_powell")
+                self.o.w(f"{name} = {x0_expr}")
+                self.o.w(f"n_powell = size({name})")
+                self.o.w(f"ftol_powell = {ftol_expr}")
+                self.o.w(f"maxiter_powell = {maxiter_expr}")
+                self.o.w(f"powell_user_fn => {fn_name}")
+                self.o.w(
+                    f"call powell_minimize({name}, n_powell, ftol_powell, maxiter_powell, "
+                    f"{name}_fun, {name}_success)"
+                )
+                self._emit_scipy_optimize_message(f"{name}_message", f"{name}_success")
+                self.scipy_minimize_result_vars[name] = ("_fun", "_success", "_message")
                 self.o.pop()
                 self.o.w("end block")
                 return
@@ -31978,32 +32214,38 @@ class translator(ast.NodeVisitor):
                 fn_name = _lb_spec["fn_name"]
                 x0_expr = self.expr(_lb_spec["x0_node"])
                 pairs = _lb_spec["bound_pairs"]
-                n_lb = len(pairs)
-                l_items = []
-                u_items = []
-                nbd_items = []
-                for lo_node, hi_node in pairs:
-                    if lo_node is None and hi_node is None:
-                        nbd_items.append("0")
-                        l_items.append("0.0_dp")
-                        u_items.append("0.0_dp")
-                    elif lo_node is not None and hi_node is None:
-                        nbd_items.append("1")
-                        l_items.append(f"real({self.expr(lo_node)}, kind=dp)")
-                        u_items.append("0.0_dp")
-                    elif lo_node is not None and hi_node is not None:
-                        nbd_items.append("2")
-                        l_items.append(f"real({self.expr(lo_node)}, kind=dp)")
-                        u_items.append(f"real({self.expr(hi_node)}, kind=dp)")
-                    else:
-                        nbd_items.append("3")
-                        l_items.append("0.0_dp")
-                        u_items.append(f"real({self.expr(hi_node)}, kind=dp)")
+                if pairs is not None:
+                    n_lb = len(pairs)
+                    l_items = []
+                    u_items = []
+                    nbd_items = []
+                    for lo_node, hi_node in pairs:
+                        if lo_node is None and hi_node is None:
+                            nbd_items.append("0")
+                            l_items.append("0.0_dp")
+                            u_items.append("0.0_dp")
+                        elif lo_node is not None and hi_node is None:
+                            nbd_items.append("1")
+                            l_items.append(f"real({self.expr(lo_node)}, kind=dp)")
+                            u_items.append("0.0_dp")
+                        elif lo_node is not None and hi_node is not None:
+                            nbd_items.append("2")
+                            l_items.append(f"real({self.expr(lo_node)}, kind=dp)")
+                            u_items.append(f"real({self.expr(hi_node)}, kind=dp)")
+                        else:
+                            nbd_items.append("3")
+                            l_items.append("0.0_dp")
+                            u_items.append(f"real({self.expr(hi_node)}, kind=dp)")
                 options = _lb_spec.get("options") or {}
                 self.o.w("block")
                 self.o.push()
-                self.o.w(f"real(kind=dp) :: l_lbfgsb({n_lb}), u_lbfgsb({n_lb})")
-                self.o.w(f"integer :: nbd_lbfgsb({n_lb})")
+                if pairs is None:
+                    self.o.w("integer :: n_lb")
+                    self.o.w("real(kind=dp), allocatable :: l_lbfgsb(:), u_lbfgsb(:)")
+                    self.o.w("integer, allocatable :: nbd_lbfgsb(:)")
+                else:
+                    self.o.w(f"real(kind=dp) :: l_lbfgsb({n_lb}), u_lbfgsb({n_lb})")
+                    self.o.w(f"integer :: nbd_lbfgsb({n_lb})")
                 call_kw = []
                 if "ftol" in options:
                     self.o.w("real(kind=dp) :: factr_lbfgsb")
@@ -32023,13 +32265,21 @@ class translator(ast.NodeVisitor):
                     _mi_expr = _mi_txt if self._expr_kind(options["maxiter"]) == "int" else f"int({_mi_txt})"
                     self.o.w(f"maxiter_lbfgsb = {_mi_expr}")
                 self.o.w(f"{name} = {x0_expr}")
-                self.o.w(f"l_lbfgsb = [{', '.join(l_items)}]")
-                self.o.w(f"u_lbfgsb = [{', '.join(u_items)}]")
-                self.o.w(f"nbd_lbfgsb = [{', '.join(nbd_items)}]")
+                if pairs is None:
+                    self.o.w(f"n_lb = size({name})")
+                    self.o.w("allocate(l_lbfgsb(n_lb), u_lbfgsb(n_lb), nbd_lbfgsb(n_lb))")
+                    self.o.w("l_lbfgsb = 0.0_dp")
+                    self.o.w("u_lbfgsb = 0.0_dp")
+                    self.o.w("nbd_lbfgsb = 0")
+                else:
+                    self.o.w(f"l_lbfgsb = [{', '.join(l_items)}]")
+                    self.o.w(f"u_lbfgsb = [{', '.join(u_items)}]")
+                    self.o.w(f"nbd_lbfgsb = [{', '.join(nbd_items)}]")
                 self.o.w(f"lbfgsb_user_fn => {fn_name}")
                 call_args = [name, "l_lbfgsb", "u_lbfgsb", "nbd_lbfgsb", f"{name}_fun", f"{name}_success"] + call_kw
                 self.o.w(f"call lbfgsb_minimize({', '.join(call_args)})")
                 self._emit_scipy_optimize_message(f"{name}_message", f"{name}_success")
+                self.scipy_minimize_result_vars[name] = ("_fun", "_success", "_message")
                 self.o.pop()
                 self.o.w("end block")
                 return
@@ -32092,6 +32342,27 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"call curvefit_covariance({popt_name}, m_cf, {pcov_name})")
                 self.o.pop()
                 self.o.w("end block")
+                return
+
+        # peaks, _ = signal.find_peaks(x, ...) -- only the peaks array
+        # (find_peaks_int) is populated; the discarded second target
+        # (scipy's properties dict) is left untouched.
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and len(t.elts) == 2
+            and all(isinstance(e, ast.Name) for e in t.elts)
+        ):
+            _fp_spec = self._scipy_signal_find_peaks_spec(v)
+            if _fp_spec is not None:
+                peaks_name = self._aliased_name(t.elts[0].id)
+                call_args = [self.expr(_fp_spec["x_node"])]
+                if _fp_spec["height_node"] is not None:
+                    call_args.append(f"height=real({self.expr(_fp_spec['height_node'])}, kind=dp)")
+                if _fp_spec["distance_node"] is not None:
+                    d_txt = self.expr(_fp_spec["distance_node"])
+                    d_expr = d_txt if self._expr_kind(_fp_spec["distance_node"]) == "int" else f"int({d_txt})"
+                    call_args.append(f"distance={d_expr}")
+                self.o.w(f"{peaks_name} = find_peaks_int({', '.join(call_args)})")
                 return
 
         # result = least_squares(fun, x0)
@@ -37903,8 +38174,20 @@ def _emit_local_function(
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.Subscript):
+                    # np.r_[1.0, -ar] / np.c_[...] is syntactically a
+                    # Subscript (r_/c_ are indexable objects, not
+                    # functions) whose "index" is actually the data being
+                    # concatenated, not an array index -- skip it here for
+                    # the same reason _infer_arg_kind_in_fn's identical
+                    # check does.
+                    is_np_rc = (
+                        isinstance(n.value, ast.Attribute)
+                        and isinstance(n.value.value, ast.Name)
+                        and n.value.value.id in {"np", "numpy"}
+                        and n.value.attr in {"r_", "c_"}
+                    )
                     sl = n.slice
-                    if _is_direct_index_expr(sl):
+                    if not is_np_rc and _is_direct_index_expr(sl):
                         return True
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "range":
                     for a in n.args:
@@ -44167,7 +44450,22 @@ def generate_flat(
         # Index/shape usage strongly implies integer.
         for st in fn.body:
             for n in ast.walk(st):
-                if isinstance(n, ast.Subscript) and _is_direct_index_expr(n.slice):
+                if (
+                    isinstance(n, ast.Subscript)
+                    and _is_direct_index_expr(n.slice)
+                    and not (
+                        # np.r_[1.0, -ar] / np.c_[...] is syntactically a
+                        # Subscript (r_/c_ are indexable objects, not
+                        # functions) whose "index" is actually the data
+                        # being concatenated, not an array index -- treating
+                        # a name appearing there as "used as an index"
+                        # produces a false positive.
+                        isinstance(n.value, ast.Attribute)
+                        and isinstance(n.value.value, ast.Name)
+                        and n.value.value.id in {"np", "numpy"}
+                        and n.value.attr in {"r_", "c_"}
+                    )
+                ):
                     return _ret("int")
                 if isinstance(n, ast.Slice) and _is_direct_index_expr(n):
                     return _ret("int")
@@ -47296,7 +47594,19 @@ def generate_flat(
                         or (isinstance(_n.right, ast.Name) and _n.right.id == _arg_nm)
                     ):
                         return True
-                if isinstance(_n, ast.Subscript):
+                if (
+                    isinstance(_n, ast.Subscript)
+                    and not (
+                        # np.r_[1.0, -ar] / np.c_[...] is syntactically a
+                        # Subscript (r_/c_ are indexable objects, not
+                        # functions) whose "index" is actually the data
+                        # being concatenated, not an array index.
+                        isinstance(_n.value, ast.Attribute)
+                        and isinstance(_n.value.value, ast.Name)
+                        and _n.value.value.id in {"np", "numpy"}
+                        and _n.value.attr in {"r_", "c_"}
+                    )
+                ):
                     # A boolean mask (e.g. `arr[prices > ma]`) is not an
                     # integer index even though the arg name appears inside
                     # the slice expression, so don't descend into
@@ -48101,6 +48411,8 @@ def generate_flat(
         o.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
     if _tree_uses_scipy_minimize_lbfgsb(tree):
         o.w("use lbfgsb_bridge_mod, only: lbfgsb_user_fn, lbfgsb_minimize")
+    if _tree_uses_scipy_minimize_powell(tree):
+        o.w("use powell_bridge_mod, only: powell_user_fn, powell_minimize")
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
@@ -48849,6 +49161,14 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
         if not found_lbfgsb:
             missing_modules.append(("lbfgsb_module", lbfgsb_s))
 
+    # powell_bridge_mod's line search uses fmin_module (fmin.f90) internally
+    # but the generated program only `use`s powell_bridge_mod -- same
+    # transitive-dependency gap as lbfgsb_minimize above.
+    if re.search(r"\bpowell_minimize\s*\(", src):
+        found_fmin, fmin_s = _ensure_helper_by_filename("fmin.f90")
+        if not found_fmin:
+            missing_modules.append(("fmin_module", fmin_s))
+
     return helper_files, auto_added, missing_modules
 
 
@@ -48872,6 +49192,16 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
             link_inputs.append(str(hp))
             continue
         obj = Path(hp.name).with_suffix(".o")
+        # A cached object built with different compiler flags (e.g. a
+        # leftover -O0 -fcheck=all debug build reused for a -O3 timing
+        # run, or vice versa) must never be silently reused: besides
+        # perf-critical helpers running unoptimized/bounds-checked
+        # without anyone asking for that, debug vs release codegen can
+        # behave differently on genuinely marginal cases. Record the
+        # exact flags used alongside the object and compare on every
+        # build.
+        flags_file = Path(str(obj) + ".flags")
+        flags_key = " ".join(compiler_parts)
         src_text = hp.read_text(encoding="utf-8", errors="ignore")
         mods = sorted(_modules_defined_in_source(src_text))
         mod_files = [Path(f"{m}.mod") for m in mods]
@@ -48891,6 +49221,8 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
                 # force a full helper recompile on every single build.
                 if obj_m < src_m:
                     cache_ok = False
+                elif not flags_file.exists() or flags_file.read_text(encoding="utf-8").strip() != flags_key:
+                    cache_ok = False
             except OSError:
                 cache_ok = False
         if cache_ok:
@@ -48901,6 +49233,10 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
         hcp = subprocess.run(helper_cmd, capture_output=True, text=True)
         if hcp.returncode != 0:
             return None, hcp, helper_cmd
+        try:
+            flags_file.write_text(flags_key, encoding="utf-8")
+        except OSError:
+            pass
         link_inputs.append(str(obj))
     return link_inputs, None, None
 

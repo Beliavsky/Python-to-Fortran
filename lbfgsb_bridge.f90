@@ -8,9 +8,9 @@
 ! scalar real(dp) result) the same way the other bridge modules do.
 !
 ! Since xp2f-translated objectives don't carry an analytic-gradient
-! counterpart, the gradient is estimated via central finite differences at
-! each 'FG' request -- the same approach bfgs_bridge.f90 uses for
-! unconstrained minimize().
+! counterpart, the gradient is estimated via forward finite differences at
+! each 'FG' request, matching scipy's own default numerical-differentiation
+! scheme for L-BFGS-B when no analytic jac is supplied.
 ! See lbfgsb.f90 (vendored alongside this file) for the actual solver.
 module lbfgsb_bridge_mod
    use, intrinsic :: iso_fortran_env, only: dp => real64
