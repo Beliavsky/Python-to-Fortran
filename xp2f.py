@@ -24903,8 +24903,15 @@ class translator(ast.NodeVisitor):
                             self._mark_complex(nm)
                         elif ksrc == "char":
                             self._mark_char(nm)
-                        else:
+                        elif ksrc == "int":
                             self._mark_int(nm)
+                        else:
+                            # Unknown source kind (e.g. `src` is itself a
+                            # not-yet-typed function parameter): defer
+                            # marking rather than forcing INTEGER, which
+                            # would wrongly stick if `src` later turns out
+                            # to be real/complex/etc.
+                            pass
                     continue
                 if (
                     len(node.targets) == 1
@@ -44125,25 +44132,46 @@ def generate_flat(
                 best_is_sentinel = False
                 saw = False
                 for _st in ast.walk(fn_node):
-                    if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _name):
+                    _is_unpack_target = (
+                        isinstance(_st, ast.Assign)
+                        and len(_st.targets) == 1
+                        and isinstance(_st.targets[0], (ast.Tuple, ast.List))
+                        and any(isinstance(_te, ast.Name) and _te.id == _name for _te in _st.targets[0].elts)
+                    )
+                    if not (
+                        (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _name)
+                        or _is_unpack_target
+                    ):
                         continue
                     saw = True
-                    try:
-                        _rr = int(tr_ctx._rank_expr(_st.value))
-                    except Exception:
+                    if _is_unpack_target:
+                        # Tuple/list-unpacking assignment (`a, name, ... =
+                        # arr`) binds `name` to a scalar of arr's element
+                        # kind, at rank 0 -- not arr's own rank.
+                        try:
+                            _kk = tr_ctx._expr_kind(_st.value)
+                        except Exception:
+                            _kk = None
+                        if _kk is None and isinstance(_st.value, ast.Name):
+                            _kk, _ = _infer(_st.value.id)
                         _rr = 0
-                    try:
-                        _kk = tr_ctx._expr_kind(_st.value)
-                    except Exception:
-                        _kk = None
-                    if _kk is None and isinstance(_st.value, ast.Name):
-                        _kk, _rr2 = _infer(_st.value.id)
-                        _rr = max(_rr, int(_rr2))
-                    elif _kk is None and isinstance(_st.value, ast.Subscript) and isinstance(_st.value.value, ast.Name):
-                        _bk, _br = _infer(_st.value.value.id)
-                        if _bk in {"int", "real", "logical", "char", "complex"}:
-                            _kk = _bk
+                    else:
+                        try:
                             _rr = int(tr_ctx._rank_expr(_st.value))
+                        except Exception:
+                            _rr = 0
+                        try:
+                            _kk = tr_ctx._expr_kind(_st.value)
+                        except Exception:
+                            _kk = None
+                        if _kk is None and isinstance(_st.value, ast.Name):
+                            _kk, _rr2 = _infer(_st.value.id)
+                            _rr = max(_rr, int(_rr2))
+                        elif _kk is None and isinstance(_st.value, ast.Subscript) and isinstance(_st.value.value, ast.Name):
+                            _bk, _br = _infer(_st.value.value.id)
+                            if _bk in {"int", "real", "logical", "char", "complex"}:
+                                _kk = _bk
+                                _rr = int(tr_ctx._rank_expr(_st.value))
                     # A bare whole-number float literal (e.g. `d = 0.0` used
                     # as a placeholder in an early-exit branch) is weak
                     # evidence for "real" and shouldn't outrank genuine int
@@ -44185,6 +44213,19 @@ def generate_flat(
                     if _global_specs:
                         _gk, _gr = sorted(_global_specs, key=lambda kr: -kr[1])[0]
                         return (_gk, _gr)
+                    # `_name` may itself be a formal parameter of fn_node
+                    # (e.g. the source array of a tuple-unpack, `a, b = arg`)
+                    # rather than something locally assigned -- fall back to
+                    # fn_node's own usage-based argument-kind inference.
+                    if _name in {a.arg for a in (list(fn_node.args.args) + list(fn_node.args.kwonlyargs))}:
+                        _pk = _infer_arg_kind_in_fn(fn_node, _name)
+                        if _pk is None:
+                            try:
+                                _pk = tr_ctx._expr_kind(ast.Name(id=_name, ctx=ast.Load()))
+                            except Exception:
+                                _pk = None
+                        if _pk in {"int", "real", "logical", "char", "complex"}:
+                            return (_pk, 0)
                     return (None, 0)
                 return (best_kind, best_rank)
             return _infer(name_nm)

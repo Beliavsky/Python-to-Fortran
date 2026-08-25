@@ -40,6 +40,9 @@ def nagarch_variance(r, mu, omega, alpha, theta, beta):
 
     h[0] = omega / denom
 
+    if h[0] <= 0.0 or not np.isfinite(h[0]):
+        return None
+
     for t in range(1, n):
         shock = r[t - 1] - mu
 
@@ -152,7 +155,14 @@ result = minimize(
     neg_loglik,
     x0,
     args=(r,),
-    method="L-BFGS-B"
+    method="L-BFGS-B",
+    bounds=[
+        (-1.0, 1.0),
+        (-30.0, 5.0),
+        (-30.0, 30.0),
+        (-5.0, 5.0),
+        (-30.0, 30.0)
+    ]
 )
 
 fit_end = time.perf_counter()
