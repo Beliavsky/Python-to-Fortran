@@ -273,6 +273,8 @@ public :: diff_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real
 public :: diff_axis1_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="first difference along axis 1 for a real matrix"
 public :: sliding_window_view_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:):intent(in),window:integer:intent(in) desc="axis-0 sliding window view for a real matrix"
 public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional desc="1D integer convolution with mode full/same/valid"
+public :: correlate_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D cross-correlation with mode full/same/valid (scipy.signal.correlate)"
+public :: lfilter_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="1D IIR/FIR filter, zero initial conditions (scipy.signal.lfilter)"
 public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load real matrix text file with basic numpy-like options"
 public :: loadtxt_real_1d !@pyapi kind=function ret=real(dp)(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected real column as vector"
 public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load integer matrix from text file"
@@ -4161,9 +4163,9 @@ contains
          if (.not. allocated(items%v)) return
          n = size(items%v)
          if (n <= 0) return
-         out = items%v(1)
+         out = trim(items%v(1))
          do i = 2, n
-            out = out // sep // items%v(i)
+            out = out // sep // trim(items%v(i))
          end do
       end function str_join
 
@@ -6069,6 +6071,55 @@ contains
          end if
          y = full
       end function convolve_int
+
+      function correlate_real(x, y, mode) result(out)
+         ! scipy.signal.correlate(x, y) = convolve(x, conj(y[::-1])) for
+         ! real inputs -- reuse convolve_real with y time-reversed.
+         real(kind=dp), intent(in) :: x(:), y(:)
+         character(len=*), intent(in), optional :: mode
+         real(kind=dp), allocatable :: out(:)
+         if (present(mode)) then
+            out = convolve_real(x, y(size(y):1:-1), mode)
+         else
+            out = convolve_real(x, y(size(y):1:-1))
+         end if
+      end function correlate_real
+
+      function lfilter_real(b, a, x) result(y)
+         ! scipy.signal.lfilter(b, a, x) with zero initial conditions:
+         ! Direct Form II Transposed IIR/FIR recursion (the same structure
+         ! scipy's own Fortran/C backend uses). b and a are zero-padded to
+         ! a common length k = max(size(b), size(a)) and normalized by
+         ! a(1); z holds the k-1 filter delay states.
+         real(kind=dp), intent(in) :: b(:), a(:), x(:)
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp), allocatable :: bn(:), an(:), z(:)
+         integer :: nb, na, k, n, i, j
+         real(kind=dp) :: a0
+
+         nb = size(b)
+         na = size(a)
+         k = max(nb, na)
+         a0 = a(1)
+         allocate(bn(k), an(k))
+         bn = 0.0_dp
+         an = 0.0_dp
+         bn(1:nb) = b / a0
+         an(1:na) = a / a0
+
+         n = size(x)
+         allocate(y(n))
+         allocate(z(max(k - 1, 1)))
+         z = 0.0_dp
+
+         do i = 1, n
+            y(i) = bn(1) * x(i) + z(1)
+            do j = 1, k - 2
+               z(j) = bn(j + 1) * x(i) + z(j + 1) - an(j + 1) * y(i)
+            end do
+            if (k >= 2) z(k - 1) = bn(k) * x(i) - an(k) * y(i)
+         end do
+      end function lfilter_real
 
       pure real(kind=dp) function polyval_real_scalar(p, x) result(y)
          real(kind=dp), intent(in) :: p(:)

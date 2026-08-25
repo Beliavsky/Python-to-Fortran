@@ -70,3 +70,37 @@ def neg_loglik(params, r):
     )
 
     return -ll
+
+
+def neg_loglik_fixed_dof(params, r, dof):
+    """Negative log-likelihood of the NAGARCH(1,1)-t model given transformed params, with dof held fixed."""
+    mu, log_omega, logit_alpha, theta, logit_beta = params
+
+    omega = np.exp(log_omega)
+    alpha = 1.0 / (1.0 + np.exp(-logit_alpha))
+    beta = 1.0 / (1.0 + np.exp(-logit_beta))
+
+    persistence = beta + alpha * (1.0 + theta**2)
+
+    if persistence >= 0.9999:
+        return 1.0e12
+
+    h = nagarch_variance(
+        r, mu, omega, alpha, theta, beta
+    )
+
+    if h is None:
+        return 1.0e12
+
+    resid = r - mu
+    z = resid / np.sqrt(h)
+
+    ll = np.sum(
+        gammaln(0.5 * (dof + 1.0))
+        - gammaln(0.5 * dof)
+        - 0.5 * np.log(np.pi * (dof - 2.0))
+        - 0.5 * np.log(h)
+        - 0.5 * (dof + 1.0) * np.log(1.0 + z**2 / (dof - 2.0))
+    )
+
+    return -ll

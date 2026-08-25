@@ -6160,6 +6160,20 @@ def detect_needed_helpers(tree):
                 needed.update(np_helper_map[node.func.attr])
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "correlate"
+            ):
+                needed.add("correlate_real")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "lfilter"
+            ):
+                needed.add("lfilter_real")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "corr"
                 and len(node.args) == 0
             ):
@@ -6385,6 +6399,7 @@ def detect_needed_helpers(tree):
                     needed.add("strvec_t")
                 else:
                     needed.add("str_join")
+                    needed.add("strvec_t")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -6607,6 +6622,90 @@ def collect_scipy_stats_norm_aliases(tree):
     return aliases
 
 
+def normalize_scipy_signal_submodule_access(tree):
+    """Rewrite every way of reaching scipy.signal (`from scipy import
+    signal as X`, `import scipy.signal as X`, `import scipy.signal`,
+    `import scipy` + `scipy.signal....`) into a single canonical
+    `signal.<func>(...)` attribute form, so scipy.signal dispatch
+    downstream only ever needs to recognize the literal receiver name
+    "signal" instead of tracking every possible alias (mirroring how
+    numpy functions are dispatched via is_numpy_name_node against a
+    fixed {"np", "numpy"} set, not an arbitrary tracked-alias set).
+    """
+    scipy_bare_aliases = set()
+    signal_aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if mod == "scipy":
+                    scipy_bare_aliases.add(asn or "scipy")
+                elif mod == "scipy.signal":
+                    if asn:
+                        signal_aliases.add(asn)
+                    else:
+                        # `import scipy.signal` (no `as`) binds the
+                        # top-level `scipy` name in Python -- access is
+                        # via scipy.signal.func(...), not a bare name.
+                        scipy_bare_aliases.add("scipy")
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                if nm == "signal":
+                    asn = (al.asname or "").strip()
+                    signal_aliases.add(asn or nm)
+
+    if not scipy_bare_aliases and not signal_aliases:
+        return tree
+
+    def _match(node):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in signal_aliases
+        ):
+            return node.attr
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in scipy_bare_aliases
+            and node.value.attr == "signal"
+        ):
+            return node.attr
+        return None
+
+    needs_signal_import = [False]
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            fn = _match(node)
+            if fn is not None:
+                # signal.convolve(...) is byte-for-byte the same operation
+                # np.convolve(...) already implements (same 'full'/'same'/
+                # 'valid' mode semantics) -- route it there directly to
+                # reuse that dispatch untouched, rather than adding a
+                # second recognition path for an identical computation.
+                receiver = "np" if fn == "convolve" else "signal"
+                if receiver == "signal":
+                    needs_signal_import[0] = True
+                return ast.copy_location(
+                    ast.Attribute(value=ast.Name(id=receiver, ctx=ast.Load()), attr=fn, ctx=node.ctx),
+                    node,
+                )
+            return node
+
+    new_body = [_Rewriter().visit(st) for st in tree.body]
+    already_canonical = "signal" in signal_aliases
+    inject = [] if (already_canonical or not needs_signal_import[0]) else [
+        ast.ImportFrom(module="scipy", names=[ast.alias(name="signal", asname=None)], level=0)
+    ]
+    new_tree = ast.Module(body=inject + new_body, type_ignores=getattr(tree, "type_ignores", []))
+    return ast.fix_missing_locations(new_tree)
+
+
 def collect_scipy_optimize_fsolve_aliases(tree):
     """Collect local names bound to scipy.optimize.fsolve."""
     aliases = set()
@@ -6683,6 +6782,103 @@ def collect_scipy_optimize_minimize_scalar_aliases(tree):
                 if nm == "minimize_scalar":
                     aliases.add(asn or nm)
     return aliases
+
+
+def normalize_scipy_submodule_attribute_calls(tree):
+    """Rewrite attribute-style scipy.optimize/scipy.stats access into the
+    direct-name-import form the rest of the pipeline recognizes.
+
+    `from scipy import optimize` + `optimize.minimize(...)` (or `import
+    scipy` + `scipy.optimize.minimize(...)`) is semantically identical to
+    `from scipy.optimize import minimize` + `minimize(...)`, but every
+    scipy.optimize/scipy.stats function this transpiler supports is only
+    ever recognized via the latter, direct-name-import form (see the
+    collect_scipy_optimize_*_aliases / collect_scipy_stats_norm_aliases
+    functions and the _tree_uses_scipy_* detectors, all of which scan for
+    `ImportFrom(module="scipy.optimize"|"scipy.stats")`). Desugaring the
+    attribute-call form early, before any of those run, means each
+    already-supported function only needs one recognition path instead of
+    a second attribute-based one. scipy.special is deliberately excluded
+    here: it already has its own native attribute-style support via
+    collect_scipy_special_aliases's module_aliases tracking.
+    """
+    SUBMODULE_FUNCS = {
+        "optimize": {"minimize", "brentq", "curve_fit", "least_squares", "minimize_scalar", "fsolve"},
+        "stats": {"norm"},
+    }
+
+    scipy_aliases = set()
+    submodule_aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if mod == "scipy":
+                    scipy_aliases.add(asn or "scipy")
+                elif mod.startswith("scipy."):
+                    sub = mod[len("scipy."):]
+                    if sub in SUBMODULE_FUNCS and "." not in sub:
+                        if asn:
+                            submodule_aliases[asn] = sub
+                        else:
+                            # `import scipy.optimize` (no `as`) binds the
+                            # top-level `scipy` name in Python -- access is
+                            # via scipy.optimize.func(...), not a bare name.
+                            scipy_aliases.add("scipy")
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").strip() == "scipy":
+            for al in node.names:
+                nm = (al.name or "").strip()
+                if nm in SUBMODULE_FUNCS:
+                    asn = (al.asname or "").strip()
+                    submodule_aliases[asn or nm] = nm
+
+    if not scipy_aliases and not submodule_aliases:
+        return tree
+
+    def _match(node):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in submodule_aliases
+            and node.attr in SUBMODULE_FUNCS[submodule_aliases[node.value.id]]
+        ):
+            return submodule_aliases[node.value.id], node.attr
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in scipy_aliases
+            and node.value.attr in SUBMODULE_FUNCS
+            and node.attr in SUBMODULE_FUNCS[node.value.attr]
+        ):
+            return node.value.attr, node.attr
+        return None
+
+    used = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            hit = _match(node)
+            if hit is not None:
+                used.add(hit)
+    if not used:
+        return tree
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            hit = _match(node)
+            if hit is not None:
+                return ast.copy_location(ast.Name(id=hit[1], ctx=node.ctx), node)
+            return node
+
+    new_body = [_Rewriter().visit(st) for st in tree.body]
+    inject = [
+        ast.ImportFrom(module=f"scipy.{submod}", names=[ast.alias(name=fn, asname=None)], level=0)
+        for submod, fn in sorted(used)
+    ]
+    new_tree = ast.Module(body=inject + new_body, type_ignores=getattr(tree, "type_ignores", []))
+    return ast.fix_missing_locations(new_tree)
 
 
 def collect_module_global_decls(local_funcs):
@@ -10460,10 +10656,21 @@ def normalize_inline_dict_literal_call_args(exec_body, local_funcs):
                 and node.args
                 and isinstance(node.args[0], ast.Dict)
             )
+            # minimize(..., options={"maxiter": ..., "ftol": ..., "gtol": ...})
+            # is a recognized scipy.optimize.minimize idiom lowered directly
+            # from its literal dict keyword-arg by _scipy_minimize_spec /
+            # _scipy_minimize_lbfgsb_spec -- leave it alone so those can
+            # still see the raw ast.Dict.
+            is_scipy_minimize_options = (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "minimize"
+            )
             if not (is_pandas_rename or is_pandas_dataframe_dict):
                 node.args = [_make_helper(a) if isinstance(a, ast.Dict) else a for a in node.args]
                 for kw in node.keywords:
                     if kw.arg is not None and isinstance(kw.value, ast.Dict):
+                        if is_scipy_minimize_options and kw.arg == "options":
+                            continue
                         kw.value = _make_helper(kw.value)
             return node
 
@@ -13858,6 +14065,13 @@ class translator(ast.NodeVisitor):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr in {"correlate", "lfilter"}
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr == "append"
                 and len(node.args) >= 2
@@ -15537,6 +15751,22 @@ class translator(ast.NodeVisitor):
         self.o.pop()
         self.o.w("end if")
 
+    def _scipy_minimize_options_nodes(self, v):
+        # Extract recognized options={"maxiter": ..., "ftol": ...,
+        # "gtol": ...} entries as AST value nodes. A literal options=
+        # dict survives normalize_inline_dict_literal_call_args
+        # unrewritten specifically so this can still see the raw
+        # ast.Dict; a non-literal options= value (or none at all) yields
+        # no overrides, and callers fall back to this bridge's defaults.
+        opt_node = next((kw.value for kw in v.keywords if kw.arg == "options"), None)
+        if not isinstance(opt_node, ast.Dict):
+            return {}
+        out = {}
+        for k, val in zip(opt_node.keys, opt_node.values):
+            if isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value in {"maxiter", "ftol", "gtol"}:
+                out[k.value] = val
+        return out
+
     def _scipy_minimize_spec(self, v):
         # res = minimize(objective, x0[, method="BFGS"]) -- objective must
         # already translate to `function objective(x) result(y)` with x(:)
@@ -15555,7 +15785,7 @@ class translator(ast.NodeVisitor):
             and not any(kw.arg == "bounds" for kw in v.keywords)
         ):
             return None
-        return {"fn_name": v.args[0].id, "x0_node": v.args[1]}
+        return {"fn_name": v.args[0].id, "x0_node": v.args[1], "options": self._scipy_minimize_options_nodes(v)}
 
     def _scipy_brentq_spec(self, v):
         # root = brentq(f, a, b) -- f must already translate to
@@ -15680,7 +15910,12 @@ class translator(ast.NodeVisitor):
             lo_node = None if (isinstance(lo, ast.Constant) and lo.value is None) else lo
             hi_node = None if (isinstance(hi, ast.Constant) and hi.value is None) else hi
             pairs.append((lo_node, hi_node))
-        return {"fn_name": v.args[0].id, "x0_node": v.args[1], "bound_pairs": pairs}
+        return {
+            "fn_name": v.args[0].id,
+            "x0_node": v.args[1],
+            "bound_pairs": pairs,
+            "options": self._scipy_minimize_options_nodes(v),
+        }
 
     def _pandas_df_rolling_spec(self, v):
         # X = df.rolling(window).mean() / df.rolling(window).std([ddof=])
@@ -16737,6 +16972,14 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         return 0
                     return r0 if keepdims else max(0, r0 - 1)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr in {"correlate", "lfilter"}
+                and len(node.args) >= 2
+            ):
+                return 1
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id in {"array", "asarray"}
@@ -19607,7 +19850,18 @@ class translator(ast.NodeVisitor):
                         return f"str_rjust({base_expr}, int({arg0}))"
                     if attr == "split":
                         return f"str_split({base_expr}, {arg0})" if arg0 is not None else f"str_split({base_expr})"
-                    return f"str_join({base_expr}, {arg0})"
+                    # See the matching comment in the sibling join-codegen
+                    # site: str_join needs type(strvec_t), so wrap a plain
+                    # character-array argument unless it's already an
+                    # inline, unassigned .split(...) call.
+                    _join_src = node.args[0]
+                    _join_is_direct_split = (
+                        isinstance(_join_src, ast.Call)
+                        and isinstance(_join_src.func, ast.Attribute)
+                        and _join_src.func.attr == "split"
+                    )
+                    _join_arg = arg0 if _join_is_direct_split else f"strvec_t({arg0})"
+                    return f"str_join({base_expr}, {_join_arg})"
                 if attr == "read" and len(node.args) == 0:
                     return f"file_read({base_expr})"
                 if attr == "sum":
@@ -22486,6 +22740,30 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "correlate"
+                and len(node.args) >= 2
+            ):
+                mode_txt = None
+                if len(node.args) >= 3 and is_const_str(node.args[2]):
+                    mode_txt = str(node.args[2].value)
+                for kw in node.keywords:
+                    if kw.arg == "mode" and is_const_str(kw.value):
+                        mode_txt = str(kw.value.value)
+                        break
+                mode_arg = f', "{mode_txt}"' if mode_txt is not None else ""
+                return f"correlate_real({self.expr(node.args[0])}, {self.expr(node.args[1])}{mode_arg})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "signal"
+                and node.func.attr == "lfilter"
+                and len(node.args) >= 3
+            ):
+                return f"lfilter_real({self.expr(node.args[0])}, {self.expr(node.args[1])}, {self.expr(node.args[2])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "append"
                 and len(node.args) >= 2
@@ -23048,7 +23326,22 @@ class translator(ast.NodeVisitor):
                     return f"str_rjust({base}, int({arg0}))"
                 if node.func.attr == "split":
                     return f"str_split({base}, {arg0})" if arg0 is not None else f"str_split({base})"
-                return f"str_join({base}, {arg0})"
+                # str_join expects type(strvec_t); a list literal/variable
+                # is a plain character array in this transpiler's codegen
+                # (even a variable populated from a prior .split() call is
+                # unwrapped to a bare array on assignment -- see the
+                # split_assign_tmp handling in visit_Assign), so it must be
+                # wrapped. The one exception is an inline, unassigned
+                # `.split(...)` call passed directly as the join argument,
+                # whose Fortran translation is itself already strvec_t-typed.
+                _join_src = node.args[0]
+                _join_is_direct_split = (
+                    isinstance(_join_src, ast.Call)
+                    and isinstance(_join_src.func, ast.Attribute)
+                    and _join_src.func.attr == "split"
+                )
+                _join_arg = arg0 if _join_is_direct_split else f"strvec_t({arg0})"
+                return f"str_join({base}, {_join_arg})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -31652,14 +31945,21 @@ class translator(ast.NodeVisitor):
                 name = self._aliased_name(t.id)
                 fn_name = _mz_spec["fn_name"]
                 x0_expr = self.expr(_mz_spec["x0_node"])
+                options = _mz_spec.get("options") or {}
+                gtol_expr = f"real({self.expr(options['gtol'])}, kind=dp)" if "gtol" in options else "1.0e-5_dp"
+                if "maxiter" in options:
+                    _mi_txt = self.expr(options["maxiter"])
+                    maxiter_expr = _mi_txt if self._expr_kind(options["maxiter"]) == "int" else f"int({_mi_txt})"
+                else:
+                    maxiter_expr = "1000"
                 self.o.w("block")
                 self.o.push()
                 self.o.w("integer :: n_bfgs, max_iter_bfgs")
                 self.o.w("real(kind=dp) :: gtol_bfgs")
                 self.o.w(f"{name} = {x0_expr}")
                 self.o.w(f"n_bfgs = size({name})")
-                self.o.w("gtol_bfgs = 1.0e-5_dp")
-                self.o.w("max_iter_bfgs = 1000")
+                self.o.w(f"gtol_bfgs = {gtol_expr}")
+                self.o.w(f"max_iter_bfgs = {maxiter_expr}")
                 self.o.w(f"bfgs_user_fn => {fn_name}")
                 self.o.w(
                     f"call bfgs_minimize_fd(bfgs_generic_wrapper, {name}, n_bfgs, max_iter_bfgs, "
@@ -31699,19 +31999,36 @@ class translator(ast.NodeVisitor):
                         nbd_items.append("3")
                         l_items.append("0.0_dp")
                         u_items.append(f"real({self.expr(hi_node)}, kind=dp)")
+                options = _lb_spec.get("options") or {}
                 self.o.w("block")
                 self.o.push()
                 self.o.w(f"real(kind=dp) :: l_lbfgsb({n_lb}), u_lbfgsb({n_lb})")
                 self.o.w(f"integer :: nbd_lbfgsb({n_lb})")
+                call_kw = []
+                if "ftol" in options:
+                    self.o.w("real(kind=dp) :: factr_lbfgsb")
+                    call_kw.append("factr_in=factr_lbfgsb")
+                if "gtol" in options:
+                    self.o.w("real(kind=dp) :: pgtol_lbfgsb")
+                    call_kw.append("pgtol_in=pgtol_lbfgsb")
+                if "maxiter" in options:
+                    self.o.w("integer :: maxiter_lbfgsb")
+                    call_kw.append("maxiter_in=maxiter_lbfgsb")
+                if "ftol" in options:
+                    self.o.w(f"factr_lbfgsb = real({self.expr(options['ftol'])}, kind=dp) / epsilon(1.0_dp)")
+                if "gtol" in options:
+                    self.o.w(f"pgtol_lbfgsb = real({self.expr(options['gtol'])}, kind=dp)")
+                if "maxiter" in options:
+                    _mi_txt = self.expr(options["maxiter"])
+                    _mi_expr = _mi_txt if self._expr_kind(options["maxiter"]) == "int" else f"int({_mi_txt})"
+                    self.o.w(f"maxiter_lbfgsb = {_mi_expr}")
                 self.o.w(f"{name} = {x0_expr}")
                 self.o.w(f"l_lbfgsb = [{', '.join(l_items)}]")
                 self.o.w(f"u_lbfgsb = [{', '.join(u_items)}]")
                 self.o.w(f"nbd_lbfgsb = [{', '.join(nbd_items)}]")
                 self.o.w(f"lbfgsb_user_fn => {fn_name}")
-                self.o.w(
-                    f"call lbfgsb_minimize({name}, l_lbfgsb, u_lbfgsb, nbd_lbfgsb, "
-                    f"{name}_fun, {name}_success)"
-                )
+                call_args = [name, "l_lbfgsb", "u_lbfgsb", "nbd_lbfgsb", f"{name}_fun", f"{name}_success"] + call_kw
+                self.o.w(f"call lbfgsb_minimize({', '.join(call_args)})")
                 self._emit_scipy_optimize_message(f"{name}_message", f"{name}_success")
                 self.o.pop()
                 self.o.w("end block")
@@ -48563,8 +48880,16 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
             try:
                 src_m = hp.stat().st_mtime
                 obj_m = obj.stat().st_mtime
-                mod_mins = min(mf.stat().st_mtime for mf in mod_files) if mod_files else obj_m
-                if obj_m < src_m or mod_mins < src_m:
+                # Only the object file's mtime is a reliable staleness
+                # signal: gfortran always rewrites it on recompile, but
+                # leaves a .mod file's mtime untouched when the module's
+                # public interface didn't change (a common case for a
+                # helper library like this one, whose implementation
+                # bodies change far more often than their signatures) --
+                # comparing .mod mtime against the source would then
+                # treat a perfectly valid, up-to-date .mod as stale and
+                # force a full helper recompile on every single build.
+                if obj_m < src_m:
                     cache_ok = False
             except OSError:
                 cache_ok = False
@@ -48924,6 +49249,8 @@ def transpile_file(
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
     tree = inline_local_from_imports(tree, py_path)
+    tree = normalize_scipy_submodule_attribute_calls(tree)
+    tree = normalize_scipy_signal_submodule_access(tree)
     translator.global_synthetic_slices = {}
     translator.global_synthetic_slice_meta = {}
     translator.global_rng_vars = set()

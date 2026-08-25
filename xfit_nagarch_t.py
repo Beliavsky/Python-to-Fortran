@@ -2,11 +2,12 @@ import time
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from nagarch_t_model import logit, nagarch_variance, neg_loglik
+from nagarch_t_model import logit, nagarch_variance, neg_loglik, neg_loglik_fixed_dof
 
 price_file = "asset_class_etf_prices.csv"
 scale_ret = 100
-max_assets = 2  # 0 (or negative) means no limit; set positive to limit the number of asset columns read
+max_assets = 0  # 0 (or negative) means no limit; set positive to limit the number of asset columns read
+fixed_dof = 0.0  # <= 0 means fit dof along with the other parameters; set positive to hold dof fixed at this value
 
 dat = pd.read_csv(price_file)
 dates = pd.to_datetime(dat["Date"], errors="coerce")
@@ -57,36 +58,62 @@ success = np.empty(nassets, dtype=bool)
 for j in range(nassets):
     r = rets[:, j]
 
-    x0 = np.array([
-        np.mean(r),
-        np.log(np.var(r)),
-        logit(0.05),
-        0.3,
-        logit(0.85),
-        np.log(8.0 - 2.0)
-    ])
+    if fixed_dof > 0.0:
+        x0 = np.array([
+            np.mean(r),
+            np.log(np.var(r)),
+            logit(0.05),
+            0.3,
+            logit(0.85)
+        ])
 
-    result = minimize(
-        neg_loglik,
-        x0,
-        args=(r,),
-        method="L-BFGS-B",
-        bounds=[
-            (-1.0, 1.0),
-            (-30.0, 5.0),
-            (-30.0, 30.0),
-            (-5.0, 5.0),
-            (-30.0, 30.0),
-            (-5.0, 5.0)
-        ]
-    )
+        result = minimize(
+            neg_loglik_fixed_dof,
+            x0,
+            args=(r, fixed_dof),
+            method="L-BFGS-B",
+            bounds=[
+                (-1.0, 1.0),
+                (-30.0, 5.0),
+                (-30.0, 30.0),
+                (-5.0, 5.0),
+                (-30.0, 30.0)
+            ]
+        )
+
+        dof_hat[j] = fixed_dof
+    else:
+        x0 = np.array([
+            np.mean(r),
+            np.log(np.var(r)),
+            logit(0.05),
+            0.3,
+            logit(0.85),
+            np.log(8.0 - 2.0)
+        ])
+
+        result = minimize(
+            neg_loglik,
+            x0,
+            args=(r,),
+            method="L-BFGS-B",
+            bounds=[
+                (-1.0, 1.0),
+                (-30.0, 5.0),
+                (-30.0, 30.0),
+                (-5.0, 5.0),
+                (-30.0, 30.0),
+                (-5.0, 5.0)
+            ]
+        )
+
+        dof_hat[j] = 2.0 + np.exp(result.x[5])
 
     mu_hat[j] = result.x[0]
     omega_hat[j] = np.exp(result.x[1])
     alpha_hat[j] = 1.0 / (1.0 + np.exp(-result.x[2]))
     theta_hat[j] = result.x[3]
     beta_hat[j] = 1.0 / (1.0 + np.exp(-result.x[4]))
-    dof_hat[j] = 2.0 + np.exp(result.x[5])
     success[j] = result.success
 
 overall_end = time.perf_counter()
@@ -96,6 +123,10 @@ overall_end = time.perf_counter()
 # -----------------------------
 
 print("\nNAGARCH(1,1)-t fits, returns scaled by scale_ret =", scale_ret)
+if fixed_dof > 0.0:
+    print("dof held fixed at:", fixed_dof)
+else:
+    print("dof fitted per asset")
 print()
 print(f"{'asset':10s} {'mu':>12s} {'omega':>12s} {'alpha':>12s} {'theta':>12s} {'beta':>12s} {'dof':>10s} {'persist':>12s} {'ok':>5s}")
 print("-" * 92)

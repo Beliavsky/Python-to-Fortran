@@ -29,18 +29,24 @@ module lbfgsb_bridge_mod
 
 contains
 
-   subroutine lbfgsb_minimize(x, l, u, nbd, f_opt, success)
+   subroutine lbfgsb_minimize(x, l, u, nbd, f_opt, success, factr_in, pgtol_in, maxiter_in)
       real(kind=dp), intent(inout) :: x(:)
       real(kind=dp), intent(in) :: l(:), u(:)
       integer, intent(in) :: nbd(:)
       real(kind=dp), intent(out) :: f_opt
       logical, intent(out), optional :: success
+      ! Overrides for scipy's minimize(..., options={"ftol": ..., "gtol":
+      ! ..., "maxiter": ...}): factr_in is the already-converted factr
+      ! (ftol/eps, matching what scipy itself passes to the underlying
+      ! Fortran L-BFGS-B routine), pgtol_in is gtol passed straight
+      ! through, maxiter_in bounds the reverse-communication loop below.
+      real(kind=dp), intent(in), optional :: factr_in, pgtol_in
+      integer, intent(in), optional :: maxiter_in
 
       integer, parameter :: mem = 10
-      real(kind=dp), parameter :: factr = 1.0e7_dp
-      real(kind=dp), parameter :: pgtol = 1.0e-5_dp
+      real(kind=dp) :: factr, pgtol
       real(kind=dp), parameter :: h = 1.0e-8_dp
-      integer, parameter :: max_setulb_calls = 20000
+      integer :: max_setulb_calls
       integer :: n, i, calls
       real(kind=dp) :: f, f_plus
       real(kind=dp), allocatable :: g(:), wa(:), p_pert(:)
@@ -49,6 +55,13 @@ contains
       logical :: lsave(4)
       integer :: isave(44)
       real(kind=dp) :: dsave(29)
+
+      factr = 1.0e7_dp
+      if (present(factr_in)) factr = factr_in
+      pgtol = 1.0e-5_dp
+      if (present(pgtol_in)) pgtol = pgtol_in
+      max_setulb_calls = 20000
+      if (present(maxiter_in)) max_setulb_calls = maxiter_in
 
       n = size(x)
       allocate (g(n), p_pert(n))
