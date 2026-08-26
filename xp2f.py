@@ -16431,6 +16431,22 @@ class translator(ast.NodeVisitor):
             ):
                 return 1
             if (
+                isinstance(node.value, ast.Call)
+                and self._is_linalg_call(node.value.func, {"lstsq"})
+                and len(node.value.args) >= 2
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and int(node.slice.value) == 0
+            ):
+                # np.linalg.lstsq(X, Y, ...)[0] (the solution array x,
+                # rather than tuple-unpacking the full (x, residuals,
+                # rank, s) return) follows Y's rank, same as the bare-call
+                # case below and np.linalg.solve's own behavior -- without
+                # this, a fresh local assigned from this expression falls
+                # through to some other/default rank, corrupting every
+                # later use of that variable.
+                return self._rank_expr(node.value.args[1])
+            if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.dict_typed_vars
                 and isinstance(node.slice, ast.Constant)
@@ -36124,8 +36140,32 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{cnt} = {cnt} + 1")
                 if name_is_alloc:
                     if name in self.alloc_chars:
-                        self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
-                        self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {val_ctor}]")
+                        # A deferred-length `character(len=:), allocatable`
+                        # array can't be allocated with a bare size (no
+                        # length-type-spec/SOURCE/MOLD) -- give it a
+                        # throwaway length-1 placeholder; the very next
+                        # line's auto-reallocating concatenation replaces
+                        # it with the real content and length immediately.
+                        self.o.w(f"if (.not. allocated({name})) allocate(character(len=1) :: {name}(1))")
+                        self.o.w(f"if ({cnt} > size({name}) .or. len({val_ctor}) > len({name})) then")
+                        self.o.push()
+                        self.o.w("block")
+                        self.o.push()
+                        self.o.w("integer :: len_new_tmp")
+                        self.o.w(f"len_new_tmp = max(len({name}), len({val_ctor}))")
+                        self.o.w(f"if ({cnt} > size({name})) then")
+                        self.o.push()
+                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}, {val_ctor}]")
+                        self.o.pop()
+                        self.o.w("else")
+                        self.o.push()
+                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}]")
+                        self.o.pop()
+                        self.o.w("end if")
+                        self.o.pop()
+                        self.o.w("end block")
+                        self.o.pop()
+                        self.o.w("end if")
                     else:
                         cap = self._list_capacity_var(name)
                         self.o.w(f"if (.not. allocated({name})) then")
@@ -36156,11 +36196,25 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("append without count mapping")
             self.o.w(f"if (allocated({name})) then")
             self.o.push()
-            self.o.w(f"{name} = [{name}, {val_ctor}]")
+            if name in self.alloc_chars:
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: len_new_tmp")
+                self.o.w(f"len_new_tmp = max(len({name}), len({val_ctor}))")
+                self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}, {val_ctor}]")
+                self.o.pop()
+                self.o.w("end block")
+            else:
+                self.o.w(f"{name} = [{name}, {val_ctor}]")
             self.o.pop()
             self.o.w("else")
             self.o.push()
-            self.o.w(f"allocate({name}(1))")
+            # See the matching fix above: a deferred-length character
+            # array can't be allocated with a bare size.
+            if name in self.alloc_chars:
+                self.o.w(f"allocate(character(len=1) :: {name}(1))")
+            else:
+                self.o.w(f"allocate({name}(1))")
             self.o.w(f"{name}(1) = {val}")
             self.o.pop()
             self.o.w("end if")
@@ -36195,8 +36249,32 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{cnt} = {cnt} + 1")
                 if name_is_alloc:
                     if name in self.alloc_chars:
-                        self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
-                        self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {vals}(i_ext)]")
+                        # A deferred-length `character(len=:), allocatable`
+                        # array can't be allocated with a bare size (no
+                        # length-type-spec/SOURCE/MOLD) -- give it a
+                        # throwaway length-1 placeholder; the very next
+                        # line's auto-reallocating concatenation replaces
+                        # it with the real content and length immediately.
+                        self.o.w(f"if (.not. allocated({name})) allocate(character(len=1) :: {name}(1))")
+                        self.o.w(f"if ({cnt} > size({name}) .or. len({vals}(i_ext)) > len({name})) then")
+                        self.o.push()
+                        self.o.w("block")
+                        self.o.push()
+                        self.o.w("integer :: len_new_tmp")
+                        self.o.w(f"len_new_tmp = max(len({name}), len({vals}(i_ext)))")
+                        self.o.w(f"if ({cnt} > size({name})) then")
+                        self.o.push()
+                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}, {vals}(i_ext)]")
+                        self.o.pop()
+                        self.o.w("else")
+                        self.o.push()
+                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}]")
+                        self.o.pop()
+                        self.o.w("end if")
+                        self.o.pop()
+                        self.o.w("end block")
+                        self.o.pop()
+                        self.o.w("end if")
                     else:
                         cap = self._list_capacity_var(name)
                         self.o.w(f"if (.not. allocated({name})) then")
@@ -36229,7 +36307,16 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("extend without count mapping")
             self.o.w(f"if (allocated({name})) then")
             self.o.push()
-            self.o.w(f"{name} = [{name}, {vals}]")
+            if name in self.alloc_chars:
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: len_new_tmp")
+                self.o.w(f"len_new_tmp = max(len({name}), len({vals}))")
+                self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}, {vals}]")
+                self.o.pop()
+                self.o.w("end block")
+            else:
+                self.o.w(f"{name} = [{name}, {vals}]")
             self.o.pop()
             self.o.w("else")
             self.o.push()
@@ -36254,14 +36341,24 @@ class translator(ast.NodeVisitor):
             val = self.expr(c.args[1])
             self.o.w("block")
             self.o.push()
-            self.o.w("integer :: n_ins, pos_ins")
-            self.o.w(f"if (.not. allocated({name})) allocate({name}(0))")
+            if name in self.alloc_chars:
+                self.o.w("integer :: n_ins, pos_ins, len_new_tmp")
+            else:
+                self.o.w("integer :: n_ins, pos_ins")
+            if name in self.alloc_chars:
+                self.o.w(f"if (.not. allocated({name})) allocate(character(len=1) :: {name}(0))")
+            else:
+                self.o.w(f"if (.not. allocated({name})) allocate({name}(0))")
             self.o.w(f"n_ins = size({name})")
             self.o.w(f"pos_ins = int({idx})")
             self.o.w("if (pos_ins < 0) pos_ins = n_ins + pos_ins")
             self.o.w("if (pos_ins < 0) pos_ins = 0")
             self.o.w("if (pos_ins > n_ins) pos_ins = n_ins")
-            self.o.w(f"{name} = [{name}(:pos_ins), {val}, {name}(pos_ins + 1:)]")
+            if name in self.alloc_chars:
+                self.o.w(f"len_new_tmp = max(len({name}), len({val}))")
+                self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}(:pos_ins), {val}, {name}(pos_ins + 1:)]")
+            else:
+                self.o.w(f"{name} = [{name}(:pos_ins), {val}, {name}(pos_ins + 1:)]")
             self.o.pop()
             self.o.w("end block")
             return
