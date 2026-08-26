@@ -39220,6 +39220,16 @@ def _emit_local_function(
         for _idx, _an in enumerate(args):
             if _idx >= len(_arg_ranks):
                 continue
+            if force_arg_ranks is not None and _an in force_arg_ranks:
+                # local_func_arg_ranks is the single, whole-function
+                # consensus rank merged across EVERY call site (e.g. 2,
+                # the max observed for an overloaded print-only-void
+                # function called with both rank-1 and rank-2 actuals) --
+                # already-forced per-overload-spec ranks must win here, or
+                # this unconditionally re-marks the arg with the merged
+                # rank and silently discards the spec-specific one applied
+                # earlier in this same function.
+                continue
             _rr = int(_arg_ranks[_idx])
             if _rr <= 0:
                 continue
@@ -47209,13 +47219,24 @@ def generate_flat(
         arg_names = list(local_func_arg_names.get(fn_name, []))
         pair_lists = [set() for _ in arg_names]
         triad_lists = [set() for _ in arg_names]
+        # Per-call-site joint profiles (positional args only): each entry
+        # maps arg index -> (kind, rank) observed together AT THAT ONE call
+        # site. pair_lists/triad_lists merge evidence across all call sites
+        # per argument POSITION independently, which loses the correlation
+        # between positions -- fine when only one argument ever varies, but
+        # wrong when two or more vary together (e.g. `print_fn(name, true,
+        # fit)` called with both `true`/`fit` rank-1 in one place and both
+        # rank-2 in another): merging independently would wrongly suggest
+        # a (rank-1 true, rank-2 fit) combination is also valid.
+        joint_calls = []
         if not arg_names:
-            return pair_lists, triad_lists
+            return pair_lists, triad_lists, joint_calls
         def _record(scan_node, tr_ctx, owner_fn=None):
             name_to_idx = {nm: i for i, nm in enumerate(arg_names)}
             for _n in ast.walk(scan_node):
                 if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == fn_name):
                     continue
+                _profile = {}
                 for _i, _a in enumerate(_n.args):
                     if _i >= len(arg_names):
                         break
@@ -47232,9 +47253,13 @@ def generate_flat(
                         if _dk in {"int", "real", "logical", "char", "complex"}:
                             pair_lists[_i].add((_dk, int(_dr)))
                             triad_lists[_i].add((_dk, int(_dr), bool(tr_ctx._is_python_list_expr(_a))))
+                            _ak, _ar = _dk, int(_dr)
                     if _ak in {"int", "real", "logical", "char", "complex"}:
                         pair_lists[_i].add((_ak, _ar))
                         triad_lists[_i].add((_ak, _ar, bool(tr_ctx._is_python_list_expr(_a))))
+                        _profile[_i] = (_ak, _ar)
+                if len(_profile) == len(arg_names):
+                    joint_calls.append(_profile)
                 for _kw in getattr(_n, "keywords", []):
                     if _kw.arg is None or _kw.arg not in name_to_idx:
                         continue
@@ -47275,7 +47300,7 @@ def generate_flat(
             )
             _tr_local_scan.prescan(_fn_scan.body)
             _record(_fn_scan, _tr_local_scan, _fn_scan)
-        return pair_lists, triad_lists
+        return pair_lists, triad_lists, joint_calls
     for fn in (local_funcs or []):
         if fn.name not in local_void_funcs:
             continue
@@ -47284,17 +47309,73 @@ def generate_flat(
         arg_names = [a.arg for a in fn.args.args]
         if not arg_names:
             continue
-        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
+        obs_pair_lists, obs_triad_lists, obs_joint_calls = _observed_local_call_specs(fn.name)
         pair_lists = []
         for i in range(len(arg_names)):
             prs = set(_safe_idx(call_kind_rank_pairs.get(fn.name, [set() for _ in arg_names]), i))
             prs |= set(_safe_idx(obs_pair_lists, i))
-            prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
+            prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1, 2}}
             pair_lists.append(prs)
         if any((not prs) for prs in pair_lists):
             continue
         varying = [i for i, prs in enumerate(pair_lists) if len(prs) > 1]
-        if len(varying) != 1:
+        if len(varying) == 0:
+            continue
+        if len(varying) > 1:
+            # Multiple arguments vary TOGETHER (e.g. `print_fn(name, true,
+            # fit)` where true/fit are both rank-1 at some call sites and
+            # both rank-2 at others): the single-argument path below
+            # would independently combine each varying position's
+            # observed values, wrongly implying combinations (like rank-1
+            # true with rank-2 fit) that were never actually called.
+            # Group call sites by their JOINT (kind, rank) profile across
+            # just the varying positions instead, and emit one specific
+            # procedure per distinct joint profile actually observed.
+            fixed = {}
+            ok = True
+            for j, prs in enumerate(pair_lists):
+                if j in varying:
+                    continue
+                if len(prs) != 1:
+                    ok = False
+                    break
+                fixed[j] = next(iter(prs))
+            if not ok:
+                continue
+            joint_profiles = set()
+            for _call in obs_joint_calls:
+                if not all(i in _call for i in varying):
+                    continue
+                if any(_call.get(i) != fixed.get(i) for i in range(len(arg_names)) if i not in varying):
+                    continue
+                _prof = tuple(_call[i] for i in varying)
+                if not all(p in pair_lists[i] for i, p in zip(varying, _prof)):
+                    continue
+                joint_profiles.add(_prof)
+            if len(joint_profiles) <= 1:
+                continue
+            specs = []
+            for _prof in sorted(joint_profiles):
+                forced_kinds = {}
+                forced_ranks = {}
+                for j, anm in enumerate(arg_names):
+                    if j in varying:
+                        kk, rr = _prof[varying.index(j)]
+                    else:
+                        kk, rr = fixed[j]
+                    forced_kinds[anm] = kk
+                    forced_ranks[anm] = rr
+                suf = "_".join(
+                    f"{arg_names[i]}_{k}_{'s' if r == 0 else f'r{r}'}"
+                    for i, (k, r) in zip(varying, _prof)
+                )
+                pname = f"{fn.name}_{suf}"
+                specs.append((pname, forced_kinds, forced_ranks, set(), True))
+            if len(specs) <= 1:
+                continue
+            local_overload_specs[fn.name] = specs
+            for j in range(len(arg_names)):
+                local_func_arg_kinds[fn.name][j] = None
             continue
         iv = varying[0]
         triads_v = set(_safe_idx(call_kind_rank_islist.get(fn.name, [set() for _ in arg_names]), iv))
@@ -47527,7 +47608,7 @@ def generate_flat(
         if _fn_requires_rank1_arg(fn, arg0):
             req_rank = max(req_rank, 1)
         pairs = set(_safe_idx(call_kind_rank_pairs.get(fn.name, [set()]), 0))
-        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
+        obs_pair_lists, obs_triad_lists, _obs_joint_calls = _observed_local_call_specs(fn.name)
         triads = set(_safe_idx(call_kind_rank_islist.get(fn.name, [set()]), 0)) | set(_safe_idx(obs_triad_lists, 0))
         pairs = set(pairs) | set(_safe_idx(obs_pair_lists, 0))
         pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
@@ -47634,7 +47715,7 @@ def generate_flat(
         arg_names = [a.arg for a in fn.args.args]
         if not arg_names:
             continue
-        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
+        obs_pair_lists, obs_triad_lists, _obs_joint_calls = _observed_local_call_specs(fn.name)
         pair_lists = []
         triad_lists = []
         for i, arg_nm in enumerate(arg_names):
@@ -47774,7 +47855,7 @@ def generate_flat(
         arg_names = list(local_func_arg_names.get(fn.name, []))
         if not arg_names:
             continue
-        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
+        obs_pair_lists, obs_triad_lists, _obs_joint_calls = _observed_local_call_specs(fn.name)
         varying = []
         for i, prs in enumerate(obs_pair_lists):
             ranks_seen = {int(r) for (_k, r) in prs}
