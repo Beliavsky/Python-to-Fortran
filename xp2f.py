@@ -44982,6 +44982,18 @@ def generate_flat(
             tuple_return_out_kinds=_prov_tuple_out,
             tuple_return_out_ranks=_prov_tuple_out_ranks,
             local_return_specs=_prov_scalar_specs,
+            # _prov_scalar_ranks (this same provisional _local_return_maps
+            # call's rank output) was never threaded through here, so
+            # tr_seed.local_return_ranks was always empty: prescanning a
+            # top-level `y = some_local_fn(...)` then had to fall back to
+            # rank 1 for `y` (see _mark_alloc_real's default) regardless of
+            # some_local_fn's real return rank, which this same call
+            # already knows correctly -- and that wrong rank-1 then fed
+            # into _record_call_hints below, corrupting any OTHER local
+            # function's inferred parameter rank for `y` at its own call
+            # site (e.g. `other_fn(y)`), overriding that function's own,
+            # correct body-based rank guess.
+            local_return_ranks=_prov_scalar_ranks,
         )
         _top_level_scan_nodes = [st for st in tree.body if not isinstance(st, ast.FunctionDef)]
         tr_seed.prescan(_top_level_scan_nodes)
@@ -45247,6 +45259,10 @@ def generate_flat(
                 tuple_return_out_kinds=_prov_tuple_out,
                 tuple_return_out_ranks=_prov_tuple_out_ranks,
                 local_return_specs=_prov_scalar_specs,
+                # See the matching fix on tr_seed above -- same gap, same
+                # fix, for a variable assigned from a local-function call
+                # inside ANOTHER local function's own body.
+                local_return_ranks=_prov_scalar_ranks,
             )
             tr_local_scan.prescan(_fn_scan.body)
             _record_call_hints(_fn_scan, tr_local_scan, _fn_scan)
@@ -47253,6 +47269,9 @@ def generate_flat(
                 tuple_return_out_kinds=_prov_tuple_out,
                 tuple_return_out_ranks=_prov_tuple_out_ranks,
                 local_return_specs=_prov_scalar_specs,
+                # See the matching fix on tr_seed near this function's
+                # construction, above.
+                local_return_ranks=_prov_scalar_ranks,
             )
             _tr_local_scan.prescan(_fn_scan.body)
             _record(_fn_scan, _tr_local_scan, _fn_scan)
