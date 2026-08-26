@@ -31,6 +31,8 @@ import tokenize
 import keyword
 import tempfile
 import os
+import hashlib
+import shutil
 from datetime import datetime
 from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import fortran_output as fout
@@ -24425,6 +24427,29 @@ class translator(ast.NodeVisitor):
             if undef_msg is not None:
                 raise NotImplementedError(undef_msg)
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id in {"np", "numpy"}
+                and node.func.value.attr == "random"
+            ):
+                # np.random.<X>(...) is the legacy global-RNG API; only a
+                # couple of its functions (rand/randn) are recognized here,
+                # and only as a whole top-level assignment RHS, not as a
+                # general sub-expression like `L @ np.random.randn(k)`.
+                # Steer users toward the Generator API this project's own
+                # examples all use instead, rather than a bare "unsupported
+                # call" that gives no hint of the fix.
+                legacy_rename = {"rand": "random", "randn": "standard_normal"}
+                modern_name = legacy_rename.get(node.func.attr, node.func.attr)
+                raise NotImplementedError(
+                    f"unsupported call: {call_txt} -- np.random.{node.func.attr}(...) is the legacy "
+                    "global-RNG API and is only supported (if at all) as a whole top-level assignment "
+                    "RHS, not as part of a larger expression. Use the Generator API instead: add "
+                    "`rng = np.random.default_rng(seed)` once (in place of np.random.seed(seed)), then "
+                    f"call `rng.{modern_name}(...)` here instead of `np.random.{node.func.attr}(...)`."
+                )
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
             if (
@@ -43943,6 +43968,46 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         rr_spec = 1 if (r_first <= 1 or axis_val == 0 and r_first <= 1) else 2
                     k = None
                     rr = 0
+                elif isinstance(r0, ast.Subscript) and isinstance(r0.value, ast.Name):
+                    # `return arr[...]` where `arr` is a plain local name:
+                    # resolve arr's own rank via _infer_local_name_spec,
+                    # which scans fn's OWN body -- not tr._rank_expr(arr),
+                    # which resolves `arr` by bare name against the
+                    # whole-program alloc_*_rank tables. Those tables are
+                    # keyed by name only, not by scope, so if a caller's
+                    # top-level variable happens to share arr's name (e.g.
+                    # both called `y`), tr._rank_expr(arr) can silently
+                    # resolve to the CALLER's (possibly still-undetermined)
+                    # entry instead of this function's own local array,
+                    # corrupting this function's own inferred return rank.
+                    _base_nm = r0.value.id
+                    _lk_base, _lr_base = _infer_local_name_spec(fn, _base_nm, tr)
+                    if _lr_base > 0 and _lk_base in {"real", "int", "logical", "complex", "char"}:
+                        _rank_tables = {
+                            "real": (tr.alloc_reals, tr.alloc_real_rank),
+                            "int": (tr.alloc_ints, tr.alloc_int_rank),
+                            "logical": (tr.alloc_logs, tr.alloc_log_rank),
+                            "complex": (tr.alloc_complexes, tr.alloc_complex_rank),
+                            "char": (tr.alloc_chars, tr.alloc_char_rank),
+                        }
+                        _members, _ranks = _rank_tables[_lk_base]
+                        _was_member = _base_nm in _members
+                        _saved_rank = _ranks.get(_base_nm)
+                        _members.add(_base_nm)
+                        _ranks[_base_nm] = _lr_base
+                        try:
+                            k = tr._expr_kind(r0)
+                            rr = int(tr._rank_expr(r0))
+                        finally:
+                            if _saved_rank is None:
+                                _ranks.pop(_base_nm, None)
+                            else:
+                                _ranks[_base_nm] = _saved_rank
+                            if not _was_member:
+                                _members.discard(_base_nm)
+                    else:
+                        k = tr._expr_kind(r0)
+                        rr = int(tr._rank_expr(r0))
                 else:
                     k = tr._expr_kind(r0)
                     rr = int(tr._rank_expr(r0))
@@ -49378,11 +49443,11 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
         src_text = hp.read_text(encoding="utf-8", errors="ignore")
         mods = sorted(_modules_defined_in_source(src_text))
         mod_files = [Path(f"{m}.mod") for m in mods]
-        cache_ok = obj.exists() and all(mf.exists() for mf in mod_files)
-        if cache_ok:
+
+        def _cache_valid(obj_path, mod_paths, src_path=hp):
+            if not (obj_path.exists() and all(mp.exists() for mp in mod_paths)):
+                return False
             try:
-                src_m = hp.stat().st_mtime
-                obj_m = obj.stat().st_mtime
                 # Only the object file's mtime is a reliable staleness
                 # signal: gfortran always rewrites it on recompile, but
                 # leaves a .mod file's mtime untouched when the module's
@@ -49392,15 +49457,38 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
                 # comparing .mod mtime against the source would then
                 # treat a perfectly valid, up-to-date .mod as stale and
                 # force a full helper recompile on every single build.
-                if obj_m < src_m:
-                    cache_ok = False
-                elif not flags_file.exists() or flags_file.read_text(encoding="utf-8").strip() != flags_key:
-                    cache_ok = False
+                return obj_path.stat().st_mtime >= src_path.stat().st_mtime
             except OSError:
-                cache_ok = False
+                return False
+
+        cache_ok = _cache_valid(obj, mod_files) and (
+            flags_file.exists() and flags_file.read_text(encoding="utf-8").strip() == flags_key
+        )
         if cache_ok:
             link_inputs.append(str(obj))
             continue
+
+        # The live <name>.o slot didn't match this flag set -- before
+        # paying for a full recompile (slow for a large helper like
+        # lapack_d.f90 at -O3), check a per-flags-variant side cache so
+        # switching back and forth between e.g. --run-both's debug flags
+        # and --time-both's -O3 flags only ever compiles each variant
+        # once, rather than re-evicting and rebuilding the other variant
+        # on every switch.
+        variant_dir = Path(".xp2f_obj_cache") / hashlib.sha256(flags_key.encode("utf-8")).hexdigest()[:16]
+        variant_obj = variant_dir / obj.name
+        variant_mods = [variant_dir / mf.name for mf in mod_files]
+        if _cache_valid(variant_obj, variant_mods):
+            try:
+                shutil.copy2(variant_obj, obj)
+                for mf, vmf in zip(mod_files, variant_mods):
+                    shutil.copy2(vmf, mf)
+                flags_file.write_text(flags_key, encoding="utf-8")
+                link_inputs.append(str(obj))
+                continue
+            except OSError:
+                pass  # fall through to a fresh compile
+
         helper_cmd = compiler_parts + ["-c", str(hp), "-o", str(obj)]
         print("Build helper:", " ".join(helper_cmd))
         hcp = subprocess.run(helper_cmd, capture_output=True, text=True)
@@ -49410,6 +49498,14 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
             flags_file.write_text(flags_key, encoding="utf-8")
         except OSError:
             pass
+        try:
+            variant_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(obj, variant_dir / obj.name)
+            for mf in mod_files:
+                if mf.exists():
+                    shutil.copy2(mf, variant_dir / mf.name)
+        except OSError:
+            pass  # side cache is a pure optimization -- never fatal
         link_inputs.append(str(obj))
     return link_inputs, None, None
 
