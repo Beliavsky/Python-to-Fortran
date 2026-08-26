@@ -1765,6 +1765,26 @@ def function_is_pure(fn_node, known_pure_calls=None):
         "min",
         "max",
         "range",
+        # scipy.special functions called bare (e.g. `from scipy.special
+        # import gammaln` then `gammaln(x)`): each lowers to either a
+        # standard PURE ELEMENTAL Fortran intrinsic (log_gamma/gamma/erf/
+        # erfc/bessel_j0/bessel_j1/bessel_jn) or a helper in python.f90
+        # explicitly declared `pure elemental` (special_factorial/
+        # special_factorial2/special_comb, backing factorial/factorial2/
+        # comb/binom) -- see the scipy.special dispatch in expr().
+        "gammaln",
+        "lgamma",
+        "gamma",
+        "erf",
+        "erfc",
+        "j0",
+        "j1",
+        "jn",
+        "jv",
+        "factorial",
+        "factorial2",
+        "comb",
+        "binom",
     }
     impure_np_leaf_calls = {
         "default_rng",
@@ -1905,6 +1925,79 @@ def function_is_pure(fn_node, known_pure_calls=None):
         if not s.ok:
             break
     return s.ok
+
+
+def compute_local_functions_purity(local_funcs, known_pure_calls=None):
+    """Fixed-point purity analysis over local (Python-sourced) functions
+    that may call each other, on top of a fixed set of known-pure library
+    helpers.
+
+    function_is_pure() alone only recognizes calls to that fixed library
+    set, so a local function calling ANOTHER local function is never
+    recognized as potentially pure in a single pass -- even when the
+    callee is itself pure and gets emitted as `pure` (e.g. neg_loglik
+    calling nagarch_variance). This iterates: a local function's name is
+    added to the known-pure set once (a) function_is_pure() accepts it
+    against the CURRENT set (so all its calls already resolve to
+    known-pure procedures) and (b) it doesn't write to a module-global or
+    reassign one of its own arguments -- the same extra checks
+    _emit_local_function applies before actually emitting the `pure`
+    prefix, duplicated here so this pre-pass predicts the same outcome --
+    repeating until no further function newly qualifies.
+
+    A genuinely mutually-recursive pair of local functions (A calls B,
+    B calls A, both otherwise clean) is never marked pure by this scheme,
+    since neither can be added before the other already is -- a safe,
+    conservative gap (never a false positive), not a bug.
+    """
+    module_global_names = set(collect_module_global_decls(local_funcs).keys())
+    fn_by_name = {f.name: f for f in (local_funcs or []) if isinstance(f, ast.FunctionDef)}
+    pure_set = set(known_pure_calls or set())
+
+    def _own_purity_ok(fn):
+        arg_names_set = {a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))}
+        for st in fn.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Global):
+                    return False
+                if (
+                    isinstance(n, ast.Assign)
+                    and any(isinstance(tg, ast.Name) and tg.id in module_global_names for tg in n.targets)
+                ):
+                    return False
+                if (
+                    isinstance(n, (ast.AnnAssign, ast.AugAssign))
+                    and isinstance(n.target, ast.Name)
+                    and n.target.id in module_global_names
+                ):
+                    return False
+        for st in fn.body:
+            for n in ast.walk(st):
+                if (
+                    isinstance(n, ast.Assign)
+                    and any(assignment_target_mutates_name(tg, arg_names_set) for tg in n.targets)
+                ):
+                    return False
+                if (
+                    isinstance(n, (ast.AnnAssign, ast.AugAssign))
+                    and assignment_target_mutates_name(n.target, arg_names_set)
+                ):
+                    return False
+        return True
+
+    changed = True
+    while changed:
+        changed = False
+        for name, fn in fn_by_name.items():
+            if name in pure_set:
+                continue
+            if not function_is_pure(fn, known_pure_calls=pure_set):
+                continue
+            if not _own_purity_ok(fn):
+                continue
+            pure_set.add(name)
+            changed = True
+    return pure_set
 
 
 def remove_redundant_tail_returns(src_text):
@@ -4492,7 +4585,9 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
             return None
         return indent, spec, entities
 
-    def _coalesce_section(decl_lines):
+    result_name_re = re.compile(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", re.IGNORECASE)
+
+    def _coalesce_section(decl_lines, result_name=None):
         # Group decl_lines into records: a "stmt" record is one (possibly
         # multi-line, "&"-continued) declaration statement; anything else
         # (blank lines, whole-line comments) is a "keep" record passed
@@ -4523,6 +4618,14 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
             if parsed is None:
                 continue
             indent, spec, entities = parsed
+            if result_name is not None and any(
+                e.split("(", 1)[0].strip().lower() == result_name.lower() for e in entities
+            ):
+                # Never fold the function's own result variable into a
+                # shared declaration line with other locals -- keep it on
+                # its own line regardless of what else this statement
+                # would otherwise merge with.
+                continue
             # Merge arrays with other arrays (any rank -- shape is
             # per-entity) and scalars with other scalars, but never mix
             # the two on one line: a dummy-argument list reads better with
@@ -4603,8 +4706,12 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
             decl_end = m
         decl_lines = body[:decl_end]
 
+        sig_text = " ".join(ln.split("!", 1)[0] for ln in lines[i:sig_end])
+        result_m = result_name_re.search(sig_text)
+        result_name = result_m.group(1) if result_m else None
+
         out.extend(lines[i:sig_end])
-        out.extend(_coalesce_section(decl_lines))
+        out.extend(_coalesce_section(decl_lines, result_name))
         out.extend(body[decl_end:])
         out.extend(lines[j:end])
         i = end
@@ -21558,7 +21665,12 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 a1 = self.expr(node.args[1])
-                return f"spread({a0}, dim=2, ncopies=size({a1})) * spread({a1}, dim=1, ncopies=size({a0}))"
+                # Parenthesized: this Call's rendered text must be safe to
+                # embed as an atomic operand in a larger expression (e.g.
+                # `sigma / np.outer(sd, sd)`) -- without the parens, a `*`
+                # here at the same precedence as a surrounding `/` would
+                # bind left-to-right instead of grouping as a single term.
+                return f"(spread({a0}, dim=2, ncopies=size({a1})) * spread({a1}, dim=1, ncopies=size({a0})))"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -26333,15 +26445,33 @@ class translator(ast.NodeVisitor):
                     self.alloc_chars.discard(t.id)
                     self.alloc_complexes.discard(t.id)
                     _csv_path = _resolve_str_literal(v.args[0]) if v.args else None
+                    _skiprows_kw = next((kw for kw in v.keywords if kw.arg == "skiprows"), None)
+                    _skiprows_n = _skiprows_kw.value.value if (
+                        _skiprows_kw is not None
+                        and isinstance(_skiprows_kw.value, ast.Constant)
+                        and isinstance(_skiprows_kw.value.value, int)
+                    ) else 0
+                    _usecols_kw = next((kw for kw in v.keywords if kw.arg == "usecols"), None)
+                    _usecols_names = None
+                    if _usecols_kw is not None and isinstance(_usecols_kw.value, (ast.List, ast.Tuple)):
+                        _usecols_names = [
+                            e.value for e in _usecols_kw.value.elts
+                            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        ]
                     if _csv_path is not None:
                         try:
                             with open(_csv_path, encoding="utf-8-sig") as _csv_f:
+                                for _ in range(_skiprows_n):
+                                    _csv_f.readline()
                                 _header = _csv_f.readline().rstrip("\r\n").split(",")
                         except OSError:
                             _header = []
                         if len(_header) >= 2:
                             self.pandas_df_index_label[t.id] = _header[0].strip()
-                            self.pandas_df_columns[t.id] = [h.strip() for h in _header[1:]]
+                            _cols = [h.strip() for h in _header[1:]]
+                            if _usecols_names is not None:
+                                _cols = [c for c in _cols if c in _usecols_names]
+                            self.pandas_df_columns[t.id] = _cols
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
@@ -27920,7 +28050,28 @@ class translator(ast.NodeVisitor):
         ):
             name = self._aliased_name(t.id)
             path_expr = self.expr(v.args[0])
-            self.o.w(f"call {name}%read_csv({path_expr})")
+            call_kw = []
+            nrows_kw = next((kw for kw in v.keywords if kw.arg == "nrows"), None)
+            if nrows_kw is not None:
+                nrows_txt = self.expr(nrows_kw.value)
+                nrows_expr = nrows_txt if self._expr_kind(nrows_kw.value) == "int" else f"int({nrows_txt})"
+                call_kw.append(f"max_rows={nrows_expr}")
+            skiprows_kw = next((kw for kw in v.keywords if kw.arg == "skiprows"), None)
+            if skiprows_kw is not None:
+                sr_txt = self.expr(skiprows_kw.value)
+                sr_expr = sr_txt if self._expr_kind(skiprows_kw.value) == "int" else f"int({sr_txt})"
+                call_kw.append(f"skiprows={sr_expr}")
+            usecols_kw = next((kw for kw in v.keywords if kw.arg == "usecols"), None)
+            if usecols_kw is not None:
+                if not (
+                    isinstance(usecols_kw.value, (ast.List, ast.Tuple))
+                    and usecols_kw.value.elts
+                    and all(is_const_str(e) for e in usecols_kw.value.elts)
+                ):
+                    raise NotImplementedError("pd.read_csv(usecols=...) requires a literal list of column-name strings")
+                call_kw.append(f"usecols={self.expr(usecols_kw.value)}")
+            args_txt = ", ".join([path_expr] + call_kw)
+            self.o.w(f"call {name}%read_csv({args_txt})")
             return
         if (
             isinstance(t, ast.Name)
@@ -35463,6 +35614,26 @@ class translator(ast.NodeVisitor):
                 self._emit_pandas_df_series_reduction_print(
                     c.args[0], c.args[0].func.attr, context_node=orig_call
                 )
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "round"
+                and self._is_pandas_df_ref_node(c.args[0].func.value)
+            ):
+                # print(df.round(n)) for a plain DataFrame reference (bare
+                # Name / select_names / iloc) -- distinct from the
+                # stats-table-specific and .corr()-chained .round() cases
+                # above, which key off different construction paths.
+                ndigits = 6
+                if (
+                    c.args[0].args
+                    and isinstance(c.args[0].args[0], ast.Constant)
+                    and isinstance(c.args[0].args[0].value, int)
+                ):
+                    ndigits = int(c.args[0].args[0].value)
+                self._emit_pandas_df_print(c.args[0].func.value, ndigits=ndigits, context_node=orig_call)
                 return
             if len(c.args) == 1 and self._is_pandas_df_ref_node(c.args[0]):
                 self._emit_pandas_df_print(c.args[0], context_node=orig_call)
@@ -47666,7 +47837,9 @@ def generate_flat(
             ):
                 _curr_kinds[_i] = _bk
     local_generic_overloads = set(local_overload_specs.keys())
-    pure_local_calls = set(known_pure_calls or set()) | set((user_class_types or {}).keys())
+    pure_local_calls = compute_local_functions_purity(
+        local_funcs, known_pure_calls=set(known_pure_calls or set()) | set((user_class_types or {}).keys())
+    )
 
     elemental_targets = set()
     # A non-intrinsic ELEMENTAL procedure cannot be passed as an actual
@@ -49904,7 +50077,10 @@ def transpile_file(
     f90_lines = mark_recursive_procedures(f90_lines)
     f90_lines = reorder_arg_decls_before_locals(f90_lines)
     f90_lines = coalesce_nonadjacent_declarations(f90_lines, max_len=10**9)
-    f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
+    _result_names = frozenset(
+        m.group(1) for ln in f90_lines for m in re.finditer(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", ln, re.IGNORECASE)
+    )
+    f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9, never_merge_names=_result_names)
     f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
     f90_lines = hoist_loop_invariant_array_realloc(f90_lines)
     # Re-run: hoisting can move a guard out of its enclosing loop, which

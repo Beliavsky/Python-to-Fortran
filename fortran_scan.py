@@ -1227,6 +1227,20 @@ def _fold_simple_integer_arithmetic(stmt: str) -> str:
     pat = re.compile(r"(?<![\w.])([+-]?\d+)\s*([+\-*/])\s*([+-]?\d+)(?![\w.])")
 
     def _repl(m: re.Match[str]) -> str:
+        # Decline when this match's first operand is itself preceded
+        # (across whitespace) by a +/- that isn't part of the match --
+        # that operator binds to this operand too, and folding only the
+        # trailing pair while leaving it untouched silently changes the
+        # expression's value. E.g. in `t - 1 + 1`, the leading `-` makes
+        # the first `1` effectively -1, but a match of just `1 + 1`
+        # (unaware of that `-`) folds to `2`, turning `t - 1 + 1` (= t)
+        # into `t - 2` (a genuine, previously-observed correctness bug).
+        s = m.string
+        p = m.start()
+        while p > 0 and s[p - 1].isspace():
+            p -= 1
+        if p > 0 and s[p - 1] in "+-":
+            return m.group(0)
         a = int(m.group(1))
         op = m.group(2)
         b = int(m.group(3))
@@ -1729,7 +1743,9 @@ def remove_redundant_tail_deallocations(lines: List[str]) -> List[str]:
     return out
 
 
-def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[str]:
+def coalesce_simple_declarations(
+    lines: List[str], max_len: int = 80, never_merge_names: "frozenset[str] | None" = None
+) -> List[str]:
     """Merge adjacent declaration lines with identical type-spec.
 
     Conservative scope:
@@ -1738,7 +1754,13 @@ def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[st
     - skips lines with inline comments
     - skips initialized entities (`= ...`)
     - preserves non-declaration lines and order
+
+    `never_merge_names` (matched case-insensitively against each entity's
+    bare name) are never combined onto a shared line with anything else --
+    e.g. a function's own `result(...)` variable, which callers may want
+    kept on its own declaration line for readability regardless of type.
     """
+    never_merge = {n.lower() for n in (never_merge_names or ())}
     out: List[str] = []
     i = 0
     decl_re = re.compile(
@@ -1766,10 +1788,16 @@ def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[st
         def _shape_sig(ent: str) -> str:
             mm = re.match(r"\s*[a-z][a-z0-9_]*(.*)\s*$", ent, re.IGNORECASE)
             return (mm.group(1).strip() if mm else "").lower()
+        def _bare_name(ent: str) -> str:
+            return ent.split("(", 1)[0].strip().lower()
         shape_sig = _shape_sig(entity)
         # Skip initialized declarations.
         # Note: entity may legally contain commas inside shape, e.g. a(:,:).
         if "=" in entity:
+            out.append(line)
+            i += 1
+            continue
+        if _bare_name(entity) in never_merge:
             out.append(line)
             i += 1
             continue
@@ -1791,6 +1819,8 @@ def coalesce_simple_declarations(lines: List[str], max_len: int = 80) -> List[st
             if _shape_sig(entj) != shape_sig:
                 break
             if "=" in entj:
+                break
+            if _bare_name(entj) in never_merge:
                 break
             names.append(entj)
             eol = "\r\n" if lines[j].endswith("\r\n") else ("\n" if lines[j].endswith("\n") else eol)

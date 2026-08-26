@@ -19,6 +19,7 @@ import xp2f
 XP2F_PATH = REPO_ROOT / "xp2f.py"
 PYTHON_HELPER_PATH = REPO_ROOT / "python.f90"
 DATAFRAME_HELPER_PATH = REPO_ROOT / "dataframe_index_date.f90"
+EXAMPLES_DIR = REPO_ROOT / "examples"
 
 SUPPORTED_PY_COMPILE_CASES = [
     "xoptions_pde.py",
@@ -53,7 +54,7 @@ def _join_fortran_continuations(text: str) -> str:
 def _run_xp2f_compile(tmp_path: Path, example_name: str) -> subprocess.CompletedProcess[str]:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     local_input = tmp_path / example_name
-    shutil.copy2(REPO_ROOT / example_name, local_input)
+    shutil.copy2(EXAMPLES_DIR / example_name, local_input)
     return subprocess.run(
         [sys.executable, str(XP2F_PATH), str(local_input), "--compile"],
         cwd=tmp_path,
@@ -2076,7 +2077,7 @@ def test_xp2f_compiles_xnp_math_funcs_smoke(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
     local_input = tmp_path / "xnp_math_funcs.py"
-    shutil.copy2(REPO_ROOT / "xnp_math_funcs.py", local_input)
+    shutil.copy2(EXAMPLES_DIR / "xnp_math_funcs.py", local_input)
 
     proc = subprocess.run(
         [sys.executable, str(XP2F_PATH), str(local_input), "--compile"],
@@ -3336,7 +3337,7 @@ def test_xp2f_dictcomp_keys_argument_stays_integer_in_generated_print_table(tmp_
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
     src = tmp_path / "xma_persist.py"
-    shutil.copy2(REPO_ROOT / "xma_persist.py", src)
+    shutil.copy2(EXAMPLES_DIR / "xma_persist.py", src)
 
     proc = subprocess.run(
         [sys.executable, str(XP2F_PATH), str(src), "--compile"],
@@ -3358,7 +3359,7 @@ def test_xp2f_can_compile_xfit_hv_with_conservative_stubbed_main(tmp_path: Path)
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
     src = tmp_path / "xfit_hv.py"
-    shutil.copy2(REPO_ROOT / "xfit_hv.py", src)
+    shutil.copy2(EXAMPLES_DIR / "xfit_hv.py", src)
 
     proc = subprocess.run(
         [sys.executable, str(XP2F_PATH), str(src), "--compile"],
@@ -3378,7 +3379,7 @@ def test_xp2f_can_compile_xfit_hv_with_conservative_stubbed_main(tmp_path: Path)
 def test_xp2f_xfit_hv_no_dates_matches_python_numeric_results(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
-    shutil.copy2(REPO_ROOT / "xfit_hv_no_dates.py", tmp_path / "xfit_hv_no_dates.py")
+    shutil.copy2(EXAMPLES_DIR / "xfit_hv_no_dates.py", tmp_path / "xfit_hv_no_dates.py")
     shutil.copy2(REPO_ROOT / "prices_no_dates.csv", tmp_path / "prices_no_dates.csv")
 
     py_run = subprocess.run(

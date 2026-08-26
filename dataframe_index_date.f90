@@ -1514,11 +1514,14 @@ end function ncol
 !
 ! The header row begins with an empty token (before the first comma).
 !------------------------------------------------------------------
-subroutine read_csv(self, filename, max_col, max_rows)
+subroutine read_csv(self, filename, max_col, max_rows, usecols, skiprows)
 class(DataFrame_index_date), intent(inout) :: self
 character(len=*), intent(in)    :: filename
-integer, intent(in), optional :: max_col, max_rows
-integer :: io, unit, i, j, nrows, ncols
+integer, intent(in), optional :: max_col, max_rows, skiprows
+character(len=*), intent(in), optional :: usecols(:)
+integer :: io, unit, i, j, k, nrows, ncols, ncols_file
+integer, allocatable :: col_map(:)
+logical :: keep
 character(len=1024) :: line
 character(:), allocatable :: tokens(:)
 type(date) :: idx
@@ -1530,17 +1533,47 @@ if (allocated(self%values)) deallocate(self%values)
 open(newunit=unit, file=filename, status='old', action='read', iostat=io)
 if (io /= 0) error stop "Error opening file in read_csv"
 
+if (present(skiprows)) then
+   do i = 1, skiprows
+      read(unit, '(A)', iostat=io) line
+      if (io /= 0) error stop "Error skipping rows in read_csv"
+   end do
+end if
+
 read(unit, '(A)', iostat=io) line
 if (io /= 0) error stop "Error reading header line in read_csv"
 
 call split_string(line, ",", tokens)
-ncols = size(tokens) - 1
-if (present(max_col)) ncols = min(ncols, max_col)
-if (ncols <= 0) error stop "No columns detected in header in read_csv"
+ncols_file = size(tokens) - 1
+if (present(max_col)) ncols_file = min(ncols_file, max_col)
+if (ncols_file <= 0) error stop "No columns detected in header in read_csv"
+
+! usecols selects a subset of the (Date-excluded) data columns by name,
+! keeping the file's own column order -- matching pandas' default
+! usecols behavior (list order is not what determines output order).
+allocate(col_map(ncols_file))
+ncols = 0
+do i = 1, ncols_file
+   keep = .true.
+   if (present(usecols)) then
+      keep = .false.
+      do k = 1, size(usecols)
+         if (trim(tokens(i+1)) == trim(usecols(k))) then
+            keep = .true.
+            exit
+         end if
+      end do
+   end if
+   if (keep) then
+      ncols = ncols + 1
+      col_map(ncols) = i
+   end if
+end do
+if (ncols <= 0) error stop "No columns selected in read_csv"
 
 allocate(self%columns(ncols))
 do i = 1, ncols
-   self%columns(i) = tokens(i+1)
+   self%columns(i) = tokens(col_map(i)+1)
 end do
 
 nrows = 0
@@ -1555,6 +1588,11 @@ end do
 if (nrows == 0) error stop "No data lines detected in read_csv"
 
 rewind(unit)
+if (present(skiprows)) then
+   do i = 1, skiprows
+      read(unit, '(A)')
+   end do
+end if
 read(unit, '(A)')
 
 allocate(self%index(nrows), self%values(nrows, ncols))
@@ -1568,7 +1606,7 @@ do i = 1, nrows
    if (.not. valid(idx)) error stop "Invalid date in first column in read_csv"
    self%index(i) = idx
    do j = 1, ncols
-      read(tokens(j+1), *) self%values(i,j)
+      read(tokens(col_map(j)+1), *) self%values(i,j)
    end do
 end do
 
