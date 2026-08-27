@@ -18777,6 +18777,18 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported expr: IfExp rank mismatch")
             kb = self._expr_kind(node.body)
             ko = self._expr_kind(node.orelse)
+            if kb == "char" and ko == "char" and rb == 0 and ro == 0:
+                # Fortran's MERGE requires both character operands to share
+                # the exact same length (unlike an array constructor's
+                # type-spec prefix, there's no automatic widening here), so
+                # pad each side up to the longer of the two with repeat(' ',
+                # ...) rather than calling merge() on them directly.
+                btxt = self.expr(node.body)
+                otxt = self.expr(node.orelse)
+                return (
+                    f"merge({btxt} // repeat(' ', max(0, len({otxt}) - len({btxt}))), "
+                    f"{otxt} // repeat(' ', max(0, len({btxt}) - len({otxt}))), {self.expr(node.test)})"
+                )
             if kb == "char" or ko == "char":
                 raise NotImplementedError("unsupported expr: IfExp with character result")
             def _cast_scalar(txt, src_kind, dst_kind):
@@ -24664,6 +24676,14 @@ class translator(ast.NodeVisitor):
             if node.attr == "imag":
                 return f"aimag({self.expr(node.value)})"
             if node.attr == "shape":
+                if self._is_pandas_df_ref_node(node.value):
+                    # The vendored DataFrame_index_date `shape()` overload is
+                    # imported renamed (df_shape => shape) rather than under
+                    # its own name, since a bare `use ..., only: shape`
+                    # would shadow Fortran's SHAPE intrinsic for the whole
+                    # program -- breaking shape(x) on ordinary numeric
+                    # arrays elsewhere.
+                    return f"df_shape({self.expr(node.value)})"
                 return f"shape({self.expr(node.value)})"
             if node.attr == "ndim":
                 # NumPy-style array rank; use transpiler rank inference to avoid
@@ -36646,6 +36666,25 @@ class translator(ast.NodeVisitor):
                 self.o.w("block")
                 self.o.push()
                 self.o.w("integer :: i_ext")
+                if not isinstance(c.args[0], (ast.Name, ast.Attribute)):
+                    # An inline literal/expression (e.g. extend([10, 20, 30]))
+                    # can't be subscripted or repeatedly re-evaluated in
+                    # place -- Fortran array constructors aren't directly
+                    # indexable (`[10, 20, 30](i)` is a syntax error).
+                    # Materialize it into a real array variable once, and
+                    # use that everywhere below instead of the raw literal.
+                    if name in self.alloc_chars:
+                        self.o.w("character(len=:), allocatable :: xp2f_extend_vals(:)")
+                    elif name in self.alloc_ints:
+                        self.o.w("integer, allocatable :: xp2f_extend_vals(:)")
+                    elif name in self.alloc_logs:
+                        self.o.w("logical, allocatable :: xp2f_extend_vals(:)")
+                    elif name in self.alloc_complexes:
+                        self.o.w("complex(kind=dp), allocatable :: xp2f_extend_vals(:)")
+                    else:
+                        self.o.w(f"{self._real_decl_type(name, alloc=True)}, allocatable :: xp2f_extend_vals(:)")
+                    self.o.w(f"xp2f_extend_vals = {vals}")
+                    vals = "xp2f_extend_vals"
                 self.o.w(f"do i_ext = 1, size({vals})")
                 self.o.push()
                 self.o.w(f"{cnt} = {cnt} + 1")
@@ -49344,7 +49383,7 @@ def generate_flat(
         o.w(
             "use dataframe_index_date_mod, only: DataFrame_index_date, nrow, ncol, date, "
             "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
-            "operator(>), operator(>=)"
+            "operator(>), operator(>=), df_shape => shape"
         )
     if _tree_uses_pandas_dict_dataframe(tree):
         o.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(-)")
