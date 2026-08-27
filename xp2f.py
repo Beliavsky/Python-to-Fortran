@@ -3938,6 +3938,29 @@ def normalize_zero_based_unit_stride_loops(lines):
     re_do_any = re.compile(r"^\s*do\b", flags=re.IGNORECASE)
     re_enddo = re.compile(r"^\s*end\s*do\b", flags=re.IGNORECASE)
 
+    def _has_unsafe_plus1_context(body_lines, iv):
+        # `iv + N` is only safe to blindly rebase to `iv` (dropping the
+        # "+N") when every occurrence is a standalone array-index
+        # adjustment. When `iv + N` is instead embedded in a larger
+        # arithmetic expression -- e.g. the slice-bound formula
+        # `(i + 1) * k` in `top(:, i*k:(i+1)*k)` -- or sits directly
+        # against a slice colon, blindly stripping the "+N" corrupts the
+        # expression's value instead of just re-basing an index. Detect
+        # those contexts and skip the rewrite entirely rather than risk
+        # silently wrong Fortran.
+        unsafe_re = re.compile(
+            rf"\(\s*{re.escape(iv)}\s*\+\s*\d+\s*\)\s*[*/]"
+            rf"|[*/]\s*\(\s*{re.escape(iv)}\s*\+\s*\d+\s*\)"
+            rf"|:\s*\(?\s*{re.escape(iv)}\s*\+\s*\d+"
+            rf"|{re.escape(iv)}\s*\+\s*\d+\s*\)?\s*:",
+            flags=re.IGNORECASE,
+        )
+        for ln in body_lines:
+            code = ln.split("!", 1)[0]
+            if unsafe_re.search(code):
+                return True
+        return False
+
     i = 0
     while i < len(out):
         code_i = out[i].split("!", 1)[0].rstrip()
@@ -3978,6 +4001,9 @@ def normalize_zero_based_unit_stride_loops(lines):
                 ck = out[k].split("!", 1)[0]
                 plus1_hits += len(plus1_pat.findall(ck))
             if plus1_hits < 2:
+                i = j + 1
+                continue
+            if _has_unsafe_plus1_context(out[i + 1:j], iv):
                 i = j + 1
                 continue
 
@@ -4053,6 +4079,9 @@ def normalize_zero_based_unit_stride_loops(lines):
             ck = out[k].split("!", 1)[0]
             plus1_hits += len(plus1_pat.findall(ck))
         if plus1_hits < 2:
+            i = j + 1
+            continue
+        if _has_unsafe_plus1_context(out[i + 1:j], iv):
             i = j + 1
             continue
 
@@ -14686,6 +14715,9 @@ class translator(ast.NodeVisitor):
                     "weibull", "vonmises", "pareto", "power", "rayleigh", "gumbel",
                     "wald", "noncentral_chisquare", "noncentral_f", "triangular",
                     "dirichlet",
+                    "exponential", "standard_exponential", "gamma", "standard_gamma",
+                    "beta", "lognormal", "chisquare", "standard_t", "f",
+                    "laplace", "logistic", "standard_cauchy",
                 }
             ):
                 return "real"
@@ -16773,6 +16805,41 @@ class translator(ast.NodeVisitor):
                 # (n_samples, dimension) -- xp2f only supports a scalar
                 # `size=` for multivariate_normal, never a size tuple.
                 return 2
+
+            _rng_dist_size_argpos = {
+                "exponential": 1, "standard_exponential": 0,
+                "gamma": 2, "standard_gamma": 1,
+                "beta": 2, "lognormal": 2, "chisquare": 1,
+                "standard_t": 1, "f": 2,
+                "laplace": 2, "logistic": 2, "standard_cauchy": 0,
+                "weibull": 1, "vonmises": 2,
+                "pareto": 1, "power": 1, "rayleigh": 1,
+                "gumbel": 2, "wald": 2,
+                "noncentral_chisquare": 2, "noncentral_f": 3, "triangular": 3,
+                "dirichlet": 1,
+                "poisson": 1, "geometric": 1, "zipf": 1, "logseries": 1,
+                "binomial": 2, "negative_binomial": 2,
+                "hypergeometric": 3,
+            }
+            if (
+                isinstance(node.func, ast.Attribute)
+                and _is_rng_rank_source(node.func.value)
+                and node.func.attr in _rng_dist_size_argpos
+            ):
+                size_node = None
+                pos = _rng_dist_size_argpos[node.func.attr]
+                if len(node.args) > pos:
+                    size_node = node.args[pos]
+                for kw in node.keywords:
+                    if kw.arg == "size":
+                        size_node = kw.value
+                if node.func.attr == "dirichlet":
+                    return 2 if size_node is not None else 1
+                if size_node is None:
+                    return 0
+                if isinstance(size_node, (ast.Tuple, ast.List)):
+                    return max(1, len(size_node.elts))
+                return 1
 
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 if len(node.args) >= 1:
@@ -19722,6 +19789,11 @@ class translator(ast.NodeVisitor):
                 if size_node is None:
                     return f"{fn_name}()"
                 if isinstance(size_node, (ast.Tuple, ast.List)):
+                    if len(size_node.elts) == 3 and fn_name in {"rnorm", "runif"}:
+                        return (
+                            f"{fn_name}({self.expr(size_node.elts[0])}, "
+                            f"{self.expr(size_node.elts[1])}, {self.expr(size_node.elts[2])})"
+                        )
                     if len(size_node.elts) == 2:
                         return f"{fn_name}({self.expr(size_node.elts[0])}, {self.expr(size_node.elts[1])})"
                     if len(size_node.elts) == 1:
@@ -27390,6 +27462,8 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(t.id)
                     elif size_node is None:
                         self._mark_real(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 3:
+                        self._mark_alloc_real(t.id, rank=3)
                     elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
                         self._mark_alloc_real(t.id, rank=2)
                     else:
@@ -27450,6 +27524,8 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(t.id, rank=2)
                     elif size_node is None:
                         self._mark_real(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 3:
+                        self._mark_alloc_real(t.id, rank=3)
                     elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
                         self._mark_alloc_real(t.id, rank=2)
                     else:
@@ -27483,6 +27559,8 @@ class translator(ast.NodeVisitor):
                             break
                     if size_node is None:
                         self._mark_int(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 3:
+                        self._mark_alloc_int(t.id, rank=3)
                     elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
                         self._mark_alloc_int(t.id, rank=2)
                     else:
@@ -30269,6 +30347,12 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{t.id} = runif()")
                 return
             if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 3:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    n2 = self.expr(size_node.elts[2])
+                    self.o.w(f"{t.id} = runif(int({n0}), int({n1}), int({n2}))")
+                    return
                 if len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
@@ -30278,7 +30362,7 @@ class translator(ast.NodeVisitor):
                     n0 = self.expr(size_node.elts[0])
                     self.o.w(f"{t.id} = runif(int({n0}))")
                     return
-                raise NotImplementedError("random size tuple rank > 2 not supported")
+                raise NotImplementedError("random size tuple rank > 3 not supported")
             self.o.w(f"{t.id} = runif(int({self.expr(size_node)}))")
             return
 
@@ -30748,7 +30832,12 @@ class translator(ast.NodeVisitor):
 
             n_expr = None
             if isinstance(size_node, (ast.Tuple, ast.List)):
-                if len(size_node.elts) == 2:
+                if len(size_node.elts) == 3:
+                    n0_i = _int_arg_expr(size_node.elts[0])
+                    n1_i = _int_arg_expr(size_node.elts[1])
+                    n2_i = _int_arg_expr(size_node.elts[2])
+                    self.o.w(f"{t.id} = rnorm({n0_i}, {n1_i}, {n2_i})")
+                elif len(size_node.elts) == 2:
                     n0_i = _int_arg_expr(size_node.elts[0])
                     n1_i = _int_arg_expr(size_node.elts[1])
                     self.o.w(f"{t.id} = rnorm({n0_i}, {n1_i})")
@@ -30757,8 +30846,8 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{t.id} = rnorm({_int_arg_expr(size_node.elts[0])})")
                 else:
                     if is_standard:
-                        raise NotImplementedError("np.random.standard_normal size tuple rank > 2 not supported")
-                    raise NotImplementedError("np.random.normal size tuple rank > 2 not supported")
+                        raise NotImplementedError("np.random.standard_normal size tuple rank > 3 not supported")
+                    raise NotImplementedError("np.random.normal size tuple rank > 3 not supported")
             else:
                 n_expr = self.expr(size_node)
                 self.o.w(f"{t.id} = rnorm({_int_arg_expr(size_node)})")
@@ -31282,6 +31371,21 @@ class translator(ast.NodeVisitor):
 
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
             if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 3:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    n2 = self.expr(size_node.elts[2])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1},1:{n2}))")
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp), allocatable :: tmp_rv(:)")
+                    self.o.w(f"allocate(tmp_rv(1:({n0})*({n1})*({n2})))")
+                    _dist_call_vec("tmp_rv")
+                    self.o.w(f"{t.id} = reshape(tmp_rv, [({n0}), ({n1}), ({n2})])")
+                    self.o.w("if (allocated(tmp_rv)) deallocate(tmp_rv)")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
                 if len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
@@ -31301,7 +31405,7 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"allocate({t.id}(1:{n0}))")
                     _dist_call_vec(t.id)
                     return
-                raise NotImplementedError(f"np.random.{dist} size tuple rank > 2 not supported")
+                raise NotImplementedError(f"np.random.{dist} size tuple rank > 3 not supported")
             n0 = self.expr(size_node)
             self.o.w(f"allocate({t.id}(1:{n0}))")
             _dist_call_vec(t.id)
@@ -31456,6 +31560,21 @@ class translator(ast.NodeVisitor):
 
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
             if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 3:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    n2 = self.expr(size_node.elts[2])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1},1:{n2}))")
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("integer, allocatable :: tmp_iv(:)")
+                    self.o.w(f"allocate(tmp_iv(1:({n0})*({n1})*({n2})))")
+                    _idist_call_vec("tmp_iv")
+                    self.o.w(f"{t.id} = reshape(tmp_iv, [({n0}), ({n1}), ({n2})])")
+                    self.o.w("if (allocated(tmp_iv)) deallocate(tmp_iv)")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
                 if len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
@@ -31475,7 +31594,7 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"allocate({t.id}(1:{n0}))")
                     _idist_call_vec(t.id)
                     return
-                raise NotImplementedError(f"np.random.{dist} size tuple rank > 2 not supported")
+                raise NotImplementedError(f"np.random.{dist} size tuple rank > 3 not supported")
             n0 = self.expr(size_node)
             self.o.w(f"allocate({t.id}(1:{n0}))")
             _idist_call_vec(t.id)
@@ -31650,7 +31769,16 @@ class translator(ast.NodeVisitor):
                 else:
                     self.o.w(f"{t.id} = rnorm({n0_i}, {n1_i})")
                 return
-            raise NotImplementedError("np.random.rand/randn supports up to 2 dimensions")
+            if len(dims) == 3:
+                n0_i = _int_arg_expr(dims[0])
+                n1_i = _int_arg_expr(dims[1])
+                n2_i = _int_arg_expr(dims[2])
+                if v.func.attr == "rand":
+                    self.o.w(f"{t.id} = runif({n0_i}, {n1_i}, {n2_i})")
+                else:
+                    self.o.w(f"{t.id} = rnorm({n0_i}, {n1_i}, {n2_i})")
+                return
+            raise NotImplementedError("np.random.rand/randn supports up to 3 dimensions")
 
         # x = rng.uniform(low, high, size=...) / np.random.uniform(...)
         if (
@@ -31690,7 +31818,13 @@ class translator(ast.NodeVisitor):
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
             runif_expr = None
             if isinstance(size_node, (ast.Tuple, ast.List)):
-                if len(size_node.elts) == 2:
+                if len(size_node.elts) == 3:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    n2 = self.expr(size_node.elts[2])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1},1:{n2}))")
+                    runif_expr = f"runif(int({n0}), int({n1}), int({n2}))"
+                elif len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
                     self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
@@ -31700,7 +31834,7 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"allocate({t.id}(1:{n0}))")
                     runif_expr = f"runif(int({n0}))"
                 else:
-                    raise NotImplementedError("uniform size tuple rank > 2 not supported")
+                    raise NotImplementedError("uniform size tuple rank > 3 not supported")
             else:
                 n0 = self.expr(size_node)
                 self.o.w(f"allocate({t.id}(1:{n0}))")
@@ -31764,18 +31898,24 @@ class translator(ast.NodeVisitor):
                 self.o.w("end block")
                 return
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
-            rank2 = False
+            needs_reshape = False
             if isinstance(size_node, (ast.Tuple, ast.List)):
-                if len(size_node.elts) == 2:
+                if len(size_node.elts) == 3:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    n2 = self.expr(size_node.elts[2])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1},1:{n2}))")
+                    needs_reshape = True
+                elif len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
                     self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
-                    rank2 = True
+                    needs_reshape = True
                 elif len(size_node.elts) == 1:
                     n0 = self.expr(size_node.elts[0])
                     self.o.w(f"allocate({t.id}(1:{n0}))")
                 else:
-                    raise NotImplementedError("integers size tuple rank > 2 not supported")
+                    raise NotImplementedError("integers size tuple rank > 3 not supported")
             else:
                 n0 = self.expr(size_node)
                 self.o.w(f"allocate({t.id}(1:{n0}))")
@@ -31785,7 +31925,7 @@ class translator(ast.NodeVisitor):
             self.o.w("real(kind=dp), allocatable :: u_rng(:)")
             self.o.w(f"allocate(u_rng(1:size({t.id})))")
             self.o.w("call random_number(u_rng)")
-            if rank2:
+            if needs_reshape:
                 self.o.w(
                     f"{t.id} = reshape(int({low_expr}) + int(u_rng * real({width_expr}, kind=dp)), shape({t.id}))"
                 )
@@ -36218,13 +36358,18 @@ class translator(ast.NodeVisitor):
             self.o.pop()
             self.o.w("else")
             self.o.push()
-            # See the matching fix above: a deferred-length character
-            # array can't be allocated with a bare size.
             if name in self.alloc_chars:
-                self.o.w(f"allocate(character(len=1) :: {name}(1))")
+                # A single-element array constructor takes its length
+                # directly from that one element -- no type-spec needed
+                # (only a multi-element constructor risks a length
+                # mismatch). Building it this way avoids allocating a
+                # length-1 placeholder and assigning into it, which
+                # would silently truncate any value longer than 1
+                # character.
+                self.o.w(f"{name} = [{val_ctor}]")
             else:
                 self.o.w(f"allocate({name}(1))")
-            self.o.w(f"{name}(1) = {val}")
+                self.o.w(f"{name}(1) = {val}")
             self.o.pop()
             self.o.w("end if")
             return
@@ -37124,7 +37269,7 @@ class translator(ast.NodeVisitor):
                             expr_txt = f"py_str({expr_txt})"
                         self.o.w(f"write({unit_txt},*, advance='no') {expr_txt}")
                 if not advance_no:
-                    self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr('')}")
+                    self.o.w(f"write({unit_txt},*)")
                 return
             parts = []
             for i_arg, a in enumerate(call.args):
@@ -37399,7 +37544,7 @@ class translator(ast.NodeVisitor):
             self.o.pop()
             self.o.w("end do")
             if not advance_no:
-                self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr('')}")
+                self.o.w(f"write({unit_txt},*)")
             self.o.pop()
             self.o.w("end block")
             return

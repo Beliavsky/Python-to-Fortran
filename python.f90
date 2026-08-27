@@ -412,11 +412,11 @@ interface polyder
 end interface polyder
 
 interface runif
-   module procedure runif0, runif1, runif2
+   module procedure runif0, runif1, runif2, runif3
 end interface runif
 
 interface rnorm
-   module procedure rnorm0, rnorm1, rnorm2
+   module procedure rnorm0, rnorm1, rnorm2, rnorm3
 end interface rnorm
 
 interface allclose
@@ -1536,6 +1536,16 @@ contains
          end if
       end function runif2
 
+      function runif3(n, m, l) result(x)
+         integer, intent(in) :: n, m, l
+         real(kind=dp), allocatable :: x(:,:,:)
+         if (n < 0 .or. m < 0 .or. l < 0) stop "runif: n,m,l must be >= 0"
+         allocate(x(n, m, l))
+         call rng_replay_maybe_init()
+         if (rng_replay_enabled) stop "rng replay: rank-3 uniform draws are not supported"
+         if (n > 0 .and. m > 0 .and. l > 0) call random_number(x)
+      end function runif3
+
       integer function random_randrange_int(start, stop, step)
          integer, intent(in) :: start, stop, step
          integer :: n
@@ -1648,6 +1658,22 @@ contains
             end if
          end if
       end function rnorm2
+
+      function rnorm3(n, m, l) result(x)
+         integer, intent(in) :: n, m, l
+         real(kind=dp), allocatable :: x(:,:,:)
+         real(kind=dp), allocatable :: tmp(:)
+         if (n < 0 .or. m < 0 .or. l < 0) stop "rnorm: n,m,l must be >= 0"
+         allocate(x(n, m, l))
+         call rng_replay_maybe_init()
+         if (rng_replay_enabled) stop "rng replay: rank-3 normal draws are not supported"
+         if (n > 0 .and. m > 0 .and. l > 0) then
+            allocate(tmp(n * m * l))
+            call random_normal_vec(tmp)
+            x = reshape(tmp, [n, m, l])
+            deallocate(tmp)
+         end if
+      end function rnorm3
 
       real(kind=dp) function random_exponential(scale)
          real(kind=dp), intent(in), optional :: scale
