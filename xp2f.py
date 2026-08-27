@@ -43703,6 +43703,15 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             for i, a in enumerate(fn_args_all):
                 rr = rr_h[i] if i < len(rr_h) else 0
                 rk = rk_h[i] if i < len(rk_h) else None
+                if rr <= 0:
+                    # No call-site rank hint available (e.g. this is the
+                    # provisional, hint-less pass) -- fall back to a body-usage
+                    # guess (tuple-unpacked `.shape`, subscript/slice chains) so
+                    # a parameter that's only ever indexed/sliced (never itself
+                    # reassigned, so _infer_local_name_spec can't see it) isn't
+                    # left completely unmarked, which otherwise cascades into
+                    # wrong ranks for every local variable derived from it.
+                    rr = int(_infer_arg_rank_local(fn, a.arg))
                 if rr > 0:
                     if rk == "int":
                         tr._mark_alloc_int(a.arg, rank=rr)
