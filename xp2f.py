@@ -12115,6 +12115,7 @@ class translator(ast.NodeVisitor):
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
         self.local_structured_return_types = {}
+        self.local_df_return_info = {}
         self.rng_replay_path = rng_replay_path
         self.rng_replay_enabled = bool(rng_replay_path)
         self.dummy_arg_names = set(dummy_arg_names or [])
@@ -13552,6 +13553,8 @@ class translator(ast.NodeVisitor):
                 return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
                 return "char"
+            if node.attr == "columns" and self._is_pandas_df_ref_node(node.value):
+                return "char"
             return None
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.Not):
@@ -13719,6 +13722,15 @@ class translator(ast.NodeVisitor):
                     return "int"
             return None
         if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "tolist"
+                and len(node.args) == 0
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "columns"
+                and self._is_pandas_df_ref_node(node.func.value.value)
+            ):
+                return "char"
             np_attr = self._numpy_call_attr(node.func)
             if np_attr in {"all", "any"} and len(node.args) >= 1:
                 return "logical"
@@ -13766,7 +13778,10 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id in self.pandas_df_vars
                 and isinstance(node.func.value.slice, ast.Name)
-                and node.func.value.slice.id in self.pandas_str_list_values
+                and (
+                    node.func.value.slice.id in self.pandas_str_list_values
+                    or node.func.value.slice.id in self.alloc_chars
+                )
             ):
                 return "real"
             if (
@@ -15654,6 +15669,7 @@ class translator(ast.NodeVisitor):
         #   {"kind": "name", "df_id": ...}
         #   {"kind": "select_names", "df_id": ..., "names": [...]}          -- df[["A","B"]] / df.loc[:, ["A","B"]]
         #   {"kind": "iloc", "df_id": ..., "row_slice": Slice, "col_slice": Slice}
+        #   {"kind": "head_tail", "df_id": ..., "which": "head"|"tail", "n_node": expr|None}  -- df.head(n) / df.tail(n)
         # or None if node doesn't match any recognized DataFrame reference shape.
         if isinstance(node, ast.Name) and node.id in self.pandas_df_vars:
             return {"kind": "name", "df_id": node.id}
@@ -15720,6 +15736,21 @@ class translator(ast.NodeVisitor):
                     "row_slice": node.slice.elts[0],
                     "col_slice": col_slice,
                 }
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"head", "tail"}
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in self.pandas_df_vars
+            and len(node.args) <= 1
+            and not node.keywords
+        ):
+            return {
+                "kind": "head_tail",
+                "df_id": node.func.value.id,
+                "which": node.func.attr,
+                "n_node": node.args[0] if node.args else None,
+            }
         return None
 
     def _pandas_df_root_id(self, node):
@@ -15774,6 +15805,23 @@ class translator(ast.NodeVisitor):
             root = self._pandas_df_root_id(a0.func.value.func.value)
             if root is not None:
                 return root
+        if (
+            isinstance(a0, ast.Call)
+            and isinstance(a0.func, ast.Attribute)
+            and a0.func.attr == "sum"
+            and len(a0.args) == 0
+            and isinstance(a0.func.value, ast.Call)
+            and isinstance(a0.func.value.func, ast.Attribute)
+            and a0.func.value.func.attr in {"isna", "isnull"}
+            and len(a0.func.value.args) == 0
+        ):
+            root = self._pandas_df_root_id(a0.func.value.func.value)
+            if root is not None:
+                return root
+        if isinstance(a0, ast.Attribute) and a0.attr == "dtypes":
+            root = self._pandas_df_root_id(a0.value)
+            if root is not None:
+                return root
         return None
 
     def _pandas_df_columns_at(self, df_id, context_node):
@@ -15824,6 +15872,16 @@ class translator(ast.NodeVisitor):
             if not args:
                 return src_expr, new_cols
             return f"{src_expr}%iloc(" + ", ".join(args) + ")", new_cols
+        if m["kind"] == "head_tail":
+            if m["n_node"] is not None:
+                n_txt = self._coerce_expr_kind(m["n_node"], self.expr(m["n_node"]), "int")
+            else:
+                n_txt = "5"
+            if m["which"] == "head":
+                lo, hi = "1", f"min({n_txt}, nrow({src_expr}))"
+            else:
+                lo, hi = f"max(1, nrow({src_expr}) - ({n_txt}) + 1)", f"nrow({src_expr})"
+            return f"{src_expr}%iloc(rows=[(i_iloc_r, i_iloc_r = {lo}, {hi})])", src_cols
         return None, None
 
     def _pandas_df_materialize_decl(self, df_expr):
@@ -16363,7 +16421,10 @@ class translator(ast.NodeVisitor):
             and isinstance(node.func.value.value, ast.Name)
             and node.func.value.value.id in self.pandas_df_vars
             and isinstance(node.func.value.slice, ast.Name)
-            and node.func.value.slice.id in self.pandas_str_list_values
+            and (
+                node.func.value.slice.id in self.pandas_str_list_values
+                or node.func.value.slice.id in self.alloc_chars
+            )
         ):
             return 2
         if (
@@ -16607,6 +16668,8 @@ class translator(ast.NodeVisitor):
             and node.value.id == "sys"
             and node.attr == "argv"
         ):
+            return 1
+        if isinstance(node, ast.Attribute) and node.attr == "columns" and self._is_pandas_df_ref_node(node.value):
             return 1
         if isinstance(node, ast.Call):
             np_attr = self._numpy_call_attr(node.func)
@@ -24698,6 +24761,12 @@ class translator(ast.NodeVisitor):
                 and node.value.id in self.dict_typed_vars
             ):
                 return f"{self.expr(node.value)}%{node.attr}"
+            if node.attr == "columns" and self._is_pandas_df_ref_node(node.value):
+                _df_expr2, _cols2 = self._pandas_df_ref(node.value, node)
+                if _cols2:
+                    _col_len2 = max(len(c) for c in _cols2)
+                    _col_lits = ", ".join(fstr(c) for c in _cols2)
+                    return f"[character(len={_col_len2}) :: {_col_lits}]"
             attr_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported attribute expr: {attr_txt}")
 
@@ -25254,6 +25323,59 @@ class translator(ast.NodeVisitor):
                 elif _k == "int":
                     self._mark_alloc_int(_tgt, rank=max(1, _rr + 1))
             if isinstance(node, ast.FunctionDef):
+                # A local function's own `X = pd.read_csv(...)` is invisible to
+                # the top-level Assign scan above (it's nested inside the
+                # FunctionDef's body, not in `nodes` directly), so a
+                # DataFrame produced and returned from a helper function (e.g.
+                # `def read_prices(path): df = pd.read_csv(path); return df`)
+                # would otherwise never register X as a tracked DataFrame.
+                # Replay the same read_csv recognition here, scoped to this
+                # function's own statements.
+                for _fn_stmt in ast.walk(node):
+                    if not (
+                        isinstance(_fn_stmt, ast.Assign)
+                        and len(_fn_stmt.targets) == 1
+                        and isinstance(_fn_stmt.targets[0], ast.Name)
+                        and isinstance(_fn_stmt.value, ast.Call)
+                        and isinstance(_fn_stmt.value.func, ast.Attribute)
+                        and isinstance(_fn_stmt.value.func.value, ast.Name)
+                        and _fn_stmt.value.func.value.id in {"pd", "pandas"}
+                        and _fn_stmt.value.func.attr == "read_csv"
+                    ):
+                        continue
+                    _fn_tgt = _fn_stmt.targets[0].id
+                    if _fn_tgt in self.pandas_df_vars:
+                        continue
+                    _fn_v = _fn_stmt.value
+                    self.pandas_df_vars[_fn_tgt] = "DataFrame_index_date"
+                    _csv_path2 = _resolve_str_literal(_fn_v.args[0]) if _fn_v.args else None
+                    _skiprows_kw2 = next((kw for kw in _fn_v.keywords if kw.arg == "skiprows"), None)
+                    _skiprows_n2 = _skiprows_kw2.value.value if (
+                        _skiprows_kw2 is not None
+                        and isinstance(_skiprows_kw2.value, ast.Constant)
+                        and isinstance(_skiprows_kw2.value.value, int)
+                    ) else 0
+                    _usecols_kw2 = next((kw for kw in _fn_v.keywords if kw.arg == "usecols"), None)
+                    _usecols_names2 = None
+                    if _usecols_kw2 is not None and isinstance(_usecols_kw2.value, (ast.List, ast.Tuple)):
+                        _usecols_names2 = [
+                            e.value for e in _usecols_kw2.value.elts
+                            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        ]
+                    if _csv_path2 is not None:
+                        try:
+                            with open(_csv_path2, encoding="utf-8-sig") as _csv_f2:
+                                for _ in range(_skiprows_n2):
+                                    _csv_f2.readline()
+                                _header2 = _csv_f2.readline().rstrip("\r\n").split(",")
+                        except OSError:
+                            _header2 = []
+                        if len(_header2) >= 2:
+                            self.pandas_df_index_label[_fn_tgt] = _header2[0].strip()
+                            _cols2 = [h.strip() for h in _header2[1:]]
+                            if _usecols_names2 is not None:
+                                _cols2 = [c for c in _cols2 if c in _usecols_names2]
+                            self.pandas_df_columns[_fn_tgt] = _cols2
                 for _ret in ast.walk(node):
                     if not isinstance(_ret, ast.Return):
                         continue
@@ -25261,6 +25383,32 @@ class translator(ast.NodeVisitor):
                         rnm = self._aliased_name(self._resolve_list_alias(_ret.value.id))
                         if rnm in self.structured_array_types:
                             self.local_structured_return_types[node.name] = self.structured_array_types[rnm]
+                        if rnm in self.pandas_df_vars:
+                            self.local_df_return_info[node.name] = (
+                                self.pandas_df_vars[rnm],
+                                list(self.pandas_df_columns.get(rnm, []) or []),
+                                self.pandas_df_index_label.get(rnm),
+                            )
+                # A caller like `def main(): df = read_prices(path)` is
+                # itself nested inside main's own FunctionDef body, so it's
+                # equally invisible to the top-level Assign scan -- propagate
+                # local_df_return_info into any such nested assignment too.
+                for _fn_assign in ast.walk(node):
+                    if not (
+                        isinstance(_fn_assign, ast.Assign)
+                        and len(_fn_assign.targets) == 1
+                        and isinstance(_fn_assign.targets[0], ast.Name)
+                        and isinstance(_fn_assign.value, ast.Call)
+                        and isinstance(_fn_assign.value.func, ast.Name)
+                        and _fn_assign.value.func.id in self.local_df_return_info
+                    ):
+                        continue
+                    _df_tgt2 = _fn_assign.targets[0].id
+                    _df_kind2, _df_cols2, _df_idx_label2 = self.local_df_return_info[_fn_assign.value.func.id]
+                    self.pandas_df_vars[_df_tgt2] = _df_kind2
+                    self.pandas_df_columns[_df_tgt2] = list(_df_cols2)
+                    if _df_idx_label2 is not None:
+                        self.pandas_df_index_label[_df_tgt2] = _df_idx_label2
             # Propagate known local function dict-typed dummy arguments to
             # call-site variables (e.g., foo(a) where foo expects foo_dict_t).
             for c in ast.walk(node):
@@ -25453,6 +25601,53 @@ class translator(ast.NodeVisitor):
                         and node.value.func.id in self.local_structured_return_types
                     ):
                         self.structured_array_types[node.targets[0].id] = self.local_structured_return_types[node.value.func.id]
+                    if (
+                        isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name)
+                        and node.value.func.id in self.local_df_return_info
+                    ):
+                        _df_tgt = node.targets[0].id
+                        _df_kind, _df_cols, _df_idx_label = self.local_df_return_info[node.value.func.id]
+                        self.pandas_df_vars[_df_tgt] = _df_kind
+                        self.pandas_df_columns[_df_tgt] = list(_df_cols)
+                        if _df_idx_label is not None:
+                            self.pandas_df_index_label[_df_tgt] = _df_idx_label
+                        self.ints.discard(_df_tgt)
+                        self.reals.discard(_df_tgt)
+                        self.logs.discard(_df_tgt)
+                        self.chars.discard(_df_tgt)
+                        self.complexes.discard(_df_tgt)
+                        self.alloc_ints.discard(_df_tgt)
+                        self.alloc_reals.discard(_df_tgt)
+                        self.alloc_logs.discard(_df_tgt)
+                        self.alloc_chars.discard(_df_tgt)
+                        self.alloc_complexes.discard(_df_tgt)
+                    # `X = Y` where Y is itself a tracked DataFrame -- e.g. the
+                    # inlined form of a single-call-site helper function that
+                    # returned a DataFrame collapses to `tmp = pd.read_csv(...)`
+                    # immediately followed by `df = tmp`, and without this the
+                    # alias `df` would never be recognized as a DataFrame.
+                    if (
+                        isinstance(node.value, ast.Name)
+                        and node.value.id in self.pandas_df_vars
+                        and node.targets[0].id != node.value.id
+                    ):
+                        _df_tgt = node.targets[0].id
+                        _df_src = node.value.id
+                        self.pandas_df_vars[_df_tgt] = self.pandas_df_vars[_df_src]
+                        self.pandas_df_columns[_df_tgt] = list(self.pandas_df_columns.get(_df_src, []) or [])
+                        if _df_src in self.pandas_df_index_label:
+                            self.pandas_df_index_label[_df_tgt] = self.pandas_df_index_label[_df_src]
+                        self.ints.discard(_df_tgt)
+                        self.reals.discard(_df_tgt)
+                        self.logs.discard(_df_tgt)
+                        self.chars.discard(_df_tgt)
+                        self.complexes.discard(_df_tgt)
+                        self.alloc_ints.discard(_df_tgt)
+                        self.alloc_reals.discard(_df_tgt)
+                        self.alloc_logs.discard(_df_tgt)
+                        self.alloc_chars.discard(_df_tgt)
+                        self.alloc_complexes.discard(_df_tgt)
                     # Track literal tuple/list containers used by tuple-target for loops.
                     tnm = node.targets[0].id
                     if isinstance(node.value, ast.Name):
@@ -26466,6 +26661,7 @@ class translator(ast.NodeVisitor):
                         and t.id not in self.alloc_chars
                         and t.id not in self.logs
                         and t.id not in self.complexes
+                        and t.id not in self.pandas_df_vars
                     ):
                         # Python numeric default is real; use as fallback when kind
                         # inference is inconclusive.
@@ -32788,6 +32984,34 @@ class translator(ast.NodeVisitor):
                 self.o.w("end do")
                 return
 
+        # X = df[runtime_char_array].to_numpy(dtype=...) -- column selection
+        # by a runtime (not compile-time known) list of names. Needs a
+        # materialized temp since Fortran forbids chaining %values directly
+        # onto a type-bound-function-call result (df%select(...)%values is
+        # invalid; the select() result must land in a variable first).
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "to_numpy"
+            and isinstance(v.func.value, ast.Subscript)
+            and isinstance(v.func.value.value, ast.Name)
+            and v.func.value.value.id in self.pandas_df_vars
+            and isinstance(v.func.value.slice, ast.Name)
+            and v.func.value.slice.id in self.alloc_chars
+        ):
+            name = self._aliased_name(t.id)
+            df_src = self._aliased_name(v.func.value.value.id)
+            names_expr = self.expr(v.func.value.slice)
+            self.o.w("block")
+            self.o.push()
+            self.o.w("type(DataFrame_index_date) :: pdf_sel_tmp")
+            self.o.w(f"pdf_sel_tmp = {df_src}%select(columns={names_expr})")
+            self.o.w(f"{name} = pdf_sel_tmp%values")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars and isinstance(v, ast.Subscript):
             _m = self._pandas_df_match(v)
@@ -35809,6 +36033,30 @@ class translator(ast.NodeVisitor):
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "sum"
+                and len(c.args[0].args) == 0
+                and isinstance(c.args[0].func.value, ast.Call)
+                and isinstance(c.args[0].func.value.func, ast.Attribute)
+                and c.args[0].func.value.func.attr in {"isna", "isnull"}
+                and len(c.args[0].func.value.args) == 0
+                and self._is_pandas_df_ref_node(c.args[0].func.value.func.value)
+            ):
+                self._emit_pandas_df_series_reduction_print(
+                    c.args[0].func.value, "isna_sum", context_node=orig_call
+                )
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Attribute)
+                and c.args[0].attr == "dtypes"
+                and self._is_pandas_df_ref_node(c.args[0].value)
+            ):
+                self._emit_pandas_df_dtypes_print(c.args[0], context_node=orig_call)
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "round"
                 and self._is_pandas_df_ref_node(c.args[0].func.value)
             ):
@@ -36699,13 +36947,30 @@ class translator(ast.NodeVisitor):
                 val_expr = f"maxval({col_expr})"
             elif method == "sum":
                 val_expr = f"sum({col_expr})"
+            elif method == "isna_sum":
+                val_expr = f"count(ieee_is_nan({col_expr}))"
             else:
                 raise NotImplementedError(f"df.{method}() printing not supported")
             pad = name_width - len(cname) + 4
-            self.o.w(f"write(*,'(A,{pad}X,F12.6)') {fstr(cname)}, {val_expr}")
-        self.o.w(f"write(*,{fstr('(A)')}) 'dtype: float64'")
+            if method == "isna_sum":
+                self.o.w(f"write(*,'(A,{pad}X,I6)') {fstr(cname)}, {val_expr}")
+            else:
+                self.o.w(f"write(*,'(A,{pad}X,F12.6)') {fstr(cname)}, {val_expr}")
+        self.o.w(f"write(*,{fstr('(A)')}) 'dtype: {'int64' if method == 'isna_sum' else 'float64'}'")
         self.o.pop()
         self.o.w("end block")
+
+    def _emit_pandas_df_dtypes_print(self, attr_node, context_node=None):
+        df_expr, col_names = self._pandas_df_ref(attr_node.value, context_node or attr_node)
+        if not col_names:
+            raise NotImplementedError(
+                "df.dtypes printing requires statically known column names"
+            )
+        name_width = max(len(c) for c in col_names)
+        for cname in col_names:
+            pad = name_width - len(cname) + 4
+            self.o.w(f"write(*,'(A,{pad}X,A)') {fstr(cname)}, 'float64'")
+        self.o.w(f"write(*,{fstr('(A)')}) 'dtype: object'")
 
     def _emit_pandas_df_corr_print(self, corr_call, ndigits=6, context_node=None):
         df_expr, col_names = self._pandas_df_ref(corr_call.func.value, context_node or corr_call)
@@ -43403,6 +43668,103 @@ def _emit_local_function(
     o.w("")
 
 
+def _scan_local_df_return_info(local_funcs, extra_stmts=None):
+    # Determine which local (helper) functions return a pandas DataFrame
+    # produced via pd.read_csv(...), e.g.
+    #   def read_prices(path):
+    #       df = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+    #       return df
+    # so that a caller assignment like `df = read_prices(filename)` can be
+    # recognized as a tracked DataFrame too. Without this, a DataFrame's
+    # provenance is invisible across a function-return boundary: the
+    # top-level pd.read_csv() recognition only fires for a *direct*
+    # `X = pd.read_csv(...)` assignment.
+    literal_assigns = {}
+
+    def _record(seq):
+        for n in seq:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                literal_assigns.setdefault(n.targets[0].id, []).append(n.value)
+            for field in ("body", "orelse", "finalbody"):
+                child = getattr(n, field, None)
+                if isinstance(child, list) and child:
+                    _record(child)
+            if isinstance(n, ast.Try):
+                for h in getattr(n, "handlers", []):
+                    _record(getattr(h, "body", []) or [])
+
+    _record(extra_stmts or [])
+    for fn in (local_funcs or []):
+        if isinstance(fn, ast.FunctionDef):
+            _record(fn.body)
+
+    def _resolve_lit(enode):
+        if isinstance(enode, ast.Constant) and isinstance(enode.value, str):
+            return enode.value
+        if isinstance(enode, ast.Name):
+            assigns = literal_assigns.get(enode.id)
+            if assigns and len(assigns) == 1 and isinstance(assigns[0], ast.Constant) and isinstance(assigns[0].value, str):
+                return assigns[0].value
+        return None
+
+    result = {}
+    for fn in (local_funcs or []):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        df_vars = {}
+        df_cols = {}
+        df_idx = {}
+        for stmt in ast.walk(fn):
+            if not (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and isinstance(stmt.value.func.value, ast.Name)
+                and stmt.value.func.value.id in {"pd", "pandas"}
+                and stmt.value.func.attr == "read_csv"
+            ):
+                continue
+            tgt = stmt.targets[0].id
+            v = stmt.value
+            df_vars[tgt] = "DataFrame_index_date"
+            csv_path = _resolve_lit(v.args[0]) if v.args else None
+            skiprows_kw = next((kw for kw in v.keywords if kw.arg == "skiprows"), None)
+            skiprows_n = skiprows_kw.value.value if (
+                skiprows_kw is not None
+                and isinstance(skiprows_kw.value, ast.Constant)
+                and isinstance(skiprows_kw.value.value, int)
+            ) else 0
+            usecols_kw = next((kw for kw in v.keywords if kw.arg == "usecols"), None)
+            usecols_names = None
+            if usecols_kw is not None and isinstance(usecols_kw.value, (ast.List, ast.Tuple)):
+                usecols_names = [
+                    e.value for e in usecols_kw.value.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                ]
+            if csv_path is not None:
+                try:
+                    with open(csv_path, encoding="utf-8-sig") as f:
+                        for _ in range(skiprows_n):
+                            f.readline()
+                        header = f.readline().rstrip("\r\n").split(",")
+                except OSError:
+                    header = []
+                if len(header) >= 2:
+                    df_idx[tgt] = header[0].strip()
+                    cols = [h.strip() for h in header[1:]]
+                    if usecols_names is not None:
+                        cols = [c for c in cols if c in usecols_names]
+                    df_cols[tgt] = cols
+        for ret in ast.walk(fn):
+            if isinstance(ret, ast.Return) and isinstance(ret.value, ast.Name):
+                rnm = ret.value.id
+                if rnm in df_vars:
+                    result[fn.name] = (df_vars[rnm], list(df_cols.get(rnm, [])), df_idx.get(rnm))
+    return result
+
+
 def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None):
     tuple_out = {}
     tuple_out_ranks = {}
@@ -49054,6 +49416,7 @@ def generate_flat(
         rng_replay_path=rng_replay_path,
         local_proc_name_aliases=fn_alias_map if use_proc_module else None,
     )
+    tr.local_df_return_info.update(_scan_local_df_return_info(local_funcs, tree.body))
     tr.prescan(tree.body)
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":

@@ -1606,7 +1606,11 @@ do i = 1, nrows
    if (.not. valid(idx)) error stop "Invalid date in first column in read_csv"
    self%index(i) = idx
    do j = 1, ncols
-      read(tokens(col_map(j)+1), *) self%values(i,j)
+      if (len_trim(tokens(col_map(j)+1)) == 0) then
+         self%values(i,j) = ieee_value(1.0_dp, ieee_quiet_nan)
+      else
+         read(tokens(col_map(j)+1), *) self%values(i,j)
+      end if
    end do
 end do
 
