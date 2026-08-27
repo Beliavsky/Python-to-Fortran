@@ -24224,9 +24224,18 @@ class translator(ast.NodeVisitor):
                 a0 = self.expr(node.args[0])
                 b0 = self.expr(node.args[1])
                 fn = "max" if node.func.attr == "fmax" else "min"
+                # max()/min() are evaluated eagerly even inside a merge() that
+                # would otherwise mask NaN away, and comparing a NaN operand
+                # trips -ffpe-trap=invalid (SIGFPE) before the merge ever runs.
+                # Replace any NaN operand with a sentinel that can never win
+                # the comparison *before* calling max/min, so the intrinsic
+                # never actually sees a NaN value.
+                sentinel = "(-huge(1.0_dp))" if fn == "max" else "huge(1.0_dp)"
+                a_safe = f"merge({sentinel}, {a0}, ieee_is_nan({a0}))"
+                b_safe = f"merge({sentinel}, {b0}, ieee_is_nan({b0}))"
                 return (
-                    f"merge(merge({fn}({a0}, {b0}), {b0}, ieee_is_nan({a0})), "
-                    f"{a0}, ieee_is_nan({b0}))"
+                    f"merge({b0}, merge({a0}, {fn}({a_safe}, {b_safe}), ieee_is_nan({b0})), "
+                    f"ieee_is_nan({a0}))"
                 )
             if (
                 isinstance(node.func, ast.Attribute)
