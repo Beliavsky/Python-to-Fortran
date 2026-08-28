@@ -25,3 +25,6 @@ tmp*.*
 burkardt_python_results*.txt
 xp2f_progress*.csv
 temp.txt
+
+# Commercial market data (Databento etc.) -- never commit.
+spy_5min_databento.csv

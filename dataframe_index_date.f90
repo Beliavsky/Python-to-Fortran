@@ -882,6 +882,24 @@ public :: DataFrame_index_date, nrow, ncol, print_summary, random, operator(*), 
    operator(==), operator(/=), operator(<), operator(<=), operator(>), operator(>=)
 integer, parameter :: nlen_columns = 100, nrows_print = 10 ! number of rows to print by default.
 logical, save :: blank_line_before_display = .true.
+! Declaring nrow/ncol/shape as (self-mapped) generic interfaces, rather
+! than plain functions, lets a program that also `use`s
+! dataframe_index_datetime_mod's own nrow/ncol/shape (declared the same
+! way there) import both under their plain names without a rename or an
+! "ambiguous reference" error -- Fortran merges same-named generics
+! use-associated from different modules, but never merges two plain
+! functions of the same name. Purely a declaration-style change, no
+! behavior difference: each interface has exactly the one specific
+! procedure it already had.
+interface nrow
+   module procedure nrow
+end interface nrow
+interface ncol
+   module procedure ncol
+end interface ncol
+interface shape
+   module procedure shape
+end interface shape
 interface display
    module procedure display_data
 end interface display
@@ -920,6 +938,23 @@ type :: DataFrame_index_date
 end type DataFrame_index_date
 
 contains
+
+function token_is_numeric(tok) result(ok)
+! Whether a CSV cell parses as a real number -- used by read_csv to
+! silently drop a column (e.g. a redundant text date/label column) that
+! would otherwise crash the unconditional numeric read of self%values.
+! A blank cell is treated as numeric (it becomes NaN elsewhere).
+character(len=*), intent(in) :: tok
+logical :: ok
+real(kind=dp) :: tmp
+integer :: ios
+if (len_trim(tok) == 0) then
+   ok = .true.
+   return
+end if
+read(tok, *, iostat=ios) tmp
+ok = (ios == 0)
+end function token_is_numeric
 
 pure function shape(df) result(ishape)
 ! return a 2-element array with the number of rows and columns of the dataframe
@@ -1523,7 +1558,7 @@ integer :: io, unit, i, j, k, nrows, ncols, ncols_file
 integer, allocatable :: col_map(:)
 logical :: keep
 character(len=1024) :: line
-character(:), allocatable :: tokens(:)
+character(:), allocatable :: tokens(:), probe_tokens(:)
 type(date) :: idx
 
 if (allocated(self%index)) deallocate(self%index)
@@ -1571,10 +1606,37 @@ do i = 1, ncols_file
 end do
 if (ncols <= 0) error stop "No columns selected in read_csv"
 
+! Some selected columns (e.g. a text column duplicating the index in a
+! different format) may not be numeric -- probe the first data row and
+! drop any such column, since self%values only supports real data.
+! Matches pandas loosely: an unusable column is dropped instead of
+! crashing, though pandas would keep it with an object dtype.
+read(unit, '(A)', iostat=io) line
+if (io == 0 .and. trim(line) /= "") then
+   call split_string(line, ",", probe_tokens)
+   k = 0
+   do i = 1, ncols
+      if (token_is_numeric(trim(probe_tokens(col_map(i)+1)))) then
+         k = k + 1
+         col_map(k) = col_map(i)
+      end if
+   end do
+   ncols = k
+   if (ncols <= 0) error stop "No numeric columns selected in read_csv"
+end if
+
 allocate(self%columns(ncols))
 do i = 1, ncols
    self%columns(i) = tokens(col_map(i)+1)
 end do
+
+rewind(unit)
+if (present(skiprows)) then
+   do i = 1, skiprows
+      read(unit, '(A)')
+   end do
+end if
+read(unit, '(A)')
 
 nrows = 0
 do

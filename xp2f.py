@@ -5234,6 +5234,28 @@ def normalize_zero_based_unit_stride_loops(lines):
                 return True
         return False
 
+    def _has_bare_loop_var_use(body_lines, iv):
+        # Once the loop is rebased to start at 1, the *only* occurrences
+        # of `iv` that get corrected below are `iv + N` (a subscript
+        # adjustment, rewritten to `iv + (N-1)`). Any other bare
+        # occurrence -- e.g. `lo = iv * bucket` feeding a later slice, or
+        # a standalone `f(iv)`/`if (iv == 0)` -- silently computes the
+        # wrong (now 1-based) value, since nothing rebases it. `1:iv` is
+        # excluded since that pattern is handled by its own `1:iv - 1`
+        # rewrite further down. Detect any other bare use and skip the
+        # rewrite entirely rather than risk silently wrong Fortran.
+        bare_re = re.compile(
+            rf"\b{re.escape(iv)}\b(?!\s*\+\s*\d+)",
+            flags=re.IGNORECASE,
+        )
+        one_colon_re = re.compile(rf"1\s*:\s*{re.escape(iv)}\b", flags=re.IGNORECASE)
+        for ln in body_lines:
+            code = ln.split("!", 1)[0]
+            code_stripped = one_colon_re.sub("", code)
+            if bare_re.search(code_stripped):
+                return True
+        return False
+
     i = 0
     while i < len(out):
         code_i = out[i].split("!", 1)[0].rstrip()
@@ -5277,6 +5299,9 @@ def normalize_zero_based_unit_stride_loops(lines):
                 i = j + 1
                 continue
             if _has_unsafe_plus1_context(out[i + 1:j], iv):
+                i = j + 1
+                continue
+            if _has_bare_loop_var_use(out[i + 1:j], iv):
                 i = j + 1
                 continue
 
@@ -5355,6 +5380,9 @@ def normalize_zero_based_unit_stride_loops(lines):
             i = j + 1
             continue
         if _has_unsafe_plus1_context(out[i + 1:j], iv):
+            i = j + 1
+            continue
+        if _has_bare_loop_var_use(out[i + 1:j], iv):
             i = j + 1
             continue
 
@@ -7044,6 +7072,90 @@ def top_level_if(tree):
     return None
 
 
+_CSV_INDEX_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
+
+
+def _detect_pandas_index_kind(csv_path, skiprows=0):
+    """Peek at a CSV's first data row to decide whether pd.read_csv(...)
+    should map to DataFrame_index_date (a plain date index, e.g.
+    "2020-01-15") or DataFrame_index_datetime (the index has a
+    time-of-day component, e.g. "2023-03-28 07:05:00-04:00" -- any
+    trailing timezone offset is fine, dataframe_index_datetime.f90's
+    parser tolerates and discards it).
+
+    The vendored read_csv (both variants) requires the index to be the
+    CSV's first column, so peeking at the first token of the first data
+    line is enough regardless of which column pandas' own index_col=
+    names. Defaults to DataFrame_index_date (the prior, only behavior)
+    whenever the file can't be read or the format can't be determined --
+    an under-detection just falls back to date-only parsing exactly as
+    before, never silently produces the wrong type for existing callers.
+    """
+    if not csv_path:
+        return "DataFrame_index_date"
+    try:
+        with open(csv_path, encoding="utf-8-sig") as f:
+            for _ in range(skiprows):
+                f.readline()
+            f.readline()  # header
+            first_data_line = f.readline()
+    except OSError:
+        return "DataFrame_index_date"
+    first_token = first_data_line.split(",", 1)[0].strip()
+    if _CSV_INDEX_DATETIME_RE.match(first_token):
+        return "DataFrame_index_datetime"
+    return "DataFrame_index_date"
+
+
+def _csv_token_is_numeric(tok):
+    tok = tok.strip()
+    if tok == "":
+        return True
+    try:
+        float(tok)
+        return True
+    except ValueError:
+        return False
+
+
+def _filter_numeric_csv_columns(csv_path, skiprows, cols):
+    """Drop any name from `cols` (a CSV's already index-excluded data
+    column names) whose cell in the first data row isn't a real number.
+
+    Mirrors dataframe_index_date.f90 / dataframe_index_datetime.f90's
+    read_csv, which now silently drops such a column (e.g. a redundant
+    text date/label column duplicating the index) instead of crashing on
+    an unconditional numeric read -- pandas_df_columns must track the
+    same reduced set, or a print's column count/headers built from it
+    would disagree with the runtime DataFrame's actual %values shape.
+    Returns `cols` unchanged if the file/row can't be read (safe
+    under-filtering, matching _detect_pandas_index_kind's own fallback).
+    """
+    if csv_path is None:
+        return cols
+    try:
+        with open(csv_path, encoding="utf-8-sig") as f:
+            for _ in range(skiprows):
+                f.readline()
+            header = [h.strip() for h in f.readline().rstrip("\r\n").split(",")]
+            data_line = f.readline().rstrip("\r\n")
+    except OSError:
+        return cols
+    if not data_line:
+        return cols
+    data_tokens = data_line.split(",")
+    kept = []
+    for c in cols:
+        try:
+            idx = header.index(c)
+        except ValueError:
+            kept.append(c)
+            continue
+        if idx < len(data_tokens) and _csv_token_is_numeric(data_tokens[idx]):
+            kept.append(c)
+    return kept
+
+
 def _tree_uses_pandas_read_csv(tree):
     for _n in ast.walk(tree):
         if (
@@ -7053,6 +7165,67 @@ def _tree_uses_pandas_read_csv(tree):
             and _n.func.value.id in {"pd", "pandas"}
             and _n.func.attr in {"read_csv", "Timestamp"}
         ):
+            return True
+    return False
+
+
+def _tree_uses_pandas_datetime_index(tree):
+    """True if any pd.read_csv(...) call in tree (walked fully, so this
+    also sees calls nested inside local function bodies) resolves -- via
+    a simple whole-tree "this name is assigned to exactly one string
+    literal" heuristic (same idea as translator._resolve_str_literal,
+    but standalone since this runs before a translator instance exists)
+    -- to a CSV whose index column has a time-of-day component.
+
+    Used only to decide whether the emitted program/module needs `use
+    dataframe_index_datetime_mod`; the per-read_csv-site kind actually
+    baked into pandas_df_vars is decided independently during prescan
+    (see _detect_pandas_index_kind) and can differ if this whole-tree
+    heuristic under- or over-resolves a name -- that's fine, since an
+    extra `use` statement here is harmless (an unused import), while a
+    missing one would be a compile error.
+    """
+    literal_assigns = {}
+    for _n in ast.walk(tree):
+        if (
+            isinstance(_n, ast.Assign)
+            and len(_n.targets) == 1
+            and isinstance(_n.targets[0], ast.Name)
+            and isinstance(_n.value, ast.Constant)
+            and isinstance(_n.value.value, str)
+        ):
+            literal_assigns.setdefault(_n.targets[0].id, []).append(_n.value.value)
+
+    def _resolve(enode):
+        if isinstance(enode, ast.Constant) and isinstance(enode.value, str):
+            return enode.value
+        if isinstance(enode, ast.Name):
+            vals = literal_assigns.get(enode.id)
+            if vals and len(set(vals)) == 1:
+                return vals[0]
+        return None
+
+    for _n in ast.walk(tree):
+        if not (
+            isinstance(_n, ast.Call)
+            and isinstance(_n.func, ast.Attribute)
+            and isinstance(_n.func.value, ast.Name)
+            and _n.func.value.id in {"pd", "pandas"}
+            and _n.func.attr == "read_csv"
+        ):
+            continue
+        csv_path = _resolve(_n.args[0]) if _n.args else None
+        skiprows_kw = next((kw for kw in _n.keywords if kw.arg == "skiprows"), None)
+        skiprows_n = (
+            skiprows_kw.value.value
+            if (
+                skiprows_kw is not None
+                and isinstance(skiprows_kw.value, ast.Constant)
+                and isinstance(skiprows_kw.value.value, int)
+            )
+            else 0
+        )
+        if _detect_pandas_index_kind(csv_path, skiprows_n) == "DataFrame_index_datetime":
             return True
     return False
 
@@ -17892,7 +18065,7 @@ class translator(ast.NodeVisitor):
             return f"{src_expr}%iloc(rows=[(i_iloc_r, i_iloc_r = {lo}, {hi})])", src_cols
         return None, None
 
-    def _pandas_df_materialize_decl(self, df_expr):
+    def _pandas_df_materialize_decl(self, df_expr, kind="DataFrame_index_date"):
         # gfortran rejects `%component` chained directly onto a
         # type-bound-procedure function reference (e.g. `df%icol([1,2])%values`:
         # "leftmost part-ref in a data-ref cannot be a function reference").
@@ -17901,10 +18074,12 @@ class translator(ast.NodeVisitor):
         # other declarations; call _pandas_df_materialize_assign afterward,
         # once all declarations are emitted (Fortran forbids executable
         # statements before declarations in the same scoping unit).
-        # Returns (new_df_expr, needs_assign).
+        # Returns (new_df_expr, needs_assign). `kind` must match the actual
+        # runtime type of df_expr (e.g. "DataFrame_index_datetime") or the
+        # assignment below is a compile-time type mismatch.
         if "(" not in df_expr:
             return df_expr, False
-        self.o.w("type(DataFrame_index_date) :: pdf_src")
+        self.o.w(f"type({kind}) :: pdf_src")
         if "i_iloc_r" in df_expr:
             self.o.w("integer :: i_iloc_r")
         if "i_iloc_c" in df_expr:
@@ -20931,7 +21106,17 @@ class translator(ast.NodeVisitor):
                 lhs = self.expr(lhs_node)
                 rhs = self.expr(rhs_node)
                 rr = self._rank_expr(rhs_node)
-                if rr <= 0:
+                if (
+                    rr <= 0
+                    and self._expr_kind(lhs_node) == "char"
+                    and self._expr_kind(rhs_node) == "char"
+                ):
+                    # `x in y` for two scalar strings is a substring test
+                    # (e.g. "." in filename), not equality -- unlike a
+                    # scalar RHS of any other kind, where `==` is the only
+                    # sensible degenerate reading of "in".
+                    mem = f"(index({rhs}, {lhs}) > 0)"
+                elif rr <= 0:
                     mem = f"({lhs} == {rhs})"
                 elif rr == 1:
                     # Scalar membership in 1D container.
@@ -21109,7 +21294,26 @@ class translator(ast.NodeVisitor):
                         while len(dims) < base_rank:
                             dims.append(":")
                         return f"{base}(" + ", ".join(dims) + ")"
-            # NumPy shape indexing: a.shape[0] -> size(a,1)
+            # NumPy shape indexing: a.shape[0] -> size(a,1). A pandas
+            # DataFrame isn't a plain array (`size()` doesn't apply to its
+            # derived type), so df.shape[0]/[1] instead go through the
+            # nrow()/ncol() module functions every pandas-using program
+            # already `use`s.
+            if (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "shape"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id in self.pandas_df_vars
+            ):
+                dim0 = int(node.slice.value)
+                df_expr = self.expr(node.value.value)
+                if dim0 == 0:
+                    return f"nrow({df_expr})"
+                if dim0 == 1:
+                    return f"ncol({df_expr})"
+                raise NotImplementedError("DataFrame .shape only has 2 dimensions")
             if (
                 isinstance(node.value, ast.Attribute)
                 and node.value.attr == "shape"
@@ -27389,7 +27593,6 @@ class translator(ast.NodeVisitor):
                     if _fn_tgt in self.pandas_df_vars:
                         continue
                     _fn_v = _fn_stmt.value
-                    self.pandas_df_vars[_fn_tgt] = "DataFrame_index_date"
                     _csv_path2 = _resolve_str_literal(_fn_v.args[0]) if _fn_v.args else None
                     _skiprows_kw2 = next((kw for kw in _fn_v.keywords if kw.arg == "skiprows"), None)
                     _skiprows_n2 = _skiprows_kw2.value.value if (
@@ -27397,6 +27600,7 @@ class translator(ast.NodeVisitor):
                         and isinstance(_skiprows_kw2.value, ast.Constant)
                         and isinstance(_skiprows_kw2.value.value, int)
                     ) else 0
+                    self.pandas_df_vars[_fn_tgt] = _detect_pandas_index_kind(_csv_path2, _skiprows_n2)
                     _usecols_kw2 = next((kw for kw in _fn_v.keywords if kw.arg == "usecols"), None)
                     _usecols_names2 = None
                     if _usecols_kw2 is not None and isinstance(_usecols_kw2.value, (ast.List, ast.Tuple)):
@@ -27417,6 +27621,7 @@ class translator(ast.NodeVisitor):
                             _cols2 = [h.strip() for h in _header2[1:]]
                             if _usecols_names2 is not None:
                                 _cols2 = [c for c in _cols2 if c in _usecols_names2]
+                            _cols2 = _filter_numeric_csv_columns(_csv_path2, _skiprows_n2, _cols2)
                             self.pandas_df_columns[_fn_tgt] = _cols2
                 for _ret in ast.walk(node):
                     if not isinstance(_ret, ast.Return):
@@ -27451,6 +27656,24 @@ class translator(ast.NodeVisitor):
                     self.pandas_df_columns[_df_tgt2] = list(_df_cols2)
                     if _df_idx_label2 is not None:
                         self.pandas_df_index_label[_df_tgt2] = _df_idx_label2
+                    # Without this, a name already classified (e.g. as
+                    # "int", by the pandas-unaware generic return-type
+                    # inference for the called function) before this
+                    # DataFrame propagation runs keeps BOTH declarations:
+                    # the correct `type(...)  :: name` from pandas_df_vars
+                    # here, and a stale `integer :: name` from whichever
+                    # generic set still has it -- a duplicate, conflicting
+                    # declaration that fails to compile.
+                    self.ints.discard(_df_tgt2)
+                    self.reals.discard(_df_tgt2)
+                    self.logs.discard(_df_tgt2)
+                    self.chars.discard(_df_tgt2)
+                    self.complexes.discard(_df_tgt2)
+                    self.alloc_ints.discard(_df_tgt2)
+                    self.alloc_reals.discard(_df_tgt2)
+                    self.alloc_logs.discard(_df_tgt2)
+                    self.alloc_chars.discard(_df_tgt2)
+                    self.alloc_complexes.discard(_df_tgt2)
             # Propagate known local function dict-typed dummy arguments to
             # call-site variables (e.g., foo(a) where foo expects foo_dict_t).
             for c in ast.walk(node):
@@ -28122,7 +28345,7 @@ class translator(ast.NodeVisitor):
                         self.pandas_df_select_indices[t.id] = [
                             _src_cols.index(_nm) + 1 for _nm in _selected
                         ]
-                        self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_src_id, "DataFrame_index_date")
                         self.pandas_df_columns[t.id] = _selected
                         self.ints.discard(t.id)
                         self.reals.discard(t.id)
@@ -28142,7 +28365,7 @@ class translator(ast.NodeVisitor):
                     if _m_spec is not None:
                         _src_cols = self.pandas_df_columns.get(_m_spec["df_id"])
                         if _src_cols is not None:
-                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_m_spec["df_id"], "DataFrame_index_date")
                             self.pandas_df_columns[t.id] = list(_src_cols)
                             self.ints.discard(t.id)
                             self.reals.discard(t.id)
@@ -28168,7 +28391,7 @@ class translator(ast.NodeVisitor):
                             else:
                                 _mapping = _d_spec["mapping"]
                                 _new_cols = [_mapping.get(c, c) for c in _src_cols]
-                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_d_spec["df_id"], "DataFrame_index_date")
                             self.pandas_df_columns[t.id] = _new_cols
                             self.ints.discard(t.id)
                             self.reals.discard(t.id)
@@ -28276,7 +28499,7 @@ class translator(ast.NodeVisitor):
                         _src_cols = self.pandas_df_columns.get(_r_spec["df_id"])
                         if _src_cols is not None:
                             self._mark_int("rw_j")
-                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_r_spec["df_id"], "DataFrame_index_date")
                             self.pandas_df_columns[t.id] = list(_src_cols)
                             self.ints.discard(t.id)
                             self.reals.discard(t.id)
@@ -28312,7 +28535,7 @@ class translator(ast.NodeVisitor):
                                     _lo_c = int(_col_slice.lower.value) + 1 if _col_slice.lower is not None else 1
                                     _hi_c = int(_col_slice.upper.value) if _col_slice.upper is not None else len(_src_cols)
                                     _new_cols = _src_cols[_lo_c - 1 : _hi_c]
-                            self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                            self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_m["df_id"], "DataFrame_index_date")
                             self.pandas_df_columns[t.id] = list(_new_cols)
                             self.ints.discard(t.id)
                             self.reals.discard(t.id)
@@ -28793,7 +29016,14 @@ class translator(ast.NodeVisitor):
                     and v.func.value.id in {"pd", "pandas"}
                     and v.func.attr == "read_csv"
                 ):
-                    self.pandas_df_vars[t.id] = "DataFrame_index_date"
+                    _csv_path3 = _resolve_str_literal(v.args[0]) if v.args else None
+                    _skiprows_kw3 = next((kw for kw in v.keywords if kw.arg == "skiprows"), None)
+                    _skiprows_n3 = _skiprows_kw3.value.value if (
+                        _skiprows_kw3 is not None
+                        and isinstance(_skiprows_kw3.value, ast.Constant)
+                        and isinstance(_skiprows_kw3.value.value, int)
+                    ) else 0
+                    self.pandas_df_vars[t.id] = _detect_pandas_index_kind(_csv_path3, _skiprows_n3)
                     self.ints.discard(t.id)
                     self.reals.discard(t.id)
                     self.logs.discard(t.id)
@@ -28831,6 +29061,7 @@ class translator(ast.NodeVisitor):
                             _cols = [h.strip() for h in _header[1:]]
                             if _usecols_names is not None:
                                 _cols = [c for c in _cols if c in _usecols_names]
+                            _cols = _filter_numeric_csv_columns(_csv_path, _skiprows_n, _cols)
                             self.pandas_df_columns[t.id] = _cols
                 if (
                     isinstance(t, ast.Name)
@@ -38883,7 +39114,10 @@ class translator(ast.NodeVisitor):
                         orig_df_expr = df_expr
                         self.o.w("block")
                         self.o.push()
-                        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+                        _to_csv_kind = self.pandas_df_vars.get(
+                            self._pandas_df_root_id(c.func.value), "DataFrame_index_date"
+                        )
+                        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_to_csv_kind)
                         self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
                         self.o.w(f"call {df_expr}%write_csv({path_expr})")
                         self.o.pop()
@@ -38962,7 +39196,10 @@ class translator(ast.NodeVisitor):
         self.o.w("block")
         self.o.push()
         orig_df_expr = df_expr
-        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+        _reduction_kind = self.pandas_df_vars.get(
+            self._pandas_df_root_id(call.func.value), "DataFrame_index_date"
+        )
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_reduction_kind)
         self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
         name_width = max(len(c) for c in col_names)
         for j, cname in enumerate(col_names, start=1):
@@ -39016,7 +39253,10 @@ class translator(ast.NodeVisitor):
         self.o.w("block")
         self.o.push()
         orig_df_expr = df_expr
-        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+        _corr_kind = self.pandas_df_vars.get(
+            self._pandas_df_root_id(corr_call.func.value), "DataFrame_index_date"
+        )
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_corr_kind)
         self.o.w("real(kind=dp), allocatable :: corr_mat(:,:)")
         self.o.w("integer :: corr_i")
         self.o.w(f"character(len={max_len}), allocatable :: corr_labels(:)")
@@ -39048,12 +39288,15 @@ class translator(ast.NodeVisitor):
             )
         df_id = self._pandas_df_root_id(df_node)
         is_str_index = self.pandas_df_vars.get(df_id) == "DataFrame_str_index"
+        is_datetime_index = self.pandas_df_vars.get(df_id) == "DataFrame_index_datetime"
         col_width = max(10, ndigits + 8)
         n_cols = len(col_names)
-        # Date-index labels are always exactly 10 chars ("YYYY-MM-DD"), but
-        # str-index row labels are arbitrary-length runtime strings -- widen
-        # the field so longer labels aren't truncated by the A-edit descriptor.
-        idx_width = 24 if is_str_index else 10
+        # Date-index labels are always exactly 10 chars ("YYYY-MM-DD"),
+        # datetime-index labels are always exactly 19 chars
+        # ("YYYY-MM-DD HH:MM:SS"), but str-index row labels are
+        # arbitrary-length runtime strings -- widen the field so longer
+        # labels aren't truncated by the A-edit descriptor.
+        idx_width = 24 if is_str_index else (19 if is_datetime_index else 10)
         header_fmt = f"'(A{idx_width},{n_cols}A{col_width})'"
         header_args = ", ".join(fstr(c) for c in col_names)
         row_fmt = f"'(A{idx_width},{n_cols}F{col_width}.{ndigits})'"
@@ -39075,7 +39318,9 @@ class translator(ast.NodeVisitor):
         self.o.w("block")
         self.o.push()
         orig_df_expr = df_expr
-        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+        df_expr, needs_assign = self._pandas_df_materialize_decl(
+            df_expr, kind=self.pandas_df_vars.get(df_id, "DataFrame_index_date")
+        )
         self.o.w("integer :: pdf_n, pdf_i")
         self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
         self.o.w(f"pdf_n = nrow({df_expr})")
@@ -39131,7 +39376,10 @@ class translator(ast.NodeVisitor):
         self.o.w("block")
         self.o.push()
         orig_df_expr = df_expr
-        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr)
+        _describe_kind = self.pandas_df_vars.get(
+            self._pandas_df_root_id(describe_call.func.value), "DataFrame_index_date"
+        )
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_describe_kind)
         self.o.w("real(kind=dp), allocatable :: desc_mat(:,:)")
         self.o.w("integer :: desc_j")
         self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
@@ -40352,6 +40600,7 @@ def _emit_local_function(
     callback_scalar_actuals=None,
     callback_scalar_actual_names=None,
     local_callback_actual_specs=None,
+    local_df_return_info=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -41377,6 +41626,19 @@ def _emit_local_function(
                 tr._mark_char(a.arg)
 
     tr.prescan(fn.body)
+    if fn.name in (local_df_return_info or {}):
+        # tr.prescan above is scoped to just this function's own body, so
+        # its own `df = pd.read_csv(path, ...)` detection can't resolve a
+        # `path` that's a parameter whose literal value is only assigned in
+        # a *caller's* scope (e.g. `filename = "x.csv"` inside `main()`,
+        # passed to `read_prices(filename)`) -- it silently falls back to
+        # the safe default kind. local_df_return_info was computed by a
+        # whole-program-scoped prescan that CAN see the caller's literal,
+        # so trust it here for the function's own return variable.
+        _known_kind, _known_cols, _known_idx_label = local_df_return_info[fn.name]
+        for _ret_stmt in ast.walk(fn):
+            if isinstance(_ret_stmt, ast.Return) and isinstance(_ret_stmt.value, ast.Name):
+                tr.pandas_df_vars[_ret_stmt.value.id] = _known_kind
     for _st in ast.walk(fn):
         if not (
             isinstance(_st, ast.Assign)
@@ -45262,6 +45524,23 @@ def _emit_local_function(
                     local_return_ranks[fn.name] = max(int(local_return_ranks.get(fn.name, 0)), int(_wrap_rank))
         if dict_return:
             ret_decl = f"type({dict_return_spec['type_name']})"
+        elif ret_name in tr.pandas_df_vars or (ret_name_src is not None and ret_name_src in tr.pandas_df_vars):
+            # The result variable's own body builds it via pandas (e.g.
+            # `df = pd.read_csv(...); return df`) -- prescan (run over
+            # just this function's body for local-function emission, so
+            # it never walks an enclosing FunctionDef node) already
+            # tracked `df` in pandas_df_vars correctly; local_df_return_info
+            # is populated by a *different* prescan pass (over the whole
+            # tree, for propagating a DataFrame return to a *caller's*
+            # local) and is empty here, so check pandas_df_vars directly.
+            # Without this branch the result variable falls through to
+            # the generic real/int/etc. inference below, which has no
+            # DataFrame case and defaults to plain integer, while the
+            # function BODY (which does consult pandas_df_vars) still
+            # emits `%`-type-bound-procedure calls against it -- a
+            # declared-vs-used type mismatch that fails to compile.
+            _df_kind = tr.pandas_df_vars.get(ret_name, tr.pandas_df_vars.get(ret_name_src))
+            ret_decl = f"type({_df_kind})"
         elif force_complex:
             ret_decl = "complex(kind=dp)"
         elif (
@@ -45477,6 +45756,17 @@ def _emit_local_function(
     arg_set = set(args)
     local_dict_vars = sorted((nm, tn) for nm, tn in tr.dict_typed_vars.items() if nm != ret_name and nm not in arg_set)
     for nm, tn in local_dict_vars:
+        o.w(f"type({tn}) :: {nm}")
+    # A local pandas DataFrame variable that is neither the function's own
+    # return variable (already declared via ret_decl above) nor a dummy
+    # argument -- e.g. a `main()` emitted as a subroutine (not unwrapped
+    # directly into `program`) that itself calls pd.read_csv(...) -- was
+    # never declared at all: this is the only place in _emit_local_function
+    # that emits declarations for pandas_df_vars-tracked names.
+    local_pandas_df_vars = sorted(
+        (nm, tn) for nm, tn in tr.pandas_df_vars.items() if nm != ret_name and nm not in arg_set
+    )
+    for nm, tn in local_pandas_df_vars:
         o.w(f"type({tn}) :: {nm}")
     for nm in alloc_logs:
         rr = max(1, tr.alloc_log_rank.get(nm, 1))
@@ -45772,7 +46062,6 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
                 continue
             tgt = stmt.targets[0].id
             v = stmt.value
-            df_vars[tgt] = "DataFrame_index_date"
             csv_path = _resolve_lit(v.args[0]) if v.args else None
             skiprows_kw = next((kw for kw in v.keywords if kw.arg == "skiprows"), None)
             skiprows_n = skiprows_kw.value.value if (
@@ -45780,6 +46069,7 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
                 and isinstance(skiprows_kw.value, ast.Constant)
                 and isinstance(skiprows_kw.value.value, int)
             ) else 0
+            df_vars[tgt] = _detect_pandas_index_kind(csv_path, skiprows_n)
             usecols_kw = next((kw for kw in v.keywords if kw.arg == "usecols"), None)
             usecols_names = None
             if usecols_kw is not None and isinstance(usecols_kw.value, (ast.List, ast.Tuple)):
@@ -45800,6 +46090,7 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
                     cols = [h.strip() for h in header[1:]]
                     if usecols_names is not None:
                         cols = [c for c in cols if c in usecols_names]
+                    cols = _filter_numeric_csv_columns(csv_path, skiprows_n, cols)
                     df_cols[tgt] = cols
         for ret in ast.walk(fn):
             if isinstance(ret, ast.Return) and isinstance(ret.value, ast.Name):
@@ -51024,6 +51315,61 @@ def generate_flat(
         for mod, syms in helper_uses_proc.items():
             if syms:
                 om.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
+        # A local function can itself call pd.read_csv/scipy.optimize/etc.
+        # (e.g. `def read_prices(path): return pd.read_csv(path)`) -- that
+        # needs the same bridge/vendored-module `use` statement this proc
+        # module's own declarations and bodies will reference, just as
+        # the program body does below for its own scope.
+        # Include tree.body (not just local_funcs) so that a helper's
+        # parameter (e.g. `def read_prices(path): pd.read_csv(path)`)
+        # whose literal value is only assigned in the caller's scope (e.g.
+        # `filename = "x.csv"` inside `main()`) is still resolvable by the
+        # whole-tree "assigned to exactly one string literal" heuristics
+        # below -- an unresolvable name just means under-detection (a
+        # missing, compile-breaking `use`), while over-detection from a
+        # wider scan is harmless (see _tree_uses_pandas_datetime_index).
+        _proc_use_scan_tree = ast.Module(
+            body=list(tree.body) + [fn for fn in local_funcs if isinstance(fn, ast.FunctionDef)],
+            type_ignores=[],
+        )
+        if _tree_uses_pandas_read_csv(_proc_use_scan_tree):
+            om.w(
+                "use dataframe_index_date_mod, only: DataFrame_index_date, nrow, ncol, date, "
+                "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
+                "operator(>), operator(>=), df_shape => shape"
+            )
+        if _tree_uses_pandas_datetime_index(_proc_use_scan_tree):
+            om.w(
+                "use dataframe_index_datetime_mod, only: DataFrame_index_datetime, datetime, "
+                "datetime_from_iso, valid, nrow, ncol, df_shape => shape"
+            )
+        if _tree_uses_pandas_dict_dataframe(_proc_use_scan_tree):
+            om.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(-)")
+        if _tree_uses_scipy_fsolve(_proc_use_scan_tree):
+            om.w("use minpack_module, only: hybrd1")
+            om.w("use fsolve_bridge_mod, only: fsolve_user_fn, fsolve_generic_wrapper")
+        if _tree_uses_scipy_minimize(_proc_use_scan_tree):
+            om.w("use bfgs_mod, only: bfgs_minimize_fd")
+            om.w("use bfgs_bridge_mod, only: bfgs_user_fn, bfgs_generic_wrapper")
+        if _tree_uses_scipy_brentq(_proc_use_scan_tree):
+            om.w("use root_module, only: root_scalar")
+            om.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
+        if _tree_uses_scipy_curve_fit(_proc_use_scan_tree):
+            om.w("use minpack_module, only: lmdif1")
+            om.w(
+                "use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper, "
+                "curvefit_covariance"
+            )
+        if _tree_uses_scipy_least_squares(_proc_use_scan_tree):
+            om.w("use minpack_module, only: lmdif1")
+            om.w("use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper")
+        if _tree_uses_scipy_minimize_scalar(_proc_use_scan_tree):
+            om.w("use fmin_module, only: fmin")
+            om.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
+        if _tree_uses_scipy_minimize_lbfgsb(_proc_use_scan_tree):
+            om.w("use lbfgsb_bridge_mod, only: lbfgsb_user_fn, lbfgsb_minimize")
+        if _tree_uses_scipy_minimize_powell(_proc_use_scan_tree):
+            om.w("use powell_bridge_mod, only: powell_user_fn, powell_minimize")
         om.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         om.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
         om.w("implicit none")
@@ -51103,6 +51449,7 @@ def generate_flat(
         om.w("")
         om.w("contains")
         om.w("")
+        _proc_mod_local_df_return_info = _scan_local_df_return_info(local_funcs, tree.body)
         for fn in local_funcs:
             arg_dict_types = _arg_dict_types_for_fn(fn)
             if fn.name in local_overload_specs:
@@ -51251,6 +51598,7 @@ def generate_flat(
                         callback_scalar_actuals=callback_scalar_actuals,
                         callback_scalar_actual_names=callback_scalar_actual_names,
                         local_callback_actual_specs=local_callback_actual_specs,
+                        local_df_return_info=_proc_mod_local_df_return_info,
                     )
             else:
                 _emit_local_function(
@@ -51291,6 +51639,7 @@ def generate_flat(
                     callback_scalar_actuals=callback_scalar_actuals,
                     callback_scalar_actual_names=callback_scalar_actual_names,
                     local_callback_actual_specs=local_callback_actual_specs,
+                    local_df_return_info=_proc_mod_local_df_return_info,
                 )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
@@ -51390,38 +51739,54 @@ def generate_flat(
     for mod, syms in helper_uses_main.items():
         if syms:
             o.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
-    if _tree_uses_pandas_read_csv(tree):
+    # When main() got unwrapped into the program body, sibling top-level
+    # functions move to local_funcs and are no longer part of `tree` --
+    # a module/bridge a program needs because of a call that only
+    # happens inside one of those helper functions (e.g. a
+    # `def read_prices(path): return pd.read_csv(path)` helper) would
+    # otherwise go undetected and its `use` statement would be silently
+    # missing. Scan tree's own body plus every local function's body.
+    _use_scan_tree = ast.Module(
+        body=list(tree.body) + [fn for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)],
+        type_ignores=[],
+    )
+    if _tree_uses_pandas_read_csv(_use_scan_tree):
         o.w(
             "use dataframe_index_date_mod, only: DataFrame_index_date, nrow, ncol, date, "
             "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
             "operator(>), operator(>=), df_shape => shape"
         )
-    if _tree_uses_pandas_dict_dataframe(tree):
+    if _tree_uses_pandas_datetime_index(_use_scan_tree):
+        o.w(
+            "use dataframe_index_datetime_mod, only: DataFrame_index_datetime, datetime, "
+            "datetime_from_iso, valid, nrow, ncol, df_shape => shape"
+        )
+    if _tree_uses_pandas_dict_dataframe(_use_scan_tree):
         o.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(-)")
-    if _tree_uses_scipy_fsolve(tree):
+    if _tree_uses_scipy_fsolve(_use_scan_tree):
         o.w("use minpack_module, only: hybrd1")
         o.w("use fsolve_bridge_mod, only: fsolve_user_fn, fsolve_generic_wrapper")
-    if _tree_uses_scipy_minimize(tree):
+    if _tree_uses_scipy_minimize(_use_scan_tree):
         o.w("use bfgs_mod, only: bfgs_minimize_fd")
         o.w("use bfgs_bridge_mod, only: bfgs_user_fn, bfgs_generic_wrapper")
-    if _tree_uses_scipy_brentq(tree):
+    if _tree_uses_scipy_brentq(_use_scan_tree):
         o.w("use root_module, only: root_scalar")
         o.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
-    if _tree_uses_scipy_curve_fit(tree):
+    if _tree_uses_scipy_curve_fit(_use_scan_tree):
         o.w("use minpack_module, only: lmdif1")
         o.w(
             "use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper, "
             "curvefit_covariance"
         )
-    if _tree_uses_scipy_least_squares(tree):
+    if _tree_uses_scipy_least_squares(_use_scan_tree):
         o.w("use minpack_module, only: lmdif1")
         o.w("use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper")
-    if _tree_uses_scipy_minimize_scalar(tree):
+    if _tree_uses_scipy_minimize_scalar(_use_scan_tree):
         o.w("use fmin_module, only: fmin")
         o.w("use brentq_bridge_mod, only: brentq_user_fn, brentq_generic_wrapper")
-    if _tree_uses_scipy_minimize_lbfgsb(tree):
+    if _tree_uses_scipy_minimize_lbfgsb(_use_scan_tree):
         o.w("use lbfgsb_bridge_mod, only: lbfgsb_user_fn, lbfgsb_minimize")
-    if _tree_uses_scipy_minimize_powell(tree):
+    if _tree_uses_scipy_minimize_powell(_use_scan_tree):
         o.w("use powell_bridge_mod, only: powell_user_fn, powell_minimize")
     if not use_proc_module:
         o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
@@ -51548,13 +51913,22 @@ def generate_flat(
     complexes_set -= module_global_names
     rng_scalar_names = set(getattr(tr, "rng_vars", set())) - module_global_names
     main_list_capacity_names = {tr._list_capacity_var(_nm) for _nm in list_counts}
+    # A name already declared via pandas_df_vars (below, as `type(...)`)
+    # must never also land in one of these generic scalar buckets: e.g. a
+    # local function's return type inference has no DataFrame case and
+    # can independently (and wrongly) classify a `df = helper(...)`
+    # target as plain "int", producing a duplicate, conflicting
+    # `integer :: df` alongside the correct `type(DataFrame_index_date)
+    # :: df` -- a declared-twice error the discards upstream don't
+    # reliably prevent for every code path that can populate pandas_df_vars.
+    pandas_df_names = set(tr.pandas_df_vars.keys())
     ints = sorted(
-        ((({*tr.ints, *set(list_counts.values()), *main_list_capacity_names} | rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set
+        ((({*tr.ints, *set(list_counts.values()), *main_list_capacity_names} | rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set - pandas_df_names
     )
-    reals = sorted((((tr.reals - rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
-    complexes = sorted(((complexes_set - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
-    logs = sorted(((tr.logs - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
-    chars = sorted(((chars_set - set(params.keys())) - module_global_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
+    reals = sorted((((tr.reals - rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set - pandas_df_names)
+    complexes = sorted(((complexes_set - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - pandas_df_names)
+    logs = sorted(((tr.logs - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set - pandas_df_names)
+    chars = sorted(((chars_set - set(params.keys())) - module_global_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set - pandas_df_names)
     dict_type_vars = sorted(tr.dict_typed_vars.items())
     if ints:
         o.w("integer :: " + ", ".join(ints))
@@ -51669,6 +52043,7 @@ def generate_flat(
                 callback_scalar_actuals=callback_scalar_actuals,
                 callback_scalar_actual_names=callback_scalar_actual_names,
                 local_callback_actual_specs=local_callback_actual_specs,
+                local_df_return_info=tr.local_df_return_info,
             )
 
     o.pop()
@@ -52130,26 +52505,24 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
             # "_module" naming convention instead of this project's usual
             # "_mod" suffix.
             base = mod[: -len("_module")]
-            cand = Path(f"{base}.f90")
-            if cand.exists():
-                cand_s = str(cand)
-                if cand_s not in helper_files:
-                    helper_files.append(cand_s)
-                    auto_added.append(cand_s)
+            found, cand_s = _ensure_helper_by_filename(f"{base}.f90")
+            if found:
                 provided.add(mod)
             else:
-                missing_modules.append((mod, str(cand)))
+                missing_modules.append((mod, cand_s))
         elif mod.endswith("_mod"):
             base = mod[: -len("_mod")]
-            cand = Path(f"{base}.f90")
-            if cand.exists():
-                cand_s = str(cand)
-                if cand_s not in helper_files:
-                    helper_files.append(cand_s)
-                    auto_added.append(cand_s)
+            # Fall back to xp2f.py's own directory (like the python.f90 /
+            # lapack_d.f90 / lbfgsb.f90 / fmin.f90 special cases below),
+            # not just the current working directory -- otherwise building
+            # a script from any directory other than the repo root requires
+            # manually copying every vendored helper (e.g.
+            # dataframe_index_date.f90) alongside it first.
+            found, cand_s = _ensure_helper_by_filename(f"{base}.f90")
+            if found:
                 provided.add(mod)
             else:
-                missing_modules.append((mod, str(cand)))
+                missing_modules.append((mod, cand_s))
         else:
             missing_modules.append((mod, ""))
 
