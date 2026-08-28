@@ -7233,6 +7233,12 @@ def _tree_uses_pandas_datetime_index(tree):
 def _tree_uses_pandas_dict_dataframe(tree):
     # pd.DataFrame({"col1": arr1, ...}, index=str_labels) -- the
     # string-row-label DataFrame construct backed by dataframe_str_index_mod.
+    # Also covers pd.DataFrame({...}) (no index=, implicit RangeIndex) and
+    # pd.DataFrame(matrix) (single positional arg, no kwargs) -- both reuse
+    # the same runtime type, see _pandas_dict_df_construct_spec_rangeidx /
+    # _pandas_matrix_df_construct_spec_rangeidx. This is a coarse
+    # over-approximation (matrix arg isn't checked for rank/static column
+    # count here), but a false positive only adds an unused `use`.
     for _n in ast.walk(tree):
         if (
             isinstance(_n, ast.Call)
@@ -7241,9 +7247,11 @@ def _tree_uses_pandas_dict_dataframe(tree):
             and _n.func.value.id in {"pd", "pandas"}
             and _n.func.attr == "DataFrame"
             and _n.args
-            and isinstance(_n.args[0], ast.Dict)
         ):
-            return True
+            if isinstance(_n.args[0], ast.Dict):
+                return True
+            if len(_n.args) == 1 and not _n.keywords and not isinstance(_n.args[0], (ast.Dict, ast.List)):
+                return True
     return False
 
 
@@ -14253,6 +14261,11 @@ class translator(ast.NodeVisitor):
         self.pandas_date_arrays = set()
         self.pandas_str_list_values = {}
         self.pandas_stats_table_vars = {}
+        # DataFrame_str_index instances built from pd.DataFrame({...}) with
+        # no index= kwarg (implicit RangeIndex), as opposed to the
+        # explicit-string-labels flavor of the same runtime type -- see
+        # _pandas_dict_df_construct_spec_rangeidx.
+        self.pandas_rangeidx_df_ids = set()
         self.pandas_df_select_indices = {}
         self.pandas_df_columns_snapshot = {}
         self.dict_aliases = {}
@@ -18092,13 +18105,18 @@ class translator(ast.NodeVisitor):
 
     def _pandas_df_simple_method_spec(self, v):
         # X = df.pct_change([periods]) / df.shift(periods[, fill_value=...])
-        # / df.sort_index([ascending=...]) -- DataFrame-returning methods
-        # already implemented by the vendored DataFrame_index_date type,
-        # applied to a bare DataFrame Name (result has the same columns).
+        # / df.sort_index([ascending=...]) / df.cumsum() / df.cumprod() /
+        # df.diff([periods]) / df.abs() / df.sort_values(by[, ascending=...])
+        # -- DataFrame-returning methods implemented by the vendored
+        # DataFrame_index_date/DataFrame_str_index types, applied to a bare
+        # DataFrame Name (result has the same columns).
         if not (
             isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and v.func.attr in {"pct_change", "shift", "sort_index"}
+            and v.func.attr in {
+                "pct_change", "shift", "sort_index",
+                "cumsum", "cumprod", "diff", "abs", "sort_values",
+            }
             and isinstance(v.func.value, ast.Name)
             and v.func.value.id in self.pandas_df_vars
         ):
@@ -18576,6 +18594,98 @@ class translator(ast.NodeVisitor):
             "value_nodes": list(dict_node.values),
             "index_id": idx_id,
         }
+
+    def _pandas_dict_df_construct_spec_rangeidx(self, v):
+        # X = pd.DataFrame({"col1": arr1, "col2": arr2, ...})  -- no index=
+        # kwarg, so pandas gives it a default integer RangeIndex (0..n-1).
+        # Distinct from _pandas_dict_df_construct_spec, which requires an
+        # explicit index= of string row labels; reuses the same
+        # DataFrame_str_index runtime type with a synthesized numeric-string
+        # index (see the "pandas_rangeidx_df_ids" codegen). Dict values may
+        # be arbitrary expressions (not just existing array names) -- each
+        # is materialized into its own real temp array via a synthetic
+        # `<df>_<col> = <expr>` assignment, so df["new"] = expr column
+        # growth after construction (also tracked via pandas_rangeidx_df_ids)
+        # can freely reference earlier columns by reading df["col"].
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Dict)
+        ):
+            return None
+        dict_node = v.args[0]
+        if not dict_node.keys or any(k is None or not is_const_str(k) for k in dict_node.keys):
+            return None
+        if any(kw.arg == "index" for kw in v.keywords):
+            return None
+        # DataFrame_str_index's %values matrix is real-only -- a string (or
+        # other non-numeric) column would silently mis-codegen rather than
+        # cleanly falling back to "unsupported call", so require every
+        # column to be real/int here.
+        if any(self._expr_kind(vn) not in ("real", "int") for vn in dict_node.values):
+            return None
+        return {
+            "columns": [k.value for k in dict_node.keys],
+            "value_nodes": list(dict_node.values),
+        }
+
+    def _static_ncols_from_matrix_var(self, node):
+        # Best-effort: how many columns a 2-D array variable has, traced
+        # back to its single construction assignment and pulling a literal
+        # int out of a shape=(rows, K) / (rows, K)-tuple's second element.
+        # Used only to size pd.DataFrame(matrix)'s synthesized column
+        # labels (see _pandas_matrix_df_construct_spec_rangeidx) -- the
+        # print codegen needs the column count at transpile time to size
+        # its format string, so returns None (leaving the construct
+        # unsupported) rather than guess when it can't be determined.
+        if not isinstance(node, ast.Name):
+            return None
+        exprs = self.real_assignment_exprs.get(node.id)
+        if not exprs or len(exprs) != 1:
+            return None
+        rhs = exprs[0]
+        shape_node = None
+        if isinstance(rhs, ast.Call):
+            size_kw = next((kw for kw in rhs.keywords if kw.arg == "size"), None)
+            if size_kw is not None:
+                shape_node = size_kw.value
+            elif rhs.args and isinstance(rhs.args[0], (ast.Tuple, ast.List)):
+                shape_node = rhs.args[0]
+        if (
+            isinstance(shape_node, (ast.Tuple, ast.List))
+            and len(shape_node.elts) == 2
+            and isinstance(shape_node.elts[1], ast.Constant)
+            and isinstance(shape_node.elts[1].value, int)
+        ):
+            return shape_node.elts[1].value
+        return None
+
+    def _pandas_matrix_df_construct_spec_rangeidx(self, v):
+        # X = pd.DataFrame(matrix) -- a plain 2-D array, no index=/columns=
+        # kwargs: implicit RangeIndex rows AND implicit 0..ncol-1 integer
+        # column labels. Reuses DataFrame_str_index (see the dict-based
+        # sibling above) with both synthesized as numeric-string labels.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and len(v.args) == 1
+            and not v.keywords
+            and not isinstance(v.args[0], (ast.Dict, ast.List))
+        ):
+            return None
+        if self._rank_expr(v.args[0]) != 2:
+            return None
+        ncols = self._static_ncols_from_matrix_var(v.args[0])
+        if not ncols or ncols <= 0:
+            return None
+        return {"matrix_node": v.args[0], "ncols": ncols}
 
     def _rank_expr(self, node):
         if (
@@ -28587,6 +28697,94 @@ class translator(ast.NodeVisitor):
                         self.alloc_complexes.discard(t.id)
                         continue
 
+                # X = pd.DataFrame({"col1": arr1, ...})  -- no index= kwarg,
+                # implicit RangeIndex. Each dict value is materialized into
+                # its own real temp array (<df>_<col>) via a synthetic
+                # assignment run back through prescan, so arbitrary
+                # expressions (not just existing array names) are supported.
+                if isinstance(t, ast.Name):
+                    _rangedf_spec = self._pandas_dict_df_construct_spec_rangeidx(v)
+                    if _rangedf_spec is not None:
+                        self.pandas_df_vars[t.id] = "DataFrame_str_index"
+                        self.pandas_rangeidx_df_ids.add(t.id)
+                        _rdf_cols = list(_rangedf_spec["columns"])
+                        for _rdf_cname, _rdf_vnode in zip(_rdf_cols, _rangedf_spec["value_nodes"]):
+                            _rdf_var = f"{t.id}_{_rdf_cname}"
+                            _rdf_fake = ast.Assign(
+                                targets=[ast.Name(id=_rdf_var, ctx=ast.Store())],
+                                value=_rdf_vnode,
+                            )
+                            self.prescan([_rdf_fake])
+                        self.pandas_df_columns[t.id] = _rdf_cols
+                        self._mark_int(f"{t.id}_ridx_i")
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = pd.DataFrame(matrix)  -- no index=/columns= kwargs:
+                # implicit RangeIndex rows AND implicit 0..ncol-1 integer
+                # column labels.
+                if isinstance(t, ast.Name):
+                    _rmat_spec = self._pandas_matrix_df_construct_spec_rangeidx(v)
+                    if _rmat_spec is not None:
+                        self.pandas_df_vars[t.id] = "DataFrame_str_index"
+                        self.pandas_rangeidx_df_ids.add(t.id)
+                        self.pandas_df_columns[t.id] = [str(i) for i in range(_rmat_spec["ncols"])]
+                        self._mark_int(f"{t.id}_ridx_i")
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # df["new_col"] = expr -- grow (or overwrite, matching
+                # pandas' in-place-if-exists semantics) a RangeIndex
+                # dict-DataFrame's column list. Materializes the RHS into
+                # its own real temp array the same way the construction
+                # site above does, so the eventual construction codegen can
+                # allocate %values to its full final width up front.
+                if (
+                    isinstance(t, ast.Subscript)
+                    and isinstance(t.value, ast.Name)
+                    and t.value.id in self.pandas_rangeidx_df_ids
+                    and is_const_str(t.slice)
+                ):
+                    # DataFrame_str_index's %values matrix is real-only --
+                    # fail clearly here rather than silently mis-codegenning
+                    # a type-mismatched assignment (see the same guard in
+                    # _pandas_dict_df_construct_spec_rangeidx).
+                    if self._expr_kind(v) not in ("real", "int"):
+                        raise NotImplementedError(
+                            "DataFrame column assignment (df[col] = expr) currently "
+                            "supports only real/int columns"
+                        )
+                    _rdf_id = t.value.id
+                    _rdf_cname = t.slice.value
+                    _rdf_var = f"{_rdf_id}_{_rdf_cname}"
+                    _rdf_fake = ast.Assign(
+                        targets=[ast.Name(id=_rdf_var, ctx=ast.Store())],
+                        value=v,
+                    )
+                    self.prescan([_rdf_fake])
+                    _rdf_cols = self.pandas_df_columns.setdefault(_rdf_id, [])
+                    if _rdf_cname not in _rdf_cols:
+                        _rdf_cols.append(_rdf_cname)
+                    continue
+
                 # diff_df = df1 - df2 -- two DataFrames of the same
                 # (str-indexed) kind subtracted elementwise.
                 if (
@@ -35346,6 +35544,28 @@ class translator(ast.NodeVisitor):
                     else:
                         self.o.w(f"call {name}%sort_index()")
                     return
+                if method in ("cumsum", "cumprod", "abs"):
+                    self.o.w(f"{name} = {src_expr}%{method}()")
+                    return
+                if method == "diff":
+                    periods_node = v.args[0] if v.args else kwargs.get("periods")
+                    arg_txt = f"({self.expr(periods_node)})" if periods_node is not None else "()"
+                    self.o.w(f"{name} = {src_expr}%diff{arg_txt}")
+                    return
+                if method == "sort_values":
+                    by_node = v.args[0] if v.args else kwargs.get("by")
+                    if by_node is None or not is_const_str(by_node):
+                        raise NotImplementedError(
+                            "df.sort_values(by=...) requires a literal string column name"
+                        )
+                    self.o.w(f"{name} = {src_expr}")
+                    ascending_node = kwargs.get("ascending")
+                    by_txt = fstr(by_node.value)
+                    if ascending_node is not None:
+                        self.o.w(f"call {name}%sort_values({by_txt}, ascending={self.expr(ascending_node)})")
+                    else:
+                        self.o.w(f"call {name}%sort_values({by_txt})")
+                    return
 
         # X = pd.DataFrame(matrix, index=date_array, columns=names)
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
@@ -35380,6 +35600,90 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
                 self.o.w(f"{name}%values = reshape([{values_txt}], [size({col_exprs[0]}), {len(cols)}])")
                 return
+
+        # X = pd.DataFrame({"col1": arr1, ...})  -- no index= kwarg,
+        # implicit RangeIndex. Final column count (initial dict keys plus
+        # any later df["new"] = expr growth, handled by the Subscript
+        # branch below) was already fixed by prescan, so %values is
+        # allocated to its full final width here; only the initial dict
+        # columns are populated now, the rest fill in as those later
+        # assignments are reached.
+        if isinstance(t, ast.Name) and t.id in self.pandas_rangeidx_df_ids:
+            _rangedf_spec = self._pandas_dict_df_construct_spec_rangeidx(v)
+            if _rangedf_spec is not None:
+                name = self._aliased_name(t.id)
+                init_cols = _rangedf_spec["columns"]
+                init_vars = [f"{t.id}_{c}" for c in init_cols]
+                for _var, _vnode in zip(init_vars, _rangedf_spec["value_nodes"]):
+                    self.visit_Assign(
+                        ast.Assign(targets=[ast.Name(id=_var, ctx=ast.Store())], value=_vnode)
+                    )
+                final_cols = self.pandas_df_columns[t.id]
+                col_len = max(10, max(len(c) for c in final_cols))
+                columns_txt = ", ".join(fstr(c) for c in final_cols)
+                n_expr = f"size({init_vars[0]})"
+                idx_var = f"{t.id}_ridx_i"
+                self._mark_int(idx_var)
+                self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
+                self.o.w(f"if (allocated({name}%values)) deallocate({name}%values)")
+                self.o.w(f"allocate({name}%values({n_expr}, {len(final_cols)}))")
+                self.o.w(f"if (allocated({name}%index)) deallocate({name}%index)")
+                self.o.w(f"allocate({name}%index({n_expr}))")
+                self.o.w(f"do {idx_var} = 1, {n_expr}")
+                self.o.push()
+                self.o.w(f"write({name}%index({idx_var}), '(I0)') {idx_var} - 1")
+                self.o.pop()
+                self.o.w("end do")
+                for _cname, _var in zip(init_cols, init_vars):
+                    _pos = final_cols.index(_cname) + 1
+                    self.o.w(f"{name}%values(:, {_pos}) = {_var}")
+                return
+
+        # X = pd.DataFrame(matrix)  -- no index=/columns= kwargs: copy the
+        # whole matrix into %values in one shot and synthesize both the
+        # numeric-string row index and (during prescan) the 0..ncol-1
+        # column labels.
+        if isinstance(t, ast.Name) and t.id in self.pandas_rangeidx_df_ids:
+            _rmat_spec = self._pandas_matrix_df_construct_spec_rangeidx(v)
+            if _rmat_spec is not None:
+                name = self._aliased_name(t.id)
+                mat_expr = self.expr(_rmat_spec["matrix_node"])
+                final_cols = self.pandas_df_columns[t.id]
+                col_len = max(10, max(len(c) for c in final_cols))
+                columns_txt = ", ".join(fstr(c) for c in final_cols)
+                n_expr = f"size({mat_expr}, 1)"
+                idx_var = f"{t.id}_ridx_i"
+                self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
+                self.o.w(f"{name}%values = {mat_expr}")
+                self.o.w(f"if (allocated({name}%index)) deallocate({name}%index)")
+                self.o.w(f"allocate({name}%index({n_expr}))")
+                self.o.w(f"do {idx_var} = 1, {n_expr}")
+                self.o.push()
+                self.o.w(f"write({name}%index({idx_var}), '(I0)') {idx_var} - 1")
+                self.o.pop()
+                self.o.w("end do")
+                return
+
+        # df["new_col"] = expr -- write into an already-known column
+        # position of a RangeIndex dict-DataFrame (position fixed by
+        # prescan); materializes the RHS via the same real temp array
+        # prescan registered, reusing the general statement-assignment
+        # codegen for it (so arbitrary expressions, including reads of
+        # earlier columns via df["other"], work as usual).
+        if (
+            isinstance(t, ast.Subscript)
+            and isinstance(t.value, ast.Name)
+            and t.value.id in self.pandas_rangeidx_df_ids
+            and is_const_str(t.slice)
+        ):
+            _rdf_id = t.value.id
+            _rdf_cname = t.slice.value
+            _rdf_var = f"{_rdf_id}_{_rdf_cname}"
+            self.visit_Assign(ast.Assign(targets=[ast.Name(id=_rdf_var, ctx=ast.Store())], value=v))
+            _pos = self.pandas_df_columns[_rdf_id].index(_rdf_cname) + 1
+            name = self._aliased_name(_rdf_id)
+            self.o.w(f"{name}%values(:, {_pos}) = {_rdf_var}")
+            return
 
         # diff_df = df1 - df2
         if (
@@ -38340,6 +38644,28 @@ class translator(ast.NodeVisitor):
             if (
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Attribute)
+                and c.args[0].attr == "T"
+                and isinstance(c.args[0].value, ast.Name)
+                and self.pandas_df_vars.get(c.args[0].value.id) == "DataFrame_str_index"
+            ):
+                self._emit_pandas_df_transpose_print(c.args[0].value)
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr in {
+                    "pct_change", "shift", "sort_index",
+                    "cumsum", "cumprod", "diff", "abs", "sort_values",
+                }
+                and isinstance(c.args[0].func.value, ast.Name)
+                and c.args[0].func.value.id in self.pandas_df_vars
+            ):
+                self._emit_pandas_df_method_result_print(c.args[0])
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Attribute)
                 and c.args[0].attr == "dtypes"
                 and self._is_pandas_df_ref_node(c.args[0].value)
             ):
@@ -39277,6 +39603,44 @@ class translator(ast.NodeVisitor):
         self.o.w(f"write(*,{row_fmt}) trim(corr_labels(corr_i)), corr_mat(corr_i, :)")
         self.o.pop()
         self.o.w("end do")
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_method_result_print(self, call, ndigits=6):
+        # print(df.pct_change()) / print(df.cumsum()) / etc -- a
+        # DataFrame-returning method call (see
+        # _pandas_df_simple_method_spec) used directly inside print(),
+        # without first assigning the result to a name. Materializes the
+        # call into an ad hoc temp DataFrame var (registered the same way
+        # prescan would have, but done here at codegen time since this
+        # shape has no assignment target to hang prescan state off of),
+        # reusing the general statement-assignment codegen to compute it
+        # and _emit_pandas_df_print to render it.
+        df_id = call.func.value.id
+        kind = self.pandas_df_vars.get(df_id, "DataFrame_index_date")
+        tmp_name = f"{df_id}_{call.func.attr}_mrtmp"
+        self.pandas_df_vars[tmp_name] = kind
+        self.pandas_df_columns[tmp_name] = list(self.pandas_df_columns.get(df_id, []) or [])
+        self.o.w("block")
+        self.o.push()
+        self.o.w(f"type({kind}) :: {tmp_name}")
+        self.visit_Assign(ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=call))
+        self._emit_pandas_df_print(ast.Name(id=tmp_name, ctx=ast.Load()), ndigits=ndigits)
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_transpose_print(self, df_name_node, ndigits=6):
+        # print(df.T) -- currently only for DataFrame_str_index, where
+        # transposing keeps the same runtime type (both index and columns
+        # are already plain strings); the display() call reads columns
+        # from runtime data, so no statically-known column list is needed
+        # here (unlike _emit_pandas_df_print's other callers).
+        df_expr = self._aliased_name(df_name_node.id)
+        self.o.w("block")
+        self.o.push()
+        self.o.w("type(DataFrame_str_index) :: pdf_t_tmp")
+        self.o.w(f"pdf_t_tmp = {df_expr}%T()")
+        self.o.w(f"call pdf_t_tmp%display({ndigits})")
         self.o.pop()
         self.o.w("end block")
 

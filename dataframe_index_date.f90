@@ -641,11 +641,12 @@ end subroutine parse_uint
 end module date_mod
 
 module df_index_date_ops_mod
+use kind_mod, only: dp
 use date_mod
 use util_mod, only: default
 implicit none
 private
-public :: findloc_index, argsort_index, union_index, intersect_index, &
+public :: findloc_index, argsort_index, argsort_real_dt, union_index, intersect_index, &
    is_sorted_index_array, is_unique_index_array, bsearch_exact_index, &
    bsearch_ffill_index, bsearch_bfill_index
 contains
@@ -721,6 +722,65 @@ subroutine argsort_index(a, perm, ascending) ! return permutation perm such that
  end do
  deallocate(tmp)
 end subroutine argsort_index
+
+subroutine argsort_real_dt(a, perm, ascending) ! same algorithm as argsort_index, for real(dp) column values (sort_values)
+ real(kind=dp), intent(in) :: a(:)
+ integer, allocatable, intent(out) :: perm(:)
+ logical, intent(in), optional :: ascending
+ logical :: asc
+ integer :: n, width, i, left, mid, right, p, q, k
+ integer, allocatable :: tmp(:)
+ asc = default(.true., ascending)
+ n = size(a)
+ allocate(perm(n), tmp(n))
+ perm = [(i, i=1,n)]
+ width = 1
+ do while (width < n)
+    i = 1
+    do while (i <= n)
+       left = i
+       mid = min(i + width - 1, n)
+       right = min(i + 2*width - 1, n)
+       p = left
+       q = mid + 1
+       k = left
+       do while (p <= mid .and. q <= right)
+          if (asc) then
+             if (a(perm(p)) <= a(perm(q))) then
+                tmp(k) = perm(p)
+                p = p + 1
+             else
+                tmp(k) = perm(q)
+                q = q + 1
+             end if
+          else
+             if (a(perm(p)) >= a(perm(q))) then
+                tmp(k) = perm(p)
+                p = p + 1
+             else
+                tmp(k) = perm(q)
+                q = q + 1
+             end if
+          end if
+          k = k + 1
+       end do
+       do while (p <= mid)
+          tmp(k) = perm(p)
+          p = p + 1
+          k = k + 1
+       end do
+       do while (q <= right)
+          tmp(k) = perm(q)
+          q = q + 1
+          k = k + 1
+       end do
+       perm(left:right) = tmp(left:right)
+       i = i + 2*width
+    end do
+    width = 2*width
+ end do
+ deallocate(tmp)
+end subroutine argsort_real_dt
 
 pure logical function is_sorted_index_array(a, ascending) result(is_sorted) ! return true if a is sorted
  type(date), intent(in) :: a(:)
@@ -869,7 +929,7 @@ use kind_mod, only: dp
 use util_mod, only: default, split_string, seq, cbind
 use iso_fortran_env, only: output_unit
 use date_mod
-use df_index_date_ops_mod, only: findloc_index, argsort_index, union_index, &
+use df_index_date_ops_mod, only: findloc_index, argsort_index, argsort_real_dt, union_index, &
    intersect_index, is_sorted_index_array, is_unique_index_array, &
    bsearch_exact_index, bsearch_ffill_index, bsearch_bfill_index
 use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_nan
@@ -934,7 +994,8 @@ type :: DataFrame_index_date
          set_at, set_iat, has_col, has_idx, drop_cols, drop_rows, &
          rename_cols, where_cols, filter_cols, where, filter, iloc, &
          select, add, subtract, multiply, divide, reindex, shift, &
-         pct_change, log_change
+         pct_change, log_change, cumsum, cumprod, diff, sort_values, &
+         abs => abs_df
 end type DataFrame_index_date
 
 contains
@@ -2235,6 +2296,84 @@ where (ratio > 0.0_dp .and. .not. ieee_is_nan(ratio))
    df_new%values = log(ratio)
 end where
 end function log_change
+
+pure function cumsum(self) result(df_new)
+! cumulative sum down each column
+class(DataFrame_index_date), intent(in) :: self
+type(DataFrame_index_date) :: df_new
+integer :: i
+df_new%index = self%index
+df_new%columns = self%columns
+df_new%values = self%values
+do i = 2, nrow(self)
+   df_new%values(i,:) = df_new%values(i-1,:) + df_new%values(i,:)
+end do
+end function cumsum
+
+pure function cumprod(self) result(df_new)
+! cumulative product down each column
+class(DataFrame_index_date), intent(in) :: self
+type(DataFrame_index_date) :: df_new
+integer :: i
+df_new%index = self%index
+df_new%columns = self%columns
+df_new%values = self%values
+do i = 2, nrow(self)
+   df_new%values(i,:) = df_new%values(i-1,:)*df_new%values(i,:)
+end do
+end function cumprod
+
+pure function diff(self, periods) result(df_new)
+! row-to-row difference `periods` rows apart (NaN-filled for the first
+! `periods` rows, matching pandas' df.diff()).
+class(DataFrame_index_date), intent(in) :: self
+integer, intent(in), optional :: periods
+type(DataFrame_index_date) :: df_new
+integer :: p, nr, nc
+p = default(1, periods)
+nr = nrow(self)
+nc = ncol(self)
+df_new%index = self%index
+df_new%columns = self%columns
+allocate(df_new%values(nr, nc))
+df_new%values = ieee_value(0.0_dp, ieee_quiet_nan)
+if (p > 0 .and. p < nr) then
+   df_new%values(p+1:nr,:) = self%values(p+1:nr,:) - self%values(1:nr-p,:)
+end if
+end function diff
+
+pure function abs_df(self) result(df_new)
+class(DataFrame_index_date), intent(in) :: self
+type(DataFrame_index_date) :: df_new
+df_new%index = self%index
+df_new%columns = self%columns
+df_new%values = abs(self%values)
+end function abs_df
+
+subroutine sort_values(self, by, ascending)
+! sort rows by a column's values, permuting the index accordingly.
+class(DataFrame_index_date), intent(inout) :: self
+character(len=*), intent(in) :: by
+logical, intent(in), optional :: ascending
+logical :: asc
+integer :: n, jcol
+integer, allocatable :: perm(:)
+real(kind=dp), allocatable :: vtmp(:,:)
+type(date), allocatable :: itmp(:)
+
+asc = default(.true., ascending)
+if (.not. allocated(self%values)) return
+n = nrow(self)
+if (n <= 1) return
+jcol = self%col_pos(by)
+call argsort_real_dt(self%values(:, jcol), perm, ascending=asc)
+itmp = self%index(perm)
+self%index = itmp
+allocate(vtmp(n, ncol(self)))
+vtmp = self%values(perm, :)
+self%values = vtmp
+deallocate(vtmp, perm)
+end subroutine sort_values
 
 pure function reindex(self, new_index, method, fill_value) result(df_new)
 ! return a dataframe with index replaced by new_index and values reindexed.
