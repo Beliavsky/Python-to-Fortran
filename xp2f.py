@@ -38,6 +38,7 @@ from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import fortran_output as fout
 import fortran_post as fpost
 from fortran_scan import (
+    _is_wrapped_by_outer_parens,
     coalesce_simple_declarations,
     remove_empty_if_blocks,
     simplify_integer_arithmetic_in_lines,
@@ -2893,6 +2894,302 @@ def simplify_generated_parentheses(lines):
         else:
             out.append(code)
     return out
+
+
+def simplify_argument_list_parens(lines):
+    """Strip a redundant whole-argument/whole-bound paren wrap anywhere a
+    comma- or colon-delimited list appears inside matching parentheses --
+    e.g. `top(k, (p * k))` -> `top(k, p * k)` and
+    `top(:, (i * k + 1):((i + 1) * k))` -> `top(:, i * k + 1:(i + 1) * k)`.
+
+    `simplify_generated_parentheses` already collapses `((expr))` when both
+    closing parens are adjacent, and cleans up whole-statement/whole-condition
+    wraps (`x = (expr)`, `if ((expr)) then`), but neither handles a wrap whose
+    content has trailing text before its own close paren (`((i + 1) * k)`,
+    where the inner `)` isn't immediately followed by the outer one), nor a
+    wrap that's just one of several comma-separated dimensions/arguments.
+    This is conservative: it never touches text inside double-quoted string
+    literals, and only strips a paren pair that spans an entire top-level
+    comma- or colon-delimited part -- never one needed for operator
+    precedence (a part like `(i + 1) * k` keeps its inner parens, since only
+    "(i + 1)" -- not the whole part -- is wrapped).
+    """
+    def _split_top_level(s, sep):
+        out = []
+        cur = []
+        depth = 0
+        in_str = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                cur.append(ch)
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == sep and depth == 0:
+                out.append("".join(cur))
+                cur = []
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+        out.append("".join(cur))
+        return out
+
+    def _has_top_level_comma(s):
+        depth = 0
+        in_str = False
+        for ch in s:
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    return True
+        return False
+
+    def _simplify_part(part):
+        # Recurse into the part's own nested parens first (e.g. a call
+        # argument like `size(x, (1))`), then check whether the whole part
+        # (after that) is itself one redundant outer wrap.
+        processed = _rewrite(part)
+        stripped = processed.strip()
+        if not stripped:
+            # All whitespace (or empty) -- nothing to strip, and leading/
+            # trailing extraction below would double-count it.
+            return processed
+        leading_ws = processed[: len(processed) - len(processed.lstrip())]
+        trailing_ws = processed[len(processed.rstrip()):]
+        # A top-level comma directly inside the wrap means the parens
+        # aren't redundant grouping -- e.g. `(0.0_dp, 1.0_dp)` is a
+        # complex literal's own required parens; stripping them would
+        # expose the comma at this part's level and silently turn one
+        # argument into two.
+        if _is_wrapped_by_outer_parens(stripped) and not _has_top_level_comma(stripped[1:-1]):
+            stripped = strip_redundant_outer_parens_expr(stripped)
+        return leading_ws + stripped + trailing_ws
+
+    def _rewrite(s):
+        out = []
+        i = 0
+        n = len(s)
+        in_str = False
+        while i < n:
+            ch = s[i]
+            if ch == '"':
+                out.append(ch)
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth = 1
+                j = i + 1
+                in_str2 = False
+                while j < n and depth > 0:
+                    cj = s[j]
+                    if cj == '"':
+                        in_str2 = not in_str2
+                    elif not in_str2:
+                        if cj == "(":
+                            depth += 1
+                        elif cj == ")":
+                            depth -= 1
+                    j += 1
+                if depth != 0:
+                    # Unbalanced (shouldn't happen in well-formed generated
+                    # code) -- bail out on this line rather than guess.
+                    out.append(s[i:])
+                    return "".join(out)
+                close_idx = j - 1
+                content = s[i + 1:close_idx]
+                args = _split_top_level(content, ",")
+                new_args = []
+                for a in args:
+                    parts = _split_top_level(a, ":")
+                    new_args.append(":".join(_simplify_part(p) for p in parts))
+                out.append("(" + ",".join(new_args) + ")")
+                i = close_idx + 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        new_code = _rewrite(code)
+        out.append(new_code + bang + comment if bang else new_code)
+    return out
+
+
+def simplify_int_wrapped_integer_literals(lines):
+    """Strip a no-op `int(N)` wrap down to `N` when N is a plain (optionally
+    signed) integer literal -- e.g. `call seed_rng(int(123))` ->
+    `call seed_rng(123)`. `int()` is applied defensively at many call sites
+    to coerce a possibly-non-integer argument, but on an already-integer
+    literal it's a pure no-op, so this is always safe.
+
+    Conservative: only strips a single-argument call whose entire content
+    is `[+-]?\\d+` -- a second argument (`int(123, kind=int64)`, which can
+    genuinely change the result) or any non-bare-literal content (a name,
+    an expression, a kind-suffixed literal like `123_int64`) is left alone.
+    """
+    int_call_re = re.compile(r"\bint\(", flags=re.IGNORECASE)
+    literal_re = re.compile(r"^[+-]?\d+$")
+
+    def _find_matching_rparen(s, lparen_idx):
+        depth = 0
+        in_str = False
+        i = lparen_idx
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _rewrite(code):
+        i = 0
+        while True:
+            m = int_call_re.search(code, i)
+            if not m:
+                break
+            open_idx = m.end() - 1
+            close_idx = _find_matching_rparen(code, open_idx)
+            if close_idx < 0:
+                break
+            inner = code[open_idx + 1 : close_idx].strip()
+            if literal_re.match(inner):
+                code = code[: m.start()] + inner + code[close_idx + 1 :]
+                i = m.start() + len(inner)
+            else:
+                # This particular int(...) isn't a bare-literal wrap, but
+                # its content may still contain a NESTED int(...) call
+                # that is one (e.g. `int(x - int(1) + 1)`) -- continue
+                # scanning from just past "int(", not past this whole
+                # call's closing paren, or such a nested case would never
+                # be visited.
+                i = open_idx + 1
+        return code
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        new_code = _rewrite(code)
+        out.append(new_code + bang + comment if bang else new_code)
+    return out
+
+
+def simplify_max_zero_len(lines):
+    """Strip a no-op `max(0, len(...))` (either argument order) down to
+    just `len(...)` -- Fortran's LEN intrinsic is always >= 0 (a string's
+    length can be zero, but never negative), so clamping it to a minimum
+    of 0 can never change the result.
+    """
+    max_call_re = re.compile(r"\bmax\(", flags=re.IGNORECASE)
+    len_call_re = re.compile(r"^len\(.*\)$", flags=re.IGNORECASE)
+
+    def _find_matching_rparen(s, lparen_idx):
+        depth = 0
+        i = lparen_idx
+        while i < len(s):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_commas(s):
+        parts = []
+        cur = []
+        depth = 0
+        for ch in s:
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                continue
+            if ch == ")":
+                depth -= 1
+                cur.append(ch)
+                continue
+            if ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                continue
+            cur.append(ch)
+        if cur:
+            parts.append("".join(cur).strip())
+        return parts
+
+    def _rewrite(code):
+        i = 0
+        while True:
+            m = max_call_re.search(code, i)
+            if not m:
+                break
+            open_idx = m.end() - 1
+            close_idx = _find_matching_rparen(code, open_idx)
+            if close_idx < 0:
+                break
+            args = _split_top_level_commas(code[open_idx + 1 : close_idx])
+            replacement = None
+            if len(args) == 2:
+                a, b = args[0].strip(), args[1].strip()
+                if a == "0" and len_call_re.match(b):
+                    replacement = b
+                elif b == "0" and len_call_re.match(a):
+                    replacement = a
+            if replacement is not None:
+                code = code[: m.start()] + replacement + code[close_idx + 1 :]
+                i = m.start() + len(replacement)
+            else:
+                i = close_idx + 1
+        return code
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        new_code = _rewrite(code)
+        out.append(new_code + bang + comment if bang else new_code)
+    return out
+
+
 def simplify_index_arithmetic_notation(lines):
     """Simplify noisy index arithmetic emitted by conservative lowering."""
     out = []
@@ -3003,6 +3300,199 @@ def simplify_allocate_default_lower_bounds(lines):
         else:
             out.append(code)
     return out
+
+
+def merge_allocate_then_scalar_fill_to_source(lines):
+    """Merge `allocate(name(dims))` + `name = expr` into a single
+    `allocate(name(dims), source=expr)`.
+
+    Fortran's `source=` broadcasts a scalar to every element right at
+    allocation time, so this is behaviorally identical to allocating and
+    then immediately filling the whole array/scalar with a value -- just
+    one statement instead of two.
+
+    Conservative rules:
+    - the `allocate(...)` statement has exactly one entity and no other
+      keyword arguments (`stat=`, `errmsg=`, an explicit `source=`, ...)
+    - the very next nonblank/noncomment line is `name = expr` (the whole
+      entity, not a section or element assignment)
+    - `expr` isn't an array constructor (`[...]`), which has its own,
+      different shape-matching rules, and doesn't reference `name` itself
+    - unlike a plain assignment, `source=` requires an exact type match
+      with no implicit conversion (`allocate(b(10), source=0)` fails to
+      compile if `b` is real), so `expr`'s apparent literal type must
+      match `name`'s declared type; anything not confidently classifiable
+      (character, complex, derived types, an unresolvable declaration) is
+      left unmerged
+    """
+    allocate_re = re.compile(r"^(\s*)allocate\(", flags=re.IGNORECASE)
+    asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
+    entity_re = re.compile(r"^([A-Za-z_]\w*)\s*(?:\(.*\))?$")
+    decl_stmt_re = re.compile(r"^(\s*)(.+?)\s*::\s*(.+)$", re.IGNORECASE)
+    base_type_re = re.compile(r"^(integer|real|logical|character|complex)\b", flags=re.IGNORECASE)
+    real_literal_re = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:_dp)?$", flags=re.IGNORECASE)
+    real_typed_re = re.compile(r"_dp\b", flags=re.IGNORECASE)
+    int_literal_re = re.compile(r"^[+-]?\d+$")
+    logical_literal_re = re.compile(r"^\.(?:true|false)\.$", flags=re.IGNORECASE)
+
+    def _declared_types(all_lines):
+        types = {}
+        m = len(all_lines)
+        k = 0
+        while k < m:
+            code0 = all_lines[k].split("!", 1)[0]
+            stripped0 = code0.strip()
+            if "::" not in stripped0 or not re.match(
+                r"^\s*(?:integer|real|logical|character|complex)\b", stripped0, flags=re.IGNORECASE
+            ):
+                k += 1
+                continue
+            stmt_lines = [all_lines[k]]
+            kk = k
+            while stmt_lines[-1].split("!", 1)[0].rstrip().endswith("&") and kk + 1 < m:
+                kk += 1
+                stmt_lines.append(all_lines[kk])
+            joined_parts = []
+            for idx, sl in enumerate(stmt_lines):
+                c = sl.split("!", 1)[0].strip()
+                if idx > 0 and c.startswith("&"):
+                    c = c[1:].strip()
+                if c.endswith("&"):
+                    c = c[:-1].rstrip()
+                joined_parts.append(c)
+            joined = " ".join(p for p in joined_parts if p)
+            md = decl_stmt_re.match(joined)
+            if md:
+                spec = md.group(2).strip()
+                mbt = base_type_re.match(spec)
+                if mbt:
+                    base_type = mbt.group(1).lower()
+                    for ent in _split_top_level_commas(md.group(3)):
+                        ment = re.match(r"^([A-Za-z_]\w*)", ent.strip())
+                        if ment:
+                            types[ment.group(1).lower()] = base_type
+            k = kk + 1
+        return types
+
+    def _rhs_matches_type(base_type, rhs):
+        if base_type == "integer":
+            return bool(int_literal_re.match(rhs))
+        if base_type == "real":
+            return bool(real_literal_re.match(rhs)) and bool(real_typed_re.search(rhs))
+        if base_type == "logical":
+            return bool(logical_literal_re.match(rhs))
+        # character/complex/derived types: too easy to get subtly wrong
+        # (length matching, constructor form, ...) -- always abstain.
+        return False
+
+    def _find_matching_rparen(s, lparen_idx):
+        depth = 0
+        in_str = False
+        i = lparen_idx
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_commas(s):
+        parts = []
+        cur = []
+        depth = 0
+        in_str = False
+        for ch in s:
+            if ch == '"':
+                cur.append(ch)
+                in_str = not in_str
+                continue
+            if in_str:
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                continue
+            if ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                continue
+            cur.append(ch)
+        if cur:
+            parts.append("".join(cur).strip())
+        return parts
+
+    out = list(lines)
+    n = len(out)
+    declared_types = _declared_types(out)
+    i = 0
+    while i < n:
+        code_i, bang_i, comment_i = out[i].partition("!")
+        m = allocate_re.match(code_i)
+        if not m:
+            i += 1
+            continue
+        open_idx = m.end() - 1
+        close_idx = _find_matching_rparen(code_i, open_idx)
+        if close_idx < 0 or code_i[close_idx + 1 :].strip() != "":
+            i += 1
+            continue
+        inner = code_i[open_idx + 1 : close_idx]
+        entities = _split_top_level_commas(inner)
+        if len(entities) != 1:
+            i += 1
+            continue
+        mname = entity_re.match(entities[0].strip())
+        if not mname:
+            i += 1
+            continue
+        nm = mname.group(1)
+
+        j = i + 1
+        while j < n:
+            code_j = out[j].split("!", 1)[0].strip()
+            if code_j == "":
+                j += 1
+                continue
+            break
+        if j >= n:
+            i += 1
+            continue
+        masn = asn_re.match(out[j].split("!", 1)[0].strip())
+        if not masn or masn.group(1).lower() != nm.lower():
+            i += 1
+            continue
+        rhs = masn.group(2).strip()
+        if rhs.startswith("[") or re.search(r"\b" + re.escape(nm) + r"\b", rhs, flags=re.IGNORECASE):
+            i += 1
+            continue
+        base_type = declared_types.get(nm.lower())
+        if base_type is None or not _rhs_matches_type(base_type, rhs):
+            i += 1
+            continue
+
+        indent = m.group(1)
+        new_code = f"{indent}allocate({inner}, source={rhs})"
+        out[i] = new_code + ("!" + comment_i if bang_i else "")
+        out[j] = ""
+        i = j + 1
+
+    return [ln for ln in out if ln != ""]
 
 
 def simplify_redundant_int_casts(lines):
@@ -3760,6 +4250,152 @@ def remove_unused_named_constants(lines):
     return [ln for ln in out if ln != ""]
 
 
+def _find_matching_rparen_simple(s, open_idx):
+    depth = 0
+    i = open_idx
+    while i < len(s):
+        if s[i] == "(":
+            depth += 1
+        elif s[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _split_top_level_commas_simple(s):
+    parts = []
+    cur = []
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            cur.append(ch)
+            continue
+        if ch == ")":
+            depth -= 1
+            cur.append(ch)
+            continue
+        if ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+    return parts
+
+
+def _joined_call_stmt(lines, k0):
+    """Join a `call ...` statement starting at physical line k0 across any
+    "&" continuations. Returns (joined_text, last_line_index)."""
+    parts = []
+    k = k0
+    n = len(lines)
+    while True:
+        code_k = lines[k].split("!", 1)[0].strip()
+        cont = code_k.endswith("&")
+        piece = code_k[:-1].rstrip() if cont else code_k
+        if k > k0 and piece.startswith("&"):
+            piece = piece[1:].strip()
+        parts.append(piece)
+        if not cont or k + 1 >= n:
+            return " ".join(p for p in parts if p), k
+        k += 1
+
+
+def _callee_dummy_intent_is_in(lines, callee, arg_index):
+    """True only if a `subroutine callee(...)` definition can be found in
+    `lines` whose dummy at `arg_index` (0-based) is declared with an
+    explicit `intent(in)`. False for a confirmed intent(out)/intent(inout)
+    dummy, or when the callee/dummy/intent can't be resolved from this
+    file at all (e.g. a python_mod helper with no local definition here)
+    -- unresolved always means "don't know," which callers must treat the
+    same as a confirmed out/inout for safety.
+    """
+    hdr_re = re.compile(
+        rf"^\s*(?:(?:pure|elemental|impure|recursive)\s+)*subroutine\s+{re.escape(callee)}\s*\(",
+        flags=re.IGNORECASE,
+    )
+    n = len(lines)
+    for idx, ln in enumerate(lines):
+        code = ln.split("!", 1)[0]
+        m = hdr_re.match(code)
+        if not m:
+            continue
+        open_idx = m.end() - 1
+        close_idx = _find_matching_rparen_simple(code, open_idx)
+        if close_idx < 0:
+            return False
+        dummies = _split_top_level_commas_simple(code[open_idx + 1 : close_idx])
+        if arg_index >= len(dummies) or not dummies[arg_index].strip():
+            return False
+        dummy_name = dummies[arg_index].strip()
+        end_idx = n
+        for k in range(idx + 1, n):
+            if re.match(r"^\s*end\s+subroutine\b", lines[k], flags=re.IGNORECASE):
+                end_idx = k
+                break
+        tok_re = re.compile(r"\b" + re.escape(dummy_name) + r"\b", flags=re.IGNORECASE)
+        for k in range(idx + 1, end_idx):
+            code_k = lines[k].split("!", 1)[0]
+            if "::" not in code_k:
+                continue
+            lhs, _, rhs = code_k.partition("::")
+            if not tok_re.search(rhs):
+                continue
+            return bool(re.search(r"intent\s*\(\s*in\s*\)", lhs, flags=re.IGNORECASE))
+        return False
+    return False
+
+
+def _name_used_as_call_arg(lines, name, start, end):
+    """True if `name` is passed, as a bare actual argument (not merely
+    read inside a larger expression -- Fortran can't bind an expression
+    to an intent(out)/inout dummy anyway, so that's always safe), to a
+    `call` statement in `lines[start:end]` at a position that ISN'T
+    confirmed intent(in) via _callee_dummy_intent_is_in.
+
+    Used by the constant-promotion passes as a disqualifier: a plain
+    `name = expr`-pattern scan can't see a reassignment that happens
+    through an intent(out)/intent(inout) call argument instead. A
+    confirmed intent(in) binding is exactly as safe as any other read, so
+    it does NOT disqualify -- unlike an unresolved callee (python_mod
+    helper, etc.), which still does, conservatively.
+    """
+    call_start_re = re.compile(r"^\s*call\s+([A-Za-z_]\w*)\s*\(", flags=re.IGNORECASE)
+    tok_re = re.compile(r"\b" + re.escape(name) + r"\b", flags=re.IGNORECASE)
+    bare_arg_re = re.compile(r"^" + re.escape(name) + r"(\s*\(.*\))?$", flags=re.IGNORECASE)
+    k = start
+    while k < end:
+        code_k = lines[k].split("!", 1)[0]
+        m = call_start_re.match(code_k)
+        if not m:
+            k += 1
+            continue
+        joined, end_k = _joined_call_stmt(lines, k)
+        mj = call_start_re.match(joined)
+        if not mj or not tok_re.search(joined):
+            k = end_k + 1
+            continue
+        callee = mj.group(1)
+        open_idx = mj.end() - 1
+        close_idx = _find_matching_rparen_simple(joined, open_idx)
+        if close_idx < 0:
+            return True
+        args = _split_top_level_commas_simple(joined[open_idx + 1 : close_idx])
+        for idx_a, a in enumerate(args):
+            if not tok_re.search(a):
+                continue
+            if not bare_arg_re.match(a.strip()):
+                continue
+            if not _callee_dummy_intent_is_in(lines, callee, idx_a):
+                return True
+        k = end_k + 1
+    return False
+
+
 def promote_immediate_scalar_constants(lines):
     """Promote immediate scalar `decl` + `name = const` to `parameter`.
 
@@ -3788,6 +4424,16 @@ def promote_immediate_scalar_constants(lines):
     tok_re = re.compile(r"\b[A-Za-z_]\w*\b")
     func_hdr_re = re.compile(r"^\s*.*\bfunction\s+([A-Za-z_]\w*)\s*\(", flags=re.IGNORECASE)
     res_re = re.compile(r"\bresult\s*\(\s*([A-Za-z_]\w*)\s*\)", flags=re.IGNORECASE)
+    # Other declaration statements (any type, not just this one's own
+    # pattern) also sit between a declaration and its initializer once
+    # split_declarations_to_single_names has broken a shared declaration
+    # list into one entity per line -- skip over those too when scanning
+    # forward for the initializing assignment, the same way blank lines
+    # are skipped.
+    declish_re = re.compile(
+        r"^\s*(?:use\b|implicit\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b)",
+        flags=re.IGNORECASE,
+    )
 
     def _is_scope_start(code):
         if start_re.match(code):
@@ -3861,23 +4507,30 @@ def promote_immediate_scalar_constants(lines):
         tdecl = mdecl.group(1).strip()
         nm = mdecl.group(2)
         d = depth_at[i]
+        nm_re = re.compile(r"\b" + re.escape(nm) + r"\b", flags=re.IGNORECASE)
 
-        # Next executable line at same depth.
+        # Scan forward at the same depth for the first statement that
+        # mentions `nm` at all (other unrelated declarations/statements in
+        # between -- e.g. sibling locals' own declarations, or other code
+        # that runs before this variable is first touched -- are skipped).
+        # If that first mention isn't a clean `nm = literal` assignment,
+        # this isn't the "declare, then immediately initialize" pattern,
+        # so promotion is abandoned.
         j = i + 1
+        masn = None
         while j < n:
+            if depth_at[j] < d:
+                j = n
+                break
             code_j = out[j].split("!", 1)[0].strip()
-            if code_j == "":
+            if code_j == "" or depth_at[j] != d:
                 j += 1
                 continue
-            if depth_at[j] != d:
-                j += 1
-                continue
-            break
-        if j >= n:
-            i += 1
-            continue
-        masn = asn_re.match(out[j].split("!", 1)[0].strip())
-        if not masn or masn.group(1).lower() != nm.lower():
+            if nm_re.search(code_j):
+                masn = asn_re.match(code_j)
+                break
+            j += 1
+        if j >= n or masn is None or masn.group(1).lower() != nm.lower():
             i += 1
             continue
         rhs = masn.group(2).strip()
@@ -3898,15 +4551,28 @@ def promote_immediate_scalar_constants(lines):
                 scope_end = k
                 break
 
-        # Ensure no later same-depth assignment to same name.
+        # Ensure no later assignment to same name anywhere in scope -- not
+        # just at the same depth: a nested `block`/`if ... then` inside
+        # this scope can legally reassign an outer-scope variable, and
+        # scope_end (first line whose depth drops BELOW d) already bounds
+        # the search to exactly this variable's scope, so every line
+        # before it is fair game regardless of its own (deeper) depth. A
+        # single-line `if (cond) nm = expr` (no `then`/`end if`) doesn't
+        # match asn_re (the line starts with "if", not the name) either,
+        # hence the second, substring-based check.
         reassigned = False
+        cond_reassign_re = re.compile(rf"(?:^\s*|\)\s*|;\s*){re.escape(nm)}\s*=(?!=)", flags=re.IGNORECASE)
         for k in range(j + 1, scope_end):
-            if depth_at[k] != d:
-                continue
-            mk = asn_re.match(out[k].split("!", 1)[0].strip())
+            code_k = out[k].split("!", 1)[0].strip()
+            mk = asn_re.match(code_k)
             if mk and mk.group(1).lower() == nm.lower():
                 reassigned = True
                 break
+            if cond_reassign_re.search(code_k):
+                reassigned = True
+                break
+        if not reassigned and _name_used_as_call_arg(out, nm, j + 1, scope_end):
+            reassigned = True
         if reassigned:
             i += 1
             continue
@@ -3919,9 +4585,616 @@ def promote_immediate_scalar_constants(lines):
         indent = re.match(r"^\s*", out[i]).group(0)
         out[i] = indent + new_decl
         out[j] = ""
-        i = j + 1
+        # Advance only past this declaration, not to j+1: another
+        # declaration for a different sibling name may sit between i and
+        # j (its initializer can be much further down than the next
+        # physical line once the forward scan above skips over unrelated
+        # statements), and that sibling still needs its own chance to be
+        # considered as i advances.
+        i += 1
 
     return [ln for ln in out if ln != ""]
+
+
+def promote_immediate_array_constants(lines):
+    """Promote immediate rank-1 array `decl` + `name = [const, ...]` to a
+    `parameter` array, mirroring promote_immediate_scalar_constants but for
+    array literals with every element a compile-time constant.
+
+    Conservative rules:
+    - declaration is `TYPE, allocatable :: name(:)` (rank-1, no other attrs)
+    - next nonblank/noncomment statement at same structural depth is
+      `name = [const, const, ...]` (a bare array constructor, every element
+      literal-only)
+    - name is never plain-reassigned (`name = ...`) NOR element/section
+      assigned (`name(...) = ...`) anywhere later in the enclosing scope, at
+      any depth within it (arrays are far more often mutated from a nested
+      loop/if than scalars are, so this is checked at every depth, not just
+      the same one the declaration/initializer sit at).
+    """
+    out = list(lines)
+    n = len(out)
+
+    start_re = re.compile(
+        r"^\s*(program|module|subroutine|function|block)\b(?!\s+data\b)(?!.*\bend\b)",
+        flags=re.IGNORECASE,
+    )
+    end_re = re.compile(
+        r"^\s*end\s*(program|module|subroutine|function|block)\b",
+        flags=re.IGNORECASE,
+    )
+    decl_re = re.compile(
+        r"^\s*(integer|real\(kind=dp\)|logical|complex\(kind=dp\))\s*,\s*allocatable\s*::\s*([A-Za-z_]\w*)\s*\(\s*:\s*\)\s*$",
+        flags=re.IGNORECASE,
+    )
+    asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
+    elem_asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*\(")
+    tok_re = re.compile(r"\b[A-Za-z_]\w*\b")
+    func_hdr_re = re.compile(r"^\s*.*\bfunction\s+([A-Za-z_]\w*)\s*\(", flags=re.IGNORECASE)
+    res_re = re.compile(r"\bresult\s*\(\s*([A-Za-z_]\w*)\s*\)", flags=re.IGNORECASE)
+    # Other declaration statements also sit between a declaration and its
+    # initializer once split_declarations_to_single_names has broken a
+    # shared declaration list into one entity per line -- skip over those
+    # too when scanning forward for the initializing assignment, the same
+    # way blank lines are skipped.
+    declish_re = re.compile(
+        r"^\s*(?:use\b|implicit\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b)",
+        flags=re.IGNORECASE,
+    )
+
+    def _is_scope_start(code):
+        if start_re.match(code):
+            return True
+        lc = code.lower()
+        if lc.startswith("end "):
+            return False
+        if re.search(r"\b(function|subroutine)\b", code, flags=re.IGNORECASE):
+            return True
+        return False
+
+    depth = 0
+    depth_at = [0] * n
+    for i, ln in enumerate(out):
+        code = ln.split("!", 1)[0].strip()
+        if end_re.match(code):
+            depth = max(0, depth - 1)
+        depth_at[i] = depth
+        if _is_scope_start(code):
+            depth += 1
+
+    def _split_top_level_commas(s):
+        parts = []
+        cur = []
+        d = 0
+        in_str = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                cur.append(ch)
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                d += 1
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == ")":
+                d = max(0, d - 1)
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "," and d == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+        if cur:
+            parts.append("".join(cur).strip())
+        return parts
+
+    def _elem_is_const(tok_expr):
+        s = tok_expr.strip()
+        if not s:
+            return False
+        if s.startswith('"') and s.endswith('"'):
+            return True
+        for t in tok_re.findall(s):
+            tl = t.lower()
+            if tl in {"dp", "true", "false"}:
+                continue
+            if re.fullmatch(r"\d+", t):
+                continue
+            return False
+        return True
+
+    def _array_literal_elems(rhs):
+        rhs_s = rhs.strip()
+        if not (rhs_s.startswith("[") and rhs_s.endswith("]")):
+            return None
+        inner = rhs_s[1:-1].strip()
+        if not inner:
+            return None
+        elems = _split_top_level_commas(inner)
+        if not elems or any(not _elem_is_const(e) for e in elems):
+            return None
+        return elems
+
+    def _enclosing_function_result_name(idx, depth_here):
+        for h in range(idx - 1, -1, -1):
+            if depth_at[h] >= depth_here:
+                continue
+            code_h = out[h].split("!", 1)[0].strip()
+            if not code_h or code_h.lower().startswith("end "):
+                continue
+            mh = func_hdr_re.match(code_h)
+            if not mh:
+                continue
+            fname = mh.group(1)
+            mr = res_re.search(code_h)
+            rname = mr.group(1) if mr else fname
+            return rname.lower()
+        return None
+
+    i = 0
+    while i < n:
+        code_i = out[i].split("!", 1)[0].strip()
+        mdecl = decl_re.match(code_i)
+        if not mdecl:
+            i += 1
+            continue
+        tdecl = mdecl.group(1).strip()
+        nm = mdecl.group(2)
+        d = depth_at[i]
+        nm_re = re.compile(r"\b" + re.escape(nm) + r"\b", flags=re.IGNORECASE)
+
+        # Scan forward at the same depth for the first statement that
+        # mentions `nm` at all (see promote_immediate_scalar_constants for
+        # why: sibling locals' own declarations and unrelated statements
+        # commonly sit between a declaration block and this variable's
+        # first use). If that first mention isn't a clean `nm = [...]`
+        # assignment, promotion is abandoned.
+        j = i + 1
+        masn = None
+        while j < n:
+            if depth_at[j] < d:
+                j = n
+                break
+            code_j = out[j].split("!", 1)[0].strip()
+            if code_j == "" or depth_at[j] != d:
+                j += 1
+                continue
+            if nm_re.search(code_j):
+                masn = asn_re.match(code_j)
+                break
+            j += 1
+        if j >= n or masn is None or masn.group(1).lower() != nm.lower():
+            i += 1
+            continue
+        elems = _array_literal_elems(masn.group(2))
+        if elems is None:
+            i += 1
+            continue
+
+        encl_res = _enclosing_function_result_name(i, d)
+        if encl_res is not None and nm.lower() == encl_res:
+            i += 1
+            continue
+
+        scope_end = n
+        for k in range(j + 1, n):
+            if depth_at[k] < d:
+                scope_end = k
+                break
+
+        # Same-line conditional forms (`if (cond) nm = expr` / `if (cond)
+        # nm(k) = expr`, no `then`/`end if`) don't open a new block, so
+        # they're already in range, but they don't match asn_re/
+        # elem_asn_re (the line starts with "if", not the name) -- check
+        # for those too, or a conditionally-mutated array would be
+        # silently promoted to a PARAMETER.
+        cond_mut_re = re.compile(rf"(?:^\s*|\)\s*|;\s*){re.escape(nm)}\s*[=(]", flags=re.IGNORECASE)
+        mutated = False
+        for k in range(j + 1, scope_end):
+            code_k = out[k].split("!", 1)[0].strip()
+            mk = asn_re.match(code_k)
+            if mk and mk.group(1).lower() == nm.lower():
+                mutated = True
+                break
+            mek = elem_asn_re.match(code_k)
+            if mek and mek.group(1).lower() == nm.lower():
+                mutated = True
+                break
+            if cond_mut_re.search(code_k):
+                mutated = True
+                break
+        if not mutated and _name_used_as_call_arg(out, nm, j + 1, scope_end):
+            mutated = True
+        if mutated:
+            i += 1
+            continue
+
+        indent = re.match(r"^\s*", out[i]).group(0)
+        lit = ", ".join(elems)
+        out[i] = f"{indent}{tdecl}, parameter :: {nm}(*) = [{lit}]"
+        out[j] = ""
+        # See promote_immediate_scalar_constants: advance only past this
+        # declaration so a sibling declared nearby still gets considered.
+        i += 1
+
+    return [ln for ln in out if ln != ""]
+
+
+def promote_immediate_2d_array_constants(lines):
+    """Promote immediate rank-2 array `decl` + `name = reshape([const, ...],
+    [d1, d2], ...)` to a `parameter` array with an explicit shape, e.g.:
+
+      real(kind=dp), allocatable :: Sigma_true(:,:)
+      ...
+      Sigma_true = reshape([1.0_dp, 0.3_dp, ...], [3, 3], order=[2, 1])
+    ->
+      real(kind=dp), parameter :: Sigma_true(3,3) = reshape([1.0_dp, 0.3_dp,
+         & ...], [3, 3], order=[2, 1])
+
+    Conservative rules (mirrors promote_immediate_array_constants):
+    - declaration is `TYPE, allocatable :: name(:,:)` (rank-2, no other attrs)
+    - the first statement (scanning forward at the same depth, skipping
+      unrelated statements) that mentions `name` is exactly
+      `name = reshape([const, const, ...], [d1, d2], ...)`, where every
+      element of the source array is compile-time literal, the explicit
+      shape `[d1, d2]` is two literal integers, and any further reshape
+      argument (e.g. `order=[...]`) is itself literal-only
+    - name is never plain-reassigned nor element/section assigned anywhere
+      later in the enclosing scope, at any depth within it
+    """
+    out = list(lines)
+    n = len(out)
+
+    start_re = re.compile(
+        r"^\s*(program|module|subroutine|function|block)\b(?!\s+data\b)(?!.*\bend\b)",
+        flags=re.IGNORECASE,
+    )
+    end_re = re.compile(
+        r"^\s*end\s*(program|module|subroutine|function|block)\b",
+        flags=re.IGNORECASE,
+    )
+    decl_re = re.compile(
+        r"^\s*(integer|real\(kind=dp\)|logical|complex\(kind=dp\))\s*,\s*allocatable\s*::\s*([A-Za-z_]\w*)\s*\(\s*:\s*,\s*:\s*\)\s*$",
+        flags=re.IGNORECASE,
+    )
+    asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
+    elem_asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*\(")
+    tok_re = re.compile(r"\b[A-Za-z_]\w*\b")
+    func_hdr_re = re.compile(r"^\s*.*\bfunction\s+([A-Za-z_]\w*)\s*\(", flags=re.IGNORECASE)
+    res_re = re.compile(r"\bresult\s*\(\s*([A-Za-z_]\w*)\s*\)", flags=re.IGNORECASE)
+    reshape_re = re.compile(r"^reshape\s*\((.*)\)\s*$", flags=re.IGNORECASE | re.DOTALL)
+
+    def _is_scope_start(code):
+        if start_re.match(code):
+            return True
+        lc = code.lower()
+        if lc.startswith("end "):
+            return False
+        if re.search(r"\b(function|subroutine)\b", code, flags=re.IGNORECASE):
+            return True
+        return False
+
+    depth = 0
+    depth_at = [0] * n
+    for i, ln in enumerate(out):
+        code = ln.split("!", 1)[0].strip()
+        if end_re.match(code):
+            depth = max(0, depth - 1)
+        depth_at[i] = depth
+        if _is_scope_start(code):
+            depth += 1
+
+    def _split_top_level(s):
+        # Splits on top-level commas, tracking both "(" ")" and "[" "]"
+        # nesting (reshape's array arguments use "[" "]", not "(" ")").
+        parts = []
+        cur = []
+        d = 0
+        in_str = False
+        for ch in s:
+            if ch == '"':
+                cur.append(ch)
+                in_str = not in_str
+                continue
+            if in_str:
+                cur.append(ch)
+                continue
+            if ch in "([":
+                d += 1
+                cur.append(ch)
+                continue
+            if ch in ")]":
+                d = max(0, d - 1)
+                cur.append(ch)
+                continue
+            if ch == "," and d == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                continue
+            cur.append(ch)
+        if cur:
+            parts.append("".join(cur).strip())
+        return parts
+
+    def _elem_is_const(tok_expr):
+        s = tok_expr.strip()
+        if not s:
+            return False
+        if s.startswith('"') and s.endswith('"'):
+            return True
+        for t in tok_re.findall(s):
+            tl = t.lower()
+            if tl in {"dp", "true", "false"}:
+                continue
+            if re.fullmatch(r"\d+", t):
+                continue
+            return False
+        return True
+
+    def _reshape_literal_dims(rhs):
+        rhs_s = rhs.strip()
+        m = reshape_re.match(rhs_s)
+        if not m:
+            return None
+        args = _split_top_level(m.group(1))
+        if len(args) < 2:
+            return None
+        src = args[0].strip()
+        shape_txt = args[1].strip()
+        if not (src.startswith("[") and src.endswith("]")):
+            return None
+        src_elems = _split_top_level(src[1:-1])
+        if not src_elems or any(not _elem_is_const(e) for e in src_elems):
+            return None
+        if not (shape_txt.startswith("[") and shape_txt.endswith("]")):
+            return None
+        shape_elems = [e.strip() for e in _split_top_level(shape_txt[1:-1])]
+        if len(shape_elems) != 2 or any(not re.fullmatch(r"\d+", d) for d in shape_elems):
+            return None
+        for extra in args[2:]:
+            extra_s = extra.strip()
+            mo = re.match(r"^order\s*=\s*(\[.*\])$", extra_s, flags=re.IGNORECASE | re.DOTALL)
+            if not mo:
+                # Conservative: bail on any other reshape argument (e.g.
+                # `pad=`) rather than guessing whether it's literal-safe.
+                return None
+            order_elems = [e.strip() for e in _split_top_level(mo.group(1)[1:-1])]
+            if any(not re.fullmatch(r"\d+", oe) for oe in order_elems):
+                return None
+        return shape_elems
+
+    def _enclosing_function_result_name(idx, depth_here):
+        for h in range(idx - 1, -1, -1):
+            if depth_at[h] >= depth_here:
+                continue
+            code_h = out[h].split("!", 1)[0].strip()
+            if not code_h or code_h.lower().startswith("end "):
+                continue
+            mh = func_hdr_re.match(code_h)
+            if not mh:
+                continue
+            fname = mh.group(1)
+            mr = res_re.search(code_h)
+            rname = mr.group(1) if mr else fname
+            return rname.lower()
+        return None
+
+    i = 0
+    while i < n:
+        code_i = out[i].split("!", 1)[0].strip()
+        mdecl = decl_re.match(code_i)
+        if not mdecl:
+            i += 1
+            continue
+        tdecl = mdecl.group(1).strip()
+        nm = mdecl.group(2)
+        d = depth_at[i]
+        nm_re = re.compile(r"\b" + re.escape(nm) + r"\b", flags=re.IGNORECASE)
+
+        j = i + 1
+        masn = None
+        while j < n:
+            if depth_at[j] < d:
+                j = n
+                break
+            code_j = out[j].split("!", 1)[0].strip()
+            if code_j == "" or depth_at[j] != d:
+                j += 1
+                continue
+            if nm_re.search(code_j):
+                masn = asn_re.match(code_j)
+                break
+            j += 1
+        if j >= n or masn is None or masn.group(1).lower() != nm.lower():
+            i += 1
+            continue
+
+        # The reshape call's argument list commonly spans a "&"-continued
+        # statement (e.g. the source array literal is long); join every
+        # continuation line before parsing so the dims/literal check sees
+        # the whole call, and remember the full line range to blank out.
+        end_idx = j
+        joined_parts = [code_j]
+        while joined_parts[-1].endswith("&") and end_idx + 1 < n:
+            end_idx += 1
+            cont_code = out[end_idx].split("!", 1)[0].strip()
+            if cont_code.startswith("&"):
+                cont_code = cont_code[1:].strip()
+            joined_parts[-1] = joined_parts[-1][:-1].rstrip()
+            joined_parts.append(cont_code)
+        joined = " ".join(p for p in joined_parts if p)
+        masn_full = asn_re.match(joined)
+        if not masn_full or masn_full.group(1).lower() != nm.lower():
+            i += 1
+            continue
+        dims = _reshape_literal_dims(masn_full.group(2))
+        if dims is None:
+            i += 1
+            continue
+
+        encl_res = _enclosing_function_result_name(i, d)
+        if encl_res is not None and nm.lower() == encl_res:
+            i += 1
+            continue
+
+        scope_end = n
+        for k in range(end_idx + 1, n):
+            if depth_at[k] < d:
+                scope_end = k
+                break
+
+        # See promote_immediate_array_constants: a same-line conditional
+        # form (`if (cond) nm = ...` / `if (cond) nm(k) = ...`) doesn't
+        # match asn_re/elem_asn_re (anchored at line start), so it needs
+        # its own check.
+        cond_mut_re = re.compile(rf"(?:^\s*|\)\s*|;\s*){re.escape(nm)}\s*[=(]", flags=re.IGNORECASE)
+        mutated = False
+        for k in range(end_idx + 1, scope_end):
+            code_k = out[k].split("!", 1)[0].strip()
+            mk = asn_re.match(code_k)
+            if mk and mk.group(1).lower() == nm.lower():
+                mutated = True
+                break
+            mek = elem_asn_re.match(code_k)
+            if mek and mek.group(1).lower() == nm.lower():
+                mutated = True
+                break
+            if cond_mut_re.search(code_k):
+                mutated = True
+                break
+        if not mutated and _name_used_as_call_arg(out, nm, end_idx + 1, scope_end):
+            mutated = True
+        if mutated:
+            i += 1
+            continue
+
+        indent = re.match(r"^\s*", out[i]).group(0)
+        rhs_text = masn_full.group(2).strip()
+        out[i] = f"{indent}{tdecl}, parameter :: {nm}({dims[0]},{dims[1]}) = {rhs_text}"
+        for k in range(j, end_idx + 1):
+            out[k] = ""
+        i += 1
+
+    return [ln for ln in out if ln != ""]
+
+
+def split_declarations_to_single_names(lines):
+    """Split a multi-entity declaration statement into one entity per line.
+
+    generate_flat groups same-type locals into a single (possibly
+    "&"-continued) declaration statement, e.g.
+    `real(kind=dp), allocatable :: a(:), b(:,:)`. promote_immediate_scalar_
+    constants / promote_immediate_array_constants only recognize a
+    candidate when its declaration already sits alone on its own line, so
+    this runs first to undo that grouping. coalesce_nonadjacent_declarations
+    / coalesce_simple_declarations, which run right after the promote
+    passes, merge same-spec *uninitialized* entities back together, so any
+    entity that wasn't promoted (and therefore still has no initializer)
+    ends up regrouped as before; only genuinely promoted entities (which
+    now carry a `parameter :: name = ...` initializer, which those
+    coalescing passes explicitly skip) stay on their own line.
+    """
+    decl_re = re.compile(r"^(\s*)(.+?)\s*::\s*(.+)$", re.IGNORECASE)
+    # A genuine declaration statement opens with a type-spec keyword.
+    # Executable statements can also contain "::" -- an array constructor
+    # with an explicit type-spec prefix, e.g. `x = [character(len=n) ::
+    # ...]` -- so this guard is required to avoid misidentifying (and then
+    # mangling, by splitting on its internal commas) that assignment as a
+    # declaration statement.
+    decl_start_re = re.compile(
+        r"^\s*(?:integer|real|logical|character|complex|type|class|procedure)\b",
+        re.IGNORECASE,
+    )
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def _split_entities(text):
+        parts = []
+        depth = 0
+        cur = []
+        for ch in text:
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+            elif ch == ")":
+                depth -= 1
+                cur.append(ch)
+            elif ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        code, bang, _comment = ln.rstrip("\r\n").partition("!")
+        stripped = code.strip()
+        if bang or "::" not in stripped or not decl_start_re.match(stripped):
+            out.append(ln)
+            i += 1
+            continue
+        stmt_lines = [ln]
+        j = i
+        while _ends_continued(lines[j]) and j + 1 < n:
+            j += 1
+            stmt_lines.append(lines[j])
+        if any("!" in sl for sl in stmt_lines):
+            out.extend(stmt_lines)
+            i = j + 1
+            continue
+        joined_parts = []
+        for k, sl in enumerate(stmt_lines):
+            c = sl.rstrip("\r\n").strip()
+            if k > 0 and c.startswith("&"):
+                c = c[1:].strip()
+            if c.endswith("&"):
+                c = c[:-1].rstrip()
+            joined_parts.append(c)
+        joined = " ".join(p for p in joined_parts if p)
+        if re.match(r"^\s*use\b", joined, re.IGNORECASE):
+            out.extend(stmt_lines)
+            i = j + 1
+            continue
+        m = decl_re.match(joined)
+        if not m:
+            out.extend(stmt_lines)
+            i = j + 1
+            continue
+        indent = stmt_lines[0][: len(stmt_lines[0]) - len(stmt_lines[0].lstrip())]
+        spec = m.group(2).strip()
+        entities = _split_entities(m.group(3).strip())
+        if len(entities) <= 1:
+            out.extend(stmt_lines)
+            i = j + 1
+            continue
+        eol = _line_eol(stmt_lines[-1]) or "\n"
+        for ent in entities:
+            out.append(f"{indent}{spec} :: {ent}{eol}")
+        i = j + 1
+    return out
 
 
 def normalize_zero_based_unit_stride_loops(lines):
@@ -4975,7 +6248,47 @@ def remove_redundant_first_guarded_deallocate(lines):
         r"^\s*if\s*\(\s*allocated\s*\(\s*([a-z_]\w*)\s*\)\s*\)\s*deallocate\s*\(\s*\1\s*\)\s*$",
         re.IGNORECASE,
     )
-    re_alloc = re.compile(r"^\s*allocate\s*\(\s*([a-z_]\w*)\s*\(.+\)\s*\)\s*$", re.IGNORECASE)
+    re_alloc_start = re.compile(r"^\s*allocate\(", re.IGNORECASE)
+
+    def _find_matching_rparen(s, lparen_idx):
+        depth = 0
+        i = lparen_idx
+        while i < len(s):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _alloc_target_name(code):
+        # Matches `allocate(name(dims))` and `allocate(name(dims), kw=...)`
+        # -- an explicit shape plus any further keyword arguments (e.g. the
+        # `source=` merge_allocate_then_scalar_fill_to_source may already
+        # have added) -- but not a bare `allocate(name)` or a multi-entity
+        # `allocate(a(...), b(...))`, since neither implies "the very next
+        # statement is what fills this specific name."
+        m0 = re_alloc_start.match(code)
+        if not m0:
+            return None
+        open_idx = m0.end() - 1
+        close_idx = _find_matching_rparen(code, open_idx)
+        if close_idx < 0 or code[close_idx + 1 :].strip() != "":
+            return None
+        inner = code[open_idx + 1 : close_idx].strip()
+        mname = re.match(r"^([a-z_]\w*)\s*\(", inner, re.IGNORECASE)
+        if not mname:
+            return None
+        name_close = _find_matching_rparen(inner, mname.end() - 1)
+        if name_close < 0:
+            return None
+        rest = inner[name_close + 1 :].strip()
+        if rest and not rest.startswith(","):
+            return None
+        return mname.group(1)
+
     re_declish = re.compile(
         r"^\s*(?:use\b|implicit\b|contains\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|interface\b|module\b|program\b|subroutine\b|function\b|end\b)",
         re.IGNORECASE,
@@ -5007,8 +6320,8 @@ def remove_redundant_first_guarded_deallocate(lines):
         if j >= len(out):
             i += 1
             continue
-        m_alloc = re_alloc.match(out[j].split("!", 1)[0].strip())
-        if not (m_alloc and m_alloc.group(1).lower() == var.lower()):
+        alloc_name = _alloc_target_name(out[j].split("!", 1)[0].strip())
+        if not (alloc_name and alloc_name.lower() == var.lower()):
             i += 1
             continue
 
@@ -5135,6 +6448,450 @@ def combine_parenthesized_integer_offset(lines):
             code = pat.sub(_repl, code)
         out.append(f"{code}{bang}{comment}" if bang else code)
     return out
+
+
+def simplify_paren_group_before_addsub(lines):
+    """Drop parens around a bare additive group immediately followed by a
+    further `+`/`-`, e.g. `do t = p, (ntot + p) - 1` ->
+    `do t = p, ntot + p - 1`.
+
+    Generalizes combine_parenthesized_integer_offset to a non-literal
+    second operand: it can't fold two literals into one, but flattening
+    still holds for the same reason -- `+`/`-` are left-associative with
+    equal precedence, so `(A) op C` == `A op C` for ANY expression A, as
+    long as nothing before the parens could flip the sign of A's own
+    terms. Matching that function's own convention, only a `(` or `,`
+    boundary right before the parens is treated as safe to drop from;
+    anything else (a bare `=`, a preceding `-`/`+`/`*`/`/` operator, ...)
+    is left untouched, since a preceding subtraction in particular would
+    need to flip the sign of every term inside, not just drop the parens.
+    """
+    def _find_matching_close(s, open_idx):
+        depth = 0
+        for i in range(open_idx, len(s)):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    logical_guard_re = re.compile(
+        r"\.and\.|\.or\.|\.not\.|\.eqv\.|\.neqv\.|==|/=|<=|>=|(?<![</>=])[<>](?!=)"
+    )
+
+    def _has_top_level_comma(s):
+        depth = 0
+        for ch in s:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return True
+        return False
+
+    def _simplify_once(code):
+        i = 0
+        n = len(code)
+        while i < n:
+            if code[i] != "(":
+                i += 1
+                continue
+            p = i - 1
+            while p >= 0 and code[p].isspace():
+                p -= 1
+            prev_ch = code[p] if p >= 0 else ""
+            if prev_ch not in "(,":
+                i += 1
+                continue
+            close_idx = _find_matching_close(code, i)
+            if close_idx == -1:
+                i += 1
+                continue
+            inner = code[i + 1 : close_idx]
+            if logical_guard_re.search(inner) or _has_top_level_comma(inner):
+                i += 1
+                continue
+            q = close_idx + 1
+            while q < n and code[q].isspace():
+                q += 1
+            if q < n and code[q] in "+-":
+                new_code = code[:i] + inner + code[close_idx + 1 :]
+                return new_code, True
+            i += 1
+        return code, False
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        changed = True
+        while changed:
+            code, changed = _simplify_once(code)
+        out.append(f"{code}{bang}{comment}" if bang else code)
+    return out
+
+
+def merge_blank_output_before_formatted_output(lines):
+    """Merge a bare blank-line output statement immediately followed by a
+    formatted print/write into one statement, prefixing the format with a
+    `/` per blank line -- e.g.
+
+      print *
+      write(*,"(a)") "fit:"
+    ->
+      write(*,"(/,a)") "fit:"
+
+    The `/` edit descriptor terminates the (empty) current record before
+    the rest of the format runs, so this is exactly equivalent output,
+    just one I/O statement instead of two. `print *` and `write(*,*)` are
+    interchangeable blank-line producers, and `write(*,"(FMT)") args` /
+    `print "(FMT)", args` are interchangeable formatted-output statements
+    -- all four combinations are merged, and consecutive blank statements
+    add one `/` each.
+    """
+    blank_re = re.compile(r"^\s*(?:print\s*\*|write\s*\(\s*\*\s*,\s*\*\s*\))\s*$", flags=re.IGNORECASE)
+    # Non-greedy fmt_full capture: the format string is the FIRST
+    # quote-delimited span after "write(*," / "print ", so it must match
+    # up to the nearest matching quote, not the rightmost one (which could
+    # otherwise land inside a quoted string among the trailing args).
+    write_fmt_re = re.compile(r'^(\s*)write\s*\(\s*\*\s*,\s*(["\'])(.*?)\2\s*\)\s*(.*)$', flags=re.IGNORECASE)
+    print_fmt_re = re.compile(r'^(\s*)print\s+(["\'])(.*?)\2\s*(?:,\s*(.*))?$', flags=re.IGNORECASE)
+
+    out = list(lines)
+    n = len(out)
+    i = 0
+    while i < n:
+        code_i = out[i].split("!", 1)[0].rstrip()
+        if not blank_re.match(code_i):
+            i += 1
+            continue
+        j = i
+        blanks = 0
+        while j < n:
+            cj = out[j].split("!", 1)[0].rstrip()
+            if blank_re.match(cj):
+                blanks += 1
+                j += 1
+                continue
+            break
+        if j >= n:
+            i += 1
+            continue
+        code_j, bang_j, comment_j = out[j].partition("!")
+        mw = write_fmt_re.match(code_j)
+        mp = None if mw else print_fmt_re.match(code_j)
+        if not mw and not mp:
+            i += 1
+            continue
+        if mw:
+            indent, quote, fmt_full, args = mw.groups()
+        else:
+            indent, quote, fmt_full, args = mp.groups()
+            args = args or ""
+        if not (fmt_full.startswith("(") and fmt_full.endswith(")")):
+            i += 1
+            continue
+        fmt_inner = fmt_full[1:-1]
+        slashes = ",".join(["/"] * blanks)
+        new_fmt = f"{slashes},{fmt_inner}" if fmt_inner else slashes
+        if mw:
+            new_code = f"{indent}write(*,{quote}({new_fmt}){quote})"
+            if args:
+                new_code += f" {args}"
+        else:
+            new_code = f'{indent}print {quote}({new_fmt}){quote}'
+            if args:
+                new_code += f", {args}"
+        out[j] = new_code + ("!" + comment_j if bang_j else "")
+        for k in range(i, j):
+            out[k] = ""
+        i = j + 1
+
+    return [ln for ln in out if ln != ""]
+
+
+def _split_format_items(fmt_body):
+    """Split a format spec's inner text on top-level commas (respecting
+    nested parens and quoted literal-text items)."""
+    items = []
+    cur = []
+    depth = 0
+    in_single = False
+    in_double = False
+    for ch in fmt_body:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            cur.append(ch)
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            cur.append(ch)
+            continue
+        if not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                t = "".join(cur).strip()
+                if t:
+                    items.append(t)
+                cur = []
+                continue
+        cur.append(ch)
+    t = "".join(cur).strip()
+    if t:
+        items.append(t)
+    return items
+
+
+def _compact_format_items_optimal(items):
+    """Fold format items into repeat-count descriptors, minimizing the
+    resulting number of top-level tokens.
+
+    A plain greedy left-to-right "merge consecutive identical items"
+    pass gets this wrong on cases like `a, a, f10.4, a, f10.4, a, f10.4`:
+    greedily merging the leading `a, a` into `2a` first leaves
+    `f10.4, a, f10.4, a, f10.4`, which doesn't group cleanly. The
+    actually-optimal answer leaves the first `a` standalone so the
+    remaining six items form a clean 3x repeat of the pair `a, f10.4`
+    (`a, 3(a, f10.4)`). Finding that requires comparing, at each
+    position, every candidate repeated-group length against the best
+    possible compaction of everything after it -- a small DP over
+    suffixes (cheap: format strings are short).
+    """
+    n = len(items)
+    lowered = [it.lower() for it in items]
+    dp_cost = [0] * (n + 1)
+    dp_choice = [None] * n  # None = "take items[i] alone"; else (L, R)
+    for i in range(n - 1, -1, -1):
+        best_cost = 1 + dp_cost[i + 1]
+        best_choice = None
+        for length in range(1, n - i + 1):
+            block = lowered[i : i + length]
+            reps = 1
+            pos = i + length
+            while pos + length <= n and lowered[pos : pos + length] == block:
+                reps += 1
+                pos += length
+            if reps < 2:
+                continue
+            cost = 1 + dp_cost[i + length * reps]
+            if cost < best_cost:
+                best_cost = cost
+                best_choice = (length, reps)
+        dp_cost[i] = best_cost
+        dp_choice[i] = best_choice
+
+    out = []
+    i = 0
+    while i < n:
+        choice = dp_choice[i]
+        if choice is None:
+            out.append(items[i])
+            i += 1
+            continue
+        length, reps = choice
+        block = items[i : i + length]
+        out.append(f"{reps}{block[0]}" if length == 1 else f"{reps}({', '.join(block)})")
+        i += length * reps
+    return out
+
+
+def compact_format_descriptor_string(fmt_body, max_items=60):
+    """Compact repeated edit descriptors in a format spec's inner text.
+
+    Example: `a, a, f10.4, a, f10.4, a, f10.4` -> `a, 3(a, f10.4)`.
+
+    `max_items` bounds the (cheap, but still superlinear) DP cost for a
+    pathologically long format string -- past that, the string is left
+    untouched rather than compacted.
+    """
+    items = _split_format_items(fmt_body)
+    if len(items) <= 1 or len(items) > max_items:
+        return fmt_body.strip()
+    return ", ".join(_compact_format_items_optimal(items))
+
+
+def compact_repeated_format_descriptors(lines):
+    """Rewrite WRITE/READ/PRINT format-string literals to use repeat
+    descriptors (a count before a single descriptor, or before a
+    parenthesized group) when doing so shortens the format.
+
+    Only touches a quoted literal whose entire content is a parenthesized
+    format spec (`"(...)"` / `'(...)'`) with no embedded quote characters
+    of either kind -- a format string that itself embeds literal text via
+    a nested string constant (e.g. `"(a,' - ',a)"`) is left alone rather
+    than risking a misparse of its nested quoting.
+    """
+    fmt_lit_pat = re.compile(r"(['\"])\(([^'\"]*)\)\1")
+
+    def _fmt_sub(m):
+        q, body = m.group(1), m.group(2)
+        return f"{q}({compact_format_descriptor_string(body)}){q}"
+
+    out = []
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        if re.search(r"(?i)\b(?:write|read|print)\b", code):
+            code = fmt_lit_pat.sub(_fmt_sub, code)
+        out.append(f"{code}{bang}{comment}" if bang else code)
+    return out
+
+
+def strip_redundant_parens_in_output_item_list(lines):
+    """Strip a redundant whole-item outer paren wrap from a WRITE/PRINT
+    output item list, e.g.
+
+      write(*,"(...)") a, b, (c - d)
+    ->
+      write(*,"(...)") a, b, c - d
+
+    Unlike a function call or array subscript, a write/print statement's
+    output item list is a bare, unparenthesized comma list sitting after
+    the format spec -- so simplify_argument_list_parens (which only
+    strips parens found INSIDE a matching paren pair) never sees it. Each
+    item is delimited purely by commas (or the start/end of the list), so
+    a wrap covering an item's *entire* text is always pure grouping and
+    safe to drop, regardless of what's inside it.
+
+    Joins "&"-continued physical lines into one logical statement first
+    (a write's item list is where these transpiler-generated line splits
+    most often land), then re-emits as a single, possibly now much
+    shorter, physical line -- the existing line-wrap pass re-wraps it if
+    it's still too long.
+    """
+    write_start_re = re.compile(r"^(\s*)write\s*\(", flags=re.IGNORECASE)
+    print_start_re = re.compile(r'^(\s*)print\s+(["\'])', flags=re.IGNORECASE)
+
+    def _find_matching_rparen(s, lparen_idx):
+        depth = 0
+        in_str = False
+        i = lparen_idx
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _split_top_level_commas(s):
+        parts = []
+        cur = []
+        depth = 0
+        in_str = False
+        for ch in s:
+            if ch == '"':
+                cur.append(ch)
+                in_str = not in_str
+                continue
+            if in_str:
+                cur.append(ch)
+                continue
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                cur.append(ch)
+                continue
+            if ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                continue
+            cur.append(ch)
+        if cur:
+            parts.append("".join(cur).strip())
+        return parts
+
+    def _ends_continued(ln):
+        return ln.split("!", 1)[0].rstrip().endswith("&")
+
+    out = list(lines)
+    n = len(out)
+    i = 0
+    while i < n:
+        ln = out[i]
+        code0 = ln.split("!", 1)[0]
+        mw = write_start_re.match(code0)
+        mp = None if mw else print_start_re.match(code0)
+        if not mw and not mp:
+            i += 1
+            continue
+
+        end_idx = i
+        joined_parts = [code0.rstrip()]
+        while _ends_continued(out[end_idx]) and end_idx + 1 < n:
+            end_idx += 1
+            c = out[end_idx].split("!", 1)[0].strip()
+            if c.startswith("&"):
+                c = c[1:].strip()
+            if joined_parts[-1].endswith("&"):
+                joined_parts[-1] = joined_parts[-1][:-1].rstrip()
+            joined_parts.append(c)
+        joined = " ".join(p for p in joined_parts if p)
+
+        if mw:
+            open_idx = mw.end() - 1
+            close_idx = _find_matching_rparen(joined, open_idx)
+            if close_idx < 0:
+                i = end_idx + 1
+                continue
+            head = joined[: close_idx + 1]
+            items_txt = joined[close_idx + 1 :].strip()
+        else:
+            q = mp.group(2)
+            close_q = joined.find(q, mp.end())
+            if close_q < 0:
+                i = end_idx + 1
+                continue
+            head = joined[: close_q + 1]
+            rest = joined[close_q + 1 :].strip()
+            items_txt = rest[1:].strip() if rest.startswith(",") else ""
+
+        if not items_txt:
+            i = end_idx + 1
+            continue
+
+        items = _split_top_level_commas(items_txt)
+        changed = False
+        new_items = []
+        for it in items:
+            s = it.strip()
+            if _is_wrapped_by_outer_parens(s):
+                stripped = strip_redundant_outer_parens_expr(s)
+                if stripped != s:
+                    changed = True
+                new_items.append(stripped)
+            else:
+                new_items.append(s)
+        if not changed:
+            i = end_idx + 1
+            continue
+
+        # `head` already carries the original first line's leading
+        # whitespace, since `joined` was built from unstripped code0 --
+        # prepending indent again here would double it.
+        out[i] = f"{head} {', '.join(new_items)}"
+        for k in range(i + 1, end_idx + 1):
+            out[k] = ""
+        i = end_idx + 1
+
+    return [ln for ln in out if ln != ""]
 
 
 def simplify_redundant_unary_minus_parens(lines):
@@ -6582,6 +8339,16 @@ def detect_needed_helpers(tree):
                 else:
                     needed.add("str_join")
                     needed.add("strvec_t")
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"append", "extend"}:
+                # Conservative: added whenever *any* `.append(`/`.extend(`
+                # call exists, without trying to determine ahead of time
+                # (before type inference has run) whether the target ends
+                # up as a character list -- remove_unused_use_only_imports
+                # prunes this from the final `use` clause if it never
+                # actually gets called.
+                needed.add("grow_and_set_char")
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "insert":
+                needed.add("insert_char")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -6707,6 +8474,163 @@ def build_list_count_map(tree, reserved_names=None):
     # keep lists that are appended to or printed
     keep = {name for name in out if name in appended_lists or name in printed_lists}
     return {k: out[k] for k in keep}
+
+
+def compute_list_final_sizes(tree):
+    """For a count-mapped list built by `name = []` immediately followed by
+    one or more consecutive `for VAR in range(N): ...` loop nests, each
+    nest containing nothing but further such nested loops down to a single
+    unconditional `name.append(...)`, return a Fortran integer expression
+    for that list's exact final length (e.g. `k + (p * (k * k))`).
+
+    Deliberately narrow: falls back (omits the list) for anything that
+    isn't this exact shape -- a conditional append, a non-range() loop, a
+    loop body with more than the one statement, an extend(), any other
+    statement woven in between the loop nests, or an append/extend to the
+    same name anywhere else in the tree. `grow_and_set_char` still checks
+    size on every call, so an under- or wrongly-omitted count only costs
+    the old per-call growth rate back for the affected list; the point of
+    this analysis is purely to let the *common* case skip that entirely,
+    never to let an incorrect count under-allocate silently.
+    """
+
+    def _simple_int_expr(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return str(node.value)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            left = _simple_int_expr(node.left)
+            right = _simple_int_expr(node.right)
+            if left is None or right is None:
+                return None
+            op = {"Add": "+", "Sub": "-", "Mult": "*"}[type(node.op).__name__]
+            return f"({left} {op} {right})"
+        return None
+
+    def _range_loop_count(for_node):
+        it = for_node.iter
+        if not (isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range"):
+            return None
+        if it.keywords:
+            return None
+        if len(it.args) == 1:
+            return _simple_int_expr(it.args[0])
+        if len(it.args) == 2:
+            a = _simple_int_expr(it.args[0])
+            b = _simple_int_expr(it.args[1])
+            if a is None or b is None:
+                return None
+            return f"({b} - {a})"
+        return None
+
+    def _is_str_valued(node):
+        # Conservative: only forms this pre-scan can be sure are strings
+        # without the translator's own (not-yet-available-here) type
+        # inference. Sizing the pre-allocation only matters for
+        # character lists (numeric ones already grow amortized), so
+        # anything else just means "don't apply this optimization",
+        # not "apply it incorrectly."
+        if isinstance(node, ast.JoinedStr):
+            return True
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        return False
+
+    def _is_char_append_call(stmt, list_name):
+        return (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and isinstance(stmt.value.func.value, ast.Name)
+            and stmt.value.func.value.id == list_name
+            and stmt.value.func.attr == "append"
+            and len(stmt.value.args) == 1
+            and _is_str_valued(stmt.value.args[0])
+        )
+
+    def _non_docstring_body(body):
+        return [
+            s
+            for s in body
+            if not (
+                isinstance(s, ast.Expr)
+                and isinstance(s.value, ast.Constant)
+                and isinstance(s.value.value, str)
+            )
+        ]
+
+    def _pure_append_nest_count(for_node, list_name):
+        if for_node.orelse:
+            return None
+        bound = _range_loop_count(for_node)
+        if bound is None:
+            return None
+        body = _non_docstring_body(for_node.body)
+        if len(body) != 1:
+            return None
+        inner = body[0]
+        if isinstance(inner, ast.For):
+            inner_count = _pure_append_nest_count(inner, list_name)
+            if inner_count is None:
+                return None
+            return f"({bound} * {inner_count})"
+        if _is_char_append_call(inner, list_name):
+            return bound
+        return None
+
+    def _count_append_extend_sites(node, list_name):
+        n = 0
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Expr)
+                and isinstance(sub.value, ast.Call)
+                and isinstance(sub.value.func, ast.Attribute)
+                and isinstance(sub.value.func.value, ast.Name)
+                and sub.value.func.value.id == list_name
+                and sub.value.func.attr in {"append", "extend"}
+            ):
+                n += 1
+        return n
+
+    sizes = {}
+
+    def _handle_body(body):
+        n = len(body)
+        i = 0
+        while i < n:
+            stmt = body[i]
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.List)
+                and len(stmt.value.elts) == 0
+            ):
+                list_name = stmt.targets[0].id
+                j = i + 1
+                parts = []
+                while j < n and isinstance(body[j], ast.For):
+                    cnt_expr = _pure_append_nest_count(body[j], list_name)
+                    if cnt_expr is None:
+                        break
+                    parts.append(cnt_expr)
+                    j += 1
+                if parts:
+                    consumed_sites = sum(_count_append_extend_sites(body[k], list_name) for k in range(i + 1, j))
+                    total_sites = _count_append_extend_sites(tree, list_name)
+                    if consumed_sites == total_sites:
+                        sizes[list_name] = " + ".join(parts)
+                        i = j
+                        continue
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(stmt, field, None)
+                if sub:
+                    _handle_body(sub)
+            i += 1
+
+    _handle_body(tree.body)
+    return sizes
 
 
 def collect_vectorize_aliases(tree, local_funcs=None):
@@ -8224,6 +10148,75 @@ def runtime_helper_templates():
          write(*,"(a)") "]"
       end subroutine print_int_list"""
 
+    pcl_pub = (
+        "public :: print_char_list  !@pyapi kind=subroutine "
+        "args=a:character(:):intent(in),n:integer:intent(in) "
+        "desc=\"print character list a(1:n) in python-style [..] format\""
+    )
+
+    pcl_blk = """      subroutine print_char_list(a, n)
+         ! print character list a(1:n) in python-style ['..', ...] format
+         character(len=*), intent(in) :: a(:)  ! array containing values to print
+         integer, intent(in) :: n               ! number of elements from a to print
+         integer :: j
+         if (n <= 0) then
+            write(*,"(a)") "[]"
+            return
+         end if
+         write(*,"(a)", advance="no") "["
+         do j = 1, n
+            if (j > 1) write(*,"(a)", advance="no") ", "
+            write(*,"(a)", advance="no") "'" // trim(a(j)) // "'"
+         end do
+         write(*,"(a)") "]"
+      end subroutine print_char_list"""
+
+    prl_pub = (
+        "public :: print_real_list  !@pyapi kind=subroutine "
+        "args=a:real(:):intent(in),n:integer:intent(in) "
+        "desc=\"print real list a(1:n) in python-style [..] format\""
+    )
+
+    prl_blk = """      subroutine print_real_list(a, n)
+         ! print real list a(1:n) in python-style [..] format
+         real(kind=dp), intent(in) :: a(:)  ! array containing values to print
+         integer, intent(in) :: n            ! number of elements from a to print
+         integer :: j
+         if (n <= 0) then
+            write(*,"(a)") "[]"
+            return
+         end if
+         write(*,"(a)", advance="no") "["
+         do j = 1, n
+            if (j > 1) write(*,"(a)", advance="no") ", "
+            write(*,"(a)", advance="no") trim(py_str(a(j)))
+         end do
+         write(*,"(a)") "]"
+      end subroutine print_real_list"""
+
+    plgl_pub = (
+        "public :: print_log_list  !@pyapi kind=subroutine "
+        "args=a:logical(:):intent(in),n:integer:intent(in) "
+        "desc=\"print logical list a(1:n) in python-style [..] format\""
+    )
+
+    plgl_blk = """      subroutine print_log_list(a, n)
+         ! print logical list a(1:n) in python-style [..] format
+         logical, intent(in) :: a(:)  ! array containing values to print
+         integer, intent(in) :: n      ! number of elements from a to print
+         integer :: j
+         if (n <= 0) then
+            write(*,"(a)") "[]"
+            return
+         end if
+         write(*,"(a)", advance="no") "["
+         do j = 1, n
+            if (j > 1) write(*,"(a)", advance="no") ", "
+            write(*,"(a)", advance="no") trim(py_str(a(j)))
+         end do
+         write(*,"(a)") "]"
+      end subroutine print_log_list"""
+
     sil_pub = (
         "public :: str_int_list  !@pyapi kind=function ret=character "
         "args=a:integer(:):intent(in),n:integer:intent(in) "
@@ -9164,6 +11157,9 @@ def runtime_helper_templates():
         "isqrt_int": (isqrt_pub, isqrt_blk),
         "mod_pow_int": (mod_pow_pub, mod_pow_blk),
         "print_int_list": (pil_pub, pil_blk),
+        "print_char_list": (pcl_pub, pcl_blk),
+        "print_real_list": (prl_pub, prl_blk),
+        "print_log_list": (plgl_pub, plgl_blk),
         "str_int_list": (sil_pub, sil_blk),
         "random_uniform": (ru_pub, ru_blk),
         "random_randrange_int": (randrange_pub, randrange_blk),
@@ -12037,12 +14033,14 @@ class translator(ast.NodeVisitor):
         local_proc_name_aliases=None,
         shape_donor_by_rank=None,
         current_function_name=None,
+        char_list_final_sizes=None,
     ):
         # context: "flat" | "compute" | "run_print"
         self.o = out
         self.params = params
         self.context = context
         self.list_counts = list_counts  # map list var -> count var
+        self.char_list_final_sizes = char_list_final_sizes or {}  # map list var -> Fortran count expr
         self.ints = set()
         self.reals = set()
         self.complexes = set()
@@ -12207,6 +14205,16 @@ class translator(ast.NodeVisitor):
 
     def _list_capacity_var(self, name):
         return f"xp2f_cap_{name}"
+
+    def _list_print_helper_name(self, name):
+        name = self._aliased_name(name)
+        if name in self.alloc_chars:
+            return "print_char_list"
+        if name in self.alloc_reals:
+            return "print_real_list"
+        if name in self.alloc_logs:
+            return "print_log_list"
+        return "print_int_list"
 
     def _resolve_list_alias(self, name):
         cur = name
@@ -18859,6 +20867,14 @@ class translator(ast.NodeVisitor):
                         or name in self.alloc_complexes
                         or name in self.alloc_chars
                     )
+                def _is_alloc_scalar_char_name(name):
+                    # A scalar Python string is always declared
+                    # `character(len=:), allocatable` (deferred length, to
+                    # support reassignment to a different length), so
+                    # `allocated()` works as an "is None" test for it too --
+                    # unlike scalar real/int/logical/complex, which are
+                    # plain (non-allocatable) and have no such test.
+                    return name in self.chars
                 if is_none(a):
                     if isinstance(b, ast.Name) and b.id in self.dict_typed_vars:
                         t = _dict_none_test(b.id)
@@ -18868,7 +20884,10 @@ class translator(ast.NodeVisitor):
                         return "(.not. present(" + b.id + "))" if op is ast.Is else "present(" + b.id + ")"
                     if isinstance(b, ast.Name) and b.id in self.callable_aliases:
                         return ".false." if op is ast.Is else ".true."
-                    if isinstance(b, ast.Name) and _is_alloc_array_name(self._aliased_name(b.id)):
+                    if isinstance(b, ast.Name) and (
+                        _is_alloc_array_name(self._aliased_name(b.id))
+                        or _is_alloc_scalar_char_name(self._aliased_name(b.id))
+                    ):
                         left = self.expr(b)
                         return f"(.not. allocated({left}))" if op is ast.Is else f"allocated({left})"
                     left = self.expr(b)
@@ -18882,7 +20901,10 @@ class translator(ast.NodeVisitor):
                         return "(.not. present(" + a.id + "))" if op is ast.Is else "present(" + a.id + ")"
                     if isinstance(a, ast.Name) and a.id in self.callable_aliases:
                         return ".false." if op is ast.Is else ".true."
-                    if isinstance(a, ast.Name) and _is_alloc_array_name(self._aliased_name(a.id)):
+                    if isinstance(a, ast.Name) and (
+                        _is_alloc_array_name(self._aliased_name(a.id))
+                        or _is_alloc_scalar_char_name(self._aliased_name(a.id))
+                    ):
                         left = self.expr(a)
                         return f"(.not. allocated({left}))" if op is ast.Is else f"allocated({left})"
                     left = self.expr(a)
@@ -32356,6 +34378,25 @@ class translator(ast.NodeVisitor):
             cnt = self.list_counts.get(name, None)
             if cnt is not None:
                 self.o.w(f"if (allocated({name})) deallocate({name})")
+                final_size = self.char_list_final_sizes.get(name)
+                if final_size is not None:
+                    # The append loops immediately following this were
+                    # proven (see compute_list_final_sizes) to append
+                    # exactly this many character values and nothing
+                    # else -- allocate the exact final size up front, so
+                    # grow_and_set_char's per-call size check is a no-op
+                    # the whole way through (it still grows the size too,
+                    # as a safety net, if this count is ever wrong).
+                    # Length starts at 1, same as grow_and_set_char's own
+                    # bootstrap default, and widens exactly as before --
+                    # a larger fixed starting width would print as visible
+                    # trailing padding on every value shorter than it
+                    # (plain "a" prints an argument's full declared
+                    # length), a visible formatting regression for no
+                    # benefit here (length-only reallocations are already
+                    # rare: one per distinct length seen, not one per
+                    # append).
+                    self.o.w(f"allocate(character(len=1) :: {name}(max(0, {final_size})))")
                 self.o.w(f"{cnt} = 0")
                 self.o.w(f"{self._list_capacity_var(name)} = 0")
                 return
@@ -36557,32 +38598,13 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{cnt} = {cnt} + 1")
                 if name_is_alloc:
                     if name in self.alloc_chars:
-                        # A deferred-length `character(len=:), allocatable`
-                        # array can't be allocated with a bare size (no
-                        # length-type-spec/SOURCE/MOLD) -- give it a
-                        # throwaway length-1 placeholder; the very next
-                        # line's auto-reallocating concatenation replaces
-                        # it with the real content and length immediately.
-                        self.o.w(f"if (.not. allocated({name})) allocate(character(len=1) :: {name}(1))")
-                        self.o.w(f"if ({cnt} > size({name}) .or. len({val_ctor}) > len({name})) then")
-                        self.o.push()
-                        self.o.w("block")
-                        self.o.push()
-                        self.o.w("integer :: len_new_tmp")
-                        self.o.w(f"len_new_tmp = max(len({name}), len({val_ctor}))")
-                        self.o.w(f"if ({cnt} > size({name})) then")
-                        self.o.push()
-                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}, {val_ctor}]")
-                        self.o.pop()
-                        self.o.w("else")
-                        self.o.push()
-                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}]")
-                        self.o.pop()
-                        self.o.w("end if")
-                        self.o.pop()
-                        self.o.w("end block")
-                        self.o.pop()
-                        self.o.w("end if")
+                        # grow_and_set_char owns both the allocate-if-needed
+                        # guard and the growth-plus-widen logic (a deferred-
+                        # length character array can't be allocated with a
+                        # bare size, so it needs a throwaway length-1
+                        # placeholder first; see the subroutine itself).
+                        self.o.w(f"call grow_and_set_char({name}, {cnt}, {val_ctor})")
+                        return
                     else:
                         cap = self._list_capacity_var(name)
                         self.o.w(f"if (.not. allocated({name})) then")
@@ -36688,35 +38710,10 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"do i_ext = 1, size({vals})")
                 self.o.push()
                 self.o.w(f"{cnt} = {cnt} + 1")
-                if name_is_alloc:
-                    if name in self.alloc_chars:
-                        # A deferred-length `character(len=:), allocatable`
-                        # array can't be allocated with a bare size (no
-                        # length-type-spec/SOURCE/MOLD) -- give it a
-                        # throwaway length-1 placeholder; the very next
-                        # line's auto-reallocating concatenation replaces
-                        # it with the real content and length immediately.
-                        self.o.w(f"if (.not. allocated({name})) allocate(character(len=1) :: {name}(1))")
-                        self.o.w(f"if ({cnt} > size({name}) .or. len({vals}(i_ext)) > len({name})) then")
-                        self.o.push()
-                        self.o.w("block")
-                        self.o.push()
-                        self.o.w("integer :: len_new_tmp")
-                        self.o.w(f"len_new_tmp = max(len({name}), len({vals}(i_ext)))")
-                        self.o.w(f"if ({cnt} > size({name})) then")
-                        self.o.push()
-                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}, {vals}(i_ext)]")
-                        self.o.pop()
-                        self.o.w("else")
-                        self.o.push()
-                        self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}]")
-                        self.o.pop()
-                        self.o.w("end if")
-                        self.o.pop()
-                        self.o.w("end block")
-                        self.o.pop()
-                        self.o.w("end if")
-                    else:
+                if name_is_alloc and name in self.alloc_chars:
+                    self.o.w(f"call grow_and_set_char({name}, {cnt}, {vals}(i_ext))")
+                else:
+                    if name_is_alloc:
                         cap = self._list_capacity_var(name)
                         self.o.w(f"if (.not. allocated({name})) then")
                         self.o.push()
@@ -36730,7 +38727,7 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"{name} = [{name}, spread({vals}(i_ext), 1, {cap} - size({name}))]")
                         self.o.pop()
                         self.o.w("end if")
-                self.o.w(f"{name}({cnt}) = {vals}(i_ext)")
+                    self.o.w(f"{name}({cnt}) = {vals}(i_ext)")
                 self.o.pop()
                 self.o.w("end do")
                 self.o.pop()
@@ -36780,26 +38777,22 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("insert currently supports only rank-1 arrays")
             idx = self.expr(c.args[0])
             val = self.expr(c.args[1])
+            if name in self.alloc_chars:
+                # insert_char owns the allocate-if-needed guard, the
+                # Python-style index clamping (negative/out-of-range), and
+                # the declared-length widening.
+                self.o.w(f"call insert_char({name}, int({idx}), {val})")
+                return
             self.o.w("block")
             self.o.push()
-            if name in self.alloc_chars:
-                self.o.w("integer :: n_ins, pos_ins, len_new_tmp")
-            else:
-                self.o.w("integer :: n_ins, pos_ins")
-            if name in self.alloc_chars:
-                self.o.w(f"if (.not. allocated({name})) allocate(character(len=1) :: {name}(0))")
-            else:
-                self.o.w(f"if (.not. allocated({name})) allocate({name}(0))")
+            self.o.w("integer :: n_ins, pos_ins")
+            self.o.w(f"if (.not. allocated({name})) allocate({name}(0))")
             self.o.w(f"n_ins = size({name})")
             self.o.w(f"pos_ins = int({idx})")
             self.o.w("if (pos_ins < 0) pos_ins = n_ins + pos_ins")
             self.o.w("if (pos_ins < 0) pos_ins = 0")
             self.o.w("if (pos_ins > n_ins) pos_ins = n_ins")
-            if name in self.alloc_chars:
-                self.o.w(f"len_new_tmp = max(len({name}), len({val}))")
-                self.o.w(f"{name} = [character(len=len_new_tmp) :: {name}(:pos_ins), {val}, {name}(pos_ins + 1:)]")
-            else:
-                self.o.w(f"{name} = [{name}(:pos_ins), {val}, {name}(pos_ins + 1:)]")
+            self.o.w(f"{name} = [{name}(:pos_ins), {val}, {name}(pos_ins + 1:)]")
             self.o.pop()
             self.o.w("end block")
             return
@@ -37516,7 +39509,8 @@ class translator(ast.NodeVisitor):
                 for a in call.args:
                     if isinstance(a, ast.Name) and a.id in self.list_counts:
                         cnt = self.list_counts[a.id]
-                        self.o.w(f"call print_int_list({a.id}, {cnt})")
+                        helper_nm = self._list_print_helper_name(a.id)
+                        self.o.w(f"call {helper_nm}({a.id}, {cnt})")
                     elif is_const_str(a):
                         self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr(a.value)}")
                     else:
@@ -37743,6 +39737,16 @@ class translator(ast.NodeVisitor):
                     val = part.value
                     stripped = val.lstrip("\n") if idx == 0 else val
                     n_leading = len(val) - len(stripped) if idx == 0 else 0
+                    # A literal segment made up entirely of spaces (a common
+                    # f-string field separator, e.g. f"{a:10s} {b:10.4f}")
+                    # is exactly what Fortran's "x" edit descriptor already
+                    # produces -- folding it into the format this way spends
+                    # zero write arguments (and no "a" descriptor) on pure
+                    # spacing, instead of a whole extra " " string argument.
+                    if stripped and stripped == " " * len(stripped):
+                        fmt_parts.extend(["/"] * n_leading)
+                        fmt_parts.append(f"{len(stripped)}x")
+                        continue
                     if n_leading and stripped and "\n" not in stripped:
                         fmt_parts.extend(["/"] * n_leading)
                         fmt_parts.append("a")
@@ -37828,7 +39832,8 @@ class translator(ast.NodeVisitor):
         # print(primes)
         if isinstance(a, ast.Name) and a.id in self.list_counts:
             cnt = self.list_counts[a.id]
-            self.o.w(f"call print_int_list({a.id}, {cnt})")
+            helper_nm = self._list_print_helper_name(a.id)
+            self.o.w(f"call {helper_nm}({a.id}, {cnt})")
             return
 
         # print(["a", "bb"]) / print(char_array)
@@ -44721,6 +46726,7 @@ def generate_flat(
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None
 ):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map, extra_def_nodes=local_funcs)
+    char_list_final_sizes = compute_list_final_sizes(tree)
     def _tuple_subscript_base_rank(elts):
         # Base-array rank consumed by a tuple subscript.
         # `None`/`np.newaxis` inserts an axis and does not consume one.
@@ -45649,6 +47655,7 @@ def generate_flat(
             params=params,
             context="flat",
             list_counts=list_counts,
+            char_list_final_sizes=char_list_final_sizes,
             tuple_return_funcs=set(_prov_tuple_out.keys()),
             tuple_return_out_kinds=_prov_tuple_out,
             tuple_return_out_ranks=_prov_tuple_out_ranks,
@@ -45926,6 +47933,7 @@ def generate_flat(
                 params=params,
                 context="flat",
                 list_counts=list_counts,
+                char_list_final_sizes=char_list_final_sizes,
                 tuple_return_funcs=set(_prov_tuple_out.keys()),
                 tuple_return_out_kinds=_prov_tuple_out,
                 tuple_return_out_ranks=_prov_tuple_out_ranks,
@@ -46347,6 +48355,7 @@ def generate_flat(
                 params=params,
                 context="flat",
                 list_counts=list_counts,
+                char_list_final_sizes=char_list_final_sizes,
                 tuple_return_funcs=set(tuple_return_out_kinds.keys()),
                 tuple_return_out_kinds=tuple_return_out_kinds,
                 tuple_return_out_ranks=tuple_return_out_ranks,
@@ -47787,6 +49796,7 @@ def generate_flat(
             params=params,
             context="flat",
             list_counts=list_counts,
+            char_list_final_sizes=char_list_final_sizes,
             tuple_return_funcs=set(_prov_tuple_out.keys()),
             tuple_return_out_kinds=_prov_tuple_out,
             tuple_return_out_ranks=_prov_tuple_out_ranks,
@@ -47951,6 +49961,7 @@ def generate_flat(
                 params=params,
                 context="flat",
                 list_counts=list_counts,
+                char_list_final_sizes=char_list_final_sizes,
                 tuple_return_funcs=set(_prov_tuple_out.keys()),
                 tuple_return_out_kinds=_prov_tuple_out,
                 tuple_return_out_ranks=_prov_tuple_out_ranks,
@@ -49430,6 +51441,7 @@ def generate_flat(
         params=params,
         context="flat",
         list_counts=list_counts,
+        char_list_final_sizes=char_list_final_sizes,
         comment_map=top_level_comment_map,
         tuple_return_funcs=tuple_return_funcs,
         dict_return_types=dict_return_types,
@@ -50827,7 +52839,11 @@ def transpile_file(
         )
     list_counts = build_list_count_map(effective_tree)
     if list_counts:
-        needed.add("print_int_list")
+        # The list's element kind isn't known yet at this point (that's
+        # resolved later during prescan), so pull in every print_*_list
+        # variant -- an unused module subroutine is harmless, unlike
+        # calling the wrong one (e.g. print_int_list on a character list).
+        needed.update({"print_int_list", "print_char_list", "print_real_list", "print_log_list"})
     helper_uses, missing_helpers, pure_helpers = resolve_helper_uses(helper_paths, needed)
     def _tree_uses_sys_argv(_tree):
         for _n in ast.walk(_tree):
@@ -50927,13 +52943,32 @@ def transpile_file(
     f90_lines = simplify_redundant_nested_arith_parens(f90_lines)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
     f90_lines = combine_parenthesized_integer_offset(f90_lines)
+    f90_lines = simplify_paren_group_before_addsub(f90_lines)
+    f90_lines = merge_blank_output_before_formatted_output(f90_lines)
+    f90_lines = compact_repeated_format_descriptors(f90_lines)
+    f90_lines = strip_redundant_parens_in_output_item_list(f90_lines)
     f90_lines = simplify_redundant_unary_minus_parens(f90_lines)
     f90_lines = simplify_index_arithmetic_notation(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
+    f90_lines = simplify_argument_list_parens(f90_lines)
+    f90_lines = simplify_int_wrapped_integer_literals(f90_lines)
+    f90_lines = simplify_max_zero_len(f90_lines)
     f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
+    f90_lines = merge_allocate_then_scalar_fill_to_source(f90_lines)
     f90_lines = combine_consecutive_axis_literal_assignments(f90_lines)
     f90_lines = mark_recursive_procedures(f90_lines)
     f90_lines = reorder_arg_decls_before_locals(f90_lines)
+    # Promote never-reassigned scalars/arrays initialized to a literal
+    # constant to genuine `parameter` declarations. generate_flat already
+    # groups same-type locals onto one shared declaration statement, so
+    # first split every declaration back to one entity per line -- the
+    # promote passes only recognize a candidate on its own solo line.
+    # coalesce_nonadjacent_declarations below regroups whatever the promote
+    # passes didn't touch.
+    f90_lines = split_declarations_to_single_names(f90_lines)
+    f90_lines = promote_immediate_scalar_constants(f90_lines)
+    f90_lines = promote_immediate_array_constants(f90_lines)
+    f90_lines = promote_immediate_2d_array_constants(f90_lines)
     f90_lines = coalesce_nonadjacent_declarations(f90_lines, max_len=10**9)
     _result_names = frozenset(
         m.group(1) for ln in f90_lines for m in re.finditer(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", ln, re.IGNORECASE)

@@ -1009,11 +1009,12 @@ def test_xp2f_runs_direct_numpy_array_import_with_integer_norm(tmp_path: Path) -
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xnorm_direct_import_p.f90").read_text(encoding="utf-8")
-    # arr1 and arr2 are both integer, allocatable (different rank), so
-    # xp2f's declaration-coalescing pass may merge them onto one line.
+    # arr2 is a rank-2 integer array literal that's never reassigned, so
+    # xp2f's constant-promotion pass turns it into a named PARAMETER with
+    # an explicit shape instead of an allocatable declaration.
     joined = _join_fortran_continuations(out_text)
     assert any(
-        line.strip().startswith("integer, allocatable ::") and "arr2(:,:)" in line
+        line.strip().startswith("integer, parameter ::") and "arr2(2,4)" in line
         for line in joined.splitlines()
     )
     assert "real(arr1, kind=dp)" in out_text
@@ -1144,8 +1145,13 @@ def test_xp2f_runs_direct_numpy_ones_import_with_string_dtype(tmp_path: Path) ->
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xones_direct_import_p.f90").read_text(encoding="utf-8")
-    assert "integer, allocatable :: a(:), o(:)" in out_text
-    assert "o = 1" in out_text
+    # `a` is a rank-1 integer literal that's never reassigned, so it's
+    # promoted to a named PARAMETER; `o`'s allocate is immediately
+    # followed by a whole-array scalar fill, so xp2f merges the two into
+    # a single `allocate(..., source=...)` statement.
+    assert "integer, parameter :: a(*) = [1, 2, 3, 4, 5]" in out_text
+    assert "integer, allocatable :: o(:)" in out_text
+    assert "allocate(o(size(a)), source=1)" in out_text
 
 
 def test_xp2f_runs_direct_numpy_dot_import_for_matrices(tmp_path: Path) -> None:
@@ -1249,7 +1255,7 @@ def test_xp2f_runs_masked_assignment_into_numpy_empty_array(tmp_path: Path) -> N
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xmasked_empty_assign_p.f90").read_text(encoding="utf-8")
-    assert "merge(real(1, kind=dp), b, (a > 2))" in out_text
+    assert "merge(real(1, kind=dp), b, a > 2)" in out_text
     assert "b = a - 3" in out_text
     assert "pack(a, (a > 5))" not in out_text
 
@@ -1323,7 +1329,9 @@ def test_xp2f_uses_allocation_assignment_for_numeric_array_literals(tmp_path: Pa
     out_text = (tmp_path / "xarray_literal_alloc_assign_p.f90").read_text(encoding="utf-8")
     assert "if (allocated(a)) deallocate(a)" not in out_text
     assert "allocate(a(1:3))" not in out_text
-    assert "a = [1, 2, 3]" in out_text
+    # `a` is a rank-1 integer literal that's never reassigned, so it's
+    # promoted to a named PARAMETER (no runtime allocate/assign at all).
+    assert "integer, parameter :: a(*) = [1, 2, 3]" in out_text
     assert "if (allocated(b)) deallocate(b)" not in out_text
     assert "allocate(b(1:2,1:2))" not in out_text
     assert "b = reshape([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp], [2, 2], order=[2, 1])" in out_text
@@ -1361,10 +1369,14 @@ def test_xp2f_runs_direct_numpy_reshape_import_with_order(tmp_path: Path) -> Non
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xreshape_direct_import_p.f90").read_text(encoding="utf-8")
-    assert "a = reshape([1, 2, 3, 4, 5, 6], [2, 3], order=[2, 1])" in out_text
-    assert "b = reshape([1, 2, 3, 4, 5, 6], [2, 3])" in out_text
-    assert "real(kind=dp), allocatable :: a(:,:), b(:,:)" in out_text
-    assert "real(kind=dp), allocatable :: a(:,:)\n   real(kind=dp), allocatable :: b(:,:)" not in out_text
+    # `a` and `b` are both rank-2 real literals (via reshape) that are
+    # never reassigned, so xp2f's constant-promotion pass turns each into
+    # a named PARAMETER with an explicit shape and the reshape() baked
+    # directly into the declaration, rather than a separate allocatable +
+    # assignment.
+    joined = _join_fortran_continuations(out_text)
+    assert "real(kind=dp), parameter :: a(2,3) = reshape([1, 2, 3, 4, 5, 6], [2, 3], order=[2, 1])" in joined
+    assert "real(kind=dp), parameter :: b(2,3) = reshape([1, 2, 3, 4, 5, 6], [2, 3])" in joined
     assert "a(1, :)" in out_text
     assert "a((1), :)" not in out_text
 
@@ -1630,7 +1642,9 @@ def test_xp2f_compiles_zip_loop_over_rank1_iterables(tmp_path: Path) -> None:
     assert "do i_zip = 1, n_zip" in out_text
     assert "zip_labels" not in out_text
     assert "zip_vals" not in out_text
-    assert 'write(*,"(a,a,g0)") labels(i_zip), ": ", vals(i_zip)' in out_text
+    # xp2f's format-descriptor compaction pass folds the two identical
+    # `a` descriptors into `2a`.
+    assert 'write(*,"(2a, g0)") labels(i_zip), ": ", vals(i_zip)' in out_text
 
 
 def test_xp2f_aliases_fortran_keyword_data_name(tmp_path: Path) -> None:
@@ -2422,7 +2436,10 @@ def test_xp2f_uses_first_axis_extent_for_2d_slices(tmp_path: Path) -> None:
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
     assert "prices(2:size(prices,1), :)" in out_text
-    assert "prices(1:(size(prices,1) - 1), :)" in out_text
+    # xp2f's paren-flattening pass drops the now-redundant parens around
+    # `size(prices,1) - 1` (a bare `+`/`-` chain right after a `:` slice
+    # bound needs no grouping).
+    assert "prices(1:size(prices,1) - 1, :)" in out_text
 
 
 def test_xp2f_preserves_fstring_widths_and_int_list_display(tmp_path: Path) -> None:
@@ -2457,8 +2474,11 @@ def test_xp2f_preserves_fstring_widths_and_int_list_display(tmp_path: Path) -> N
     out_f90 = tmp_path / "xfstring_formats_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert 'write(*,"(a,a)") "strategy_k_list: ", str_int_list(ks, size(ks))' in out_text
-    assert 'write(*,"(a,f18.6,f18.6)") str_ljust(py_str(k), 6), mean_before, mean_after' in out_text
+    # xp2f's format-descriptor compaction pass folds the two identical
+    # `a` descriptors into `2a`, and the two identical `f18.6` descriptors
+    # into `2f18.6`.
+    assert 'write(*,"(2a)") "strategy_k_list: ", str_int_list(ks, size(ks))' in out_text
+    assert 'write(*,"(a, 2f18.6)") str_ljust(py_str(k), 6), mean_before, mean_after' in out_text
 
 
 def test_xp2f_lowers_bitwise_invert_on_logical_arrays(tmp_path: Path) -> None:
@@ -2523,7 +2543,9 @@ def test_xp2f_lowers_masked_augassign_with_where(tmp_path: Path) -> None:
     out_f90 = tmp_path / "xmasked_augassign_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "where (((.not. ieee_is_nan(x))))" in out_text
+    # xp2f's paren-simplification passes now fully strip the redundant
+    # triple wrap around the where-mask condition.
+    assert "where (.not. ieee_is_nan(x))" in out_text
     assert "y = y + 1" in out_text
 
 
@@ -2822,7 +2844,8 @@ def test_xp2f_runs_statistics_quantiles_and_means(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
-    assert "statistics_quantiles_real(real(x, kind=dp), int(4))" in out_text
+    # xp2f strips the no-op `int(...)` wrap off an already-integer literal.
+    assert "statistics_quantiles_real(real(x, kind=dp), 4)" in out_text
     assert "exp(mean_1d(log(real(x, kind=dp))))" in out_text
     assert "sum(1.0_dp / real(x, kind=dp))" in out_text
 
@@ -2891,12 +2914,13 @@ def test_xp2f_compiles_random_module_sequence_helpers(tmp_path: Path) -> None:
     out_text = (tmp_path / "xrandom_sequence_small_p.f90").read_text(encoding="utf-8")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
-    assert "random_randrange_int(int(0), int(100), int(5))" in out_text
+    # xp2f strips the no-op `int(...)` wraps off already-integer literals.
+    assert "random_randrange_int(0, 100, 5)" in out_text
     assert "random_choice_char(colors)" in out_text
-    assert "random_choices_char(colors, int(5))" in out_text
-    assert "random_sample_char(colors, int(3))" in out_text
+    assert "random_choices_char(colors, 5)" in out_text
+    assert "random_sample_char(colors, 3)" in out_text
     assert "rnorm(size(arange_int(0, 5, 1)))" in out_text
-    assert "int(10) - int(1) + 1" in out_text
+    assert "max(1, 10 - 1 + 1)" in out_text
 
 
 def test_xp2f_numeric_diff_tol_implies_run_both(tmp_path: Path) -> None:
@@ -3302,6 +3326,191 @@ def test_xp2f_keeps_double_parens_for_complex_literal_imag(tmp_path: Path) -> No
     assert "aimag((0.0_dp, 1.0_dp))" in out_text
 
 
+def test_xp2f_skips_constant_promotion_for_nested_block_reassignment(tmp_path: Path) -> None:
+    # `n_data` is declared and immediately assigned a literal (0) at
+    # program scope, which on its own looks like a promotable constant --
+    # but a tuple-return call site further down reassigns it from inside
+    # a `block ... end block` (the temp-holding wrapper generated for
+    # unpacking a multi-value function result), a genuinely deeper scope
+    # than the declaration. The constant-promotion passes must still see
+    # that reassignment (not just same-depth ones), or `n_data` gets
+    # wrongly turned into a PARAMETER and the build fails with "Named
+    # constant ... in variable definition context".
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xpromote_nested_block.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def values(n_data):",
+                "    if n_data >= 3:",
+                "        n_data = 0",
+                "        d = 0.0",
+                "    else:",
+                "        d = float(n_data)",
+                "        n_data = n_data + 1",
+                "    return n_data, d",
+                "",
+                "n_data = 0",
+                "n_data, d = values(n_data)",
+                "print(n_data, d)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xpromote_nested_block_p.f90").read_text(encoding="utf-8")
+    assert "integer, parameter :: n_data" not in out_text
+    assert "integer :: n_data" in out_text
+
+
+def test_xp2f_promotes_constant_only_for_confirmed_intent_in_call_arg(tmp_path: Path) -> None:
+    # `k` is passed to `show(x)`, whose dummy `x` is declared
+    # intent(in) in this same file -- that's exactly as safe as any other
+    # read, so `k` should still be promoted to a PARAMETER. A plain
+    # text-only scan can't tell intent(in) from intent(out)/intent(inout)
+    # just from `k` appearing inside `call show(k)`, so this needs the
+    # promotion pass to actually resolve show's signature.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xpromote_intent_in_call.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def show(x):",
+                "    print(x)",
+                "",
+                "k = 5",
+                "show(k)",
+                "show(k)",
+                "print(k)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xpromote_intent_in_call_p.f90").read_text(encoding="utf-8")
+    assert "integer, parameter :: k = 5" in out_text
+
+
+def test_xp2f_does_not_merge_allocate_source_on_type_mismatch(tmp_path: Path) -> None:
+    # `b` is a real array; the fill value `0` is a bare integer literal.
+    # allocate(..., source=...) requires an EXACT type match (unlike a
+    # plain assignment, which implicitly converts), so merging the
+    # allocate and the fill into `allocate(b(5), source=0)` would fail to
+    # compile ("Type of entity is type incompatible with source-expr").
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xallocate_source_type_mismatch.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "b = np.empty(5)",
+                "b[:] = 0",
+                "print(b)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xallocate_source_type_mismatch_p.f90").read_text(encoding="utf-8")
+    assert "source=0" not in out_text
+    assert "allocate(b(5))" in out_text
+    assert "b = 0" in out_text
+
+
+def test_xp2f_char_list_preallocation_starts_at_default_length_one(tmp_path: Path) -> None:
+    # When xp2f can prove a count-mapped character list's final size
+    # ahead of time (a `name = []` immediately followed by pure
+    # range()-loop append nests), it pre-allocates that size up front --
+    # but the starting declared character length must still default to 1
+    # (matching grow_and_set_char's own bootstrap default) and widen only
+    # as needed, not some larger fixed guess: a plain "a" edit descriptor
+    # prints an argument's FULL declared length, so a too-generous
+    # default would print as visible, incorrect trailing padding on every
+    # value shorter than it.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xcharlist_default_length.py"
+    src.write_text(
+        "\n".join(
+            [
+                "k = 3",
+                "names = []",
+                "for i in range(k):",
+                '    names.append(f"c[{i + 1}]")',
+                "print(names)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xcharlist_default_length_p.f90").read_text(encoding="utf-8")
+    assert "allocate(character(len=1) :: names(max(0, k)))" in out_text
+
+
+def test_fortran_int_wrap_strips_nested_literal_inside_non_literal_int_call() -> None:
+    # An outer int(...) whose content isn't a bare literal (a real cast
+    # of a computed expression) must not be skipped over wholesale --
+    # simplify_int_wrapped_integer_literals still needs to look INSIDE it
+    # for a nested int(N) wrap around a genuine literal and strip that,
+    # even though the outer int() itself stays.
+    lines = [
+        "   print *, 1 + int(runif() * real(max(1, int(10) - int(1) + 1), kind=dp))",
+    ]
+
+    out = xp2f.simplify_int_wrapped_integer_literals(lines)
+
+    assert out == [
+        "   print *, 1 + int(runif() * real(max(1, 10 - 1 + 1), kind=dp))",
+    ]
+
+
 def test_xp2f_complex_isinf_isnan_lowering(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
@@ -3352,7 +3561,10 @@ def test_xp2f_dictcomp_keys_argument_stays_integer_in_generated_print_table(tmp_
     out_text = out_f90.read_text(encoding="utf-8")
     assert "integer, intent(in) :: sharpe_vals_keys(:)" in out_text
     assert "integer :: i_sharpe_vals_230, k" in out_text
-    assert 'write(*,"(a,f18.6,f18.6)") str_ljust(py_str(k), 6), mean_before, &' in out_text
+    # xp2f's format-descriptor compaction pass folds the two identical
+    # `f18.6` descriptors into `2f18.6`, which now fits on one line
+    # instead of needing a "&" continuation.
+    assert 'write(*,"(a, 2f18.6)") str_ljust(py_str(k), 6), mean_before, mean_after' in out_text
 
 
 def test_xp2f_can_compile_xfit_hv_with_conservative_stubbed_main(tmp_path: Path) -> None:
@@ -4376,7 +4588,9 @@ def test_xp2f_structured_top_level_if_preserves_real_scalar_kinds(tmp_path: Path
     assert "Build: PASS" in proc.stdout
     out_text = (tmp_path / "xxif_p.f90").read_text(encoding="utf-8")
     assert "integer, parameter :: dp = real64" in out_text
-    assert "real(kind=dp) :: y" in out_text
+    # `y` is a real literal that's never reassigned, so xp2f's
+    # constant-promotion pass turns it into a named PARAMETER.
+    assert "real(kind=dp), parameter :: y = 4.0_dp" in out_text
 
 
 def test_xp2f_keeps_negative_literal_comparisons_valid_in_if_chains(tmp_path: Path) -> None:

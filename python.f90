@@ -22,6 +22,11 @@ public :: factorial_int !@pyapi kind=function ret=integer args=x:integer:intent(
 public :: comb_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in) desc="binomial coefficient for integer inputs"
 public :: perm_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in):optional desc="permutations nPk for integer inputs"
 public :: print_int_list  !@pyapi kind=subroutine args=a:integer(:):intent(in),n:integer:intent(in) desc="print integer list a(1:n) in python-style [..] format"
+public :: print_char_list  !@pyapi kind=subroutine args=a:character(:):intent(in),n:integer:intent(in) desc="print character list a(1:n) in python-style [..] format"
+public :: grow_and_set_char !@pyapi kind=subroutine args=arr:character(:)(:):intent(inout),idx:integer:intent(in),item:character(*):intent(in) desc="grow allocatable character list arr (size and/or declared length) so index idx and item both fit, then set arr(idx) = item"
+public :: insert_char !@pyapi kind=subroutine args=arr:character(:)(:):intent(inout),idx:integer:intent(in),item:character(*):intent(in) desc="insert item into allocatable character list arr at Python-style index idx, widening declared length if needed"
+public :: print_real_list  !@pyapi kind=subroutine args=a:real(dp)(:):intent(in),n:integer:intent(in) desc="print real list a(1:n) in python-style [..] format"
+public :: print_log_list  !@pyapi kind=subroutine args=a:logical(:):intent(in),n:integer:intent(in) desc="print logical list a(1:n) in python-style [..] format"
 public :: str_int_list  !@pyapi kind=function ret=character args=a:integer(:):intent(in),n:integer:intent(in) desc="return integer list a(1:n) in python-style [..] format"
 public :: seed_rng !@pyapi kind=subroutine args=seed:integer:intent(in):optional desc="seed intrinsic RNG; deterministic stream when seed is provided"
 public :: random_normal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out) desc="fill x with N(0,1) variates using Box-Muller"
@@ -702,6 +707,102 @@ contains
          end do
          write(*,'(a)') ']'
       end subroutine print_int_list
+
+      subroutine print_char_list(a, n)
+         ! print character list a(1:n) in python-style ['..', ...] format
+         implicit none
+         character(len=*), intent(in) :: a(:)  ! array containing values to print
+         integer, intent(in) :: n               ! number of elements from a to print
+         integer :: j
+         if (n <= 0) then
+            write(*,'(a)') '[]'
+            return
+         end if
+         write(*,'(a)', advance='no') '['
+         do j = 1, n
+            if (j > 1) write(*,'(a)', advance='no') ', '
+            write(*,'(a)', advance='no') "'" // trim(a(j)) // "'"
+         end do
+         write(*,'(a)') ']'
+      end subroutine print_char_list
+
+      subroutine grow_and_set_char(arr, idx, item)
+         ! grow allocatable character list arr to fit index idx and item's
+         ! length, then set arr(idx) = item -- the shared "list.append()"
+         ! growth machinery previously inlined at every append call site.
+         implicit none
+         character(len=:), allocatable, intent(inout) :: arr(:)  ! growable character list
+         integer, intent(in) :: idx                              ! 1-based target index (== new length after an append)
+         character(len=*), intent(in) :: item                    ! value to store at arr(idx)
+         integer :: len_new
+         if (.not. allocated(arr)) allocate(character(len=1) :: arr(1))
+         if (idx > size(arr) .or. len(item) > len(arr)) then
+            len_new = max(len(arr), len(item))
+            if (idx > size(arr)) then
+               arr = [character(len=len_new) :: arr, item]
+            else
+               arr = [character(len=len_new) :: arr]
+            end if
+         end if
+         arr(idx) = item
+      end subroutine grow_and_set_char
+
+      subroutine insert_char(arr, idx, item)
+         ! insert item into allocatable character list arr at Python-style
+         ! index idx (negative counts from the end, out-of-range clamps to
+         ! the nearer end), widening arr's declared length if item is
+         ! longer than its current elements -- the shared "list.insert()"
+         ! machinery previously inlined at every insert call site.
+         implicit none
+         character(len=:), allocatable, intent(inout) :: arr(:)  ! growable character list
+         integer, intent(in) :: idx                              ! Python-style insertion index
+         character(len=*), intent(in) :: item                    ! value to insert
+         integer :: n_ins, pos_ins, len_new
+         if (.not. allocated(arr)) allocate(character(len=1) :: arr(0))
+         n_ins = size(arr)
+         pos_ins = idx
+         if (pos_ins < 0) pos_ins = n_ins + pos_ins
+         if (pos_ins < 0) pos_ins = 0
+         if (pos_ins > n_ins) pos_ins = n_ins
+         len_new = max(len(arr), len(item))
+         arr = [character(len=len_new) :: arr(:pos_ins), item, arr(pos_ins + 1:)]
+      end subroutine insert_char
+
+      subroutine print_real_list(a, n)
+         ! print real list a(1:n) in python-style [..] format
+         implicit none
+         real(kind=dp), intent(in) :: a(:)  ! array containing values to print
+         integer, intent(in) :: n            ! number of elements from a to print
+         integer :: j
+         if (n <= 0) then
+            write(*,'(a)') '[]'
+            return
+         end if
+         write(*,'(a)', advance='no') '['
+         do j = 1, n
+            if (j > 1) write(*,'(a)', advance='no') ', '
+            write(*,'(a)', advance='no') trim(py_str(a(j)))
+         end do
+         write(*,'(a)') ']'
+      end subroutine print_real_list
+
+      subroutine print_log_list(a, n)
+         ! print logical list a(1:n) in python-style [..] format
+         implicit none
+         logical, intent(in) :: a(:)  ! array containing values to print
+         integer, intent(in) :: n      ! number of elements from a to print
+         integer :: j
+         if (n <= 0) then
+            write(*,'(a)') '[]'
+            return
+         end if
+         write(*,'(a)', advance='no') '['
+         do j = 1, n
+            if (j > 1) write(*,'(a)', advance='no') ', '
+            write(*,'(a)', advance='no') trim(py_str(a(j)))
+         end do
+         write(*,'(a)') ']'
+      end subroutine print_log_list
 
       function str_int_list(a, n) result(s)
          ! return integer list a(1:n) in python-style [..] format
