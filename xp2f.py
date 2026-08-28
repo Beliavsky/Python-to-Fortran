@@ -7250,12 +7250,33 @@ def _tree_uses_pandas_dict_dataframe(tree):
         ):
             if isinstance(_n.args[0], ast.Dict):
                 return True
-            if len(_n.args) == 1 and not _n.keywords and not isinstance(_n.args[0], (ast.Dict, ast.List)):
+            if (
+                len(_n.args) == 1
+                and not isinstance(_n.args[0], (ast.Dict, ast.List))
+                and all(kw.arg in (None, "columns") for kw in _n.keywords)
+            ):
                 return True
             # pd.DataFrame([df.mean(), df.std(), ...], index=[...]) -- see
             # _pandas_df_reduction_rows_construct_spec.
             if isinstance(_n.args[0], ast.List) and any(kw.arg == "index" for kw in _n.keywords):
                 return True
+        # pd.concat([...], ignore_index=True) -- forces a DataFrame_str_index
+        # result regardless of the source frames' own kind (see
+        # _pandas_concat_spec), so needs the same `use` even when nothing
+        # else in the script would otherwise trigger it (e.g. concatenating
+        # two read_csv'd DataFrame_index_date frames).
+        if (
+            isinstance(_n, ast.Call)
+            and isinstance(_n.func, ast.Attribute)
+            and isinstance(_n.func.value, ast.Name)
+            and _n.func.value.id in {"pd", "pandas"}
+            and _n.func.attr == "concat"
+            and any(
+                kw.arg == "ignore_index" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                for kw in _n.keywords
+            )
+        ):
+            return True
     return False
 
 
@@ -15971,6 +15992,25 @@ class translator(ast.NodeVisitor):
                 return "logical"
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "sum"
+                and len(node.args) == 0
+                and not node.keywords
+                and isinstance(node.func.value, ast.Call)
+                and isinstance(node.func.value.func, ast.Attribute)
+                and node.func.value.func.attr == "sum"
+                and len(node.func.value.args) == 0
+                and not node.func.value.keywords
+                and isinstance(node.func.value.func.value, ast.Call)
+                and isinstance(node.func.value.func.value.func, ast.Attribute)
+                and node.func.value.func.value.func.attr in {"isna", "isnull"}
+                and len(node.func.value.func.value.args) == 0
+                and isinstance(node.func.value.func.value.func.value, ast.Name)
+                and node.func.value.func.value.func.value.id in self.pandas_df_vars
+            ):
+                # df.isna().sum().sum() -- total NaN count, an integer.
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "to_numpy"
                 and isinstance(node.func.value, ast.Subscript)
                 and isinstance(node.func.value.value, ast.Name)
@@ -18127,6 +18167,91 @@ class translator(ast.NodeVisitor):
             return None
         return {"method": v.func.attr, "df_id": v.func.value.id, "call": v}
 
+    def _pandas_df_dropna_spec(self, v):
+        # X = df.dropna() / df.dropna(axis=1) -- drop rows (axis=0,
+        # default) or columns (axis=1) containing at least one NaN.
+        # Handled separately from _pandas_df_simple_method_spec since it
+        # needs bespoke codegen (row/column count is data-dependent) and,
+        # for axis=1, produces a result whose column list is genuinely
+        # unknown at transpile time (see the prescan/codegen sites).
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "dropna"
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        axis = 0
+        axis_kw = next((kw for kw in v.keywords if kw.arg == "axis"), None)
+        axis_node = v.args[0] if v.args else (axis_kw.value if axis_kw else None)
+        if axis_node is not None:
+            if not (isinstance(axis_node, ast.Constant) and axis_node.value in (0, 1)):
+                return None
+            axis = axis_node.value
+        return {"df_id": v.func.value.id, "axis": axis}
+
+    def _pandas_concat_spec(self, v):
+        # X = pd.concat([df1, df2, ...][, axis=0|1][, ignore_index=True])
+        # -- 2+ DataFrames of the same kind concatenated. axis=0 (default)
+        # requires identical column lists (row-stack, keeping each
+        # frame's own index, or a synthesized RangeIndex if
+        # ignore_index=True); axis=1 requires the same row count
+        # (positionally aligned, not pandas' index-alignment/join --
+        # column-stack, keeping the first frame's index). Anything else
+        # (mismatched columns without join=, keys=, Series, non-axis=0/1
+        # ignore_index=True) is intentionally left unsupported here.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "concat"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], (ast.List, ast.Tuple))
+            and len(v.args[0].elts) >= 2
+            and all(isinstance(e, ast.Name) and e.id in self.pandas_df_vars for e in v.args[0].elts)
+        ):
+            return None
+        df_ids = [e.id for e in v.args[0].elts]
+        kinds = [self.pandas_df_vars[i] for i in df_ids]
+        if len(set(kinds)) != 1:
+            return None
+        kind = kinds[0]
+        kwargs = {kw.arg: kw.value for kw in v.keywords}
+        if any(k not in ("axis", "ignore_index") for k in kwargs):
+            return None
+        axis = 0
+        if "axis" in kwargs:
+            an = kwargs["axis"]
+            if not (isinstance(an, ast.Constant) and an.value in (0, 1)):
+                return None
+            axis = an.value
+        ignore_index = False
+        if "ignore_index" in kwargs:
+            in_ = kwargs["ignore_index"]
+            if not (isinstance(in_, ast.Constant) and isinstance(in_.value, bool)):
+                return None
+            ignore_index = in_.value
+        if ignore_index and axis == 1:
+            return None
+        cols_list = [self.pandas_df_columns.get(i) for i in df_ids]
+        if any(c is None for c in cols_list):
+            return None
+        if axis == 0:
+            if any(c != cols_list[0] for c in cols_list[1:]):
+                return None
+            columns = list(cols_list[0])
+        else:
+            columns = [c for cols in cols_list for c in cols]
+        return {
+            "df_ids": df_ids,
+            "kind": kind,
+            "axis": axis,
+            "ignore_index": ignore_index,
+            "columns": columns,
+        }
+
     def _pandas_df_drop_spec(self, v):
         # X = df.drop(columns=["A", "B"]) / df.drop(["A", "B"], axis=1)
         if not (
@@ -18669,10 +18794,12 @@ class translator(ast.NodeVisitor):
         return None
 
     def _pandas_matrix_df_construct_spec_rangeidx(self, v):
-        # X = pd.DataFrame(matrix) -- a plain 2-D array, no index=/columns=
-        # kwargs: implicit RangeIndex rows AND implicit 0..ncol-1 integer
-        # column labels. Reuses DataFrame_str_index (see the dict-based
-        # sibling above) with both synthesized as numeric-string labels.
+        # X = pd.DataFrame(matrix) / pd.DataFrame(matrix, columns=[...]) --
+        # a plain 2-D array, no index= kwarg: implicit RangeIndex rows,
+        # AND either implicit 0..ncol-1 integer column labels (no columns=
+        # kwarg either) or explicit ones from a literal columns= list.
+        # Reuses DataFrame_str_index (see the dict-based sibling above)
+        # with the row index synthesized as numeric-string labels.
         if not (
             isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
@@ -18680,16 +18807,28 @@ class translator(ast.NodeVisitor):
             and v.func.value.id in {"pd", "pandas"}
             and v.func.attr == "DataFrame"
             and len(v.args) == 1
-            and not v.keywords
             and not isinstance(v.args[0], (ast.Dict, ast.List))
         ):
             return None
+        cols_kw = next((kw for kw in v.keywords if kw.arg == "columns"), None)
+        if any(kw.arg != "columns" for kw in v.keywords):
+            return None
         if self._rank_expr(v.args[0]) != 2:
             return None
-        ncols = self._static_ncols_from_matrix_var(v.args[0])
-        if not ncols or ncols <= 0:
-            return None
-        return {"matrix_node": v.args[0], "ncols": ncols}
+        if cols_kw is not None:
+            if not (
+                isinstance(cols_kw.value, (ast.List, ast.Tuple))
+                and cols_kw.value.elts
+                and all(is_const_str(e) for e in cols_kw.value.elts)
+            ):
+                return None
+            columns = [e.value for e in cols_kw.value.elts]
+        else:
+            ncols = self._static_ncols_from_matrix_var(v.args[0])
+            if not ncols or ncols <= 0:
+                return None
+            columns = [str(i) for i in range(ncols)]
+        return {"matrix_node": v.args[0], "columns": columns}
 
     def _pandas_df_reduction_expr(self, method, col_expr):
         # Fortran expression computing one of df.mean()/.std()/.min()/
@@ -18766,6 +18905,50 @@ class translator(ast.NodeVisitor):
             "row_labels": [x.value for x in idx_kw.value.elts],
             "columns": list(cols),
         }
+
+    def _pandas_df_mask_assign_spec(self, t, v):
+        # df[df.abs() > thresh] = np.nan / df[df > thresh] = 0 -- whole-
+        # DataFrame element-wise masked assignment (pandas' df[mask] =
+        # value), where the mask compares df's own values (optionally
+        # through .abs()) against a scalar. RHS must be a scalar too (a
+        # DataFrame-shaped RHS, e.g. df[mask] = other_df, isn't handled).
+        if not (
+            isinstance(t, ast.Subscript)
+            and isinstance(t.value, ast.Name)
+            and t.value.id in self.pandas_df_vars
+            and isinstance(t.slice, ast.Compare)
+            and len(t.slice.ops) == 1
+            and len(t.slice.comparators) == 1
+        ):
+            return None
+        df_id = t.value.id
+        cmp = t.slice
+        opmap = {
+            ast.Gt: ">", ast.Lt: "<", ast.GtE: ">=", ast.LtE: "<=",
+            ast.Eq: "==", ast.NotEq: "/=",
+        }
+        op_cls = type(cmp.ops[0])
+        if op_cls not in opmap:
+            return None
+        left = cmp.left
+        if isinstance(left, ast.Name) and left.id == df_id:
+            left_kind = "plain"
+        elif (
+            isinstance(left, ast.Call)
+            and isinstance(left.func, ast.Attribute)
+            and left.func.attr == "abs"
+            and len(left.args) == 0
+            and not left.keywords
+            and isinstance(left.func.value, ast.Name)
+            and left.func.value.id == df_id
+        ):
+            left_kind = "abs"
+        else:
+            return None
+        rhs_scalar = cmp.comparators[0]
+        if self._rank_expr(rhs_scalar) != 0 or self._rank_expr(v) != 0:
+            return None
+        return {"df_id": df_id, "op": opmap[op_cls], "left_kind": left_kind, "rhs_node": rhs_scalar}
 
     def _rank_expr(self, node):
         if (
@@ -22567,6 +22750,34 @@ class translator(ast.NodeVisitor):
                     if idx0 in m:
                         return m[idx0]
                 return self.expr(node.func.value)
+            # df.isna().sum().sum() -- total NaN count across the whole
+            # DataFrame, as a scalar expression (as opposed to
+            # print(df.isna().sum()) alone, the pre-existing per-column
+            # print special case in _emit_pandas_df_series_reduction_print).
+            # Must be checked before the generic "Method-call reductions"
+            # block below, which eagerly evaluates self.expr(node.func.value)
+            # -- i.e. the inner df.isna().sum() -- and would blow up trying
+            # to resolve the bare .isna() one level further in before ever
+            # reaching a method-name check for the outer .sum().
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "sum"
+                and len(node.args) == 0
+                and not node.keywords
+                and isinstance(node.func.value, ast.Call)
+                and isinstance(node.func.value.func, ast.Attribute)
+                and node.func.value.func.attr == "sum"
+                and len(node.func.value.args) == 0
+                and not node.func.value.keywords
+                and isinstance(node.func.value.func.value, ast.Call)
+                and isinstance(node.func.value.func.value.func, ast.Attribute)
+                and node.func.value.func.value.func.attr in {"isna", "isnull"}
+                and len(node.func.value.func.value.args) == 0
+                and isinstance(node.func.value.func.value.func.value, ast.Name)
+                and node.func.value.func.value.func.value.id in self.pandas_df_vars
+            ):
+                inner_df_expr = self.expr(node.func.value.func.value.func.value)
+                return f"count(ieee_is_nan({inner_df_expr}%values))"
             # Method-call reductions: a.sum(), a.mean(), a.var(ddof=...)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -28569,6 +28780,54 @@ class translator(ast.NodeVisitor):
                             self.alloc_complexes.discard(t.id)
                             continue
 
+                # X = df.dropna() / df.dropna(axis=1) -- axis=0 (row drop)
+                # keeps df's columns; axis=1 (column drop) produces a
+                # column list only known at runtime, so pandas_df_columns
+                # is deliberately left unset (further static column-name
+                # uses correctly fail; print() still works for
+                # DataFrame_str_index via its runtime-columns display()).
+                if isinstance(t, ast.Name):
+                    _dn_spec = self._pandas_df_dropna_spec(v)
+                    if _dn_spec is not None:
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_dn_spec["df_id"], "DataFrame_str_index")
+                        self.pandas_df_columns.pop(t.id, None)
+                        if _dn_spec["axis"] == 0:
+                            _src_cols = self.pandas_df_columns.get(_dn_spec["df_id"])
+                            if _src_cols is not None:
+                                self.pandas_df_columns[t.id] = list(_src_cols)
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = pd.concat([df1, df2, ...][, axis=][, ignore_index=])
+                if isinstance(t, ast.Name):
+                    _cc_spec = self._pandas_concat_spec(v)
+                    if _cc_spec is not None:
+                        _cc_kind = "DataFrame_str_index" if _cc_spec["ignore_index"] else _cc_spec["kind"]
+                        self.pandas_df_vars[t.id] = _cc_kind
+                        self.pandas_df_columns[t.id] = list(_cc_spec["columns"])
+                        if _cc_spec["ignore_index"]:
+                            self.pandas_rangeidx_df_ids.add(t.id)
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
                 # X = df.drop(columns=[...]) / X = df.rename(columns={...})
                 if isinstance(t, ast.Name):
                     _d_spec = self._pandas_df_drop_spec(v) or self._pandas_df_rename_spec(v)
@@ -28809,15 +29068,15 @@ class translator(ast.NodeVisitor):
                         self.alloc_complexes.discard(t.id)
                         continue
 
-                # X = pd.DataFrame(matrix)  -- no index=/columns= kwargs:
-                # implicit RangeIndex rows AND implicit 0..ncol-1 integer
-                # column labels.
+                # X = pd.DataFrame(matrix[, columns=[...]])  -- no index=
+                # kwarg: implicit RangeIndex rows, and implicit 0..ncol-1
+                # or explicit literal column labels.
                 if isinstance(t, ast.Name):
                     _rmat_spec = self._pandas_matrix_df_construct_spec_rangeidx(v)
                     if _rmat_spec is not None:
                         self.pandas_df_vars[t.id] = "DataFrame_str_index"
                         self.pandas_rangeidx_df_ids.add(t.id)
-                        self.pandas_df_columns[t.id] = [str(i) for i in range(_rmat_spec["ncols"])]
+                        self.pandas_df_columns[t.id] = list(_rmat_spec["columns"])
                         self._mark_int(f"{t.id}_ridx_i")
                         self.ints.discard(t.id)
                         self.reals.discard(t.id)
@@ -35667,6 +35926,89 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"call {name}%sort_values({by_txt})")
                     return
 
+        # X = df.dropna() / df.dropna(axis=1)
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _dn_spec = self._pandas_df_dropna_spec(v)
+            if _dn_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_dn_spec["df_id"])
+                self.o.w("block")
+                self.o.push()
+                if _dn_spec["axis"] == 0:
+                    self.o.w("logical, allocatable :: dropna_keep(:)")
+                    self.o.w("integer, allocatable :: dropna_idx(:)")
+                    self.o.w("integer :: dropna_i")
+                    self.o.w(f"dropna_keep = .not. any(ieee_is_nan({src_expr}%values), dim=2)")
+                    self.o.w("dropna_idx = pack([(dropna_i, dropna_i=1,size(dropna_keep))], dropna_keep)")
+                    self.o.w(f"{name}%columns = {src_expr}%columns")
+                    self.o.w(f"{name}%index = {src_expr}%index(dropna_idx)")
+                    self.o.w(f"{name}%values = {src_expr}%values(dropna_idx, :)")
+                else:
+                    self.o.w("logical, allocatable :: dropna_keep(:)")
+                    self.o.w("integer, allocatable :: dropna_idx(:)")
+                    self.o.w("integer :: dropna_i")
+                    self.o.w(f"dropna_keep = .not. any(ieee_is_nan({src_expr}%values), dim=1)")
+                    self.o.w("dropna_idx = pack([(dropna_i, dropna_i=1,size(dropna_keep))], dropna_keep)")
+                    self.o.w(f"{name}%index = {src_expr}%index")
+                    self.o.w(f"{name}%columns = {src_expr}%columns(dropna_idx)")
+                    self.o.w(f"{name}%values = {src_expr}%values(:, dropna_idx)")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # X = pd.concat([df1, df2, ...][, axis=][, ignore_index=])
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _cc_spec = self._pandas_concat_spec(v)
+            if _cc_spec is not None:
+                name = self._aliased_name(t.id)
+                srcs = [self._aliased_name(i) for i in _cc_spec["df_ids"]]
+                if _cc_spec["axis"] == 1:
+                    # Column-stack: reshape works here (unlike row-stack)
+                    # because Fortran's column-major layout means the flat
+                    # concatenation of same-row-count 2-D arrays already
+                    # is their column-wise concatenation.
+                    values_txt = ", ".join(f"{s}%values" for s in srcs)
+                    ncol_txt = "+".join(f"ncol({s})" for s in srcs)
+                    self.o.w(f"{name}%index = {srcs[0]}%index")
+                    self.o.w(f"{name}%columns = [{', '.join(f'{s}%columns' for s in srcs)}]")
+                    self.o.w(f"{name}%values = reshape([{values_txt}], [nrow({srcs[0]}), {ncol_txt}])")
+                    return
+                # Row-stack: an array-constructor concat-then-reshape would
+                # scramble the layout (column-major), so allocate and copy
+                # each frame's rows into an explicit slice instead.
+                self.o.w("block")
+                self.o.push()
+                idx_var = "concat_i"
+                # concat_i declared locally (rather than relying on
+                # prescan's _mark_int) so this also works when the whole
+                # pd.concat(...) call is materialized ad hoc inside
+                # print(...), which never goes through prescan as a
+                # Name-targeted assignment -- see
+                # _emit_pandas_concat_print.
+                self.o.w(f"integer :: concat_r0, concat_r1, {idx_var}")
+                nrow_sum = "+".join(f"nrow({s})" for s in srcs)
+                self.o.w(f"if (allocated({name}%values)) deallocate({name}%values)")
+                self.o.w(f"allocate({name}%values({nrow_sum}, ncol({srcs[0]})))")
+                self.o.w(f"{name}%columns = {srcs[0]}%columns")
+                self.o.w("concat_r0 = 0")
+                for s in srcs:
+                    self.o.w(f"concat_r1 = concat_r0 + nrow({s})")
+                    self.o.w(f"{name}%values(concat_r0+1:concat_r1, :) = {s}%values")
+                    self.o.w("concat_r0 = concat_r1")
+                if _cc_spec["ignore_index"]:
+                    self.o.w(f"if (allocated({name}%index)) deallocate({name}%index)")
+                    self.o.w(f"allocate({name}%index({nrow_sum}))")
+                    self.o.w(f"do {idx_var} = 1, {nrow_sum}")
+                    self.o.push()
+                    self.o.w(f"write({name}%index({idx_var}), '(I0)') {idx_var} - 1")
+                    self.o.pop()
+                    self.o.w("end do")
+                else:
+                    self.o.w(f"{name}%index = [{', '.join(f'{s}%index' for s in srcs)}]")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
         # X = pd.DataFrame(matrix, index=date_array, columns=names)
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
             _dfc_spec = self._pandas_df_construct_spec(v)
@@ -35739,10 +36081,10 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{name}%values(:, {_pos}) = {_var}")
                 return
 
-        # X = pd.DataFrame(matrix)  -- no index=/columns= kwargs: copy the
-        # whole matrix into %values in one shot and synthesize both the
-        # numeric-string row index and (during prescan) the 0..ncol-1
-        # column labels.
+        # X = pd.DataFrame(matrix[, columns=[...]])  -- no index= kwarg:
+        # copy the whole matrix into %values in one shot and synthesize
+        # the numeric-string row index (columns come from prescan, either
+        # 0..ncol-1 or the literal columns= list).
         if isinstance(t, ast.Name) and t.id in self.pandas_rangeidx_df_ids:
             _rmat_spec = self._pandas_matrix_df_construct_spec_rangeidx(v)
             if _rmat_spec is not None:
@@ -35787,6 +36129,24 @@ class translator(ast.NodeVisitor):
                         _col_expr = f"{src_expr}%values(:, {_j})"
                         _val_expr = self._pandas_df_reduction_expr(_method, _col_expr)
                         self.o.w(f"{name}%values({_i}, {_j}) = {_val_expr}")
+                return
+
+        # df[df.abs() > thresh] = np.nan -- whole-DataFrame element-wise
+        # masked assignment.
+        if isinstance(t, ast.Subscript):
+            _mask_spec = self._pandas_df_mask_assign_spec(t, v)
+            if _mask_spec is not None:
+                df_expr = self._aliased_name(_mask_spec["df_id"])
+                left_expr = (
+                    f"abs({df_expr}%values)" if _mask_spec["left_kind"] == "abs" else f"{df_expr}%values"
+                )
+                rhs_scalar_expr = self.expr(_mask_spec["rhs_node"])
+                fill_expr = self.expr(v)
+                self.o.w(f"where ({left_expr} {_mask_spec['op']} {rhs_scalar_expr})")
+                self.o.push()
+                self.o.w(f"{df_expr}%values = {fill_expr}")
+                self.o.pop()
+                self.o.w("end where")
                 return
 
         # df["new_col"] = expr -- write into an already-known column
@@ -38779,6 +39139,16 @@ class translator(ast.NodeVisitor):
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
+                and isinstance(c.args[0].func.value, ast.Name)
+                and c.args[0].func.value.id in {"pd", "pandas"}
+                and c.args[0].func.attr == "concat"
+            ):
+                self._emit_pandas_concat_print(c.args[0])
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr in {
                     "pct_change", "shift", "sort_index",
                     "cumsum", "cumprod", "diff", "abs", "sort_values",
@@ -39754,6 +40124,27 @@ class translator(ast.NodeVisitor):
         self.o.pop()
         self.o.w("end block")
 
+    def _emit_pandas_concat_print(self, call, ndigits=6):
+        # print(pd.concat([df1, df2, ...])) -- same "materialize into an ad
+        # hoc temp DataFrame, then print" approach as
+        # _emit_pandas_df_method_result_print, but for pd.concat's
+        # different (namespaced-call, multi-source) shape; see
+        # _pandas_concat_spec.
+        _cc_spec = self._pandas_concat_spec(call)
+        if _cc_spec is None:
+            raise NotImplementedError(f"unsupported call: {ast.unparse(call)}")
+        kind = "DataFrame_str_index" if _cc_spec["ignore_index"] else _cc_spec["kind"]
+        tmp_name = "pdf_concat_mrtmp"
+        self.pandas_df_vars[tmp_name] = kind
+        self.pandas_df_columns[tmp_name] = list(_cc_spec["columns"])
+        self.o.w("block")
+        self.o.push()
+        self.o.w(f"type({kind}) :: {tmp_name}")
+        self.visit_Assign(ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=call))
+        self._emit_pandas_df_print(ast.Name(id=tmp_name, ctx=ast.Load()), ndigits=ndigits)
+        self.o.pop()
+        self.o.w("end block")
+
     def _emit_pandas_df_transpose_print(self, df_name_node, ndigits=6):
         # print(df.T) -- currently only for DataFrame_str_index, where
         # transposing keeps the same runtime type (both index and columns
@@ -39771,12 +40162,38 @@ class translator(ast.NodeVisitor):
 
     def _emit_pandas_df_print(self, df_node, ndigits=6, context_node=None):
         df_expr, col_names = self._pandas_df_ref(df_node, context_node)
+        df_id = self._pandas_df_root_id(df_node)
+        df_kind = self.pandas_df_vars.get(df_id)
+        is_str_index = df_kind == "DataFrame_str_index"
+        if is_str_index and df_expr is not None:
+            # DataFrame_str_index carries its column names as runtime data
+            # (%columns), so the whole header/row/truncation logic below --
+            # which needs col_names known at transpile time -- is
+            # unnecessary here: a single call to its display() type-bound
+            # procedure (dataframe_str_index.f90) covers it generically,
+            # including when col_names is unknown (e.g. after
+            # df.dropna(axis=1), whose surviving columns are data-dependent).
+            self.o.w(f"call {df_expr}%display({ndigits})")
+            return
+        if not col_names and df_expr is not None and df_kind in {"DataFrame_index_date", "DataFrame_index_datetime"}:
+            # Column list not known at transpile time (df.dropna(axis=1))
+            # -- fall back to a runtime method that reads %columns from
+            # the instance itself, the same way the str_index case above
+            # always does: dataframe_index_datetime.f90's display_datetime
+            # was already written this way; dataframe_index_date.f90's
+            # display_pdf_date was added to match (its pre-existing
+            # display=>display_data binding predates pandas-print support
+            # and uses a different, non-pandas-matching layout, so it's
+            # not reused here).
+            if df_kind == "DataFrame_index_datetime":
+                self.o.w(f"call {df_expr}%display({ndigits})")
+            else:
+                self.o.w(f"call {df_expr}%display_pdf({ndigits})")
+            return
         if not col_names:
             raise NotImplementedError(
                 "printing a DataFrame requires statically known column names"
             )
-        df_id = self._pandas_df_root_id(df_node)
-        is_str_index = self.pandas_df_vars.get(df_id) == "DataFrame_str_index"
         is_datetime_index = self.pandas_df_vars.get(df_id) == "DataFrame_index_datetime"
         col_width = max(10, ndigits + 8)
         n_cols = len(col_names)
@@ -39795,14 +40212,6 @@ class translator(ast.NodeVisitor):
             if is_str_index:
                 return f"trim({idx_expr})"
             return f"trim({idx_expr}%to_str())"
-
-        if is_str_index:
-            # DataFrame_str_index carries its column names as runtime data
-            # (%columns), so the whole header/row/truncation block below is
-            # unnecessary here -- a single call to its display() type-bound
-            # procedure (dataframe_str_index.f90) covers it generically.
-            self.o.w(f"call {df_expr}%display({ndigits})")
-            return
 
         self.o.w("block")
         self.o.push()

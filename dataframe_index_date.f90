@@ -995,7 +995,7 @@ type :: DataFrame_index_date
          rename_cols, where_cols, filter_cols, where, filter, iloc, &
          select, add, subtract, multiply, divide, reindex, shift, &
          pct_change, log_change, cumsum, cumprod, diff, sort_values, &
-         abs => abs_df
+         abs => abs_df, display_pdf => display_pdf_date
 end type DataFrame_index_date
 
 contains
@@ -2374,6 +2374,53 @@ vtmp = self%values(perm, :)
 self%values = vtmp
 deallocate(vtmp, perm)
 end subroutine sort_values
+
+subroutine display_pdf_date(self, ndigits)
+! pandas-style print(df): reads %columns from runtime data rather than a
+! caller-supplied format string, so it works even when the column list
+! is only known at runtime (e.g. after df.dropna(axis=1), whose
+! surviving columns are data-dependent) -- mirrors
+! dataframe_str_index.f90's display_str_index / dataframe_index_datetime.f90's
+! display_datetime, which xp2f.py's _emit_pandas_df_print falls back to
+! in that situation. Distinct from the pre-existing display=>display_data
+! binding, which predates pandas-print support and uses a different,
+! non-pandas-matching layout.
+class(DataFrame_index_date), intent(in) :: self
+integer, intent(in), optional :: ndigits
+integer :: nd, col_width, n_cols, pdf_n, pdf_i
+character(len=:), allocatable :: header_fmt, row_fmt, dots_fmt
+character(len=32) :: nc_str, cw_str, nd_str
+
+nd = default(6, ndigits)
+col_width = max(10, nd + 8)
+n_cols = size(self%columns)
+pdf_n = nrow(self)
+
+write (nc_str, '(I0)') n_cols
+write (cw_str, '(I0)') col_width
+write (nd_str, '(I0)') nd
+
+header_fmt = '(A10,'//trim(nc_str)//'A'//trim(cw_str)//')'
+row_fmt = '(A10,'//trim(nc_str)//'F'//trim(cw_str)//'.'//trim(nd_str)//')'
+dots_fmt = '(A10,'//trim(nc_str)//'A'//trim(cw_str)//')'
+
+write (*, header_fmt) '', (trim(self%columns(pdf_i)), pdf_i=1, n_cols)
+if (pdf_n <= 10) then
+   do pdf_i = 1, pdf_n
+      write (*, row_fmt) self%index(pdf_i)%to_str(), self%values(pdf_i, :)
+   end do
+else
+   do pdf_i = 1, 5
+      write (*, row_fmt) self%index(pdf_i)%to_str(), self%values(pdf_i, :)
+   end do
+   write (*, dots_fmt) '...', ('...', pdf_i=1, n_cols)
+   do pdf_i = pdf_n - 4, pdf_n
+      write (*, row_fmt) self%index(pdf_i)%to_str(), self%values(pdf_i, :)
+   end do
+end if
+write (*, *)
+write (*, '(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', n_cols, ' columns]'
+end subroutine display_pdf_date
 
 pure function reindex(self, new_index, method, fill_value) result(df_new)
 ! return a dataframe with index replaced by new_index and values reindexed.
