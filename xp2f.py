@@ -7252,6 +7252,10 @@ def _tree_uses_pandas_dict_dataframe(tree):
                 return True
             if len(_n.args) == 1 and not _n.keywords and not isinstance(_n.args[0], (ast.Dict, ast.List)):
                 return True
+            # pd.DataFrame([df.mean(), df.std(), ...], index=[...]) -- see
+            # _pandas_df_reduction_rows_construct_spec.
+            if isinstance(_n.args[0], ast.List) and any(kw.arg == "index" for kw in _n.keywords):
+                return True
     return False
 
 
@@ -18687,6 +18691,82 @@ class translator(ast.NodeVisitor):
             return None
         return {"matrix_node": v.args[0], "ncols": ncols}
 
+    def _pandas_df_reduction_expr(self, method, col_expr):
+        # Fortran expression computing one of df.mean()/.std()/.min()/
+        # .max()/.sum()/.median() over a single column array -- shared by
+        # _emit_pandas_df_series_reduction_print (print(df.mean())) and
+        # _pandas_df_reduction_rows_construct_spec's codegen
+        # (pd.DataFrame([df.mean(), df.std()], index=[...])).
+        if method == "mean":
+            return f"mean_1d({col_expr})"
+        if method == "median":
+            return f"quantile_linear({col_expr}, 0.5_dp)"
+        if method == "std":
+            return f"std({col_expr}, 1)"
+        if method == "min":
+            return f"minval({col_expr})"
+        if method == "max":
+            return f"maxval({col_expr})"
+        if method == "sum":
+            return f"sum({col_expr})"
+        raise NotImplementedError(f"df.{method}() reduction not supported")
+
+    def _pandas_df_reduction_rows_construct_spec(self, v):
+        # X = pd.DataFrame([df.mean(), df.std(), ...], index=["mean", "sd", ...])
+        # -- a DataFrame built by stacking whole-DataFrame column-wise
+        # reductions as rows (each element a Series over df's columns,
+        # matching pandas' behavior for a list of same-index Series), with
+        # an explicit string row index. Result has df's ORIGINAL columns,
+        # not the row labels. Reuses DataFrame_str_index.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.List)
+            and v.args[0].elts
+        ):
+            return None
+        elts = v.args[0].elts
+        idx_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+        if not (
+            idx_kw is not None
+            and isinstance(idx_kw.value, (ast.List, ast.Tuple))
+            and idx_kw.value.elts
+            and len(idx_kw.value.elts) == len(elts)
+            and all(is_const_str(e) for e in idx_kw.value.elts)
+        ):
+            return None
+        df_id = None
+        methods = []
+        for e in elts:
+            if not (
+                isinstance(e, ast.Call)
+                and isinstance(e.func, ast.Attribute)
+                and e.func.attr in {"mean", "std", "min", "max", "sum", "median"}
+                and len(e.args) == 0
+                and not e.keywords
+                and isinstance(e.func.value, ast.Name)
+                and e.func.value.id in self.pandas_df_vars
+            ):
+                return None
+            if df_id is None:
+                df_id = e.func.value.id
+            elif e.func.value.id != df_id:
+                return None
+            methods.append(e.func.attr)
+        cols = self.pandas_df_columns.get(df_id)
+        if not cols:
+            return None
+        return {
+            "df_id": df_id,
+            "methods": methods,
+            "row_labels": [x.value for x in idx_kw.value.elts],
+            "columns": list(cols),
+        }
+
     def _rank_expr(self, node):
         if (
             isinstance(node, ast.Call)
@@ -28751,6 +28831,26 @@ class translator(ast.NodeVisitor):
                         self.alloc_complexes.discard(t.id)
                         continue
 
+                # X = pd.DataFrame([df.mean(), df.std(), ...], index=[...])
+                # -- stack whole-DataFrame column reductions as rows; result
+                # keeps df's original columns (not the row labels).
+                if isinstance(t, ast.Name):
+                    _rr_spec = self._pandas_df_reduction_rows_construct_spec(v)
+                    if _rr_spec is not None:
+                        self.pandas_df_vars[t.id] = "DataFrame_str_index"
+                        self.pandas_df_columns[t.id] = list(_rr_spec["columns"])
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
                 # df["new_col"] = expr -- grow (or overwrite, matching
                 # pandas' in-place-if-exists semantics) a RangeIndex
                 # dict-DataFrame's column list. Materializes the RHS into
@@ -35662,6 +35762,31 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"write({name}%index({idx_var}), '(I0)') {idx_var} - 1")
                 self.o.pop()
                 self.o.w("end do")
+                return
+
+        # X = pd.DataFrame([df.mean(), df.std(), ...], index=[...]) -- one
+        # row per reduction, one column per df's original column.
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _rr_spec = self._pandas_df_reduction_rows_construct_spec(v)
+            if _rr_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_rr_spec["df_id"])
+                cols = _rr_spec["columns"]
+                row_labels = _rr_spec["row_labels"]
+                methods = _rr_spec["methods"]
+                col_len = max(10, max(len(c) for c in cols))
+                row_len = max(10, max(len(r) for r in row_labels))
+                columns_txt = ", ".join(fstr(c) for c in cols)
+                index_txt = ", ".join(fstr(r) for r in row_labels)
+                self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
+                self.o.w(f"{name}%index = [character(len={row_len}) :: {index_txt}]")
+                self.o.w(f"if (allocated({name}%values)) deallocate({name}%values)")
+                self.o.w(f"allocate({name}%values({len(row_labels)}, {len(cols)}))")
+                for _i, _method in enumerate(methods, start=1):
+                    for _j in range(1, len(cols) + 1):
+                        _col_expr = f"{src_expr}%values(:, {_j})"
+                        _val_expr = self._pandas_df_reduction_expr(_method, _col_expr)
+                        self.o.w(f"{name}%values({_i}, {_j}) = {_val_expr}")
                 return
 
         # df["new_col"] = expr -- write into an already-known column
