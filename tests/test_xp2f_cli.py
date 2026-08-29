@@ -6216,3 +6216,198 @@ def test_xp2f_pandas_df_divide_fillna_row_reduction_and_iloc_slice(tmp_path: Pat
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def _run_xp2f_compile_diff(tmp_path: Path, filename: str, lines: list) -> None:
+    # Shared helper for the DataFrame-stats regression tests below: write
+    # `lines` as a script, transpile+compile+run it, and assert its
+    # output matches real Python's exactly.
+    src = tmp_path / filename
+    src.write_text("\n".join(lines + [""]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_cummax_cummin(tmp_path: Path) -> None:
+    # Regression test: df.cummax()/df.cummin() -- new DataFrame_str_index/
+    # DataFrame_index_date type-bound procedures (cummax_str/cummin_str
+    # and cummax/cummin respectively), mirroring the pre-existing cumsum/
+    # cumprod.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_cummax.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 5.0, 3.0, 8.0, 2.0], 'b': [9.0, 2.0, 6.0, 1.0, 4.0]})",
+            "cmax = df.cummax()",
+            "cmin = df.cummin()",
+            "cmax_a = cmax['a']",
+            "cmax_b = cmax['b']",
+            "cmin_a = cmin['a']",
+            "cmin_b = cmin['b']",
+            "print(cmax_a[0], cmax_a[4], cmax_b[2])",
+            "print(cmin_a[0], cmin_a[4], cmin_b[2])",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_cov(tmp_path: Path) -> None:
+    # Regression test: df.cov() -- new print codegen (mirroring the
+    # pre-existing df.corr(), swapping corrcoef_matrix_rows_real for the
+    # cov_matrix_rows_real helper that already existed but was unused by
+    # any DataFrame method), including the round(df.cov(), n) form.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_cov.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 5.0, 3.0, 8.0, 2.0], 'b': [9.0, 2.0, 6.0, 1.0, 4.0], "
+            "'c': [1.0, 1.0, 2.0, 2.0, 3.0]})",
+            "print(df.cov())",
+            "print(df.cov().round(3))",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_sem_skew_kurt(tmp_path: Path) -> None:
+    # Regression test: df.sem()/df.skew()/df.kurt() -- sem is std/sqrt(n)
+    # (no new Fortran helper); skew/kurt are new skew_1d/kurt_1d helpers
+    # implementing pandas' adjusted (bias-corrected) Fisher-Pearson
+    # formulas, verified against real pandas' own output (not
+    # independently re-derived).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_semskewkurt.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 5.0, 3.0, 8.0, 2.0, 9.0, 4.0], "
+            "'b': [9.0, 2.0, 6.0, 1.0, 4.0, 3.0, 7.0]})",
+            "print(df.sem())",
+            "print(df.skew())",
+            "print(df.kurt())",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_idxmax_idxmin(tmp_path: Path) -> None:
+    # Regression test: df.idxmax()/df.idxmin() -- new print-only codegen
+    # (_emit_pandas_df_idxreduce_print), using maxloc/minloc for the row
+    # position and printing the row's index LABEL, not the value. Checks
+    # both the RangeIndex-default case (pandas reports dtype: int64 for
+    # the result, not object, since the "labels" are row positions --
+    # see pandas_rangeidx_df_ids) exercised here.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_idxmax.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 5.0, 3.0, 8.0, 2.0], 'b': [9.0, 2.0, 6.0, 1.0, 4.0]})",
+            "print(df.idxmax())",
+            "print(df.idxmin())",
+        ],
+    )
+
+
+def test_xp2f_series_autocorr(tmp_path: Path) -> None:
+    # Regression test: Series.autocorr()/.autocorr(lag=k) -- new
+    # autocorr_1d Fortran helper (lag-k serial correlation via the
+    # existing corrcoef2_real, wrapped since its 2x2-matrix result can't
+    # be subscripted inline in the same expression as the call).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xautocorr.py",
+        [
+            "import pandas as pd",
+            "",
+            "s = pd.Series([1.0, 2.5, 2.0, 3.5, 3.0, 4.5, 4.0, 5.5])",
+            "print(s.autocorr())",
+            "print(s.autocorr(lag=2))",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_corrwith(tmp_path: Path) -> None:
+    # Regression test: df.corrwith(other) -- new print codegen
+    # (_emit_pandas_df_corrwith_print), one Pearson correlation per
+    # column of df against a plain rank-1 `other` array, via the new
+    # corr2_1d helper (also shared by autocorr_1d after a refactor).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_corrwith.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 5.0, 3.0, 8.0, 2.0], 'b': [9.0, 2.0, 6.0, 1.0, 4.0], "
+            "'c': [2.0, 4.0, 5.0, 9.0, 1.0]})",
+            "other = pd.Series([2.0, 4.0, 3.0, 7.0, 1.0])",
+            "print(df.corrwith(other))",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_expanding(tmp_path: Path) -> None:
+    # Regression test: df.expanding().mean()/.std() -- new
+    # expanding_mean_1d/expanding_std_1d Fortran helpers (Welford's
+    # online update with no fixed trailing window, unlike the pre-
+    # existing rolling_mean_1d/rolling_std_1d) -- checks both the
+    # min_periods=1 mean (a value from row 1 on) and the std (NaN for
+    # row 1 alone, a value from row 2 on).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_expanding.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 3.0, 2.0, 5.0, 4.0], 'b': [10.0, 8.0, 12.0, 9.0, 11.0]})",
+            "em = df.expanding().mean()",
+            "es = df.expanding().std()",
+            "em_a = em['a']",
+            "em_b = em['b']",
+            "es_a = es['a']",
+            "es_b = es['b']",
+            "print(em_a[0], em_a[2], em_a[4], em_b[1], em_b[3])",
+            "print(es_a[0], es_a[2], es_a[4], es_b[1], es_b[3])",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_ewm(tmp_path: Path) -> None:
+    # Regression test: df.ewm(span=...).mean()/.std() and
+    # df.ewm(alpha=...).mean() -- new ewm_mean_1d/ewm_std_1d Fortran
+    # helpers (adjust=True, bias=False, both pandas' defaults). The std
+    # formula (a Bessel-corrected exponentially weighted sample
+    # variance) was verified by direct numeric comparison against
+    # pandas' own ewm(...).std() output during development, not
+    # independently re-derived -- see ewm_std_1d's docstring.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_ewm.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 3.0, 2.0, 5.0, 4.0, 6.0], "
+            "'b': [10.0, 8.0, 12.0, 9.0, 11.0, 7.0]})",
+            "em = df.ewm(span=3).mean()",
+            "es = df.ewm(span=3).std()",
+            "ea = df.ewm(alpha=0.3).mean()",
+            "em_a = em['a']",
+            "em_b = em['b']",
+            "es_a = es['a']",
+            "es_b = es['b']",
+            "ea_a = ea['a']",
+            "print(em_a[0], em_a[2], em_a[5], em_b[1], em_b[4])",
+            "print(es_a[0], es_a[1], es_a[3], es_b[2], es_b[5])",
+            "print(ea_a[0], ea_a[2], ea_a[5])",
+        ],
+    )

@@ -115,6 +115,8 @@ public :: geomspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):in
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
 public :: weighted_mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),w:real(dp)(:):intent(in) desc="weighted mean of 1D real vector"
 public :: var_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
+public :: skew_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="pandas-style bias-corrected (adjusted Fisher-Pearson) sample skewness of 1D real vector"
+public :: kurt_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="pandas-style bias-corrected (adjusted Fisher-Pearson) excess sample kurtosis of 1D real vector"
 public :: statistics_quantiles_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in) desc="statistics.quantiles default exclusive method for 1D real vector"
 public :: median_1d_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="median of 1D real vector"
 public :: median_low_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="median_low of 1D integer vector"
@@ -273,6 +275,8 @@ public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):i
 public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional desc="covariance matrix for observations in rows (numpy rowvar=False)"
 public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
 public :: corrcoef_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="correlation matrix for observations in rows (numpy rowvar=False)"
+public :: autocorr_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),lag:integer:intent(in):optional desc="pandas-style lag-k serial autocorrelation of a 1D real vector"
+public :: corr2_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="Pearson correlation of two 1D real vectors as a plain scalar"
 public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D convolution with mode full/same/valid"
 public :: diff_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="first difference along axis 0 for a real matrix"
 public :: diff_axis1_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="first difference along axis 1 for a real matrix"
@@ -340,6 +344,10 @@ public :: polyder
 
 public :: rolling_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in) desc="rolling mean over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
 public :: rolling_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in),ddof:integer:intent(in) desc="rolling sample standard deviation over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
+public :: expanding_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="expanding (growing-window, min_periods=1) running mean"
+public :: expanding_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="expanding (growing-window) sample standard deviation"
+public :: ewm_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) desc="exponentially weighted moving average (adjust=True, pandas' default)"
+public :: ewm_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) desc="exponentially weighted sample standard deviation (adjust=True, bias=False, pandas' defaults)"
 
 interface cumsum
    module procedure cumsum_real, cumsum_int
@@ -3708,6 +3716,56 @@ contains
          var_1d = sum((x - mu)**2) / real(n - d, kind=dp)
       end function var_1d
 
+      pure real(kind=dp) function skew_1d(x)
+         ! pandas Series/DataFrame.skew() -- the adjusted (bias-corrected)
+         ! Fisher-Pearson standardized moment coefficient: G1 =
+         ! sqrt(n*(n-1))/(n-2) * m3/m2**1.5, where m2/m3 are the 2nd/3rd
+         ! central moments about the (population, /n not /(n-1)) mean.
+         ! NaN for n<3 (undefined) or zero variance, matching pandas.
+         real(kind=dp), intent(in) :: x(:)
+         integer :: n
+         real(kind=dp) :: mu, m2, m3
+         n = size(x)
+         if (n < 3) then
+            skew_1d = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         mu = mean_1d(x)
+         m2 = sum((x - mu)**2) / real(n, kind=dp)
+         m3 = sum((x - mu)**3) / real(n, kind=dp)
+         if (m2 <= tiny(1.0_dp)) then
+            skew_1d = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         skew_1d = (sqrt(real(n, kind=dp)*real(n - 1, kind=dp)) / real(n - 2, kind=dp)) * (m3 / m2**1.5_dp)
+      end function skew_1d
+
+      pure real(kind=dp) function kurt_1d(x)
+         ! pandas Series/DataFrame.kurt() -- the adjusted (bias-corrected)
+         ! excess kurtosis: G2 = ((n-1)/((n-2)*(n-3))) * ((n+1)*g2 + 6),
+         ! where g2 = m4/m2**2 - 3 is the population excess kurtosis (m2/m4
+         ! the 2nd/4th central moments about the population mean). NaN for
+         ! n<4 (undefined) or zero variance, matching pandas.
+         real(kind=dp), intent(in) :: x(:)
+         integer :: n
+         real(kind=dp) :: mu, m2, m4, g2
+         n = size(x)
+         if (n < 4) then
+            kurt_1d = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         mu = mean_1d(x)
+         m2 = sum((x - mu)**2) / real(n, kind=dp)
+         m4 = sum((x - mu)**4) / real(n, kind=dp)
+         if (m2 <= tiny(1.0_dp)) then
+            kurt_1d = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         g2 = m4 / m2**2 - 3.0_dp
+         kurt_1d = (real(n - 1, kind=dp) / (real(n - 2, kind=dp)*real(n - 3, kind=dp))) * &
+                   (real(n + 1, kind=dp)*g2 + 6.0_dp)
+      end function kurt_1d
+
       function median_1d_real(x) result(m)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp) :: m
@@ -6046,6 +6104,35 @@ contains
          end if
       end function corrcoef2_real
 
+      pure real(kind=dp) function corr2_1d(x, y)
+         ! Pearson correlation of two 1D real vectors, as a plain scalar
+         ! -- a thin wrapper around corrcoef2_real (whose 2x2 matrix
+         ! result can't be subscripted inline in the same expression as
+         ! the call itself, not being a Fortran variable). Shared by
+         ! autocorr_1d (x against a shifted copy of itself) and
+         ! DataFrame.corrwith(other) (each column against `other`).
+         real(kind=dp), intent(in) :: x(:), y(:)
+         real(kind=dp), allocatable :: r(:,:)
+         r = corrcoef2_real(x, y)
+         corr2_1d = r(1, 2)
+      end function corr2_1d
+
+      pure real(kind=dp) function autocorr_1d(x, lag)
+         ! pandas Series.autocorr(lag) -- lag-k serial correlation of a
+         ! vector with itself.
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: lag
+         integer :: k, n
+         k = 1
+         if (present(lag)) k = lag
+         n = size(x)
+         if (k <= 0 .or. k >= n) then
+            autocorr_1d = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         autocorr_1d = corr2_1d(x(1:n - k), x(1 + k:n))
+      end function autocorr_1d
+
       pure function corrcoef_matrix_rows_real(x) result(r)
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -7046,5 +7133,113 @@ contains
             end if
          end do
       end function rolling_std_1d
+
+      pure function expanding_mean_1d(x) result(y)
+         ! pandas Series/DataFrame.expanding().mean() -- a growing-window
+         ! (from row 1 through row i) running mean, one value per row from
+         ! the very first row on (min_periods=1, pandas' default) --
+         ! Welford's online update, same as rolling_mean_1d but never
+         ! downdating (no fixed trailing window to slide out of).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: mean, dev
+         integer :: n, i
+         n = size(x)
+         allocate(y(n))
+         mean = 0.0_dp
+         do i = 1, n
+            dev = x(i) - mean
+            mean = mean + dev / real(i, kind=dp)
+            y(i) = mean
+         end do
+      end function expanding_mean_1d
+
+      pure function expanding_std_1d(x, ddof) result(y)
+         ! pandas Series/DataFrame.expanding().std() -- growing-window
+         ! sample standard deviation (NaN while fewer than ddof+1 rows
+         ! have accumulated, pandas' default ddof=1 meaning row 1 alone is
+         ! always NaN) -- Welford's online update, same as rolling_std_1d
+         ! but never downdating.
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: ddof
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: mean, sumsq, dev
+         integer :: n, i, d
+         d = 1
+         if (present(ddof)) d = ddof
+         n = size(x)
+         allocate(y(n))
+         y = ieee_value(0.0_dp, ieee_quiet_nan)
+         mean = 0.0_dp
+         sumsq = 0.0_dp
+         do i = 1, n
+            dev = x(i) - mean
+            mean = mean + dev / real(i, kind=dp)
+            sumsq = sumsq + dev * (x(i) - mean)
+            if (i > d) y(i) = sqrt(max(sumsq, 0.0_dp) / real(i - d, kind=dp))
+         end do
+      end function expanding_std_1d
+
+      pure function ewm_mean_1d(x, alpha) result(y)
+         ! pandas Series/DataFrame.ewm(...).mean() with adjust=True
+         ! (pandas' default): y(t) = sum_{j<=t} w_j*x(j) / sum_{j<=t} w_j,
+         ! weight w_j = (1-alpha)**(t-j) (most recent observation weighted
+         ! 1) -- via the standard num/den recursion num(t) = x(t) +
+         ! (1-alpha)*num(t-1), den(t) = 1 + (1-alpha)*den(t-1).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), intent(in) :: alpha
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: num, den, r
+         integer :: n, i
+         n = size(x)
+         allocate(y(n))
+         if (n == 0) return
+         r = 1.0_dp - alpha
+         num = x(1)
+         den = 1.0_dp
+         y(1) = num / den
+         do i = 2, n
+            num = x(i) + r*num
+            den = 1.0_dp + r*den
+            y(i) = num / den
+         end do
+      end function ewm_mean_1d
+
+      pure function ewm_std_1d(x, alpha) result(y)
+         ! pandas Series/DataFrame.ewm(...).std() with adjust=True and
+         ! bias=False (both pandas' defaults) -- an exponentially
+         ! weighted sample standard deviation, Bessel-corrected the same
+         ! way a weighted sample variance with "reliability weights" is:
+         ! var = var_biased * (sum_w)**2 / ((sum_w)**2 - sum_w2), where
+         ! var_biased is the weighted variance about the running weighted
+         ! mean. NaN for the first row (a single observation has no
+         ! variance) -- pandas' own behavior. Verified by direct
+         ! comparison against pandas' own ewm(...).std() output (its
+         ! exact recursive update, not independently re-derived).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), intent(in) :: alpha
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: mean, cov, den, den2, r, old_wt, old_mean, denom
+         integer :: n, i
+         n = size(x)
+         allocate(y(n))
+         y = ieee_value(0.0_dp, ieee_quiet_nan)
+         if (n == 0) return
+         r = 1.0_dp - alpha
+         mean = x(1)
+         cov = 0.0_dp
+         den = 1.0_dp
+         den2 = 1.0_dp
+         do i = 2, n
+            old_wt = r*den
+            old_mean = mean
+            mean = (old_wt*old_mean + x(i)) / (old_wt + 1.0_dp)
+            cov = (old_wt*(cov + (old_mean - mean)**2) + (x(i) - mean)**2) / (old_wt + 1.0_dp)
+            den = old_wt + 1.0_dp
+            den2 = r*r*den2 + 1.0_dp
+            denom = den**2 - den2
+            if (denom > 0.0_dp) y(i) = sqrt(max(cov*den**2/denom, 0.0_dp))
+         end do
+      end function ewm_std_1d
 
 end module python_mod

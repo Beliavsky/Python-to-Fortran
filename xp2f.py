@@ -8375,6 +8375,13 @@ def detect_needed_helpers(tree):
                 needed.add("corrcoef_matrix_rows_real")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "cov"
+                and len(node.args) == 0
+            ):
+                # pandas DataFrame.cov() lowers to cov_matrix_rows_real.
+                needed.add("cov_matrix_rows_real")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "describe"
                 and len(node.args) == 0
             ):
@@ -8392,6 +8399,22 @@ def detect_needed_helpers(tree):
                 needed.add("rolling_std_1d")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "expanding"
+            ):
+                # pandas DataFrame.expanding().mean()/.std() lowers to
+                # expanding_mean_1d/expanding_std_1d.
+                needed.add("expanding_mean_1d")
+                needed.add("expanding_std_1d")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ewm"
+            ):
+                # pandas DataFrame.ewm(...).mean()/.std() lowers to
+                # ewm_mean_1d/ewm_std_1d.
+                needed.add("ewm_mean_1d")
+                needed.add("ewm_std_1d")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "median"
                 and len(node.args) == 0
             ):
@@ -8402,6 +8425,36 @@ def detect_needed_helpers(tree):
                 and len(node.args) == 0
             ):
                 needed.add("std")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "sem"
+                and len(node.args) == 0
+            ):
+                needed.add("std")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "autocorr"
+                and len(node.args) <= 1
+            ):
+                needed.add("autocorr_1d")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "corrwith"
+                and len(node.args) == 1
+            ):
+                needed.add("corr2_1d")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "skew"
+                and len(node.args) == 0
+            ):
+                needed.add("skew_1d")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "kurt"
+                and len(node.args) == 0
+            ):
+                needed.add("kurt_1d")
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var"}
@@ -18381,8 +18434,17 @@ class translator(ast.NodeVisitor):
         if (
             isinstance(a0, ast.Call)
             and isinstance(a0.func, ast.Attribute)
-            and a0.func.attr in {"corr", "describe", "mean", "median", "std", "min", "max", "sum", "prod", "var"}
+            and a0.func.attr in {"corr", "cov", "describe", "mean", "median", "std", "min", "max", "sum", "prod", "var", "sem", "skew", "kurt", "idxmax", "idxmin"}
             and len(a0.args) == 0
+        ):
+            root = self._pandas_df_root_id(a0.func.value)
+            if root is not None:
+                return root
+        if (
+            isinstance(a0, ast.Call)
+            and isinstance(a0.func, ast.Attribute)
+            and a0.func.attr == "corrwith"
+            and len(a0.args) == 1
         ):
             root = self._pandas_df_root_id(a0.func.value)
             if root is not None:
@@ -18393,7 +18455,7 @@ class translator(ast.NodeVisitor):
             and a0.func.attr == "round"
             and isinstance(a0.func.value, ast.Call)
             and isinstance(a0.func.value.func, ast.Attribute)
-            and a0.func.value.func.attr == "corr"
+            and a0.func.value.func.attr in {"corr", "cov"}
             and len(a0.func.value.args) == 0
         ):
             root = self._pandas_df_root_id(a0.func.value.func.value)
@@ -18506,16 +18568,17 @@ class translator(ast.NodeVisitor):
     def _pandas_df_simple_method_spec(self, v):
         # X = df.pct_change([periods]) / df.shift(periods[, fill_value=...])
         # / df.sort_index([ascending=...]) / df.cumsum() / df.cumprod() /
-        # df.diff([periods]) / df.abs() / df.sort_values(by[, ascending=...])
-        # -- DataFrame-returning methods implemented by the vendored
-        # DataFrame_index_date/DataFrame_str_index types, applied to a bare
-        # DataFrame Name (result has the same columns).
+        # df.cummax() / df.cummin() / df.diff([periods]) / df.abs() /
+        # df.sort_values(by[, ascending=...]) -- DataFrame-returning
+        # methods implemented by the vendored DataFrame_index_date/
+        # DataFrame_str_index types, applied to a bare DataFrame Name
+        # (result has the same columns).
         if not (
             isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
             and v.func.attr in {
                 "pct_change", "shift", "sort_index",
-                "cumsum", "cumprod", "diff", "abs", "sort_values",
+                "cumsum", "cumprod", "cummax", "cummin", "diff", "abs", "sort_values",
             }
             and isinstance(v.func.value, ast.Name)
             and v.func.value.id in self.pandas_df_vars
@@ -18540,7 +18603,7 @@ class translator(ast.NodeVisitor):
         # including a sort_index()/sort_values() match.
         _m_spec = self._pandas_df_simple_method_spec(v)
         if _m_spec is None or _m_spec["method"] not in {
-            "shift", "pct_change", "cumsum", "cumprod", "diff", "abs",
+            "shift", "pct_change", "cumsum", "cumprod", "cummax", "cummin", "diff", "abs",
         }:
             return None
         method = _m_spec["method"]
@@ -18567,7 +18630,7 @@ class translator(ast.NodeVisitor):
             periods_node = v.args[0] if v.args else kwargs.get("periods")
             arg_txt = f"({self.expr(periods_node)})" if periods_node is not None else "()"
             return f"{src_expr}%diff{arg_txt}"
-        # cumsum / cumprod / abs
+        # cumsum / cumprod / cummax / cummin / abs
         return f"{src_expr}%{method}()"
 
     def _pandas_df_copy_spec(self, v):
@@ -19244,6 +19307,94 @@ class translator(ast.NodeVisitor):
             "ddof_node": ddof_node,
         }
 
+    def _pandas_df_expanding_spec(self, v):
+        # X = df.expanding().mean() / df.expanding().std([ddof=]) --
+        # mirrors _pandas_df_rolling_spec, minus the window argument
+        # rolling() takes (expanding() takes none -- a growing window
+        # from row 1, not a fixed trailing one).
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"mean", "std"}
+            and len(v.args) == 0
+            and isinstance(v.func.value, ast.Call)
+            and isinstance(v.func.value.func, ast.Attribute)
+            and v.func.value.func.attr == "expanding"
+            and len(v.func.value.args) == 0
+            and not v.func.value.keywords
+            and isinstance(v.func.value.func.value, ast.Name)
+            and v.func.value.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        ddof_node = None
+        if v.func.attr == "std":
+            ddof_node = next((kw.value for kw in v.keywords if kw.arg == "ddof"), None)
+        return {
+            "method": v.func.attr,
+            "df_id": v.func.value.func.value.id,
+            "ddof_node": ddof_node,
+        }
+
+    def _pandas_df_ewm_spec(self, v):
+        # X = df.ewm(span=|com=|halflife=|alpha=...).mean() / .std() --
+        # mirrors _pandas_df_rolling_spec/_pandas_df_expanding_spec, with
+        # ewm()'s several alternate ways to specify the decay parameter
+        # (exactly one is required, same as pandas) instead of a window.
+        # adjust=True and (for .std()) bias=False are always assumed --
+        # both are pandas' own defaults -- so an explicit adjust=False or
+        # bias=True is rejected rather than silently computing the wrong
+        # (differently-weighted) thing.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"mean", "std"}
+            and len(v.args) == 0
+            and isinstance(v.func.value, ast.Call)
+            and isinstance(v.func.value.func, ast.Attribute)
+            and v.func.value.func.attr == "ewm"
+            and isinstance(v.func.value.func.value, ast.Name)
+            and v.func.value.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        ewm_call = v.func.value
+        ewm_kwargs = {kw.arg: kw.value for kw in ewm_call.keywords}
+        if ewm_kwargs.get("adjust") is not None and not (
+            isinstance(ewm_kwargs["adjust"], ast.Constant) and ewm_kwargs["adjust"].value is True
+        ):
+            return None
+        param_kind = None
+        param_node = None
+        for _k in ("span", "com", "halflife", "alpha"):
+            if _k in ewm_kwargs:
+                param_kind, param_node = _k, ewm_kwargs[_k]
+                break
+        if param_kind is None:
+            return None
+        if v.func.attr == "std":
+            _bias_node = next((kw.value for kw in v.keywords if kw.arg == "bias"), None)
+            if _bias_node is not None and not (
+                isinstance(_bias_node, ast.Constant) and _bias_node.value is False
+            ):
+                return None
+        return {
+            "method": v.func.attr,
+            "df_id": ewm_call.func.value.id,
+            "param_kind": param_kind,
+            "param_node": param_node,
+        }
+
+    def _ewm_alpha_expr(self, param_kind, param_node):
+        p = self._coerce_expr_kind(param_node, self.expr(param_node), "real")
+        if param_kind == "alpha":
+            return p
+        if param_kind == "span":
+            return f"(2.0_dp / ({p} + 1.0_dp))"
+        if param_kind == "com":
+            return f"(1.0_dp / (1.0_dp + {p}))"
+        if param_kind == "halflife":
+            return f"(1.0_dp - 0.5_dp**(1.0_dp / {p}))"
+        raise NotImplementedError(f"unsupported ewm parameter: {param_kind}")
+
     def _pandas_df_construct_spec(self, v):
         # pd.DataFrame(matrix, index=date_array, columns=str_list) -- build
         # a DataFrame_index_date directly from an in-memory real matrix.
@@ -19585,6 +19736,14 @@ class translator(ast.NodeVisitor):
             # (non-DataFrame) .var() handler needs an explicit ddof= to
             # get this same value; a bare df.var() always means ddof=1.
             return f"var_1d({col_expr}, 1)"
+        if method == "sem":
+            # Standard error of the mean -- pandas' default ddof=1, same
+            # sample-std convention as above.
+            return f"(std({col_expr}, 1) / sqrt(real(size({col_expr}), kind=dp)))"
+        if method == "skew":
+            return f"skew_1d({col_expr})"
+        if method == "kurt":
+            return f"kurt_1d({col_expr})"
         raise NotImplementedError(f"df.{method}() reduction not supported")
 
     def _pandas_df_reduction_series_spec(self, v):
@@ -19598,7 +19757,7 @@ class translator(ast.NodeVisitor):
         if not (
             isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and v.func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var"}
+            and v.func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var", "sem", "skew", "kurt"}
             and len(v.args) == 0
             and not v.keywords
             and isinstance(v.func.value, ast.Name)
@@ -19830,7 +19989,7 @@ class translator(ast.NodeVisitor):
             return self._pandas_df_arith_kind_cols(node.args[0])
         _m_spec = self._pandas_df_simple_method_spec(node)
         if _m_spec is not None and _m_spec["method"] in {
-            "shift", "pct_change", "cumsum", "cumprod", "diff", "abs",
+            "shift", "pct_change", "cumsum", "cumprod", "cummax", "cummin", "diff", "abs",
         }:
             # Kind/columns are unchanged by any of these -- same shape
             # (transform) in, same shape out.
@@ -23934,6 +24093,24 @@ class translator(ast.NodeVisitor):
             ):
                 inner_df_expr = self.expr(node.func.value.func.value.func.value)
                 return f"count(ieee_is_nan({inner_df_expr}%values))"
+            # X.autocorr() / X.autocorr(lag=k) -- lag-k serial correlation
+            # of a plain rank-1 real array (a pandas Series, modeled the
+            # same as any other plain array -- see pandas_series_vars)
+            # with itself -- see autocorr_1d.
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "autocorr"
+                and len(node.args) <= 1
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.alloc_reals
+                and self._rank_expr(node.func.value) == 1
+            ):
+                _ac_kwargs = {kw.arg: kw.value for kw in node.keywords}
+                _ac_lag_node = node.args[0] if node.args else _ac_kwargs.get("lag")
+                _ac_arr = self._aliased_name(node.func.value.id)
+                if _ac_lag_node is not None:
+                    return f"autocorr_1d({_ac_arr}, {self.expr(_ac_lag_node)})"
+                return f"autocorr_1d({_ac_arr})"
             # Method-call reductions: a.sum(), a.mean(), a.var(ddof=...)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -23945,12 +24122,12 @@ class translator(ast.NodeVisitor):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
                 if (
-                    attr in {"shift", "pct_change", "cumsum", "cumprod", "diff", "abs"}
+                    attr in {"shift", "pct_change", "cumsum", "cumprod", "cummax", "cummin", "diff", "abs"}
                     and isinstance(node.func.value, ast.Name)
                     and node.func.value.id in self.pandas_df_vars
                 ):
                     # df.shift(n)/.pct_change(n)/.cumsum()/.cumprod()/
-                    # .diff(n)/.abs() used as a general expression -- e.g.
+                    # .cummax()/.cummin()/.diff(n)/.abs() used as a general expression -- e.g.
                     # nested inside DataFrame arithmetic
                     # (weights.shift(1) * asset_rets, see
                     # _is_pandas_df_arith_value) or passed to another call
@@ -30285,6 +30462,48 @@ class translator(ast.NodeVisitor):
                         if _src_cols is not None:
                             self._mark_int("rw_j")
                             self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_r_spec["df_id"], "DataFrame_index_date")
+                            self.pandas_df_columns[t.id] = list(_src_cols)
+                            self.ints.discard(t.id)
+                            self.reals.discard(t.id)
+                            self.logs.discard(t.id)
+                            self.chars.discard(t.id)
+                            self.complexes.discard(t.id)
+                            self.alloc_ints.discard(t.id)
+                            self.alloc_reals.discard(t.id)
+                            self.alloc_logs.discard(t.id)
+                            self.alloc_chars.discard(t.id)
+                            self.alloc_complexes.discard(t.id)
+                            continue
+
+                # X = df.expanding().mean()/.std() -- same columns as df.
+                if isinstance(t, ast.Name):
+                    _e_spec = self._pandas_df_expanding_spec(v)
+                    if _e_spec is not None:
+                        _src_cols = self.pandas_df_columns.get(_e_spec["df_id"])
+                        if _src_cols is not None:
+                            self._mark_int("rw_j")
+                            self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_e_spec["df_id"], "DataFrame_index_date")
+                            self.pandas_df_columns[t.id] = list(_src_cols)
+                            self.ints.discard(t.id)
+                            self.reals.discard(t.id)
+                            self.logs.discard(t.id)
+                            self.chars.discard(t.id)
+                            self.complexes.discard(t.id)
+                            self.alloc_ints.discard(t.id)
+                            self.alloc_reals.discard(t.id)
+                            self.alloc_logs.discard(t.id)
+                            self.alloc_chars.discard(t.id)
+                            self.alloc_complexes.discard(t.id)
+                            continue
+
+                # X = df.ewm(...).mean()/.std() -- same columns as df.
+                if isinstance(t, ast.Name):
+                    _ew_spec = self._pandas_df_ewm_spec(v)
+                    if _ew_spec is not None:
+                        _src_cols = self.pandas_df_columns.get(_ew_spec["df_id"])
+                        if _src_cols is not None:
+                            self._mark_int("rw_j")
+                            self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_ew_spec["df_id"], "DataFrame_index_date")
                             self.pandas_df_columns[t.id] = list(_src_cols)
                             self.ints.discard(t.id)
                             self.reals.discard(t.id)
@@ -37520,6 +37739,46 @@ class translator(ast.NodeVisitor):
                 self.o.w("end do")
                 return
 
+        # X = df.expanding().mean()/.std()
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _e_spec = self._pandas_df_expanding_spec(v)
+            if _e_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_e_spec["df_id"])
+                self.o.w(f"{name} = {src_expr}")
+                self.o.w(f"do rw_j = 1, ncol({name})")
+                self.o.push()
+                if _e_spec["method"] == "mean":
+                    self.o.w(
+                        f"{name}%values(:, rw_j) = expanding_mean_1d({src_expr}%values(:, rw_j))"
+                    )
+                else:
+                    ddof_txt = f", {self.expr(_e_spec['ddof_node'])}" if _e_spec["ddof_node"] is not None else ""
+                    self.o.w(
+                        f"{name}%values(:, rw_j) = expanding_std_1d({src_expr}%values(:, rw_j){ddof_txt})"
+                    )
+                self.o.pop()
+                self.o.w("end do")
+                return
+
+        # X = df.ewm(...).mean()/.std()
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _ew_spec = self._pandas_df_ewm_spec(v)
+            if _ew_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_ew_spec["df_id"])
+                alpha_expr = self._ewm_alpha_expr(_ew_spec["param_kind"], _ew_spec["param_node"])
+                fn = "ewm_mean_1d" if _ew_spec["method"] == "mean" else "ewm_std_1d"
+                self.o.w(f"{name} = {src_expr}")
+                self.o.w(f"do rw_j = 1, ncol({name})")
+                self.o.push()
+                self.o.w(
+                    f"{name}%values(:, rw_j) = {fn}({src_expr}%values(:, rw_j), {alpha_expr})"
+                )
+                self.o.pop()
+                self.o.w("end do")
+                return
+
         # X = df[runtime_char_array].to_numpy(dtype=...) -- column selection
         # by a runtime (not compile-time known) list of names. Needs a
         # materialized temp since Fortran forbids chaining %values directly
@@ -37593,7 +37852,7 @@ class translator(ast.NodeVisitor):
                     else:
                         self.o.w(f"call {name}%sort_index()")
                     return
-                if method in ("cumsum", "cumprod", "abs"):
+                if method in ("cumsum", "cumprod", "cummax", "cummin", "abs"):
                     self.o.w(f"{name} = {src_expr}%{method}()")
                     return
                 if method == "diff":
@@ -41092,6 +41351,43 @@ class translator(ast.NodeVisitor):
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "cov"
+                and len(c.args[0].args) == 0
+                and self._is_pandas_df_ref_node(c.args[0].func.value)
+            ):
+                self._emit_pandas_df_cov_print(c.args[0], context_node=orig_call)
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr in {"idxmax", "idxmin"}
+                and len(c.args[0].args) == 0
+                and not c.args[0].keywords
+                and self._is_pandas_df_ref_node(c.args[0].func.value)
+            ):
+                self._emit_pandas_df_idxreduce_print(c.args[0], c.args[0].func.attr, context_node=orig_call)
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "corrwith"
+                and len(c.args[0].args) == 1
+                and not c.args[0].keywords
+                and self._is_pandas_df_ref_node(c.args[0].func.value)
+                and isinstance(c.args[0].args[0], ast.Name)
+                and c.args[0].args[0].id in self.alloc_reals
+                and self._rank_expr(c.args[0].args[0]) == 1
+            ):
+                self._emit_pandas_df_corrwith_print(
+                    c.args[0], c.args[0].args[0], context_node=orig_call
+                )
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "describe"
                 and len(c.args[0].args) == 0
                 and self._is_pandas_df_ref_node(c.args[0].func.value)
@@ -41104,7 +41400,7 @@ class translator(ast.NodeVisitor):
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
-                and c.args[0].func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var"}
+                and c.args[0].func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var", "sem", "skew", "kurt"}
                 and len(c.args[0].args) == 0
                 and all(kw.arg == "axis" for kw in c.args[0].keywords)
                 and (
@@ -41173,7 +41469,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr in {
                     "pct_change", "shift", "sort_index",
-                    "cumsum", "cumprod", "diff", "abs", "sort_values",
+                    "cumsum", "cumprod", "cummax", "cummin", "diff", "abs", "sort_values",
                 }
                 and isinstance(c.args[0].func.value, ast.Name)
                 and c.args[0].func.value.id in self.pandas_df_vars
@@ -41253,6 +41549,28 @@ class translator(ast.NodeVisitor):
                 ):
                     ndigits = int(c.args[0].args[0].value)
                 self._emit_pandas_df_corr_print(
+                    c.args[0].func.value, ndigits=ndigits, context_node=orig_call
+                )
+                return
+            if (
+                len(c.args) == 1
+                and isinstance(c.args[0], ast.Call)
+                and isinstance(c.args[0].func, ast.Attribute)
+                and c.args[0].func.attr == "round"
+                and isinstance(c.args[0].func.value, ast.Call)
+                and isinstance(c.args[0].func.value.func, ast.Attribute)
+                and c.args[0].func.value.func.attr == "cov"
+                and len(c.args[0].func.value.args) == 0
+                and self._is_pandas_df_ref_node(c.args[0].func.value.func.value)
+            ):
+                ndigits = 6
+                if (
+                    c.args[0].args
+                    and isinstance(c.args[0].args[0], ast.Constant)
+                    and isinstance(c.args[0].args[0].value, int)
+                ):
+                    ndigits = int(c.args[0].args[0].value)
+                self._emit_pandas_df_cov_print(
                     c.args[0].func.value, ndigits=ndigits, context_node=orig_call
                 )
                 return
@@ -42143,6 +42461,12 @@ class translator(ast.NodeVisitor):
                 val_expr = f"product({col_expr})"
             elif method == "var":
                 val_expr = f"var_1d({col_expr}, 1)"
+            elif method == "sem":
+                val_expr = f"(std({col_expr}, 1) / sqrt(real(size({col_expr}), kind=dp)))"
+            elif method == "skew":
+                val_expr = f"skew_1d({col_expr})"
+            elif method == "kurt":
+                val_expr = f"kurt_1d({col_expr})"
             elif method == "isna_sum":
                 val_expr = f"count(ieee_is_nan({col_expr}))"
             else:
@@ -42153,6 +42477,81 @@ class translator(ast.NodeVisitor):
             else:
                 self.o.w(f"write(*,'(A,{pad}X,F12.6)') {fstr(cname)}, {val_expr}")
         self.o.w(f"write(*,{fstr('(A)')}) 'dtype: {'int64' if method == 'isna_sum' else 'float64'}'")
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_idxreduce_print(self, call, method, context_node=None):
+        # print(df.idxmax()) / print(df.idxmin()) -- for each column, the
+        # row INDEX LABEL (not position) of the max/min value, printed the
+        # same way pandas_row_reduce_i's axis=1 row-reduction already
+        # prints a row label (see _emit_pandas_df_series_reduction_print):
+        # the DataFrame_str_index's own character label, or
+        # DataFrame_index_date's %to_str() -- and Fortran's maxloc/minloc
+        # give the 1-based row position directly.
+        df_expr, col_names = self._pandas_df_ref(call.func.value, context_node or call)
+        if not col_names:
+            raise NotImplementedError(
+                f"df.{method}() printing requires statically known column names"
+            )
+        self.o.w("block")
+        self.o.push()
+        orig_df_expr = df_expr
+        _reduction_kind = self.pandas_df_vars.get(
+            self._pandas_df_root_id(call.func.value), "DataFrame_index_date"
+        )
+        # A plain RangeIndex-default frame (see pandas_rangeidx_df_ids)
+        # still stores its labels as digit-string %index text the same as
+        # any other DataFrame_str_index, but pandas itself reports the
+        # result's dtype as int64 (row *positions*), not object (genuine
+        # string labels) -- this only affects the trailer line, not the
+        # value text itself (Fortran's `trim()` on "3" prints the same
+        # digits either way).
+        _is_rangeidx = self._pandas_df_root_id(call.func.value) in self.pandas_rangeidx_df_ids
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_reduction_kind)
+        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
+        self.o.w("integer :: pdf_idxreduce_pos")
+        name_width = max(len(c) for c in col_names)
+        loc_fn = "maxloc" if method == "idxmax" else "minloc"
+        for j, cname in enumerate(col_names, start=1):
+            col_expr = f"{df_expr}%values(:, {j})"
+            self.o.w(f"pdf_idxreduce_pos = {loc_fn}({col_expr}, dim=1)")
+            if _reduction_kind == "DataFrame_str_index":
+                label_expr = f"trim({df_expr}%index(pdf_idxreduce_pos))"
+            else:
+                label_expr = f"trim({df_expr}%index(pdf_idxreduce_pos)%to_str())"
+            pad = name_width - len(cname) + 4
+            self.o.w(f"write(*,'(A,{pad}X,A)') {fstr(cname)}, {label_expr}")
+        self.o.w(f"write(*,{fstr('(A)')}) 'dtype: {'int64' if _is_rangeidx else 'object'}'")
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_corrwith_print(self, call, other_node, context_node=None):
+        # print(df.corrwith(other)) -- other a plain rank-1 real array
+        # (e.g. a pd.Series(...) or a df["col"] extracted to a variable):
+        # one Pearson correlation per column of df, against the same
+        # `other` each time -- via corr2_1d (see _emit_pandas_df_print's
+        # sibling reduction prints for the shared column-loop/label-width
+        # layout convention).
+        df_expr, col_names = self._pandas_df_ref(call.func.value, context_node or call)
+        if not col_names:
+            raise NotImplementedError(
+                "df.corrwith() printing requires statically known column names"
+            )
+        self.o.w("block")
+        self.o.push()
+        orig_df_expr = df_expr
+        _cw_kind = self.pandas_df_vars.get(
+            self._pandas_df_root_id(call.func.value), "DataFrame_index_date"
+        )
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_cw_kind)
+        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
+        other_expr = self.expr(other_node)
+        name_width = max(len(c) for c in col_names)
+        for j, cname in enumerate(col_names, start=1):
+            col_expr = f"{df_expr}%values(:, {j})"
+            pad = name_width - len(cname) + 4
+            self.o.w(f"write(*,'(A,{pad}X,F12.6)') {fstr(cname)}, corr2_1d({col_expr}, {other_expr})")
+        self.o.w(f"write(*,{fstr('(A)')}) 'dtype: float64'")
         self.o.pop()
         self.o.w("end block")
 
@@ -42202,6 +42601,46 @@ class translator(ast.NodeVisitor):
         self.o.w(f"do corr_i = 1, {n_cols}")
         self.o.push()
         self.o.w(f"write(*,{row_fmt}) trim(corr_labels(corr_i)), corr_mat(corr_i, :)")
+        self.o.pop()
+        self.o.w("end do")
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_cov_print(self, cov_call, ndigits=6, context_node=None):
+        # print(df.cov()) / print(df.cov().round(n)) -- pairwise covariance
+        # matrix. Near-identical to _emit_pandas_df_corr_print, just using
+        # cov_matrix_rows_real (ddof=1, pandas' default) instead of
+        # corrcoef_matrix_rows_real -- see that function's comments for
+        # the shared conventions (columns as variables, no transpose).
+        df_expr, col_names = self._pandas_df_ref(cov_call.func.value, context_node or cov_call)
+        if not col_names:
+            raise NotImplementedError(
+                "df.cov() printing requires statically known column names"
+            )
+        col_width = max(10, ndigits + 8)
+        n_cols = len(col_names)
+        max_len = max(len(c) for c in col_names)
+        self.o.w("block")
+        self.o.push()
+        orig_df_expr = df_expr
+        _cov_kind = self.pandas_df_vars.get(
+            self._pandas_df_root_id(cov_call.func.value), "DataFrame_index_date"
+        )
+        df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_cov_kind)
+        self.o.w("real(kind=dp), allocatable :: cov_mat(:,:)")
+        self.o.w("integer :: cov_i")
+        self.o.w(f"character(len={max_len}), allocatable :: cov_labels(:)")
+        self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
+        self.o.w(f"cov_mat = cov_matrix_rows_real({df_expr}%values, 1)")
+        labels_txt = ", ".join(fstr(c) for c in col_names)
+        self.o.w(f"cov_labels = [character(len={max_len}) :: {labels_txt}]")
+        header_fmt = f"'(A10,{n_cols}A{col_width})'"
+        header_args = ", ".join(fstr(c) for c in col_names)
+        self.o.w(f"write(*,{header_fmt}) '', {header_args}")
+        row_fmt = f"'(A10,{n_cols}F{col_width}.{ndigits})'"
+        self.o.w(f"do cov_i = 1, {n_cols}")
+        self.o.push()
+        self.o.w(f"write(*,{row_fmt}) trim(cov_labels(cov_i)), cov_mat(cov_i, :)")
         self.o.pop()
         self.o.w("end do")
         self.o.pop()

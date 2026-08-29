@@ -994,7 +994,7 @@ type :: DataFrame_index_date
          set_at, set_iat, has_col, has_idx, drop_cols, drop_rows, &
          rename_cols, where_cols, filter_cols, where, filter, iloc, &
          select, add, subtract, multiply, divide, reindex, shift, &
-         pct_change, log_change, cumsum, cumprod, diff, sort_values, &
+         pct_change, log_change, cumsum, cumprod, cummax, cummin, diff, sort_values, &
          abs => abs_df, display_pdf => display_pdf_date
 end type DataFrame_index_date
 
@@ -2336,6 +2336,32 @@ do i = 2, nrow(self)
    df_new%values(i,:) = df_new%values(i-1,:)*df_new%values(i,:)
 end do
 end function cumprod
+
+pure function cummax(self) result(df_new)
+! running maximum down each column
+class(DataFrame_index_date), intent(in) :: self
+type(DataFrame_index_date) :: df_new
+integer :: i
+df_new%index = self%index
+df_new%columns = self%columns
+df_new%values = self%values
+do i = 2, nrow(self)
+   df_new%values(i,:) = max(df_new%values(i-1,:), df_new%values(i,:))
+end do
+end function cummax
+
+pure function cummin(self) result(df_new)
+! running minimum down each column
+class(DataFrame_index_date), intent(in) :: self
+type(DataFrame_index_date) :: df_new
+integer :: i
+df_new%index = self%index
+df_new%columns = self%columns
+df_new%values = self%values
+do i = 2, nrow(self)
+   df_new%values(i,:) = min(df_new%values(i-1,:), df_new%values(i,:))
+end do
+end function cummin
 
 pure function diff(self, periods) result(df_new)
 ! row-to-row difference `periods` rows apart (NaN-filled for the first

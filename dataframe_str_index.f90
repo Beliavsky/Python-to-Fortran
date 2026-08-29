@@ -25,6 +25,8 @@ module dataframe_str_index_mod
       procedure :: has_col => has_col_str
       procedure :: cumsum => cumsum_str
       procedure :: cumprod => cumprod_str
+      procedure :: cummax => cummax_str
+      procedure :: cummin => cummin_str
       procedure :: diff => diff_str
       procedure :: abs => abs_str
       procedure :: sort_values => sort_values_str
@@ -183,6 +185,32 @@ contains
          df_new%values(i, :) = df_new%values(i - 1, :)*df_new%values(i, :)
       end do
    end function cumprod_str
+
+   pure function cummax_str(self) result(df_new)
+      ! running maximum down each column
+      class(DataFrame_str_index), intent(in) :: self
+      type(DataFrame_str_index) :: df_new
+      integer :: i
+      df_new%index = self%index
+      df_new%columns = self%columns
+      df_new%values = self%values
+      do i = 2, nrow(self)
+         df_new%values(i, :) = max(df_new%values(i - 1, :), df_new%values(i, :))
+      end do
+   end function cummax_str
+
+   pure function cummin_str(self) result(df_new)
+      ! running minimum down each column
+      class(DataFrame_str_index), intent(in) :: self
+      type(DataFrame_str_index) :: df_new
+      integer :: i
+      df_new%index = self%index
+      df_new%columns = self%columns
+      df_new%values = self%values
+      do i = 2, nrow(self)
+         df_new%values(i, :) = min(df_new%values(i - 1, :), df_new%values(i, :))
+      end do
+   end function cummin_str
 
    pure function diff_str(self, periods) result(df_new)
       ! row-to-row difference `periods` rows apart (NaN-filled for the
