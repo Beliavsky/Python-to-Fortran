@@ -6411,3 +6411,112 @@ def test_xp2f_pandas_df_ewm(tmp_path: Path) -> None:
             "print(ea_a[0], ea_a[2], ea_a[5])",
         ],
     )
+
+
+def test_xp2f_pandas_df_astype_binop_and_nan_safe_compare(tmp_path: Path) -> None:
+    # Regression test for examples/xtrend_ma.py's trend-signal
+    # construction: `signal = above.astype(float) - below.astype(float)`
+    # (a BinOp of two .astype(float) calls, neither a bare df Name) was
+    # NEVER recognized as producing a DataFrame at all -- prescan's own
+    # "X = df1 op df2" registration branch and _is_pandas_df_arith_value
+    # (used by expr()'s BinOp codegen too) both only recognized a bare
+    # Name operand, not a chained call -- so `signal` silently fell
+    # through to a completely unrelated generic (non-DataFrame) codegen
+    # path, producing wrong/invalid Fortran with no error at transpile
+    # time (only surfaced once printed). Fixed by teaching
+    # _is_pandas_df_arith_value/_pandas_df_arith_kind_cols to recognize
+    # _pandas_df_astype_spec the same way they already did for
+    # .shift()/.cumsum()/etc, and generalizing both the prescan and
+    # codegen "X = df1 op df2" branches to use them instead of a bare-
+    # Name-only check.
+    #
+    # Also exercises the DataFrame comparison (`prices > ma`) that feeds
+    # this: ma = prices.rolling(n).mean() is NaN for the window's warm-up
+    # rows, and comparing against NaN used to trip -ffpe-trap=invalid
+    # (Fortran's ordered comparisons all signal on NaN, unlike pandas
+    # where a NaN comparison quietly evaluates to False) -- now guarded.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_astype_binop_signal.py",
+        [
+            "import pandas as pd",
+            "",
+            "prices = pd.DataFrame({'a': [10.0, 11.0, 9.0, 12.0, 13.0], "
+            "'b': [5.0, 4.0, 6.0, 5.5, 5.2]})",
+            "ma = prices.rolling(2).mean()",
+            "above = prices > ma",
+            "below = prices < ma",
+            "signal = above.astype(float) - below.astype(float)",
+            "sig_a = signal['a']",
+            "sig_b = signal['b']",
+            "print(sig_a[0], sig_a[1], sig_a[2], sig_a[3], sig_a[4])",
+            "print(sig_b[0], sig_b[1], sig_b[2], sig_b[3], sig_b[4])",
+        ],
+    )
+
+
+def test_xp2f_dynamic_column_series_shift_and_nan_safe_generic_compare(tmp_path: Path) -> None:
+    # Regression test for examples/xtrend_ma.py's per-asset loop:
+    #   for name in asset_names:
+    #       sig = signal[name].iloc[n:]
+    #       ret = asset_rets[name].shift(-1).iloc[n:]
+    #       active = sig != 0.0
+    #       correct = ((sig > 0.0) & (ret > 0.0)) | ((sig < 0.0) & (ret < 0.0))
+    #       pct_long = (sig[active] > 0.0).mean()
+    # Three separate new/fixed pieces, all exercised together:
+    # 1. df[name] -- a single column selected by a RUNTIME character-
+    #    scalar expression (a `for name in ...:` loop variable), not a
+    #    literal string -- new Subscript branch in expr()'s dispatch.
+    # 2. Series.shift(periods) (as opposed to DataFrame.shift(), a type-
+    #    bound procedure) on a plain rank-1 array -- new shift_1d helper,
+    #    and _plain_series_expr_text/_plain_array_iloc_slice_spec
+    #    generalized to chain .iloc[lo:hi] onto either of the above.
+    # 3. `ret > 0.0` where ret's last element is NaN (from .shift(-1)
+    #    having no value to shift in) previously tripped
+    #    -ffpe-trap=invalid the same way DataFrame comparisons did --
+    #    the GENERIC (non-DataFrame) comparison codegen needed the same
+    #    NaN guard.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdyncol_shift_compare.py",
+        [
+            "import pandas as pd",
+            "",
+            "signal = pd.DataFrame({'a': [1.0, -1.0, 0.0, 1.0, -1.0], "
+            "'b': [0.0, 1.0, -1.0, 1.0, 0.0]})",
+            "rets = pd.DataFrame({'a': [0.01, -0.02, 0.03, -0.01, 0.02], "
+            "'b': [-0.01, 0.02, 0.01, -0.03, 0.01]})",
+            "names = ['a', 'b']",
+            "n = 1",
+            "for name in names:",
+            "    sig = signal[name].iloc[n:]",
+            "    ret = rets[name].shift(-1).iloc[n:]",
+            "    active = sig != 0.0",
+            "    correct = ((sig > 0.0) & (ret > 0.0)) | ((sig < 0.0) & (ret < 0.0))",
+            "    pct_long = (sig[active] > 0.0).mean()",
+            "    hit = correct[active].mean()",
+            "    print(name, pct_long, hit)",
+        ],
+    )
+
+
+def test_xp2f_pandas_date_iloc_runtime_index(tmp_path: Path) -> None:
+    # Regression test: dates.iloc[n] where n is a variable (not a
+    # literal) -- _pandas_date_scalar_expr only handled a literal
+    # (possibly negative) integer index; extended to also emit a general
+    # runtime (assumed non-negative) index expression.
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdate_iloc_runtime.py",
+        [
+            "import pandas as pd",
+            "",
+            "n = 2",
+            "dat = pd.read_csv('prices.csv')",
+            "dates = pd.to_datetime(dat['Date'], errors='coerce')",
+            "print(str(dates.iloc[n].date()))",
+            "print(str(dates.iloc[0].date()))",
+            "print(str(dates.iloc[-1].date()))",
+        ],
+    )

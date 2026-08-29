@@ -348,6 +348,7 @@ public :: expanding_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp
 public :: expanding_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="expanding (growing-window) sample standard deviation"
 public :: ewm_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) desc="exponentially weighted moving average (adjust=True, pandas' default)"
 public :: ewm_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) desc="exponentially weighted sample standard deviation (adjust=True, bias=False, pandas' defaults)"
+public :: shift_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),periods:integer:intent(in):optional,fill_value:real(dp):intent(in):optional desc="pandas-style Series.shift(periods, fill_value) for a plain 1D real vector"
 
 interface cumsum
    module procedure cumsum_real, cumsum_int
@@ -7241,5 +7242,40 @@ contains
             if (denom > 0.0_dp) y(i) = sqrt(max(cov*den**2/denom, 0.0_dp))
          end do
       end function ewm_std_1d
+
+      pure function shift_1d(x, periods, fill_value) result(y)
+         ! pandas Series.shift(periods[, fill_value]) -- shift values by
+         ! `periods` positions (positive shifts toward higher indices,
+         ! negative toward lower), filling the vacated positions with
+         ! fill_value (NaN by default). Mirrors dataframe_str_index.f90's
+         ! shift_str/dataframe_index_date.f90's shift (axis=0 case) for a
+         ! plain rank-1 array -- needed for a Series extracted from a
+         ! DataFrame column (e.g. `df[name].shift(-1)` inside a `for name
+         ! in ...:` loop, where `name` is a runtime column-name
+         ! expression, not a whole-DataFrame .shift()).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: periods
+         real(kind=dp), intent(in), optional :: fill_value
+         real(kind=dp), allocatable :: y(:)
+         integer :: p, k, n
+         real(kind=dp) :: fill
+         p = 1
+         if (present(periods)) p = periods
+         fill = ieee_value(0.0_dp, ieee_quiet_nan)
+         if (present(fill_value)) fill = fill_value
+         n = size(x)
+         allocate(y(n))
+         y = fill
+         if (n <= 0 .or. p == 0) then
+            if (p == 0) y = x
+            return
+         end if
+         if (p > 0) then
+            if (p < n) y(p + 1:n) = x(1:n - p)
+         else
+            k = -p
+            if (k < n) y(1:n - k) = x(k + 1:n)
+         end if
+      end function shift_1d
 
 end module python_mod

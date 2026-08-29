@@ -8445,6 +8445,19 @@ def detect_needed_helpers(tree):
                 needed.add("corr2_1d")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "shift"
+                and len(node.args) <= 1
+            ):
+                # DataFrame.shift() is a type-bound procedure (no
+                # python_mod helper needed); a Series/plain-array .shift()
+                # lowers to shift_1d -- see _plain_series_expr_text. Safe
+                # to always add: an unused `use ... only:` entry is
+                # harmless, and there's no cheap way to tell the two
+                # apart here (this walks the raw AST, before
+                # pandas_df_vars is populated).
+                needed.add("shift_1d")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "skew"
                 and len(node.args) == 0
             ):
@@ -18281,7 +18294,7 @@ class translator(ast.NodeVisitor):
             and isinstance(node.value, ast.Attribute)
             and node.value.attr == "iloc"
             and isinstance(node.value.value, ast.Name)
-            and _slice_int is not None
+            and not isinstance(node.slice, (ast.Slice, ast.List, ast.Tuple))
             and (
                 node.value.value.id in self.pandas_date_array_aliases
                 or node.value.value.id in self.pandas_date_arrays
@@ -18292,13 +18305,21 @@ class translator(ast.NodeVisitor):
                 arr_expr = f"{self._aliased_name(self.pandas_date_array_aliases[base_id])}%index"
             else:
                 arr_expr = self._aliased_name(base_id)
-            idx = _slice_int
-            if idx >= 0:
-                fidx = str(idx + 1)
-            elif idx == -1:
-                fidx = f"size({arr_expr})"
+            if _slice_int is not None:
+                idx = _slice_int
+                if idx >= 0:
+                    fidx = str(idx + 1)
+                elif idx == -1:
+                    fidx = f"size({arr_expr})"
+                else:
+                    fidx = f"size({arr_expr}) + {idx + 1}"
             else:
-                fidx = f"size({arr_expr}) + {idx + 1}"
+                # A general runtime index (e.g. `dates.iloc[n]` where n
+                # is a variable, not a literal) -- assumed non-negative,
+                # unlike the literal case above (which special-cases
+                # negative Python-style indices); a runtime negative
+                # index isn't supported here.
+                fidx = f"({self.expr(node.slice)} + 1)"
             return f"{arr_expr}({fidx})"
         return None
 
@@ -18859,6 +18880,49 @@ class translator(ast.NodeVisitor):
             return {"df_id": None, "inner_expr": v.func.value, "method": v.func.attr}
         return None
 
+    def _plain_series_expr_text(self, node):
+        # Fortran expression text for a plain rank-1 real "Series" value
+        # built from one of a few recognized runtime-dynamic shapes, none
+        # of which are a bare DataFrame/date-array Name (those have their
+        # own, more specific handling elsewhere) -- used by
+        # _plain_array_iloc_slice_spec and expr()'s matching Call
+        # dispatch for the same shapes used as a general sub-expression.
+        # Returns None if node isn't one of these shapes.
+        #   - X (a bare Name already tracked as a plain real array)
+        #   - df[name] (a single column selected by a runtime character-
+        #     scalar expression, e.g. a `for name in asset_names:` loop
+        #     variable -- see the matching Subscript branch in expr()'s
+        #     main dispatch)
+        #   - <either of the above>.shift(periods) (Series.shift, NOT
+        #     DataFrame.shift -- see shift_1d)
+        if isinstance(node, ast.Name) and node.id in self.alloc_reals:
+            return self._aliased_name(node.id)
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.pandas_df_vars
+            and isinstance(node.slice, ast.Name)
+            and self._expr_kind(node.slice) == "char"
+            and self._rank_expr(node.slice) == 0
+        ):
+            df_expr = self._aliased_name(node.value.id)
+            col_expr = self.expr(node.slice)
+            return f"{df_expr}%values(:, {df_expr}%col_pos({col_expr}))"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "shift"
+            and len(node.args) <= 1
+        ):
+            inner_txt = self._plain_series_expr_text(node.func.value)
+            if inner_txt is None:
+                return None
+            kwargs = {kw.arg: kw.value for kw in node.keywords}
+            periods_node = node.args[0] if node.args else kwargs.get("periods")
+            periods_txt = f", {self.expr(periods_node)}" if periods_node is not None else ""
+            return f"shift_1d({inner_txt}{periods_txt})"
+        return None
+
     def _plain_array_iloc_slice_spec(self, v):
         # X = Y.iloc[lo:hi] -- a slice of a plain rank-1 real/int array
         # (as opposed to a DataFrame or a pandas date-array, which have
@@ -18867,30 +18931,39 @@ class translator(ast.NodeVisitor):
         # reallocating a new array holding the sliced values; covers the
         # common `port_ret = port_ret.iloc[n:]` pattern of dropping a
         # rolling-window warm-up prefix after a row-reduction (see
-        # _pandas_df_row_reduction_spec) computed the full series.
+        # _pandas_df_row_reduction_spec) computed the full series, as
+        # well as chains built on the runtime-dynamic shapes recognized
+        # by _plain_series_expr_text (e.g. `asset_rets[name].shift(-1)
+        # .iloc[n:]` inside a `for name in asset_names:` loop).
         if not (
             isinstance(v, ast.Subscript)
             and isinstance(v.value, ast.Attribute)
             and v.value.attr == "iloc"
-            and isinstance(v.value.value, ast.Name)
             and isinstance(v.slice, ast.Slice)
             and v.slice.step is None
         ):
             return None
-        base_id = v.value.value.id
-        if (
-            base_id in self.pandas_df_vars
-            or base_id in self.pandas_date_array_aliases
-            or base_id in self.pandas_date_arrays
-        ):
-            return None
-        if base_id in self.alloc_reals:
-            kind = "real"
-        elif base_id in self.alloc_ints:
-            kind = "int"
-        else:
-            return None
-        return {"base_id": base_id, "slice": v.slice, "kind": kind}
+        base = v.value.value
+        if isinstance(base, ast.Name):
+            base_id = base.id
+            if (
+                base_id in self.pandas_df_vars
+                or base_id in self.pandas_date_array_aliases
+                or base_id in self.pandas_date_arrays
+            ):
+                return None
+            if base_id in self.alloc_reals:
+                kind = "real"
+            elif base_id in self.alloc_ints:
+                kind = "int"
+            else:
+                return None
+            return {"base_kind": "name", "base_id": base_id, "slice": v.slice, "kind": kind}
+        if not isinstance(base, ast.Name):
+            _base_txt = self._plain_series_expr_text(base)
+            if _base_txt is not None:
+                return {"base_kind": "expr", "base_expr": _base_txt, "slice": v.slice, "kind": "real"}
+        return None
 
     def _pandas_concat_spec(self, v):
         # X = pd.concat([df1, df2, ...][, axis=0|1][, ignore_index=True])
@@ -19935,6 +20008,16 @@ class translator(ast.NodeVisitor):
             # a subroutine call and so are NOT expression-safe (see
             # _pandas_df_simple_method_expr_text, which excludes them).
             return True
+        if self._pandas_df_astype_spec(node) is not None:
+            # df.astype(float) -- also a genuine pure function (a no-op
+            # copy, see _pandas_df_astype_spec), so `above.astype(float) -
+            # below.astype(float)` (e.g. examples/xtrend_ma.py's
+            # trend-signal construction) needs this the same way the
+            # simple-method case above does; without it, neither operand
+            # is recognized here, so the whole BinOp silently falls
+            # through to a completely unrelated generic (non-DataFrame)
+            # codegen path instead of erroring loudly.
+            return True
         return False
 
     def _snapshot_df_arith_refs(self, expr_node):
@@ -19994,6 +20077,11 @@ class translator(ast.NodeVisitor):
             # Kind/columns are unchanged by any of these -- same shape
             # (transform) in, same shape out.
             return self._pandas_df_arith_kind_cols(node.func.value)
+        _a_spec = self._pandas_df_astype_spec(node)
+        if _a_spec is not None:
+            # Also shape-preserving -- see the matching case in
+            # _is_pandas_df_arith_value.
+            return self.pandas_df_vars.get(_a_spec["df_id"]), self.pandas_df_columns.get(_a_spec["df_id"])
         return None
 
     def _pandas_df_union_arith_spec(self, v):
@@ -22778,6 +22866,25 @@ class translator(ast.NodeVisitor):
                     a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
                 else:
                     a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
+            # A NaN operand (e.g. the vacated row from a .shift() on a
+            # real array) would otherwise trip -ffpe-trap=invalid: ordered
+            # comparisons all signal on NaN in Fortran, unlike Python/
+            # pandas where a NaN comparison just quietly evaluates to
+            # False (True for !=). Only real-valued comparisons can ever
+            # see a NaN operand at all, so this only guards those --
+            # int/char/logical comparisons (including the logical/logical
+            # eq/neq case just above, which already returned) are
+            # unaffected. Mirrors the same guard used for DataFrame
+            # comparisons (see _pandas_df_compare_spec's codegen).
+            _l_real = self._expr_kind(node.left) == "real"
+            _r_real = self._expr_kind(node.comparators[0]) == "real"
+            if _l_real or _r_real:
+                _nan_result = ".true." if op is ast.NotEq else ".false."
+                _a_safe = f"merge(0.0_dp, {a}, ieee_is_nan({a}))" if _l_real else a
+                _b_safe = f"merge(0.0_dp, {b}, ieee_is_nan({b}))" if _r_real else b
+                _nan_mask_parts = [p for p, r in ((f"ieee_is_nan({a})", _l_real), (f"ieee_is_nan({b})", _r_real)) if r]
+                _nan_mask = " .or. ".join(_nan_mask_parts)
+                return f"merge({_nan_result}, ({_a_safe} {opmap[op]} {_b_safe}), {_nan_mask})"
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
@@ -22852,6 +22959,23 @@ class translator(ast.NodeVisitor):
                 if col_name == self.pandas_df_index_label.get(df_id):
                     return f"{df_expr}%index"
                 return f"{df_expr}%values(:, {df_expr}%col_pos({fstr(col_name)}))"
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in self.pandas_df_vars
+                and isinstance(node.slice, ast.Name)
+                and self._expr_kind(node.slice) == "char"
+                and self._rank_expr(node.slice) == 0
+            ):
+                # df[name] -- a SINGLE column selected by a runtime
+                # character-scalar expression (e.g. a `for name in
+                # asset_names:` loop variable), as opposed to the literal-
+                # string case just above. col_pos_str/col_pos both accept
+                # any character(len=*) argument already, so this is just
+                # the same %values(:, %col_pos(...)) shape with the
+                # column-name text resolved at runtime instead of a
+                # literal.
+                df_expr = self.expr(node.value)
+                return f"{df_expr}%values(:, {df_expr}%col_pos({self.expr(node.slice)}))"
             # NumPy row-wise concatenation helper: np.r_[...]
             if (
                 isinstance(node.value, ast.Attribute)
@@ -24111,6 +24235,23 @@ class translator(ast.NodeVisitor):
                 if _ac_lag_node is not None:
                     return f"autocorr_1d({_ac_arr}, {self.expr(_ac_lag_node)})"
                 return f"autocorr_1d({_ac_arr})"
+            # X.shift(periods) -- Series.shift (as opposed to
+            # DataFrame.shift, a type-bound procedure on a bare df Name --
+            # excluded here via _pandas_df_simple_method_spec's own
+            # isinstance(v.func.value, ast.Name)-and-in-pandas_df_vars
+            # requirement, which this doesn't satisfy for any of
+            # _plain_series_expr_text's recognized shapes) on a plain
+            # rank-1 array, e.g. a runtime-selected DataFrame column
+            # (`asset_rets[name].shift(-1)`) -- see shift_1d.
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "shift"
+                and len(node.args) <= 1
+                and not (isinstance(node.func.value, ast.Name) and node.func.value.id in self.pandas_df_vars)
+            ):
+                _sh_txt = self._plain_series_expr_text(node)
+                if _sh_txt is not None:
+                    return _sh_txt
             # Method-call reductions: a.sum(), a.mean(), a.var(ddof=...)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -26490,6 +26631,20 @@ class translator(ast.NodeVisitor):
                         dims = ", ".join(self._reshape_dims_exprs(arr, list(node.args)))
                         return f"reshape({arr}, [{dims}])"
                     raise NotImplementedError("reshape requires shape arguments")
+                if node.func.attr == "astype" and self._pandas_df_astype_spec(node) is not None:
+                    # df.astype(float) as a nested sub-expression (e.g.
+                    # `above.astype(float) - below.astype(float)`, not a
+                    # top-level `X = df.astype(float)` assignment, which
+                    # visit_Assign's own _pandas_df_astype_spec branch
+                    # already handles) -- a true no-op given comparisons
+                    # already produce real 1.0/0.0 (see
+                    # _pandas_df_astype_spec), so `arr` (the DataFrame's
+                    # own Fortran text) passes straight through. Must be
+                    # checked before the generic (non-DataFrame) astype
+                    # handling just below, which would otherwise wrap a
+                    # whole derived-type value in real(...)/int(...) --
+                    # invalid Fortran.
+                    return arr
                 if node.func.attr == "astype":
                     dtype_txt = ""
                     if len(node.args) >= 1:
@@ -30947,17 +31102,25 @@ class translator(ast.NodeVisitor):
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.BinOp)
                     and type(v.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
+                    and (self._is_pandas_df_arith_value(v.left) or self._is_pandas_df_arith_value(v.right))
                 ):
-                    _df_l = isinstance(v.left, ast.Name) and v.left.id in self.pandas_df_vars
-                    _df_r = isinstance(v.right, ast.Name) and v.right.id in self.pandas_df_vars
-                    if _df_l or _df_r:
-                        _arith_df_id = v.left.id if _df_l else v.right.id
-                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_arith_df_id]
+                    # A bare df Name on either side is the common case, but
+                    # either side may also be a chained DataFrame-producing
+                    # expression that isn't a bare Name at all -- e.g.
+                    # `above.astype(float) - below.astype(float)` (see
+                    # _is_pandas_df_arith_value/_pandas_df_arith_kind_cols,
+                    # the same general recognition expr()'s own BinOp
+                    # codegen uses) -- so resolve kind/columns through
+                    # those rather than requiring v.left/v.right to be
+                    # bare Names directly.
+                    _kc = self._pandas_df_arith_kind_cols(v)
+                    if _kc is not None and _kc[0] is not None:
+                        self.pandas_df_vars[t.id] = _kc[0]
                         _union_spec = self._pandas_df_union_arith_spec(v)
                         if _union_spec is not None:
                             self.pandas_df_columns[t.id] = list(_union_spec["columns"])
                         else:
-                            self.pandas_df_columns[t.id] = list(self.pandas_df_columns.get(_arith_df_id, []) or [])
+                            self.pandas_df_columns[t.id] = list(_kc[1] or [])
                         self.ints.discard(t.id)
                         self.reals.discard(t.id)
                         self.logs.discard(t.id)
@@ -37922,12 +38085,28 @@ class translator(ast.NodeVisitor):
                 name = self._aliased_name(t.id)
                 opmap = {ast.Gt: ">", ast.Lt: "<", ast.GtE: ">=", ast.LtE: "<=", ast.Eq: "==", ast.NotEq: "/="}
                 op_txt = opmap[_cmp_spec["op"]]
+                # A NaN operand (e.g. a rolling(n).mean()'s own warm-up
+                # rows) would otherwise trip -ffpe-trap=invalid: ordered
+                # comparisons (all of >,<,>=,<=,==,/=) signal on NaN in
+                # Fortran, unlike Python/pandas where a NaN comparison
+                # just quietly evaluates to False (True for !=, pandas'
+                # own behavior). Guard by substituting a NaN operand with
+                # 0.0 *before* the comparison ever runs (so the trap can
+                # never fire), then override the result to the correct
+                # constant wherever either original operand was NaN.
+                nan_result = "1.0_dp" if _cmp_spec["op"] is ast.NotEq else "0.0_dp"
+                def _nan_safe(expr_txt):
+                    return f"merge(0.0_dp, {expr_txt}, ieee_is_nan({expr_txt}))"
                 if _cmp_spec["kind"] == "df_df":
                     l_expr = self._aliased_name(_cmp_spec["left"])
                     r_expr = self._aliased_name(_cmp_spec["right"])
                     self.o.w(f"{name}%index = {l_expr}%index")
                     self.o.w(f"{name}%columns = {l_expr}%columns")
-                    self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {l_expr}%values {op_txt} {r_expr}%values)")
+                    self.o.w(
+                        f"{name}%values = merge({nan_result}, merge(1.0_dp, 0.0_dp, "
+                        f"{_nan_safe(f'{l_expr}%values')} {op_txt} {_nan_safe(f'{r_expr}%values')}), "
+                        f"ieee_is_nan({l_expr}%values) .or. ieee_is_nan({r_expr}%values))"
+                    )
                 else:
                     df_expr = self._aliased_name(_cmp_spec["df_id"])
                     scalar_txt = self._coerce_expr_kind(
@@ -37935,10 +38114,12 @@ class translator(ast.NodeVisitor):
                     )
                     self.o.w(f"{name}%index = {df_expr}%index")
                     self.o.w(f"{name}%columns = {df_expr}%columns")
-                    if _cmp_spec["df_left"]:
-                        self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {df_expr}%values {op_txt} {scalar_txt})")
-                    else:
-                        self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {scalar_txt} {op_txt} {df_expr}%values)")
+                    _a, _b = (f"{df_expr}%values", scalar_txt) if _cmp_spec["df_left"] else (scalar_txt, f"{df_expr}%values")
+                    self.o.w(
+                        f"{name}%values = merge({nan_result}, merge(1.0_dp, 0.0_dp, "
+                        f"{_nan_safe(_a)} {op_txt} {_nan_safe(_b)}), "
+                        f"ieee_is_nan({df_expr}%values) .or. ieee_is_nan({scalar_txt}))"
+                    )
                 return
 
         # X = df.astype(float) -- a true no-op copy (see _pandas_df_astype_spec).
@@ -38048,9 +38229,23 @@ class translator(ast.NodeVisitor):
             _pis_spec = self._plain_array_iloc_slice_spec(v)
             if _pis_spec is not None:
                 name = self._aliased_name(t.id)
-                src_expr = self._aliased_name(_pis_spec["base_id"])
-                trip = self._slice_triplet(_pis_spec["slice"], f"size({src_expr})")
-                self.o.w(f"{name} = {src_expr}({trip})")
+                if _pis_spec["base_kind"] == "name":
+                    src_expr = self._aliased_name(_pis_spec["base_id"])
+                    trip = self._slice_triplet(_pis_spec["slice"], f"size({src_expr})")
+                    self.o.w(f"{name} = {src_expr}({trip})")
+                else:
+                    # A runtime-dynamic base expression (a df column
+                    # selected by a runtime name, or a .shift() of one --
+                    # see _plain_series_expr_text) isn't a named entity,
+                    # so it can't be subscripted a second time inline
+                    # (`df%values(:, df%col_pos(x))(lo:hi)` is invalid
+                    # Fortran) -- materialize it into `name` first, then
+                    # re-slice `name` in place (safe self-referential
+                    # assignment, same as port_ret.iloc[n:]'s bare-Name
+                    # case above).
+                    self.o.w(f"{name} = {_pis_spec['base_expr']}")
+                    trip = self._slice_triplet(_pis_spec["slice"], f"size({name})")
+                    self.o.w(f"{name} = {name}({trip})")
                 return
 
         # X = pd.concat([df1, df2, ...][, axis=][, ignore_index=])
@@ -38405,10 +38600,7 @@ class translator(ast.NodeVisitor):
             and t.id in self.pandas_df_vars
             and isinstance(v, ast.BinOp)
             and type(v.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
-            and (
-                (isinstance(v.left, ast.Name) and v.left.id in self.pandas_df_vars)
-                or (isinstance(v.right, ast.Name) and v.right.id in self.pandas_df_vars)
-            )
+            and (self._is_pandas_df_arith_value(v.left) or self._is_pandas_df_arith_value(v.right))
         ):
             name = self._aliased_name(t.id)
             self.o.w(f"{name} = {self.expr(v)}")
