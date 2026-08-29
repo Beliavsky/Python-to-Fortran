@@ -4421,6 +4421,760 @@ def test_xp2f_pandas_timestamp_construction_and_comparison(tmp_path: Path) -> No
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
 
+def test_xp2f_pandas_series_bare_assignment_aliases_and_mutates(tmp_path: Path) -> None:
+    # Regression test: `ser_cp = ser` (bare Name-to-Name) must alias ser_cp
+    # to ser's own Fortran variable at transpile time, matching Python's
+    # object-aliasing semantics -- so a later `ser_cp *= 10` mutates ser
+    # too. Previously ser_cp got its own separate copy, so the mutation
+    # was invisible via ser (silently wrong, no compile error).
+    src = tmp_path / "xseries_bare_alias.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "ser = pd.Series([4.0, 9.0, 16.0])",
+                "print(ser[0], ser[1], ser[2])",
+                "ser_cp = ser",
+                "ser_cp *= 10",
+                "print(ser[0], ser[1], ser[2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_series_cumsum_method_call_survives_later_bare_alias(tmp_path: Path) -> None:
+    # Regression test: the `.cumsum()` method-call form on a pd.Series(...)
+    # must keep resolving to cumsum_real even when the same variable is
+    # later bare-aliased and mutated in place (`ser_cp = ser; ser_cp *= 10`).
+    # A prior fix for that alias mutation exposed a latent bug where
+    # _mark_int (called by the generic AugAssign prescan handler on the
+    # alias target) could downgrade the alias's already-known allocatable
+    # real array to scalar int, making cumsum_int get selected instead.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xseries_cumsum_alias.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "",
+                "rng = np.random.default_rng(12345)",
+                "ser = pd.Series(rng.normal(size=5))",
+                "print(ser.cumsum())",
+                "ser_cp = ser",
+                "ser_cp *= 10",
+                "print(ser)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out_f90 = tmp_path / "xseries_cumsum_alias_p.f90"
+    assert out_f90.exists()
+    out_text = out_f90.read_text(encoding="utf-8")
+    assert "cumsum_real(" in out_text
+    assert "cumsum_int(" not in out_text
+
+
+def test_xp2f_pandas_dataframe_bare_alias_mutates_original(tmp_path: Path) -> None:
+    # Regression test: `dfz = df` (bare Name-to-Name) is pure Python object
+    # aliasing, so a column grown through dfz (dfz["z"] = ...) must be
+    # visible through df too. Mirrors the pd.Series bare-alias tests above
+    # (pandas_df_aliases / _resolve_pandas_df_alias).
+    src = tmp_path / "xdf_bare_alias.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0], 'y': [4.0, 5.0, 6.0]})",
+                "dfz = df",
+                "dfz['z'] = df['x'] + df['y']",
+                "col = df['z']",
+                "print(col[0], col[1], col[2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_dataframe_copy_does_not_mutate_original(tmp_path: Path) -> None:
+    # Contrast case for the alias test above: `dfz = df.copy()` must be an
+    # independent object, so growing a column on dfz leaves df's column
+    # count -- and, per the has_col regression below, its `"z" in
+    # df.columns` membership check too -- unchanged.
+    src = tmp_path / "xdf_copy_independent.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0], 'y': [4.0, 5.0, 6.0]})",
+                "dfz = df.copy()",
+                "dfz['z'] = df['x'] + df['y']",
+                "print(df.shape[1], dfz.shape[1])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_has_col_membership_check_on_dict_constructed_df(tmp_path: Path) -> None:
+    # Regression test: `"col" not in df.columns` compiles to `df%has_col(...)`
+    # regardless of DataFrame kind, but has_col was only ever defined on
+    # DataFrame_index_date (the pd.read_csv-derived kind) -- a
+    # DataFrame_str_index (RangeIndex/dict-constructed, e.g. plain
+    # pd.DataFrame({...})) failed to compile with "'has_col' is not a
+    # member of the 'dataframe_str_index' structure". Now defined on
+    # DataFrame_str_index and DataFrame_index_datetime too.
+    src = tmp_path / "xdf_has_col_dict.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0], 'y': [4.0, 5.0, 6.0]})",
+                "dfz = df.copy()",
+                "dfz['z'] = df['x'] + df['y']",
+                "if 'z' not in df.columns:",
+                "    print('df has no z')",
+                "else:",
+                "    print('df has z')",
+                "if 'z' not in dfz.columns:",
+                "    print('dfz has no z')",
+                "else:",
+                "    print('dfz has z')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_rangeidx_dict_df_column_growth_ordering(tmp_path: Path) -> None:
+    # Regression test for the column-growth-ordering bug: df["new_col"] = expr
+    # must genuinely append at runtime (append_col_str) rather than
+    # pre-allocating %values to the column count the variable eventually
+    # reaches by end of script, which previously corrupted earlier uses.
+    src = tmp_path / "xdf_rangeidx_growth.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0], 'y': [4.0, 5.0, 6.0]})",
+                "df['sum'] = df['x'] + df['y']",
+                "df['ratio'] = df['x'] / df['y']",
+                "s = df['sum']",
+                "r = df['ratio']",
+                "print(s[0], s[1], s[2])",
+                "print(r[0], r[1], r[2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_dropna_rows_and_columns(tmp_path: Path) -> None:
+    src = tmp_path / "xdf_dropna_shapes.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x1': [1.0, np.nan, 3.0], 'x2': [4.0, 5.0, np.nan]})",
+                "d_rows = df.dropna()",
+                "d_cols = df.dropna(axis=1)",
+                "print(d_rows.shape[0], d_rows.shape[1])",
+                "print(d_cols.shape[0], d_cols.shape[1])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_concat_ignore_index(tmp_path: Path) -> None:
+    src = tmp_path / "xdf_concat.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df1 = pd.DataFrame({'x': [1.0, 2.0]})",
+                "df2 = pd.DataFrame({'x': [3.0, 4.0]})",
+                "both = pd.concat([df1, df2], ignore_index=True)",
+                "x = both['x']",
+                "print(x[0], x[1], x[2], x[3])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_rolling_mean(tmp_path: Path) -> None:
+    src = tmp_path / "xdf_rolling.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0, 4.0, 5.0]})",
+                "r = df.rolling(2).mean()",
+                "x = r['x']",
+                "print(x[1], x[2], x[3], x[4])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_iloc_fancy_negative_literal_columns(tmp_path: Path) -> None:
+    # Regression test for the negative-integer-literal AST shape
+    # (UnaryOp(USub, Constant(positive_int)), not a single negative
+    # Constant) in .iloc[[...], [0, -1]] column-position extraction.
+    src = tmp_path / "xdf_iloc_neg_cols.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [4.0, 5.0, 6.0], 'c': [7.0, 8.0, 9.0]})",
+                "sub = df.iloc[[0, -1], [0, -1]]",
+                "print(sub['a'].sum(), sub['c'].sum())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_series_from_fancy_row_selection_preserves_row_labels(tmp_path: Path) -> None:
+    # Regression test: a Series extracted (col = df["name"]) from a
+    # fancy-row-selected DataFrame (df.iloc[[...]] / df.loc[[...]]) is
+    # just a plain array copy in the SELECTED row order, which no longer
+    # lines up with the original 0-based row positions -- e.g. after
+    # sub = df.iloc[[0, -1]], sub's rows keep pandas' original row labels
+    # 0 and 2 (not renumbered to 0 and 1), so real pandas' sub["a"][2] is
+    # the correct/only valid access, and sub["a"][1] raises KeyError.
+    # Previously xp2f treated every integer subscript as a direct 0-based
+    # position, silently returning the WRONG value for label 2 (and
+    # crashing with an out-of-bounds array index for anything beyond the
+    # frame's own length) -- fixed via pandas_series_reindexed_source /
+    # pandas_df_reindexed_ids, resolving a literal integer subscript
+    # through the source frame's row_pos() instead.
+    src = tmp_path / "xdf_fancy_row_series_labels.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'c': [7.0, 8.0, 9.0]})",
+                "sub = df.iloc[[0, -1]]",
+                "a = sub['a']",
+                "c = sub['c']",
+                "print(a[0], a[2], c[0], c[2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_series_from_fancy_row_selection_rejects_dynamic_index(tmp_path: Path) -> None:
+    # A runtime (non-literal) subscript on such a series can't be resolved
+    # correctly at transpile time -- must raise a clear error rather than
+    # silently compute against the wrong row (see the test above).
+    src = tmp_path / "xdf_fancy_row_series_dynamic_index.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0]})",
+                "sub = df.iloc[[0, -1]]",
+                "a = sub['a']",
+                "i = 0",
+                "print(a[i])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "Transpile: FAIL" in proc.stdout
+    assert "fancy-row-selected" in proc.stdout
+
+
+def test_xp2f_pandas_dataframe_chained_iloc_fancy_display(tmp_path: Path) -> None:
+    # Regression test for the gfortran limitation where a type-bound
+    # subroutine call chained directly onto the result of another
+    # type-bound function call ("leftmost part-ref in a data-ref cannot be
+    # a function reference") is invalid Fortran -- fixed by materializing
+    # into a block-scoped temp first (_pandas_df_materialize_decl/_assign).
+    src = tmp_path / "xdf_chained_iloc_display.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0], 'b': [3.0, 4.0], 'c': [5.0, 6.0]})",
+                "print(df.iloc[[0, 1], [0, 2]])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_list_abc_columns_kwarg(tmp_path: Path) -> None:
+    # Regression test for the `list("abc")` Python idiom (split a string
+    # into a list of its individual characters) used as a columns= kwarg.
+    src = tmp_path / "xdf_list_abc_columns.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0], 'b': [2.0], 'c': [3.0]}, columns=list('abc'))",
+                "a = df['a']",
+                "b = df['b']",
+                "c = df['c']",
+                "print(a[0], b[0], c[0])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_loc_fancy_row_selection_by_label(tmp_path: Path) -> None:
+    src = tmp_path / "xdf_loc_fancy_rows.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "",
+                "mat = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])",
+                "df = pd.DataFrame(mat, columns=['a', 'b'], index=['d', 'e', 'f'])",
+                "sub = df.loc[['d', 'f']]",
+                "print(sub['a'].sum(), sub['b'].sum())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_iloc_row_as_series(tmp_path: Path) -> None:
+    # df.iloc[row, :] -- a single row as a Series (_pandas_df_iloc_row_series_spec).
+    src = tmp_path / "xdf_iloc_row_series.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0], 'b': [3.0, 4.0]})",
+                "row = df.iloc[0, :]",
+                "print(row.sum())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_mean_reduction_to_labeled_series(tmp_path: Path) -> None:
+    # df.mean()/.std() -- a plain real array (one value per df column) plus
+    # a static label list for m["col"]-style reads (_pandas_df_reduction_series_spec).
+    src = tmp_path / "xdf_mean_reduction_series.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0], 'y': [4.0, 5.0, 6.0]})",
+                "m = df.mean()",
+                "print(m['x'], m['y'])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_dataframe_construct_from_series(tmp_path: Path) -> None:
+    # Regression test: pd.DataFrame(ser) for a rank-1 array/Series argument
+    # -- a single-column frame with pandas' own default column label (the
+    # stringified integer 0) and a RangeIndex matching ser's own length.
+    # _pandas_matrix_df_construct_spec_rangeidx previously required rank 2
+    # (a real matrix) unconditionally, so this raised "unsupported call".
+    src = tmp_path / "xdf_construct_from_series.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "ser = pd.Series([4.0, 9.0, 16.0])",
+                "df = pd.DataFrame(ser)",
+                "print(df.shape[0], df.shape[1])",
+                "s = df.sum()",
+                "print(s.sum())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_dataframe_augassign_scalar_multiply(tmp_path: Path) -> None:
+    # Regression test: `df *= 10` (target is a DataFrame, RHS an integer
+    # literal) previously hand-built "{lhs} = {lhs} * {rhs}" directly in
+    # visit_AugAssign without the real-scalar coercion that expr()'s own
+    # DataFrame-arithmetic BinOp handling already does for e.g.
+    # print(df * 10) -- the vendored DataFrame_str_index operator(*)
+    # overload only accepts a real scalar, so gfortran rejected the bare
+    # integer literal ("Unexpected derived-type entities in binary
+    # intrinsic numeric operator '*'"). Also exercises df_cp = df (bare
+    # alias) mutating the original df in place via *=, mirroring the
+    # Series alias tests above.
+    src = tmp_path / "xdf_augassign_mult.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0]})",
+                "df_cp = df",
+                "df_cp *= 10",
+                "x = df['x']",
+                "print(x[0], x[1], x[2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_print_trailing_dataframe_arg(tmp_path: Path) -> None:
+    # Regression test: print("label:", df) -- a DataFrame reference as the
+    # LAST of several print() arguments (the pre-existing DataFrame print
+    # special-casing only covered print(df) alone). Fortran can't print a
+    # derived type with allocatable components inline via `print *, ...,
+    # df` ("Data transfer element ... cannot have ALLOCATABLE components
+    # unless it is processed by a defined input/output procedure") -- now
+    # the leading args are printed first, then the DataFrame via its own
+    # %display().
+    src = tmp_path / "xdf_print_trailing.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'x': [1.0, 2.0, 3.0]})",
+                "print('df =', df)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_xp2f_ternary_char_result_padding_survives_max_zero_len_cleanup(tmp_path: Path) -> None:
+    # Regression test: Fortran's MERGE requires both character operands of
+    # an IfExp to share the exact same length, so each branch is padded
+    # with `// repeat(' ', max(0, len(other) - len(self)))`. A separate
+    # text-level cleanup pass (simplify_max_zero_len) strips a genuinely
+    # no-op `max(0, len(...))` down to bare `len(...)` -- but its bare-call
+    # detection used to be a naive "starts with len( and ends with )" regex,
+    # which also matched (and wrongly stripped the clamp from) the
+    # subtraction `len(a) - len(b)`, reintroducing "Argument NCOPIES of
+    # REPEAT intrinsic is negative" whenever the "none" branch was longer
+    # than the actual runtime string.
+    src = tmp_path / "xternary_char_padding.py"
+    src.write_text(
+        "\n".join(
+            [
+                "date_min = ''",
+                "print('none' if date_min == '' else str(date_min))",
+                "date_min2 = '2020-01-15'",
+                "print('none' if date_min2 == '' else str(date_min2))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_extend_inline_list_literal_after_count_mapped_growth(tmp_path: Path) -> None:
+    # Regression test: extend() with an inline list-literal argument (after
+    # count-mapped growth via append()) previously repeatedly subscripted
+    # the raw argument text, invalid Fortran when the argument is itself an
+    # array-constructor literal like [10, 20, 30] (constructors can't be
+    # directly indexed) -- fixed by materializing it into a real temp array.
+    src = tmp_path / "xextend_inline_literal.py"
+    src.write_text(
+        "\n".join(
+            [
+                "nums = []",
+                "for i in range(3):",
+                "    nums.append(i)",
+                "nums.extend([10, 20, 30])",
+                "print(nums)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_xp2f_keeps_wrapper_return_rank_for_scalar_times_local_array_call(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xscalar_times_local_array_wrapper.py"

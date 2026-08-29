@@ -22,12 +22,15 @@ module dataframe_str_index_mod
    contains
       procedure :: display => display_str_index
       procedure :: col_pos => col_pos_str
+      procedure :: has_col => has_col_str
       procedure :: cumsum => cumsum_str
       procedure :: cumprod => cumprod_str
       procedure :: diff => diff_str
       procedure :: abs => abs_str
       procedure :: sort_values => sort_values_str
       procedure :: T => transpose_str
+      procedure :: icol => icol_str
+      procedure :: row_pos => row_pos_str
    end type DataFrame_str_index
 
    public :: nrow, ncol, abs_str, log_df_str, exp_df_str, append_col_str
@@ -82,6 +85,43 @@ contains
       jcol = findloc(self%columns, column, dim=1)
       if (jcol == 0) error stop "in col_pos, column not found: "//trim(column)
    end function col_pos_str
+
+   pure function has_col_str(self, name) result(found)
+      ! return .true. if dataframe has a column with the given name --
+      ! ported from dataframe_index_date.f90's has_col, needed so
+      ! xp2f.py's generic `"col" not in df.columns` codegen (which always
+      ! emits %has_col(...) regardless of DataFrame kind) works for
+      ! DataFrame_str_index (RangeIndex/dict-constructed) frames too.
+      class(DataFrame_str_index), intent(in) :: self
+      character(len=*), intent(in) :: name
+      logical :: found
+      found = (findloc(self%columns, name, dim=1) > 0)
+   end function has_col_str
+
+   pure function icol_str(self, ivec) result(df_new)
+      ! returns a dataframe with the subset of columns in ivec(:) -- ported
+      ! from dataframe_index_date.f90's icol, needed so df[["a", "c"]]
+      ! column-selection-by-name reads (see xp2f.py's _pandas_df_match
+      ! "select_names" kind, which always emits %icol([...])) work for
+      ! DataFrame_str_index too.
+      class(DataFrame_str_index), intent(in) :: self
+      integer, intent(in) :: ivec(:)
+      type(DataFrame_str_index) :: df_new
+      df_new%index = self%index
+      df_new%columns = self%columns(ivec)
+      df_new%values = self%values(:, ivec)
+   end function icol_str
+
+   pure function row_pos_str(self, label) result(irow)
+      ! return the row position (1..nrow) for an index label -- mirrors
+      ! col_pos_str, for xp2f.py's df.loc[[label0, label1, ...]] fancy
+      ! row-selection-by-label codegen.
+      class(DataFrame_str_index), intent(in) :: self
+      character(len=*), intent(in) :: label
+      integer :: irow
+      irow = findloc(self%index, label, dim=1)
+      if (irow == 0) error stop "in row_pos, label not found: "//trim(label)
+   end function row_pos_str
 
    subroutine append_col_str(self, column, col_values)
       ! Grow %values/%columns by one column at runtime -- used by

@@ -46,6 +46,7 @@ module dataframe_index_datetime_mod
       procedure :: display => display_datetime
       procedure :: rename_cols => rename_cols_datetime
       procedure :: col_pos => col_pos_datetime
+      procedure :: has_col => has_col_datetime
    end type DataFrame_index_datetime
 
    public :: nrow, ncol, shape, datetime_from_iso, valid
@@ -452,6 +453,18 @@ contains
       jcol = findloc(self%columns, column, dim=1)
       if (jcol == 0) error stop "in col_pos, column not found: "//trim(column)
    end function col_pos_datetime
+
+   pure function has_col_datetime(self, name) result(found)
+      ! return .true. if dataframe has a column with the given name --
+      ! ported from dataframe_index_date.f90's has_col, needed so
+      ! xp2f.py's generic `"col" not in df.columns` codegen (which always
+      ! emits %has_col(...) regardless of DataFrame kind) works for
+      ! DataFrame_index_datetime frames too.
+      class(DataFrame_index_datetime), intent(in) :: self
+      character(len=*), intent(in) :: name
+      logical :: found
+      found = (findloc(self%columns, name, dim=1) > 0)
+   end function has_col_datetime
 
    ! pandas-style print(df): index label (yyyy-mm-dd hh:mm:ss) + one
    ! right-justified column per %columns entry, computed at runtime --

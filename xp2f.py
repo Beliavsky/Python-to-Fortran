@@ -103,14 +103,34 @@ def remove_allocatable_shadow_decls(lines):
             alloc_names.add(nm.lower())
 
     out = []
-    scalar_decl_re = re.compile(r"^(\s*)integer\s*::\s*([A-Za-z]\w*)\s*$", re.IGNORECASE)
+    # Originally integer-only; broadened to every scalar type-spec this
+    # codegen can emit (found via a real(kind=dp) case: a DataFrame
+    # reduction assigned to a variable, e.g. `s = df.mean()`, produced a
+    # `real(kind=dp) :: s` block-local shadowing the correct top-level
+    # `real(kind=dp), allocatable :: s(:)`, which this pass's original
+    # integer-only regex didn't catch).
+    scalar_decl_re = re.compile(
+        r"^(\s*)(?:integer|real\(kind=dp\)|logical|complex\(kind=dp\)|character\(len=:\),\s*allocatable)"
+        r"\s*::\s*([A-Za-z]\w*)\s*$",
+        re.IGNORECASE,
+    )
     for i, line in enumerate(lines):
         m = scalar_decl_re.match(line)
         if m and m.group(2).lower() in alloc_names:
             j = i + 1
             while j < len(lines) and lines[j].strip() == "":
                 j += 1
-            if j < len(lines) and re.search(rf"\ballocated\s*\(\s*{re.escape(m.group(2))}\s*\)", lines[j], re.IGNORECASE):
+            if j < len(lines) and (
+                # An `if (allocated(name)) ...` guard right after the
+                # shadow decl (the original pattern this was written for)
+                re.search(rf"\ballocated\s*\(\s*{re.escape(m.group(2))}\s*\)", lines[j], re.IGNORECASE)
+                # ...or a bare `allocate(name(...))` -- e.g. when an
+                # earlier cleanup pass (collapse_alloc_dealloc_before_
+                # assignment) has already stripped a redundant `if
+                # (allocated(name)) deallocate(name)` guard that preceded
+                # it, since name is provably first-use here.
+                or re.match(rf"^\s*allocate\s*\(\s*{re.escape(m.group(2))}\s*\(", lines[j], re.IGNORECASE)
+            ):
                 continue
         out.append(line)
     return out
@@ -3120,7 +3140,7 @@ def simplify_max_zero_len(lines):
     of 0 can never change the result.
     """
     max_call_re = re.compile(r"\bmax\(", flags=re.IGNORECASE)
-    len_call_re = re.compile(r"^len\(.*\)$", flags=re.IGNORECASE)
+    len_prefix_re = re.compile(r"^len\(", flags=re.IGNORECASE)
 
     def _find_matching_rparen(s, lparen_idx):
         depth = 0
@@ -3134,6 +3154,21 @@ def simplify_max_zero_len(lines):
                     return i
             i += 1
         return -1
+
+    def _is_bare_len_call(s):
+        # True only when `s` is a SINGLE balanced len(...) call spanning
+        # the whole string -- e.g. "len(x)". A naive "starts with len( and
+        # ends with )" text check (the previous approach here) also
+        # matches things like "len(x) - len(y)", which merely happens to
+        # start and end that way but is NOT itself always >= 0; stripping
+        # its enclosing max(0, ...) guard in that case reintroduces the
+        # exact negative-length bug the guard exists to prevent (see the
+        # IfExp character-padding codegen, which relies on this clamp).
+        m = len_prefix_re.match(s)
+        if not m:
+            return False
+        close_idx = _find_matching_rparen(s, m.end() - 1)
+        return close_idx == len(s) - 1
 
     def _split_top_level_commas(s):
         parts = []
@@ -3171,9 +3206,9 @@ def simplify_max_zero_len(lines):
             replacement = None
             if len(args) == 2:
                 a, b = args[0].strip(), args[1].strip()
-                if a == "0" and len_call_re.match(b):
+                if a == "0" and _is_bare_len_call(b):
                     replacement = b
-                elif b == "0" and len_call_re.match(a):
+                elif b == "0" and _is_bare_len_call(a):
                     replacement = a
             if replacement is not None:
                 code = code[: m.start()] + replacement + code[close_idx + 1 :]
@@ -7253,7 +7288,7 @@ def _tree_uses_pandas_dict_dataframe(tree):
             if (
                 len(_n.args) == 1
                 and not isinstance(_n.args[0], (ast.Dict, ast.List))
-                and all(kw.arg in (None, "columns") for kw in _n.keywords)
+                and all(kw.arg in (None, "columns", "index") for kw in _n.keywords)
             ):
                 return True
             # pd.DataFrame([df.mean(), df.std(), ...], index=[...]) -- see
@@ -8567,6 +8602,21 @@ def detect_needed_helpers(tree):
                 needed.add("cumsum_real_axis1_2d")
                 needed.add("cumsum_int_axis0_2d")
                 needed.add("cumsum_int_axis1_2d")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"cumsum", "cumprod"}
+                and len(node.args) == 0
+                and not node.keywords
+            ):
+                # arr.cumsum()/arr.cumprod() method-call form (e.g. a
+                # pd.Series(array) result, which is just the array -- see
+                # expr()'s matching method-call branch). A false positive
+                # here (e.g. a DataFrame's own %cumsum()/%cumprod(), which
+                # doesn't need these symbols) only adds an unused `use`.
+                needed.add("cumsum_real")
+                needed.add("cumsum_int")
+                needed.add("cumprod_real")
+                needed.add("cumprod_int")
             self.generic_visit(node)
 
         def visit_Set(self, node):
@@ -14328,6 +14378,46 @@ class translator(ast.NodeVisitor):
         # pandas_df_columns already reflects the WHOLE script's growth,
         # not just what's happened up to this statement.
         self.pandas_df_col_is_new = {}
+        # s = df.mean() / df.std() / df.sum() / df.min() / df.max() /
+        # df.median() -- a pandas Series (one value per column of df),
+        # assignable to a variable. Modeled as a plain real array (s
+        # itself is just a real array, in df's column order) plus this
+        # static label list, used for label-based reads (s["x"]) -- see
+        # _pandas_df_reduction_series_spec. Note df["col"] assigned to a
+        # variable already just works as a plain array without any of
+        # this (expr()'s existing generic Subscript-read branch for
+        # pandas_df_vars handles it), since a single column has no
+        # separate label dimension to track.
+        self.pandas_series_labels = {}
+        # DataFrame variables whose row index is a SUBSET/reordering of the
+        # source frame's row positions (from df.iloc[[i0,...]] / df.loc[[l0,
+        # ...]] fancy row selection) -- i.e. row N of this frame is NOT
+        # necessarily at position N of the original frame it was selected
+        # from. df["col"] extracted from one of these into a plain array
+        # (pandas_series_reindexed_source, below) loses that %index once
+        # copied out, so later integer-literal subscripts on it must be
+        # resolved via the SOURCE frame's %row_pos rather than treated as a
+        # direct 0-based position -- see the matching expr() Subscript
+        # branch. A runtime (non-literal) or negative subscript on such a
+        # series is deliberately left unsupported (raises) rather than
+        # silently computed against the wrong row.
+        self.pandas_df_reindexed_ids = set()
+        # Series variable name -> source DataFrame variable name, for a
+        # `col = df["name"]` extraction where df is itself in
+        # pandas_df_reindexed_ids -- see pandas_df_reindexed_ids above.
+        self.pandas_series_reindexed_source = {}
+        # Names known to have originated from pd.Series(...) (either flavor
+        # -- the plain-array pass-through or the index=df.index broadcast).
+        # Used to scope ser2 = ser (bare Name-to-Name) pure-alias
+        # resolution (pandas_series_aliases / _resolve_pandas_series_alias,
+        # consulted by _aliased_name) to Series-derived variables
+        # specifically, mirroring the DataFrame alias technique
+        # (pandas_df_aliases) but deliberately NOT extended to plain numpy
+        # arrays generally -- that's a separate, much larger-footprint
+        # decision (arrays are used far more pervasively throughout
+        # translated scripts than either DataFrames or Series).
+        self.pandas_series_vars = set()
+        self.pandas_series_aliases = {}
         self.pandas_df_select_indices = {}
         self.pandas_df_columns_snapshot = {}
         self.dict_aliases = {}
@@ -14478,6 +14568,14 @@ class translator(ast.NodeVisitor):
         while cur in self.pandas_df_aliases and cur not in seen:
             seen.add(cur)
             cur = self.pandas_df_aliases[cur]
+        return cur
+
+    def _resolve_pandas_series_alias(self, name):
+        cur = name
+        seen = set()
+        while cur in self.pandas_series_aliases and cur not in seen:
+            seen.add(cur)
+            cur = self.pandas_series_aliases[cur]
         return cur
 
     def _dict_array_map_info(self, name):
@@ -14648,6 +14746,10 @@ class translator(ast.NodeVisitor):
         # callers via _resolve_list_alias before reaching here.
         if name in self.pandas_df_aliases:
             name = self._resolve_pandas_df_alias(name)
+        # Same idea for pd.Series(...)-derived variables (ser2 = ser) --
+        # see pandas_series_aliases / _resolve_pandas_series_alias.
+        if name in self.pandas_series_aliases:
+            name = self._resolve_pandas_series_alias(name)
         if name in self.name_aliases:
             return self.name_aliases[name]
         # If caller already passes a chosen alias token, keep it stable.
@@ -15321,6 +15423,13 @@ class translator(ast.NodeVisitor):
         if name in self.chars:
             return
         if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_chars:
+            return
+        # An already-known allocatable real/complex array (e.g. the root of
+        # a pd.Series(...) alias resolved via _aliased_name just above) must
+        # never be downgraded to scalar int by a heuristic caller -- see the
+        # AugAssign prescan handler, which calls _mark_int on any target not
+        # already in self.reals, without itself knowing about alloc_reals.
+        if name in self.alloc_reals or name in self.alloc_complexes:
             return
         self.ints.add(name)
 
@@ -17247,6 +17356,24 @@ class translator(ast.NodeVisitor):
                 return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Attribute) and node.func.attr == "reshape":
                 return self._expr_kind(node.func.value)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"pd", "pandas"}
+                and node.func.attr == "Series"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                # pd.Series(array) with no index=/name= kwargs -- an
+                # already-computed array wrapped as a Series with an
+                # implicit RangeIndex; modeled the same way as
+                # df["col"]/df.mean() results (see
+                # _pandas_df_reduction_series_spec) -- ser IS just the
+                # array, so it's a transparent pass-through everywhere,
+                # not a new runtime type. Distinct from the pre-existing
+                # pd.Series(scalar, index=df.index) broadcast pattern
+                # (which always has an index= kwarg).
+                return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype":
                 dtype_txt = ""
                 if len(node.args) >= 1:
@@ -18835,21 +18962,12 @@ class translator(ast.NodeVisitor):
             "value_nodes": list(dict_node.values),
         }
 
-    def _static_ncols_from_matrix_var(self, node):
-        # Best-effort: how many columns a 2-D array variable has, traced
-        # back to its single construction assignment and pulling a literal
-        # int out of a shape=(rows, K) / (rows, K)-tuple's second element.
-        # Used only to size pd.DataFrame(matrix)'s synthesized column
-        # labels (see _pandas_matrix_df_construct_spec_rangeidx) -- the
-        # print codegen needs the column count at transpile time to size
-        # its format string, so returns None (leaving the construct
-        # unsupported) rather than guess when it can't be determined.
-        if not isinstance(node, ast.Name):
-            return None
-        exprs = self.real_assignment_exprs.get(node.id)
-        if not exprs or len(exprs) != 1:
-            return None
-        rhs = exprs[0]
+    def _ncols_from_shape_call(self, rhs):
+        # Best-effort: pull a literal int out of a construction call's
+        # shape=(rows, K) / (rows, K)-tuple second element (e.g.
+        # np.random.normal(size=(n, K)), np.zeros((n, K))). Shared by
+        # _static_ncols_from_matrix_var's two cases: a Name traced back to
+        # its single assignment, or the construction call given directly.
         shape_node = None
         if isinstance(rhs, ast.Call):
             size_kw = next((kw for kw in rhs.keywords if kw.arg == "size"), None)
@@ -18866,13 +18984,60 @@ class translator(ast.NodeVisitor):
             return shape_node.elts[1].value
         return None
 
+    def _static_ncols_from_matrix_var(self, node):
+        # Best-effort: how many columns a 2-D array expression has. Either
+        # `node` is itself a construction call (pd.DataFrame(np.random.
+        # normal(size=(n, K)))), or a Name traced back to its single
+        # construction assignment. Used only to size pd.DataFrame(matrix)'s
+        # synthesized column labels (see
+        # _pandas_matrix_df_construct_spec_rangeidx) -- the print codegen
+        # needs the column count at transpile time to size its format
+        # string, so returns None (leaving the construct unsupported)
+        # rather than guess when it can't be determined.
+        if isinstance(node, ast.Call):
+            return self._ncols_from_shape_call(node)
+        if not isinstance(node, ast.Name):
+            return None
+        exprs = self.real_assignment_exprs.get(node.id)
+        if not exprs or len(exprs) != 1:
+            return None
+        return self._ncols_from_shape_call(exprs[0])
+
+    def _resolve_str_list_literal(self, node):
+        # A literal list/tuple of string constants, OR list("abc") (Python
+        # splits a string into its individual characters) -- used for
+        # columns=/index= kwargs so pd.DataFrame(matrix, index=list("defgh"),
+        # columns=list("abc")) is recognized the same as spelling out
+        # index=["d","e","f","g","h"], columns=["a","b","c"]. Returns None
+        # if node isn't one of these two shapes.
+        if (
+            isinstance(node, (ast.List, ast.Tuple))
+            and node.elts
+            and all(is_const_str(e) for e in node.elts)
+        ):
+            return [e.value for e in node.elts]
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "list"
+            and len(node.args) == 1
+            and not node.keywords
+            and is_const_str(node.args[0])
+            and node.args[0].value
+        ):
+            return list(node.args[0].value)
+        return None
+
     def _pandas_matrix_df_construct_spec_rangeidx(self, v):
-        # X = pd.DataFrame(matrix) / pd.DataFrame(matrix, columns=[...]) --
-        # a plain 2-D array, no index= kwarg: implicit RangeIndex rows,
-        # AND either implicit 0..ncol-1 integer column labels (no columns=
-        # kwarg either) or explicit ones from a literal columns= list.
-        # Reuses DataFrame_str_index (see the dict-based sibling above)
-        # with the row index synthesized as numeric-string labels.
+        # X = pd.DataFrame(matrix[, columns=[...]][, index=[...]]) -- a
+        # plain 2-D array. Columns: either implicit 0..ncol-1 integer
+        # labels (no columns= kwarg) or explicit ones from a literal
+        # columns= list. Index: either an implicit synthesized numeric-
+        # string RangeIndex (no index= kwarg) or explicit literal string
+        # labels from an index= list/tuple (NOT validated against the
+        # matrix's actual row count -- a mismatch is a runtime user
+        # error, same as pandas itself would raise one). Reuses
+        # DataFrame_str_index (see the dict-based sibling above) either way.
         if not (
             isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
@@ -18884,24 +19049,36 @@ class translator(ast.NodeVisitor):
         ):
             return None
         cols_kw = next((kw for kw in v.keywords if kw.arg == "columns"), None)
-        if any(kw.arg != "columns" for kw in v.keywords):
+        index_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+        if any(kw.arg not in ("columns", "index") for kw in v.keywords):
             return None
-        if self._rank_expr(v.args[0]) != 2:
+        arg_rank = self._rank_expr(v.args[0])
+        if arg_rank not in (1, 2):
             return None
         if cols_kw is not None:
-            if not (
-                isinstance(cols_kw.value, (ast.List, ast.Tuple))
-                and cols_kw.value.elts
-                and all(is_const_str(e) for e in cols_kw.value.elts)
-            ):
+            columns = self._resolve_str_list_literal(cols_kw.value)
+            if columns is None:
                 return None
-            columns = [e.value for e in cols_kw.value.elts]
+            if arg_rank == 1 and len(columns) != 1:
+                return None
+        elif arg_rank == 1:
+            # pd.DataFrame(some_1d_array) -- a rank-1 array (Series or
+            # plain array) becomes a single-column frame, with pandas'
+            # own default column label for this case: the integer 0
+            # (stringified, matching DataFrame_str_index's string-only
+            # column-label model).
+            columns = ["0"]
         else:
             ncols = self._static_ncols_from_matrix_var(v.args[0])
             if not ncols or ncols <= 0:
                 return None
             columns = [str(i) for i in range(ncols)]
-        return {"matrix_node": v.args[0], "columns": columns}
+        index = None
+        if index_kw is not None:
+            index = self._resolve_str_list_literal(index_kw.value)
+            if index is None:
+                return None
+        return {"matrix_node": v.args[0], "columns": columns, "index": index}
 
     def _pandas_df_reduction_expr(self, method, col_expr):
         # Fortran expression computing one of df.mean()/.std()/.min()/
@@ -18922,6 +19099,164 @@ class translator(ast.NodeVisitor):
         if method == "sum":
             return f"sum({col_expr})"
         raise NotImplementedError(f"df.{method}() reduction not supported")
+
+    def _pandas_df_reduction_series_spec(self, v):
+        # X = df.mean() / df.std() / df.sum() / df.min() / df.max() /
+        # df.median() -- assigned to a variable (as opposed to
+        # print(df.mean()) alone, the pre-existing direct-print-only
+        # special case in _emit_pandas_df_series_reduction_print). Result
+        # is a pandas Series: one value per column of df, in column
+        # order -- modeled as a plain real array plus a static label list
+        # (pandas_series_labels), not a new runtime type.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"mean", "median", "std", "min", "max", "sum"}
+            and len(v.args) == 0
+            and not v.keywords
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+        ):
+            return None
+        cols = self.pandas_df_columns.get(v.func.value.id)
+        if not cols:
+            return None
+        return {"df_id": v.func.value.id, "method": v.func.attr, "columns": list(cols)}
+
+    def _iloc_row_pos_expr(self, row_node, df_expr):
+        # 1-based Fortran row position from a 0-based Python iloc index,
+        # handling negative (from-the-end) indices at RUNTIME via merge()
+        # -- unlike the pre-existing slice-bounds iloc handling (row_slice/
+        # col_slice in _pandas_df_ref), which never adjusts for negative
+        # bounds, this covers `-1`-style indices since df.iloc[[0, -1], :]
+        # and df.iloc[-1, :] are common enough to be worth it directly.
+        row_txt = self.expr(row_node)
+        return f"merge({row_txt} + nrow({df_expr}) + 1, {row_txt} + 1, ({row_txt}) < 0)"
+
+    def _pandas_df_iloc_row_series_spec(self, v):
+        # X = df.iloc[row, :] -- a single row as a pandas Series, indexed
+        # by df's column names (row may be any integer expression,
+        # including a negative Python-style index). Modeled the same way
+        # as _pandas_df_reduction_series_spec (a plain real array plus a
+        # static label list), since a row slice across all columns is
+        # already a single real(:) Fortran expression -- no new runtime
+        # type needed.
+        if not (
+            isinstance(v, ast.Subscript)
+            and isinstance(v.value, ast.Attribute)
+            and v.value.attr == "iloc"
+            and isinstance(v.value.value, ast.Name)
+            and v.value.value.id in self.pandas_df_vars
+            and isinstance(v.slice, ast.Tuple)
+            and len(v.slice.elts) == 2
+            # row must be scalar-ish -- excludes both a slice (the
+            # pre-existing full-iloc row/col-slice path) and a list (the
+            # fancy-row-selection path, _pandas_df_iloc_fancy_rows_spec).
+            and not isinstance(v.slice.elts[0], (ast.Slice, ast.List, ast.Tuple))
+            and isinstance(v.slice.elts[1], ast.Slice)
+            and v.slice.elts[1].lower is None
+            and v.slice.elts[1].upper is None
+            and v.slice.elts[1].step is None
+        ):
+            return None
+        df_id = v.value.value.id
+        cols = self.pandas_df_columns.get(df_id)
+        if not cols:
+            return None
+        return {"df_id": df_id, "row_node": v.slice.elts[0], "columns": list(cols)}
+
+    def _pandas_df_iloc_fancy_rows_spec(self, v):
+        # X = df.iloc[[i0, i1, ...]] (bare row list -- pandas' single-axis
+        # iloc shorthand, all columns implicitly) or
+        # X = df.iloc[[i0, i1, ...], :] (same, spelled out) or
+        # X = df.iloc[[i0, i1, ...], [j0, j1, ...]] (also fancy columns)
+        # -- fancy row selection by a literal list of integer row
+        # positions (each may be negative, Python-style, and any runtime
+        # expression -- resolved via _iloc_row_pos_expr), in the given
+        # order (may repeat/reorder rows). Column positions, if a list
+        # rather than a bare `:` slice (or the axis omitted entirely),
+        # must be LITERAL integer constants (also may be negative) since
+        # the result's %columns list has to be known statically at
+        # transpile time; col_positions is None for the all-columns case,
+        # else the resolved 0-based positions into df's own (statically
+        # known) column list, in the given order (may also repeat/reorder
+        # columns).
+        if not (
+            isinstance(v, ast.Subscript)
+            and isinstance(v.value, ast.Attribute)
+            and v.value.attr == "iloc"
+            and isinstance(v.value.value, ast.Name)
+            and v.value.value.id in self.pandas_df_vars
+        ):
+            return None
+        df_id = v.value.value.id
+        if isinstance(v.slice, ast.List) and v.slice.elts:
+            # df.iloc[[i0, i1, ...]] -- no column axis at all.
+            return {"df_id": df_id, "row_nodes": list(v.slice.elts), "col_positions": None}
+        if not (
+            isinstance(v.slice, ast.Tuple)
+            and len(v.slice.elts) == 2
+            and isinstance(v.slice.elts[0], ast.List)
+            and v.slice.elts[0].elts
+        ):
+            return None
+        col_node = v.slice.elts[1]
+        if isinstance(col_node, ast.Slice):
+            if not (col_node.lower is None and col_node.upper is None and col_node.step is None):
+                return None
+            col_positions = None
+        elif isinstance(col_node, ast.List) and col_node.elts:
+            src_cols = self.pandas_df_columns.get(df_id)
+            if not src_cols:
+                return None
+            col_positions = []
+            for cn in col_node.elts:
+                # Python parses a negative literal as UnaryOp(USub, Constant),
+                # not a single negative Constant -- is_const_int alone (or a
+                # bare Constant check) would miss `-1` here.
+                if is_const_int(cn):
+                    idx = cn.value
+                elif (
+                    isinstance(cn, ast.UnaryOp)
+                    and isinstance(cn.op, ast.USub)
+                    and is_const_int(cn.operand)
+                ):
+                    idx = -cn.operand.value
+                else:
+                    return None
+                if idx < 0:
+                    idx += len(src_cols)
+                if not (0 <= idx < len(src_cols)):
+                    return None
+                col_positions.append(idx)
+        else:
+            return None
+        return {
+            "df_id": df_id,
+            "row_nodes": list(v.slice.elts[0].elts),
+            "col_positions": col_positions,
+        }
+
+    def _pandas_df_loc_fancy_rows_spec(self, v):
+        # X = df.loc[[label0, label1, ...]] -- fancy row selection by a
+        # literal list of string row labels (DataFrame_str_index only,
+        # since that's the only kind with a plain string row index).
+        # Result keeps df's kind and all columns.
+        if not (
+            isinstance(v, ast.Subscript)
+            and isinstance(v.value, ast.Attribute)
+            and v.value.attr == "loc"
+            and isinstance(v.value.value, ast.Name)
+            and v.value.value.id in self.pandas_df_vars
+            and isinstance(v.slice, ast.List)
+            and v.slice.elts
+            and all(is_const_str(e) for e in v.slice.elts)
+        ):
+            return None
+        df_id = v.value.value.id
+        if self.pandas_df_vars[df_id] != "DataFrame_str_index":
+            return None
+        return {"df_id": df_id, "labels": [e.value for e in v.slice.elts]}
 
     def _is_pandas_df_arith_value(self, node):
         # Whether `node` evaluates to "a whole DataFrame value" via the
@@ -20218,6 +20553,15 @@ class translator(ast.NodeVisitor):
                 if r1 <= 1 and r2 <= 1:
                     return 1
                 return 2
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"pd", "pandas"}
+                and node.func.attr == "Series"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                return self._rank_expr(node.args[0])
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype":
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist":
@@ -21764,6 +22108,47 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Subscript):
             if (
                 isinstance(node.value, ast.Name)
+                and node.value.id in self.pandas_series_labels
+                and is_const_str(node.slice)
+            ):
+                # means["x"] -- label-based read into a df.mean()-style
+                # Series (see _pandas_df_reduction_series_spec): means is
+                # just a plain real array, resolved to its position via
+                # the static label list rather than any runtime lookup.
+                _labels = self.pandas_series_labels[node.value.id]
+                if node.slice.value not in _labels:
+                    raise NotImplementedError(
+                        f"label {node.slice.value!r} not found in Series {node.value.id!r}"
+                    )
+                _pos = _labels.index(node.slice.value) + 1
+                return f"{self.expr(node.value)}({_pos})"
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in self.pandas_series_reindexed_source
+            ):
+                # col[i] where col was extracted (col = df["name"]) from a
+                # fancy-row-selected frame (pandas_df_reindexed_ids/
+                # pandas_series_reindexed_source): col is now just a plain
+                # array copy in the SELECTED row order, which no longer
+                # lines up with the original 0-based row positions its
+                # source frame's row_pos() lookup expects a string label
+                # for -- so a runtime or negative subscript here can't be
+                # resolved correctly (silently) and is refused outright,
+                # while a non-negative literal is looked up by the exact
+                # row label pandas itself would use (its str() form).
+                if not (is_const_int(node.slice) and node.slice.value >= 0):
+                    raise NotImplementedError(
+                        "unsupported expr: only a non-negative integer-literal subscript "
+                        "is supported on a Series extracted from a fancy-row-selected "
+                        "DataFrame (df.iloc[[...]] / df.loc[[...]]); the original row "
+                        "order is not preserved for a runtime or negative index"
+                    )
+                _src_id = self.pandas_series_reindexed_source[node.value.id]
+                _src_expr = self._aliased_name(_src_id)
+                _label = fstr(str(node.slice.value))
+                return f"{self.expr(node.value)}({_src_expr}%row_pos({_label}))"
+            if (
+                isinstance(node.value, ast.Name)
                 and node.value.id in self.pandas_df_vars
                 and is_const_str(node.slice)
             ):
@@ -23135,6 +23520,17 @@ class translator(ast.NodeVisitor):
                     return f"str_join({base_expr}, {_join_arg})"
                 if attr == "read" and len(node.args) == 0:
                     return f"file_read({base_expr})"
+                if attr in {"cumsum", "cumprod"} and len(node.args) == 0 and not node.keywords:
+                    # arr.cumsum()/arr.cumprod() method-call form -- the
+                    # bare-function form np.cumsum(arr)/np.cumprod(arr) is
+                    # handled separately below (requires node.func.value.id
+                    # == "np"); this covers the same rank-1 case reached
+                    # via a plain pd.Series(array) (ser IS just the array,
+                    # see the pd.Series transparent-pass-through branches),
+                    # reusing the same cumsum_real/cumsum_int helpers.
+                    k0 = self._expr_kind(node.func.value)
+                    fn = ("cumsum" if attr == "cumsum" else "cumprod") + ("_int" if k0 == "int" else "_real")
+                    return f"{fn}({base_expr})"
                 if attr == "sum":
                     axis_node = None
                     keepdims = False
@@ -25338,6 +25734,21 @@ class translator(ast.NodeVisitor):
                         return f"diagonal({a0})"
                     return f"diagonal({a0}, {offset_txt})"
                 raise NotImplementedError("np.diagonal currently supports only axis1=0,axis2=1 or axis1=1,axis2=2")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"pd", "pandas"}
+                and node.func.attr == "Series"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                # pd.Series(array) with no index=/name= kwargs -- see the
+                # matching _expr_kind/_rank_expr branches: ser is just the
+                # array, a transparent pass-through everywhere. Must be
+                # checked before the generic method-chain fallback right
+                # below, which would otherwise try to treat "pd" itself
+                # (node.func.value) as the array being operated on.
+                return self.expr(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
                 and not (_module_attr_root_name(node.func.value) in {"np", "math", "random"})
@@ -28951,6 +29362,36 @@ class translator(ast.NodeVisitor):
                 # of the many pandas_df_vars[t.id] = ... branches below.
                 if isinstance(t, ast.Name):
                     self.pandas_df_aliases.pop(t.id, None)
+                    self.pandas_series_aliases.pop(t.id, None)
+
+                # ser2 = ser (bare Name-to-Name, no operation, ser a
+                # pd.Series(...)-derived variable) -- same pure-alias
+                # technique as the DataFrame case below, scoped via
+                # pandas_series_vars. Must be checked before the DataFrame
+                # branch's fallthrough reaches any generic array-copy
+                # handling, and is naturally disjoint from it (pandas_df_vars
+                # and pandas_series_vars never share a name).
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Name)
+                    and v.id in self.pandas_series_vars
+                ):
+                    _series_alias_root = self._resolve_pandas_series_alias(v.id)
+                    self.pandas_series_aliases[t.id] = _series_alias_root
+                    self.pandas_series_vars.add(t.id)
+                    if _series_alias_root in self.pandas_series_labels:
+                        self.pandas_series_labels[t.id] = self.pandas_series_labels[_series_alias_root]
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
+                    continue
 
                 # dfz = df (bare Name-to-Name, no operation) -- Python
                 # aliasing: dfz and df are the same object, so later
@@ -28970,6 +29411,8 @@ class translator(ast.NodeVisitor):
                     _alias_root = self._resolve_pandas_df_alias(v.id)
                     self.pandas_df_aliases[t.id] = _alias_root
                     self.pandas_df_vars[t.id] = self.pandas_df_vars[_alias_root]
+                    if _alias_root in self.pandas_df_reindexed_ids:
+                        self.pandas_df_reindexed_ids.add(t.id)
                     # Share the SAME list object (not a copy!) so that a
                     # later df["new_col"] = ... growth statement reached
                     # through either name during prescan -- which mutates
@@ -29456,6 +29899,105 @@ class translator(ast.NodeVisitor):
                         self.alloc_complexes.discard(t.id)
                         continue
 
+                # X = df.mean() / df.std() / df.sum() / df.min() / df.max()
+                # / df.median() -- assigned to a variable; a plain real
+                # array (one value per df column) plus a static label
+                # list for s["col"] reads later. See
+                # _pandas_df_reduction_series_spec.
+                if isinstance(t, ast.Name):
+                    _sr_spec = self._pandas_df_reduction_series_spec(v)
+                    if _sr_spec is not None:
+                        self.pandas_df_vars.pop(t.id, None)
+                        self.pandas_df_columns.pop(t.id, None)
+                        self.pandas_series_labels[t.id] = list(_sr_spec["columns"])
+                        self._mark_alloc_real(t.id, rank=1)
+                        continue
+
+                # X = df.iloc[row, :] -- a single row as a Series (see
+                # _pandas_df_iloc_row_series_spec).
+                if isinstance(t, ast.Name):
+                    _ir_spec = self._pandas_df_iloc_row_series_spec(v)
+                    if _ir_spec is not None:
+                        self.pandas_df_vars.pop(t.id, None)
+                        self.pandas_df_columns.pop(t.id, None)
+                        self.pandas_series_labels[t.id] = list(_ir_spec["columns"])
+                        self._mark_alloc_real(t.id, rank=1)
+                        continue
+
+                # X = df.iloc[[i0, i1, ...], :] / df.iloc[[i0, ...], [j0, ...]]
+                # -- fancy row (and optionally column) selection (see
+                # _pandas_df_iloc_fancy_rows_spec); result keeps df's kind,
+                # and either all its columns or the selected subset.
+                if isinstance(t, ast.Name):
+                    _fr_spec = self._pandas_df_iloc_fancy_rows_spec(v)
+                    if _fr_spec is not None:
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_fr_spec["df_id"]]
+                        self.pandas_df_reindexed_ids.add(t.id)
+                        _fr_src_cols = self.pandas_df_columns.get(_fr_spec["df_id"], []) or []
+                        if _fr_spec["col_positions"] is None:
+                            self.pandas_df_columns[t.id] = list(_fr_src_cols)
+                        else:
+                            self.pandas_df_columns[t.id] = [_fr_src_cols[p] for p in _fr_spec["col_positions"]]
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = df.loc[[label0, label1, ...]] -- fancy row selection
+                # by string label (see _pandas_df_loc_fancy_rows_spec);
+                # result keeps df's kind and all columns.
+                if isinstance(t, ast.Name):
+                    _lr_spec = self._pandas_df_loc_fancy_rows_spec(v)
+                    if _lr_spec is not None:
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_lr_spec["df_id"]]
+                        self.pandas_df_reindexed_ids.add(t.id)
+                        self.pandas_df_columns[t.id] = list(
+                            self.pandas_df_columns.get(_lr_spec["df_id"], []) or []
+                        )
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # col = df["name"] where df is itself a fancy-row-selected
+                # frame (pandas_df_reindexed_ids) -- col's %index-derived
+                # row ordering is about to be lost once copied out into a
+                # plain array, so remember which frame (and hence which
+                # %row_pos) a later integer-literal subscript on col must
+                # be resolved against instead. Deliberately does NOT
+                # continue -- the generic real/int/... array-kind inference
+                # further below still needs to run to actually type col.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Subscript)
+                    and isinstance(v.value, ast.Name)
+                    and v.value.id in self.pandas_df_reindexed_ids
+                    # row_pos(str-label) is only available on
+                    # DataFrame_str_index (dataframe_str_index.f90's
+                    # row_pos_str) -- DataFrame_index_date's row_pos takes
+                    # a type(date), not a string, so this stays scoped to
+                    # the RangeIndex/dict-constructed kind.
+                    and self.pandas_df_vars.get(v.value.id) == "DataFrame_str_index"
+                    and is_const_str(v.slice)
+                ):
+                    self.pandas_series_reindexed_source[t.id] = v.value.id
+                elif isinstance(t, ast.Name):
+                    self.pandas_series_reindexed_source.pop(t.id, None)
+
                 # df["new_col"] = expr -- grow (or overwrite, matching
                 # pandas' in-place-if-exists semantics) a RangeIndex
                 # dict-DataFrame's column list. Materializes the RHS into
@@ -29602,6 +30144,30 @@ class translator(ast.NodeVisitor):
                         self.alloc_chars.discard(t.id)
                         self.alloc_complexes.discard(t.id)
                         continue
+
+                # ser = pd.Series([...]) / pd.Series(arr) -- mark as
+                # Series-derived so a later bare-Name-to-Name assignment
+                # (ser2 = ser) can be resolved as a pure alias
+                # (pandas_series_vars / pandas_series_aliases, see the
+                # "ser2 = ser" branch above and _aliased_name). Deliberately
+                # does NOT continue: pd.Series(...) is modeled as a
+                # transparent pass-through in _expr_kind/_rank_expr, so the
+                # generic real/int/... array-kind inference just below
+                # (which is what actually declares ser's Fortran type) must
+                # still run for this same statement -- without this dict
+                # update it would `continue` first and this file's other
+                # pd.Series(...) construction branch further down (which
+                # handles the index=df.index-labeled flavor specifically)
+                # would never be reached to set the flag itself.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"pd", "pandas"}
+                    and v.func.attr == "Series"
+                ):
+                    self.pandas_series_vars.add(t.id)
 
                 # No-op self-casts/normalizations should not force type/rank
                 # changes during prescan.
@@ -30022,6 +30588,7 @@ class translator(ast.NodeVisitor):
                     and v.func.attr == "Series"
                     and len(v.args) >= 1
                 ):
+                    self.pandas_series_vars.add(t.id)
                     _idx_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
                     if (
                         _idx_kw is not None
@@ -30053,6 +30620,41 @@ class translator(ast.NodeVisitor):
                         else:
                             self.alloc_logs.add(t.id)
                             self.alloc_log_rank[t.id] = 1
+                    elif len(v.args) == 1 and not v.keywords:
+                        # pd.Series(array) -- no index=/name= kwargs: an
+                        # already-computed array wrapped as a Series with
+                        # an implicit RangeIndex. ser is just the array
+                        # (see the matching expr()/_expr_kind/_rank_expr
+                        # transparent-pass-through branches), so register
+                        # it here the same way the index=df.index case
+                        # above does.
+                        _series_kind = self._expr_kind(v.args[0])
+                        _series_rank = max(1, self._rank_expr(v.args[0]))
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        if _series_kind == "int":
+                            self.alloc_ints.add(t.id)
+                            self.alloc_int_rank[t.id] = _series_rank
+                        elif _series_kind == "char":
+                            self.alloc_chars.add(t.id)
+                            self.alloc_char_rank[t.id] = _series_rank
+                        elif _series_kind == "logical":
+                            self.alloc_logs.add(t.id)
+                            self.alloc_log_rank[t.id] = _series_rank
+                        elif _series_kind == "complex":
+                            self.alloc_complexes.add(t.id)
+                            self.alloc_complex_rank[t.id] = _series_rank
+                        else:
+                            self.alloc_reals.add(t.id)
+                            self.alloc_real_rank[t.id] = _series_rank
 
                 def _is_bool_mask_node(n):
                     return (
@@ -31585,6 +32187,14 @@ class translator(ast.NodeVisitor):
             return
         t = node.targets[0]
         v = node.value
+        if isinstance(t, ast.Name) and isinstance(v, ast.Name) and v.id in self.pandas_series_vars:
+            # ser2 = ser (bare Name-to-Name, ser a pd.Series(...)-derived
+            # variable) -- same pure-alias resolution as the DataFrame
+            # case right below (nothing emitted; _aliased_name resolves
+            # ser2 straight to ser's Fortran variable, including for the
+            # AugAssign target of ser2 *= 10, which is what makes an
+            # in-place mutation through ser2 correctly visible via ser too).
+            return
         if isinstance(t, ast.Name) and isinstance(v, ast.Name) and v.id in self.pandas_df_vars:
             # dfz = df (bare Name-to-Name) -- pure object alias, resolved
             # entirely at transpile time (see the matching prescan branch
@@ -36508,6 +37118,12 @@ class translator(ast.NodeVisitor):
             if _rmat_spec is not None:
                 name = self._aliased_name(t.id)
                 mat_expr = self.expr(_rmat_spec["matrix_node"])
+                if self._rank_expr(_rmat_spec["matrix_node"]) == 1:
+                    # pd.DataFrame(some_1d_array) -- reshape into the
+                    # single-column matrix %values expects (see the
+                    # matching prescan spec, which already defaulted
+                    # columns to ["0"] for this case).
+                    mat_expr = f"reshape({mat_expr}, [size({mat_expr}), 1])"
                 final_cols = _rmat_spec["columns"]
                 col_len = max(10, max(len(c) for c in final_cols))
                 columns_txt = ", ".join(fstr(c) for c in final_cols)
@@ -36515,13 +37131,19 @@ class translator(ast.NodeVisitor):
                 idx_var = f"{t.id}_ridx_i"
                 self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
                 self.o.w(f"{name}%values = {mat_expr}")
-                self.o.w(f"if (allocated({name}%index)) deallocate({name}%index)")
-                self.o.w(f"allocate({name}%index({n_expr}))")
-                self.o.w(f"do {idx_var} = 1, {n_expr}")
-                self.o.push()
-                self.o.w(f"write({name}%index({idx_var}), '(I0)') {idx_var} - 1")
-                self.o.pop()
-                self.o.w("end do")
+                if _rmat_spec["index"] is not None:
+                    idx_labels = _rmat_spec["index"]
+                    idx_len = max(10, max(len(s) for s in idx_labels))
+                    idx_lits = ", ".join(fstr(s) for s in idx_labels)
+                    self.o.w(f"{name}%index = [character(len={idx_len}) :: {idx_lits}]")
+                else:
+                    self.o.w(f"if (allocated({name}%index)) deallocate({name}%index)")
+                    self.o.w(f"allocate({name}%index({n_expr}))")
+                    self.o.w(f"do {idx_var} = 1, {n_expr}")
+                    self.o.push()
+                    self.o.w(f"write({name}%index({idx_var}), '(I0)') {idx_var} - 1")
+                    self.o.pop()
+                    self.o.w("end do")
                 return
 
         # X = pd.DataFrame([df.mean(), df.std(), ...], index=[...]) -- one
@@ -36547,6 +37169,63 @@ class translator(ast.NodeVisitor):
                         _col_expr = f"{src_expr}%values(:, {_j})"
                         _val_expr = self._pandas_df_reduction_expr(_method, _col_expr)
                         self.o.w(f"{name}%values({_i}, {_j}) = {_val_expr}")
+                return
+
+        # X = df.mean() / df.std() / df.sum() / df.min() / df.max() / df.median()
+        if isinstance(t, ast.Name) and t.id in self.pandas_series_labels:
+            _sr_spec = self._pandas_df_reduction_series_spec(v)
+            if _sr_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_sr_spec["df_id"])
+                cols = _sr_spec["columns"]
+                self.o.w(f"if (allocated({name})) deallocate({name})")
+                self.o.w(f"allocate({name}({len(cols)}))")
+                for _j, _cname in enumerate(cols, start=1):
+                    _col_expr = f"{src_expr}%values(:, {_j})"
+                    _val_expr = self._pandas_df_reduction_expr(_sr_spec["method"], _col_expr)
+                    self.o.w(f"{name}({_j}) = {_val_expr}")
+                return
+
+        # X = df.iloc[row, :] -- a single row as a Series.
+        if isinstance(t, ast.Name) and t.id in self.pandas_series_labels:
+            _ir_spec = self._pandas_df_iloc_row_series_spec(v)
+            if _ir_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_ir_spec["df_id"])
+                row_pos = self._iloc_row_pos_expr(_ir_spec["row_node"], src_expr)
+                self.o.w(f"{name} = {src_expr}%values({row_pos}, :)")
+                return
+
+        # X = df.iloc[[i0, i1, ...], :] / df.iloc[[i0, ...], [j0, ...]] --
+        # fancy row (and optionally column) selection.
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _fr_spec = self._pandas_df_iloc_fancy_rows_spec(v)
+            if _fr_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_fr_spec["df_id"])
+                pos_exprs = [self._iloc_row_pos_expr(rn, src_expr) for rn in _fr_spec["row_nodes"]]
+                idx_txt = ", ".join(pos_exprs)
+                if _fr_spec["col_positions"] is None:
+                    self.o.w(f"{name}%columns = {src_expr}%columns")
+                    self.o.w(f"{name}%index = {src_expr}%index([{idx_txt}])")
+                    self.o.w(f"{name}%values = {src_expr}%values([{idx_txt}], :)")
+                else:
+                    col_idx_txt = ", ".join(str(p + 1) for p in _fr_spec["col_positions"])
+                    self.o.w(f"{name}%columns = {src_expr}%columns([{col_idx_txt}])")
+                    self.o.w(f"{name}%index = {src_expr}%index([{idx_txt}])")
+                    self.o.w(f"{name}%values = {src_expr}%values([{idx_txt}], [{col_idx_txt}])")
+                return
+
+        # X = df.loc[[label0, label1, ...]] -- fancy row selection by label.
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _lr_spec = self._pandas_df_loc_fancy_rows_spec(v)
+            if _lr_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_lr_spec["df_id"])
+                idx_txt = ", ".join(f"{src_expr}%row_pos({fstr(lbl)})" for lbl in _lr_spec["labels"])
+                self.o.w(f"{name}%columns = {src_expr}%columns")
+                self.o.w(f"{name}%index = {src_expr}%index([{idx_txt}])")
+                self.o.w(f"{name}%values = {src_expr}%values([{idx_txt}], :)")
                 return
 
         # df[df.abs() > thresh] = np.nan -- whole-DataFrame element-wise
@@ -37849,6 +38528,23 @@ class translator(ast.NodeVisitor):
             self.o.pop()
             self.o.w("end where")
             return
+        # df *= 10 / df += df2 / etc. -- a DataFrame-typed target. Route
+        # through a synthesized BinOp and expr()'s own DataFrame-arithmetic
+        # handling (_is_pandas_df_arith_value) rather than hand-building
+        # "{lhs} = {lhs} {op} {rhs}" below, which -- unlike that handler --
+        # doesn't coerce an integer scalar RHS to real(kind=dp): the vendored
+        # DataFrame_str_index operator(*) overload only accepts a real
+        # scalar, so `df * 10` (bare integer literal) fails to compile.
+        if (
+            isinstance(node.target, ast.Name)
+            and node.target.id in self.pandas_df_vars
+            and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div))
+        ):
+            lhs = self._aliased_name(node.target.id)
+            rhs_txt = self.expr(ast.BinOp(left=node.target, op=node.op, right=node.value))
+            self.o.w(f"{lhs} = {rhs_txt}")
+            return
+
         # supports common augmented assignments on names and indexed targets
         if isinstance(node.target, ast.Name):
             lhs = self._aliased_name(node.target.id)
@@ -39616,6 +40312,15 @@ class translator(ast.NodeVisitor):
             ):
                 self._emit_pandas_concat_print(c.args[0])
                 return
+            if len(c.args) == 1 and self._pandas_df_iloc_row_series_spec(c.args[0]) is not None:
+                self._emit_pandas_df_iloc_row_series_print(c.args[0])
+                return
+            if len(c.args) == 1 and self._pandas_df_iloc_fancy_rows_spec(c.args[0]) is not None:
+                self._emit_pandas_df_iloc_fancy_rows_print(c.args[0])
+                return
+            if len(c.args) == 1 and self._pandas_df_loc_fancy_rows_spec(c.args[0]) is not None:
+                self._emit_pandas_df_loc_fancy_rows_print(c.args[0])
+                return
             if (
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
@@ -39704,6 +40409,26 @@ class translator(ast.NodeVisitor):
                 self._emit_pandas_df_corr_print(
                     c.args[0].func.value, ndigits=ndigits, context_node=orig_call
                 )
+                return
+            if (
+                len(c.args) >= 2
+                and not c.keywords
+                and self._is_pandas_df_ref_node(c.args[-1])
+                and all(not self._is_pandas_df_ref_node(a) for a in c.args[:-1])
+            ):
+                # print("label:", df) -- a DataFrame reference as the LAST
+                # of several print() arguments (the plain print(df) case
+                # above only covers a single argument). Fortran can't
+                # print a derived type with allocatable components inline
+                # via `print *, ..., df` (no defined I/O procedure), so the
+                # leading args are printed first as an ordinary statement,
+                # then the DataFrame is rendered via its own %display() the
+                # same way print(df) alone is -- an approximation of
+                # Python's single print() call (same caveat as print(df)
+                # alone: pandas' box formatting is never byte-matched).
+                lead_txt = ", ".join(self.expr(a) for a in c.args[:-1])
+                self.o.w(f"print *, {lead_txt}")
+                self._emit_pandas_df_print(c.args[-1], context_node=orig_call)
                 return
             self._emit_print_call(c)
             return
@@ -40627,6 +41352,64 @@ class translator(ast.NodeVisitor):
         self.o.pop()
         self.o.w("end block")
 
+    def _emit_pandas_df_iloc_row_series_print(self, node):
+        # print(df.iloc[row, :]) -- a single row as a Series; same
+        # "materialize into an ad hoc temp, then print" approach as the
+        # other print(<df expr>) helpers, but the result here is a plain
+        # real array (see _pandas_df_iloc_row_series_spec), so it's
+        # printed via the generic array-print path, not
+        # _emit_pandas_df_print.
+        _ir_spec = self._pandas_df_iloc_row_series_spec(node)
+        if _ir_spec is None:
+            raise NotImplementedError(f"unsupported call: {ast.unparse(node)}")
+        tmp_name = "pdf_ilocrow_mrtmp"
+        self.pandas_series_labels[tmp_name] = list(_ir_spec["columns"])
+        self.o.w("block")
+        self.o.push()
+        self.o.w(f"real(kind=dp), allocatable :: {tmp_name}(:)")
+        self.visit_Assign(ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=node))
+        self._emit_print_call(ast.Call(func=ast.Name(id="print"), args=[ast.Name(id=tmp_name, ctx=ast.Load())], keywords=[]))
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_iloc_fancy_rows_print(self, node, ndigits=6):
+        # print(df.iloc[[i0, i1, ...], :]) -- fancy row selection; same
+        # "materialize into an ad hoc temp DataFrame, then print"
+        # approach as the other print(<df expr>) helpers.
+        _fr_spec = self._pandas_df_iloc_fancy_rows_spec(node)
+        if _fr_spec is None:
+            raise NotImplementedError(f"unsupported call: {ast.unparse(node)}")
+        kind = self.pandas_df_vars[_fr_spec["df_id"]]
+        tmp_name = "pdf_ilocfancy_mrtmp"
+        self.pandas_df_vars[tmp_name] = kind
+        self.pandas_df_columns[tmp_name] = list(self.pandas_df_columns.get(_fr_spec["df_id"], []) or [])
+        self.o.w("block")
+        self.o.push()
+        self.o.w(f"type({kind}) :: {tmp_name}")
+        self.visit_Assign(ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=node))
+        self._emit_pandas_df_print(ast.Name(id=tmp_name, ctx=ast.Load()), ndigits=ndigits)
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_loc_fancy_rows_print(self, node, ndigits=6):
+        # print(df.loc[[label0, label1, ...]]) -- fancy row selection by
+        # label; same "materialize into an ad hoc temp DataFrame, then
+        # print" approach as the other print(<df expr>) helpers.
+        _lr_spec = self._pandas_df_loc_fancy_rows_spec(node)
+        if _lr_spec is None:
+            raise NotImplementedError(f"unsupported call: {ast.unparse(node)}")
+        kind = self.pandas_df_vars[_lr_spec["df_id"]]
+        tmp_name = "pdf_locfancy_mrtmp"
+        self.pandas_df_vars[tmp_name] = kind
+        self.pandas_df_columns[tmp_name] = list(self.pandas_df_columns.get(_lr_spec["df_id"], []) or [])
+        self.o.w("block")
+        self.o.push()
+        self.o.w(f"type({kind}) :: {tmp_name}")
+        self.visit_Assign(ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=node))
+        self._emit_pandas_df_print(ast.Name(id=tmp_name, ctx=ast.Load()), ndigits=ndigits)
+        self.o.pop()
+        self.o.w("end block")
+
     def _emit_pandas_df_arith_print(self, node, ndigits=6):
         # print(df * 10) / print(df + df2) / print(np.exp(df)) /
         # print(np.log(np.exp(df)) - df) -- same "materialize into an ad
@@ -40676,7 +41459,20 @@ class translator(ast.NodeVisitor):
             # procedure (dataframe_str_index.f90) covers it generically,
             # including when col_names is unknown (e.g. after
             # df.dropna(axis=1), whose surviving columns are data-dependent).
+            # df_expr may itself be a function-call expression (e.g.
+            # df[["a","c"]] renders as df%icol([...])) -- gfortran rejects
+            # chaining %display() directly onto that ("leftmost part-ref in
+            # a data-ref cannot be a function reference"), so materialize
+            # it into a block-scoped temp first, the same way the
+            # hand-rolled print path below already has to.
+            self.o.w("block")
+            self.o.push()
+            orig_df_expr = df_expr
+            df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind="DataFrame_str_index")
+            self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
             self.o.w(f"call {df_expr}%display({ndigits})")
+            self.o.pop()
+            self.o.w("end block")
             return
         if not col_names and df_expr is not None and df_kind in {"DataFrame_index_date", "DataFrame_index_datetime"}:
             # Column list not known at transpile time (df.dropna(axis=1))
