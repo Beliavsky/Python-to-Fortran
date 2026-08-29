@@ -14291,6 +14291,43 @@ class translator(ast.NodeVisitor):
         # explicit-string-labels flavor of the same runtime type -- see
         # _pandas_dict_df_construct_spec_rangeidx.
         self.pandas_rangeidx_df_ids = set()
+        # dfz = df (bare Name-to-Name, no operation) -- Python binds dfz to
+        # the same object; resolved at transpile time as a pure alias for
+        # df's own Fortran variable (see _resolve_pandas_df_alias), the
+        # same technique already used for Python list aliasing
+        # (list_aliases / _resolve_list_alias).
+        #
+        # KNOWN LIMITATION: this dict (like pandas_df_vars/pandas_df_columns)
+        # is a single whole-program-final mapping per variable name, not
+        # position-aware -- _aliased_name resolves it using its state AFTER
+        # prescan has walked the ENTIRE script, not "as of this statement".
+        # This is fine as long as each DataFrame variable name is used for
+        # only ONE role for its whole lifetime (a real value, OR an alias --
+        # never both at different points). If the SAME name is reused for
+        # different roles across the script (e.g. `dfz = df.copy()` early
+        # on, then LATER `dfz = df2` as a true alias of a DIFFERENT frame),
+        # every reference to that name -- including ones textually BEFORE
+        # the rebind -- resolves via its FINAL role, corrupting the earlier
+        # ones. (The equivalent bug for pandas_df_columns, which affected
+        # column-growth ordering and DataFrame-arithmetic column lists, was
+        # fixed with per-statement snapshots -- pandas_df_columns_snapshot /
+        # _snapshot_df_arith_refs; the same fix was judged not worth
+        # replicating here, since _aliased_name is consulted essentially
+        # everywhere a DataFrame name appears, not just in arithmetic
+        # expressions, making it a much larger undertaking for a narrow,
+        # avoidable case.) Practical takeaway: give each DataFrame variable
+        # a name used for only one purpose for its whole lifetime; use a
+        # fresh name (`dfcopy`, `dfalias`, ...) rather than reassigning an
+        # existing one to a different kind of binding partway through.
+        self.pandas_df_aliases = {}
+        # df["col"] = expr -- per-statement (keyed by the Assign node's
+        # identity) record of whether THIS specific growth statement adds
+        # a genuinely new column (True, needs a runtime append) or
+        # overwrites an existing one (False, a plain slot write); see the
+        # growth prescan/codegen branches. Needed because by codegen time
+        # pandas_df_columns already reflects the WHOLE script's growth,
+        # not just what's happened up to this statement.
+        self.pandas_df_col_is_new = {}
         self.pandas_df_select_indices = {}
         self.pandas_df_columns_snapshot = {}
         self.dict_aliases = {}
@@ -14433,6 +14470,14 @@ class translator(ast.NodeVisitor):
         while cur in self.list_aliases and cur not in seen:
             seen.add(cur)
             cur = self.list_aliases[cur]
+        return cur
+
+    def _resolve_pandas_df_alias(self, name):
+        cur = name
+        seen = set()
+        while cur in self.pandas_df_aliases and cur not in seen:
+            seen.add(cur)
+            cur = self.pandas_df_aliases[cur]
         return cur
 
     def _dict_array_map_info(self, name):
@@ -14596,6 +14641,13 @@ class translator(ast.NodeVisitor):
         return False
 
     def _aliased_name(self, name):
+        # Resolve pure DataFrame object-aliasing (dfz = df) to its root
+        # variable first -- see pandas_df_aliases / _resolve_pandas_df_alias.
+        # A no-op for every other name (the dict only ever holds DataFrame
+        # variables), matching how list aliasing is resolved separately by
+        # callers via _resolve_list_alias before reaching here.
+        if name in self.pandas_df_aliases:
+            name = self._resolve_pandas_df_alias(name)
         if name in self.name_aliases:
             return self.name_aliases[name]
         # If caller already passes a chosen alias token, keep it stable.
@@ -18167,6 +18219,27 @@ class translator(ast.NodeVisitor):
             return None
         return {"method": v.func.attr, "df_id": v.func.value.id, "call": v}
 
+    def _pandas_df_copy_spec(self, v):
+        # X = df.copy() / df.copy(deep=True) / df.copy(deep=False) -- an
+        # independent DataFrame value. We don't model pandas' shared-
+        # buffer deep=False semantics (nothing here tracks aliasing at
+        # the column-array level, only at the whole-DataFrame-variable
+        # level -- see pandas_df_aliases for that), so deep= is accepted
+        # but doesn't change codegen: this is always a plain Fortran
+        # value copy (already independent, unlike "X = df" with no
+        # .copy(), which is a pure alias -- see the bare Name-to-Name
+        # prescan/codegen branches).
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "copy"
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+            and all(kw.arg == "deep" for kw in v.keywords)
+        ):
+            return None
+        return {"df_id": v.func.value.id}
+
     def _pandas_df_dropna_spec(self, v):
         # X = df.dropna() / df.dropna(axis=1) -- drop rows (axis=0,
         # default) or columns (axis=1) containing at least one NaN.
@@ -18849,6 +18922,126 @@ class translator(ast.NodeVisitor):
         if method == "sum":
             return f"sum({col_expr})"
         raise NotImplementedError(f"df.{method}() reduction not supported")
+
+    def _is_pandas_df_arith_value(self, node):
+        # Whether `node` evaluates to "a whole DataFrame value" via the
+        # arithmetic/ufunc paths added for DataFrame math (df +-*/
+        # df-or-scalar, np.exp/log/abs(df)) -- recurses so nested
+        # compositions like np.log(np.exp(df)) - df are recognized, not
+        # just a bare df Name. Used to decide whether an expression needs
+        # routing through those paths at all (print(...) dispatch,
+        # expr()'s BinOp/ufunc-Call handling).
+        if isinstance(node, ast.Name) and node.id in self.pandas_df_vars:
+            return True
+        if isinstance(node, ast.BinOp) and type(node.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div):
+            return self._is_pandas_df_arith_value(node.left) or self._is_pandas_df_arith_value(node.right)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in {"np", "numpy"}
+            and node.func.attr in {"abs", "absolute", "log", "exp"}
+            and len(node.args) == 1
+        ):
+            return self._is_pandas_df_arith_value(node.args[0])
+        return False
+
+    def _snapshot_df_arith_refs(self, expr_node):
+        # Capture a column-list snapshot (as of THIS point in program
+        # order) for every bare-Name DataFrame reference inside a
+        # DataFrame-arithmetic expression (see _is_pandas_df_arith_value),
+        # keyed by each Name node's own identity. Needed because
+        # _pandas_df_arith_kind_cols/_pandas_df_union_arith_spec re-read
+        # column lists at CODEGEN time -- by which point prescan has
+        # already walked (and possibly grown, via df["col"]=... later in
+        # the script) every DataFrame variable -- so this is the only way
+        # to recover "as of this statement" info, captured here during
+        # prescan's own true sequential program-order walk.
+        if isinstance(expr_node, ast.Name) and expr_node.id in self.pandas_df_vars:
+            self.pandas_df_columns_snapshot[id(expr_node)] = list(
+                self.pandas_df_columns.get(expr_node.id, []) or []
+            )
+        elif isinstance(expr_node, ast.BinOp):
+            self._snapshot_df_arith_refs(expr_node.left)
+            self._snapshot_df_arith_refs(expr_node.right)
+        elif isinstance(expr_node, ast.Call):
+            for _a in expr_node.args:
+                self._snapshot_df_arith_refs(_a)
+
+    def _pandas_df_arith_kind_cols(self, node):
+        # (kind, columns) for a DataFrame-arithmetic expression node (see
+        # _is_pandas_df_arith_value), by recursing to the first operand
+        # that resolves. Returns None if node isn't such an expression.
+        if isinstance(node, ast.Name) and node.id in self.pandas_df_vars:
+            _snap = self.pandas_df_columns_snapshot.get(id(node))
+            _cols = _snap if _snap is not None else self.pandas_df_columns.get(node.id)
+            return self.pandas_df_vars[node.id], _cols
+        if isinstance(node, ast.BinOp) and type(node.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div):
+            l = self._pandas_df_arith_kind_cols(node.left)
+            r = self._pandas_df_arith_kind_cols(node.right)
+            # Both sides a DataFrame with DIFFERENT known column lists --
+            # this is the union-columns/NaN-fill shape (see
+            # _pandas_df_union_arith_spec's codegen), which produces a
+            # result with the SORTED UNION of both column lists, not
+            # either side's own columns.
+            if l is not None and r is not None and l[0] == r[0] and l[1] is not None and r[1] is not None and l[1] != r[1]:
+                return l[0], sorted(set(l[1]) | set(r[1]))
+            return l or r
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in {"np", "numpy"}
+            and node.func.attr in {"abs", "absolute", "log", "exp"}
+            and len(node.args) == 1
+        ):
+            return self._pandas_df_arith_kind_cols(node.args[0])
+        return None
+
+    def _pandas_df_union_arith_spec(self, v):
+        # X = df1 + df2 (mismatched columns) -- pandas aligns on the
+        # SORTED UNION of both frames' columns; a column present in only
+        # one frame comes out all-NaN in the result (mirrors pandas'
+        # behavior when the two column Index objects don't already
+        # match). Distinct from the plain expr()-level operator handling
+        # (used when columns DO match, which composes/nests freely as a
+        # single inline expression); this needs block-level codegen
+        # (allocate + per-column assignment/NaN-fill), so it's only
+        # usable as a direct assignment/print target, not nested inside
+        # another expression. Row index is taken from the left operand
+        # (assumes both frames share the same row index/count --
+        # positional, not pandas' real index-alignment, matching the
+        # same simplification already used for axis=1 concat).
+        if not (
+            isinstance(v, ast.BinOp)
+            and type(v.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
+            and isinstance(v.left, ast.Name)
+            and isinstance(v.right, ast.Name)
+            and v.left.id in self.pandas_df_vars
+            and v.right.id in self.pandas_df_vars
+        ):
+            return None
+        lk = self.pandas_df_vars[v.left.id]
+        rk = self.pandas_df_vars[v.right.id]
+        if lk != rk or lk != "DataFrame_str_index":
+            return None
+        # Prefer a per-node snapshot (columns as of THIS statement, in
+        # program order) over the raw dict, which by codegen time
+        # reflects the whole script's growth -- see _snapshot_df_arith_refs.
+        _lsnap = self.pandas_df_columns_snapshot.get(id(v.left))
+        _rsnap = self.pandas_df_columns_snapshot.get(id(v.right))
+        lcols = _lsnap if _lsnap is not None else self.pandas_df_columns.get(v.left.id)
+        rcols = _rsnap if _rsnap is not None else self.pandas_df_columns.get(v.right.id)
+        if lcols is None or rcols is None or lcols == rcols:
+            return None
+        return {
+            "left_id": v.left.id,
+            "right_id": v.right.id,
+            "op": type(v.op),
+            "columns": sorted(set(lcols) | set(rcols)),
+            "lcols": lcols,
+            "rcols": rcols,
+        }
 
     def _pandas_df_reduction_rows_construct_spec(self, v):
         # X = pd.DataFrame([df.mean(), df.std(), ...], index=["mean", "sd", ...])
@@ -20873,6 +21066,49 @@ class translator(ast.NodeVisitor):
 
         if isinstance(node, ast.BinOp):
             op = type(node.op)
+            # DataFrame arithmetic: df +-*/ df (same kind, same columns) or
+            # df +-*/ scalar (either order) -- routes through operator
+            # overloads on the vendored DataFrame type (currently only
+            # DataFrame_str_index has them) rather than a per-statement
+            # construct-spec, so it composes naturally with arbitrary
+            # nesting (e.g. np.log(np.exp(df)) - df).
+            _df_left = self._is_pandas_df_arith_value(node.left)
+            _df_right = self._is_pandas_df_arith_value(node.right)
+            if (_df_left or _df_right) and op in (ast.Add, ast.Sub, ast.Mult, ast.Div):
+                _df_opmap = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
+                if _df_left and _df_right:
+                    _lkc = self._pandas_df_arith_kind_cols(node.left)
+                    _rkc = self._pandas_df_arith_kind_cols(node.right)
+                    if (
+                        _lkc is None
+                        or _rkc is None
+                        or _lkc[0] != _rkc[0]
+                        or _lkc[0] != "DataFrame_str_index"
+                        or _lkc[1] is None
+                        or _rkc[1] is None
+                        or _lkc[1] != _rkc[1]
+                    ):
+                        raise NotImplementedError(
+                            "DataFrame arithmetic between two DataFrames currently requires "
+                            "both to be DataFrame_str_index of the same kind, with identical, "
+                            "statically-known column lists"
+                        )
+                    return f"({self.expr(node.left)} {_df_opmap[op]} {self.expr(node.right)})"
+                _df_node, _scalar_node = (node.left, node.right) if _df_left else (node.right, node.left)
+                _kc = self._pandas_df_arith_kind_cols(_df_node)
+                if _kc is None or _kc[0] != "DataFrame_str_index":
+                    raise NotImplementedError(
+                        "DataFrame-scalar arithmetic currently supports only DataFrame_str_index"
+                    )
+                if self._rank_expr(_scalar_node) != 0:
+                    raise NotImplementedError(
+                        "DataFrame arithmetic supports only a scalar or another DataFrame operand"
+                    )
+                _scalar_txt = self._coerce_expr_kind(_scalar_node, self.expr(_scalar_node), "real")
+                _df_txt = self.expr(_df_node)
+                if _df_left:
+                    return f"({_df_txt} {_df_opmap[op]} {_scalar_txt})"
+                return f"({_scalar_txt} {_df_opmap[op]} {_df_txt})"
             if self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right):
                 a_set = self.expr(node.left)
                 b_set = self.expr(node.right)
@@ -24026,6 +24262,31 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 return f"conjg({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"abs", "absolute", "log", "exp"}
+                and len(node.args) == 1
+                and self._is_pandas_df_arith_value(node.args[0])
+            ):
+                # np.exp(df) / np.log(df) / np.abs(df) -- a numpy ufunc
+                # applied to a whole DataFrame (as opposed to df.abs(),
+                # the method-call form handled by
+                # _pandas_df_simple_method_spec); the plain intrinsics
+                # below can't take a derived-type argument, so this must
+                # be intercepted before falling into them. The argument
+                # can itself be a nested DataFrame-arithmetic expression
+                # (e.g. np.log(np.exp(df))), not just a bare Name.
+                _ufunc_kc = self._pandas_df_arith_kind_cols(node.args[0])
+                if _ufunc_kc is None or _ufunc_kc[0] != "DataFrame_str_index":
+                    raise NotImplementedError(
+                        f"np.{node.func.attr}() on a whole DataFrame is currently only "
+                        "supported for DataFrame_str_index"
+                    )
+                _ufunc_attr = "abs" if node.func.attr == "absolute" else node.func.attr
+                _ufunc_fn = {"abs": "abs_str", "log": "log_df_str", "exp": "exp_df_str"}[_ufunc_attr]
+                return f"{_ufunc_fn}({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -27753,6 +28014,20 @@ class translator(ast.NodeVisitor):
             return None
 
         for node in nodes:
+            # Snapshot columns (as of THIS point in program order) for
+            # every DataFrame-arithmetic BinOp reachable from this
+            # statement -- covers both `X = df1 + df2` and
+            # `print(df1 + df2)` uniformly, since it walks the whole
+            # statement rather than assuming a particular shape. See
+            # _snapshot_df_arith_refs / _pandas_df_arith_kind_cols /
+            # _pandas_df_union_arith_spec.
+            for _bn in ast.walk(node):
+                if (
+                    isinstance(_bn, ast.BinOp)
+                    and type(_bn.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
+                    and (self._is_pandas_df_arith_value(_bn.left) or self._is_pandas_df_arith_value(_bn.right))
+                ):
+                    self._snapshot_df_arith_refs(_bn)
             if (
                 isinstance(node, ast.Expr)
                 and isinstance(node.value, ast.Call)
@@ -28669,6 +28944,57 @@ class translator(ast.NodeVisitor):
                 t = node.targets[0]
                 v = node.value
 
+                # Any real (non-alias) assignment to a DataFrame name clears
+                # a previously-established pure alias (see the "dfz = df"
+                # bare-Name-to-Name branch below, which re-establishes one
+                # when applicable) -- centralized here rather than at each
+                # of the many pandas_df_vars[t.id] = ... branches below.
+                if isinstance(t, ast.Name):
+                    self.pandas_df_aliases.pop(t.id, None)
+
+                # dfz = df (bare Name-to-Name, no operation) -- Python
+                # aliasing: dfz and df are the same object, so later
+                # mutations through dfz (e.g. dfz["z"] = ...) must be
+                # visible via df too. Resolved at transpile time: dfz
+                # becomes a pure alias for df's own Fortran variable
+                # (_resolve_pandas_df_alias, consulted by _aliased_name),
+                # so no separate dfz value is ever computed or assigned --
+                # only valid as long as dfz is never independently
+                # reassigned afterward (the centralized pop above clears
+                # this if it is).
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Name)
+                    and v.id in self.pandas_df_vars
+                ):
+                    _alias_root = self._resolve_pandas_df_alias(v.id)
+                    self.pandas_df_aliases[t.id] = _alias_root
+                    self.pandas_df_vars[t.id] = self.pandas_df_vars[_alias_root]
+                    # Share the SAME list object (not a copy!) so that a
+                    # later df["new_col"] = ... growth statement reached
+                    # through either name during prescan -- which mutates
+                    # this list in place -- is visible through the other
+                    # name too, matching the true aliasing this models
+                    # (and so the eventual %values allocation, sized from
+                    # this list at codegen time, comes out with the right
+                    # final width regardless of which name grew it).
+                    if _alias_root not in self.pandas_df_columns:
+                        self.pandas_df_columns[_alias_root] = []
+                    self.pandas_df_columns[t.id] = self.pandas_df_columns[_alias_root]
+                    if _alias_root in self.pandas_rangeidx_df_ids:
+                        self.pandas_rangeidx_df_ids.add(t.id)
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
+                    continue
+
                 # df.columns list comprehensions resolve to a compile-time
                 # literal (df.columns is statically known from the CSV
                 # header); handle before the generic ListComp fallback below
@@ -28779,6 +29105,26 @@ class translator(ast.NodeVisitor):
                             self.alloc_chars.discard(t.id)
                             self.alloc_complexes.discard(t.id)
                             continue
+
+                # X = df.copy() / df.copy(deep=...)
+                if isinstance(t, ast.Name):
+                    _cp_spec = self._pandas_df_copy_spec(v)
+                    if _cp_spec is not None:
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_cp_spec["df_id"]]
+                        self.pandas_df_columns[t.id] = list(self.pandas_df_columns.get(_cp_spec["df_id"], []) or [])
+                        if _cp_spec["df_id"] in self.pandas_rangeidx_df_ids:
+                            self.pandas_rangeidx_df_ids.add(t.id)
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
 
                 # X = df.dropna() / df.dropna(axis=1) -- axis=0 (row drop)
                 # keeps df's columns; axis=1 (column drop) produces a
@@ -29140,24 +29486,71 @@ class translator(ast.NodeVisitor):
                     )
                     self.prescan([_rdf_fake])
                     _rdf_cols = self.pandas_df_columns.setdefault(_rdf_id, [])
+                    # Recorded per-statement (keyed by this specific Assign
+                    # node's identity, not by the whole-program-final
+                    # column list) so codegen -- which runs only after
+                    # prescan has walked the WHOLE script, by which point
+                    # _rdf_cols already reflects every later growth
+                    # statement too -- can still tell whether THIS
+                    # particular statement is adding a genuinely new
+                    # column (needs a real runtime append, growing
+                    # %values/%columns by one) or overwriting an existing
+                    # one (a plain slot write). See the codegen branch.
+                    self.pandas_df_col_is_new[id(node)] = _rdf_cname not in _rdf_cols
                     if _rdf_cname not in _rdf_cols:
                         _rdf_cols.append(_rdf_cname)
                     continue
 
-                # diff_df = df1 - df2 -- two DataFrames of the same
-                # (str-indexed) kind subtracted elementwise.
+                # X = df1 +-*/ df2 (same kind, same columns) or
+                # X = df +-*/ scalar / scalar +-*/ df -- DataFrame
+                # arithmetic (see the expr()-level ast.BinOp handling,
+                # which does the actual column/kind validation and
+                # Fortran-side rendering; this just propagates result
+                # kind/columns for declaration purposes).
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.BinOp)
-                    and isinstance(v.op, ast.Sub)
-                    and isinstance(v.left, ast.Name)
-                    and isinstance(v.right, ast.Name)
-                    and v.left.id in self.pandas_df_vars
-                    and v.right.id in self.pandas_df_vars
-                    and self.pandas_df_vars[v.left.id] == self.pandas_df_vars[v.right.id]
+                    and type(v.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
                 ):
-                    self.pandas_df_vars[t.id] = self.pandas_df_vars[v.left.id]
-                    self.pandas_df_columns[t.id] = list(self.pandas_df_columns.get(v.left.id, []))
+                    _df_l = isinstance(v.left, ast.Name) and v.left.id in self.pandas_df_vars
+                    _df_r = isinstance(v.right, ast.Name) and v.right.id in self.pandas_df_vars
+                    if _df_l or _df_r:
+                        _arith_df_id = v.left.id if _df_l else v.right.id
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_arith_df_id]
+                        _union_spec = self._pandas_df_union_arith_spec(v)
+                        if _union_spec is not None:
+                            self.pandas_df_columns[t.id] = list(_union_spec["columns"])
+                        else:
+                            self.pandas_df_columns[t.id] = list(self.pandas_df_columns.get(_arith_df_id, []) or [])
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = np.exp(df) / np.log(df) / np.abs(df) -- a numpy ufunc
+                # applied to a whole DataFrame (see the expr()-level Call
+                # handling for np.exp/np.log/np.abs, which does the actual
+                # rendering).
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"np", "numpy"}
+                    and v.func.attr in {"abs", "absolute", "log", "exp"}
+                    and len(v.args) == 1
+                    and isinstance(v.args[0], ast.Name)
+                    and v.args[0].id in self.pandas_df_vars
+                ):
+                    self.pandas_df_vars[t.id] = self.pandas_df_vars[v.args[0].id]
+                    self.pandas_df_columns[t.id] = list(self.pandas_df_columns.get(v.args[0].id, []) or [])
                     self.ints.discard(t.id)
                     self.reals.discard(t.id)
                     self.logs.discard(t.id)
@@ -31192,6 +31585,15 @@ class translator(ast.NodeVisitor):
             return
         t = node.targets[0]
         v = node.value
+        if isinstance(t, ast.Name) and isinstance(v, ast.Name) and v.id in self.pandas_df_vars:
+            # dfz = df (bare Name-to-Name) -- pure object alias, resolved
+            # entirely at transpile time (see the matching prescan branch
+            # and _resolve_pandas_df_alias); dfz never gets its own
+            # assigned value, so nothing is emitted here at all -- every
+            # later reference to dfz's Fortran variable resolves straight
+            # to df's via _aliased_name, the same way list aliasing never
+            # emits an assignment for the alias name either.
+            return
         if (
             isinstance(t, ast.Name)
             and t.id in self.pandas_df_vars
@@ -35926,6 +36328,16 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"call {name}%sort_values({by_txt})")
                     return
 
+        # X = df.copy() / df.copy(deep=...) -- plain Fortran value copy
+        # (already independent, unlike a bare "X = df" alias).
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _cp_spec = self._pandas_df_copy_spec(v)
+            if _cp_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_cp_spec["df_id"])
+                self.o.w(f"{name} = {src_expr}")
+                return
+
         # X = df.dropna() / df.dropna(axis=1)
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
             _dn_spec = self._pandas_df_dropna_spec(v)
@@ -36044,12 +36456,16 @@ class translator(ast.NodeVisitor):
                 return
 
         # X = pd.DataFrame({"col1": arr1, ...})  -- no index= kwarg,
-        # implicit RangeIndex. Final column count (initial dict keys plus
-        # any later df["new"] = expr growth, handled by the Subscript
-        # branch below) was already fixed by prescan, so %values is
-        # allocated to its full final width here; only the initial dict
-        # columns are populated now, the rest fill in as those later
-        # assignments are reached.
+        # implicit RangeIndex. Allocates %values/%columns to ONLY the
+        # columns literal to this dict, not the whole script's eventual
+        # final column count -- a later df["new"] = expr growth statement
+        # (handled by the Subscript branch below) does a real runtime
+        # append instead. This matters because pandas_df_columns[t.id] is
+        # a single whole-program-final value by the time codegen runs
+        # (prescan already walked the entire script), so using it here
+        # would make %values already contain uninitialized future columns
+        # even before their own growth statement has executed --
+        # corrupting anything that reads/prints this DataFrame in between.
         if isinstance(t, ast.Name) and t.id in self.pandas_rangeidx_df_ids:
             _rangedf_spec = self._pandas_dict_df_construct_spec_rangeidx(v)
             if _rangedf_spec is not None:
@@ -36060,15 +36476,14 @@ class translator(ast.NodeVisitor):
                     self.visit_Assign(
                         ast.Assign(targets=[ast.Name(id=_var, ctx=ast.Store())], value=_vnode)
                     )
-                final_cols = self.pandas_df_columns[t.id]
-                col_len = max(10, max(len(c) for c in final_cols))
-                columns_txt = ", ".join(fstr(c) for c in final_cols)
+                col_len = max(10, max(len(c) for c in init_cols))
+                columns_txt = ", ".join(fstr(c) for c in init_cols)
                 n_expr = f"size({init_vars[0]})"
                 idx_var = f"{t.id}_ridx_i"
                 self._mark_int(idx_var)
                 self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
                 self.o.w(f"if (allocated({name}%values)) deallocate({name}%values)")
-                self.o.w(f"allocate({name}%values({n_expr}, {len(final_cols)}))")
+                self.o.w(f"allocate({name}%values({n_expr}, {len(init_cols)}))")
                 self.o.w(f"if (allocated({name}%index)) deallocate({name}%index)")
                 self.o.w(f"allocate({name}%index({n_expr}))")
                 self.o.w(f"do {idx_var} = 1, {n_expr}")
@@ -36077,20 +36492,23 @@ class translator(ast.NodeVisitor):
                 self.o.pop()
                 self.o.w("end do")
                 for _cname, _var in zip(init_cols, init_vars):
-                    _pos = final_cols.index(_cname) + 1
+                    _pos = init_cols.index(_cname) + 1
                     self.o.w(f"{name}%values(:, {_pos}) = {_var}")
                 return
 
         # X = pd.DataFrame(matrix[, columns=[...]])  -- no index= kwarg:
         # copy the whole matrix into %values in one shot and synthesize
-        # the numeric-string row index (columns come from prescan, either
-        # 0..ncol-1 or the literal columns= list).
+        # the numeric-string row index. Uses the spec's own (literal)
+        # column list, not pandas_df_columns[t.id] -- same reasoning as
+        # the dict-construct branch above (this one can't grow further
+        # anyway, since it's built from a whole matrix in one shot, but
+        # kept consistent regardless).
         if isinstance(t, ast.Name) and t.id in self.pandas_rangeidx_df_ids:
             _rmat_spec = self._pandas_matrix_df_construct_spec_rangeidx(v)
             if _rmat_spec is not None:
                 name = self._aliased_name(t.id)
                 mat_expr = self.expr(_rmat_spec["matrix_node"])
-                final_cols = self.pandas_df_columns[t.id]
+                final_cols = _rmat_spec["columns"]
                 col_len = max(10, max(len(c) for c in final_cols))
                 columns_txt = ", ".join(fstr(c) for c in final_cols)
                 n_expr = f"size({mat_expr}, 1)"
@@ -36149,12 +36567,18 @@ class translator(ast.NodeVisitor):
                 self.o.w("end where")
                 return
 
-        # df["new_col"] = expr -- write into an already-known column
-        # position of a RangeIndex dict-DataFrame (position fixed by
-        # prescan); materializes the RHS via the same real temp array
-        # prescan registered, reusing the general statement-assignment
-        # codegen for it (so arbitrary expressions, including reads of
-        # earlier columns via df["other"], work as usual).
+        # df["new_col"] = expr -- either a genuinely new column (real
+        # runtime append via append_col_str, growing %values/%columns by
+        # one -- NOT a pre-planned slot, since anything that reads df
+        # between construction and this statement must see only the
+        # columns that exist so far) or an overwrite of an existing one
+        # (a plain slot write). Which one is determined per-statement by
+        # prescan (pandas_df_col_is_new), since by codegen time
+        # pandas_df_columns already reflects the whole script's growth.
+        # Materializes the RHS via the same real temp array prescan
+        # registered, reusing the general statement-assignment codegen
+        # for it (so arbitrary expressions, including reads of earlier
+        # columns via df["other"], work as usual).
         if (
             isinstance(t, ast.Subscript)
             and isinstance(t.value, ast.Name)
@@ -36165,26 +36589,73 @@ class translator(ast.NodeVisitor):
             _rdf_cname = t.slice.value
             _rdf_var = f"{_rdf_id}_{_rdf_cname}"
             self.visit_Assign(ast.Assign(targets=[ast.Name(id=_rdf_var, ctx=ast.Store())], value=v))
-            _pos = self.pandas_df_columns[_rdf_id].index(_rdf_cname) + 1
             name = self._aliased_name(_rdf_id)
-            self.o.w(f"{name}%values(:, {_pos}) = {_rdf_var}")
+            if self.pandas_df_col_is_new.get(id(node)):
+                self.o.w(f"call append_col_str({name}, {fstr(_rdf_cname)}, {_rdf_var})")
+            else:
+                _pos = self.pandas_df_columns[_rdf_id].index(_rdf_cname) + 1
+                self.o.w(f"{name}%values(:, {_pos}) = {_rdf_var}")
             return
 
-        # diff_df = df1 - df2
+        # X = df1 + df2 (mismatched columns) -- union-columns/NaN-fill;
+        # see _pandas_df_union_arith_spec. Block-level codegen since this
+        # can't be a single inline expression.
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars and isinstance(v, ast.BinOp):
+            _ua_spec = self._pandas_df_union_arith_spec(v)
+            if _ua_spec is not None:
+                name = self._aliased_name(t.id)
+                lexpr = self._aliased_name(_ua_spec["left_id"])
+                rexpr = self._aliased_name(_ua_spec["right_id"])
+                lcols, rcols = _ua_spec["lcols"], _ua_spec["rcols"]
+                result_cols = _ua_spec["columns"]
+                opsym = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}[_ua_spec["op"]]
+                col_len = max(10, max(len(c) for c in result_cols))
+                columns_txt = ", ".join(fstr(c) for c in result_cols)
+                self.o.w(f"{name}%index = {lexpr}%index")
+                self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
+                self.o.w(f"if (allocated({name}%values)) deallocate({name}%values)")
+                self.o.w(f"allocate({name}%values(nrow({lexpr}), {len(result_cols)}))")
+                for _i, _cname in enumerate(result_cols, start=1):
+                    if _cname in lcols and _cname in rcols:
+                        _lj = lcols.index(_cname) + 1
+                        _rj = rcols.index(_cname) + 1
+                        self.o.w(f"{name}%values(:, {_i}) = {lexpr}%values(:, {_lj}) {opsym} {rexpr}%values(:, {_rj})")
+                    else:
+                        self.o.w(f"{name}%values(:, {_i}) = ieee_value(0.0_dp, ieee_quiet_nan)")
+                return
+
+        # X = df1 +-*/ df2 / df +-*/ scalar / scalar +-*/ df -- DataFrame
+        # arithmetic; self.expr() does the actual rendering (and
+        # column/kind validation) via its ast.BinOp handling.
         if (
             isinstance(t, ast.Name)
             and t.id in self.pandas_df_vars
             and isinstance(v, ast.BinOp)
-            and isinstance(v.op, ast.Sub)
-            and isinstance(v.left, ast.Name)
-            and isinstance(v.right, ast.Name)
-            and v.left.id in self.pandas_df_vars
-            and v.right.id in self.pandas_df_vars
+            and type(v.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
+            and (
+                (isinstance(v.left, ast.Name) and v.left.id in self.pandas_df_vars)
+                or (isinstance(v.right, ast.Name) and v.right.id in self.pandas_df_vars)
+            )
         ):
             name = self._aliased_name(t.id)
-            lhs_expr = self._aliased_name(v.left.id)
-            rhs_expr = self._aliased_name(v.right.id)
-            self.o.w(f"{name} = {lhs_expr} - {rhs_expr}")
+            self.o.w(f"{name} = {self.expr(v)}")
+            return
+
+        # X = np.exp(df) / np.log(df) / np.abs(df)
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.pandas_df_vars
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"np", "numpy"}
+            and v.func.attr in {"abs", "absolute", "log", "exp"}
+            and len(v.args) == 1
+            and isinstance(v.args[0], ast.Name)
+            and v.args[0].id in self.pandas_df_vars
+        ):
+            name = self._aliased_name(t.id)
+            self.o.w(f"{name} = {self.expr(v)}")
             return
 
         # stats = pd.DataFrame([fn(col) for j in range(N)], index=labels)
@@ -39191,6 +39662,17 @@ class translator(ast.NodeVisitor):
                 return
             if (
                 len(c.args) == 1
+                and (isinstance(c.args[0], ast.BinOp) or isinstance(c.args[0], ast.Call))
+                and self._is_pandas_df_arith_value(c.args[0])
+            ):
+                # print(df * 10) / print(df + df2) / print(np.exp(df)) /
+                # print(np.log(np.exp(df)) - df) -- a DataFrame arithmetic
+                # expression (see _is_pandas_df_arith_value) used directly
+                # inside print(), possibly nested/composed.
+                self._emit_pandas_df_arith_print(c.args[0])
+                return
+            if (
+                len(c.args) == 1
                 and isinstance(c.args[0], ast.Attribute)
                 and c.args[0].attr == "shape"
                 and isinstance(c.args[0].value, ast.Name)
@@ -40141,6 +40623,27 @@ class translator(ast.NodeVisitor):
         self.o.push()
         self.o.w(f"type({kind}) :: {tmp_name}")
         self.visit_Assign(ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=call))
+        self._emit_pandas_df_print(ast.Name(id=tmp_name, ctx=ast.Load()), ndigits=ndigits)
+        self.o.pop()
+        self.o.w("end block")
+
+    def _emit_pandas_df_arith_print(self, node, ndigits=6):
+        # print(df * 10) / print(df + df2) / print(np.exp(df)) /
+        # print(np.log(np.exp(df)) - df) -- same "materialize into an ad
+        # hoc temp DataFrame, then print" approach as the other
+        # print(<df expr>) helpers, but for a (possibly nested)
+        # DataFrame-arithmetic expression; see _is_pandas_df_arith_value.
+        _kc = self._pandas_df_arith_kind_cols(node)
+        if _kc is None:
+            raise NotImplementedError(f"unsupported call: {ast.unparse(node)}")
+        kind, cols = _kc
+        tmp_name = "pdf_arith_mrtmp"
+        self.pandas_df_vars[tmp_name] = kind
+        self.pandas_df_columns[tmp_name] = list(cols or [])
+        self.o.w("block")
+        self.o.push()
+        self.o.w(f"type({kind}) :: {tmp_name}")
+        self.visit_Assign(ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=node))
         self._emit_pandas_df_print(ast.Name(id=tmp_name, ctx=ast.Load()), ndigits=ndigits)
         self.o.pop()
         self.o.w("end block")
@@ -52242,7 +52745,7 @@ def generate_flat(
                 "datetime_from_iso, valid, nrow, ncol, df_shape => shape"
             )
         if _tree_uses_pandas_dict_dataframe(_proc_use_scan_tree):
-            om.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(-)")
+            om.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(+), operator(-), operator(*), operator(/), abs_str, log_df_str, exp_df_str, append_col_str")
         if _tree_uses_scipy_fsolve(_proc_use_scan_tree):
             om.w("use minpack_module, only: hybrd1")
             om.w("use fsolve_bridge_mod, only: fsolve_user_fn, fsolve_generic_wrapper")
@@ -52660,7 +53163,7 @@ def generate_flat(
             "datetime_from_iso, valid, nrow, ncol, df_shape => shape"
         )
     if _tree_uses_pandas_dict_dataframe(_use_scan_tree):
-        o.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(-)")
+        o.w("use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, operator(+), operator(-), operator(*), operator(/), abs_str, log_df_str, exp_df_str, append_col_str")
     if _tree_uses_scipy_fsolve(_use_scan_tree):
         o.w("use minpack_module, only: hybrd1")
         o.w("use fsolve_bridge_mod, only: fsolve_user_fn, fsolve_generic_wrapper")

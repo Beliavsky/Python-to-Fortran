@@ -30,11 +30,23 @@ module dataframe_str_index_mod
       procedure :: T => transpose_str
    end type DataFrame_str_index
 
-   public :: nrow, ncol
-   public :: operator(-)
+   public :: nrow, ncol, abs_str, log_df_str, exp_df_str, append_col_str
+   public :: operator(+), operator(-), operator(*), operator(/)
+
+   interface operator(+)
+      module procedure add_df_df_str, add_df_scalar_str, add_scalar_df_str
+   end interface
 
    interface operator(-)
-      module procedure subtract_df_df_str
+      module procedure subtract_df_df_str, subtract_df_scalar_str, subtract_scalar_df_str
+   end interface
+
+   interface operator(*)
+      module procedure multiply_df_df_str, multiply_df_scalar_str, multiply_scalar_df_str
+   end interface
+
+   interface operator(/)
+      module procedure divide_df_df_str, divide_df_scalar_str, divide_scalar_df_str
    end interface
 
 contains
@@ -70,6 +82,39 @@ contains
       jcol = findloc(self%columns, column, dim=1)
       if (jcol == 0) error stop "in col_pos, column not found: "//trim(column)
    end function col_pos_str
+
+   subroutine append_col_str(self, column, col_values)
+      ! Grow %values/%columns by one column at runtime -- used by
+      ! xp2f.py's df["new_col"] = expr codegen for a genuinely NEW
+      ! column (as opposed to overwriting an existing one, a plain slot
+      ! write). Deliberately a real runtime append rather than assuming
+      ! the final column count is already known/pre-allocated: the
+      ! caller may print or otherwise use self between construction and
+      ! this call, and that use must see only the columns that exist so
+      ! far, not ones a later statement will add.
+      class(DataFrame_str_index), intent(inout) :: self
+      character(len=*), intent(in) :: column
+      real(kind=dp), intent(in) :: col_values(:)
+      real(kind=dp), allocatable :: vtmp(:, :)
+      character(len=nlen_columns_str), allocatable :: ctmp(:)
+      integer :: n, ncol0
+      n = size(col_values)
+      if (.not. allocated(self%values)) then
+         allocate (self%values(n, 1))
+         self%values(:, 1) = col_values
+         self%columns = [column]
+         return
+      end if
+      ncol0 = size(self%values, 2)
+      allocate (vtmp(n, ncol0 + 1))
+      vtmp(:, 1:ncol0) = self%values
+      vtmp(:, ncol0 + 1) = col_values
+      call move_alloc(vtmp, self%values)
+      allocate (ctmp(ncol0 + 1))
+      ctmp(1:ncol0) = self%columns
+      ctmp(ncol0 + 1) = column
+      call move_alloc(ctmp, self%columns)
+   end subroutine append_col_str
 
    pure function cumsum_str(self) result(df_new)
       ! cumulative sum down each column
@@ -215,6 +260,114 @@ contains
       c%columns = a%columns
       c%values = a%values - b%values
    end function subtract_df_df_str
+
+   pure function subtract_df_scalar_str(a, s) result(c)
+      type(DataFrame_str_index), intent(in) :: a
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = a%values - s
+   end function subtract_df_scalar_str
+
+   pure function subtract_scalar_df_str(s, a) result(c)
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index), intent(in) :: a
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = s - a%values
+   end function subtract_scalar_df_str
+
+   pure function add_df_df_str(a, b) result(c)
+      type(DataFrame_str_index), intent(in) :: a, b
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = a%values + b%values
+   end function add_df_df_str
+
+   pure function add_df_scalar_str(a, s) result(c)
+      type(DataFrame_str_index), intent(in) :: a
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = a%values + s
+   end function add_df_scalar_str
+
+   pure function add_scalar_df_str(s, a) result(c)
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index), intent(in) :: a
+      type(DataFrame_str_index) :: c
+      c = add_df_scalar_str(a, s)
+   end function add_scalar_df_str
+
+   pure function multiply_df_df_str(a, b) result(c)
+      type(DataFrame_str_index), intent(in) :: a, b
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = a%values*b%values
+   end function multiply_df_df_str
+
+   pure function multiply_df_scalar_str(a, s) result(c)
+      type(DataFrame_str_index), intent(in) :: a
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = a%values*s
+   end function multiply_df_scalar_str
+
+   pure function multiply_scalar_df_str(s, a) result(c)
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index), intent(in) :: a
+      type(DataFrame_str_index) :: c
+      c = multiply_df_scalar_str(a, s)
+   end function multiply_scalar_df_str
+
+   pure function divide_df_df_str(a, b) result(c)
+      type(DataFrame_str_index), intent(in) :: a, b
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = a%values/b%values
+   end function divide_df_df_str
+
+   pure function divide_df_scalar_str(a, s) result(c)
+      type(DataFrame_str_index), intent(in) :: a
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = a%values/s
+   end function divide_df_scalar_str
+
+   pure function divide_scalar_df_str(s, a) result(c)
+      real(kind=dp), intent(in) :: s
+      type(DataFrame_str_index), intent(in) :: a
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = s/a%values
+   end function divide_scalar_df_str
+
+   pure function log_df_str(a) result(c)
+      type(DataFrame_str_index), intent(in) :: a
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = log(a%values)
+   end function log_df_str
+
+   pure function exp_df_str(a) result(c)
+      type(DataFrame_str_index), intent(in) :: a
+      type(DataFrame_str_index) :: c
+      c%index = a%index
+      c%columns = a%columns
+      c%values = exp(a%values)
+   end function exp_df_str
 
    ! pandas-style print(df): index label + one right-justified column per
    ! %columns entry (read at runtime, not baked into a literal format string

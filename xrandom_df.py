@@ -16,4 +16,3 @@ df["ratio"] = df["x"] / df["y"]
 
 print(df)
 print(df.cumsum())
-
