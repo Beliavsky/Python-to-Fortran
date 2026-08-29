@@ -31,6 +31,8 @@ module dataframe_str_index_mod
       procedure :: T => transpose_str
       procedure :: icol => icol_str
       procedure :: row_pos => row_pos_str
+      procedure :: shift => shift_str
+      procedure :: pct_change => pct_change_str
    end type DataFrame_str_index
 
    public :: nrow, ncol, abs_str, log_df_str, exp_df_str, append_col_str
@@ -209,6 +211,75 @@ contains
       df_new%columns = self%columns
       df_new%values = abs(self%values)
    end function abs_str
+
+   pure function shift_str(self, periods, fill_value, axis) result(df_new)
+      ! shift values by 'periods' rows (axis=0, the default -- positive
+      ! periods shifts down) or columns (axis=1 -- positive periods
+      ! shifts right) -- ported from dataframe_index_date.f90's shift,
+      ! extended with the axis parameter that one lacks (its only caller
+      ! there never passes axis=1, so backporting axis support there too
+      ! wasn't needed to fix this).
+      class(DataFrame_str_index), intent(in) :: self
+      integer, intent(in), optional :: periods
+      real(kind=dp), intent(in), optional :: fill_value
+      integer, intent(in), optional :: axis
+      type(DataFrame_str_index) :: df_new
+      integer :: p, k, nr, nc, ax
+      real(kind=dp) :: fill
+
+      p = 1
+      if (present(periods)) p = periods
+      fill = ieee_value(0.0_dp, ieee_quiet_nan)
+      if (present(fill_value)) fill = fill_value
+      ax = 0
+      if (present(axis)) ax = axis
+
+      df_new = self
+      nr = nrow(self)
+      nc = ncol(self)
+      if (nr <= 0 .or. nc <= 0) return
+
+      df_new%values = fill
+      if (p == 0) then
+         df_new%values = self%values
+      else if (ax == 0) then
+         if (p > 0) then
+            if (p < nr) df_new%values(p + 1:nr, :) = self%values(1:nr - p, :)
+         else
+            k = -p
+            if (k < nr) df_new%values(1:nr - k, :) = self%values(k + 1:nr, :)
+         end if
+      else
+         if (p > 0) then
+            if (p < nc) df_new%values(:, p + 1:nc) = self%values(:, 1:nc - p)
+         else
+            k = -p
+            if (k < nc) df_new%values(:, 1:nc - k) = self%values(:, k + 1:nc)
+         end if
+      end if
+   end function shift_str
+
+   pure function pct_change_str(self, periods) result(df_new)
+      ! percent change (simple return) over 'periods' rows -- ported from
+      ! dataframe_index_date.f90's pct_change.
+      class(DataFrame_str_index), intent(in) :: self
+      integer, intent(in), optional :: periods
+      type(DataFrame_str_index) :: df_new
+      type(DataFrame_str_index) :: lag
+      integer :: p, nr, nc
+      p = 1
+      if (present(periods)) p = periods
+      lag = self%shift(p) ! default fill is NaN
+
+      df_new%index = self%index
+      df_new%columns = self%columns
+      nr = nrow(self)
+      nc = ncol(self)
+      allocate (df_new%values(nr, nc))
+      if (nr == 0 .or. nc == 0) return
+
+      df_new%values = self%values/lag%values - 1.0_dp
+   end function pct_change_str
 
    pure function transpose_str(self) result(df_new)
       ! df.T -- swap rows/columns; symmetric for this type since both the

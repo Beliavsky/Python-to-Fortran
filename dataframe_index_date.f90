@@ -2219,17 +2219,22 @@ res = aligned_binary(self, other, "/", how, fill_value)
 end function divide
 
 
-pure function shift(self, periods, fill_value) result(df_new)
-! shift the values by 'periods' rows (positive periods shifts down).
+pure function shift(self, periods, fill_value, axis) result(df_new)
+! shift the values by 'periods' rows (axis=0, the default -- positive
+! periods shifts down) or columns (axis=1 -- positive periods shifts
+! right; see dataframe_str_index.f90's shift_str, ported from this
+! function, where axis=1 support was added first).
 class(DataFrame_index_date), intent(in) :: self
 integer, intent(in), optional :: periods
 real(kind=dp), intent(in), optional :: fill_value
+integer, intent(in), optional :: axis
 type(DataFrame_index_date) :: df_new
-integer :: p, k, nr, nc
+integer :: p, k, nr, nc, ax
 real(kind=dp) :: fill
 
 p = default(1, periods)
 fill = default(ieee_value(0.0_dp, ieee_quiet_nan), fill_value)
+ax = default(0, axis)
 
 df_new = self
 nr = nrow(self)
@@ -2239,11 +2244,20 @@ if (nr <= 0 .or. nc <= 0) return
 df_new%values = fill
 if (p == 0) then
    df_new%values = self%values
-else if (p > 0) then
-   if (p < nr) df_new%values(p+1:nr,:) = self%values(1:nr-p,:)
+else if (ax == 0) then
+   if (p > 0) then
+      if (p < nr) df_new%values(p+1:nr,:) = self%values(1:nr-p,:)
+   else
+      k = -p
+      if (k < nr) df_new%values(1:nr-k,:) = self%values(k+1:nr,:)
+   end if
 else
-   k = -p
-   if (k < nr) df_new%values(1:nr-k,:) = self%values(k+1:nr,:)
+   if (p > 0) then
+      if (p < nc) df_new%values(:,p+1:nc) = self%values(:,1:nc-p)
+   else
+      k = -p
+      if (k < nc) df_new%values(:,1:nc-k) = self%values(:,k+1:nc)
+   end if
 end if
 end function shift
 

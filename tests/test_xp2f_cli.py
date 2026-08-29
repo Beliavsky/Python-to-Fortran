@@ -5031,6 +5031,44 @@ def test_xp2f_pandas_dataframe_construct_from_series(tmp_path: Path) -> None:
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
 
+def test_xp2f_pandas_dataframe_construct_from_index_and_columns_only(tmp_path: Path) -> None:
+    # Regression test: pd.DataFrame(index=[...], columns=[...]) -- no
+    # positional data argument at all -- previously raised "unsupported
+    # call" (no construct-spec matched it). Now an all-NaN frame of the
+    # given shape (_pandas_empty_df_construct_spec). Also exercises a
+    # second, independent gap this exposed: _tree_uses_pandas_dict_dataframe
+    # (which decides whether to `use dataframe_str_index_mod` and link
+    # dataframe_str_index.f90 at all) required at least one positional
+    # arg, so this construct compiled with the module/type entirely
+    # undeclared ("used before it is defined") even once the construct
+    # itself was supported.
+    src = tmp_path / "xdf_construct_index_columns_only.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame(index=list('abc'), columns=list('tuvwx'))",
+                "print(df.shape[0], df.shape[1])",
+                "print(df.isna().sum().sum())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_xp2f_pandas_dataframe_augassign_scalar_multiply(tmp_path: Path) -> None:
     # Regression test: `df *= 10` (target is a DataFrame, RHS an integer
     # literal) previously hand-built "{lhs} = {lhs} * {rhs}" directly in
@@ -5069,6 +5107,62 @@ def test_xp2f_pandas_dataframe_augassign_scalar_multiply(tmp_path: Path) -> None
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_series_alias_passed_as_minimize_args(tmp_path: Path) -> None:
+    # Regression test: scipy.optimize.minimize(f, x0, args=(r,)) where `r`
+    # is a bare Name-to-Name alias of a pd.Series (`r = vals`). xp2f
+    # synthesizes a single-argument wrapper function that references `r`
+    # directly and hoists it into a module-shared variable -- but `r`
+    # being a true alias means xp2f's own pure-alias codegen never
+    # assigns a separate value into `r` at all (every reference resolves
+    # straight through to `vals`'s own storage), so the hoisted module
+    # variable `r` stayed permanently unallocated, segfaulting at runtime.
+    # Fixed by resolving a simple top-level Name-to-Name alias chain to
+    # its root BEFORE synthesizing the wrapper, so it references `vals`
+    # directly instead.
+    src = tmp_path / "xminimize_series_alias.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "from scipy.optimize import minimize",
+                "",
+                "def neg_sum_sq(params, r):",
+                "    mu = params[0]",
+                "    return np.sum((r - mu) ** 2)",
+                "",
+                "vals = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])",
+                "r = vals",
+                "x0 = np.array([0.0])",
+                "result = minimize(neg_sum_sq, x0, args=(r,))",
+                "print(result.x[0])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable, str(XP2F_PATH), str(src),
+            "--compile", "--run-diff", "--numeric-diff", "--numeric-diff-tol", "1e-5",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # A loose numeric tolerance: xp2f's own BFGS bridge and scipy's BFGS
+    # converge to slightly different floating-point values for the same
+    # minimum (this test's whole point is that it no longer segfaults, not
+    # bit-for-bit optimizer agreement) -- both should still land near the
+    # true minimizer (mean of vals = 3.0).
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run numeric diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
 
 def test_xp2f_pandas_print_trailing_dataframe_arg(tmp_path: Path) -> None:
@@ -5725,3 +5819,400 @@ def test_xp2f_flips_result_of_nested_numpy_call(tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout
+
+
+def test_xp2f_pandas_df_shift_and_arithmetic_on_date_indexed_frame(tmp_path: Path) -> None:
+    # Regression test bundling three related fixes surfaced together by a
+    # trend-following strategy script (weights.shift(1) * asset_rets on a
+    # date-indexed DataFrame):
+    #   1. df.shift()/.pct_change()/.cumsum()/.cumprod()/.diff()/.abs() are
+    #      pure functions on the vendored DataFrame types, but were only
+    #      ever reachable as a standalone `X = df.shift(n)` statement or
+    #      directly inside print() -- not as a general expression (e.g.
+    #      nested inside DataFrame arithmetic). See
+    #      _pandas_df_simple_method_expr_text.
+    #   2. DataFrame arithmetic (scalar and DataFrame-DataFrame) was wired
+    #      up only for DataFrame_str_index, even though DataFrame_index_date
+    #      (the pd.read_csv-derived kind) has an equivalent, richer
+    #      operator(+/-/*//) set already in dataframe_index_date.f90.
+    #   3. Once DataFrame_index_date arithmetic became reachable, its own
+    #      `use dataframe_index_date_mod, only: ...` line turned out to
+    #      never import operator(+/-/*//) at all (only the comparison
+    #      operators) -- gfortran rejected `dat%shift(1) + dat` with
+    #      "Unexpected derived-type entities in binary intrinsic numeric
+    #      operator '+'" even though the module-level overload exists.
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    src = tmp_path / "xdf_shift_arith.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "dat = pd.read_csv('prices.csv', index_col='Date')",
+                "combined = dat.shift(1) + dat",
+                "spy = combined['SPY']",
+                "print(spy[1], spy[2])",
+                "scaled = dat * 2.0",
+                "spy2 = scaled['SPY']",
+                "print(spy2[0], spy2[1], spy2[2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Compared by hand below (Python and Fortran stdout captured
+    # separately), not via --run-diff: an integer subscript on a
+    # date-indexed Series (spy[1], not spy.iloc[1]) triggers pandas' own
+    # "Series.__getitem__ treating keys as positions is deprecated"
+    # FutureWarning, and xp2f's own --run-diff captures the reference
+    # Python run's stdout+stderr together for comparison, so the warning
+    # text (an extra line, and -- with --numeric-diff -- spurious numeric
+    # tokens from the pytest tmp_path in its traceback) perturbs the
+    # comparison. Reads spy[1]/spy[2], skipping the NaN-producing warm-up
+    # row (spy[0], from shift(1)).
+    py_proc = subprocess.run(
+        [sys.executable, str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert py_proc.returncode == 0, py_proc.stdout + py_proc.stderr
+    py_values = [float(x) for x in py_proc.stdout.split()]
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    ft_values = [float(x) for x in proc.stdout.rsplit("Run: PASS", 1)[1].split()]
+
+    assert len(py_values) == 5, py_values
+    assert len(ft_values) == 5, ft_values
+    for py_v, ft_v in zip(py_values, ft_values):
+        assert abs(py_v - ft_v) < 1.0e-6, (py_values, ft_values)
+
+
+def test_xp2f_pandas_df_column_selection_via_resolved_name_list(tmp_path: Path) -> None:
+    # Regression test: df[names] where `names` is a variable already
+    # resolved to a static list of strings (most notably `names = [c for
+    # c in dat.columns if c != "Date"]`, see the df.columns-list-
+    # comprehension prescan branch / pandas_str_list_values) -- previously
+    # only a LITERAL list (df[["colA", "colB"]]) was recognized as
+    # multi-column selection; a Name reference fell through to being
+    # treated as a plain (non-DataFrame) array, silently losing all
+    # DataFrame-ness for everything derived from it.
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    src = tmp_path / "xdf_select_via_name_list.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "dat = pd.read_csv('prices.csv', index_col='Date')",
+                "names = [c for c in dat.columns if c != 'Date']",
+                "sub = dat[names]",
+                "print(sub['SPY'].sum(), sub['EFA'].sum())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_ones_full_shape_and_fill_value_kwargs(tmp_path: Path) -> None:
+    # Regression test: np.ones(shape=[...])/np.full(shape=[...],
+    # fill_value=...) -- shape (and full's fill value) passed as a
+    # keyword rather than positionally. Every consumer of these calls
+    # (expr()'s codegen, _rank_expr, _expr_kind, prescan's own shape
+    # inference) only ever looked at node.args[0]/node.args[1], even
+    # though real numpy accepts either calling convention -- fixed by
+    # normalize_numpy_shape_kwarg_calls, an AST pass that rewrites the
+    # keyword form into the equivalent positional-args call up front.
+    # Also exercises the column count of np.ones(shape=[nrow, ncol])
+    # resolving through a top-level int constant (ncol = 4), not just a
+    # literal int inline -- see _ncols_from_shape_call.
+    src = tmp_path / "xnp_shape_kwarg.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "nrow = 3",
+                "ncol = 4",
+                "x = np.ones(shape=[nrow, ncol])",
+                "y = np.full(shape=[nrow, ncol], fill_value=7.0)",
+                "print(x[0, 0], x[2, 3])",
+                "print(y[0, 0], y[1, 2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_sum_axis1_reduces_rows_not_columns(tmp_path: Path) -> None:
+    # Regression test: print(df.sum(axis=1)) silently computed COLUMN
+    # sums (axis=0, the default) instead of ROW sums -- the print
+    # dispatcher matched on len(args) == 0 alone, ignoring an axis=
+    # keyword entirely, so _emit_pandas_df_series_reduction_print always
+    # ran its hardcoded one-value-per-column loop regardless of what was
+    # actually requested. Fixed by threading an axis argument through and
+    # adding a genuine row-wise (reduce across columns, one value per
+    # row, printed against df's own row labels) code path for axis=1.
+    # Distinct per-row/per-column values (not e.g. all-ones) so a wrong
+    # axis would be caught, not accidentally masked by symmetry.
+    src = tmp_path / "xdf_sum_axis1.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [10.0, 20.0, 30.0], 'c': [100.0, 200.0, 300.0]})",
+                "print(df.sum(axis=1))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff", "--numeric-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run numeric diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_prod_axis0_and_axis1(tmp_path: Path) -> None:
+    # Regression test: df.prod(axis=0)/.prod(axis=1) -- .prod() wasn't
+    # in the DataFrame reduction method set at all (only mean/median/std/
+    # min/max/sum), so print(df.prod(...)) fell through to a completely
+    # different, generic "call product() on some array-like base"
+    # handler that just emitted `product(df, dim=...)` -- invalid
+    # Fortran, since df is a derived type, not a numeric array. Added
+    # "prod" alongside the other reduction methods, in both the
+    # column-wise (axis=0, default) and row-wise (axis=1) code paths.
+    src = tmp_path / "xdf_prod.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [2.0, 2.0, 2.0], 'c': [1.0, 5.0, 1.0]})",
+                "print(df.prod(axis=0))",
+                "print(df.prod(axis=1))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff", "--numeric-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run numeric diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_var_ddof1_axis0_and_axis1(tmp_path: Path) -> None:
+    # Regression test: df.var()/.var(axis=0)/.var(axis=1) -- "var" wasn't
+    # in the DataFrame reduction method set either, and df.var(axis=...)
+    # specifically fell through to a different, generic .var(axis=...)
+    # handler (shared with plain numpy arrays) that explicitly raises
+    # "var(..., axis=...) not yet supported" for ANY axis= argument,
+    # DataFrame or not. Uses ddof=1 (var_1d(expr, 1)) to match pandas'
+    # own default (sample variance) -- unlike numpy's np.var() default of
+    # ddof=0, which is why the generic handler needs an explicit ddof= to
+    # get this same value; a bare df.var() always means ddof=1. Verified
+    # with fixed (non-random) data so the exact ddof=1 formula, not just
+    # "some" variance, is checked.
+    src = tmp_path / "xdf_var.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0, 4.0], 'b': [10.0, 20.0, 30.0, 45.0]})",
+                "print(df.var())",
+                "print(df.var(axis=0))",
+                "print(df.var(axis=1))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff", "--numeric-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run numeric diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_shift_on_rangeidx_frame_and_axis1(tmp_path: Path) -> None:
+    # Regression test: df.shift(n) on a DataFrame_str_index (RangeIndex/
+    # dict-constructed) frame -- shift/pct_change were type-bound
+    # procedures on DataFrame_index_date only (dataframe_index_date.f90),
+    # never ported to dataframe_str_index.f90, so gfortran rejected
+    # `df%shift(1)` as "'shift' is not a member of the 'dataframe_str_index'
+    # structure". Ported shift_str/pct_change_str, and along the way added
+    # genuine axis=1 support (shift across columns, not rows) to both
+    # DataFrame kinds -- previously axis= was silently ignored entirely
+    # (any axis value behaved like axis=0), which this also checks
+    # (including a negative-periods axis=1 shift) with non-uniform,
+    # per-row/per-column-distinct data so a wrong axis or sign would be
+    # caught, not accidentally masked by symmetry.
+    # Column extraction + specific (non-NaN) positions, not print(df) of
+    # the whole shifted frame -- a full-frame print's "[N rows x M
+    # columns]" footer and header-name line don't tokenize consistently
+    # between run-diff/numeric-diff's python-side and fortran-side
+    # captures (an unrelated harness quirk, not a real output mismatch;
+    # established by other DataFrame print tests in this file).
+    src = tmp_path / "xdf_shift_rangeidx.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0, 4.0], 'b': [10.0, 20.0, 30.0, 45.0], 'c': [100.0, 200.0, 300.0, 450.0]})",
+                "s1 = df.shift(1)",
+                "a1 = s1['a']",
+                "print(a1[1], a1[2], a1[3])",
+                "s2 = df.shift(1, axis=1)",
+                "b2 = s2['b']",
+                "c2 = s2['c']",
+                "print(b2[0], b2[1], c2[0], c2[1])",
+                "s3 = df.shift(-1, axis=1)",
+                "a3 = s3['a']",
+                "b3 = s3['b']",
+                "print(a3[0], a3[1], b3[0], b3[1])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_divide_fillna_row_reduction_and_iloc_slice(tmp_path: Path) -> None:
+    # Regression test for the trend-following-strategy chain in
+    # examples/xtrend_ma.py: `weights = signal.divide(n_active,
+    # axis=0).fillna(0.0)` where n_active = (signal != 0.0).sum(axis=1)
+    # (a per-row count, ASSIGNED not printed -- see
+    # _pandas_df_row_reduction_spec), followed by `(weights.shift(1) *
+    # rets).sum(axis=1)` (same row-reduction spec, but with a BinOp
+    # DataFrame-arithmetic expression as the base rather than a bare
+    # Name or a Compare) and finally `port_ret.iloc[n:]` (a slice of a
+    # plain rank-1 array, not a DataFrame or pandas date-array -- see
+    # _plain_array_iloc_slice_spec).
+    #
+    # This combination surfaced three separate bugs, all fixed together:
+    # 1. _rank_expr/_expr_kind had no idea `X.sum(axis=1)` on a
+    #    DataFrame-shaped base (a Compare or DataFrame-arithmetic BinOp,
+    #    neither tracked via alloc_reals/etc since DataFrames use a
+    #    separate tracking mechanism entirely) is itself a real, rank-1
+    #    value -- the generic reduction-rank/-kind fallback (meant for
+    #    ordinary numpy arrays) computed the wrong answer (rank 0,
+    #    kind 'logical') by recursing into the base's own wrong rank/kind,
+    #    which silently corrupted a *later* statement's type stability
+    #    check into scheduling a bogus type-rebind for n_active partway
+    #    through the script.
+    # 2. `signal.divide(n_active, axis=0)` with n_active containing a
+    #    genuine 0 (no active positions that day, so the corresponding
+    #    signal row is entirely 0.0 too) computed a literal 0.0/0.0
+    #    division, tripping -ffpe-trap=invalid/zero (SIGFPE) before the
+    #    .fillna(0.0) chained after it ever ran -- fixed by guarding the
+    #    divisor to 1 (giving the same 0.0 result) whenever it's 0.
+    # 3. `.sum(axis=1)` on a row with some (but not all) NaN entries (the
+    #    very first row here, from .shift(1)/.pct_change() both having no
+    #    antecedent value) used a plain, non-NaN-skipping `sum()`,
+    #    whereas pandas' default is skipna=True (an all-NaN row sums to
+    #    0.0, not NaN) -- fixed by using the nan*-prefixed helpers for
+    #    this specific (assigned, axis=1) row-reduction codegen.
+    src = tmp_path / "xdf_divide_fillna_chain.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df1 = pd.DataFrame({'a': [1.0, 5.0, 3.0], 'b': [2.0, 2.0, 6.0]})",
+                "df2 = pd.DataFrame({'a': [2.0, 2.0, 2.0], 'b': [2.0, 2.0, 2.0]})",
+                "above = df1 > df2",
+                "signal = above.astype(float)",
+                "n_active = (signal != 0.0).sum(axis=1)",
+                "weights = signal.divide(n_active, axis=0).fillna(0.0)",
+                "rets = df1.pct_change()",
+                "port_ret = (weights.shift(1) * rets).sum(axis=1)",
+                "trimmed = port_ret.iloc[1:]",
+                "print(port_ret[0], port_ret[1], port_ret[2])",
+                "print(trimmed.iloc[0], trimmed.iloc[1])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

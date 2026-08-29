@@ -7275,6 +7275,20 @@ def _tree_uses_pandas_dict_dataframe(tree):
     # over-approximation (matrix arg isn't checked for rank/static column
     # count here), but a false positive only adds an unused `use`.
     for _n in ast.walk(tree):
+        # pd.DataFrame(index=[...], columns=[...]) -- no positional data
+        # argument at all (see _pandas_empty_df_construct_spec); the
+        # `_n.args` check just below skips this entirely otherwise.
+        if (
+            isinstance(_n, ast.Call)
+            and isinstance(_n.func, ast.Attribute)
+            and isinstance(_n.func.value, ast.Name)
+            and _n.func.value.id in {"pd", "pandas"}
+            and _n.func.attr == "DataFrame"
+            and not _n.args
+            and any(kw.arg == "index" for kw in _n.keywords)
+            and any(kw.arg == "columns" for kw in _n.keywords)
+        ):
+            return True
         if (
             isinstance(_n, ast.Call)
             and isinstance(_n.func, ast.Attribute)
@@ -8390,6 +8404,24 @@ def detect_needed_helpers(tree):
                 needed.add("std")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var"}
+                and len(node.args) == 0
+                and any(kw.arg == "axis" for kw in node.keywords)
+            ):
+                # DataFrame.{...}(axis=1), assigned -- see
+                # _pandas_df_row_reduction_spec's codegen, which is
+                # skipna-True (pandas' default) via the nan*-prefixed
+                # helpers rather than the plain ones used elsewhere in
+                # this file for already-NaN-free columns.
+                needed.add("nanmean")
+                needed.add("nanstd")
+                needed.add("nanvar")
+                needed.add("nanmin")
+                needed.add("nanmax")
+                needed.add("nansum")
+                needed.add("quantile_linear")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
@@ -9455,7 +9487,57 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_re
             k = _merge_kind(k, ke)
         return (k or "real"), 1
 
-    def _infer_from_node(n):
+    def _infer_from_node(n, _seen=None):
+        # A bare Name referring to another top-level assignment target --
+        # e.g. `r = rets` where `rets` was itself assigned earlier -- needs
+        # to resolve through that chain rather than falling to the generic
+        # ("real", 0) default below (which would wrongly promote a shared
+        # module variable that's actually an array to a scalar). _seen
+        # guards against a cycle (e.g. `x = f(x)` reassigning through
+        # itself) recursing forever; _name_rhs_map is built once, below,
+        # from every top-level `name = ...` assignment (not just the
+        # needed_names-filtered ones the main decls loop uses).
+        if isinstance(n, ast.Name) and n.id in _name_rhs_map and n.id not in (_seen or set()):
+            _seen2 = set(_seen or ()) | {n.id}
+            k, r = None, 0
+            for _rhs in _name_rhs_map[n.id]:
+                _k2, _r2 = _infer_from_node(_rhs, _seen2)
+                k = _merge_kind(k, _k2)
+                r = max(r, int(_r2 or 0))
+            return k, r
+        if isinstance(n, ast.BinOp):
+            k0, r0 = _infer_from_node(n.left, _seen)
+            k1, r1 = _infer_from_node(n.right, _seen)
+            return _merge_kind(k0, k1), max(int(r0 or 0), int(r1 or 0))
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id in {"pd", "pandas"}
+            and n.func.attr == "Series"
+            and n.args
+        ):
+            # pd.Series(x) is a transparent pass-through over x elsewhere
+            # in this transpiler (see the translator's own _expr_kind/
+            # _rank_expr handling) -- match that here too.
+            return _infer_from_node(n.args[0], _seen)
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id in {"np", "numpy"}
+            and n.func.attr in {
+                "diff", "log", "exp", "sqrt", "abs", "absolute", "cumsum",
+                "cumprod", "sort", "round", "floor", "ceil", "square",
+            }
+            and n.args
+        ):
+            # Elementwise/same-shape numpy functions (np.diff shrinks
+            # length by one but keeps the same rank) -- propagate the
+            # first argument's own inferred rank/kind rather than falling
+            # to the generic Call default.
+            k, r = _infer_from_node(n.args[0], _seen)
+            return (k or "real"), max(1, int(r or 0))
         if isinstance(n, ast.Constant):
             v = n.value
             if isinstance(v, bool):
@@ -9472,7 +9554,7 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_re
         if isinstance(n, (ast.List, ast.Tuple)):
             return _infer_from_literal_seq(n)
         if isinstance(n, ast.UnaryOp):
-            return _infer_from_node(n.operand)
+            return _infer_from_node(n.operand, _seen)
         if isinstance(n, ast.Subscript):
             # r = arr[j, :] / arr[:, j] / arr[i:j] -- count the surviving
             # (sliced, not scalar-indexed) axes directly from the
@@ -9576,6 +9658,17 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_re
                     yield from _iter_top_level_assigns(h.body)
                 yield from _iter_top_level_assigns(st.orelse)
                 yield from _iter_top_level_assigns(st.finalbody)
+
+    # Every top-level `name = ...` assignment's RHS, unfiltered by
+    # needed_names (unlike the decls loop below) -- consulted by
+    # _infer_from_node's Name-chain resolution above, so e.g. `r = rets`
+    # resolves through to however `rets` was itself assigned, even though
+    # `rets` alone is never referenced inside a local function body (and
+    # so would otherwise never get its own entry in decls).
+    _name_rhs_map = {}
+    for st in _iter_top_level_assigns(tree.body):
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            _name_rhs_map.setdefault(st.targets[0].id, []).append(st.value)
 
     decls = {}
     for st in _iter_top_level_assigns(tree.body):
@@ -12750,6 +12843,48 @@ def normalize_numpy_shape_assignments(exec_body, local_funcs):
         exec_body[:] = [ast.fix_missing_locations(st) for st in new_body]
 
 
+def normalize_numpy_shape_kwarg_calls(exec_body, local_funcs):
+    """Rewrite np.ones(shape=X)/np.zeros(shape=X)/np.empty(shape=X)/
+    np.full(shape=X, fill_value=Y) -- shape (and full's fill value)
+    passed as a keyword rather than positionally -- into the equivalent
+    positional-args call. Every downstream consumer (expr()'s codegen,
+    _rank_expr, _expr_kind, prescan's own shape inference, ...) only ever
+    looks at node.args[0]/node.args[1], never these keyword names, even
+    though real numpy accepts shape=/fill_value= for all four functions.
+    """
+    shape_first = {"ones", "zeros", "empty"}
+    shape_and_fill = {"full"}
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"np", "numpy"}
+                and node.func.attr in (shape_first | shape_and_fill)
+            ):
+                return node
+            shape_kw = next((kw for kw in node.keywords if kw.arg == "shape"), None)
+            if shape_kw is not None and not node.args:
+                node.args = [shape_kw.value]
+                node.keywords = [kw for kw in node.keywords if kw.arg != "shape"]
+            if node.func.attr in shape_and_fill:
+                fill_kw = next((kw for kw in node.keywords if kw.arg == "fill_value"), None)
+                if fill_kw is not None and len(node.args) == 1:
+                    node.args = node.args + [fill_kw.value]
+                    node.keywords = [kw for kw in node.keywords if kw.arg != "fill_value"]
+            return node
+
+    rw = _Rewriter()
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn.body = [rw.visit(st) for st in fn.body]
+            ast.fix_missing_locations(fn)
+    if exec_body:
+        exec_body[:] = [rw.visit(st) for st in exec_body]
+
+
 def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
     """Rewrite `res = minimize(f, x0)` / `res = least_squares(fun, x0)` /
     `res = minimize_scalar(f, bounds=(a, b))` and later `res.x` / `res.fun`
@@ -12969,6 +13104,38 @@ def normalize_scipy_minimize_args_wrapper(exec_body, local_funcs):
             fn.body = [_Renamer().visit(st) for st in fn.body]
             ast.fix_missing_locations(fn)
 
+    # A bare-Name args= element that is itself just an alias of another
+    # top-level name (`r = rets`, a plain Name-to-Name assignment with no
+    # further transformation) needs to be resolved to that alias's root
+    # BEFORE the wrapper is synthesized. `r` in that case would otherwise
+    # get hoisted into its own module-shared variable, but xp2f's own
+    # pure-alias codegen (see pandas_series_aliases / _resolve_
+    # pandas_series_alias, and its DataFrame counterpart) never assigns a
+    # separate value into `r` at all -- it resolves every reference to
+    # `r` straight through to `rets`'s own storage -- so the promoted
+    # module variable `r` would stay permanently unallocated. Referencing
+    # `rets` directly here sidesteps the whole interaction. Only a flat,
+    # top-level (not nested in a for/if/etc.) `name = <bare Name>` chain
+    # is resolved; anything else is left as xp2f's alias machinery
+    # already otherwise handles it fine (it only breaks for a captured
+    # scipy args= name specifically).
+    _alias_root_map = {}
+    for _st in (exec_body or []):
+        if (
+            isinstance(_st, ast.Assign)
+            and len(_st.targets) == 1
+            and isinstance(_st.targets[0], ast.Name)
+            and isinstance(_st.value, ast.Name)
+        ):
+            _alias_root_map[_st.targets[0].id] = _st.value.id
+
+    def _resolve_alias_root(nm):
+        seen = set()
+        while nm in _alias_root_map and nm not in seen:
+            seen.add(nm)
+            nm = _alias_root_map[nm]
+        return nm
+
     def _handle_call(v):
         if not (
             isinstance(v, ast.Call)
@@ -12982,6 +13149,11 @@ def normalize_scipy_minimize_args_wrapper(exec_body, local_funcs):
         args_kw = next((kw for kw in v.keywords if kw.arg == "args"), None)
         if args_kw is None or not isinstance(args_kw.value, (ast.Tuple, ast.List)) or not args_kw.value.elts:
             return
+        for _i, _e in enumerate(args_kw.value.elts):
+            if isinstance(_e, ast.Name):
+                _root = _resolve_alias_root(_e.id)
+                if _root != _e.id:
+                    args_kw.value.elts[_i] = ast.copy_location(ast.Name(id=_root, ctx=ast.Load()), _e)
         fn_name = v.args[0].id
         wrapper_name = f"{fn_name}_argswrap_{getattr(v, 'lineno', 0)}"
         if wrapper_name not in fn_map:
@@ -16482,6 +16654,11 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 0
             ):
                 return "char"
+            if self._pandas_df_row_reduction_spec(node) is not None:
+                # See the matching early-out in _rank_expr for why this
+                # must be checked before the generic reduction-kind
+                # fallback just below.
+                return "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"sum", "mean", "var", "max", "min", "all", "any", "prod"}
@@ -18204,7 +18381,7 @@ class translator(ast.NodeVisitor):
         if (
             isinstance(a0, ast.Call)
             and isinstance(a0.func, ast.Attribute)
-            and a0.func.attr in {"corr", "describe", "mean", "median", "std", "min", "max", "sum"}
+            and a0.func.attr in {"corr", "describe", "mean", "median", "std", "min", "max", "sum", "prod", "var"}
             and len(a0.args) == 0
         ):
             root = self._pandas_df_root_id(a0.func.value)
@@ -18346,6 +18523,53 @@ class translator(ast.NodeVisitor):
             return None
         return {"method": v.func.attr, "df_id": v.func.value.id, "call": v}
 
+    def _pandas_df_simple_method_expr_text(self, v):
+        # Fortran EXPRESSION text for df.shift(n)/.pct_change(n)/.cumsum()/
+        # .cumprod()/.diff(n)/.abs() -- these are pure functions on the
+        # vendored DataFrame types (return a whole new DataFrame value, no
+        # mutation), so they're safe to use anywhere an expression is
+        # needed, e.g. nested inside DataFrame arithmetic
+        # (`weights.shift(1) * asset_rets`, see _is_pandas_df_arith_value)
+        # or passed straight to another call -- not just as a full `X =
+        # df.shift(n)` statement (see visit_Assign, which duplicates this
+        # same arg-building logic for that statement-level case) or
+        # directly inside print(). Deliberately excludes sort_index()/
+        # sort_values(): those mutate a copy in place via a subroutine
+        # call (`name = src; call name%sort_index()`), which has no
+        # single-expression Fortran form. Returns None for anything else,
+        # including a sort_index()/sort_values() match.
+        _m_spec = self._pandas_df_simple_method_spec(v)
+        if _m_spec is None or _m_spec["method"] not in {
+            "shift", "pct_change", "cumsum", "cumprod", "diff", "abs",
+        }:
+            return None
+        method = _m_spec["method"]
+        src_expr = self._aliased_name(_m_spec["df_id"])
+        kwargs = {kw.arg: kw.value for kw in v.keywords}
+        if method == "pct_change":
+            periods_node = v.args[0] if v.args else kwargs.get("periods")
+            arg_txt = f"({self.expr(periods_node)})" if periods_node is not None else "()"
+            return f"{src_expr}%pct_change{arg_txt}"
+        if method == "shift":
+            periods_node = v.args[0] if v.args else kwargs.get("periods")
+            fill_node = kwargs.get("fill_value")
+            axis_node = kwargs.get("axis")
+            parts = []
+            if periods_node is not None:
+                parts.append(self.expr(periods_node))
+            if fill_node is not None:
+                parts.append(f"fill_value={self.expr(fill_node)}")
+            if axis_node is not None:
+                parts.append(f"axis={self.expr(axis_node)}")
+            arg_txt = "(" + ", ".join(parts) + ")" if parts else "()"
+            return f"{src_expr}%shift{arg_txt}"
+        if method == "diff":
+            periods_node = v.args[0] if v.args else kwargs.get("periods")
+            arg_txt = f"({self.expr(periods_node)})" if periods_node is not None else "()"
+            return f"{src_expr}%diff{arg_txt}"
+        # cumsum / cumprod / abs
+        return f"{src_expr}%{method}()"
+
     def _pandas_df_copy_spec(self, v):
         # X = df.copy() / df.copy(deep=True) / df.copy(deep=False) -- an
         # independent DataFrame value. We don't model pandas' shared-
@@ -18390,6 +18614,220 @@ class translator(ast.NodeVisitor):
                 return None
             axis = axis_node.value
         return {"df_id": v.func.value.id, "axis": axis}
+
+    def _pandas_df_compare_spec(self, v):
+        # X = df1 > df2 / df1 < df2 / df != scalar / df > scalar / etc. --
+        # elementwise comparison. Modeled as a DataFrame of 1.0/0.0
+        # directly (not a separate boolean-dtype representation), since
+        # every real use of this immediately does .astype(float) on the
+        # result anyway (see _pandas_df_astype_spec, a no-op given this
+        # choice) -- same "not a new runtime type" simplification as
+        # elsewhere in this file.
+        if not (
+            isinstance(v, ast.Compare)
+            and len(v.ops) == 1
+            and len(v.comparators) == 1
+            and type(v.ops[0]) in (ast.Gt, ast.Lt, ast.GtE, ast.LtE, ast.Eq, ast.NotEq)
+        ):
+            return None
+        left, right = v.left, v.comparators[0]
+        df_left = isinstance(left, ast.Name) and left.id in self.pandas_df_vars
+        df_right = isinstance(right, ast.Name) and right.id in self.pandas_df_vars
+        if not (df_left or df_right):
+            return None
+        if df_left and df_right:
+            lcols = self.pandas_df_columns.get(left.id)
+            rcols = self.pandas_df_columns.get(right.id)
+            if lcols is None or rcols is None or lcols != rcols:
+                return None
+            return {
+                "kind": "df_df", "left": left.id, "right": right.id,
+                "op": type(v.ops[0]), "columns": list(lcols),
+            }
+        df_node, scalar_node = (left, right) if df_left else (right, left)
+        if self._rank_expr(scalar_node) != 0:
+            return None
+        cols = self.pandas_df_columns.get(df_node.id)
+        if cols is None:
+            return None
+        return {
+            "kind": "df_scalar", "df_id": df_node.id, "scalar_node": scalar_node,
+            "df_left": df_left, "op": type(v.ops[0]), "columns": list(cols),
+        }
+
+    def _pandas_df_astype_spec(self, v):
+        # X = df.astype(float) -- a true no-op given _pandas_df_compare_spec
+        # models a comparison's result as already-real 1.0/0.0 (see there),
+        # so this never needs to touch %values at all; just a plain copy.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "astype"
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+            and len(v.args) == 1
+        ):
+            return None
+        a0 = v.args[0]
+        is_float = (
+            (isinstance(a0, ast.Name) and a0.id == "float")
+            or (isinstance(a0, ast.Attribute) and a0.attr in {"float64", "float32"})
+        )
+        if not is_float:
+            return None
+        return {"df_id": v.func.value.id}
+
+    def _materialize_chained_df_call(self, call_node, at_codegen):
+        # Given a Call node that itself produces a DataFrame (matching
+        # one of this file's df-producing spec functions -- divide()
+        # currently, since that's the case this exists for:
+        # `signal.divide(n, axis=0).fillna(0.0)`), materialize it into a
+        # synthetic temp variable, the same way e.g.
+        # _pandas_dict_df_construct_spec_rangeidx's column values are
+        # materialized via a fake ast.Assign run back through prescan.
+        # Each individual df spec function only recognizes a bare Name as
+        # its own "df" operand, not an arbitrary nested call, so this is
+        # what lets one be chained directly onto another. id(call_node)
+        # (stable across the whole transpile, since prescan and codegen
+        # both walk the SAME ast tree) keeps the prescan-time and
+        # codegen-time temp names in sync without needing to thread state
+        # between those two otherwise-separate passes.
+        tmp_name = f"pdf_chain_tmp_{id(call_node)}"
+        fake = ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=call_node)
+        if at_codegen:
+            self.visit_Assign(fake)
+        else:
+            self.prescan([fake])
+        return tmp_name
+
+    def _pandas_df_fillna_spec(self, v):
+        # X = df.fillna(scalar) -- replace NaN with a scalar. `df` may
+        # also be another df-producing call chained directly in, e.g.
+        # `signal.divide(n_active, axis=0).fillna(0.0)` -- see
+        # _materialize_chained_df_call, invoked by the prescan/codegen
+        # call sites (not here, so this stays a pure matcher) when
+        # inner_call is not None.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "fillna"
+            and len(v.args) == 1
+            and not v.keywords
+            and self._rank_expr(v.args[0]) == 0
+        ):
+            return None
+        if isinstance(v.func.value, ast.Name) and v.func.value.id in self.pandas_df_vars:
+            return {"df_id": v.func.value.id, "inner_call": None, "fill_node": v.args[0]}
+        if (
+            isinstance(v.func.value, ast.Call)
+            and self._pandas_df_divide_axis0_spec(v.func.value) is not None
+        ):
+            return {"df_id": None, "inner_call": v.func.value, "fill_node": v.args[0]}
+        return None
+
+    def _pandas_df_divide_axis0_spec(self, v):
+        # X = df.divide(other, axis=0) -- row-wise broadcast division:
+        # result[i, j] = df[i, j] / other[i] for every column j. `other`
+        # must be a plain rank-1 array (e.g. a df.sum(axis=1)-style
+        # per-row reduction, see _pandas_df_row_reduction_spec) with one
+        # entry per row of df. Anything else (axis=1, a DataFrame divisor,
+        # a column-aligned Series) is intentionally left unsupported here.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "divide"
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.pandas_df_vars
+            and len(v.args) >= 1
+        ):
+            return None
+        kwargs = {kw.arg: kw.value for kw in v.keywords}
+        other_node = v.args[0]
+        axis_node = v.args[1] if len(v.args) >= 2 else kwargs.get("axis")
+        if not (
+            axis_node is not None
+            and isinstance(axis_node, ast.Constant)
+            and axis_node.value == 0
+        ):
+            return None
+        if self._rank_expr(other_node) != 1:
+            return None
+        return {"df_id": v.func.value.id, "other_node": other_node}
+
+    def _pandas_df_row_reduction_spec(self, v):
+        # X = df.sum(axis=1) / .mean(axis=1) / .std(axis=1) / etc.,
+        # ASSIGNED to a variable (as opposed to print(df.sum(axis=1)), the
+        # pre-existing direct-print-only case in
+        # _emit_pandas_df_series_reduction_print, which this mirrors).
+        # Result is a plain real array, one value per row of df -- no
+        # column-label dimension survives an axis=1 reduction, so unlike
+        # _pandas_df_reduction_series_spec (axis=0), no
+        # pandas_series_labels entry is needed.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var"}
+            and len(v.args) == 0
+        ):
+            return None
+        axis_kw = next((kw for kw in v.keywords if kw.arg == "axis"), None)
+        if not (
+            axis_kw is not None
+            and isinstance(axis_kw.value, ast.Constant)
+            and axis_kw.value.value == 1
+        ):
+            return None
+        if any(kw.arg != "axis" for kw in v.keywords):
+            return None
+        if isinstance(v.func.value, ast.Name) and v.func.value.id in self.pandas_df_vars:
+            return {"df_id": v.func.value.id, "inner_expr": None, "method": v.func.attr}
+        # The base may also be a chained DataFrame-producing expression
+        # that isn't a bare Name, e.g. `(signal != 0.0).sum(axis=1)` or
+        # `(weights.shift(1) * asset_rets).sum(axis=1)` -- materialize it
+        # via _materialize_chained_df_call (done by the prescan/codegen
+        # call sites, not here; this stays a pure matcher) when it
+        # matches a recognized df-producing shape.
+        if (
+            isinstance(v.func.value, ast.Compare)
+            and self._pandas_df_compare_spec(v.func.value) is not None
+        ):
+            return {"df_id": None, "inner_expr": v.func.value, "method": v.func.attr}
+        if self._is_pandas_df_arith_value(v.func.value):
+            return {"df_id": None, "inner_expr": v.func.value, "method": v.func.attr}
+        return None
+
+    def _plain_array_iloc_slice_spec(self, v):
+        # X = Y.iloc[lo:hi] -- a slice of a plain rank-1 real/int array
+        # (as opposed to a DataFrame or a pandas date-array, which have
+        # their own, more specific .iloc handling elsewhere -- excluded
+        # here so those specs still take precedence). Modeled as
+        # reallocating a new array holding the sliced values; covers the
+        # common `port_ret = port_ret.iloc[n:]` pattern of dropping a
+        # rolling-window warm-up prefix after a row-reduction (see
+        # _pandas_df_row_reduction_spec) computed the full series.
+        if not (
+            isinstance(v, ast.Subscript)
+            and isinstance(v.value, ast.Attribute)
+            and v.value.attr == "iloc"
+            and isinstance(v.value.value, ast.Name)
+            and isinstance(v.slice, ast.Slice)
+            and v.slice.step is None
+        ):
+            return None
+        base_id = v.value.value.id
+        if (
+            base_id in self.pandas_df_vars
+            or base_id in self.pandas_date_array_aliases
+            or base_id in self.pandas_date_arrays
+        ):
+            return None
+        if base_id in self.alloc_reals:
+            kind = "real"
+        elif base_id in self.alloc_ints:
+            kind = "int"
+        else:
+            return None
+        return {"base_id": base_id, "slice": v.slice, "kind": kind}
 
     def _pandas_concat_spec(self, v):
         # X = pd.concat([df1, df2, ...][, axis=0|1][, ignore_index=True])
@@ -18975,13 +19413,19 @@ class translator(ast.NodeVisitor):
                 shape_node = size_kw.value
             elif rhs.args and isinstance(rhs.args[0], (ast.Tuple, ast.List)):
                 shape_node = rhs.args[0]
-        if (
-            isinstance(shape_node, (ast.Tuple, ast.List))
-            and len(shape_node.elts) == 2
-            and isinstance(shape_node.elts[1], ast.Constant)
-            and isinstance(shape_node.elts[1].value, int)
-        ):
-            return shape_node.elts[1].value
+        if isinstance(shape_node, (ast.Tuple, ast.List)) and len(shape_node.elts) == 2:
+            ncol_node = shape_node.elts[1]
+            if isinstance(ncol_node, ast.Constant) and isinstance(ncol_node.value, int):
+                return ncol_node.value
+            if isinstance(ncol_node, ast.Name) and ncol_node.id in self.params:
+                # A top-level scalar assigned exactly once with a
+                # constant-int RHS (see find_parameters) -- e.g.
+                # `ncol = 3` used as np.ones([nrow, ncol])'s column
+                # count -- not just a literal int inline.
+                try:
+                    return int(self.params[ncol_node.id])
+                except ValueError:
+                    pass
         return None
 
     def _static_ncols_from_matrix_var(self, node):
@@ -19026,6 +19470,14 @@ class translator(ast.NodeVisitor):
             and node.args[0].value
         ):
             return list(node.args[0].value)
+        if isinstance(node, ast.Name) and node.id in self.pandas_str_list_values:
+            # A variable already resolved to a static list of strings --
+            # most notably `asset_names = [c for c in dat.columns if c !=
+            # "Date"]` (see the df.columns-list-comprehension prescan
+            # branch that populates pandas_str_list_values), so
+            # `dat[asset_names]` is recognized as multi-column selection
+            # the same as spelling out the literal list inline.
+            return list(self.pandas_str_list_values[node.id])
         return None
 
     def _pandas_matrix_df_construct_spec_rangeidx(self, v):
@@ -19080,6 +19532,33 @@ class translator(ast.NodeVisitor):
                 return None
         return {"matrix_node": v.args[0], "columns": columns, "index": index}
 
+    def _pandas_empty_df_construct_spec(self, v):
+        # X = pd.DataFrame(index=[...]/list("..."), columns=[...]/list("..."))
+        # -- no positional data argument at all: pandas fills this with an
+        # all-NaN frame of the given shape. Reuses DataFrame_str_index
+        # (see the matrix-based sibling above) with %values allocated and
+        # broadcast-filled to NaN rather than copied from any source.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and not v.args
+        ):
+            return None
+        index_kw = next((kw for kw in v.keywords if kw.arg == "index"), None)
+        cols_kw = next((kw for kw in v.keywords if kw.arg == "columns"), None)
+        if index_kw is None or cols_kw is None:
+            return None
+        if any(kw.arg not in ("index", "columns") for kw in v.keywords):
+            return None
+        index = self._resolve_str_list_literal(index_kw.value)
+        columns = self._resolve_str_list_literal(cols_kw.value)
+        if index is None or columns is None:
+            return None
+        return {"index": index, "columns": columns}
+
     def _pandas_df_reduction_expr(self, method, col_expr):
         # Fortran expression computing one of df.mean()/.std()/.min()/
         # .max()/.sum()/.median() over a single column array -- shared by
@@ -19098,6 +19577,14 @@ class translator(ast.NodeVisitor):
             return f"maxval({col_expr})"
         if method == "sum":
             return f"sum({col_expr})"
+        if method == "prod":
+            return f"product({col_expr})"
+        if method == "var":
+            # pandas' default ddof=1 (sample variance) -- unlike numpy's
+            # own np.var() default of ddof=0, which is why the generic
+            # (non-DataFrame) .var() handler needs an explicit ddof= to
+            # get this same value; a bare df.var() always means ddof=1.
+            return f"var_1d({col_expr}, 1)"
         raise NotImplementedError(f"df.{method}() reduction not supported")
 
     def _pandas_df_reduction_series_spec(self, v):
@@ -19111,7 +19598,7 @@ class translator(ast.NodeVisitor):
         if not (
             isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and v.func.attr in {"mean", "median", "std", "min", "max", "sum"}
+            and v.func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var"}
             and len(v.args) == 0
             and not v.keywords
             and isinstance(v.func.value, ast.Name)
@@ -19279,6 +19766,16 @@ class translator(ast.NodeVisitor):
             and len(node.args) == 1
         ):
             return self._is_pandas_df_arith_value(node.args[0])
+        if self._pandas_df_simple_method_expr_text(node) is not None:
+            # df.shift(n)/.pct_change(n)/.cumsum()/.cumprod()/.diff(n)/.abs()
+            # -- these are genuine pure functions on the vendored DataFrame
+            # types (returning a whole new DataFrame value), so they're
+            # usable as an arithmetic operand the same as a bare df Name
+            # (e.g. `weights.shift(1) * asset_rets`) -- unlike
+            # sort_index()/sort_values(), which mutate a copy in place via
+            # a subroutine call and so are NOT expression-safe (see
+            # _pandas_df_simple_method_expr_text, which excludes them).
+            return True
         return False
 
     def _snapshot_df_arith_refs(self, expr_node):
@@ -19331,6 +19828,13 @@ class translator(ast.NodeVisitor):
             and len(node.args) == 1
         ):
             return self._pandas_df_arith_kind_cols(node.args[0])
+        _m_spec = self._pandas_df_simple_method_spec(node)
+        if _m_spec is not None and _m_spec["method"] in {
+            "shift", "pct_change", "cumsum", "cumprod", "diff", "abs",
+        }:
+            # Kind/columns are unchanged by any of these -- same shape
+            # (transform) in, same shape out.
+            return self._pandas_df_arith_kind_cols(node.func.value)
         return None
 
     def _pandas_df_union_arith_spec(self, v):
@@ -19412,7 +19916,7 @@ class translator(ast.NodeVisitor):
             if not (
                 isinstance(e, ast.Call)
                 and isinstance(e.func, ast.Attribute)
-                and e.func.attr in {"mean", "std", "min", "max", "sum", "median"}
+                and e.func.attr in {"mean", "std", "min", "max", "sum", "median", "prod", "var"}
                 and len(e.args) == 0
                 and not e.keywords
                 and isinstance(e.func.value, ast.Name)
@@ -20497,6 +21001,16 @@ class translator(ast.NodeVisitor):
                     return 2
                 if node.func.attr == "cond" and len(node.args) >= 1:
                     return 0
+            if self._pandas_df_row_reduction_spec(node) is not None:
+                # X.sum(axis=1)/etc. on a DataFrame (or a chained
+                # DataFrame-producing expression like `(signal != 0.0)`) --
+                # one value per row. Must be checked before the generic
+                # reduction-rank fallback just below, which computes rank
+                # via _rank_expr(node.func.value) and has no idea a
+                # DataFrame Name is really rank 2 (DataFrames aren't
+                # tracked via alloc_reals/etc at all), so it would
+                # otherwise derive the wrong answer here.
+                return 1
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"sum", "mean", "var", "max", "min", "all", "any", "prod"}
@@ -21420,6 +21934,7 @@ class translator(ast.NodeVisitor):
             _df_right = self._is_pandas_df_arith_value(node.right)
             if (_df_left or _df_right) and op in (ast.Add, ast.Sub, ast.Mult, ast.Div):
                 _df_opmap = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
+                _df_arith_kinds = {"DataFrame_str_index", "DataFrame_index_date"}
                 if _df_left and _df_right:
                     _lkc = self._pandas_df_arith_kind_cols(node.left)
                     _rkc = self._pandas_df_arith_kind_cols(node.right)
@@ -21427,22 +21942,23 @@ class translator(ast.NodeVisitor):
                         _lkc is None
                         or _rkc is None
                         or _lkc[0] != _rkc[0]
-                        or _lkc[0] != "DataFrame_str_index"
+                        or _lkc[0] not in _df_arith_kinds
                         or _lkc[1] is None
                         or _rkc[1] is None
                         or _lkc[1] != _rkc[1]
                     ):
                         raise NotImplementedError(
                             "DataFrame arithmetic between two DataFrames currently requires "
-                            "both to be DataFrame_str_index of the same kind, with identical, "
-                            "statically-known column lists"
+                            "both to be the same kind (DataFrame_str_index or "
+                            "DataFrame_index_date), with identical, statically-known column lists"
                         )
                     return f"({self.expr(node.left)} {_df_opmap[op]} {self.expr(node.right)})"
                 _df_node, _scalar_node = (node.left, node.right) if _df_left else (node.right, node.left)
                 _kc = self._pandas_df_arith_kind_cols(_df_node)
-                if _kc is None or _kc[0] != "DataFrame_str_index":
+                if _kc is None or _kc[0] not in _df_arith_kinds:
                     raise NotImplementedError(
-                        "DataFrame-scalar arithmetic currently supports only DataFrame_str_index"
+                        "DataFrame-scalar arithmetic currently supports only DataFrame_str_index "
+                        "and DataFrame_index_date"
                     )
                 if self._rank_expr(_scalar_node) != 0:
                     raise NotImplementedError(
@@ -22106,6 +22622,25 @@ class translator(ast.NodeVisitor):
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "iloc"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id not in self.pandas_df_vars
+                and node.value.value.id not in self.pandas_date_array_aliases
+                and node.value.value.id not in self.pandas_date_arrays
+                and (node.value.value.id in self.alloc_reals or node.value.value.id in self.alloc_ints)
+            ):
+                # X.iloc[i] / X.iloc[lo:hi] on a plain rank-1 array (as
+                # opposed to a DataFrame or pandas date-array, which have
+                # their own, more specific .iloc handling above/elsewhere)
+                # -- .iloc is purely positional and this file's plain
+                # arrays carry no separate index/label tracking to begin
+                # with, so it's identical to a bare subscript on the same
+                # base; just re-dispatch to that.
+                inner = ast.Subscript(value=node.value.value, slice=node.slice, ctx=ast.Load())
+                ast.copy_location(inner, node)
+                return self.expr(inner)
             if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.pandas_series_labels
@@ -23409,6 +23944,22 @@ class translator(ast.NodeVisitor):
             ):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
+                if (
+                    attr in {"shift", "pct_change", "cumsum", "cumprod", "diff", "abs"}
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.pandas_df_vars
+                ):
+                    # df.shift(n)/.pct_change(n)/.cumsum()/.cumprod()/
+                    # .diff(n)/.abs() used as a general expression -- e.g.
+                    # nested inside DataFrame arithmetic
+                    # (weights.shift(1) * asset_rets, see
+                    # _is_pandas_df_arith_value) or passed to another call
+                    # -- not just as a standalone `X = df.shift(n)`
+                    # statement (visit_Assign) or directly inside print()
+                    # (_emit_pandas_df_method_result_print).
+                    _txt = self._pandas_df_simple_method_expr_text(node)
+                    if _txt is not None:
+                        return _txt
                 if (
                     attr in {"cdf", "pdf"}
                     and isinstance(node.func.value, ast.Name)
@@ -29494,24 +30045,20 @@ class translator(ast.NodeVisitor):
                     self.alloc_complexes.discard(t.id)
                     continue
 
-                # X = df[["colA", "colB"]] -- select a literal list of
-                # columns by name into a new (sub-)DataFrame.
+                # X = df[["colA", "colB"]] / X = df[names] (names a
+                # resolved list-of-strings variable) -- select columns by
+                # name into a new (sub-)DataFrame.
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Subscript)
                     and isinstance(v.value, ast.Name)
                     and v.value.id in self.pandas_df_vars
-                    and isinstance(v.slice, ast.List)
-                    and v.slice.elts
-                    and all(
-                        isinstance(e, ast.Constant) and isinstance(e.value, str)
-                        for e in v.slice.elts
-                    )
+                    and self._resolve_str_list_literal(v.slice) is not None
                 ):
                     _src_id = v.value.id
                     _src_cols = self.pandas_df_columns.get(_src_id)
                     if _src_cols is not None:
-                        _selected = [e.value for e in v.slice.elts]
+                        _selected = self._resolve_str_list_literal(v.slice)
                         self.pandas_df_select_indices[t.id] = [
                             _src_cols.index(_nm) + 1 for _nm in _selected
                         ]
@@ -29877,6 +30424,134 @@ class translator(ast.NodeVisitor):
                         self.alloc_logs.discard(t.id)
                         self.alloc_chars.discard(t.id)
                         self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = pd.DataFrame(index=[...], columns=[...]) -- no data
+                # argument: an all-NaN frame of the given shape.
+                if isinstance(t, ast.Name):
+                    _edf_spec = self._pandas_empty_df_construct_spec(v)
+                    if _edf_spec is not None:
+                        self.pandas_df_vars[t.id] = "DataFrame_str_index"
+                        self.pandas_df_columns[t.id] = list(_edf_spec["columns"])
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = df1 > df2 / df != scalar / etc. (see
+                # _pandas_df_compare_spec) -- result keeps the same kind
+                # and columns as the DataFrame operand(s).
+                if isinstance(t, ast.Name):
+                    _cmp_spec = self._pandas_df_compare_spec(v)
+                    if _cmp_spec is not None:
+                        _cmp_src = _cmp_spec["left"] if _cmp_spec["kind"] == "df_df" else _cmp_spec["df_id"]
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_cmp_src, "DataFrame_str_index")
+                        self.pandas_df_columns[t.id] = list(_cmp_spec["columns"])
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = df.astype(float) -- a true no-op copy (see
+                # _pandas_df_astype_spec).
+                if isinstance(t, ast.Name):
+                    _ast_spec = self._pandas_df_astype_spec(v)
+                    if _ast_spec is not None:
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_ast_spec["df_id"]]
+                        self.pandas_df_columns[t.id] = list(
+                            self.pandas_df_columns.get(_ast_spec["df_id"], []) or []
+                        )
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = df.fillna(scalar) -- same kind/columns as df.
+                if isinstance(t, ast.Name):
+                    _fn_spec = self._pandas_df_fillna_spec(v)
+                    if _fn_spec is not None:
+                        _fn_df_id = _fn_spec["df_id"]
+                        if _fn_df_id is None:
+                            _fn_df_id = self._materialize_chained_df_call(_fn_spec["inner_call"], at_codegen=False)
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_fn_df_id]
+                        self.pandas_df_columns[t.id] = list(
+                            self.pandas_df_columns.get(_fn_df_id, []) or []
+                        )
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = df.divide(other, axis=0) -- same kind/columns as df
+                # (a plain real array, NOT a DataFrame).
+                if isinstance(t, ast.Name):
+                    _dv_spec = self._pandas_df_divide_axis0_spec(v)
+                    if _dv_spec is not None:
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars[_dv_spec["df_id"]]
+                        self.pandas_df_columns[t.id] = list(
+                            self.pandas_df_columns.get(_dv_spec["df_id"], []) or []
+                        )
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # X = df.sum(axis=1) / etc., assigned -- a plain real
+                # array, one value per row (see _pandas_df_row_reduction_spec).
+                if isinstance(t, ast.Name):
+                    _rr2_spec = self._pandas_df_row_reduction_spec(v)
+                    if _rr2_spec is not None:
+                        if _rr2_spec["df_id"] is None:
+                            self._materialize_chained_df_call(_rr2_spec["inner_expr"], at_codegen=False)
+                        self.pandas_df_vars.pop(t.id, None)
+                        self.pandas_df_columns.pop(t.id, None)
+                        self._mark_alloc_real(t.id, rank=1)
+                        continue
+
+                # X = Y.iloc[lo:hi] -- a slice of a plain rank-1 array
+                # (see _plain_array_iloc_slice_spec).
+                if isinstance(t, ast.Name):
+                    _pis_spec = self._plain_array_iloc_slice_spec(v)
+                    if _pis_spec is not None:
+                        if _pis_spec["kind"] == "real":
+                            self._mark_alloc_real(t.id, rank=1)
+                        else:
+                            self._mark_alloc_int(t.id, rank=1)
                         continue
 
                 # X = pd.DataFrame([df.mean(), df.std(), ...], index=[...])
@@ -36899,11 +37574,14 @@ class translator(ast.NodeVisitor):
                 if method == "shift":
                     periods_node = v.args[0] if v.args else kwargs.get("periods")
                     fill_node = kwargs.get("fill_value")
+                    axis_node = kwargs.get("axis")
                     parts = []
                     if periods_node is not None:
                         parts.append(self.expr(periods_node))
                     if fill_node is not None:
                         parts.append(f"fill_value={self.expr(fill_node)}")
+                    if axis_node is not None:
+                        parts.append(f"axis={self.expr(axis_node)}")
                     arg_txt = "(" + ", ".join(parts) + ")" if parts else "()"
                     self.o.w(f"{name} = {src_expr}%shift{arg_txt}")
                     return
@@ -36976,6 +37654,144 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{name}%values = {src_expr}%values(:, dropna_idx)")
                 self.o.pop()
                 self.o.w("end block")
+                return
+
+        # X = df1 > df2 / df != scalar / etc. (see _pandas_df_compare_spec).
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _cmp_spec = self._pandas_df_compare_spec(v)
+            if _cmp_spec is not None:
+                name = self._aliased_name(t.id)
+                opmap = {ast.Gt: ">", ast.Lt: "<", ast.GtE: ">=", ast.LtE: "<=", ast.Eq: "==", ast.NotEq: "/="}
+                op_txt = opmap[_cmp_spec["op"]]
+                if _cmp_spec["kind"] == "df_df":
+                    l_expr = self._aliased_name(_cmp_spec["left"])
+                    r_expr = self._aliased_name(_cmp_spec["right"])
+                    self.o.w(f"{name}%index = {l_expr}%index")
+                    self.o.w(f"{name}%columns = {l_expr}%columns")
+                    self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {l_expr}%values {op_txt} {r_expr}%values)")
+                else:
+                    df_expr = self._aliased_name(_cmp_spec["df_id"])
+                    scalar_txt = self._coerce_expr_kind(
+                        _cmp_spec["scalar_node"], self.expr(_cmp_spec["scalar_node"]), "real"
+                    )
+                    self.o.w(f"{name}%index = {df_expr}%index")
+                    self.o.w(f"{name}%columns = {df_expr}%columns")
+                    if _cmp_spec["df_left"]:
+                        self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {df_expr}%values {op_txt} {scalar_txt})")
+                    else:
+                        self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {scalar_txt} {op_txt} {df_expr}%values)")
+                return
+
+        # X = df.astype(float) -- a true no-op copy (see _pandas_df_astype_spec).
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _ast_spec = self._pandas_df_astype_spec(v)
+            if _ast_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_ast_spec["df_id"])
+                self.o.w(f"{name} = {src_expr}")
+                return
+
+        # X = df.fillna(scalar).
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _fn_spec = self._pandas_df_fillna_spec(v)
+            if _fn_spec is not None:
+                _fn_df_id = _fn_spec["df_id"]
+                if _fn_df_id is None:
+                    _fn_df_id = self._materialize_chained_df_call(_fn_spec["inner_call"], at_codegen=True)
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_fn_df_id)
+                fill_txt = self._coerce_expr_kind(_fn_spec["fill_node"], self.expr(_fn_spec["fill_node"]), "real")
+                self.o.w(f"{name} = {src_expr}")
+                self.o.w(f"{name}%values = merge({fill_txt}, {src_expr}%values, ieee_is_nan({src_expr}%values))")
+                return
+
+        # X = df.divide(other, axis=0) -- row-wise broadcast division.
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _dv_spec = self._pandas_df_divide_axis0_spec(v)
+            if _dv_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_dv_spec["df_id"])
+                other_txt = self.expr(_dv_spec["other_node"])
+                self.o.w(f"{name} = {src_expr}")
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"real(kind=dp), allocatable :: pdf_divide_denom(:, :)")
+                self.o.w(
+                    f"pdf_divide_denom = spread({other_txt}, dim=2, ncopies=ncol({src_expr}))"
+                )
+                # A zero divisor (e.g. no active positions that day) would
+                # otherwise trip -ffpe-trap=zero/invalid before the result
+                # ever reaches the .fillna(0.0) that real callers of this
+                # pattern always pair it with -- guard it to 1 (giving 0/1
+                # = 0 whenever the numerator is, as it structurally is
+                # here, also 0) instead of raising.
+                self.o.w(
+                    f"{name}%values = merge(0.0_dp, {src_expr}%values, pdf_divide_denom == 0.0_dp) / "
+                    f"merge(1.0_dp, pdf_divide_denom, pdf_divide_denom == 0.0_dp)"
+                )
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # X = df.sum(axis=1) / etc., assigned (see _pandas_df_row_reduction_spec).
+        if isinstance(t, ast.Name) and t.id not in self.pandas_df_vars:
+            _rr2_spec = self._pandas_df_row_reduction_spec(v)
+            if _rr2_spec is not None:
+                _rr2_df_id = _rr2_spec["df_id"]
+                if _rr2_df_id is None:
+                    _rr2_df_id = self._materialize_chained_df_call(_rr2_spec["inner_expr"], at_codegen=True)
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_rr2_df_id)
+                method = _rr2_spec["method"]
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: pdf_row_reduce_asn_i")
+                self.o.w(f"if (allocated({name})) deallocate({name})")
+                self.o.w(f"allocate({name}(size({src_expr}%values, 1)))")
+                self.o.w(f"do pdf_row_reduce_asn_i = 1, size({src_expr}%values, 1)")
+                self.o.push()
+                row_expr = f"{src_expr}%values(pdf_row_reduce_asn_i, :)"
+                # pandas' reductions default to skipna=True -- a row with
+                # some (but not all) NaN entries (e.g. the very first row
+                # after a .shift(1)/.pct_change() feeding into this) still
+                # reduces over the remaining values, not NaN, so these all
+                # use the nan*-prefixed helpers rather than the plain
+                # intrinsics/1d-helpers used elsewhere in this file for
+                # already-NaN-free columns.
+                if method == "mean":
+                    val_expr = f"nanmean({row_expr})"
+                elif method == "median":
+                    val_expr = f"quantile_linear(pack({row_expr}, .not. ieee_is_nan({row_expr})), 0.5_dp)"
+                elif method == "std":
+                    val_expr = f"nanstd({row_expr}, 1)"
+                elif method == "var":
+                    val_expr = f"nanvar({row_expr}, 1)"
+                elif method == "min":
+                    val_expr = f"nanmin({row_expr})"
+                elif method == "max":
+                    val_expr = f"nanmax({row_expr})"
+                elif method == "sum":
+                    val_expr = f"nansum({row_expr})"
+                elif method == "prod":
+                    val_expr = f"product(pack({row_expr}, .not. ieee_is_nan({row_expr})))"
+                else:
+                    raise NotImplementedError(f"df.{method}(axis=1) not supported")
+                self.o.w(f"{name}(pdf_row_reduce_asn_i) = {val_expr}")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
+        # X = Y.iloc[lo:hi] -- a slice of a plain rank-1 array (see
+        # _plain_array_iloc_slice_spec).
+        if isinstance(t, ast.Name):
+            _pis_spec = self._plain_array_iloc_slice_spec(v)
+            if _pis_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_pis_spec["base_id"])
+                trip = self._slice_triplet(_pis_spec["slice"], f"size({src_expr})")
+                self.o.w(f"{name} = {src_expr}({trip})")
                 return
 
         # X = pd.concat([df1, df2, ...][, axis=][, ignore_index=])
@@ -37144,6 +37960,25 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"write({name}%index({idx_var}), '(I0)') {idx_var} - 1")
                     self.o.pop()
                     self.o.w("end do")
+                return
+
+        # X = pd.DataFrame(index=[...], columns=[...]) -- no data argument:
+        # allocate %values to the given shape and broadcast-fill it NaN.
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _edf_spec = self._pandas_empty_df_construct_spec(v)
+            if _edf_spec is not None:
+                name = self._aliased_name(t.id)
+                idx_labels = _edf_spec["index"]
+                final_cols = _edf_spec["columns"]
+                col_len = max(10, max(len(c) for c in final_cols))
+                columns_txt = ", ".join(fstr(c) for c in final_cols)
+                idx_len = max(10, max(len(s) for s in idx_labels))
+                idx_lits = ", ".join(fstr(s) for s in idx_labels)
+                self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
+                self.o.w(f"{name}%index = [character(len={idx_len}) :: {idx_lits}]")
+                self.o.w(f"if (allocated({name}%values)) deallocate({name}%values)")
+                self.o.w(f"allocate({name}%values({len(idx_labels)}, {len(final_cols)}))")
+                self.o.w(f"{name}%values = ieee_value(0.0_dp, ieee_quiet_nan)")
                 return
 
         # X = pd.DataFrame([df.mean(), df.std(), ...], index=[...]) -- one
@@ -40269,12 +41104,23 @@ class translator(ast.NodeVisitor):
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
                 and isinstance(c.args[0].func, ast.Attribute)
-                and c.args[0].func.attr in {"mean", "median", "std", "min", "max", "sum"}
+                and c.args[0].func.attr in {"mean", "median", "std", "min", "max", "sum", "prod", "var"}
                 and len(c.args[0].args) == 0
+                and all(kw.arg == "axis" for kw in c.args[0].keywords)
+                and (
+                    not c.args[0].keywords
+                    or (
+                        isinstance(c.args[0].keywords[0].value, ast.Constant)
+                        and c.args[0].keywords[0].value.value in (0, 1)
+                    )
+                )
                 and self._is_pandas_df_ref_node(c.args[0].func.value)
             ):
+                _reduce_axis = 0
+                if c.args[0].keywords:
+                    _reduce_axis = c.args[0].keywords[0].value.value
                 self._emit_pandas_df_series_reduction_print(
-                    c.args[0], c.args[0].func.attr, context_node=orig_call
+                    c.args[0], c.args[0].func.attr, context_node=orig_call, axis=_reduce_axis
                 )
                 return
             if (
@@ -41215,7 +42061,7 @@ class translator(ast.NodeVisitor):
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
-    def _emit_pandas_df_series_reduction_print(self, call, method, context_node=None):
+    def _emit_pandas_df_series_reduction_print(self, call, method, context_node=None, axis=0):
         df_expr, col_names = self._pandas_df_ref(call.func.value, context_node or call)
         if not col_names:
             raise NotImplementedError(
@@ -41229,6 +42075,55 @@ class translator(ast.NodeVisitor):
         )
         df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind=_reduction_kind)
         self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
+        if axis == 1:
+            # df.sum(axis=1)/.mean(axis=1)/etc. -- one value per ROW
+            # (reduce across columns), unlike the axis=0 default below
+            # (one value per column, reduce down rows) -- printed against
+            # df's own row index/labels, not its column names.
+            self.o.w("integer :: pdf_row_reduce_i")
+            # size(...) rather than nrow(df_expr) -- a user script variable
+            # named "nrow" (unlucky, but real: see examples/xdf_sum.py) would
+            # collide with dataframe_str_index_mod's own nrow() function, and
+            # the text-level collision-rename pass that disambiguates the
+            # user's variable to "nrow_" doesn't distinguish it from an
+            # actual nrow(...) call, wrongly mangling this one too.
+            self.o.w(f"do pdf_row_reduce_i = 1, size({df_expr}%values, 1)")
+            self.o.push()
+            row_expr = f"{df_expr}%values(pdf_row_reduce_i, :)"
+            if method == "mean":
+                val_expr = f"mean_1d({row_expr})"
+            elif method == "median":
+                val_expr = f"quantile_linear({row_expr}, 0.5_dp)"
+            elif method == "std":
+                val_expr = f"std({row_expr}, 1)"
+            elif method == "min":
+                val_expr = f"minval({row_expr})"
+            elif method == "max":
+                val_expr = f"maxval({row_expr})"
+            elif method == "sum":
+                val_expr = f"sum({row_expr})"
+            elif method == "prod":
+                val_expr = f"product({row_expr})"
+            elif method == "var":
+                val_expr = f"var_1d({row_expr}, 1)"
+            elif method == "isna_sum":
+                val_expr = f"count(ieee_is_nan({row_expr}))"
+            else:
+                raise NotImplementedError(f"df.{method}(axis=1) printing not supported")
+            if _reduction_kind == "DataFrame_str_index":
+                label_expr = f"{df_expr}%index(pdf_row_reduce_i)"
+            else:
+                label_expr = f"{df_expr}%index(pdf_row_reduce_i)%to_str()"
+            if method == "isna_sum":
+                self.o.w(f"write(*,'(A10,I6)') {label_expr}, {val_expr}")
+            else:
+                self.o.w(f"write(*,'(A10,F12.6)') {label_expr}, {val_expr}")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.w(f"write(*,{fstr('(A)')}) 'dtype: {'int64' if method == 'isna_sum' else 'float64'}'")
+            self.o.pop()
+            self.o.w("end block")
+            return
         name_width = max(len(c) for c in col_names)
         for j, cname in enumerate(col_names, start=1):
             col_expr = f"{df_expr}%values(:, {j})"
@@ -41244,6 +42139,10 @@ class translator(ast.NodeVisitor):
                 val_expr = f"maxval({col_expr})"
             elif method == "sum":
                 val_expr = f"sum({col_expr})"
+            elif method == "prod":
+                val_expr = f"product({col_expr})"
+            elif method == "var":
+                val_expr = f"var_1d({col_expr}, 1)"
             elif method == "isna_sum":
                 val_expr = f"count(ieee_is_nan({col_expr}))"
             else:
@@ -53533,7 +54432,8 @@ def generate_flat(
             om.w(
                 "use dataframe_index_date_mod, only: DataFrame_index_date, nrow, ncol, date, "
                 "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
-                "operator(>), operator(>=), df_shape => shape"
+                "operator(>), operator(>=), operator(+), operator(-), operator(*), "
+                "operator(/), operator(**), df_shape => shape"
             )
         if _tree_uses_pandas_datetime_index(_proc_use_scan_tree):
             om.w(
@@ -53951,7 +54851,8 @@ def generate_flat(
         o.w(
             "use dataframe_index_date_mod, only: DataFrame_index_date, nrow, ncol, date, "
             "date_from_iso, operator(==), operator(/=), operator(<), operator(<=), "
-            "operator(>), operator(>=), df_shape => shape"
+            "operator(>), operator(>=), operator(+), operator(-), operator(*), "
+            "operator(/), operator(**), df_shape => shape"
         )
     if _tree_uses_pandas_datetime_index(_use_scan_tree):
         o.w(
@@ -55328,6 +56229,7 @@ def transpile_file(
     normalize_no_dates_price_csv_reader(effective_tree.body, local_funcs)
     normalize_csv_reader_list_calls(effective_tree.body, local_funcs)
     normalize_numpy_shape_assignments(effective_tree.body, local_funcs)
+    normalize_numpy_shape_kwarg_calls(effective_tree.body, local_funcs)
     normalize_scipy_minimize_args_wrapper(effective_tree.body, local_funcs)
     normalize_scipy_minimize_result_attrs(effective_tree.body, local_funcs)
     normalize_scipy_curve_fit_residual_helper(effective_tree.body, local_funcs)
