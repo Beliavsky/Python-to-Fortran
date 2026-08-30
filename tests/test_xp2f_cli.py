@@ -7074,3 +7074,233 @@ def test_xp2f_polyfit_poly1d_roots(tmp_path: Path) -> None:
             "print(r[0], r[1], r[2])",
         ],
     )
+
+
+def test_xp2f_linalg_pinv_and_matrix_power(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_pinv_matrix_power.py:
+    # np.linalg.pinv (new linalg_pinv helper: V * diag(1/s) * U^T via the
+    # existing economy-SVD helper) and np.linalg.matrix_power (new
+    # linalg_matrix_power helper: identity at p=0, repeated matmul for
+    # p>0, repeated matmul of inv(a) for p<0) were both unsupported.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlinalg_pinv_matrix_power.py",
+        [
+            "import numpy as np",
+            "",
+            "A = np.array([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]])",
+            "Ap = np.linalg.pinv(A)",
+            "recon = A.dot(Ap).dot(A)",
+            "err_norm = np.sqrt(((recon - A) * (recon - A)).sum())",
+            "print(Ap.shape[0], Ap.shape[1])",
+            "print(err_norm)",
+            "",
+            "B = np.array([[2.0, 1.0], [0.0, 2.0]])",
+            "B3 = np.linalg.matrix_power(B, 3)",
+            "B0 = np.linalg.matrix_power(B, 0)",
+            "print(B3[0, 0], B3[0, 1], B3[1, 0], B3[1, 1])",
+            "print(B0[0, 0], B0[0, 1], B0[1, 0], B0[1, 1])",
+        ],
+    )
+
+
+def test_xp2f_linalg_eigvalsh_and_multi_dot(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_eigvalsh_multidot.py:
+    # np.linalg.eigvalsh (new linalg_eigvalsh helper: LAPACK DSYEV with
+    # jobz='N', eigenvalues only) and np.linalg.multi_dot (a literal
+    # list of matrices, chained left-to-right via matmul) were both
+    # unsupported.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlinalg_eigvalsh_multidot.py",
+        [
+            "import numpy as np",
+            "",
+            "A = np.array([[4.0, 1.0, 1.0], [1.0, 3.0, 0.5], [1.0, 0.5, 2.0]])",
+            "w = np.linalg.eigvalsh(A)",
+            "print(w[0], w[1], w[2])",
+            "",
+            "X = np.array([[1.0, 2.0], [3.0, 4.0]])",
+            "Y = np.array([[5.0, 6.0], [7.0, 8.0]])",
+            "Z = np.array([[1.0, 0.0], [0.0, 1.0]])",
+            "M = np.linalg.multi_dot([X, Y, Z])",
+            "print(M[0, 0], M[0, 1], M[1, 0], M[1, 1])",
+        ],
+    )
+
+
+def test_xp2f_tensordot(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_tensordot.py:
+    # np.tensordot was unsupported; added for the 2D-input subset
+    # (axes=1 -- same as matmul; axes=2 -- full elementwise-product sum,
+    # a scalar).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtensordot.py",
+        [
+            "import numpy as np",
+            "",
+            "A = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])",
+            "B = np.array([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])",
+            "t1 = np.tensordot(A, B, axes=1)",
+            "print(t1[0, 0], t1[0, 1], t1[1, 0], t1[1, 1])",
+            "",
+            "C = np.array([[1.0, 2.0], [3.0, 4.0]])",
+            "D = np.array([[5.0, 6.0], [7.0, 8.0]])",
+            "t2 = np.tensordot(C, D, axes=2)",
+            "print(t2)",
+        ],
+    )
+
+
+def test_xp2f_select_piecewise_digitize(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_select_piecewise_digitize.py:
+    # np.select, np.piecewise, and np.digitize were all unsupported.
+    #
+    # select/piecewise are lowered as a merge() chain over condlist,
+    # processed last-to-first so the highest-priority (first) condition
+    # wins; both require condlist/choicelist (or funclist) as literal
+    # lists at the call site.
+    #
+    # piecewise additionally needed a fix beyond the merge-chain codegen
+    # itself: funclist[i](x) is synthesized as call text rather than a
+    # literal ast.Call node, so the normal call-hint scan that infers a
+    # local function's own parameter type never saw it as evidence --
+    # each function's parameter defaulted to INTEGER regardless of x's
+    # real type, causing a build-time type mismatch. Fixed by a
+    # dedicated _record_piecewise_call_hints pass that seeds the same
+    # call-hint structures directly for this call shape.
+    #
+    # digitize is a new digitize_real helper (right=False, increasing
+    # bins: count of bin edges <= x(i)).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xselect_piecewise_digitize.py",
+        [
+            "import numpy as np",
+            "",
+            "x = np.array([-3.0, -1.0, 0.0, 2.0, 5.0])",
+            "",
+            "sel = np.select(",
+            "    [x < -2.0, (x >= -2.0) & (x < 1.0), x >= 1.0],",
+            "    [x * 10.0, x * 100.0, x * 1000.0],",
+            ")",
+            "print(sel[0], sel[1], sel[2], sel[3], sel[4])",
+            "",
+            "",
+            "def neg_branch(v):",
+            "    return -v",
+            "",
+            "",
+            "def pos_branch(v):",
+            "    return v * v",
+            "",
+            "",
+            "pw = np.piecewise(x, [x < 0.0, x >= 0.0], [neg_branch, pos_branch])",
+            "print(pw[0], pw[1], pw[2], pw[3], pw[4])",
+            "",
+            "bins = np.array([-2.0, 0.0, 2.0, 4.0])",
+            "idx = np.digitize(x, bins)",
+            "print(idx[0], idx[1], idx[2], idx[3], idx[4])",
+        ],
+    )
+
+
+def test_xp2f_histogram2d(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_histogram2d.py:
+    # np.histogram2d(x, y, bins=[xedges, yedges]) was unsupported
+    # (tuple-unpack assign). Added via a new histogram2d_real_edges
+    # helper, mirroring the existing 1D histogram_real_edges helper's
+    # right-inclusive-last-bin convention applied independently on
+    # each axis, and requires bins as a literal [xedges, yedges] list
+    # at the call site (matching this codebase's scoping convention for
+    # other literal-list-argument features).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xhistogram2d.py",
+        [
+            "import numpy as np",
+            "",
+            "x = np.array([0.5, 1.5, 1.5, 2.5, 0.5, 2.5])",
+            "y = np.array([0.5, 0.5, 1.5, 1.5, 1.5, 0.5])",
+            "xedges = np.array([0.0, 1.0, 2.0, 3.0])",
+            "yedges = np.array([0.0, 1.0, 2.0])",
+            "H, xe, ye = np.histogram2d(x, y, bins=[xedges, yedges])",
+            "print(H.shape[0], H.shape[1])",
+            "for i in range(3):",
+            "    print(H[i, 0], H[i, 1])",
+            "print(H.sum())",
+        ],
+    )
+
+
+def test_xp2f_apply_along_axis(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_apply_along_axis.py:
+    # np.apply_along_axis was unsupported. Added for the 2D-array
+    # subset where func returns a scalar per row/column slice -- lowered
+    # as an explicit block+do-loop (not a Fortran implied-DO array
+    # constructor, since that construct's index variable is not
+    # auto-declared under implicit none and a first attempt at that hit
+    # exactly that "no IMPLICIT type" build failure), only supported as
+    # the entire right-hand side of a direct assignment.
+    #
+    # Also exercises a second, independent pre-existing bug this
+    # surfaced: `arr.max(axis=1) - arr.min(axis=1)` (and the analogous
+    # `.min`) was wrongly inferred as a scalar (rank 0) by _rank_expr,
+    # because a generic "bare .max()/.min() with zero args -> scalar"
+    # branch only checked positional arg count and didn't exclude calls
+    # that have an `axis=` keyword (which have zero positional args
+    # too), so it wrongly intercepted `.max(axis=1)` before the correct,
+    # later axis-aware reduction-rank branch was ever reached. Fixed by
+    # also requiring `not node.keywords` on that early branch.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xapply_along_axis.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def value_range(v):",
+            "    return v.max() - v.min()",
+            "",
+            "",
+            "A = np.array([[1.0, 5.0, 3.0], [4.0, 2.0, 8.0], [7.0, 6.0, 0.0]])",
+            "r_rows = np.apply_along_axis(value_range, 1, A)",
+            "r_cols = np.apply_along_axis(value_range, 0, A)",
+            "print(r_rows[0], r_rows[1], r_rows[2])",
+            "print(r_cols[0], r_cols[1], r_cols[2])",
+            "",
+            "r_rows_direct = A.max(axis=1) - A.min(axis=1)",
+            "r_cols_direct = A.max(axis=0) - A.min(axis=0)",
+            "print(r_rows_direct[0], r_rows_direct[1], r_rows_direct[2])",
+            "print(r_cols_direct[0], r_cols_direct[1], r_cols_direct[2])",
+        ],
+    )
+
+
+def test_xp2f_np_save_load_1d_real_npy_roundtrip(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_save_load.py:
+    # np.save/np.load (binary .npy files) were unsupported -- only
+    # text-based loadtxt/genfromtxt/savetxt existed. Added new
+    # np_save_1d_real/np_load_1d_real helpers implementing the real
+    # NumPy .npy binary format (magic + version + header dict padded to
+    # a 64-byte-aligned preamble + raw float64 data) for the 1D-real-
+    # array subset, verified as genuinely interoperable with real numpy
+    # in both directions (not just self-consistent): a file numpy wrote
+    # was read correctly by the transpiled binary, and a file the
+    # transpiled binary wrote was read correctly by real numpy.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_save_load.py",
+        [
+            "import numpy as np",
+            "",
+            "a = np.array([1.5, -2.25, 3.0, 0.0, 42.75])",
+            "np.save('xnp_save_load_scratch.npy', a)",
+            "b = np.load('xnp_save_load_scratch.npy')",
+            "diff = np.abs(a - b).sum()",
+            "print(b.shape[0])",
+            "print(diff)",
+            "print(b[0], b[1], b[2], b[3], b[4])",
+        ],
+    )

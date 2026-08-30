@@ -7593,6 +7593,7 @@ def detect_needed_helpers(tree):
         "bincount": {"bincount_int"},
         "searchsorted": {"searchsorted_left_int", "searchsorted_right_int", "searchsorted_left_int_scalar", "searchsorted_right_int_scalar"},
         "histogram": {"histogram"},
+        "histogram2d": {"histogram2d_real_edges"},
         "setdiff1d": {"setdiff1d_int"},
         "intersect1d": {"intersect1d_int"},
         "lexsort": {"lexsort2_int", "lexsort2_real"},
@@ -7638,6 +7639,9 @@ def detect_needed_helpers(tree):
         "polyder": {"polyder"},
         "polyfit": {"polyfit_real"},
         "roots": {"polyroots_real"},
+        "digitize": {"digitize_real"},
+        "load": {"np_load_1d_real"},
+        "save": {"np_save_1d_real"},
     }
     np_reduceat_helper_map = {
         "add": {"reduceat_add"},
@@ -8639,6 +8643,12 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_eigh")
                 elif node.func.attr == "qr":
                     needed.add("linalg_qr_reduced")
+                elif node.func.attr == "pinv":
+                    needed.add("linalg_pinv")
+                elif node.func.attr == "matrix_power":
+                    needed.add("linalg_matrix_power")
+                elif node.func.attr == "eigvalsh":
+                    needed.add("linalg_eigvalsh")
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "leggauss"
@@ -8678,6 +8688,12 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_qr_reduced")
                 elif node.func.attr == "lstsq":
                     needed.add("linalg_solve")
+                elif node.func.attr == "pinv":
+                    needed.add("linalg_pinv")
+                elif node.func.attr == "matrix_power":
+                    needed.add("linalg_matrix_power")
+                elif node.func.attr == "eigvalsh":
+                    needed.add("linalg_eigvalsh")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -16673,6 +16689,40 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
+                and node.func.attr == "tensordot"
+                and len(node.args) >= 2
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "load"
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"select", "piecewise"}
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "apply_along_axis"
+                and len(node.args) >= 3
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "digitize"
+                and len(node.args) >= 2
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "interp"
                 and len(node.args) >= 3
             ):
@@ -16728,7 +16778,7 @@ class translator(ast.NodeVisitor):
                 return "int"
             if self._is_linalg_call(node.func, {"eigvals"}) and len(node.args) >= 1:
                 return "complex"
-            if self._is_linalg_call(node.func, {"solve", "cholesky", "det", "inv", "cond", "eig", "eigh", "svd", "qr", "lstsq"}):
+            if self._is_linalg_call(node.func, {"solve", "cholesky", "det", "inv", "cond", "eig", "eigh", "svd", "qr", "lstsq", "pinv", "matrix_power", "eigvalsh", "multi_dot"}):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -21170,6 +21220,24 @@ class translator(ast.NodeVisitor):
                     return self._rank_expr(node.args[0]) + 1
                 if node.func.attr == "squeeze" and len(node.args) >= 1:
                     return 1
+                if node.func.attr == "load" and len(node.args) >= 1:
+                    return 1
+                if node.func.attr == "apply_along_axis" and len(node.args) >= 3:
+                    return max(0, self._rank_expr(node.args[2]) - 1)
+                if node.func.attr == "select" and len(node.args) >= 2 and isinstance(node.args[1], (ast.List, ast.Tuple)) and node.args[1].elts:
+                    return self._rank_expr(node.args[1].elts[0])
+                if node.func.attr == "piecewise" and len(node.args) >= 1:
+                    return self._rank_expr(node.args[0])
+                if node.func.attr == "digitize" and len(node.args) >= 1:
+                    return self._rank_expr(node.args[0])
+                if node.func.attr == "tensordot" and len(node.args) >= 2:
+                    _axes = 2
+                    if len(node.args) >= 3 and isinstance(node.args[2], ast.Constant) and isinstance(node.args[2].value, int):
+                        _axes = node.args[2].value
+                    for _kw in node.keywords:
+                        if _kw.arg == "axes" and isinstance(_kw.value, ast.Constant) and isinstance(_kw.value.value, int):
+                            _axes = _kw.value.value
+                    return 0 if _axes >= 2 else 2
                 if node.func.attr in {"matmul", "dot"} and len(node.args) >= 2:
                     r1 = self._rank_expr(node.args[0])
                     r2 = self._rank_expr(node.args[1])
@@ -21377,6 +21445,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"ravel", "flatten", "squeeze", "argmin", "argmax", "min", "max", "copy"}
                 and len(node.args) == 0
+                and not node.keywords
             ):
                 if node.func.attr in {"ravel", "flatten"}:
                     return 1
@@ -21399,6 +21468,14 @@ class translator(ast.NodeVisitor):
                     return 2
                 if node.func.attr == "cond" and len(node.args) >= 1:
                     return 0
+                if node.func.attr == "pinv" and len(node.args) >= 1:
+                    return 2
+                if node.func.attr == "matrix_power" and len(node.args) >= 1:
+                    return 2
+                if node.func.attr == "eigvalsh" and len(node.args) >= 1:
+                    return 1
+                if node.func.attr == "multi_dot" and len(node.args) >= 1:
+                    return 2
             if self._pandas_df_row_reduction_spec(node) is not None:
                 # X.sum(axis=1)/etc. on a DataFrame (or a chained
                 # DataFrame-producing expression like `(signal != 0.0)`) --
@@ -26121,6 +26198,33 @@ class translator(ast.NodeVisitor):
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
                 return f"linalg_inv({_a0})"
+            if self._is_linalg_call(node.func, {"pinv"}) and len(node.args) >= 1:
+                _a0 = self.expr(node.args[0])
+                if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    _a0 = f"real({_a0}, kind=dp)"
+                return f"linalg_pinv({_a0})"
+            if self._is_linalg_call(node.func, {"eigvalsh"}) and len(node.args) >= 1:
+                _a0 = self.expr(node.args[0])
+                if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    _a0 = f"real({_a0}, kind=dp)"
+                return f"linalg_eigvalsh({_a0})"
+            if self._is_linalg_call(node.func, {"matrix_power"}) and len(node.args) >= 2:
+                _a0 = self.expr(node.args[0])
+                if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    _a0 = f"real({_a0}, kind=dp)"
+                return f"linalg_matrix_power({_a0}, int({self.expr(node.args[1])}))"
+            if self._is_linalg_call(node.func, {"multi_dot"}) and len(node.args) >= 1:
+                # np.linalg.multi_dot([A, B, C, ...]) -- chained matmul in
+                # source order (numpy internally picks the cheapest
+                # parenthesization; correctness doesn't depend on that, so
+                # a plain left-to-right chain is enough here).
+                _mats = node.args[0]
+                if not isinstance(_mats, (ast.List, ast.Tuple)) or len(_mats.elts) < 2:
+                    raise NotImplementedError("np.linalg.multi_dot requires a literal list/tuple of at least 2 matrices")
+                _chain = self.expr(_mats.elts[0])
+                for _m in _mats.elts[1:]:
+                    _chain = f"matmul({_chain}, {self.expr(_m)})"
+                return _chain
             if self._is_linalg_call(node.func, {"cond"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
@@ -26188,6 +26292,126 @@ class translator(ast.NodeVisitor):
                 a1 = self.expr(node.args[2])
                 a2 = self.expr(node.args[3])
                 return f"sum(matmul({a0}, {a1}) * {a2}, dim=2)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "tensordot"
+                and len(node.args) >= 2
+            ):
+                # 2D-input subset: axes=1 (contract the last axis of the
+                # first operand with the first axis of the second -- same
+                # as a standard 2D matmul) and axes=2 (contract both axes
+                # -- full elementwise-product-and-sum, a scalar). General
+                # N-D tensordot with an explicit (axes_a, axes_b) pair is
+                # not handled.
+                _axes_node = node.args[2] if len(node.args) >= 3 else None
+                for _kw in node.keywords:
+                    if _kw.arg == "axes":
+                        _axes_node = _kw.value
+                        break
+                _axes = 2
+                if _axes_node is not None:
+                    if not (isinstance(_axes_node, ast.Constant) and isinstance(_axes_node.value, int)):
+                        raise NotImplementedError("np.tensordot currently supports only a literal integer axes")
+                    _axes = _axes_node.value
+                _a0 = self.expr(node.args[0])
+                _a1 = self.expr(node.args[1])
+                if _axes == 1:
+                    return f"matmul({_a0}, {_a1})"
+                if _axes == 2:
+                    return f"sum({_a0} * {_a1})"
+                raise NotImplementedError("np.tensordot currently supports only axes=1 or axes=2 on 2D inputs")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "apply_along_axis"
+                and len(node.args) >= 3
+            ):
+                # Only supported as the entire RHS of a direct `name =
+                # np.apply_along_axis(...)` assignment -- see the
+                # dedicated visit_Assign branch, which needs a real
+                # declared DO-loop index (an implied-DO array
+                # constructor's index variable is not auto-declared
+                # under implicit none) and so can't be expressed as a
+                # plain sub-expression returned from here.
+                raise NotImplementedError("np.apply_along_axis is currently only supported as the entire right-hand side of a direct assignment")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "select"
+                and len(node.args) >= 2
+            ):
+                # np.select(condlist, choicelist, default=0): first-match-
+                # wins over condlist, in order. Built as a merge() chain,
+                # processed last-to-first so an earlier (higher-priority)
+                # condition's merge is applied last and so wins. condlist/
+                # choicelist must be literal lists/tuples at the call site
+                # (matching the scoping already used for
+                # np.linalg.multi_dot's matrix list).
+                _condlist = node.args[0]
+                _choicelist = node.args[1]
+                if not (isinstance(_condlist, (ast.List, ast.Tuple)) and isinstance(_choicelist, (ast.List, ast.Tuple))):
+                    raise NotImplementedError("np.select currently requires condlist and choicelist as literal lists at the call site")
+                if len(_condlist.elts) != len(_choicelist.elts) or not _condlist.elts:
+                    raise NotImplementedError("np.select condlist and choicelist must be the same non-zero length")
+                _default_txt = "0.0_dp"
+                for kw in node.keywords:
+                    if kw.arg == "default":
+                        _default_txt = self.expr(kw.value)
+                _result = _default_txt
+                for _cond, _choice in zip(reversed(_condlist.elts), reversed(_choicelist.elts)):
+                    _result = f"merge({self.expr(_choice)}, {_result}, {self.expr(_cond)})"
+                return _result
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "piecewise"
+                and len(node.args) >= 3
+            ):
+                # np.piecewise(x, condlist, funclist): same merge-chain
+                # idea as np.select, but each "choice" is func(x) for a
+                # local function referenced by name in funclist (a
+                # literal list at the call site) -- relies on
+                # local_elemental_funcs already allowing an elemental
+                # local function to be called directly on an array
+                # argument. The condlist/funclist-length-plus-one
+                # "trailing default value/function" numpy form is not
+                # handled.
+                _x_node = node.args[0]
+                _condlist = node.args[1]
+                _funclist = node.args[2]
+                if not (isinstance(_condlist, (ast.List, ast.Tuple)) and isinstance(_funclist, (ast.List, ast.Tuple))):
+                    raise NotImplementedError("np.piecewise currently requires condlist and funclist as literal lists at the call site")
+                if len(_condlist.elts) != len(_funclist.elts) or not _condlist.elts:
+                    raise NotImplementedError("np.piecewise currently requires condlist and funclist of the same non-zero length (no trailing default)")
+                for _fn in _funclist.elts:
+                    if not isinstance(_fn, ast.Name):
+                        raise NotImplementedError("np.piecewise funclist entries must be plain function names")
+                _x_txt = self.expr(_x_node)
+                _result = "0.0_dp"
+                for _cond, _fn in zip(reversed(_condlist.elts), reversed(_funclist.elts)):
+                    _result = f"merge({_fn.id}({_x_txt}), {_result}, {self.expr(_cond)})"
+                return _result
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "digitize"
+                and len(node.args) >= 2
+            ):
+                return f"digitize_real({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"np", "numpy"}
+                and node.func.attr == "load"
+                and len(node.args) >= 1
+            ):
+                return f"np_load_1d_real({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -30467,6 +30691,21 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_int(outs[1], rank=1)
                         else:
                             self._mark_alloc_real(outs[1], rank=1)
+                        continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and isinstance(node.value.func.value, ast.Name)
+                    and node.value.func.value.id == "np"
+                    and node.value.func.attr == "histogram2d"
+                ):
+                    outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
+                    if len(outs) >= 3:
+                        self._mark_alloc_int(outs[0], rank=2)
+                        self._mark_alloc_real(outs[1], rank=1)
+                        self._mark_alloc_real(outs[2], rank=1)
                         continue
                 if (
                     len(node.targets) == 1
@@ -35553,6 +35792,42 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("np.histogram currently requires explicit bins")
             self.o.w(f"call histogram({xname}, {self.expr(bins_node)}, {outs[0]}, {outs[1]})")
             return
+        # tuple unpacking from np.histogram2d(x, y, bins=[xedges, yedges])
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr == "histogram2d"
+        ):
+            outs = []
+            for e in t.elts:
+                if not isinstance(e, ast.Name):
+                    raise NotImplementedError("tuple assignment targets must be names")
+                outs.append(e.id)
+            if len(outs) < 3 or len(v.args) < 2:
+                raise NotImplementedError("np.histogram2d assignment expects three outputs and x, y input arrays")
+            xname = self.expr(v.args[0])
+            yname = self.expr(v.args[1])
+            bins_node = v.args[2] if len(v.args) >= 3 else None
+            for kw in v.keywords:
+                if kw.arg == "bins":
+                    bins_node = kw.value
+                elif kw.arg in {"range", "weights", "density"}:
+                    raise NotImplementedError(f"np.histogram2d keyword '{kw.arg}' is not yet supported")
+            if (
+                bins_node is None
+                or not isinstance(bins_node, (ast.List, ast.Tuple))
+                or len(bins_node.elts) != 2
+            ):
+                raise NotImplementedError("np.histogram2d currently requires explicit bins=[xedges, yedges]")
+            xedges_txt = self.expr(bins_node.elts[0])
+            yedges_txt = self.expr(bins_node.elts[1])
+            self.o.w(f"call histogram2d_real_edges({xname}, {yname}, {xedges_txt}, {yedges_txt}, {outs[0]})")
+            self.o.w(f"{outs[1]} = {xedges_txt}")
+            self.o.w(f"{outs[2]} = {yedges_txt}")
+            return
         # tuple unpacking from os.path.splitext(path):
         #   head, tail = os.path.splitext(filename)
         if (
@@ -37272,6 +37547,46 @@ class translator(ast.NodeVisitor):
             and len(v.args) >= 1
         ):
             self.o.w(f"{self._aliased_name(t.id)} = {self.expr(v.args[0])}")
+            return
+
+        # name = np.apply_along_axis(func, axis, arr) -- 2D-array subset:
+        # func is applied to each row (axis=1) or column (axis=0) 1D
+        # slice and must return a scalar. Emitted as an explicit block
+        # with a real declared loop index (an implied-DO array
+        # constructor's index variable is not auto-declared under
+        # implicit none, unlike this project's other implied-DO uses
+        # which happen to sit in a `use ... implicit none`-free context
+        # -- safest to just declare it here rather than rely on that).
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"np", "numpy"}
+            and v.func.attr == "apply_along_axis"
+            and len(v.args) >= 3
+        ):
+            _func_node, _axis_node, _arr_node = v.args[0], v.args[1], v.args[2]
+            if not isinstance(_func_node, ast.Name):
+                raise NotImplementedError("np.apply_along_axis currently requires a plain function name")
+            if not (isinstance(_axis_node, ast.Constant) and isinstance(_axis_node.value, int) and _axis_node.value in (0, 1)):
+                raise NotImplementedError("np.apply_along_axis currently requires a literal axis of 0 or 1")
+            _name = self._aliased_name(t.id)
+            _arr_txt = self.expr(_arr_node)
+            _n_txt = f"size({_arr_txt}, 1)" if _axis_node.value == 1 else f"size({_arr_txt}, 2)"
+            _slice_txt = f"{_arr_txt}(i_apply_axis, :)" if _axis_node.value == 1 else f"{_arr_txt}(:, i_apply_axis)"
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: i_apply_axis")
+            self.o.w(f"if (allocated({_name})) deallocate({_name})")
+            self.o.w(f"allocate({_name}(1:{_n_txt}))")
+            self.o.w(f"do i_apply_axis = 1, {_n_txt}")
+            self.o.push()
+            self.o.w(f"{_name}(i_apply_axis) = {_func_node.id}({_slice_txt})")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         # x = np.random.rand(n0, n1, ...) / np.random.randn(n0, n1, ...)
@@ -41670,6 +41985,22 @@ class translator(ast.NodeVisitor):
         if not isinstance(node.value, ast.Call):
             raise NotImplementedError("only call expressions supported")
         c = node.value
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Name)
+            and c.func.value.id in {"np", "numpy"}
+            and c.func.attr == "save"
+            and len(c.args) >= 2
+        ):
+            # np.save(path, arr) -- 1D real array subset, writing a real
+            # .npy file (magic + version + JSON-ish header dict + raw
+            # little-endian float64 data) via np_save_1d_real. See
+            # np_load_1d_real for the matching reader.
+            if self._rank_expr(c.args[1]) != 1 or self._expr_kind(c.args[1]) != "real":
+                raise NotImplementedError("np.save currently supports only 1D real arrays")
+            self.o.w(f"call np_save_1d_real({self.expr(c.args[0])}, {self.expr(c.args[1])})")
+            return
 
         if (
             isinstance(c.func, ast.Attribute)
@@ -52454,8 +52785,65 @@ def generate_flat(
                                         rks[i].add(pk)
                                         rk[i] = _promote_kind_hint(rk[i], pk)
 
+        def _record_piecewise_call_hints(scan_node, tr_ctx):
+            # np.piecewise(x, condlist, funclist) implicitly calls each
+            # funclist[i](x), and np.apply_along_axis(func, axis, arr)
+            # implicitly calls func(slice) once per row/column slice of
+            # arr -- but neither call ever appears as a literal `fn(...)`
+            # ast.Call node anywhere in the source (both are synthesized
+            # directly as text in expr()'s Call dispatch), so the normal
+            # _record_call_hints scan above (which only walks real
+            # ast.Call nodes) never sees this evidence and each
+            # function's own parameter defaults to int. Seed the same
+            # call_rank_hints/call_kind_hints (and friends) structures
+            # directly here, as if the call had appeared literally.
+            def _seed(callee, ar, ak):
+                if callee not in call_rank_hints or not call_rank_hints[callee]:
+                    return
+                call_rank_hints[callee][0] = max(call_rank_hints[callee][0], ar)
+                call_rank_sets[callee][0].add(ar)
+                if ak is not None:
+                    call_kind_sets[callee][0].add(ak)
+                    call_kind_rank_pairs[callee][0].add((ak, ar))
+                    call_kind_rank_islist[callee][0].add((ak, ar, False))
+                    if call_kind_hints[callee][0] is None:
+                        call_kind_hints[callee][0] = ak
+                    elif call_kind_hints[callee][0] != ak:
+                        if "real" in {call_kind_hints[callee][0], ak} and "logical" not in {call_kind_hints[callee][0], ak}:
+                            call_kind_hints[callee][0] = "real"
+
+            for n in ast.walk(scan_node):
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id in {"np", "numpy"}
+                    and n.func.attr == "piecewise"
+                    and len(n.args) >= 3
+                    and isinstance(n.args[2], (ast.List, ast.Tuple))
+                ):
+                    _xr = tr_ctx._rank_expr(n.args[0])
+                    _xk = tr_ctx._expr_kind(n.args[0])
+                    for _fn in n.args[2].elts:
+                        if isinstance(_fn, ast.Name):
+                            _seed(_fn.id, _xr, _xk)
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id in {"np", "numpy"}
+                    and n.func.attr == "apply_along_axis"
+                    and len(n.args) >= 3
+                    and isinstance(n.args[0], ast.Name)
+                ):
+                    # func receives a 1D slice -- one axis fewer than arr.
+                    _slice_r = max(0, tr_ctx._rank_expr(n.args[2]) - 1)
+                    _slice_k = tr_ctx._expr_kind(n.args[2])
+                    _seed(n.args[0].id, _slice_r, _slice_k)
+
         for st in _top_level_scan_nodes:
             _record_call_hints(st, tr_seed, None)
+            _record_piecewise_call_hints(st, tr_seed)
         for _fn_scan in (local_funcs or []):
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
@@ -52476,6 +52864,7 @@ def generate_flat(
             )
             tr_local_scan.prescan(_fn_scan.body)
             _record_call_hints(_fn_scan, tr_local_scan, _fn_scan)
+            _record_piecewise_call_hints(_fn_scan, tr_local_scan)
 
     def _apply_c8_container_return_hints(_specs):
         _c8_noncomplex_returns = {

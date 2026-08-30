@@ -226,6 +226,7 @@ public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:i
 public :: kron_2d !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),b:integer(:,:):intent(in) desc="2D Kronecker product for integer matrices"
 public :: histogram_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:integer(:):intent(out),edges:real(dp)(:):intent(out) desc="1D histogram with explicit real bin edges"
 public :: histogram_int_edges !@pyapi kind=subroutine args=x:integer(:):intent(in),bins:integer(:):intent(in),h:integer(:):intent(out),edges:integer(:):intent(out) desc="1D histogram with explicit integer bin edges"
+public :: histogram2d_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),xbins:real(dp)(:):intent(in),ybins:real(dp)(:):intent(in),h:integer(:,:):intent(out) desc="2D histogram with explicit real bin edges on both axes"
 public :: reduceat_add_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for real vector"
 public :: reduceat_add_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for integer vector"
 public :: reduceat_mul_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.multiply.reduceat for real vector"
@@ -258,6 +259,9 @@ public :: linalg_matrix_rank !@pyapi kind=function ret=integer args=a:real(dp)(:
 public :: linalg_eigvals !@pyapi kind=function ret=complex(dp)(:) args=a:real(dp)(:,:):intent(in) desc="eigenvalues of real square matrix using LAPACK DGEEV"
 public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="right eigenpairs of real square matrix using LAPACK DGEEV (real-spectrum only)"
 public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
+public :: linalg_eigvalsh !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) desc="eigenvalues only of real symmetric matrix using LAPACK DSYEV (jobz='N')"
+public :: linalg_pinv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="Moore-Penrose pseudo-inverse via economy SVD"
+public :: linalg_matrix_power !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),p:integer:intent(in) desc="integer matrix power (identity at p=0, repeated matmul of inv(a) for p<0)"
 public :: linalg_qr_reduced !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),q:real(dp)(:,:):intent(out),r:real(dp)(:,:):intent(out) desc="reduced QR factorization using LAPACK DGEQRF/DORGQR"
 public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="full SVD using LAPACK DGESVD"
 public :: linalg_svd_econ !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="economy/reduced SVD (full_matrices=False) using LAPACK DGESVD"
@@ -344,6 +348,9 @@ public :: reduceat_max
 public :: polyval
 public :: polyder
 public :: polyfit_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in) desc="least-squares polynomial fit (deg+1 coefficients, highest degree first), matching numpy.polyfit"
+public :: digitize_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in) desc="bin index of each x(i) against increasing bin edges, matching numpy.digitize (right=False)"
+public :: np_save_1d_real !@pyapi kind=subroutine args=filename:character(*):intent(in),x:real(dp)(:):intent(in) desc="write a 1D real array to a binary .npy file, matching numpy.save"
+public :: np_load_1d_real !@pyapi kind=function ret=real(dp)(:) args=filename:character(*):intent(in) desc="read a 1D real array from a binary .npy file, matching numpy.load"
 
 public :: rolling_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in) desc="rolling mean over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
 public :: rolling_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in),ddof:integer:intent(in) desc="rolling sample standard deviation over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
@@ -3434,6 +3441,51 @@ contains
          end do
       end subroutine histogram_int_edges
 
+      subroutine histogram2d_real_edges(x, y, xbins, ybins, h)
+         ! 2D histogram with explicit real bin edges on both axes,
+         ! matching numpy.histogram2d(x, y, bins=[xbins, ybins]): same
+         ! per-axis binning rule as histogram_real_edges (last bin is
+         ! right-inclusive), applied independently to x against xbins
+         ! and y against ybins, then counted jointly.
+         real(kind=dp), intent(in) :: x(:), y(:), xbins(:), ybins(:)
+         integer, allocatable, intent(out) :: h(:,:)
+         integer :: i, j, ix, iy, nxb, nyb
+         logical :: placed
+         nxb = size(xbins) - 1
+         nyb = size(ybins) - 1
+         if (nxb < 1 .or. nyb < 1) error stop 'histogram2d_real_edges: bins must have at least 2 entries'
+         allocate(h(1:nxb, 1:nyb), source=0)
+         do i = 1, size(x)
+            if (x(i) < xbins(1) .or. x(i) > xbins(nxb + 1)) cycle
+            if (y(i) < ybins(1) .or. y(i) > ybins(nyb + 1)) cycle
+            ix = 0
+            placed = .false.
+            do j = 1, nxb - 1
+               if (x(i) >= xbins(j) .and. x(i) < xbins(j + 1)) then
+                  ix = j
+                  placed = .true.
+                  exit
+               end if
+            end do
+            if (.not. placed) then
+               if (x(i) >= xbins(nxb) .and. x(i) <= xbins(nxb + 1)) ix = nxb
+            end if
+            iy = 0
+            placed = .false.
+            do j = 1, nyb - 1
+               if (y(i) >= ybins(j) .and. y(i) < ybins(j + 1)) then
+                  iy = j
+                  placed = .true.
+                  exit
+               end if
+            end do
+            if (.not. placed) then
+               if (y(i) >= ybins(nyb) .and. y(i) <= ybins(nyb + 1)) iy = nyb
+            end if
+            if (ix > 0 .and. iy > 0) h(ix, iy) = h(ix, iy) + 1
+         end do
+      end subroutine histogram2d_real_edges
+
       function reduceat_add_real(x, idx) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
@@ -5519,6 +5571,96 @@ contains
          allocate(v(1:n,1:n), source=ac)
       end subroutine linalg_eigh
 
+      function linalg_eigvalsh(a) result(w)
+         ! Eigenvalues only of a real symmetric matrix, matching
+         ! numpy.linalg.eigvalsh -- same LAPACK DSYEV as linalg_eigh but
+         ! with jobz='N' (skip computing eigenvectors).
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable :: w(:)
+         real(kind=dp), allocatable :: ac(:,:), work(:)
+         integer :: n, info, lwork
+         interface
+            subroutine dsyev(jobz, uplo, n, a, lda, w, work, lwork, info)
+               character(len=1), intent(in) :: jobz, uplo
+               integer, intent(in) :: n, lda, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*), work(*)
+               double precision, intent(out) :: w(*)
+            end subroutine dsyev
+         end interface
+         n = size(a,1)
+         if (size(a,2) /= n) stop "linalg_eigvalsh: matrix must be square"
+         allocate(ac(1:n,1:n), source=a)
+         allocate(w(1:n))
+         allocate(work(1))
+         lwork = -1
+         call dsyev('N', 'U', n, ac, n, w, work, lwork, info)
+         if (info /= 0) stop "linalg_eigvalsh: dsyev workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dsyev('N', 'U', n, ac, n, w, work, lwork, info)
+         if (info /= 0) stop "linalg_eigvalsh: dsyev failed"
+      end function linalg_eigvalsh
+
+      function linalg_pinv(a) result(ap)
+         ! Moore-Penrose pseudo-inverse via economy SVD (A = U S V^T):
+         ! pinv(A) = V * diag(1/s_i, s_i > tol else 0) * U^T, matching
+         ! numpy.linalg.pinv's default rcond-based singular-value cutoff
+         ! (same tol formula numpy itself uses: max(m,n)*eps*largest
+         ! singular value).
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable :: ap(:,:)
+         real(kind=dp), allocatable :: u(:,:), s(:), vt(:,:), sinv_ut(:,:)
+         real(kind=dp) :: tol, smax
+         integer :: m, n, k, i
+         call linalg_svd_econ(a, u, s, vt)
+         m = size(a,1)
+         n = size(a,2)
+         k = size(s)
+         smax = 0.0_dp
+         do i = 1, k
+            if (s(i) > smax) smax = s(i)
+         end do
+         tol = real(max(m,n), kind=dp) * epsilon(1.0_dp) * smax
+         allocate(sinv_ut(1:k, 1:m))
+         do i = 1, k
+            if (s(i) > tol) then
+               sinv_ut(i, :) = u(:, i) / s(i)
+            else
+               sinv_ut(i, :) = 0.0_dp
+            end if
+         end do
+         ap = matmul(transpose(vt), sinv_ut)
+      end function linalg_pinv
+
+      function linalg_matrix_power(a, p) result(ap)
+         ! Integer matrix power, matching numpy.linalg.matrix_power: p=0
+         ! gives the identity, p>0 repeated matmul, p<0 repeated matmul
+         ! of linalg_inv(a).
+         real(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: p
+         real(kind=dp), allocatable :: ap(:,:)
+         real(kind=dp), allocatable :: base(:,:)
+         integer :: n, i, pp
+         n = size(a,1)
+         if (size(a,2) /= n) stop "linalg_matrix_power: matrix must be square"
+         allocate(ap(1:n,1:n), source=0.0_dp)
+         do i = 1, n
+            ap(i, i) = 1.0_dp
+         end do
+         if (p == 0) return
+         pp = abs(p)
+         if (p > 0) then
+            base = a
+         else
+            base = linalg_inv(a)
+         end if
+         do i = 1, pp
+            ap = matmul(ap, base)
+         end do
+      end function linalg_matrix_power
+
       subroutine linalg_qr_reduced(a, q, r)
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable, intent(out) :: q(:,:), r(:,:)
@@ -6624,6 +6766,91 @@ contains
          end do
          coeffs = linalg_solve(matmul(transpose(v), v), matmul(transpose(v), y))
       end function polyfit_real
+
+      pure function digitize_real(x, bins) result(idx)
+         ! Bin index of each x(i) against increasing bin edges, matching
+         ! numpy.digitize(x, bins) with its default right=False: idx(i)
+         ! is the count of bin edges <= x(i) (0 if x(i) < bins(1), size
+         ! (bins) if x(i) >= bins(last)). Decreasing bins and right=True
+         ! are not handled.
+         real(kind=dp), intent(in) :: x(:), bins(:)
+         integer, allocatable :: idx(:)
+         integer :: i, j, n, nb
+         n = size(x)
+         nb = size(bins)
+         allocate(idx(1:n))
+         do i = 1, n
+            j = 0
+            do while (j < nb)
+               if (x(i) >= bins(j + 1)) then
+                  j = j + 1
+               else
+                  exit
+               end if
+            end do
+            idx(i) = j
+         end do
+      end function digitize_real
+
+      subroutine np_save_1d_real(filename, x)
+         ! Writes a 1D float64 array to a real .npy file (NumPy's binary
+         ! array format: an 8-byte preamble of a magic string, a 2-byte
+         ! version, and a 2-byte little-endian header length, followed by
+         ! a Python-dict-literal-style ASCII header padded with spaces
+         ! and a trailing newline so the whole preamble is a multiple of
+         ! 64 bytes, then the raw data), matching numpy.save(path, x) for
+         ! a 1D real array -- interoperable with numpy.load on the
+         ! Python side and vice versa (see np_load_1d_real).
+         character(len=*), intent(in) :: filename
+         real(kind=dp), intent(in) :: x(:)
+         character(len=:), allocatable :: base_header, header, n_str
+         integer :: unit, n, unpadded_len, total_before_pad, pad, header_len
+         n = size(x)
+         allocate(character(len=20) :: n_str)
+         write(n_str, '(I0)') n
+         n_str = trim(n_str)
+         base_header = "{'descr': '<f8', 'fortran_order': False, 'shape': (" &
+            & // n_str // ",), }"
+         unpadded_len = len(base_header) + 1
+         total_before_pad = 10 + unpadded_len
+         pad = 0
+         if (mod(total_before_pad, 64) /= 0) pad = 64 - mod(total_before_pad, 64)
+         header = base_header // repeat(' ', pad) // achar(10)
+         header_len = len(header)
+         open(newunit=unit, file=filename, access='stream', form='unformatted', status='replace')
+         write(unit) achar(147) // 'NUMPY' // achar(1) // achar(0)
+         write(unit) achar(iand(header_len, 255)), achar(iand(ishft(header_len, -8), 255))
+         write(unit) header
+         write(unit) x
+         close(unit)
+      end subroutine np_save_1d_real
+
+      function np_load_1d_real(filename) result(x)
+         ! Reads a 1D float64 array from a .npy file written by
+         ! numpy.save (or np_save_1d_real). The array length is derived
+         ! from the file size minus the preamble+header size rather than
+         ! by parsing the header's 'shape' field, since the raw data is
+         ! always float64 regardless of the exact header text.
+         character(len=*), intent(in) :: filename
+         real(kind=dp), allocatable :: x(:)
+         character(len=8) :: preamble
+         character(len=2) :: hl_bytes
+         integer :: unit, header_len, n
+         integer(kind=8) :: fsize
+         open(newunit=unit, file=filename, access='stream', form='unformatted', status='old', action='read')
+         inquire(unit=unit, size=fsize)
+         read(unit) preamble
+         read(unit) hl_bytes
+         header_len = iachar(hl_bytes(1:1)) + 256 * iachar(hl_bytes(2:2))
+         block
+            character(len=header_len) :: hdr
+            read(unit) hdr
+         end block
+         n = int((fsize - (10_8 + int(header_len, kind=8))) / 8_8)
+         allocate(x(1:n))
+         read(unit) x
+         close(unit)
+      end function np_load_1d_real
 
       pure function polyder_real(p, m) result(dpcoef)
          real(kind=dp), intent(in) :: p(:)
