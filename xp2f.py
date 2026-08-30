@@ -24997,6 +24997,19 @@ class translator(ast.NodeVisitor):
                     return f"nrow({self.expr(a0)})"
                 if self._expr_kind(a0) == "char" and self._rank_expr(a0) == 0:
                     return f"len({self.expr(a0)})"
+                if self._rank_expr(a0) >= 2:
+                    # Python's len() on a rank>=2 array is shape[0] (the
+                    # first/leading dimension only), not the total
+                    # element count -- e.g. len(X) for a (10000, 2)
+                    # array is 10000, matching Fortran's size(X, 1), not
+                    # size(X) (which would give 20000). Surfaced by
+                    # np.column_stack((np.ones(len(X)), X)): the wrong
+                    # length fed both the ones() row count and the
+                    # column_stack reshape's row count, producing a
+                    # completely mis-shaped result caught only at
+                    # runtime (a MATMUL extent mismatch, once X was used
+                    # in a later matrix computation).
+                    return f"size({self.expr(a0)}, 1)"
                 return f"size({self.expr(a0)})"
             if isinstance(node.func, ast.Name) and node.func.id == "array":
                 if len(node.args) < 1:
@@ -25855,8 +25868,25 @@ class translator(ast.NodeVisitor):
                         vals_parts.append(_ee)
                 vals = ", ".join(vals_parts)
                 if node.func.attr == "column_stack":
+                    # Column count is the SUM of each input's own column
+                    # contribution (1 for a rank-1 input, size(_,2) for a
+                    # rank-2 one) -- not just the number of input arrays,
+                    # which is only correct when every input is rank-1.
+                    # `vals` (built above) already concatenates each
+                    # input's own expression text in order; Fortran's
+                    # array constructor flattens a rank-2 element in
+                    # column-major order (all of its column 1, then all
+                    # of column 2, ...), which is exactly the layout this
+                    # reshape needs, so only the target shape itself
+                    # needed fixing here.
                     first = self.expr(seq.elts[0])
-                    return f"reshape([{vals}], [size({first}), {len(seq.elts)}])"
+                    rows_expr = f"size({first}, 1)" if r0 >= 2 else f"size({first})"
+                    col_parts = [
+                        f"size({self.expr(_e)}, 2)" if self._rank_expr(_e) >= 2 else "1"
+                        for _e in seq.elts
+                    ]
+                    cols_expr = " + ".join(col_parts)
+                    return f"reshape([{vals}], [{rows_expr}, {cols_expr}])"
                 if r0 <= 1:
                     if node.func.attr == "vstack":
                         first = self.expr(seq.elts[0])

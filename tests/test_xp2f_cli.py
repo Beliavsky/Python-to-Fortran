@@ -6793,3 +6793,42 @@ def test_xp2f_local_function_mvn_only_called_from_a_loop(tmp_path: Path) -> None
             "    print(rho_i, shp[0], shp[1])",
         ],
     )
+
+
+def test_xp2f_len_on_2d_array_and_column_stack_with_multi_column_input(
+    tmp_path: Path,
+) -> None:
+    # Regression test, surfaced by examples/xreg.py's
+    # `np.column_stack((np.ones(len(X)), X))` where X is (n, 2):
+    #
+    # 1. len() on a rank>=2 array must give shape[0] (the row count),
+    #    matching Fortran's size(x, 1) -- not the old codegen, which
+    #    used the generic size(x) (total element count). len(X) below
+    #    is 3, not 6.
+    #
+    # 2. np.column_stack's reshape-shape computation must sum each
+    #    input's own column contribution (1 for a rank-1 input,
+    #    size(_, 2) for a rank>=2 input) -- not just the count of input
+    #    arrays, which silently under-counts whenever an input is
+    #    itself multi-column. column_stack((ones(3), X)) with X (3, 2)
+    #    must produce a (3, 3) result, not (3, 2).
+    #
+    # Both bugs together previously produced a mis-shaped array caught
+    # only later at runtime (a MATMUL extent mismatch in xreg.py, once
+    # the mis-shaped array was used in a matrix computation) rather
+    # than at the point of construction.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlen_column_stack_2d.py",
+        [
+            "import numpy as np",
+            "",
+            "X = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])",
+            "print(len(X))",
+            "Y = np.column_stack((np.ones(len(X)), X))",
+            "print(Y.shape[0], Y.shape[1])",
+            "print(Y[0, 0], Y[0, 1], Y[0, 2])",
+            "print(Y[1, 0], Y[1, 1], Y[1, 2])",
+            "print(Y[2, 0], Y[2, 1], Y[2, 2])",
+        ],
+    )
