@@ -7534,6 +7534,18 @@ def is_numpy_sliding_window_view_axis0_call(node):
     )
 
 
+def _svd_call_wants_economy(node):
+    """True if a np.linalg.svd(...) call node passes full_matrices=False
+    (numpy's economy/reduced SVD: U is (m, k) and Vt is (k, n) instead of
+    the default full (m, m)/(n, n)). Only a literal False is recognized;
+    anything else (omitted, True, or a non-constant expression) keeps the
+    default full-matrices behavior."""
+    for kw in getattr(node, "keywords", []):
+        if kw.arg == "full_matrices":
+            return isinstance(kw.value, ast.Constant) and kw.value.value is False
+    return False
+
+
 def detect_needed_helpers(tree):
     needed = set()
     linalg_aliases = collect_linalg_aliases(tree)
@@ -7613,6 +7625,7 @@ def detect_needed_helpers(tree):
         "cov": {"cov2_real", "cov_matrix_rows_real"},
         "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real"},
         "convolve": {"convolve_real", "convolve_int"},
+        "correlate": {"correlate_real"},
         "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
         "genfromtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
         "savetxt": {"savetxt_real_2d"},
@@ -7623,6 +7636,7 @@ def detect_needed_helpers(tree):
         "isnan": {"complex_isnan"},
         "polyval": {"polyval"},
         "polyder": {"polyder"},
+        "polyfit": {"polyfit_real"},
         "roots": {"polyroots_real"},
     }
     np_reduceat_helper_map = {
@@ -7664,10 +7678,33 @@ def detect_needed_helpers(tree):
                 names.add(_n.targets[0].id)
         return names
 
+    def _prescan_poly1d_names(_tree):
+        # Same full-tree pre-pass idea as _prescan_rng_names: a `p =
+        # np.poly1d(coeffs)` assignment can be defined in one function and
+        # called (p(x)) from another, so this must see the whole tree, not
+        # just whatever function detect_needed_helpers is currently
+        # scanning.
+        names = set()
+        for _n in ast.walk(_tree):
+            if not (
+                isinstance(_n, ast.Assign)
+                and len(_n.targets) == 1
+                and isinstance(_n.targets[0], ast.Name)
+                and isinstance(_n.value, ast.Call)
+                and isinstance(_n.value.func, ast.Attribute)
+                and isinstance(_n.value.func.value, ast.Name)
+                and _n.value.func.value.id in {"np", "numpy"}
+                and _n.value.func.attr == "poly1d"
+            ):
+                continue
+            names.add(_n.targets[0].id)
+        return names
+
     class scan(ast.NodeVisitor):
         def __init__(self):
             super().__init__()
             self.rng_names = _prescan_rng_names(tree)
+            self.poly1d_names = _prescan_poly1d_names(tree)
             self.scipy_special_aliases, self.scipy_special_func_aliases = collect_scipy_special_aliases(tree)
             self.statistics_aliases, self.statistics_func_aliases = collect_statistics_aliases(tree)
             self.time_aliases, self.time_func_aliases = time_aliases, time_func_aliases
@@ -7800,6 +7837,14 @@ def detect_needed_helpers(tree):
                     return None
                 return [cur.id] + list(reversed(parts))
 
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.poly1d_names
+                and len(node.args) == 1
+            ):
+                # p(x) where p = np.poly1d(coeffs) is rewritten to
+                # polyval(p, x) in codegen -- see poly1d_vars.
+                needed.add("polyval")
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id == "print"
@@ -8589,11 +8634,19 @@ def detect_needed_helpers(tree):
                 elif node.func.attr == "eig":
                     needed.add("linalg_eig")
                 elif node.func.attr == "svd":
-                    needed.add("linalg_svd")
+                    needed.add("linalg_svd_econ" if _svd_call_wants_economy(node) else "linalg_svd")
                 elif node.func.attr == "eigh":
                     needed.add("linalg_eigh")
                 elif node.func.attr == "qr":
                     needed.add("linalg_qr_reduced")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "leggauss"
+            ):
+                # np.polynomial.legendre.leggauss(n)
+                _lg_parts = _attr_chain_parts(node.func.value)
+                if _lg_parts and _lg_parts[0] in {"np", "numpy"} and _lg_parts[1:] == ["polynomial", "legendre"]:
+                    needed.add("leggauss")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -8620,7 +8673,7 @@ def detect_needed_helpers(tree):
                 elif node.func.attr == "eigh":
                     needed.add("linalg_eigh")
                 elif node.func.attr == "svd":
-                    needed.add("linalg_svd")
+                    needed.add("linalg_svd_econ" if _svd_call_wants_economy(node) else "linalg_svd")
                 elif node.func.attr == "qr":
                     needed.add("linalg_qr_reduced")
                 elif node.func.attr == "lstsq":
@@ -14801,6 +14854,7 @@ class translator(ast.NodeVisitor):
                 self.name_aliases[_src_name] = _alias_name
                 self.fortran_name_owner[_alias_name.lower()] = _src_name
         self.rng_vars = set(translator.global_rng_vars)
+        self.poly1d_vars = set()
         self.python_list_vars = set()
         self.list_aliases = {}
         self.python_set_vars = set()
@@ -14962,6 +15016,16 @@ class translator(ast.NodeVisitor):
         if attrs is not None and func_node.attr not in set(attrs):
             return False
         return self._is_linalg_module_attr(func_node.value)
+
+    def _is_leggauss_call(self, node):
+        # Matches np.polynomial.legendre.leggauss(n) (and the numpy.*
+        # spelling); returns Gauss-Legendre quadrature nodes/weights.
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            return False
+        if node.func.attr != "leggauss":
+            return False
+        parts = self._attr_chain_parts(node.func.value)
+        return bool(parts) and len(parts) == 3 and parts[0] in {"np", "numpy"} and parts[1:] == ["polynomial", "legendre"]
 
     def _numpy_call_attr(self, func_node):
         if isinstance(func_node, ast.Attribute) and is_numpy_name_node(func_node.value):
@@ -16941,6 +17005,14 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"polyfit", "poly1d"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "convolve"
                 and len(node.args) >= 2
             ):
@@ -16956,6 +17028,14 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "signal"
                 and node.func.attr in {"correlate", "lfilter", "filtfilt", "detrend"}
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "correlate"
+                and len(node.args) >= 2
             ):
                 return "real"
             if (
@@ -20997,7 +21077,9 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "searchsorted" and len(node.args) >= 2:
                     r = self._rank_expr(node.args[1])
                     return r if r > 0 else 0
-                if node.func.attr == "convolve" and len(node.args) >= 2:
+                if node.func.attr in {"convolve", "correlate"} and len(node.args) >= 2:
+                    return 1
+                if node.func.attr in {"polyfit", "poly1d"} and len(node.args) >= 1:
                     return 1
                 if node.func.attr in {"loadtxt", "genfromtxt"} and len(node.args) >= 1:
                     if self._loadtxt_usecols_scalar(node):
@@ -23938,6 +24020,19 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("ListComp currently supports only single-generator form")
 
         if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.poly1d_vars
+                and len(node.args) == 1
+            ):
+                # p(x) where p = np.poly1d(coeffs): poly1d is tracked as a
+                # plain coefficient array (see the poly1d assignment
+                # handling in prescan/visit_Assign), so calling it is just
+                # polynomial evaluation -- same call shape as np.polyval.
+                return (
+                    f"polyval(real({self.expr(node.func)}, kind=dp), "
+                    f"real({self.expr(node.args[0])}, kind=dp))"
+                )
             if is_numpy_sliding_window_view_axis0_call(node):
                 if len(node.args) < 1:
                     raise NotImplementedError("sliding_window_view requires an input array")
@@ -25691,6 +25786,17 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 2
             ):
                 return f"polyval(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "polyfit"
+                and len(node.args) >= 3
+            ):
+                return (
+                    f"polyfit_real(real({self.expr(node.args[0])}, kind=dp), "
+                    f"real({self.expr(node.args[1])}, kind=dp), int({self.expr(node.args[2])}))"
+                )
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -27499,6 +27605,26 @@ class translator(ast.NodeVisitor):
                 if k0 == "int" and k1 == "int":
                     return f"convolve_int({self.expr(node.args[0])}, {self.expr(node.args[1])}{mode_arg})"
                 return f"convolve_real({self.expr(node.args[0])}, {self.expr(node.args[1])}{mode_arg})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "correlate"
+                and len(node.args) >= 2
+            ):
+                # np.correlate(a, v, mode='valid') -- same underlying math
+                # as scipy.signal.correlate (convolve with the second
+                # array time-reversed), reuse correlate_real, but np's
+                # own default mode is "valid" (scipy's is "full"), so
+                # pass it explicitly when not given.
+                mode_txt = "valid"
+                if len(node.args) >= 3 and is_const_str(node.args[2]):
+                    mode_txt = str(node.args[2].value)
+                for kw in node.keywords:
+                    if kw.arg == "mode" and is_const_str(kw.value):
+                        mode_txt = str(kw.value.value)
+                        break
+                return f'correlate_real({self.expr(node.args[0])}, {self.expr(node.args[1])}, "{mode_txt}")'
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -30274,6 +30400,15 @@ class translator(ast.NodeVisitor):
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                    and self._is_leggauss_call(node.value)
+                ):
+                    for e in node.targets[0].elts:
+                        if isinstance(e, ast.Name):
+                            self._mark_alloc_real(e.id, rank=1)
+                    continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], (ast.Tuple, ast.List))
                     and isinstance(node.value, ast.Call)
                     and isinstance(node.value.func, ast.Attribute)
                     and self._is_linalg_module_attr(node.value.func.value)
@@ -30424,6 +30559,26 @@ class translator(ast.NodeVisitor):
                     _mvn_call = v.left if self._is_mvn_call(v.left) else v.right
                     self._materialize_mvn_call(_mvn_call, at_codegen=False)
                     self._mark_alloc_real(t.id, rank=2)
+                    continue
+
+                # p = np.poly1d(coeffs): tracked as a plain coefficient
+                # array (poly1d_vars), not a distinct object type --
+                # calling p(x) later is recognized in expr()'s Call
+                # dispatch and rewritten to polyval(p, x). Must run before
+                # the generic call-based fallback below would otherwise
+                # try (and fail) to infer a shape for an unrecognized
+                # "poly1d" call.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in {"np", "numpy"}
+                    and v.func.attr == "poly1d"
+                    and len(v.args) >= 1
+                ):
+                    self.poly1d_vars.add(t.id)
+                    self._mark_alloc_real(t.id, rank=1)
                     continue
 
                 # Any real (non-alias) assignment to a DataFrame name clears
@@ -35157,6 +35312,16 @@ class translator(ast.NodeVisitor):
                 self.alloc_reals.discard(e.id)
                 self.o.w(f"{e.id} = quantile_linear(reshape({a0}, [size({a0})]), {self.expr(qn)})")
             return
+        # tuple unpacking from np.polynomial.legendre.leggauss(n):
+        #   nodes, weights = np.polynomial.legendre.leggauss(n)
+        if isinstance(t, (ast.Tuple, ast.List)) and self._is_leggauss_call(v) and len(t.elts) >= 2:
+            if not isinstance(t.elts[0], ast.Name) or not isinstance(t.elts[1], ast.Name):
+                raise NotImplementedError("tuple assignment targets must be names")
+            n_txt = self.expr(v.args[0]) if v.args else self.expr(
+                next(kw.value for kw in v.keywords if kw.arg == "deg")
+            )
+            self.o.w(f"call leggauss({n_txt}, {t.elts[0].id}, {t.elts[1].id})")
+            return
         # tuple unpacking from supported numpy.linalg calls:
         #   w, v = np.linalg.eig(a)
         #   w, v = np.linalg.eigh(a)
@@ -35196,17 +35361,52 @@ class translator(ast.NodeVisitor):
                 return
             outs = []
             for e in t.elts:
-                if isinstance(e, ast.Name):
+                # A literal `_` discard target (e.g. `w, _ = np.linalg.eigh(a)`)
+                # is a plain ast.Name, not ast.Starred -- must NOT go through
+                # _aliased_name (which mangles a bare "_" into a synthetic
+                # "v_name" identifier that is never declared, since
+                # _mark_alloc_real's own prescan pass correctly treats "_" as
+                # a no-op to skip). Keep it as the same "_" sentinel used for
+                # ast.Starred so every call site below can check for it.
+                if isinstance(e, ast.Name) and e.id == "_":
+                    outs.append("_")
+                elif isinstance(e, ast.Name):
                     outs.append(self._aliased_name(e.id))
                 elif isinstance(e, ast.Starred):
                     outs.append("_")
                 else:
                     raise NotImplementedError("tuple assignment targets must be names or starred ignores")
             if v.func.attr == "eig" and len(v.args) >= 1 and len(outs) >= 2:
-                self.o.w(f"call linalg_eig({self.expr(v.args[0])}, {outs[0]}, {outs[1]})")
+                out0, out1 = outs[0], outs[1]
+                if out0 != "_" and out1 != "_":
+                    self.o.w(f"call linalg_eig({self.expr(v.args[0])}, {out0}, {out1})")
+                else:
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp), allocatable :: w_eig_tmp(:), v_eig_tmp(:,:)")
+                    self.o.w(f"call linalg_eig({self.expr(v.args[0])}, w_eig_tmp, v_eig_tmp)")
+                    if out0 != "_":
+                        self.o.w(f"{out0} = w_eig_tmp")
+                    if out1 != "_":
+                        self.o.w(f"{out1} = v_eig_tmp")
+                    self.o.pop()
+                    self.o.w("end block")
                 return
             if v.func.attr == "eigh" and len(v.args) >= 1 and len(outs) >= 2:
-                self.o.w(f"call linalg_eigh({self.expr(v.args[0])}, {outs[0]}, {outs[1]})")
+                out0, out1 = outs[0], outs[1]
+                if out0 != "_" and out1 != "_":
+                    self.o.w(f"call linalg_eigh({self.expr(v.args[0])}, {out0}, {out1})")
+                else:
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp), allocatable :: w_eigh_tmp(:), v_eigh_tmp(:,:)")
+                    self.o.w(f"call linalg_eigh({self.expr(v.args[0])}, w_eigh_tmp, v_eigh_tmp)")
+                    if out0 != "_":
+                        self.o.w(f"{out0} = w_eigh_tmp")
+                    if out1 != "_":
+                        self.o.w(f"{out1} = v_eigh_tmp")
+                    self.o.pop()
+                    self.o.w("end block")
                 return
             if v.func.attr == "qr" and len(v.args) >= 1 and len(outs) >= 2:
                 mode = "reduced"
@@ -35233,7 +35433,25 @@ class translator(ast.NodeVisitor):
                     self.o.w("end block")
                 return
             if v.func.attr == "svd" and len(v.args) >= 1 and len(outs) >= 3:
-                self.o.w(f"call linalg_svd({self.expr(v.args[0])}, {outs[0]}, {outs[1]}, {outs[2]})")
+                svd_fn = "linalg_svd_econ" if _svd_call_wants_economy(v) else "linalg_svd"
+                out0, out1, out2 = outs[0], outs[1], outs[2]
+                if out0 != "_" and out1 != "_" and out2 != "_":
+                    self.o.w(f"call {svd_fn}({self.expr(v.args[0])}, {out0}, {out1}, {out2})")
+                else:
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w(
+                        "real(kind=dp), allocatable :: u_svd_tmp(:,:), s_svd_tmp(:), vt_svd_tmp(:,:)"
+                    )
+                    self.o.w(f"call {svd_fn}({self.expr(v.args[0])}, u_svd_tmp, s_svd_tmp, vt_svd_tmp)")
+                    if out0 != "_":
+                        self.o.w(f"{out0} = u_svd_tmp")
+                    if out1 != "_":
+                        self.o.w(f"{out1} = s_svd_tmp")
+                    if out2 != "_":
+                        self.o.w(f"{out2} = vt_svd_tmp")
+                    self.o.pop()
+                    self.o.w("end block")
                 return
             if v.func.attr == "slogdet" and len(v.args) >= 1 and len(outs) >= 2:
                 a0 = self.expr(v.args[0])
@@ -37038,6 +37256,22 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"{name} = {_mvn_tmp} {_opsym} {_other_txt}")
             else:
                 self.o.w(f"{name} = {_other_txt} {_opsym} {_mvn_tmp}")
+            return
+
+        # p = np.poly1d(coeffs): tracked as a plain coefficient array
+        # (see the matching prescan branch and poly1d_vars) -- poly1d(c)
+        # is the identity on the coefficient array for our purposes,
+        # since calling p(x) later is rewritten directly to polyval(p, x).
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"np", "numpy"}
+            and v.func.attr == "poly1d"
+            and len(v.args) >= 1
+        ):
+            self.o.w(f"{self._aliased_name(t.id)} = {self.expr(v.args[0])}")
             return
 
         # x = np.random.rand(n0, n1, ...) / np.random.randn(n0, n1, ...)
@@ -55796,8 +56030,15 @@ def generate_flat(
         o.w("use lbfgsb_bridge_mod, only: lbfgsb_user_fn, lbfgsb_minimize")
     if _tree_uses_scipy_minimize_powell(_use_scan_tree):
         o.w("use powell_bridge_mod, only: powell_user_fn, powell_minimize")
+    # Always emitted (even in proc-module mode, where dp/sp already come
+    # from the proc module's own `use`) because a NaN-safe comparison
+    # guard (merge(...)/ieee_is_nan(...)) can be generated directly in
+    # the program body itself -- e.g. a bare `if f(lo) * fmid <= 0.0:`
+    # -- independent of whether any local function needed a proc
+    # module. remove_unused_ieee_arithmetic_use prunes this back out
+    # per program/module unit when its own body has no ieee symbols.
+    o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
     if not use_proc_module:
-        o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
     o.w("implicit none")
     if not use_proc_module:

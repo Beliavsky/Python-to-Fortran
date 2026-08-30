@@ -260,6 +260,8 @@ public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:r
 public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
 public :: linalg_qr_reduced !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),q:real(dp)(:,:):intent(out),r:real(dp)(:,:):intent(out) desc="reduced QR factorization using LAPACK DGEQRF/DORGQR"
 public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="full SVD using LAPACK DGESVD"
+public :: linalg_svd_econ !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="economy/reduced SVD (full_matrices=False) using LAPACK DGESVD"
+public :: leggauss !@pyapi kind=subroutine args=n:integer:intent(in),x:real(dp)(:):intent(out),w:real(dp)(:):intent(out) desc="Gauss-Legendre quadrature nodes x and weights w on [-1,1] for degree n, matching numpy.polynomial.legendre.leggauss"
 public :: quantile_linear !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),q:real(dp):intent(in) desc="1D quantile with linear interpolation (NumPy-like default)"
 public :: quantile_linear_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),q:real(dp)(:):intent(in) desc="1D quantiles at multiple probabilities with linear interpolation (NumPy-like default)"
 public :: tri_int !@pyapi kind=function ret=integer(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
@@ -341,6 +343,7 @@ public :: reduceat_min
 public :: reduceat_max
 public :: polyval
 public :: polyder
+public :: polyfit_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in) desc="least-squares polynomial fit (deg+1 coefficients, highest degree first), matching numpy.polyfit"
 
 public :: rolling_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in) desc="rolling mean over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
 public :: rolling_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in),ddof:integer:intent(in) desc="rolling sample standard deviation over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
@@ -5599,6 +5602,81 @@ contains
          if (info /= 0) stop "linalg_svd: dgesvd failed"
       end subroutine linalg_svd
 
+      subroutine linalg_svd_econ(a, u, s, vt)
+         ! Economy/reduced SVD, matching numpy's
+         ! np.linalg.svd(a, full_matrices=False): u is (m, k), vt is
+         ! (k, n), k = min(m, n) -- vs linalg_svd's full (m, m)/(n, n).
+         ! Uses LAPACK DGESVD with jobu='S', jobvt='S' instead of 'A','A'.
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable, intent(out) :: u(:,:), s(:), vt(:,:)
+         real(kind=dp), allocatable :: ac(:,:), work(:)
+         integer :: m, n, k, info, lwork
+         interface
+            subroutine dgesvd(jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, info)
+               character(len=1), intent(in) :: jobu, jobvt
+               integer, intent(in) :: m, n, lda, ldu, ldvt, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*)
+               double precision, intent(out) :: s(*), u(ldu,*), vt(ldvt,*), work(*)
+            end subroutine dgesvd
+         end interface
+         m = size(a,1)
+         n = size(a,2)
+         k = min(m,n)
+         allocate(ac(1:m,1:n), source=a)
+         allocate(u(1:m,1:k), source=0.0_dp)
+         allocate(s(1:k), source=0.0_dp)
+         allocate(vt(1:k,1:n), source=0.0_dp)
+         allocate(work(1))
+         lwork = -1
+         call dgesvd('S', 'S', m, n, ac, m, s, u, m, vt, k, work, lwork, info)
+         if (info /= 0) stop "linalg_svd_econ: dgesvd workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dgesvd('S', 'S', m, n, ac, m, s, u, m, vt, k, work, lwork, info)
+         if (info /= 0) stop "linalg_svd_econ: dgesvd failed"
+      end subroutine linalg_svd_econ
+
+      subroutine leggauss(n, x, w)
+         ! Gauss-Legendre quadrature nodes and weights on [-1, 1], matching
+         ! numpy.polynomial.legendre.leggauss(n). Classic Newton-iteration
+         ! algorithm (nodes are the roots of the degree-n Legendre
+         ! polynomial P_n, found via the three-term recurrence for P_n and
+         ! its derivative; weights follow from P_n'(x_i)) -- see e.g.
+         ! Numerical Recipes' gauleg. Converges to full double precision,
+         ! so results match numpy's own (eigenvalue-based) implementation
+         ! to within the run-diff numeric tolerance.
+         integer, intent(in) :: n
+         real(kind=dp), allocatable, intent(out) :: x(:), w(:)
+         real(kind=dp), parameter :: eps = 1.0e-15_dp
+         real(kind=dp) :: p1, p2, p3, pp, z, z1
+         integer :: i, j, m
+         allocate(x(1:n), source=0.0_dp)
+         allocate(w(1:n), source=0.0_dp)
+         m = (n + 1) / 2
+         do i = 1, m
+            z = cos(acos(-1.0_dp) * (real(i, kind=dp) - 0.25_dp) / (real(n, kind=dp) + 0.5_dp))
+            do
+               p1 = 1.0_dp
+               p2 = 0.0_dp
+               do j = 1, n
+                  p3 = p2
+                  p2 = p1
+                  p1 = ((2.0_dp * j - 1.0_dp) * z * p2 - (j - 1.0_dp) * p3) / real(j, kind=dp)
+               end do
+               pp = real(n, kind=dp) * (z * p1 - p2) / (z * z - 1.0_dp)
+               z1 = z
+               z = z1 - p1 / pp
+               if (abs(z - z1) <= eps) exit
+            end do
+            x(i) = -z
+            x(n + 1 - i) = z
+            w(i) = 2.0_dp / ((1.0_dp - z * z) * pp * pp)
+            w(n + 1 - i) = w(i)
+         end do
+      end subroutine leggauss
+
       real(kind=dp) function quantile_linear(x, q)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), intent(in) :: q
@@ -6521,6 +6599,31 @@ contains
             y(i) = polyval_real_scalar(p, x(i))
          end do
       end function polyval_real_vec
+
+      function polyfit_real(x, y, deg) result(coeffs)
+         ! Least-squares polynomial fit, matching numpy.polyfit(x, y, deg):
+         ! returns deg+1 coefficients, highest degree first (same
+         ! convention as polyval/roots). Builds the Vandermonde matrix and
+         ! solves the normal equations (V^T V) c = V^T y via linalg_solve.
+         ! numpy itself uses an SVD-based least-squares solve for extra
+         ! numerical stability on ill-conditioned fits; the normal-
+         ! equations approach here matches it closely for well-conditioned
+         ! data (run-diff's numeric tolerance covers the difference).
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable :: coeffs(:)
+         real(kind=dp), allocatable :: v(:,:)
+         integer :: n, m, i, j
+         n = size(x)
+         m = deg + 1
+         allocate(v(1:n, 1:m))
+         do i = 1, n
+            do j = 1, m
+               v(i, j) = x(i) ** (deg - (j - 1))
+            end do
+         end do
+         coeffs = linalg_solve(matmul(transpose(v), v), matmul(transpose(v), y))
+      end function polyfit_real
 
       pure function polyder_real(p, m) result(dpcoef)
          real(kind=dp), intent(in) :: p(:)

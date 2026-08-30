@@ -6832,3 +6832,245 @@ def test_xp2f_len_on_2d_array_and_column_stack_with_multi_column_input(
             "print(Y[2, 0], Y[2, 1], Y[2, 2])",
         ],
     )
+
+
+def test_xp2f_ieee_is_nan_in_program_body_with_local_function(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_root_bisection.py:
+    # a NaN-safe comparison guard (merge(...)/ieee_is_nan(...), emitted
+    # for a bare `<=` comparison) can be generated directly in the main
+    # PROGRAM body, not just inside a helper/local function living in a
+    # proc module. The program's own `use, intrinsic :: ieee_arithmetic`
+    # line was only ever written when the source had NO local functions
+    # (`if not use_proc_module`) -- wrongly assuming ieee symbols could
+    # only be needed inside a proc module (which already gets its own
+    # unconditional ieee_arithmetic use). Once a script has both (a)
+    # some other local function forcing proc-module mode and (b) a
+    # NaN-safe comparison directly in the main body, the program unit
+    # compiled with "Function 'ieee_is_nan' has no IMPLICIT type".
+    #
+    # Fixed by always emitting the ieee_arithmetic use line for the
+    # program unit (matching how the module case already does it) and
+    # relying on remove_unused_ieee_arithmetic_use's existing per-unit
+    # pruning to drop it back out when genuinely unused.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xieee_is_nan_program_body_with_local_fn.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def f(x):",
+            "    return x**3 - 2.0 * x - 5.0",
+            "",
+            "",
+            "lo = 2.0",
+            "hi = 3.0",
+            "n_iter = 30",
+            "",
+            "for k in range(n_iter):",
+            "    mid = 0.5 * (lo + hi)",
+            "    fmid = f(mid)",
+            "    if f(lo) * fmid <= 0.0:",
+            "        hi = mid",
+            "    else:",
+            "        lo = mid",
+            "",
+            "root = 0.5 * (lo + hi)",
+            "print('root =', root)",
+            "print('f(root) =', f(root))",
+        ],
+    )
+
+
+def test_xp2f_np_polynomial_legendre_leggauss(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_quadrature.py: adds
+    # support for np.polynomial.legendre.leggauss(n) (Gauss-Legendre
+    # quadrature nodes/weights on [-1, 1]), previously an unsupported
+    # call ("unsupported assign: nodes, weights = ..."). Implemented via
+    # a new leggauss(n, x, w) subroutine in python.f90 using the classic
+    # Newton-iteration algorithm (roots of the degree-n Legendre
+    # polynomial via its three-term recurrence), which converges to
+    # full double precision and so matches numpy's own (eigenvalue-
+    # based) implementation within run-diff's numeric tolerance.
+    #
+    # Checks both a degree with an exact closed form (n=3: nodes 0,
+    # +/-sqrt(3/5); weights 8/9, 5/9, 5/9) and an odd/even-length-
+    # agnostic n=5 case, plus using the nodes/weights to integrate
+    # sin(x) over [0, pi] (exact value 2.0) as an end-to-end check.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xleggauss.py",
+        [
+            "import numpy as np",
+            "",
+            "nodes3, weights3 = np.polynomial.legendre.leggauss(3)",
+            "print(nodes3[0], nodes3[1], nodes3[2])",
+            "print(weights3[0], weights3[1], weights3[2])",
+            "",
+            "nodes5, weights5 = np.polynomial.legendre.leggauss(5)",
+            "print(nodes5[0], nodes5[1], nodes5[2], nodes5[3], nodes5[4])",
+            "print(weights5[0], weights5[1], weights5[2], weights5[3], weights5[4])",
+            "",
+            "a = 0.0",
+            "b = np.pi",
+            "xm = 0.5 * (b - a) * nodes5 + 0.5 * (b + a)",
+            "integral = 0.5 * (b - a) * (weights5 * np.sin(xm)).sum()",
+            "print('integral =', integral)",
+        ],
+    )
+
+
+def test_xp2f_svd_full_matrices_false_uses_economy_shapes(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_linalg_svd.py:
+    # np.linalg.svd(a, full_matrices=False) silently ignored the kwarg --
+    # the generated linalg_svd helper always called LAPACK dgesvd with
+    # jobu='A', jobvt='A' (numpy's *full* SVD: U is (m, m), Vt is
+    # (n, n)) regardless of the kwarg, so U's column count (m) never
+    # matched S's economy size (k = min(m, n)), causing a MATMUL extent
+    # mismatch at runtime once U was used with S (e.g. U @ diag(s)) for
+    # an m != n input.
+    #
+    # Fixed by adding a separate linalg_svd_econ helper (jobu='S',
+    # jobvt='S': U is (m, k), Vt is (k, n)) and dispatching to it at
+    # transpile time when full_matrices=False is a literal keyword
+    # argument on the call, leaving the default (full_matrices omitted,
+    # or =True) path unchanged.
+    #
+    # A (4, 3) input's economy SVD should give U (4, 3), s (3,), Vt
+    # (3, 3) -- checked both by shape and by reconstructing A via
+    # U @ diag(s) @ Vt.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xsvd_econ.py",
+        [
+            "import numpy as np",
+            "",
+            "A = np.array(",
+            "    [",
+            "        [1.0, 2.0, 3.0],",
+            "        [4.0, 5.0, 6.0],",
+            "        [7.0, 8.0, 10.0],",
+            "        [1.0, 0.0, 1.0],",
+            "    ]",
+            ")",
+            "",
+            "U, s, Vt = np.linalg.svd(A, full_matrices=False)",
+            "print(U.shape[0], U.shape[1])",
+            "print(s.shape[0])",
+            "print(Vt.shape[0], Vt.shape[1])",
+            "",
+            "S = np.diag(s)",
+            "recon = U.dot(S).dot(Vt)",
+            "err = recon - A",
+            "err_norm = np.sqrt((err * err).sum())",
+            "print('reconstruction error norm =', err_norm)",
+        ],
+    )
+
+
+def test_xp2f_linalg_eig_eigh_underscore_discard_target(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_power_iteration.py's
+    # `w_eigh, _ = np.linalg.eigh(A)`: a literal `_` discard target is a
+    # plain ast.Name (not ast.Starred), so the eig/eigh/svd tuple-unpack
+    # codegen's outs-builder ran it through _aliased_name like any real
+    # variable -- which mangles a bare "_" into a synthetic "v_name"
+    # identifier (base.lstrip('_') or 'name') that is never declared,
+    # since _mark_alloc_real's prescan pass correctly treats "_" as a
+    # no-op to skip. The mismatch (codegen emits a reference to
+    # "v_name"; nothing ever declares it) produced "Symbol 'v_name' has
+    # no IMPLICIT type" at build time.
+    #
+    # Fixed by keeping a literal `_` Name target as the same "_"
+    # sentinel already used for ast.Starred, and extending the
+    # already-existing (from np.linalg.qr) "some outputs discarded"
+    # block pattern -- call into real temp variables, then assign only
+    # the non-discarded outputs -- to eig, eigh, and svd as well.
+    #
+    # Covers both eigh (2 outputs, second discarded) and eig (2
+    # outputs, first discarded) in one script.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xeig_eigh_underscore.py",
+        [
+            "import numpy as np",
+            "",
+            "A = np.array([[4.0, 1.0, 1.0], [1.0, 3.0, 0.5], [1.0, 0.5, 2.0]])",
+            "w, _ = np.linalg.eigh(A)",
+            "print(w[0], w[1], w[2])",
+            "",
+            "B = np.array([[2.0, 0.0], [0.0, 3.0]])",
+            "_, v = np.linalg.eig(B)",
+            "print(v.shape[0], v.shape[1])",
+        ],
+    )
+
+
+def test_xp2f_np_correlate_modes(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_convolve_correlate.py:
+    # np.correlate(a, v[, mode]) was unsupported ("unsupported call").
+    # Fixed by recognizing it as np.convolve(a, v[::-1], mode) under the
+    # hood -- reusing the existing correlate_real helper (already used
+    # for scipy.signal.correlate), but with np.correlate's own default
+    # mode ("valid", vs scipy's "full") passed explicitly when the
+    # Python source omits the mode argument.
+    #
+    # Checks all three modes (default/"valid", "full", "same") against
+    # the same fixed inputs.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xcorrelate_modes.py",
+        [
+            "import numpy as np",
+            "",
+            "a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])",
+            "k = np.array([1.0, 0.0, -1.0])",
+            "",
+            "c_valid = np.correlate(a, k)",
+            "c_full = np.correlate(a, k, mode='full')",
+            "c_same = np.correlate(a, k, mode='same')",
+            "",
+            "print(c_valid.shape[0], c_full.shape[0], c_same.shape[0])",
+            "print(c_valid[0], c_valid[1], c_valid[2])",
+            "print(c_full[0], c_full[1], c_full[2], c_full[3], c_full[4], c_full[5], c_full[6])",
+            "print(c_same[0], c_same[1], c_same[2], c_same[3], c_same[4])",
+        ],
+    )
+
+
+def test_xp2f_polyfit_poly1d_roots(tmp_path: Path) -> None:
+    # Regression test, surfaced by numpy_examples/x_polyfit.py:
+    #
+    # 1. np.polyfit(x, y, deg) was unsupported. Fixed via a new
+    #    polyfit_real Fortran helper (Vandermonde matrix + normal
+    #    equations via the existing linalg_solve, matching numpy's
+    #    SVD-based least-squares fit closely for well-conditioned data).
+    #
+    # 2. np.poly1d(coeffs) was unsupported. Fixed by tracking the
+    #    assigned variable as a "poly1d" name (poly1d_vars) -- treated
+    #    as a plain coefficient array, identical to `p = coeffs` -- and
+    #    recognizing a later call p(x) in expr()'s Call dispatch,
+    #    rewriting it to polyval(p, x) (same call shape as np.polyval,
+    #    same highest-degree-first coefficient convention).
+    #
+    # np.roots was already supported; included here for an end-to-end
+    # check alongside the two new features.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xpolyfit_poly1d_roots.py",
+        [
+            "import numpy as np",
+            "",
+            "x = np.array([-2.0, -1.0, 0.0, 1.0, 2.0, 3.0])",
+            "y = 2.0 * x**2 - 3.0 * x + 1.0",
+            "",
+            "coeffs = np.polyfit(x, y, 2)",
+            "print(coeffs[0], coeffs[1], coeffs[2])",
+            "",
+            "p = np.poly1d(coeffs)",
+            "print(p(0.0), p(2.0), p(-1.0))",
+            "",
+            "cubic_coeffs = np.array([1.0, -6.0, 11.0, -6.0])",
+            "r = np.sort(np.roots(cubic_coeffs))",
+            "print(r[0], r[1], r[2])",
+        ],
+    )
