@@ -7081,6 +7081,28 @@ def hoist_loop_invariant_array_realloc(lines):
                 if assign_re.match(out[k2].split("!", 1)[0].strip()):
                     unsafe = True
                     break
+        if not unsafe:
+            # Hoisting drops whatever value `name` held coming into this
+            # iteration (deallocate+allocate gives uninitialized memory,
+            # not a preserved value) -- safe only if the array's PRIOR
+            # content is never actually read anywhere in the loop, e.g. a
+            # stateful "carry to next iteration" pattern like
+            # `d_new = d * (...); ...; d = target` (a real case that
+            # broke silently: `d`'s pre-loop initial value fed the first
+            # iteration's read, and hoisting wiped it out, only visibly
+            # corrupting results once the reused memory the reallocation
+            # happened to land on wasn't coincidentally still zero).
+            # Conservative like the rest of this function: any other
+            # whole-word occurrence of `name` in the loop body at all
+            # (read or write) means don't hoist, not just a provably-safe
+            # subset of them.
+            name_re = re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
+            for k2 in range(i + 1, end_idx):
+                if k2 in (guard_idx, alloc_idx):
+                    continue
+                if name_re.search(out[k2].split("!", 1)[0]):
+                    unsafe = True
+                    break
         if unsafe:
             i = end_idx + 1
             continue
@@ -8079,6 +8101,22 @@ def detect_needed_helpers(tree):
                     needed.add("random_mvn_samples")
                 else:
                     needed.add("rnorm")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id not in self.rng_names
+                and node.func.attr == "multivariate_normal"
+            ):
+                # self.rng_names is a NAME-based scan (only "X = ...
+                # default_rng(...)" assignments), which misses a local
+                # function parameter used as `param.multivariate_normal(
+                # ...)` when detect_needed_helpers is called per-function
+                # on just that function's own body (the assignment that
+                # actually created the generator is in the CALLER, a
+                # different AST subtree never scanned here) -- but the
+                # method name itself is specific enough to be safe
+                # evidence on its own, independent of the receiver name.
+                needed.add("random_mvn_samples")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
@@ -18776,6 +18814,46 @@ class translator(ast.NodeVisitor):
             self.prescan([fake])
         return tmp_name
 
+    def _is_mvn_call(self, node):
+        # rng.multivariate_normal(...) / np.random.multivariate_normal(...)
+        # -- the exact shape visit_Assign's own "X = rng.multivariate_normal
+        # (...)" branch requires (a fill-in-place call via
+        # random_mvn_samples(), not a pure function -- see
+        # _materialize_mvn_call, needed because of that, for any other
+        # shape this appears in, e.g. `rng.multivariate_normal(...) /
+        # 100.0`).
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "multivariate_normal"
+            and (
+                (isinstance(node.func.value, ast.Name) and node.func.value.id in self.rng_vars)
+                or (
+                    isinstance(node.func.value, ast.Attribute)
+                    and isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id == "np"
+                    and node.func.value.attr == "random"
+                )
+            )
+        )
+
+    def _materialize_mvn_call(self, call_node, at_codegen):
+        # Same idea as _materialize_chained_df_call, for a
+        # multivariate_normal() draw used as part of a larger expression
+        # (e.g. `rng.multivariate_normal(...) / 100.0`) rather than as a
+        # bare `X = rng.multivariate_normal(...)` assignment -- needed
+        # because that codegen fills a preallocated array in place via a
+        # subroutine call (random_mvn_samples), not a pure function, so
+        # it can't be inlined into expr() at all; materialize it into a
+        # real temp variable first via the existing machinery instead.
+        tmp_name = f"mvn_tmp_{id(call_node)}"
+        fake = ast.Assign(targets=[ast.Name(id=tmp_name, ctx=ast.Store())], value=call_node)
+        if at_codegen:
+            self.visit_Assign(fake)
+        else:
+            self.prescan([fake])
+        return tmp_name
+
     def _pandas_df_fillna_spec(self, v):
         # X = df.fillna(scalar) -- replace NaN with a scalar. `df` may
         # also be another df-producing call chained directly in, e.g.
@@ -26763,15 +26841,42 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 ddof_node = None
+                axis_node = None
+                keepdims = False
                 for kw in node.keywords:
                     if kw.arg == "ddof":
                         ddof_node = kw.value
-                        break
+                    elif kw.arg == "axis":
+                        axis_node = kw.value
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 a0 = self.expr(node.args[0])
-                flat = f"reshape({a0}, [size({a0})])"
-                if ddof_node is None:
-                    return f"var_1d({flat})"
-                return f"var_1d({flat}, {self.expr(ddof_node)})"
+                if axis_node is None:
+                    flat = f"reshape({a0}, [size({a0})])"
+                    if ddof_node is None:
+                        return f"var_1d({flat})"
+                    return f"var_1d({flat}, {self.expr(ddof_node)})"
+                # np.var(x, axis=N[, ddof=][, keepdims=]) -- per-axis
+                # variance, mirroring np.mean's axis handling just above
+                # (sum(x, dim=)-based reduction) rather than the
+                # axis=None case's flatten-to-1D-and-call-var_1d shape,
+                # which can't express a per-axis result at all.
+                a0_kind = self._expr_kind(node.args[0])
+                a0_real = a0 if a0_kind == "real" else f"real({a0}, kind=dp)"
+                ddof_txt = self.expr(ddof_node) if ddof_node is not None else "0"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                n_txt = f"size({a0_real}, dim={dim_expr})"
+                mean_bcast = (
+                    f"spread(sum({a0_real}, dim={dim_expr}) / real({n_txt}, kind=dp), "
+                    f"dim={dim_expr}, ncopies={n_txt})"
+                )
+                reduced = (
+                    f"(sum(({a0_real} - {mean_bcast})**2, dim={dim_expr}) / "
+                    f"real(max(1, {n_txt} - ({ddof_txt})), kind=dp))"
+                )
+                if keepdims:
+                    return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                return reduced
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -26802,13 +26907,45 @@ class translator(ast.NodeVisitor):
                 a0_kind = self._expr_kind(node.args[0])
                 a0_real = a0 if a0_kind == "real" else f"real({a0}, kind=dp)"
                 ddof_node = None
+                axis_node = None
+                keepdims = False
                 for kw in node.keywords:
                     if kw.arg == "ddof":
                         ddof_node = kw.value
-                        break
-                if ddof_node is None:
-                    return f"std({a0_real})"
-                return f"std({a0_real}, {self.expr(ddof_node)})"
+                    elif kw.arg == "axis":
+                        axis_node = kw.value
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                if axis_node is None:
+                    # Flatten first -- std() (like var_1d(), see np.var's
+                    # own axis=None case just above) is the 1D reduction
+                    # helper and gfortran rejects it outright for a
+                    # rank>1 x ("Rank mismatch") without this; a pre-
+                    # existing gap, not new with axis= support.
+                    flat = f"reshape({a0_real}, [size({a0_real})])"
+                    if ddof_node is None:
+                        return f"std({flat})"
+                    return f"std({flat}, {self.expr(ddof_node)})"
+                # np.std(x, axis=N[, ddof=][, keepdims=]) -- per-axis std,
+                # same sum(x, dim=)-based reduction as np.var's axis case
+                # (see just above) plus a final sqrt; previously this
+                # silently ignored axis= entirely and always called the
+                # scalar/1D std(x, ddof) helper, which gfortran rejects
+                # outright for a rank>1 x ("Rank mismatch").
+                ddof_txt = self.expr(ddof_node) if ddof_node is not None else "0"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                n_txt = f"size({a0_real}, dim={dim_expr})"
+                mean_bcast = (
+                    f"spread(sum({a0_real}, dim={dim_expr}) / real({n_txt}, kind=dp), "
+                    f"dim={dim_expr}, ncopies={n_txt})"
+                )
+                reduced = (
+                    f"sqrt(sum(({a0_real} - {mean_bcast})**2, dim={dim_expr}) / "
+                    f"real(max(1, {n_txt} - ({ddof_txt})), kind=dp))"
+                )
+                if keepdims:
+                    return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                return reduced
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -30237,6 +30374,27 @@ class translator(ast.NodeVisitor):
                     continue
                 t = node.targets[0]
                 v = node.value
+
+                # X = rng.multivariate_normal(...) +-*/ <scalar or other
+                # expr> -- e.g. `rng.multivariate_normal(...) / 100.0`
+                # (see _is_mvn_call/_materialize_mvn_call). Must be
+                # checked before the generic _extent_expr/_expr_kind/
+                # _rank_expr-based fallback further below, which -- via
+                # _rank_expr's own multivariate_normal recognition --
+                # already infers the correct rank=2/kind=real for this
+                # shape and `continue`s, so this would otherwise never be
+                # reached at all, silently skipping the materialization
+                # a nested (non-bare-assignment) mvn draw needs.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.BinOp)
+                    and type(v.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
+                    and (self._is_mvn_call(v.left) or self._is_mvn_call(v.right))
+                ):
+                    _mvn_call = v.left if self._is_mvn_call(v.left) else v.right
+                    self._materialize_mvn_call(_mvn_call, at_codegen=False)
+                    self._mark_alloc_real(t.id, rank=2)
+                    continue
 
                 # Any real (non-alias) assignment to a DataFrame name clears
                 # a previously-established pure alias (see the "dfz = df"
@@ -36825,6 +36983,31 @@ class translator(ast.NodeVisitor):
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
             self.o.w(f"allocate({t.id}(1:{n_expr},1:size({mean_expr})))")
             self.o.w(f"call random_mvn_samples({mean_expr}, {cov_expr}, {t.id})")
+            return
+
+        # X = rng.multivariate_normal(...) +-*/ <scalar or other expr> --
+        # e.g. `rng.multivariate_normal(...) / 100.0` (see
+        # _is_mvn_call/_materialize_mvn_call): random_mvn_samples() fills
+        # a preallocated array in place via a subroutine call, so the
+        # draw itself can't be inlined into self.expr() the way a pure
+        # function's result could be -- materialize it into a real temp
+        # variable first, then apply the rest of the BinOp to that.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.BinOp)
+            and type(v.op) in (ast.Add, ast.Sub, ast.Mult, ast.Div)
+            and (self._is_mvn_call(v.left) or self._is_mvn_call(v.right))
+        ):
+            _mvn_left = self._is_mvn_call(v.left)
+            _mvn_call = v.left if _mvn_left else v.right
+            _mvn_tmp = self._materialize_mvn_call(_mvn_call, at_codegen=True)
+            _other_txt = self.expr(v.right if _mvn_left else v.left)
+            _opsym = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}[type(v.op)]
+            name = self._aliased_name(t.id)
+            if _mvn_left:
+                self.o.w(f"{name} = {_mvn_tmp} {_opsym} {_other_txt}")
+            else:
+                self.o.w(f"{name} = {_other_txt} {_opsym} {_mvn_tmp}")
             return
 
         # x = np.random.rand(n0, n1, ...) / np.random.randn(n0, n1, ...)
@@ -44995,7 +45178,7 @@ def _emit_local_function(
                 recv = n.func.value
                 if not (isinstance(recv, ast.Name) and recv.id == nm):
                     continue
-                if n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice", "permutation", "shuffle"}:
+                if n.func.attr in {"random", "uniform", "standard_normal", "normal", "multivariate_normal", "integers", "randint", "choice", "permutation", "shuffle"}:
                     return True
         return False
 
@@ -45324,6 +45507,20 @@ def _emit_local_function(
             rk_hint = "int"
         if _arg_used_as_rng_receiver(a.arg):
             rk_hint = "int"
+            # _arg_used_as_rng_receiver is a structural check (the
+            # parameter is used as `arg.multivariate_normal(...)`/
+            # `.normal(...)`/etc in the body), independent of what the
+            # CALLER's own rng variable happens to be named -- but
+            # rng_vars itself is name-based (populated only from actual
+            # `X = np.random.default_rng(...)` assignments prescan has
+            # already seen), so a local function parameter is only ever
+            # recognized here by an accidental name collision with the
+            # caller's variable (e.g. both called "rng"). Add it
+            # directly so prescan's own multivariate_normal recognition
+            # (_is_mvn_call and the pre-existing bare-assignment case
+            # alike) works for this function body regardless of what the
+            # caller named its generator.
+            tr.rng_vars.add(a.arg)
         if _arg_integer_seed_recurrence(a.arg):
             rk_hint = "int"
         if _char_scalar_arg_pattern_local(a.arg):
@@ -51845,7 +52042,30 @@ def generate_flat(
                     # (e.g. the source array of a tuple-unpack, `a, b = arg`)
                     # rather than something locally assigned -- fall back to
                     # fn_node's own usage-based argument-kind inference.
-                    if _name in {a.arg for a in (list(fn_node.args.args) + list(fn_node.args.kwonlyargs))}:
+                    _fn_params = list(fn_node.args.args) + list(fn_node.args.kwonlyargs)
+                    if _name in {a.arg for a in _fn_params}:
+                        # Prefer fn_node's OWN already-inferred call-site
+                        # kind for this parameter (from call_kind_hints,
+                        # populated by scanning fn_node's own callers
+                        # elsewhere in the program) over a fresh, purely
+                        # local usage-based guess -- needed when `_name`
+                        # is merely passed through fn_node's body to
+                        # ANOTHER local function (e.g. simulate_turnover's
+                        # own "rho" parameter, passed straight into
+                        # equicorr_cov(rho, ...), with no other arithmetic
+                        # use of "rho" inside simulate_turnover itself to
+                        # give _infer_arg_kind_in_fn any real/int evidence
+                        # of its own -- the pass-through call site is
+                        # otherwise the ONLY evidence there is).
+                        _idx = next((_i for _i, _a in enumerate(_fn_params) if _a.arg == _name), None)
+                        _outer_hints = call_kind_hints.get(fn_node.name)
+                        if (
+                            _idx is not None
+                            and _outer_hints is not None
+                            and _idx < len(_outer_hints)
+                            and _outer_hints[_idx] in {"int", "real", "logical", "char", "complex"}
+                        ):
+                            return (_outer_hints[_idx], 0)
                         _pk = _infer_arg_kind_in_fn(fn_node, _name)
                         if _pk is None:
                             try:

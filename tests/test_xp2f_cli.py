@@ -6580,3 +6580,216 @@ def test_xp2f_pandas_df_multi_column_and_whole_df_to_numpy(tmp_path: Path) -> No
             "print(y[0, 0], y[4, 1])",
         ],
     )
+
+
+def test_xp2f_numpy_std_var_axis_reduction(tmp_path: Path) -> None:
+    # Regression test: np.std(x, axis=N, ddof=...) on a rank-2 array
+    # previously silently ignored axis= entirely and always called the
+    # scalar/1D std(x, ddof) helper, which gfortran rejects outright for
+    # a rank>1 x ("Rank mismatch in argument 'x'... (rank-1 and rank-2)")
+    # -- examples/xequicorr.py's `np.std(x, axis=0, ddof=1)`.
+    # np.var(x, axis=N, ...) had the same gap but *silently computed the
+    # wrong (flattened, scalar) result* instead of failing to build, since
+    # its axis=None case already flattens via reshape() -- no rank
+    # mismatch to catch it. Both now do a proper per-axis reduction (a
+    # sum(x, dim=)-based mean, spread back and subtracted, mirroring how
+    # np.mean(x, axis=...) already worked). Also exercises the
+    # axis=None case for both (which, for std specifically, had its own
+    # separate pre-existing rank-mismatch bug: std(x) never flattened x
+    # first at all, unlike var's own axis=None case).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnumpy_std_var_axis.py",
+        [
+            "import numpy as np",
+            "",
+            "x = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 9.0, 2.0], [2.0, 1.0, 8.0]])",
+            "s0 = np.std(x, axis=0, ddof=1)",
+            "s1 = np.std(x, axis=1)",
+            "v0 = np.var(x, axis=0, ddof=1)",
+            "v1 = np.var(x, axis=1)",
+            "print(s0[0], s0[1], s0[2])",
+            "print(s1[0], s1[1], s1[2], s1[3])",
+            "print(v0[0], v0[1], v0[2])",
+            "print(v1[0], v1[1], v1[2], v1[3])",
+            "print(np.std(x))",
+            "print(np.var(x, ddof=1))",
+        ],
+    )
+
+
+def test_xp2f_rng_multivariate_normal_in_binop_and_local_function(tmp_path: Path) -> None:
+    # Regression test: rng.multivariate_normal(...) used as part of a
+    # larger expression (e.g. `rng.multivariate_normal(...) / 100.0`,
+    # from examples/xequicorr_turnover.py) raised "unsupported call" --
+    # every recognized shape required the call to be the WHOLE right-hand
+    # side of an assignment (X = rng.multivariate_normal(...)), since its
+    # codegen fills a preallocated array in place via a subroutine call
+    # (random_mvn_samples), not a pure function usable inline. Fixed via
+    # _is_mvn_call/_materialize_mvn_call, the same "materialize a nested
+    # call into a real temp variable first" approach used elsewhere in
+    # this file for other subroutine-backed calls.
+    #
+    # Also exercises this from inside a local function with `rng` passed
+    # in as a parameter (not the top-level Name that created it) -- the
+    # prescan branch for this had to be positioned *before* the generic
+    # _rank_expr/_expr_kind-based fallback (which already infers the
+    # right rank/kind for this shape via _rank_expr's own
+    # multivariate_normal recognition and would otherwise `continue`
+    # first, silently skipping the materialization a local-function-scope
+    # temp variable needs a declaration for).
+    #
+    # Does not assert exact values against real Python's output: xp2f's
+    # random number generation is a separate, independent implementation
+    # from numpy's Generator API (PCG64) and doesn't reproduce its exact
+    # draws bit-for-bit -- only that the transpile/build/run pipeline
+    # completes successfully (Build/Run: PASS) for this call shape.
+    src = tmp_path / "xmvn_binop_local_fn.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def draw(p, n, rng):",
+                "    cov = np.eye(p) * 4.0",
+                "    x = rng.multivariate_normal(mean=np.zeros(p), cov=cov, size=n) / 100.0",
+                "    return x",
+                "",
+                "rng = np.random.default_rng(12345)",
+                "x = draw(3, 5, rng)",
+                "print(x.shape)",
+                "",
+                "for i in range(3):",
+                "    rng_i = np.random.default_rng(12345 + i)",
+                "    xi = draw(3, 5, rng_i)",
+                "    print(i, xi.shape)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_does_not_hoist_array_realloc_read_before_reassignment(tmp_path: Path) -> None:
+    # Regression test for a silent data-corruption bug found while
+    # debugging examples/xequicorr_turnover.py's runtime SIGFPE crash:
+    # hoist_loop_invariant_array_realloc moves a loop-body
+    # `if (allocated(x)) deallocate(x); allocate(x(shape))` pair out to
+    # just before the loop whenever `shape` doesn't depend on the loop
+    # variable or anything the loop reassigns -- but it never checked
+    # whether `x`'s value coming INTO the loop (from before it, or
+    # carried from the previous iteration) is actually read anywhere,
+    # e.g. a stateful "d_new = d * (...); ...; d = np.full(p, target)"
+    # rebalancing pattern (`d_new` reads `d` *before* `d` gets
+    # reassigned at the end of the same iteration). Hoisting the
+    # reallocation drops the array's contents (deallocate+allocate gives
+    # uninitialized memory, not a preserved value) -- so it silently fed
+    # garbage into the first iteration's read, corrupting every later
+    # value derived from it. The corruption was invisible whenever the
+    # freshly-allocated memory happened to still be zero-filled (why
+    # examples/xequicorr_turnover.py's first few simulate_turnover()
+    # calls looked fine and only a later one, reusing already-used
+    # memory, went visibly wrong and eventually crashed with SIGFPE from
+    # a resulting zero/negative portfolio value).
+    #
+    # Fixed by refusing to hoist whenever the array name appears
+    # anywhere else at all in the loop body (conservative, like the rest
+    # of this pass -- may leave some genuinely-safe cases unhoisted too,
+    # but never incorrect).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xhoist_realloc_carried_state.py",
+        [
+            "import numpy as np",
+            "",
+            "p = 3",
+            "n = 4",
+            "d = np.full(p, 2.0)",
+            "out = np.zeros(n)",
+            "for t in range(n):",
+            "    d_new = d * 2.0",
+            "    out[t] = d_new.sum()",
+            "    d = np.full(p, float(t + 1))",
+            "print(out[0], out[1], out[2], out[3])",
+        ],
+    )
+
+
+def test_xp2f_local_function_mvn_only_called_from_a_loop(tmp_path: Path) -> None:
+    # Regression test: a local function using rng.multivariate_normal(...)
+    # (rng passed in as a parameter, not the top-level Name that created
+    # it -- see test_xp2f_rng_multivariate_normal_in_binop_and_local_fn)
+    # failed differently, and for reasons unrelated to that call shape,
+    # when its ONLY call site is inside a `for` loop (no bare top-level
+    # call anywhere) -- found while debugging
+    # examples/xequicorr_turnover.py, which happens to have a bare call
+    # before its own sweep loop and so never hit either bug. Three
+    # separate gaps, all in call-site-driven local-function inference,
+    # fixed together:
+    # 1. "unsupported call" for the multivariate_normal call itself --
+    #    _is_mvn_call requires the receiver's name to be in self.rng_vars,
+    #    which is populated purely by NAME from actual
+    #    `X = default_rng(...)` assignments prescan has seen; a
+    #    same-named receiver at the call site (e.g. both called "rng")
+    #    made this work only by coincidence. Fixed by having the local-
+    #    function arg-kind-hint pass add a parameter to rng_vars whenever
+    #    _arg_used_as_rng_receiver structurally recognizes it (extended
+    #    to also recognize multivariate_normal, which it didn't before).
+    # 2. "Type mismatch ... passed REAL(8) to INTEGER(4)" for a SECOND
+    #    local function called only via a pass-through parameter (e.g.
+    #    equicorr_cov(rho, ...) inside simulate_turnover(rho, ...,
+    #    rng), simulate_turnover itself only ever called with a
+    #    loop-derived real value) -- the pass-through parameter's own
+    #    within-body usage gave no int-vs-real evidence on its own, so
+    #    the callee's arg-kind inference had nothing to go on. Fixed by
+    #    preferring the enclosing function's own already-inferred
+    #    call-site kind (call_kind_hints) for that parameter over a
+    #    purely local, usage-based guess.
+    # 3. A linker error ("undefined reference to random_mvn_samples_")
+    #    from detect_needed_helpers missing the `use python_mod, only:
+    #    random_mvn_samples` it needs -- detect_needed_helpers runs
+    #    per-function on just that function's own body, so its own
+    #    (separate, module-level) rng-name scan never sees the
+    #    assignment that actually created the generator, which lives in
+    #    the caller. Fixed by recognizing the multivariate_normal method
+    #    name itself as sufficient evidence, regardless of the receiver.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlocal_fn_mvn_loop_only.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def equicorr_cov(rho, xsd, p):",
+            "    corr = np.full((p, p), rho)",
+            "    np.fill_diagonal(corr, 1.0)",
+            "    return xsd**2 * corr",
+            "",
+            "",
+            "def simulate_turnover(rho, xsd, p, n, rng):",
+            "    cov = equicorr_cov(rho, xsd, p)",
+            "    rets = rng.multivariate_normal(mean=np.zeros(p), cov=cov, size=n) / 100.0",
+            "    return rets.shape",
+            "",
+            "",
+            "n = 20",
+            "p = 3",
+            "xsd = 0.02",
+            "for i, rho_i in enumerate([0.0, 0.2]):",
+            "    rng_i = np.random.default_rng(12345 + i)",
+            "    shp = simulate_turnover(rho_i, xsd, p, n, rng_i)",
+            "    print(rho_i, shp[0], shp[1])",
+        ],
+    )
