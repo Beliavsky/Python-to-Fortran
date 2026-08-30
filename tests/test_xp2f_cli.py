@@ -6520,3 +6520,63 @@ def test_xp2f_pandas_date_iloc_runtime_index(tmp_path: Path) -> None:
             "print(str(dates.iloc[-1].date()))",
         ],
     )
+
+
+def test_xp2f_pandas_df_single_column_to_numpy(tmp_path: Path) -> None:
+    # Regression test: df["col"].to_numpy() -- a single column selected
+    # by a literal string, then .to_numpy() -- raised "unsupported call"
+    # entirely. Only two to_numpy() shapes were recognized (a whole
+    # DataFrame, and a multi-column selection via a resolved name-list
+    # variable); a single df["col"].to_numpy() is a pure passthrough
+    # (self.expr() already resolves the subscript itself to a plain real
+    # array), but needed its own rank/kind recognition in _rank_expr/
+    # _expr_kind too -- the assigned variable was otherwise declared as a
+    # rank-0 scalar (the prescan fallback's default for an unrecognized
+    # Call shape), causing an "Incompatible ranks 0 and 1" compile error.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_single_col_to_numpy.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'x1': [1.5, -2.5, 3.5, -4.5, 5.5], "
+            "'x2': [0.1, 0.2, 0.3, 0.4, 0.5]})",
+            "x1 = df['x1'].to_numpy()",
+            "print(x1[0], x1[2], x1[4])",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_multi_column_and_whole_df_to_numpy(tmp_path: Path) -> None:
+    # Regression test: .to_numpy() should work on any expression that
+    # resolves to a DataFrame -- not just the specific shapes previously
+    # special-cased one at a time. Generalized by (1) extending
+    # _pandas_df_match's "select_names" recognition (previously a df[[
+    # "A","B"]] LITERAL list only) to use the already-general
+    # _resolve_str_list_literal (also covers a resolved name-list
+    # variable and list("abc")), and (2) routing .to_numpy() through
+    # _is_pandas_df_ref_node/_pandas_df_ref -- the same general
+    # DataFrame-reference recognition used elsewhere (corr()/cov()/
+    # print(), etc.) -- instead of three separate ad hoc Call shapes.
+    # Also exercises a genuinely new statement-level codegen branch:
+    # _pandas_df_ref's resolved expression for a multi-column selection
+    # is a type-bound-function-call result (df%icol([1,2])), and
+    # gfortran rejects %values chained directly onto that ("leftmost
+    # part-ref in a data-ref cannot be a function reference") -- fixed
+    # by materializing it into a block-scoped temp first (see
+    # _pandas_df_materialize_decl), the same pattern already used by
+    # corr()/cov()/the reduction prints.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_multi_col_to_numpy.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'x1': [1.5, -2.5, 3.5, -4.5, 5.5], "
+            "'x2': [0.1, 0.2, 0.3, 0.4, 0.5]})",
+            "x = df[['x1', 'x2']].to_numpy()",
+            "y = df.to_numpy()",
+            "print(x[0, 0], x[4, 1])",
+            "print(y[0, 0], y[4, 1])",
+        ],
+    )

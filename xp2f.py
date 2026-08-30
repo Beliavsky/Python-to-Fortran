@@ -16411,23 +16411,26 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "to_numpy"
+                and len(node.args) == 0
                 and isinstance(node.func.value, ast.Subscript)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id in self.pandas_df_vars
-                and isinstance(node.func.value.slice, ast.Name)
-                and (
-                    node.func.value.slice.id in self.pandas_str_list_values
-                    or node.func.value.slice.id in self.alloc_chars
-                )
+                and is_const_str(node.func.value.slice)
             ):
+                # df["col"].to_numpy() -- a single column (Series-valued,
+                # not a DataFrame reference -- _is_pandas_df_ref_node
+                # below doesn't cover this).
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "to_numpy"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in self.pandas_df_vars
                 and len(node.args) == 0
+                and self._is_pandas_df_ref_node(node.func.value)
             ):
+                # X.to_numpy() for any whole-DataFrame reference
+                # expression _pandas_df_match recognizes (a bare Name,
+                # df[["A","B"]] / df[names_var] / df.loc[:, [...]],
+                # df.iloc[rows, cols], df.head(n)/.tail(n)).
                 return "real"
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}:
                 return "char"
@@ -18341,22 +18344,14 @@ class translator(ast.NodeVisitor):
         # or None if node doesn't match any recognized DataFrame reference shape.
         if isinstance(node, ast.Name) and node.id in self.pandas_df_vars:
             return {"kind": "name", "df_id": node.id}
-        _is_str_list = lambda n: (
-            isinstance(n, ast.List)
-            and n.elts
-            and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in n.elts)
-        )
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
             and node.value.id in self.pandas_df_vars
-            and _is_str_list(node.slice)
         ):
-            return {
-                "kind": "select_names",
-                "df_id": node.value.id,
-                "names": [e.value for e in node.slice.elts],
-            }
+            _names = self._resolve_str_list_literal(node.slice)
+            if _names is not None:
+                return {"kind": "select_names", "df_id": node.value.id, "names": _names}
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Attribute)
@@ -18369,13 +18364,10 @@ class translator(ast.NodeVisitor):
             and node.slice.elts[0].lower is None
             and node.slice.elts[0].upper is None
             and node.slice.elts[0].step is None
-            and _is_str_list(node.slice.elts[1])
         ):
-            return {
-                "kind": "select_names",
-                "df_id": node.value.value.id,
-                "names": [e.value for e in node.slice.elts[1].elts],
-            }
+            _names = self._resolve_str_list_literal(node.slice.elts[1])
+            if _names is not None:
+                return {"kind": "select_names", "df_id": node.value.value.id, "names": _names}
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Attribute)
@@ -20252,24 +20244,23 @@ class translator(ast.NodeVisitor):
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "to_numpy"
+            and len(node.args) == 0
             and isinstance(node.func.value, ast.Subscript)
             and isinstance(node.func.value.value, ast.Name)
             and node.func.value.value.id in self.pandas_df_vars
-            and isinstance(node.func.value.slice, ast.Name)
-            and (
-                node.func.value.slice.id in self.pandas_str_list_values
-                or node.func.value.slice.id in self.alloc_chars
-            )
+            and is_const_str(node.func.value.slice)
         ):
-            return 2
+            # df["col"].to_numpy() -- a single column, already rank 1.
+            return 1
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "to_numpy"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in self.pandas_df_vars
             and len(node.args) == 0
+            and self._is_pandas_df_ref_node(node.func.value)
         ):
+            # X.to_numpy() for any whole-DataFrame reference expression
+            # (see the matching _expr_kind case).
             return 2
         if (
             isinstance(node, ast.Subscript)
@@ -24321,26 +24312,35 @@ class translator(ast.NodeVisitor):
                     return f"(.not. valid({base_expr}))"
                 if (
                     attr == "to_numpy"
+                    and len(node.args) == 0
                     and isinstance(node.func.value, ast.Subscript)
                     and isinstance(node.func.value.value, ast.Name)
                     and node.func.value.value.id in self.pandas_df_vars
-                    and isinstance(node.func.value.slice, ast.Name)
-                    and node.func.value.slice.id in self.pandas_str_list_values
+                    and is_const_str(node.func.value.slice)
                 ):
-                    _df_id = node.func.value.value.id
-                    _df_expr = self.expr(node.func.value.value)
-                    _names = self.pandas_str_list_values[node.func.value.slice.id]
-                    _col_list = self.pandas_df_columns.get(_df_id, [])
-                    _idxs = [_col_list.index(_nm) + 1 for _nm in _names]
-                    _idx_txt = ", ".join(str(_i) for _i in _idxs)
-                    return f"{_df_expr}%values(:, [{_idx_txt}])"
+                    # df["col"].to_numpy() -- a single column, already a
+                    # plain real array once .expr() resolves the
+                    # subscript (base_expr, computed above); a pure
+                    # passthrough, unlike the whole-DataFrame case below
+                    # (which needs %values since that base_expr is a
+                    # derived-type value, not already an array).
+                    return base_expr
                 if (
                     attr == "to_numpy"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id in self.pandas_df_vars
                     and len(node.args) == 0
+                    and self._is_pandas_df_ref_node(node.func.value)
                 ):
-                    return f"{base_expr}%values"
+                    # X.to_numpy() for any whole-DataFrame reference
+                    # expression _pandas_df_match recognizes (a bare
+                    # Name, df[["A","B"]] / df[names_var] / df.loc[:,
+                    # [...]], df.iloc[rows, cols], df.head(n)/.tail(n))
+                    # -- _pandas_df_ref's resolved expression is always a
+                    # derived-type DataFrame value in every one of those
+                    # cases (a bare Name, or an %icol(...)/%iloc(...)
+                    # call result), so %values works uniformly.
+                    _df_expr2, _ = self._pandas_df_ref(node.func.value, node)
+                    if _df_expr2 is not None:
+                        return f"{_df_expr2}%values"
                 if attr == "index" and len(node.args) == 1:
                     arg0 = self.expr(node.args[0])
                     if self._rank_expr(node.func.value) == 0 and self._expr_kind(node.func.value) == "char":
@@ -37969,6 +37969,35 @@ class translator(ast.NodeVisitor):
             self.o.pop()
             self.o.w("end block")
             return
+
+        # X = <df-ref>.to_numpy() for any statically-known whole-
+        # DataFrame reference (see _is_pandas_df_ref_node) -- e.g.
+        # df[["A","B"]].to_numpy(), df[names_var].to_numpy(),
+        # df.iloc[rows, cols].to_numpy(), df.head(n).to_numpy(), or a
+        # bare df.to_numpy(). A block since the resolved expression may
+        # be a type-bound-function-call result (df%icol([1,2]), etc.),
+        # which -- unlike a bare df Name -- can't have %values chained
+        # onto it directly (see _pandas_df_materialize_decl).
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "to_numpy"
+            and len(v.args) == 0
+            and self._is_pandas_df_ref_node(v.func.value)
+        ):
+            _tn_expr, _ = self._pandas_df_ref(v.func.value, v)
+            if _tn_expr is not None:
+                name = self._aliased_name(t.id)
+                _tn_kind = self.pandas_df_vars.get(self._pandas_df_root_id(v.func.value), "DataFrame_index_date")
+                self.o.w("block")
+                self.o.push()
+                _tn_expr2, _tn_needs_assign = self._pandas_df_materialize_decl(_tn_expr, kind=_tn_kind)
+                self._pandas_df_materialize_assign(_tn_expr, _tn_needs_assign)
+                self.o.w(f"{name} = {_tn_expr2}%values")
+                self.o.pop()
+                self.o.w("end block")
+                return
 
         # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
         if isinstance(t, ast.Name) and t.id in self.pandas_df_vars and isinstance(v, ast.Subscript):
