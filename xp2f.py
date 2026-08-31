@@ -759,6 +759,75 @@ def is_const_str(node):
     return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
 
+_FLOAT_FORMAT_FSTRING_SPEC_RE = re.compile(r"^\.(\d+)f$")
+_FLOAT_FORMAT_STR_SPEC_RE = re.compile(r"^\{:\.(\d+)f\}$")
+_FLOAT_FORMAT_PERCENT_SPEC_RE = re.compile(r"^%\.(\d+)f$")
+
+
+def _extract_float_format_ndigits(node):
+    """Recognize `float_format=...` as a fixed-N-decimal-places formatter
+    and return N, or None if it's some other (unsupported) callable.
+
+    Only the common `lambda x: f"{x:.Nf}"` / `lambda x: "{:.Nf}".format(x)`
+    / `"{:.Nf}".format` (bound, no lambda) / `lambda x: "%.Nf" % x` shapes
+    are recognized -- this can't (and doesn't try to) evaluate an
+    arbitrary Python callable at transpile time; anything else (percent
+    formats, thousands separators, scientific notation, conditional/
+    custom logic) is left unrecognized for the caller to fall back on.
+    """
+    if (
+        isinstance(node, ast.Lambda)
+        and len(node.args.args) == 1
+        and not node.args.posonlyargs
+        and not node.args.kwonlyargs
+        and node.args.vararg is None
+        and node.args.kwarg is None
+    ):
+        arg_name = node.args.args[0].arg
+        body = node.body
+        # lambda x: f"{x:.Nf}"
+        if (
+            isinstance(body, ast.JoinedStr)
+            and len(body.values) == 1
+            and isinstance(body.values[0], ast.FormattedValue)
+            and isinstance(body.values[0].value, ast.Name)
+            and body.values[0].value.id == arg_name
+            and isinstance(body.values[0].format_spec, ast.JoinedStr)
+            and len(body.values[0].format_spec.values) == 1
+            and is_const_str(body.values[0].format_spec.values[0])
+        ):
+            m = _FLOAT_FORMAT_FSTRING_SPEC_RE.match(body.values[0].format_spec.values[0].value)
+            return int(m.group(1)) if m else None
+        # lambda x: "{:.Nf}".format(x)
+        if (
+            isinstance(body, ast.Call)
+            and isinstance(body.func, ast.Attribute)
+            and body.func.attr == "format"
+            and is_const_str(body.func.value)
+            and len(body.args) == 1
+            and isinstance(body.args[0], ast.Name)
+            and body.args[0].id == arg_name
+        ):
+            m = _FLOAT_FORMAT_STR_SPEC_RE.match(body.func.value.value)
+            return int(m.group(1)) if m else None
+        # lambda x: "%.Nf" % x
+        if (
+            isinstance(body, ast.BinOp)
+            and isinstance(body.op, ast.Mod)
+            and is_const_str(body.left)
+            and isinstance(body.right, ast.Name)
+            and body.right.id == arg_name
+        ):
+            m = _FLOAT_FORMAT_PERCENT_SPEC_RE.match(body.left.value)
+            return int(m.group(1)) if m else None
+        return None
+    # "{:.Nf}".format  (bound method passed directly, no lambda wrapper)
+    if isinstance(node, ast.Attribute) and node.attr == "format" and is_const_str(node.value):
+        m = _FLOAT_FORMAT_STR_SPEC_RE.match(node.value.value)
+        return int(m.group(1)) if m else None
+    return None
+
+
 def is_bool_const(node):
     return isinstance(node, ast.Constant) and isinstance(node.value, bool)
 
@@ -12375,7 +12444,7 @@ def normalize_if_scalar_array_merges(stmts):
                     "array", "asarray", "zeros", "ones", "empty", "full",
                     "linspace", "arange", "copy", "empty_like", "ones_like",
                     "zeros_like", "concatenate", "stack", "vstack", "hstack",
-                    "column_stack", "row_stack", "where",
+                    "column_stack", "row_stack", "where", "minimum", "maximum",
                 }
             ):
                 return True
@@ -12403,9 +12472,22 @@ def normalize_if_scalar_array_merges(stmts):
                 o_arr = _is_arrayish_expr(o_asg.value)
                 if b_arr and (not o_arr):
                     o_asg.value = ast.List(elts=[copy.deepcopy(o_asg.value)], ctx=ast.Load())
+                    # Marks this as a synthetic pass-through wrapper (not a
+                    # genuine user-written `[x]` array literal) so rank/kind
+                    # inference for ast.List nodes (_rank_expr/_expr_kind)
+                    # can recognize it and defer directly to the wrapped
+                    # element instead of applying array-literal-shape
+                    # heuristics meant for real `[row1, row2, ...]` /
+                    # `[array_valued_name]` literals -- those heuristics
+                    # otherwise misinfer the rank of whatever non-trivial
+                    # expression (e.g. an elementwise np.minimum/np.maximum
+                    # call, or a scalar*array BinOp) got wrapped here purely
+                    # to make this branch look "arrayish" like its sibling.
+                    o_asg.value._xp2f_scalar_wrap = True
                     ast.fix_missing_locations(o_asg)
                 elif o_arr and (not b_arr):
                     b_asg.value = ast.List(elts=[copy.deepcopy(b_asg.value)], ctx=ast.Load())
+                    b_asg.value._xp2f_scalar_wrap = True
                     ast.fix_missing_locations(b_asg)
             normalize_if_scalar_array_merges(st.body)
             normalize_if_scalar_array_merges(st.orelse)
@@ -16122,6 +16204,11 @@ class translator(ast.NodeVisitor):
                 return "char"
             return None
         if isinstance(node, ast.List):
+            if getattr(node, "_xp2f_scalar_wrap", False) and len(node.elts) == 1:
+                # See the matching _xp2f_scalar_wrap check in _rank_expr:
+                # this is a synthetic pass-through wrapper, not a genuine
+                # literal `[x]`, so its kind is just the wrapped element's.
+                return self._expr_kind(node.elts[0])
             if not node.elts:
                 return None
             kinds = {self._expr_kind(e) for e in node.elts}
@@ -20622,6 +20709,12 @@ class translator(ast.NodeVisitor):
                 return self.alloc_char_rank.get(nm, 1)
             return 0
         if isinstance(node, ast.List):
+            if getattr(node, "_xp2f_scalar_wrap", False) and len(node.elts) == 1:
+                # Synthetic pass-through wrapper from
+                # normalize_if_scalar_array_merges -- not a genuine literal
+                # `[x]`, so it should carry the wrapped element's own rank
+                # rather than the array-literal-shape heuristics below.
+                return self._rank_expr(node.elts[0])
             lit_shape = self._literal_nested_shape(node)
             if lit_shape is not None and len(lit_shape) > 1:
                 return len(lit_shape)
@@ -21182,7 +21275,7 @@ class translator(ast.NodeVisitor):
                     return 0
                 if node.func.attr in {"delete", "insert"} and len(node.args) >= 1:
                     return 1
-                if node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "array", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"} and len(node.args) >= 1:
+                if node.func.attr in {"log", "exp", "sqrt", "asarray", "array", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "polyval" and len(node.args) >= 2:
                     return self._rank_expr(node.args[1])
@@ -22443,6 +22536,18 @@ class translator(ast.NodeVisitor):
             return " // ".join(parts)
 
         if isinstance(node, ast.List):
+            if getattr(node, "_xp2f_scalar_wrap", False) and len(node.elts) == 1:
+                # Synthetic pass-through wrapper from
+                # normalize_if_scalar_array_merges -- emit the wrapped
+                # element's own Fortran text directly. It isn't a genuine
+                # literal `[x]`, so it must not be flattened/reshaped as
+                # an array-constructor row the way real list literals are
+                # just below (that path assumes building a NEW array from
+                # elements, which is wrong for an expression that may
+                # already be rank >= 1 in its own right, e.g. an
+                # elementwise np.minimum/np.maximum call or a
+                # scalar*array BinOp).
+                return self.expr(node.elts[0])
             lit_shape = self._literal_nested_shape(node)
             if lit_shape is not None and len(lit_shape) >= 2:
                 flat_nodes = self._literal_flatten_nodes(node)
@@ -36988,9 +37093,26 @@ class translator(ast.NodeVisitor):
                     seed_node = kw.value
             if seed_node is None or is_none(seed_node):
                 self.o.w("call seed_rng()")
+            elif isinstance(seed_node, ast.Constant) and isinstance(seed_node.value, int):
+                self.o.w(f"call seed_rng({seed_node.value})")
             else:
+                # seed isn't a literal, so it may be an Optional[int]
+                # value that's None at runtime (e.g. a `seed: int | None`
+                # parameter fed from a module-level `X = None` global --
+                # see the matching -1 sentinel emitted for such globals).
+                # numpy seeds are always non-negative, so a negative
+                # value unambiguously means "no seed" here; guard at
+                # runtime rather than assuming the static non-None case.
                 seed_expr = self.expr(seed_node)
+                self.o.w(f"if (int({seed_expr}) < 0) then")
+                self.o.push()
+                self.o.w("call seed_rng()")
+                self.o.pop()
+                self.o.w("else")
+                self.o.push()
                 self.o.w(f"call seed_rng(int({seed_expr}))")
+                self.o.pop()
+                self.o.w("end if")
             # Keep a placeholder scalar for the RNG object name.
             self._force_mark_int(t.id)
             self.o.w(f"{self._aliased_name(t.id)} = 0")
@@ -37012,8 +37134,20 @@ class translator(ast.NodeVisitor):
                     seed_node = kw.value
             if seed_node is None or is_none(seed_node):
                 self.o.w("call seed_rng()")
+            elif isinstance(seed_node, ast.Constant) and isinstance(seed_node.value, int):
+                self.o.w(f"call seed_rng({seed_node.value})")
             else:
-                self.o.w(f"call seed_rng(int({self.expr(seed_node)}))")
+                # See the matching comment just above for default_rng.
+                seed_expr = self.expr(seed_node)
+                self.o.w(f"if (int({seed_expr}) < 0) then")
+                self.o.push()
+                self.o.w("call seed_rng()")
+                self.o.pop()
+                self.o.w("else")
+                self.o.push()
+                self.o.w(f"call seed_rng(int({seed_expr}))")
+                self.o.pop()
+                self.o.w("end if")
             self._force_mark_int(t.id)
             self.o.w(f"{self._aliased_name(t.id)} = 0")
             self.rng_vars.add(t.id)
@@ -37034,8 +37168,22 @@ class translator(ast.NodeVisitor):
             if is_standard:
                 if v.args:
                     size_node = v.args[0]
-            elif v.args:
-                size_node = v.args[0]
+            else:
+                # np.random.normal(loc=0.0, scale=1.0, size=None) / the
+                # equivalent rng.normal(...) -- positional order is
+                # (loc, scale, size). v.args[0] is loc (e.g. a mean=
+                # argument passed positionally), never size; previously
+                # this wrongly took v.args[0] as size_node and never
+                # looked at positional loc/scale at all, so a positional
+                # call like rng.normal(mean, std, size=(...)) silently
+                # dropped the mean/std affine transform entirely (emitted
+                # bare rnorm(...), i.e. mean=0, std=1).
+                if len(v.args) >= 1:
+                    loc_node = v.args[0]
+                if len(v.args) >= 2:
+                    scale_node = v.args[1]
+                if len(v.args) >= 3:
+                    size_node = v.args[2]
             for kw in v.keywords:
                 if kw.arg == "size":
                     size_node = kw.value
@@ -42830,11 +42978,34 @@ class translator(ast.NodeVisitor):
                 and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "to_string"
                 and len(c.args[0].args) == 0
-                and not getattr(c.args[0], "keywords", [])
+                and all(kw.arg == "float_format" for kw in getattr(c.args[0], "keywords", []))
             ):
                 # `.to_string()` on our synthesized DataFrame-print helpers
                 # is a no-op wrapper (print() already stringifies); unwrap
-                # it so the patterns below still match.
+                # it so the patterns below still match. A float_format=
+                # callback that fixes the number of decimal places (the
+                # common `lambda x: f"{x:.Nf}"` idiom and its siblings --
+                # see _extract_float_format_ndigits) is honored directly
+                # by short-circuiting straight to _emit_pandas_df_print
+                # with ndigits=N, the same "extract a literal and thread
+                # it through as ndigits" approach print(df.round(n))
+                # already uses just below. Anything else float_format
+                # could be (percent/scientific/thousands-separator/custom
+                # logic) can't be evaluated at transpile time, so it's
+                # dropped with a warning instead of rejecting the whole
+                # statement -- cosmetic only, values are unaffected.
+                _ff_kw = next((kw for kw in c.args[0].keywords if kw.arg == "float_format"), None)
+                _ff_ndigits = _extract_float_format_ndigits(_ff_kw.value) if _ff_kw is not None else None
+                if _ff_ndigits is not None and self._is_pandas_df_ref_node(c.args[0].func.value):
+                    self._emit_pandas_df_print(c.args[0].func.value, ndigits=_ff_ndigits, context_node=orig_call)
+                    return
+                if _ff_kw is not None and _ff_ndigits is None:
+                    print(
+                        "Warning: ignoring unsupported to_string(float_format=...) "
+                        f"at line {getattr(orig_call, 'lineno', '?')}; using default numeric formatting instead "
+                        "(cosmetic difference only, values are unaffected)",
+                        file=sys.stderr,
+                    )
                 c = ast.Call(func=c.func, args=[c.args[0].func.value], keywords=c.keywords)
             df_transposed = False
             if (
@@ -45658,6 +45829,7 @@ def _emit_local_function(
     callback_scalar_actual_names=None,
     local_callback_actual_specs=None,
     local_df_return_info=None,
+    toplevel_shared_specs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -46014,6 +46186,84 @@ def _emit_local_function(
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
+    if toplevel_shared_specs:
+        # Give tr's own rank/kind-inference state (_rank_expr/_expr_kind,
+        # queried by e.g. visit_For to pick a codegen strategy) visibility
+        # into module-level globals this function reads but never
+        # locally assigns -- a plain `for t in TERMINAL_THRESHOLDS:`
+        # inside a local function otherwise falls through every
+        # rank>=1-aware branch (TERMINAL_THRESHOLDS looks like an
+        # unrecognized, rank-0 name to this function's own fresh
+        # translator instance) straight to the generic "only for .. in
+        # range(..) or for .. in sorted(..) supported" error -- even
+        # though the exact same top-level list works fine outside any
+        # function. (Only scalar globals worked before this: an
+        # unrecognized name already defaults to "real, rank 0"
+        # elsewhere, which happens to be right for a scalar but wrong
+        # for an array/list.) A name locally assigned anywhere in this
+        # function's own body is left alone -- its local usage governs
+        # via prescan as usual, matching collect_top_level_shared_decls's
+        # own per-function bound-name exclusion when it built this set.
+        _locally_bound = set(args)
+        for _n in ast.walk(fn):
+            if isinstance(_n, (ast.Assign, ast.AnnAssign, ast.For, ast.withitem)):
+                _targets = (
+                    _n.targets if isinstance(_n, ast.Assign)
+                    else [_n.target] if isinstance(_n, (ast.AnnAssign, ast.For))
+                    else [_n.optional_vars] if _n.optional_vars is not None else []
+                )
+                for _tgt in _targets:
+                    for _tn in ast.walk(_tgt):
+                        if isinstance(_tn, ast.Name) and isinstance(_tn.ctx, ast.Store):
+                            _locally_bound.add(_tn.id)
+        # toplevel_shared_specs (module_global_decls) is a single dict
+        # merged across every local function in the script, not scoped to
+        # this one -- so it can carry globals this particular function
+        # never references at all (e.g. simulate_extrema doesn't touch
+        # INITIAL_PRICE even though main() does). Seeding one of those
+        # unconditionally still calls _mark_real/_mark_alloc_real, which
+        # resolves an alias via _aliased_name -- and that registers the
+        # global's lowercased spelling as taken in THIS function's own
+        # fortran_name_owner table before its own, entirely unrelated,
+        # same-named parameter gets a chance to. Fortran dummy arguments
+        # always safely shadow a host-associated global of the same
+        # case-insensitive name, so no rename was ever needed there --
+        # but the resulting spurious rename (e.g. initial_price ->
+        # initial_price_2) desyncs the body from the subroutine's actual
+        # signature (declared and called under the unaliased name),
+        # since that gets emitted separately, leaving the "_2" local
+        # permanently unassigned. Restrict seeding to globals this
+        # function's body actually reads (Load context), matching
+        # collect_top_level_shared_decls's own per-function need
+        # computation before it got merged into the shared dict.
+        _locally_referenced = {
+            _n.id for _n in ast.walk(fn) if isinstance(_n, ast.Name) and isinstance(_n.ctx, ast.Load)
+        }
+        for _nm, (_gk, _gr) in toplevel_shared_specs.items():
+            if _nm in _locally_bound or _nm not in _locally_referenced:
+                continue
+            if _gr >= 1:
+                if _gk == "real":
+                    tr._mark_alloc_real(_nm, rank=_gr)
+                elif _gk == "int":
+                    tr._mark_alloc_int(_nm, rank=_gr)
+                elif _gk == "logical":
+                    tr._mark_alloc_log(_nm, rank=_gr)
+                elif _gk == "complex":
+                    tr._mark_alloc_complex(_nm, rank=_gr)
+                elif _gk == "char":
+                    tr._mark_alloc_char(_nm, rank=_gr)
+            else:
+                if _gk == "real":
+                    tr._mark_real(_nm)
+                elif _gk == "int":
+                    tr._mark_int(_nm)
+                elif _gk == "logical":
+                    tr._mark_log(_nm)
+                elif _gk == "complex":
+                    tr._mark_complex(_nm)
+                elif _gk == "char":
+                    tr._mark_char(_nm)
     for _st_nested_fn in fn.body:
         if isinstance(_st_nested_fn, ast.FunctionDef):
             _nested_lam = _simple_function_as_lambda(_st_nested_fn)
@@ -47305,6 +47555,21 @@ def _emit_local_function(
             continue
         _nm = _st.targets[0].id
         if _nm in args:
+            continue
+        # This is a rank-recovery fixup for plain numeric-array locals
+        # (see the comment above) -- names already tracked as one of the
+        # special non-plain-array categories (a pandas DataFrame, a dict
+        # comprehension result, a Series-like reduction result, a
+        # dict-typed value, ...) must never be blindly re-marked as a
+        # real/int/etc array here, or they end up declared twice with
+        # conflicting types (e.g. `type(DataFrame_str_index) :: summary`
+        # AND `real(kind=dp), allocatable :: summary(:)`).
+        if (
+            _nm in tr.pandas_df_vars
+            or _nm in tr.dict_comp_vars
+            or _nm in tr.pandas_series_labels
+            or _nm in tr.dict_typed_vars
+        ):
             continue
         _rhs = _st.value
         _rr = int(tr._rank_expr(_rhs))
@@ -56752,6 +57017,7 @@ def generate_flat(
                         callback_scalar_actual_names=callback_scalar_actual_names,
                         local_callback_actual_specs=local_callback_actual_specs,
                         local_df_return_info=_proc_mod_local_df_return_info,
+                        toplevel_shared_specs=module_global_decls,
                     )
             else:
                 _emit_local_function(
@@ -56793,6 +57059,7 @@ def generate_flat(
                     callback_scalar_actual_names=callback_scalar_actual_names,
                     local_callback_actual_specs=local_callback_actual_specs,
                     local_df_return_info=_proc_mod_local_df_return_info,
+                    toplevel_shared_specs=module_global_decls,
                 )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
@@ -57152,6 +57419,28 @@ def generate_flat(
             continue
         if is_main_guard_if(stmt):
             continue
+        # `X = None` module-level globals are otherwise silently skipped
+        # by visit_Assign's generic "None sentinel assignment" handling
+        # (it only tracks None-ness statically; it emits no Fortran
+        # statement at all), which leaves a scalar int/real global that's
+        # genuinely used as a runtime value (e.g. an `Optional[int]`
+        # RNG seed threaded into a local function, like RNG_SEED here)
+        # uninitialized -- undefined behavior, not "no seed". Give it an
+        # explicit -1 sentinel instead: numpy/RNG seeds are always
+        # non-negative, so -1 is unambiguous, and the matching runtime
+        # `if (seed < 0) ... else ...` guard in the default_rng/Random
+        # seeding codegen (see visit_Assign) treats it as "no seed".
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and is_none(stmt.value)
+        ):
+            _gnm = stmt.targets[0].id
+            _gkr = module_global_decls.get(_gnm)
+            if _gkr is not None and _gkr[1] == 0 and _gkr[0] in ("int", "real"):
+                o.w(f"{_gnm} = -1" if _gkr[0] == "int" else f"{_gnm} = -1.0_dp")
+                continue
         tr.visit(stmt)
     if (
         use_proc_module
@@ -57167,6 +57456,22 @@ def generate_flat(
         o.w("")
         o.w("contains")
         o.w("")
+        # Flat mode emits local functions as Fortran internal procedures
+        # (inside this program's own `contains`), so they already get
+        # automatic host association to the program's own variables --
+        # no new Fortran declaration is needed here. This is purely
+        # about giving each function's own translator instance the
+        # rank/kind knowledge it needs for correct codegen when reading
+        # a module-level global it never locally assigns (see the
+        # matching comment at the toplevel_shared_specs seeding step in
+        # _emit_local_function).
+        _toplevel_shared_specs = collect_top_level_shared_decls(
+            tree,
+            local_funcs=local_funcs,
+            params=params,
+            tuple_return_out_kinds=tuple_return_out_kinds,
+            tuple_return_out_ranks=tuple_return_out_ranks,
+        )
         for fn in local_funcs:
             arg_dict_types = _arg_dict_types_for_fn(fn)
             _emit_local_function(
@@ -57193,6 +57498,7 @@ def generate_flat(
                 local_func_callback_params=local_func_callback_params,
                 local_void_funcs=local_void_funcs,
                 local_generic_overloads=local_generic_overloads,
+                toplevel_shared_specs=_toplevel_shared_specs,
                 local_overload_dispatch=local_overload_dispatch,
                 user_class_types=user_class_types,
                 local_func_dict_arg_types=local_func_dict_arg_types,

@@ -7701,15 +7701,12 @@ def test_xp2f_dict_comprehension_over_list_consumed_via_items(tmp_path: Path) ->
     # machinery's vectorized-elemental-map strategy, which can't
     # express a per-element reduction like `.mean()` at all).
     #
-    # This is deliberately NOT the exact xpaths.py shape: that specific
-    # usage is a dict comprehension inside a local function (def
-    # main():) iterating a MODULE-LEVEL list global (TERMINAL_THRESHOLDS)
-    # -- which hits an entirely separate, pre-existing, and much wider
-    # limitation confirmed independently of dict comprehensions (a bare
-    # `for t in GLOBAL_LIST:` loop inside a local function already fails
-    # with "only for .. in range(..) or for .. in sorted(..) supported").
-    # This test instead exercises the dict-comprehension feature itself
-    # at the top level, where that separate limitation doesn't apply.
+    # This exercises the dict-comprehension feature itself at the top
+    # level; see test_xp2f_dict_comprehension_in_local_function_over_
+    # module_global_list for the exact xpaths.py shape (same
+    # comprehension, but inside a local function iterating a module-
+    # level list global -- which needed a separate fix, see
+    # test_xp2f_local_function_iterates_module_level_list_global).
     _run_xp2f_compile_diff(
         tmp_path,
         "xdictcomp_items.py",
@@ -7726,5 +7723,377 @@ def test_xp2f_dict_comprehension_over_list_consumed_via_items(tmp_path: Path) ->
             "",
             "for threshold, probability in threshold_probs.items():",
             "    print(threshold, probability)",
+        ],
+    )
+
+
+def test_xp2f_local_function_iterates_module_level_list_global(tmp_path: Path) -> None:
+    # Regression test, surfaced by xpaths.py: a local function (def
+    # main():) iterating a module-level list global it never locally
+    # assigns -- `for t in TERMINAL_THRESHOLDS:` -- failed even as a
+    # BARE for-loop, with no dict comprehension involved:
+    #   Transpile: FAIL (only for .. in range(..) or for .. in
+    #   sorted(..) supported)
+    # despite the exact same top-level list working fine in a for-loop
+    # outside any function, and despite a SCALAR module-level global
+    # already working fine inside a local function (e.g. `X = 5.0`
+    # read inside main()) -- that scalar case only "worked" because an
+    # unrecognized name already defaults to rank-0 real, which happens
+    # to be correct for a scalar but wrong for a list/array.
+    #
+    # Root cause: _emit_local_function builds each local function's own
+    # translator instance from scratch, with no visibility into a
+    # module-level global's actual type/rank unless it's the (much
+    # narrower) target of an explicit Python `global` statement inside
+    # some local function -- collect_top_level_shared_decls already
+    # computed the right (kind, rank) info per name (merged into
+    # module_global_decls when use_proc_module, i.e. whenever there are
+    # any local functions at all) for a *different* purpose (avoiding
+    # duplicate local Fortran declarations), but that info was never
+    # used to seed the new translator instance's own rank/kind-inference
+    # state before visiting the function body.
+    #
+    # Fixed by threading module_global_decls into _emit_local_function
+    # as toplevel_shared_specs and seeding tr's own alloc_real/etc.
+    # state with it (skipping any name the function locally reassigns
+    # itself, so genuine local shadowing -- e.g. a same-named local
+    # variable -- still works correctly via normal prescan).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlocal_fn_global_list_iter.py",
+        [
+            "TERMINAL_THRESHOLDS = [100.0, 104.0]",
+            "",
+            "",
+            "def main():",
+            "    total = 0.0",
+            "    for t in TERMINAL_THRESHOLDS:",
+            "        total = total + t",
+            "    print(total)",
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    main()",
+        ],
+    )
+
+
+def test_xp2f_local_function_shadows_module_level_list_global(tmp_path: Path) -> None:
+    # Regression test for the seeding fix above: a local variable that
+    # shares a name with a module-level list global (but is never that
+    # global -- pure name collision, reassigned to something else
+    # entirely inside the function) must not be wrongly treated as the
+    # global. toplevel_shared_specs seeding skips any name the function
+    # locally (re)assigns, so this stays governed by normal local
+    # prescan.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlocal_fn_shadows_global_list.py",
+        [
+            "VALUES = [1.0, 2.0, 3.0]",
+            "",
+            "",
+            "def main():",
+            "    VALUES = 42.0",
+            "    print(VALUES)",
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    main()",
+        ],
+    )
+
+
+def test_xp2f_dict_comprehension_in_local_function_over_module_global_list(
+    tmp_path: Path,
+) -> None:
+    # Regression test: the exact xpaths.py shape -- a dict comprehension
+    # (test_xp2f_dict_comprehension_over_list_consumed_via_items) inside
+    # a local function (test_xp2f_local_function_iterates_module_level_
+    # list_global) iterating a module-level list global. Both fixes
+    # combined, exercised together.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdictcomp_in_local_fn.py",
+        [
+            "import numpy as np",
+            "",
+            "TERMINAL_THRESHOLDS = [100.0, 104.0]",
+            "",
+            "",
+            "def main():",
+            "    terminals = np.array([98.0, 101.0, 105.0, 99.0, 110.0])",
+            "    threshold_probs = {",
+            "        threshold: (terminals > threshold).mean()",
+            "        for threshold in TERMINAL_THRESHOLDS",
+            "    }",
+            "    for threshold, probability in threshold_probs.items():",
+            "        print(threshold, probability)",
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    main()",
+        ],
+    )
+
+
+def test_xp2f_df_to_string_float_format_fixed_decimals_recognized(tmp_path: Path) -> None:
+    # Regression test, surfaced by xpaths.py:
+    #   print(summary.to_string(float_format=lambda x: f"{x:.4f}"))
+    # was originally unsupported (only a bare, no-keyword .to_string()
+    # was recognized as the existing print-helpers' no-op wrapper).
+    #
+    # The common "fixed N decimal places" float_format idiom (this
+    # lambda's f-string form, plus its "{:.Nf}".format(x) and "%.Nf" % x
+    # siblings -- see _extract_float_format_ndigits) is recognized and
+    # honored directly by threading N through as the print helper's
+    # existing ndigits= parameter (the same mechanism print(df.round(n))
+    # already uses), so no warning is emitted and the rounded values
+    # match Python's f"{x:.4f}" rounding exactly.
+    #
+    # Not run through _run_xp2f_compile_diff/--run-diff: to_string()
+    # output has a known, pre-existing cosmetic gap from Python's exact
+    # column widths/"[N rows x M columns]" footer (same gap plain
+    # print(df) and bare to_string() already have) -- unrelated to
+    # float_format, so this checks the rounded values textually instead.
+    src = tmp_path / "xdf_to_string_float_format_fixed.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "",
+                "price_paths = pd.DataFrame(",
+                "    {",
+                "        'Maximum': np.array([105.0, 110.0, 98.0, 120.0, 101.0]),",
+                "        'Minimum': np.array([95.0, 90.0, 88.0, 100.0, 97.0]),",
+                "        'Terminal': np.array([100.0, 105.0, 92.0, 115.0, 99.0]),",
+                "    }",
+                ")",
+                "",
+                "summary = pd.DataFrame(",
+                "    {",
+                "        'mean': price_paths.mean(axis=0),",
+                "        'std': price_paths.std(axis=0, ddof=0),",
+                "    }",
+                ")",
+                "print(summary.to_string(float_format=lambda x: f'{x:.4f}'))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "ignoring unsupported to_string(float_format=...)" not in proc.stderr, proc.stdout + proc.stderr
+    # Fortran's own unrounded stat (7.730459...) rounds to "7.7305" --
+    # confirms ndigits=4 was actually threaded through, not just that
+    # the call happened to compile.
+    assert "7.7305" in proc.stdout, proc.stdout + proc.stderr
+    assert "4.4272" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_df_to_string_float_format_unrecognized_ignored_with_warning(tmp_path: Path) -> None:
+    # An unrecognized float_format shape (anything other than the fixed
+    # N-decimal-places idioms handled above -- e.g. a percentage format)
+    # can't be evaluated at transpile time. It's silently ignored
+    # (falling back to the print helper's own fixed numeric formatting)
+    # with a warning on stderr explaining the fallback, instead of
+    # rejecting the whole statement. Any *other* .to_string() keyword
+    # argument is still unsupported (not touched by this fix).
+    #
+    # Checks Build/Run: PASS and the warning text, not an exact
+    # Run diff: MATCH -- ignoring float_format's formatting entirely is
+    # expected to show up as a cosmetic numeric-formatting difference in
+    # the run-diff comparison, not a real value mismatch.
+    src = tmp_path / "xdf_to_string_float_format_unrecognized.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "",
+                "df = pd.DataFrame(",
+                "    {",
+                "        'a': np.array([1.5, 2.5]),",
+                "        'b': np.array([3.5, 4.5]),",
+                "    }",
+                ")",
+                "print(df.to_string(float_format=lambda x: f'{x:.2%}'))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "ignoring unsupported to_string(float_format=...)" in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_xp2f_rng_normal_positional_loc_scale_applied(tmp_path: Path) -> None:
+    # Regression test, surfaced by xpaths.py's
+    #   log_returns = rng.normal(mean, std, size=(current_batch, num_steps))
+    # rng.normal(loc, scale, size=...) called with loc/scale passed
+    # POSITIONALLY (not as loc=/scale= keywords) previously dropped the
+    # affine transform entirely in the `X = rng.normal(...)` statement-
+    # level codegen path (distinct from an expression-level sibling,
+    # which already handled positional loc/scale correctly): v.args[0]
+    # was wrongly treated as size_node instead of loc_node, and
+    # loc_node/scale_node were only ever populated from loc=/scale=
+    # keywords -- so a positional call silently emitted bare rnorm(...)
+    # (mean=0, std=1) instead of loc + scale * rnorm(...).
+    #
+    # std=0.0 makes this an exact, deterministic check without depending
+    # on matching numpy's RNG bit-for-bit: every draw collapses to
+    # exactly `mean` regardless of the underlying random values, in both
+    # Python and Fortran, so a real diff would show up as anything other
+    # than the same constant.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xrng_normal_positional_loc_scale.py",
+        [
+            "import numpy as np",
+            "",
+            "rng = np.random.default_rng(42)",
+            "mean = 5.0",
+            "std = 0.0",
+            "x = rng.normal(mean, std, size=(4, 3))",
+            "print(x.min(), x.max())",
+        ],
+    )
+
+
+def test_xp2f_module_global_none_seed_gets_sentinel_not_uninitialized(tmp_path: Path) -> None:
+    # Regression test, surfaced by xpaths.py's `RNG_SEED = None` module
+    # global fed into `simulate_extrema(..., seed=RNG_SEED, ...)` ->
+    # `rng = np.random.default_rng(seed)`. `X = None` at module level
+    # previously produced NO Fortran initializer at all (visit_Assign's
+    # generic "None sentinel assignment" branch is a deliberate no-op:
+    # "preserve None in state only"), leaving the real(kind=dp) variable
+    # uninitialized -- undefined behavior (whatever garbage happened to
+    # be in memory becomes the seed), not "use entropy" semantics. Fixed
+    # by giving such globals an explicit -1 sentinel (RNG seeds are
+    # always non-negative, so it's unambiguous) plus a matching runtime
+    # `if (seed < 0) then call seed_rng() else call seed_rng(int(seed))`
+    # guard in the default_rng/random.Random seeding codegen.
+    #
+    # Can't assert an exact value (the whole point is it's now genuinely
+    # entropy-seeded), so this checks Build/Run: PASS plus, structurally,
+    # that the generated source carries the -1 sentinel and the runtime
+    # guard rather than an unconditional call.
+    src = tmp_path / "xrng_seed_none_sentinel.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "RNG_SEED = None",
+                "",
+                "",
+                "def simulate(seed):",
+                "    rng = np.random.default_rng(seed)",
+                "    x = rng.normal(0.0, 1.0, size=5)",
+                "    return x",
+                "",
+                "",
+                "def main():",
+                "    x = simulate(RNG_SEED)",
+                "    print(len(x))",
+                "",
+                "",
+                "if __name__ == '__main__':",
+                "    main()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    f90_text = (tmp_path / "xrng_seed_none_sentinel_p.f90").read_text(encoding="utf-8")
+    assert "-1.0_dp" in f90_text, f90_text
+    # `simulate` is simple enough to get inlined into main(), so the
+    # runtime guard ends up keyed on RNG_SEED directly rather than a
+    # `seed` dummy argument -- match the shape, not the exact name.
+    assert "< 0) then" in f90_text, f90_text
+    assert "call seed_rng()" in f90_text, f90_text
+    assert "call seed_rng(int(" in f90_text, f90_text
+
+
+def test_xp2f_local_function_param_case_insensitive_collision_with_module_global(
+    tmp_path: Path,
+) -> None:
+    # Regression test, surfaced by xpaths.py's simulate_extrema(initial_price,
+    # ...) -- a local function's own parameter (`initial_price`)
+    # case-insensitively colliding with an unrelated module-level global
+    # (`INITIAL_PRICE`) that this SAME function never reads (Fortran is
+    # case-insensitive, so the two are the same identifier there).
+    #
+    # Triggered by the toplevel_shared_specs seeding (see
+    # test_xp2f_local_function_iterates_module_level_list_global): before
+    # this fix, seeding was applied for every global in the whole
+    # script's merged module_global_decls, not just the ones this
+    # particular function actually reads, so seeding INITIAL_PRICE
+    # (needed only by main(), never by this unrelated local helper)
+    # still ran _mark_real -> _aliased_name('INITIAL_PRICE'), claiming
+    # the lowercased "initial_price" spelling in this function's own
+    # alias table before its actual parameter got a turn. That silently
+    # renamed the parameter's body references to initial_price_2, while
+    # the subroutine signature/declaration (and every call site) kept
+    # the unaliased name -- leaving initial_price_2 permanently
+    # unassigned (reads as 0.0), even though Fortran's normal lexical
+    # scoping already lets a dummy argument safely shadow a
+    # host-associated global of the same case-insensitive name with no
+    # rename needed at all. Fixed by restricting seeding to globals this
+    # function's body actually reads (Load context), not just "not
+    # locally bound".
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xparam_global_case_collision.py",
+        [
+            "INITIAL_PRICE = 100.0",
+            "",
+            "",
+            "def scale_price(initial_price, factor):",
+            "    return initial_price * factor",
+            "",
+            "",
+            "def main():",
+            "    print(INITIAL_PRICE)",
+            "    print(scale_price(50.0, 2.0))",
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    main()",
         ],
     )
