@@ -16250,6 +16250,24 @@ class translator(ast.NodeVisitor):
             and node.slice.value != self.pandas_df_index_label.get(node.value.id)
         ):
             return "real"
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.pandas_df_vars
+            and isinstance(node.slice, ast.Name)
+            and self._expr_kind(node.slice) == "char"
+            and self._rank_expr(node.slice) == 0
+        ):
+            # df[col] -- a single column selected by a runtime character-
+            # scalar expression (e.g. a str function parameter), as
+            # opposed to the literal-string case just above. Mirrors the
+            # dedicated codegen text for this same shape in
+            # _plain_series_expr_text/expr()'s own Subscript dispatch --
+            # this is the kind/rank side of that, needed so a variable
+            # assigned df[col] gets declared real rank-1 in the first
+            # place instead of falling through to a generic (wrong)
+            # default.
+            return "real"
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
                 return "logical"
@@ -16722,11 +16740,18 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Subscript)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id in self.pandas_df_vars
-                and is_const_str(node.func.value.slice)
+                and (
+                    is_const_str(node.func.value.slice)
+                    or (
+                        self._expr_kind(node.func.value.slice) == "char"
+                        and self._rank_expr(node.func.value.slice) == 0
+                    )
+                )
             ):
-                # df["col"].to_numpy() -- a single column (Series-valued,
-                # not a DataFrame reference -- _is_pandas_df_ref_node
-                # below doesn't cover this).
+                # df["col"].to_numpy() / df[name].to_numpy() (name a
+                # runtime character-scalar expression) -- a single column
+                # (Series-valued, not a DataFrame reference --
+                # _is_pandas_df_ref_node below doesn't cover this).
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -18235,7 +18260,14 @@ class translator(ast.NodeVisitor):
                 # Scalar tuple indexing like a(i,j) is scalar-valued.
                 if all((not isinstance(e, ast.Slice)) and (not is_none(e)) and self._rank_expr(e) == 0 for e in node.slice.elts):
                     return None
-                return f"size({self.expr(node.value)})"
+                # Same best-effort degrade as the plain-Slice branch just
+                # above -- e.g. df.loc[:, col] has an ast.Tuple slice
+                # whose node.value ("df.loc") a not-yet-seeded prescan
+                # translator instance can't evaluate.
+                try:
+                    return f"size({self.expr(node.value)})"
+                except NotImplementedError:
+                    return None
             # Vector subscript: x(idx_vec) has extent size(idx_vec).
             sr = self._rank_expr(node.slice)
             if sr > 0:
@@ -20795,9 +20827,16 @@ class translator(ast.NodeVisitor):
             and isinstance(node.func.value, ast.Subscript)
             and isinstance(node.func.value.value, ast.Name)
             and node.func.value.value.id in self.pandas_df_vars
-            and is_const_str(node.func.value.slice)
+            and (
+                is_const_str(node.func.value.slice)
+                or (
+                    self._expr_kind(node.func.value.slice) == "char"
+                    and self._rank_expr(node.func.value.slice) == 0
+                )
+            )
         ):
-            # df["col"].to_numpy() -- a single column, already rank 1.
+            # df["col"].to_numpy() / df[name].to_numpy() -- a single
+            # column, already rank 1.
             return 1
         if (
             isinstance(node, ast.Call)
@@ -20819,6 +20858,17 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError(
                     "assigning a pandas DataFrame date-index column to a plain variable is not yet supported"
                 )
+            return 1
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.pandas_df_vars
+            and isinstance(node.slice, ast.Name)
+            and self._expr_kind(node.slice) == "char"
+            and self._rank_expr(node.slice) == 0
+        ):
+            # df[col] -- a single column selected by a runtime character-
+            # scalar expression -- see the matching _expr_kind case.
             return 1
         if isinstance(node, ast.Name):
             if node.id in self.pandas_date_array_aliases:
@@ -23544,6 +23594,31 @@ class translator(ast.NodeVisitor):
                 _label = fstr(str(node.slice.value))
                 return f"{self.expr(node.value)}({_src_expr}%row_pos({_label}))"
             if (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "loc"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id in self.pandas_df_vars
+                and isinstance(node.slice, ast.Tuple)
+                and len(node.slice.elts) == 2
+                and isinstance(node.slice.elts[0], ast.Slice)
+                and node.slice.elts[0].lower is None
+                and node.slice.elts[0].upper is None
+                and node.slice.elts[0].step is None
+                and not isinstance(node.slice.elts[1], (ast.Slice, ast.List, ast.Tuple))
+            ):
+                # df.loc[:, col] -- a single column (not a list), every
+                # row. Same result shape as df[col] (a Series/1D array),
+                # just spelled with .loc -- delegate to the exact same
+                # df[col] codegen just below (which already handles both
+                # a literal string and a runtime character-scalar column
+                # name) instead of duplicating it. df.loc[:, ["A","B"]]
+                # (a list -- stays a DataFrame) is a different, already-
+                # supported shape handled via _pandas_df_match/
+                # _pandas_df_ref, not this branch.
+                equiv = ast.Subscript(value=node.value.value, slice=node.slice.elts[1], ctx=ast.Load())
+                ast.copy_location(equiv, node)
+                return self.expr(equiv)
+            if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.pandas_df_vars
                 and is_const_str(node.slice)
@@ -24933,14 +25008,21 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.func.value, ast.Subscript)
                     and isinstance(node.func.value.value, ast.Name)
                     and node.func.value.value.id in self.pandas_df_vars
-                    and is_const_str(node.func.value.slice)
+                    and (
+                        is_const_str(node.func.value.slice)
+                        or (
+                            self._expr_kind(node.func.value.slice) == "char"
+                            and self._rank_expr(node.func.value.slice) == 0
+                        )
+                    )
                 ):
-                    # df["col"].to_numpy() -- a single column, already a
-                    # plain real array once .expr() resolves the
-                    # subscript (base_expr, computed above); a pure
-                    # passthrough, unlike the whole-DataFrame case below
-                    # (which needs %values since that base_expr is a
-                    # derived-type value, not already an array).
+                    # df["col"].to_numpy() / df[name].to_numpy() -- a
+                    # single column, already a plain real array once
+                    # .expr() resolves the subscript (base_expr, computed
+                    # above); a pure passthrough, unlike the whole-
+                    # DataFrame case below (which needs %values since
+                    # that base_expr is a derived-type value, not already
+                    # an array).
                     return base_expr
                 if (
                     attr == "to_numpy"
@@ -31837,6 +31919,35 @@ class translator(ast.NodeVisitor):
                             self.alloc_chars.discard(t.id)
                             self.alloc_complexes.discard(t.id)
                             continue
+
+                # X = df[col] -- a single column selected by a runtime
+                # character-scalar expression (e.g. a str function
+                # parameter, or a `for col in names:` loop variable).
+                # Deliberately NOT one of _pandas_df_match's shapes: that
+                # classifier is only for expressions that themselves
+                # produce ANOTHER DataFrame (name/iloc/select_names/
+                # head_tail); df[col] produces a Series (a plain real
+                # array), same as the already-handled literal-string
+                # case (df["a"]) just below -- see the matching
+                # dedicated branches in _plain_series_expr_text and
+                # expr()'s own Subscript dispatch. Without this, the
+                # target here fell through to the generic numeric
+                # inference below, which can't resolve df[col]'s kind or
+                # rank either and defaulted to a scalar -- producing a
+                # wrong outer declaration, "corrected" by a further wrong
+                # on-the-fly integer-scalar declaration inside a block
+                # once the actual (array-valued) assignment ran.
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Subscript)
+                    and isinstance(v.value, ast.Name)
+                    and v.value.id in self.pandas_df_vars
+                    and isinstance(v.slice, ast.Name)
+                    and self._expr_kind(v.slice) == "char"
+                    and self._rank_expr(v.slice) == 0
+                ):
+                    self._mark_alloc_real(t.id, rank=1)
+                    continue
 
                 # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
                 if isinstance(t, ast.Name) and isinstance(v, ast.Subscript):
@@ -46742,8 +46853,20 @@ def _emit_local_function(
                         and n.value.value.id in {"np", "numpy"}
                         and n.value.attr in {"r_", "c_"}
                     )
+                    # df[symbol] / some_dict[symbol] -- a DataFrame or
+                    # dict-typed base subscripted by `nm` is a string
+                    # column/key lookup, not an integer index, even
+                    # though it's syntactically a Subscript. Without this,
+                    # a str-annotated parameter used only this way got
+                    # its explicit annotation overridden to "int" by the
+                    # hint_kind logic below, producing a genuinely wrong
+                    # declaration (and a call site passing a string
+                    # literal into an integer dummy).
+                    is_str_keyed_lookup = isinstance(n.value, ast.Name) and (
+                        n.value.id in tr.pandas_df_vars or n.value.id in tr.dict_typed_vars
+                    )
                     sl = n.slice
-                    if not is_np_rc and _is_direct_index_expr(sl):
+                    if not is_np_rc and not is_str_keyed_lookup and _is_direct_index_expr(sl):
                         return True
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "range":
                     for a in n.args:

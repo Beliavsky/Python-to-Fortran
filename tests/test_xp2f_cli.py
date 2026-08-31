@@ -8452,3 +8452,114 @@ def test_xp2f_pd_dataframe_param_iloc_dynamic_slice_with_unknown_columns(tmp_pat
             "main()",
         ],
     )
+
+
+def test_xp2f_pd_loc_single_dynamic_column(tmp_path: Path) -> None:
+    # Regression test: df.loc[:, col] -- every row, a single (not a
+    # list-wrapped) column -- is semantically the same as df[col] (both
+    # return a Series/1D array, unlike df.loc[:, ["A","B"]] which stays a
+    # DataFrame), but was entirely unrecognized: _pandas_df_match only
+    # matched a .loc column-spec that resolves as a string-list literal,
+    # so a single column (literal or, as here, a runtime character-
+    # scalar expression like a str function parameter) fell all the way
+    # through to the generic Subscript fallback and crashed:
+    #   NotImplementedError: unsupported attribute expr: data.loc
+    # Fixed with a delegating rewrite in expr() -- df.loc[:, col] is
+    # rebuilt as the equivalent df[col] Subscript node and handed back
+    # to self.expr(), reusing the existing df[col] codegen (already
+    # correct for both a literal string and a runtime character-scalar
+    # column name) instead of duplicating it. Also had to harden
+    # _extent_expr's ast.Tuple-slice branch the same way its ast.Slice
+    # branch was hardened for df.iloc[lo:hi] above -- df.loc[:, col]'s
+    # slice is an ast.Tuple (Slice, col), and the un-guarded fallback
+    # there crashed the same prescan translator instances the same way.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_loc_single.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def get_col(data: pd.DataFrame, symbol: str) -> pd.Series:",
+            "    return data.loc[:, symbol]",
+            "",
+            "",
+            "def main():",
+            "    d = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [4.0, 5.0, 6.0]})",
+            "    s = get_col(d, 'a')",
+            "    print(s[0], s[1], s[2])",
+            "    t = d.loc[:, 'b']",
+            "    print(t[0], t[1], t[2])",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_pd_dynamic_column_key_str_param_and_to_numpy(tmp_path: Path) -> None:
+    # Regression test: df[col] where col is a runtime character-scalar
+    # expression (typically a str function parameter) -- as opposed to
+    # df["literal"] -- surfaced three separate bugs while chasing
+    # .to_numpy(dtype=...) support for the OHLC-Correlation scripts
+    # (both scripts' first .to_numpy(dtype=float) usages turned out to
+    # already work; dtype= was never the actual blocker):
+    #
+    # 1. `_arg_used_as_index_or_range` (decides whether an unannotated-
+    #    by-usage-evidence argument should be forced to "int") treated
+    #    ANY Subscript slice mentioning the argument as integer-index
+    #    evidence, with no exception for a DataFrame/dict base -- so a
+    #    str-annotated parameter used only as `df[symbol]` got its
+    #    explicit `: str` annotation silently overridden to `integer`:
+    #    the parameter declared `integer, intent(in) :: symbol`, the
+    #    call site passed a string literal into it, and the column
+    #    lookup itself came out as raw array indexing. Fixed by
+    #    excluding a pandas_df_vars/dict_typed_vars-based subscript.
+    # 2. Even with (1) fixed, `col = df[symbol]` (assigning a dynamically
+    #    selected column to a plain variable) still declared `col` as a
+    #    scalar because prescan's DataFrame-assignment branches all key
+    #    off _pandas_df_match, which deliberately only covers shapes
+    #    that themselves produce ANOTHER DataFrame (name/iloc/
+    #    select_names/head_tail) -- df[col] produces a Series (a plain
+    #    real array), a different, uncovered shape. Fixed with a
+    #    dedicated prescan branch mirroring the existing df["literal"]
+    #    one.
+    # 3. Even with (1) and (2) fixed, the live per-statement
+    #    _expr_kind/_rank_expr calls used by visit_Assign's type-rebind-
+    #    detection (a *different* code path from prescan) still didn't
+    #    recognize df[col]'s kind/rank, so it "corrected" the (by then
+    #    correct) outer declaration with a wrong on-the-fly scalar
+    #    integer declaration inside a block:
+    #      Error: Syntax error in argument list
+    #    (`col(1)` doesn't parse when `col` resolves to a scalar in that
+    #    scope). Fixed by adding the same df[col]-recognizing branch to
+    #    _expr_kind and _rank_expr themselves, mirroring their existing
+    #    df["literal"] branches.
+    #
+    # Also exercises the actual to_numpy(dtype=float) shape from the
+    # target scripts once (1)-(3) let it transpile at all -- to_numpy's
+    # own dynamic-single-column recognition (in _expr_kind, _rank_expr,
+    # and expr()'s codegen) was extended alongside the fixes above.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_dyncol.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def get_eps(raw_returns: pd.DataFrame, symbol: str) -> float:",
+            "    col = raw_returns[symbol]",
+            "    eps = raw_returns[symbol].to_numpy(dtype=float) - 1.0",
+            "    return float(col[0]) + float(eps[1])",
+            "",
+            "",
+            "def main():",
+            "    df = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [4.0, 5.0, 6.0]})",
+            "    print(get_eps(df, 'a'))",
+            "",
+            "",
+            "main()",
+        ],
+    )
+    f90_text = (tmp_path / "xdf_dyncol_p.f90").read_text(encoding="utf-8")
+    assert "character(len=*), intent(in) :: symbol" in f90_text, f90_text
