@@ -32,6 +32,7 @@ module dataframe_str_index_mod
       procedure :: sort_values => sort_values_str
       procedure :: T => transpose_str
       procedure :: icol => icol_str
+      procedure :: iloc => iloc_str
       procedure :: row_pos => row_pos_str
       procedure :: shift => shift_str
       procedure :: pct_change => pct_change_str
@@ -115,6 +116,44 @@ contains
       df_new%columns = self%columns(ivec)
       df_new%values = self%values(:, ivec)
    end function icol_str
+
+   pure function iloc_str(self, rows, cols) result(df_new)
+      ! positional selection by row/column positions (1-based) -- ported
+      ! from dataframe_index_datetime.f90's iloc_datetime, needed so
+      ! xp2f.py's generic df.iloc[...] codegen (see _pandas_df_match's
+      ! "iloc" kind, which always emits %iloc(...)) works for
+      ! DataFrame_str_index too. No label-based .loc/select here either.
+      ! Declared pure (unlike iloc_datetime) to match the rest of this
+      ! module's type-bound procedures (e.g. col_pos_str also error
+      ! stops and is pure) -- a caller with a pure local function
+      ! calling %iloc on a pd.DataFrame-typed parameter needs this.
+      class(DataFrame_str_index), intent(in) :: self
+      integer, intent(in), optional :: rows(:)
+      integer, intent(in), optional :: cols(:)
+      type(DataFrame_str_index) :: df_new
+      integer, allocatable :: i_keep(:), j_keep(:)
+      integer :: k
+
+      if (present(rows)) then
+         i_keep = rows
+         do k = 1, size(i_keep)
+            if (i_keep(k) < 1 .or. i_keep(k) > nrow(self)) error stop "iloc: row position out of range"
+         end do
+      else
+         i_keep = [(k, k=1, nrow(self))]
+      end if
+      if (present(cols)) then
+         j_keep = cols
+         do k = 1, size(j_keep)
+            if (j_keep(k) < 1 .or. j_keep(k) > ncol(self)) error stop "iloc: column position out of range"
+         end do
+      else
+         j_keep = [(k, k=1, ncol(self))]
+      end if
+      df_new%index = self%index(i_keep)
+      df_new%columns = self%columns(j_keep)
+      df_new%values = self%values(i_keep, j_keep)
+   end function iloc_str
 
    pure function row_pos_str(self, label) result(irow)
       ! return the row position (1..nrow) for an index label -- mirrors

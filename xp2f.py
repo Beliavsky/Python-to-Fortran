@@ -18216,7 +18216,21 @@ class translator(ast.NodeVisitor):
                     if "array" in ckind:
                         return f"size({self.expr(node)})"
             if isinstance(node.slice, ast.Slice):
-                return f"size({self.expr(node.value)})"
+                # node.value isn't necessarily a plain array Name -- e.g.
+                # df.iloc[lo:hi] has an ast.Attribute base ("df.iloc").
+                # Several one-off prescan translator instances scattered
+                # through generate_flat (hint-collection passes, not the
+                # actual per-function codegen translator) never get
+                # seeded with pandas_df_vars for a DataFrame-typed
+                # parameter/variable, so self.expr() on that base can
+                # raise here even though the real codegen pass handles it
+                # fine via _pandas_df_match. This is a best-effort extent
+                # hint (see the docstring), so degrade to "unknown"
+                # instead of aborting the whole transpile.
+                try:
+                    return f"size({self.expr(node.value)})"
+                except NotImplementedError:
+                    return None
             if isinstance(node.slice, ast.Tuple):
                 # Scalar tuple indexing like a(i,j) is scalar-valued.
                 if all((not isinstance(e, ast.Slice)) and (not is_none(e)) and self._rank_expr(e) == 0 for e in node.slice.elts):
@@ -18773,6 +18787,25 @@ class translator(ast.NodeVisitor):
                     "col_slice": col_slice,
                 }
         if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "iloc"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id in self.pandas_df_vars
+            and isinstance(node.slice, ast.Slice)
+            and node.slice.step is None
+        ):
+            # df.iloc[lo:hi] -- row-only slice, no column spec (as opposed
+            # to the df.iloc[rows, cols] 2-tuple form just above): every
+            # column, a row subset. Reuses the same "iloc" kind/codegen
+            # with an implicit full column slice.
+            return {
+                "kind": "iloc",
+                "df_id": node.value.value.id,
+                "row_slice": node.slice,
+                "col_slice": ast.Slice(lower=None, upper=None, step=None),
+            }
+        if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in {"head", "tail"}
@@ -18891,18 +18924,22 @@ class translator(ast.NodeVisitor):
         src_expr = self._aliased_name(df_id)
         if m["kind"] == "name":
             return src_expr, src_cols
-        if src_cols is None:
-            return None, None
-        if m["kind"] == "select_names":
-            selected = m["names"]
-            idxs = [src_cols.index(nm) + 1 for nm in selected]
-            idx_txt = ", ".join(str(i) for i in idxs)
-            return f"{src_expr}%icol([{idx_txt}])", selected
         if m["kind"] == "iloc":
+            # Unlike "select_names" (below) and "head_tail", a row-only
+            # (or row+full-column) iloc slice needs src_cols only for
+            # bookkeeping (propagating the result's column list forward),
+            # never to build the Fortran expression itself -- so don't
+            # require it to be known here. This matters for a source
+            # DataFrame whose columns genuinely aren't statically known
+            # (e.g. a pd.DataFrame-typed function parameter whose body
+            # only reads columns via dynamic keys): src_cols stays None,
+            # new_cols just propagates that same "unknown" forward.
             row_slice = m["row_slice"]
             col_slice = m["col_slice"]
             row_full = row_slice.lower is None and row_slice.upper is None
             col_full = col_slice.lower is None and col_slice.upper is None
+            if not col_full and src_cols is None:
+                return None, None
             args = []
             if not row_full:
                 lo = f"({self.expr(row_slice.lower)} + 1)" if row_slice.lower is not None else "1"
@@ -18917,6 +18954,13 @@ class translator(ast.NodeVisitor):
             if not args:
                 return src_expr, new_cols
             return f"{src_expr}%iloc(" + ", ".join(args) + ")", new_cols
+        if src_cols is None:
+            return None, None
+        if m["kind"] == "select_names":
+            selected = m["names"]
+            idxs = [src_cols.index(nm) + 1 for nm in selected]
+            idx_txt = ", ".join(str(i) for i in idxs)
+            return f"{src_expr}%icol([{idx_txt}])", selected
         if m["kind"] == "head_tail":
             if m["n_node"] is not None:
                 n_txt = self._coerce_expr_kind(m["n_node"], self.expr(m["n_node"]), "int")
@@ -31798,37 +31842,52 @@ class translator(ast.NodeVisitor):
                 if isinstance(t, ast.Name) and isinstance(v, ast.Subscript):
                     _m = self._pandas_df_match(v)
                     if _m is not None and _m["kind"] in {"iloc", "select_names"}:
+                        # _src_cols is None when the source DataFrame's
+                        # column list isn't statically known here (e.g.
+                        # it's a pd.DataFrame-typed function parameter
+                        # whose only column access in the body uses
+                        # dynamic/computed keys, so _df_arg_types_for_fn
+                        # couldn't collect any literal ones). That's still
+                        # a real, valid DataFrame -- register it as one
+                        # (pandas_df_columns[t.id] just stays unset, same
+                        # as the pd.DataFrame(matrix, ...) construct-spec
+                        # path just below) instead of falling all the way
+                        # through to the generic numeric _extent_expr
+                        # fallback, which can't handle a bare `df.iloc`
+                        # attribute and raises "unsupported attribute
+                        # expr".
                         _src_cols = self.pandas_df_columns.get(_m["df_id"])
-                        if _src_cols is not None:
-                            if _m["kind"] == "iloc":
-                                _row_slice = _m["row_slice"]
-                                if not (_row_slice.lower is None and _row_slice.upper is None):
-                                    self._mark_int("i_iloc_r")
-                                if not (_m["col_slice"].lower is None and _m["col_slice"].upper is None):
-                                    self._mark_int("i_iloc_c")
-                            if _m["kind"] == "select_names":
-                                _new_cols = _m["names"]
+                        if _m["kind"] == "iloc":
+                            _row_slice = _m["row_slice"]
+                            if not (_row_slice.lower is None and _row_slice.upper is None):
+                                self._mark_int("i_iloc_r")
+                            if not (_m["col_slice"].lower is None and _m["col_slice"].upper is None):
+                                self._mark_int("i_iloc_c")
+                        _new_cols = None
+                        if _m["kind"] == "select_names":
+                            _new_cols = _m["names"]
+                        elif _src_cols is not None:
+                            _col_slice = _m["col_slice"]
+                            if _col_slice.lower is None and _col_slice.upper is None:
+                                _new_cols = _src_cols
                             else:
-                                _col_slice = _m["col_slice"]
-                                if _col_slice.lower is None and _col_slice.upper is None:
-                                    _new_cols = _src_cols
-                                else:
-                                    _lo_c = int(_col_slice.lower.value) + 1 if _col_slice.lower is not None else 1
-                                    _hi_c = int(_col_slice.upper.value) if _col_slice.upper is not None else len(_src_cols)
-                                    _new_cols = _src_cols[_lo_c - 1 : _hi_c]
-                            self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_m["df_id"], "DataFrame_index_date")
+                                _lo_c = int(_col_slice.lower.value) + 1 if _col_slice.lower is not None else 1
+                                _hi_c = int(_col_slice.upper.value) if _col_slice.upper is not None else len(_src_cols)
+                                _new_cols = _src_cols[_lo_c - 1 : _hi_c]
+                        self.pandas_df_vars[t.id] = self.pandas_df_vars.get(_m["df_id"], "DataFrame_index_date")
+                        if _new_cols is not None:
                             self.pandas_df_columns[t.id] = list(_new_cols)
-                            self.ints.discard(t.id)
-                            self.reals.discard(t.id)
-                            self.logs.discard(t.id)
-                            self.chars.discard(t.id)
-                            self.complexes.discard(t.id)
-                            self.alloc_ints.discard(t.id)
-                            self.alloc_reals.discard(t.id)
-                            self.alloc_logs.discard(t.id)
-                            self.alloc_chars.discard(t.id)
-                            self.alloc_complexes.discard(t.id)
-                            continue
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
 
                 # X = pd.DataFrame(matrix, index=date_array, columns=names)
                 if isinstance(t, ast.Name):
@@ -45958,6 +46017,7 @@ def _emit_local_function(
     tuple_return_funcs=None,
     dict_type_components=None,
     dict_arg_types=None,
+    df_arg_types=None,
     local_func_arg_ranks=None,
     local_func_arg_kinds=None,
     local_func_arg_names=None,
@@ -46340,6 +46400,36 @@ def _emit_local_function(
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
+    if df_arg_types:
+        # A pd.DataFrame-annotated parameter (see _df_arg_types_for_fn)
+        # gets a real derived-type declaration below instead of falling
+        # through to the generic scalar/array inference -- but that
+        # alone doesn't make this function's OWN body recognize `arg`
+        # as a DataFrame; _pandas_df_match/_pandas_df_ref and friends
+        # all key off self.pandas_df_vars/self.pandas_df_columns, which
+        # a fresh per-function translator instance starts empty. Seed
+        # them here, the same way toplevel_shared_specs seeds
+        # module-global visibility just below.
+        for _dfarg, _dfspec in df_arg_types.items():
+            tr.pandas_df_vars[_dfarg] = _dfspec["kind"]
+            if _dfspec.get("columns"):
+                tr.pandas_df_columns[_dfarg] = list(_dfspec["columns"])
+            # A DataFrame parameter name that collides with a Fortran
+            # keyword (e.g. "data") is declared under its raw name here
+            # (arg_emit_map only special-cases "dp"/"eye"), but every
+            # DataFrame-specific body reference to it goes through
+            # _aliased_name (_pandas_df_match/_pandas_df_ref call
+            # self._aliased_name(df_id) directly), which independently
+            # renames any self.reserved_names hit to "xdata" -- with
+            # nothing syncing the two, the body silently reads an
+            # unrelated, never-assigned "xdata" instead of the actual
+            # parameter. Resolve the alias now (idempotent -- memoizes
+            # into tr.name_aliases) and make the declaration/signature
+            # use that same resolved name via arg_emit_map, so both
+            # sides agree.
+            _dfarg_alias = tr._aliased_name(_dfarg)
+            if _dfarg_alias != _dfarg:
+                arg_emit_map[_dfarg] = _dfarg_alias
     if toplevel_shared_specs:
         # Give tr's own rank/kind-inference state (_rank_expr/_expr_kind,
         # queried by e.g. visit_For to pick a codegen strategy) visibility
@@ -47827,6 +47917,16 @@ def _emit_local_function(
         def _promote_name_rank(_nm, _rr):
             _rr = int(_rr)
             if _rr <= 0:
+                return
+            if _nm in tr.pandas_df_vars or _nm in tr.dict_typed_vars:
+                # A pandas DataFrame (or synthesized dict-type) variable
+                # already has its own derived-type declaration; the
+                # rank/kind inferred here for the callee's *formal*
+                # parameter reflects the generic scalar/array fallback
+                # (e.g. from a subscript like df["a"] inside the callee),
+                # not this variable's real type. Forcing a real-array
+                # declaration on top of it produces a duplicate,
+                # conflicting Fortran declaration for the same name.
                 return
             if _nm in tr.alloc_ints or _nm in tr.ints:
                 tr._mark_alloc_int(_nm, rank=_rr)
@@ -50014,6 +50114,10 @@ def _emit_local_function(
             tnm = (dict_arg_types or {})[arg]
             arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg_emit}"
             decl_kind = f"type({tnm})"
+        elif arg in (df_arg_types or {}):
+            tnm = (df_arg_types or {})[arg]["kind"]
+            arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg_emit}"
+            decl_kind = f"type({tnm})"
         elif is_elemental_fn:
             if hint_kind == "char":
                 arg_kind = "character(len=*)"
@@ -52041,7 +52145,27 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             rk_h = arg_kind_hints.get(fn.name, [])
             fn_args_all = list(fn.args.args) + list(fn.args.kwonlyargs)
             arg_idx = {a.arg: i for i, a in enumerate(fn_args_all)}
+            # A pd.DataFrame-annotated parameter needs to be visible to
+            # tr.prescan below as a DataFrame (not left to the generic
+            # numeric rank/kind marking just below, nor unmarked) --
+            # otherwise a body expression like `data.iloc[...]` or
+            # `data["col"]` can't be resolved by _pandas_df_match and
+            # prescan crashes with "unsupported attribute expr: data.iloc"
+            # (this mirrors _emit_local_function's own df_arg_types
+            # seeding, but this pass runs earlier, before that mechanism
+            # is even computed, and needs its own minimal version).
+            _df_param_names = {
+                a.arg
+                for a in fn_args_all
+                if a.annotation is not None
+                and hasattr(ast, "unparse")
+                and ast.unparse(a.annotation).split(".")[-1] == "DataFrame"
+            }
+            for _dfnm in _df_param_names:
+                tr.pandas_df_vars[_dfnm] = "DataFrame_str_index"
             for i, a in enumerate(fn_args_all):
+                if a.arg in _df_param_names:
+                    continue
                 rr = rr_h[i] if i < len(rr_h) else 0
                 rk = rk_h[i] if i < len(rk_h) else None
                 if rr <= 0:
@@ -52077,6 +52201,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         tr._mark_char(a.arg)
             tr.prescan(fn.body)
             for a in fn_args_all:
+                if a.arg in _df_param_names:
+                    continue
                 _lk, _lr = _infer_local_name_spec(fn, a.arg, tr)
                 if int(_lr) > 0:
                     if _lk == "int":
@@ -56836,6 +56962,49 @@ def generate_flat(
                 out[anm] = sorted(matches)[0]
         return out
 
+    def _df_arg_types_for_fn(fn):
+        # A local function parameter annotated `pd.DataFrame` (or
+        # `pandas.DataFrame`) currently has no derived-type declaration
+        # at all -- it falls through to the generic scalar/array
+        # inference and gets declared real(kind=dp), so calling it with
+        # an actual DataFrame argument is a build-time type mismatch.
+        # Give it a real declaration: type(DataFrame_str_index) is the
+        # one runtime-columns-aware DataFrame kind (its %columns/%index
+        # are read at runtime, not baked into the type), so it's a safe
+        # default even when this function's own body doesn't reveal the
+        # exact column list. Best-effort: also collect any column names
+        # the body accesses via a literal string key (arg["literal"]),
+        # the same scan _arg_dict_types_for_fn uses just above -- when
+        # found, seeding pandas_df_columns with them lets column-name-
+        # dependent codegen (e.g. static select/print paths) work too;
+        # when not found (dynamic/computed keys, or the body only uses
+        # column-count-agnostic methods), columns stays None and only
+        # the runtime-columns-aware operations work.
+        out = {}
+        for a in fn.args.args:
+            anm = a.arg
+            if not (
+                a.annotation is not None
+                and hasattr(ast, "unparse")
+                and ast.unparse(a.annotation).split(".")[-1] == "DataFrame"
+            ):
+                continue
+            keys = []
+            seen = set()
+            for st in ast.walk(fn):
+                if (
+                    isinstance(st, ast.Subscript)
+                    and isinstance(st.value, ast.Name)
+                    and st.value.id == anm
+                    and isinstance(st.slice, ast.Constant)
+                    and isinstance(st.slice.value, str)
+                    and st.slice.value not in seen
+                ):
+                    seen.add(st.slice.value)
+                    keys.append(st.slice.value)
+            out[anm] = {"kind": "DataFrame_str_index", "columns": keys or None}
+        return out
+
     local_func_dict_arg_types = {}
     for fn in (local_funcs or []):
         by_name = _arg_dict_types_for_fn(fn)
@@ -57024,6 +57193,7 @@ def generate_flat(
         _proc_mod_local_df_return_info = _scan_local_df_return_info(local_funcs, tree.body)
         for fn in local_funcs:
             arg_dict_types = _arg_dict_types_for_fn(fn)
+            arg_df_types = _df_arg_types_for_fn(fn)
             if fn.name in local_overload_specs:
                 for spec in local_overload_specs[fn.name]:
                     pname, forced_kinds, forced_ranks = spec[:3]
@@ -57146,6 +57316,7 @@ def generate_flat(
                         tuple_return_funcs=tuple_return_funcs,
                         dict_type_components=dict_type_components,
                         dict_arg_types=arg_dict_types,
+                        df_arg_types=arg_df_types,
                         local_func_arg_ranks=local_func_arg_ranks,
                         local_func_arg_kinds=local_func_arg_kinds,
                         local_func_arg_names=local_func_arg_names,
@@ -57191,6 +57362,7 @@ def generate_flat(
                     tuple_return_funcs=tuple_return_funcs,
                     dict_type_components=dict_type_components,
                     dict_arg_types=arg_dict_types,
+                    df_arg_types=arg_df_types,
                     local_func_arg_ranks=local_func_arg_ranks,
                     local_func_arg_kinds=local_func_arg_kinds,
                     local_func_arg_names=local_func_arg_names,
@@ -57628,6 +57800,7 @@ def generate_flat(
         )
         for fn in local_funcs:
             arg_dict_types = _arg_dict_types_for_fn(fn)
+            arg_df_types = _df_arg_types_for_fn(fn)
             _emit_local_function(
                 o,
                 fn,
@@ -57645,6 +57818,7 @@ def generate_flat(
                 tuple_return_funcs=tuple_return_funcs,
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
+                df_arg_types=arg_df_types,
                 local_func_arg_ranks=local_func_arg_ranks,
                 local_func_arg_kinds=local_func_arg_kinds,
                 local_func_arg_names=local_func_arg_names,

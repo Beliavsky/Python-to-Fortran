@@ -8348,3 +8348,107 @@ def test_xp2f_pandas_df_print_helpers_skip_block_for_bare_df_name(tmp_path: Path
     assert '"a", mean_1d(df%values' in f90_text, f90_text
     assert "block" in f90_text, f90_text  # axis=1 and the df[["a","b"]] cases still need one
     assert "pdf_src" in f90_text, f90_text  # the materialized-temp path is still exercised
+
+
+def test_xp2f_local_function_pd_dataframe_typed_parameter(tmp_path: Path) -> None:
+    # Regression test: a local function parameter annotated `pd.DataFrame`
+    # was not tracked in the callee's own translator instance at all --
+    # `_pandas_df_match`/`_pandas_df_ref` (the DataFrame-reference codegen
+    # path) only ever populates `self.pandas_df_vars`/`pandas_df_columns`
+    # from assignment-site inference, so a bare parameter name was invisible
+    # to it. The parameter got declared as a plain real(8) dummy, which
+    # built fine in isolation but failed at Fortran build time as soon as
+    # the caller passed an actual DataFrame value in:
+    #   Error: Type mismatch in argument 'df' at (1);
+    #   passed TYPE(dataframe_str_index) to REAL(8)
+    # Fixed with `_df_arg_types_for_fn`, which detects `pd.DataFrame`-
+    # annotated params and seeds `tr.pandas_df_vars`/`tr.pandas_df_columns`
+    # for the callee up front (mirroring the existing `dict_arg_types`
+    # mechanism for synthesized dict-typed params), plus a new declaration
+    # branch emitting `type(DataFrame_str_index), intent(in) :: df`.
+    #
+    # Uses literal column-name subscripting inside the function body
+    # (df["a"]) -- dynamic/runtime column-name lookup (df[col] where col
+    # is itself a str parameter) is a separate, harder, not-yet-supported
+    # gap (needs a runtime %columns search) and is deliberately not
+    # exercised here.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_param.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def show_col(df: pd.DataFrame) -> None:",
+            "    col = df['a']",
+            "    print(col[0], col[1], col[2])",
+            "    print(df['a'].sum())",
+            "",
+            "",
+            "def main():",
+            "    d = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [4.0, 5.0, 6.0]})",
+            "    show_col(d)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+    f90_text = (tmp_path / "xdf_param_p.f90").read_text(encoding="utf-8")
+    assert "type(DataFrame_str_index), intent(in) :: df" in f90_text, f90_text
+
+
+def test_xp2f_pd_dataframe_param_iloc_dynamic_slice_with_unknown_columns(tmp_path: Path) -> None:
+    # Regression test, discovered testing the pd.DataFrame-typed-parameter
+    # fix above against real code: a local variable assigned from
+    # `data.iloc[lo:hi]` where `lo`/`hi` are runtime expressions (not
+    # literals) crashed the transpiler entirely -- not just for a
+    # DataFrame-typed parameter, but for any DataFrame whose column list
+    # isn't statically known at the assignment site (e.g. `data` here is
+    # a parameter whose body only reads columns via dynamic f-string
+    # keys, so nothing seeds `pandas_df_columns["data"]`):
+    #   NotImplementedError: unsupported attribute expr: data.iloc
+    # Root causes, both in the type-inference prescan pass (a separate,
+    # earlier walk from the actual codegen pass that already handled this
+    # fine): (1) prescan's own `iloc`/`select_names` DataFrame-tracking
+    # branch required `pandas_df_columns.get(df_id)` to already be
+    # non-None before registering the assigned name as a DataFrame at
+    # all, so an unknown-columns source fell through to the generic
+    # `_extent_expr` numeric-size fallback, which can't handle a bare
+    # `df.iloc` attribute; (2) a separate cross-function-call rank-
+    # propagation helper (`_promote_name_rank`, used by the same prescan
+    # pass to size a caller's local variable from a callee's expected
+    # parameter rank) didn't know about `pandas_df_vars`/`dict_typed_vars`
+    # either, so it could layer a spurious `real(kind=dp), allocatable`
+    # declaration on top of an already-correctly-typed DataFrame variable.
+    # Fixed by (1) registering the assigned name in `pandas_df_vars`
+    # unconditionally on an "iloc"/"select_names" match, only skipping the
+    # (still nice-to-have) `pandas_df_columns` entry when the source
+    # columns are unknown, and (2) making `_promote_name_rank` skip any
+    # name already known as a DataFrame/dict-typed variable. Also added
+    # the `iloc` type-bound procedure to `dataframe_str_index.f90` itself
+    # (ported from `dataframe_index_datetime.f90`'s `iloc_datetime`) --
+    # `_df_arg_types_for_fn` always defaults a DataFrame-typed parameter
+    # to the `DataFrame_str_index` kind, which previously had no `%iloc`
+    # at all.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_iloc_dynamic.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def running_window_sum(data: pd.DataFrame, lo: int, hi: int) -> float:",
+            "    chunk = data.iloc[lo:hi]",
+            "    return float(chunk['a'].sum())",
+            "",
+            "",
+            "def main():",
+            "    d = pd.DataFrame({'a': [1.0, 2.0, 3.0, 4.0, 5.0], 'b': [5.0, 4.0, 3.0, 2.0, 1.0]})",
+            "    start = 1",
+            "    end = 3",
+            "    print(running_window_sum(d, start, end))",
+            "",
+            "",
+            "main()",
+        ],
+    )
