@@ -136,6 +136,82 @@ def remove_allocatable_shadow_decls(lines):
     return out
 
 
+def _parse_simple_allocate_stmt(line):
+    """Parse a standalone `allocate(NAME(shape))` line (single target,
+    no other clauses like source=/stat=) into (indent, name, shape), or
+    None if the line isn't exactly that shape. Used by
+    combine_consecutive_simple_allocates below."""
+    stripped = line.strip()
+    if not (stripped.startswith("allocate(") and stripped.endswith(")")):
+        return None
+    indent = line[: len(line) - len(line.lstrip())]
+    inner = stripped[len("allocate(") : -1]
+    m = re.match(r"^(\w+)\((.*)\)$", inner)
+    if not m:
+        return None
+    name, shape = m.group(1), m.group(2)
+    depth = 0
+    for ch in shape:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+    if depth != 0:
+        return None
+    return indent, name, shape
+
+
+def combine_consecutive_simple_allocates(lines):
+    """Merge a run of consecutive, same-indentation, single-target
+    `allocate(NAME(shape))` statements into one combined
+    `allocate(NAME1(shape1), NAME2(shape2), ...)` -- purely cosmetic
+    (Fortran's allocate statement already supports allocating several
+    independently-shaped/typed targets in one statement), but a script
+    with several sibling `np.empty(...)`-style allocations otherwise
+    generates a wall of near-identical one-liners right next to each
+    other. Only ever merges lines that are ALREADY exactly one bare
+    allocate-object each (see _parse_simple_allocate_stmt) -- never
+    touches an allocate carrying source=/stat=/other clauses, or one
+    that's already a multi-target statement, so it can't change what
+    gets allocated or in what order."""
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        parsed = _parse_simple_allocate_stmt(lines[i])
+        if parsed is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        indent = parsed[0]
+        group = [parsed]
+        j = i + 1
+        while j < n:
+            p2 = _parse_simple_allocate_stmt(lines[j])
+            if p2 is None or p2[0] != indent:
+                break
+            group.append(p2)
+            j += 1
+        if len(group) >= 2:
+            targets = ", ".join(f"{nm}({shape})" for _, nm, shape in group)
+            merged = f"{indent}allocate({targets})"
+            # Re-wrap only this freshly-merged line if it's now too
+            # long, rather than re-running the wrapper over the whole
+            # file: that would also re-scan every already-wrapped
+            # continuation line elsewhere, and re-wrapping a line that
+            # already ends in " &" (now 2 characters over its original
+            # budget) is exactly the kind of input this wrapper isn't
+            # designed to receive.
+            out.extend(fpost.wrap_long_lines([merged], max_len=80))
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return out
+
+
 def enforce_comment_array_dummy_decls(lines):
     """Promote scalar intent(in) dummies documented as arrays in comments."""
 
@@ -15749,8 +15825,14 @@ class translator(ast.NodeVisitor):
                 return "logical"
             nm = self._aliased_name(node.id)
             prev = self.var_type_first_seen.get(nm)
-            if prev is not None:
-                # tuple: (k, fam, rk, rkind, line)
+            if prev is not None and prev[3] is not None:
+                # tuple: (k, fam, rk, rkind, line) -- an unresolved cached
+                # kind (prev[3] is None, e.g. the first-seen RHS was
+                # itself something this best-effort tagger couldn't
+                # classify) must not short-circuit here: fall through to
+                # the more reliable declared-kind lookups below instead
+                # of reporting "unknown" for a name that's actually
+                # trackable via self.reals/self.alloc_reals.
                 return prev[3]
             if nm in self.reals:
                 return self._real_kind_for_name(nm, alloc=False)
@@ -15818,6 +15900,20 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id in {"float", "real"}:
                 return "real64"
         return None
+
+    def _dp_cast_if_needed(self, node, expr_txt):
+        """Wrap expr_txt in real(..., kind=dp) only when node isn't
+        already confidently known to be real(kind=dp) -- an int
+        argument or a real32-precision value still needs the widening
+        cast, but a plain real(kind=dp) name/expr doesn't (the codegen
+        that calls this is often defensive-by-default, e.g. always
+        casting a helper call's real args regardless of what's already
+        known about them). _expr_real_kind_tag is "best-effort" per its
+        own docstring, so a None/unrecognized result keeps the cast
+        (safe default) rather than risk dropping a genuinely-needed one."""
+        if self._expr_kind(node) == "real" and self._expr_real_kind_tag(node) == "real64":
+            return expr_txt
+        return f"real({expr_txt}, kind=dp)"
 
     def _real_kind_for_name(self, name, alloc=None):
         nm = self._aliased_name(name)
@@ -26874,32 +26970,39 @@ class translator(ast.NodeVisitor):
                 _a0_node, _a1_node = node.args[0], node.args[1]
                 _ra = self._rank_expr(_a0_node)
                 _rb = self._rank_expr(_a1_node)
-                _a0 = self.expr(_a0_node)
-                _a1 = self.expr(_a1_node)
-                _a0_txt = f"[real({_a0}, kind=dp)]" if _ra == 0 else f"real({_a0}, kind=dp)"
-                _a1_txt = f"[real({_a1}, kind=dp)]" if _rb == 0 else f"real({_a1}, kind=dp)"
+                _a0_cast = self._dp_cast_if_needed(_a0_node, self.expr(_a0_node))
+                _a1_cast = self._dp_cast_if_needed(_a1_node, self.expr(_a1_node))
+                _a0_txt = f"[{_a0_cast}]" if _ra == 0 else _a0_cast
+                _a1_txt = f"[{_a1_cast}]" if _rb == 0 else _a1_cast
+                _rtol_node = None
+                _atol_node = None
                 _rtol = "1.0e-5_dp"
                 _atol = "1.0e-8_dp"
                 _equal_nan = ".false."
                 if len(node.args) >= 3:
-                    _rtol = self.expr(node.args[2])
+                    _rtol_node = node.args[2]
                 if len(node.args) >= 4:
-                    _atol = self.expr(node.args[3])
+                    _atol_node = node.args[3]
                 for kw in node.keywords:
                     if kw.arg == "rtol":
-                        _rtol = self.expr(kw.value)
+                        _rtol_node = kw.value
                     elif kw.arg == "atol":
-                        _atol = self.expr(kw.value)
+                        _atol_node = kw.value
                     elif kw.arg == "equal_nan":
                         if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
                             _equal_nan = ".true." if kw.value.value else ".false."
                         else:
                             _ev = self.expr(kw.value)
                             _equal_nan = _ev if self._expr_kind(kw.value) == "logical" else f"({_ev} /= 0)"
-                _call = (
-                    f"isclose_real({_a0_txt}, {_a1_txt}, "
-                    f"real({_rtol}, kind=dp), real({_atol}, kind=dp), {_equal_nan})"
-                )
+                # The literal defaults above are already dp-suffixed float
+                # literals -- no cast needed; an explicit rtol=/atol= arg
+                # still goes through the same "only cast if not already
+                # confidently real(kind=dp)" check as the compared values.
+                if _rtol_node is not None:
+                    _rtol = self._dp_cast_if_needed(_rtol_node, self.expr(_rtol_node))
+                if _atol_node is not None:
+                    _atol = self._dp_cast_if_needed(_atol_node, self.expr(_atol_node))
+                _call = f"isclose_real({_a0_txt}, {_a1_txt}, {_rtol}, {_atol}, {_equal_nan})"
                 if _ra == 0 and _rb == 0:
                     return f"{_call}(1)"
                 return _call
@@ -37104,13 +37207,14 @@ class translator(ast.NodeVisitor):
                 # value unambiguously means "no seed" here; guard at
                 # runtime rather than assuming the static non-None case.
                 seed_expr = self.expr(seed_node)
-                self.o.w(f"if (int({seed_expr}) < 0) then")
+                seed_int_expr = seed_expr if self._expr_kind(seed_node) == "int" else f"int({seed_expr})"
+                self.o.w(f"if ({seed_int_expr} < 0) then")
                 self.o.push()
                 self.o.w("call seed_rng()")
                 self.o.pop()
                 self.o.w("else")
                 self.o.push()
-                self.o.w(f"call seed_rng(int({seed_expr}))")
+                self.o.w(f"call seed_rng({seed_int_expr})")
                 self.o.pop()
                 self.o.w("end if")
             # Keep a placeholder scalar for the RNG object name.
@@ -37139,13 +37243,14 @@ class translator(ast.NodeVisitor):
             else:
                 # See the matching comment just above for default_rng.
                 seed_expr = self.expr(seed_node)
-                self.o.w(f"if (int({seed_expr}) < 0) then")
+                seed_int_expr = seed_expr if self._expr_kind(seed_node) == "int" else f"int({seed_expr})"
+                self.o.w(f"if ({seed_int_expr} < 0) then")
                 self.o.push()
                 self.o.w("call seed_rng()")
                 self.o.pop()
                 self.o.w("else")
                 self.o.push()
-                self.o.w(f"call seed_rng(int({seed_expr}))")
+                self.o.w(f"call seed_rng({seed_int_expr})")
                 self.o.pop()
                 self.o.w("end if")
             self._force_mark_int(t.id)
@@ -37262,7 +37367,13 @@ class translator(ast.NodeVisitor):
                     s_rank = self._rank_expr(scale_node)
                     if t_rank == 2 and s_rank == 1:
                         scale_expr = f"spread({scale_expr}, dim=1, ncopies=size({t.id},1))"
-                    self.o.w(f"{t.id} = ({scale_expr}) * {t.id}")
+                    elif not isinstance(scale_node, (ast.Name, ast.Constant, ast.Subscript, ast.Attribute, ast.Call)):
+                        # A primary expression (bare name/literal/call/...)
+                        # never needs grouping parens; anything else (e.g.
+                        # a BinOp) does, or precedence would silently
+                        # change once spliced into `... * {t.id}`.
+                        scale_expr = f"({scale_expr})"
+                    self.o.w(f"{t.id} = {scale_expr} * {t.id}")
                 if (not is_standard) and loc_node is not None:
                     loc_expr = self.expr(loc_node)
                     t_rank = max(
@@ -37276,7 +37387,10 @@ class translator(ast.NodeVisitor):
                     l_rank = self._rank_expr(loc_node)
                     if t_rank == 2 and l_rank == 1:
                         loc_expr = f"spread({loc_expr}, dim=1, ncopies=size({t.id},1))"
-                    self.o.w(f"{t.id} = {t.id} + ({loc_expr})")
+                    elif not isinstance(loc_node, (ast.Name, ast.Constant, ast.Subscript, ast.Attribute, ast.Call)):
+                        # See the matching comment on scale_expr just above.
+                        loc_expr = f"({loc_expr})"
+                    self.o.w(f"{t.id} = {t.id} + {loc_expr}")
             return
 
         # x = np.random.{exponential,gamma,beta,lognormal,chisquare}(..., size=...)
@@ -39346,13 +39460,20 @@ class translator(ast.NodeVisitor):
             if _tn_expr is not None:
                 name = self._aliased_name(t.id)
                 _tn_kind = self.pandas_df_vars.get(self._pandas_df_root_id(v.func.value), "DataFrame_index_date")
-                self.o.w("block")
-                self.o.push()
+                # _pandas_df_materialize_decl only actually declares
+                # anything when _tn_expr is a function-call expression
+                # (see its own docstring) -- a bare df Name needs no
+                # block at all around the single assignment below.
+                _tn_needs_block = "(" in _tn_expr
+                if _tn_needs_block:
+                    self.o.w("block")
+                    self.o.push()
                 _tn_expr2, _tn_needs_assign = self._pandas_df_materialize_decl(_tn_expr, kind=_tn_kind)
                 self._pandas_df_materialize_assign(_tn_expr, _tn_needs_assign)
                 self.o.w(f"{name} = {_tn_expr2}%values")
-                self.o.pop()
-                self.o.w("end block")
+                if _tn_needs_block:
+                    self.o.pop()
+                    self.o.w("end block")
                 return
 
         # X = df.iloc[rows, cols] / X = df.loc[:, ["A", "B"]]
@@ -40088,11 +40209,23 @@ class translator(ast.NodeVisitor):
             name = t.id
             shp = v.args[0]
             fill_expr = self.expr(v.args[1])
-            self.o.w(f"if (allocated({name})) deallocate({name})")
             dims_list = self._shape_dim_exprs(shp)
-            dims = ", ".join(f"1:{d}" for d in dims_list)
-            self.o.w(f"allocate({name}({dims}))")
-            self.o.w(f"{name} = {fill_expr}")
+            if len(dims_list) == 1:
+                # An array-valued RHS assigned to an allocatable LHS
+                # auto-(re)allocates to match, regardless of whether the
+                # LHS was previously unallocated, allocated at a
+                # different size, or already the right size -- so
+                # spread(...) alone is both shorter and safer than the
+                # explicit deallocate+allocate+scalar-broadcast-assign
+                # below, which would abort at runtime if this is the
+                # first assignment to `name` and the scalar broadcast
+                # ran against a still-unallocated array.
+                self.o.w(f"{name} = spread({fill_expr}, dim=1, ncopies={dims_list[0]})")
+            else:
+                self.o.w(f"if (allocated({name})) deallocate({name})")
+                dims = ", ".join(f"1:{d}" for d in dims_list)
+                self.o.w(f"allocate({name}({dims}))")
+                self.o.w(f"{name} = {fill_expr}")
             return
 
         # x = np.triu(a[, k]) / x = np.tril(a[, k])
@@ -44078,9 +44211,15 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError(
                 f"df.{method}() printing requires statically known column names"
             )
-        self.o.w("block")
-        self.o.push()
         orig_df_expr = df_expr
+        # axis=1 always declares its own loop variable below regardless
+        # of materialization, so it always needs the block; axis=0 has
+        # no declarations of its own -- only materialize_decl's, which
+        # only exist when df_expr is a function-call expression.
+        _needs_block = axis == 1 or "(" in df_expr
+        if _needs_block:
+            self.o.w("block")
+            self.o.push()
         _reduction_kind = self.pandas_df_vars.get(
             self._pandas_df_root_id(call.func.value), "DataFrame_index_date"
         )
@@ -44170,8 +44309,9 @@ class translator(ast.NodeVisitor):
             else:
                 self.o.w(f"write(*,'(A,{pad}X,F12.6)') {fstr(cname)}, {val_expr}")
         self.o.w(f"write(*,{fstr('(A)')}) 'dtype: {'int64' if method == 'isna_sum' else 'float64'}'")
-        self.o.pop()
-        self.o.w("end block")
+        if _needs_block:
+            self.o.pop()
+            self.o.w("end block")
 
     def _emit_pandas_df_idxreduce_print(self, call, method, context_node=None):
         # print(df.idxmax()) / print(df.idxmin()) -- for each column, the
@@ -44230,9 +44370,13 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError(
                 "df.corrwith() printing requires statically known column names"
             )
-        self.o.w("block")
-        self.o.push()
         orig_df_expr = df_expr
+        # No declarations of its own besides materialize_decl's, which
+        # only exist when df_expr is a function-call expression.
+        _needs_block = "(" in df_expr
+        if _needs_block:
+            self.o.w("block")
+            self.o.push()
         _cw_kind = self.pandas_df_vars.get(
             self._pandas_df_root_id(call.func.value), "DataFrame_index_date"
         )
@@ -44245,8 +44389,9 @@ class translator(ast.NodeVisitor):
             pad = name_width - len(cname) + 4
             self.o.w(f"write(*,'(A,{pad}X,F12.6)') {fstr(cname)}, corr2_1d({col_expr}, {other_expr})")
         self.o.w(f"write(*,{fstr('(A)')}) 'dtype: float64'")
-        self.o.pop()
-        self.o.w("end block")
+        if _needs_block:
+            self.o.pop()
+            self.o.w("end block")
 
     def _emit_pandas_df_dtypes_print(self, attr_node, context_node=None):
         df_expr, col_names = self._pandas_df_ref(attr_node.value, context_node or attr_node)
@@ -44496,14 +44641,23 @@ class translator(ast.NodeVisitor):
             # a data-ref cannot be a function reference"), so materialize
             # it into a block-scoped temp first, the same way the
             # hand-rolled print path below already has to.
-            self.o.w("block")
-            self.o.push()
             orig_df_expr = df_expr
+            # _pandas_df_materialize_decl only actually declares/assigns
+            # anything when df_expr is a function-call expression (e.g.
+            # `df%icol([...])`) -- for a bare variable name (no "("),
+            # nothing goes inside the block at all, so wrapping in
+            # block/end block for that case is pure overhead around a
+            # single `call`.
+            needs_block = "(" in df_expr
+            if needs_block:
+                self.o.w("block")
+                self.o.push()
             df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind="DataFrame_str_index")
             self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
             self.o.w(f"call {df_expr}%display({ndigits})")
-            self.o.pop()
-            self.o.w("end block")
+            if needs_block:
+                self.o.pop()
+                self.o.w("end block")
             return
         if not col_names and df_expr is not None and df_kind in {"DataFrame_index_date", "DataFrame_index_datetime"}:
             # Column list not known at transpile time (df.dropna(axis=1))
@@ -58890,6 +59044,7 @@ def transpile_file(
     if list_directed_io:
         f90_lines = rewrite_to_list_directed_io(f90_lines)
     f90_lines = remove_allocatable_shadow_decls(f90_lines)
+    f90_lines = combine_consecutive_simple_allocates(f90_lines)
     f90_lines = enforce_comment_array_dummy_decls(f90_lines)
     f90_lines = reconcile_allocatable_decl_ranks(f90_lines)
     # Keep inline Fortran comments consistently separated from code.

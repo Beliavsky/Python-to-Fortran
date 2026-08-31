@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -8097,3 +8098,253 @@ def test_xp2f_local_function_param_case_insensitive_collision_with_module_global
             "    main()",
         ],
     )
+
+
+def test_xp2f_sort_correctness_after_merge_sort_rewrite(tmp_path: Path) -> None:
+    # Regression test, surfaced by a user's timing report on xpaths.py:
+    # at NUM_PATHS=10**5 (with quantile_linear -- used for median/q1/q3
+    # in the summary DataFrame -- called 9 times on 100,000-element
+    # arrays), the Fortran run took ~4x longer than a 10x-smaller input
+    # would predict under linear scaling. Root cause: sort_real_vec/
+    # sort_int_vec/sort_char_vec (the shared `sort_vec` implementation
+    # behind quantile_linear, median, unique, np.sort, etc.) were plain
+    # insertion sort -- O(n^2) -- ~2.5e9 compare/shift operations to
+    # sort 100,000 elements, vs ~1.7e6 for an O(n log n) sort.
+    # (argsort_real/argsort_int had already been fixed for this exact
+    # issue at some earlier point; these sibling routines were missed.)
+    # Rewritten as a bottom-up iterative merge sort, matching the
+    # existing argsort_msort_real precedent.
+    #
+    # This checks correctness (exact match against Python) across
+    # shapes a merge sort's recursive/iterative merging can get subtly
+    # wrong if broken: already-sorted, reverse-sorted, many duplicates,
+    # single-element, and a larger randomized array with repeats.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xsort_merge_sort_correctness.py",
+        [
+            "import numpy as np",
+            "",
+            "a = np.array([5.0, 3.0, 3.0, 1.0, 9.0, 2.0, 2.0, 8.0, 0.0, 7.0, 3.0])",
+            "a_sorted = np.sort(a)",
+            "print(a_sorted)",
+            "",
+            "b = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])",
+            "b_sorted = np.sort(b)",
+            "print(b_sorted)",
+            "",
+            "c = np.array([6.0, 5.0, 4.0, 3.0, 2.0, 1.0])",
+            "c_sorted = np.sort(c)",
+            "print(c_sorted)",
+            "",
+            "d = np.array([1.0])",
+            "d_sorted = np.sort(d)",
+            "print(d_sorted)",
+            "",
+            "e = np.array([2.0, 2.0, 2.0, 2.0, 2.0])",
+            "e_sorted = np.sort(e)",
+            "print(e_sorted)",
+            "",
+            # A deterministic (not RNG-derived) larger array with many
+            # duplicates -- avoids relying on Fortran's own RNG matching
+            # numpy's draws bit-for-bit, which it doesn't (different
+            # algorithms) without the separate --rng-replay mechanism.
+            "f = (np.arange(2000, dtype=np.float64) * 37.0) % 100.0",
+            "f_sorted = np.sort(f)",
+            "print(f_sorted.min(), f_sorted.max(), f_sorted.sum())",
+        ],
+    )
+
+
+def test_xp2f_np_full_1d_uses_spread_not_explicit_realloc(tmp_path: Path) -> None:
+    # Code-quality/correctness fix, flagged from xpaths.py's generated
+    # `if (allocated(batch_max)) deallocate(batch_max); allocate(
+    # batch_max(current_batch)); batch_max = initial_price` (the
+    # `X = np.full(n, value)` codegen) -- three lines where one would
+    # do, since an array-valued RHS assigned to an allocatable LHS
+    # always auto-(re)allocates to match in Fortran, regardless of
+    # whether the LHS was previously unallocated or a different size.
+    # Rewritten as `X = spread(value, dim=1, ncopies=n)` for the 1D
+    # shape case (2D+ shapes still use the explicit allocate, since
+    # spread only adds one dimension at a time).
+    #
+    # This exercises exactly the case the explicit deallocate+allocate
+    # was needed for -- repeated calls with a first-ever (unallocated),
+    # then a smaller, then a larger n -- to confirm spread's automatic
+    # reallocation handles all three without it.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_full_1d_spread.py",
+        [
+            "import numpy as np",
+            "",
+            "def f(n):",
+            "    x = np.full(n, 3.5, dtype=np.float64)",
+            "    return x",
+            "",
+            "",
+            "def main():",
+            "    print(f(5))",
+            "    print(f(3))",
+            "    print(f(7))",
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    main()",
+        ],
+    )
+
+
+def test_xp2f_wrapped_declaration_keeps_trailing_comma_on_first_line(tmp_path: Path) -> None:
+    # Regression test, flagged from xpaths.py's generated
+    #   integer :: i_threshold_probs_130, i_threshold_probs_143, price_paths_ridx_i &
+    #      & , rng
+    # -- a long `integer ::`/`real(kind=dp) ::` declaration list wrapped
+    # with the separating comma leading the continuation line instead
+    # of trailing the line it belongs to. Root cause was in
+    # _break_candidates_for_wrap (fortran_scan.py): a comma's break
+    # candidate was recorded at the comma's own index, so
+    # wrap_long_fortran_line's `cur[:cut]` / `cur[cut:]` slice put the
+    # comma on the continuation side. Fixed by recording the candidate
+    # one past the comma instead, so it stays attached to the item
+    # before it -- `... item, &` / `& next`, not `... item &` / `& , next`.
+    #
+    # Forces a wrap via many long local-variable names, then checks the
+    # generated source directly: no line may start a continuation with
+    # a leading comma, and no continuation line may be the empty
+    # `& &` artifact (a related bug this same investigation surfaced:
+    # see test_xp2f_allocate_merge_self_wraps_without_corrupting_file).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xwrap_decl_trailing_comma.py",
+        [
+            "def compute(aaaaaaaaaa, bbbbbbbbbb, cccccccccc, dddddddddd, eeeeeeeeee):",
+            "    return aaaaaaaaaa + bbbbbbbbbb + cccccccccc + dddddddddd + eeeeeeeeee",
+            "",
+            "",
+            "def main():",
+            "    print(compute(1.0, 2.0, 3.0, 4.0, 5.0))",
+            "",
+            "",
+            "if __name__ == '__main__':",
+            "    main()",
+        ],
+    )
+    f90_text = (tmp_path / "xwrap_decl_trailing_comma_p.f90").read_text(encoding="utf-8")
+    assert not re.search(r"^\s*&\s*,", f90_text, re.MULTILINE), f90_text
+    assert "& &" not in f90_text, f90_text
+
+
+def test_xp2f_allocate_merge_self_wraps_without_corrupting_file(tmp_path: Path) -> None:
+    # Regression test: combine_consecutive_simple_allocates (see
+    # test_xp2f_sort_correctness_after_merge_sort_rewrite's sibling
+    # allocate-merge fix) can produce a single merged `allocate(...)`
+    # line longer than the 80-column wrap width when several sibling
+    # np.empty(...)-style arrays with long names get combined. The
+    # first fix for that re-ran the WHOLE-FILE wrap_long_lines pass a
+    # second time afterward -- which corrupted already-wrapped lines
+    # elsewhere in the file whose trailing " &" pushed them 1-2
+    # characters over the limit (wrap_long_fortran_line isn't designed
+    # to receive an already-wrapped continuation line as fresh input,
+    # and produced a stray empty `& &` continuation). Fixed by having
+    # combine_consecutive_simple_allocates re-wrap only the one new
+    # line it just produced, never re-scanning the rest of the file.
+    #
+    # Uses enough long array names that the merged allocate line must
+    # wrap, and checks Build/Run: PASS plus the same "no leading-comma
+    # continuation, no stray & &" invariants on the whole generated file.
+    src = tmp_path / "xallocate_merge_self_wrap.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def make_arrays(n):",
+                "    array_one_long_name = np.empty(n, dtype=np.float64)",
+                "    array_two_long_name = np.empty(n, dtype=np.float64)",
+                "    array_three_long_name = np.empty(n, dtype=np.float64)",
+                "    array_four_long_name = np.empty(n, dtype=np.float64)",
+                "    array_one_long_name[:] = 1.0",
+                "    array_two_long_name[:] = 2.0",
+                "    array_three_long_name[:] = 3.0",
+                "    array_four_long_name[:] = 4.0",
+                "    return array_one_long_name, array_two_long_name, array_three_long_name, array_four_long_name",
+                "",
+                "",
+                "def main():",
+                "    a, b, c, d = make_arrays(3)",
+                "    print(a)",
+                "    print(b)",
+                "    print(c)",
+                "    print(d)",
+                "",
+                "",
+                "if __name__ == '__main__':",
+                "    main()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    f90_text = (tmp_path / "xallocate_merge_self_wrap_p.f90").read_text(encoding="utf-8")
+    assert not re.search(r"^\s*&\s*,", f90_text, re.MULTILINE), f90_text
+    assert "& &" not in f90_text, f90_text
+
+
+def test_xp2f_pandas_df_print_helpers_skip_block_for_bare_df_name(tmp_path: Path) -> None:
+    # Regression test: several DataFrame print/reduction codegen helpers
+    # (_emit_pandas_df_print's DataFrame_str_index %display() path,
+    # X = df.to_numpy(), df.mean()/df.sum(axis=1) reduction printing,
+    # df.corrwith()) unconditionally wrapped their generated statements
+    # in `block ... end block`, needed only when the resolved DataFrame
+    # reference is itself a function-call expression (e.g.
+    # `df[["a","b"]]` renders as `df%icol([...])`, which can't have
+    # %display()/%values chained directly onto it -- gfortran: "leftmost
+    # part-ref in a data-ref cannot be a function reference"). For a
+    # bare DataFrame variable name, _pandas_df_materialize_decl declares
+    # nothing at all, so the block ends up wrapping only the single
+    # statement with no declarations of its own -- pure overhead. Fixed
+    # by checking whether the resolved reference actually needs
+    # materializing (contains "(") before opening the block, at every
+    # site with this pattern; axis=1 reductions still always need a
+    # block (they always declare their own loop variable), so that path
+    # is intentionally left wrapped.
+    #
+    # Exercises both shapes for to_numpy()/mean(): a bare df (no block
+    # needed) and a df[["a","b"]] column-selected reference (still
+    # needs one) -- checked directly against the generated source.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xpandas_block_skip.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [4.0, 5.0, 6.0]})",
+            "",
+            "x = df.to_numpy()",
+            "print(x)",
+            "print(df.mean())",
+            "print(df.sum(axis=1))",
+            "",
+            "y = df[['a', 'b']].to_numpy()",
+            "print(y)",
+            "print(df[['a', 'b']].mean())",
+        ],
+    )
+    f90_text = (tmp_path / "xpandas_block_skip_p.f90").read_text(encoding="utf-8")
+    assert "x = df%values" in f90_text, f90_text
+    assert '"a", mean_1d(df%values' in f90_text, f90_text
+    assert "block" in f90_text, f90_text  # axis=1 and the df[["a","b"]] cases still need one
+    assert "pdf_src" in f90_text, f90_text  # the materialized-temp path is still exercised

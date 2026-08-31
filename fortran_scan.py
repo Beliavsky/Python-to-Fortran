@@ -4234,7 +4234,16 @@ def _break_candidates_for_wrap(body: str, start: int, end: int) -> List[int]:
                     if k >= 0 and (body[k].isdigit() or body[k] == "."):
                         i += 1
                         continue
-            if ch.isspace() or ch in ",+-*/)=]":
+            if ch == ",":
+                # Break right after the comma, not at it: cur[:cut]/
+                # cur[cut:] slicing in wrap_long_fortran_line means a
+                # cut *at* the comma index puts the comma on the
+                # continuation line (`... item &` / `& , next`), which
+                # reads oddly -- Fortran style, like most languages,
+                # keeps a trailing comma attached to the item before
+                # it (`... item, &` / `& next`).
+                out.append(i + 1)
+            elif ch.isspace() or ch in "+-*/)=]":
                 out.append(i)
         i += 1
     return out

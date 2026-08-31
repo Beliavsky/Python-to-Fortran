@@ -2788,58 +2788,147 @@ contains
       end subroutine random_choice_prob
 
       pure subroutine sort_real_vec(x)
-         ! sort real vector x in ascending order
+         ! sort real vector x in ascending order -- bottom-up iterative
+         ! merge sort (O(n log n) worst case). Previously a plain
+         ! insertion sort (O(n^2)): fine for the small arrays it was
+         ! first written against, but a severe bottleneck for the sizes
+         ! quantile_linear/median/unique/etc. actually see in practice
+         ! (e.g. ~2.5e9 compare/shift operations sorting a 100,000-
+         ! element array, vs ~1.7e6 for this merge sort).
          implicit none
          real(kind=dp), intent(inout) :: x(:)
-         integer :: i, j, n
-         real(kind=dp) :: key
+         real(kind=dp), allocatable :: buf(:)
+         integer :: n, width, lo, mid, hi, i, j, k
          n = size(x)
-         do i = 2, n
-            key = x(i)
-            j = i - 1
-            do while (j >= 1)
-               if (x(j) <= key) exit
-               x(j+1) = x(j)
-               j = j - 1
+         if (n <= 1) return
+         allocate(buf(n))
+         width = 1
+         do while (width < n)
+            lo = 1
+            do while (lo <= n - width)
+               mid = lo + width - 1
+               hi = min(lo + 2 * width - 1, n)
+               i = lo
+               j = mid + 1
+               k = lo
+               do while (i <= mid .and. j <= hi)
+                  if (x(i) <= x(j)) then
+                     buf(k) = x(i)
+                     i = i + 1
+                  else
+                     buf(k) = x(j)
+                     j = j + 1
+                  end if
+                  k = k + 1
+               end do
+               do while (i <= mid)
+                  buf(k) = x(i)
+                  i = i + 1
+                  k = k + 1
+               end do
+               do while (j <= hi)
+                  buf(k) = x(j)
+                  j = j + 1
+                  k = k + 1
+               end do
+               x(lo:hi) = buf(lo:hi)
+               lo = lo + 2 * width
             end do
-            x(j+1) = key
+            width = width * 2
          end do
       end subroutine sort_real_vec
 
       pure subroutine sort_int_vec(x)
-         ! sort integer vector x in ascending order
+         ! sort integer vector x in ascending order -- see sort_real_vec
+         ! just above for why this is a bottom-up merge sort now, not an
+         ! insertion sort.
          implicit none
          integer, intent(inout) :: x(:)
-         integer :: i, j, n, key
+         integer, allocatable :: buf(:)
+         integer :: n, width, lo, mid, hi, i, j, k
          n = size(x)
-         do i = 2, n
-            key = x(i)
-            j = i - 1
-            do while (j >= 1)
-               if (x(j) <= key) exit
-               x(j+1) = x(j)
-               j = j - 1
+         if (n <= 1) return
+         allocate(buf(n))
+         width = 1
+         do while (width < n)
+            lo = 1
+            do while (lo <= n - width)
+               mid = lo + width - 1
+               hi = min(lo + 2 * width - 1, n)
+               i = lo
+               j = mid + 1
+               k = lo
+               do while (i <= mid .and. j <= hi)
+                  if (x(i) <= x(j)) then
+                     buf(k) = x(i)
+                     i = i + 1
+                  else
+                     buf(k) = x(j)
+                     j = j + 1
+                  end if
+                  k = k + 1
+               end do
+               do while (i <= mid)
+                  buf(k) = x(i)
+                  i = i + 1
+                  k = k + 1
+               end do
+               do while (j <= hi)
+                  buf(k) = x(j)
+                  j = j + 1
+                  k = k + 1
+               end do
+               x(lo:hi) = buf(lo:hi)
+               lo = lo + 2 * width
             end do
-            x(j+1) = key
+            width = width * 2
          end do
       end subroutine sort_int_vec
 
       pure subroutine sort_char_vec(x)
-         ! sort character vector x in ascending order
+         ! sort character vector x in ascending order -- see
+         ! sort_real_vec above for why this is a bottom-up merge sort
+         ! now, not an insertion sort.
          implicit none
          character(len=*), intent(inout) :: x(:)
-         integer :: i, j, n
-         character(len=len(x)) :: key
+         character(len=len(x)), allocatable :: buf(:)
+         integer :: n, width, lo, mid, hi, i, j, k
          n = size(x)
-         do i = 2, n
-            key = x(i)
-            j = i - 1
-            do while (j >= 1)
-               if (x(j) <= key) exit
-               x(j+1) = x(j)
-               j = j - 1
+         if (n <= 1) return
+         allocate(buf(n))
+         width = 1
+         do while (width < n)
+            lo = 1
+            do while (lo <= n - width)
+               mid = lo + width - 1
+               hi = min(lo + 2 * width - 1, n)
+               i = lo
+               j = mid + 1
+               k = lo
+               do while (i <= mid .and. j <= hi)
+                  if (x(i) <= x(j)) then
+                     buf(k) = x(i)
+                     i = i + 1
+                  else
+                     buf(k) = x(j)
+                     j = j + 1
+                  end if
+                  k = k + 1
+               end do
+               do while (i <= mid)
+                  buf(k) = x(i)
+                  i = i + 1
+                  k = k + 1
+               end do
+               do while (j <= hi)
+                  buf(k) = x(j)
+                  j = j + 1
+                  k = k + 1
+               end do
+               x(lo:hi) = buf(lo:hi)
+               lo = lo + 2 * width
             end do
-            x(j+1) = key
+            width = width * 2
          end do
       end subroutine sort_char_vec
 
