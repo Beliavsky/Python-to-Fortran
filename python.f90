@@ -276,6 +276,7 @@ public :: moveaxis3_logical !@pyapi kind=function ret=logical(:,:,:) args=a:logi
 public :: pad2d_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:integer:intent(in) desc="2D constant pad for integer matrix"
 public :: pad2d_real !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:real(dp):intent(in) desc="2D constant pad for real matrix"
 public :: allclose !@pyapi kind=function ret=logical args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="NumPy-like allclose on 1D arrays"
+public :: isclose_real !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="element-wise version of allclose (NumPy's isclose), a or b may have length 1 to broadcast"
 public :: allclose_integer !@pyapi kind=function ret=logical args=a:integer(:):intent(in),b:integer(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional desc="NumPy-like allclose on 1D integer arrays"
 public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="2x2 covariance matrix for two real vectors"
 public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional desc="covariance matrix for observations in rows (numpy rowvar=False)"
@@ -349,6 +350,8 @@ public :: polyval
 public :: polyder
 public :: polyfit_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in) desc="least-squares polynomial fit (deg+1 coefficients, highest degree first), matching numpy.polyfit"
 public :: digitize_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in) desc="bin index of each x(i) against increasing bin edges, matching numpy.digitize (right=False)"
+public :: isin_real !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) desc="element-wise membership test, matching numpy.isin (and numpy.in1d) for real arrays"
+public :: isin_int !@pyapi kind=function ret=logical(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="element-wise membership test, matching numpy.isin (and numpy.in1d) for integer arrays"
 public :: np_save_1d_real !@pyapi kind=subroutine args=filename:character(*):intent(in),x:real(dp)(:):intent(in) desc="write a 1D real array to a binary .npy file, matching numpy.save"
 public :: np_load_1d_real !@pyapi kind=function ret=real(dp)(:) args=filename:character(*):intent(in) desc="read a 1D real array from a binary .npy file, matching numpy.load"
 
@@ -6263,6 +6266,54 @@ contains
          end do
       end function allclose_integer
 
+      function isclose_real(a, b, rtol, atol, equal_nan) result(mask)
+         ! Element-wise version of allclose_real's same tolerance test
+         ! (abs(a-b) <= atol + rtol*abs(b)) and the same NaN handling
+         ! (a NaN element is never "close" unless equal_nan is true and
+         ! both sides are NaN), matching numpy.isclose. Explicit
+         ! if/else control flow (not an elemental expression combining
+         ! the NaN check and the comparison via .and.) so the unsafe
+         ! ordered comparison never actually runs on a NaN operand --
+         ! Fortran's .and. is not guaranteed to short-circuit, and this
+         ! project's -ffpe-trap=invalid build turns an ordered
+         ! comparison against a real NaN into a SIGFPE crash. a or b
+         ! (but not both) may have length 1 to broadcast against the
+         ! other, matching numpy's scalar-broadcasting for this call
+         ! shape.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), intent(in), optional :: rtol, atol
+         logical, intent(in), optional :: equal_nan
+         logical, allocatable :: mask(:)
+         real(kind=dp) :: rtolv, atolv, av, bv
+         logical :: eqnan
+         integer :: i, n
+         rtolv = 1.0e-5_dp
+         atolv = 1.0e-8_dp
+         eqnan = .false.
+         if (present(rtol)) rtolv = rtol
+         if (present(atol)) atolv = atol
+         if (present(equal_nan)) eqnan = equal_nan
+         n = max(size(a), size(b))
+         allocate(mask(1:n))
+         do i = 1, n
+            if (size(a) == 1) then
+               av = a(1)
+            else
+               av = a(i)
+            end if
+            if (size(b) == 1) then
+               bv = b(1)
+            else
+               bv = b(i)
+            end if
+            if (ieee_is_nan(av) .or. ieee_is_nan(bv)) then
+               mask(i) = eqnan .and. ieee_is_nan(av) .and. ieee_is_nan(bv)
+            else
+               mask(i) = abs(av - bv) <= atolv + rtolv * abs(bv)
+            end if
+         end do
+      end function isclose_real
+
       pure function cov2_real(x, y, ddof) result(c)
          real(kind=dp), intent(in) :: x(:), y(:)
          integer, intent(in), optional :: ddof
@@ -6791,6 +6842,30 @@ contains
             idx(i) = j
          end do
       end function digitize_real
+
+      pure function isin_real(a, b) result(mask)
+         ! mask(i) = a(i) is present (exactly) in b, matching
+         ! numpy.isin(a, b) (and its older alias numpy.in1d) for real
+         ! arrays.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         logical, allocatable :: mask(:)
+         integer :: i
+         allocate(mask(1:size(a)))
+         do i = 1, size(a)
+            mask(i) = any(a(i) == b)
+         end do
+      end function isin_real
+
+      pure function isin_int(a, b) result(mask)
+         ! Integer counterpart of isin_real.
+         integer, intent(in) :: a(:), b(:)
+         logical, allocatable :: mask(:)
+         integer :: i
+         allocate(mask(1:size(a)))
+         do i = 1, size(a)
+            mask(i) = any(a(i) == b)
+         end do
+      end function isin_int
 
       subroutine np_save_1d_real(filename, x)
          ! Writes a 1D float64 array to a real .npy file (NumPy's binary

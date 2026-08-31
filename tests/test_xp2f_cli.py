@@ -7304,3 +7304,427 @@ def test_xp2f_np_save_load_1d_real_npy_roundtrip(tmp_path: Path) -> None:
             "print(b[0], b[1], b[2], b[3], b[4])",
         ],
     )
+
+
+def test_xp2f_df_column_selection_reports_unsupported_instead_of_crashing(
+    tmp_path: Path,
+) -> None:
+    # Regression test, surfaced by option_pricing/xquad_option.py (a
+    # stripped copy of the public-domain Non-lognormal-option-pricing
+    # repo's xquad_option.py): `curve_df[["distribution", "strike", ...]]`
+    # where curve_df = pd.DataFrame(curve_records) and curve_records is a
+    # list of dicts returned by a called function -- xp2f's static
+    # column-name tracking for pd.DataFrame(...) can't trace dict keys
+    # through a function call, so it silently under-tracks the columns.
+    # The df[[...]] column-selection prescan logic then did
+    # `_src_cols.index(_nm)` unconditionally, which previously raised an
+    # UNHANDLED `ValueError: 'distribution' is not in list` -- a raw
+    # traceback rather than xp2f's usual clean "Transpile: FAIL" message.
+    #
+    # Fixed by checking for any selected column missing from the tracked
+    # set first and raising a clear NotImplementedError instead. This
+    # does not add real support for tracing columns through a function
+    # call (a much bigger undertaking) -- only replaces a crash with a
+    # graceful, clearly-worded rejection.
+    src = tmp_path / "xdf_select_from_fn_returned_records.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "",
+                "def make_records():",
+                "    return [",
+                "        {'name': 'a', 'value': 1.0},",
+                "        {'name': 'b', 'value': 2.0},",
+                "    ]",
+                "",
+                "",
+                "records = make_records()",
+                "df = pd.DataFrame(records)",
+                "view = df[['name', 'value']]",
+                "print(view)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "Traceback (most recent call last)" not in proc.stderr, proc.stdout + proc.stderr
+    assert "Transpile: FAIL" in proc.stdout, proc.stdout + proc.stderr
+    assert "not found in xp2f's tracked columns" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_np_isclose_array_and_scalar(tmp_path: Path) -> None:
+    # Regression test, surfaced by xpaths.py: `arr[start:end] =
+    # np.isclose(batch_max, initial_price)` failed with "unsupported
+    # call: np.isclose(...)" -- np.isclose (element-wise, array-
+    # returning) was never implemented at all; only the unrelated
+    # scalar math.isclose/cmath.isclose were supported.
+    #
+    # Fixed via a direct inline formula (no helper function needed):
+    # abs(a - b) <= atol + rtol * abs(b), the same tolerance test
+    # np.allclose already used, but element-wise instead of aggregated
+    # with .all(). Fortran's abs/+/*/<= are all elemental, so this
+    # broadcasts a scalar against an array exactly like numpy's own
+    # broadcasting for this call shape.
+    #
+    # Covers array-vs-array, array-vs-scalar (the exact xpaths.py
+    # shape), and explicit rtol/atol.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_isclose.py",
+        [
+            "import numpy as np",
+            "",
+            "a = np.array([1.0, 2.0000001, 3.0, 100.00005])",
+            "b = np.array([1.0, 2.0, 3.1, 100.0])",
+            "c = np.isclose(a, b)",
+            "print(c[0], c[1], c[2], c[3])",
+            "",
+            "x = np.array([5.0, 5.0001, 6.0])",
+            "d = np.isclose(x, 5.0)",
+            "print(d[0], d[1], d[2])",
+            "",
+            "e = np.isclose(a, b, rtol=1e-3, atol=1e-6)",
+            "print(e[0], e[1], e[2], e[3])",
+        ],
+    )
+
+
+def test_xp2f_np_isclose_nan_does_not_crash(tmp_path: Path) -> None:
+    # Regression test for a bug in the np.isclose fix itself: comparing
+    # a NaN element with `<=` under this project's -ffpe-trap=invalid
+    # build raises IEEE's invalid-operation exception -> SIGFPE, and
+    # Fortran's `.and.` is not guaranteed to short-circuit, so a naive
+    # "not-NaN .and. (abs(a-b) <= tol)" elemental expression still
+    # evaluates the unsafe comparison on the NaN element. Fixed by
+    # routing np.isclose through a new isclose_real Fortran helper (a
+    # loop with explicit if/else control flow, like the existing
+    # allclose_real helper already uses) instead of an inline elemental
+    # expression, so the comparison genuinely never runs on a NaN value.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_isclose_nan.py",
+        [
+            "import numpy as np",
+            "",
+            "a = np.array([1.0, np.nan, 3.0])",
+            "b = np.array([1.0, np.nan, 3.0])",
+            "c = np.isclose(a, b)",
+            "print(c[0], c[1], c[2])",
+        ],
+    )
+
+
+def test_xp2f_np_logical_not(tmp_path: Path) -> None:
+    # Regression test: np.logical_not was missing even though
+    # logical_and/logical_or/logical_xor were all already supported --
+    # the one sibling of that function family left unimplemented.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_logical_not.py",
+        [
+            "import numpy as np",
+            "",
+            "x = np.array([True, False, True])",
+            "y = np.logical_not(x)",
+            "print(y[0], y[1], y[2])",
+        ],
+    )
+
+
+def test_xp2f_np_isreal_iscomplex(tmp_path: Path) -> None:
+    # Regression test: np.isreal/np.iscomplex were both unsupported.
+    # For a complex-typed array this is a rank-correct elemental
+    # aimag(x) == 0 / /= 0 comparison; for a non-complex array every
+    # element is (trivially) real, reusing the existing ones_logical/
+    # zeros_logical helpers already used elsewhere for zeros_like/
+    # ones_like (same known rank>=2 flattening limitation those share).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_isreal_iscomplex.py",
+        [
+            "import numpy as np",
+            "",
+            "r = np.array([1.0, 2.0, 3.0])",
+            "c = np.array([1.0 + 0.0j, 2.0 + 1.0j, 0.0 - 3.0j])",
+            "print(np.isreal(r)[0], np.isreal(r)[1])",
+            "print(np.iscomplex(r)[0], np.iscomplex(r)[1])",
+            "print(np.isreal(c)[0], np.isreal(c)[1], np.isreal(c)[2])",
+            "print(np.iscomplex(c)[0], np.iscomplex(c)[1], np.iscomplex(c)[2])",
+        ],
+    )
+
+
+def test_xp2f_np_isposinf_isneginf(tmp_path: Path) -> None:
+    # Regression test: np.isposinf/np.isneginf were both unsupported
+    # (siblings of the already-supported np.isinf). Uses a real np.inf/
+    # -np.inf array literal (see test_xp2f_np_inf_literal_is_real_ieee_infinity
+    # for the fix that made this representable at all).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_isposinf_isneginf.py",
+        [
+            "import numpy as np",
+            "",
+            "a = np.array([1.0, np.inf, -np.inf, np.nan, -5.0])",
+            "print(np.isposinf(a)[0], np.isposinf(a)[1], np.isposinf(a)[2], np.isposinf(a)[3], np.isposinf(a)[4])",
+            "print(np.isneginf(a)[0], np.isneginf(a)[1], np.isneginf(a)[2], np.isneginf(a)[3], np.isneginf(a)[4])",
+        ],
+    )
+
+
+def test_xp2f_np_comparison_ufuncs(tmp_path: Path) -> None:
+    # Regression test: the explicit ufunc-call forms np.equal/
+    # not_equal/greater/greater_equal/less/less_equal were all
+    # unsupported (only the operator forms ==, !=, >, etc. worked).
+    # Implemented by building a synthetic ast.Compare node from the two
+    # call arguments and reusing the existing, already-correct Compare-
+    # node codegen, rather than duplicating its type-promotion logic.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_comparison_ufuncs.py",
+        [
+            "import numpy as np",
+            "",
+            "a = np.array([1.0, 2.0, 3.0, 4.0])",
+            "b = np.array([4.0, 3.0, 2.0, 1.0])",
+            "print(np.equal(a, b)[0], np.equal(a, b)[3])",
+            "print(np.not_equal(a, b)[0], np.not_equal(a, b)[3])",
+            "print(np.greater(a, b)[0], np.greater(a, b)[3])",
+            "print(np.greater_equal(a, b)[1], np.greater_equal(a, b)[2])",
+            "print(np.less(a, b)[0], np.less(a, b)[3])",
+            "print(np.less_equal(a, b)[1], np.less_equal(a, b)[2])",
+        ],
+    )
+
+
+def test_xp2f_np_isin_and_in1d(tmp_path: Path) -> None:
+    # Regression test: np.isin (and its older alias np.in1d) were both
+    # unsupported. New isin_real/isin_int Fortran helpers ("is each
+    # element of a present in b", rank-1 inputs), dispatched on
+    # int-vs-real element kind.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_isin.py",
+        [
+            "import numpy as np",
+            "",
+            "ai = np.array([1, 2, 3, 4, 5])",
+            "bi = np.array([2, 4, 6])",
+            "mask = np.isin(ai, bi)",
+            "print(mask[0], mask[1], mask[2], mask[3], mask[4])",
+            "",
+            "af = np.array([1.5, 2.5, 3.5])",
+            "bf = np.array([2.5, 9.0])",
+            "maskf = np.isin(af, bf)",
+            "print(maskf[0], maskf[1], maskf[2])",
+        ],
+    )
+
+
+def test_xp2f_np_array_equiv(tmp_path: Path) -> None:
+    # Regression test: np.array_equiv (array_equal's broadcasting-aware
+    # sibling) was unsupported. Scoped narrowly -- same-rank-and-shape
+    # (delegates to the same check np.array_equal already uses) or one
+    # operand a scalar (trivial broadcast); full N-D broadcast-shape
+    # compatibility is not attempted.
+    #
+    # Also exercises a fix to np.array_equal itself, found while adding
+    # array_equiv: array_equal's own codegen had the identical bug this
+    # test's shape-check formula would otherwise trigger -- a redundant
+    # extra layer of parens around each shape-check clause made a
+    # pre-existing print-argument paren-stripping pass
+    # (_peel_print_arg_parens) peel a second, mismatched "outer" layer
+    # after correctly stripping array_equal's own single wrap,
+    # corrupting the expression into a syntax error. Fixed in both
+    # functions by dropping the (unnecessary -- relational operators
+    # already bind tighter than .and. in Fortran) per-clause parens.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_array_equiv.py",
+        [
+            "import numpy as np",
+            "",
+            "m1 = np.array([[1.0, 2.0], [3.0, 4.0]])",
+            "m2 = np.array([[1.0, 2.0], [3.0, 4.0]])",
+            "m3 = np.array([[1.0, 2.0], [3.0, 5.0]])",
+            "print(np.array_equiv(m1, m2))",
+            "print(np.array_equiv(m1, m3))",
+            "print(np.array_equiv(np.array([2.0, 2.0, 2.0]), 2.0))",
+            "print(np.array_equiv(np.array([2.0, 2.0, 3.0]), 2.0))",
+            "print(np.array_equal(m1, m2))",
+        ],
+    )
+
+
+def test_xp2f_np_inf_literal_is_real_ieee_infinity(tmp_path: Path) -> None:
+    # Regression test for a significant pre-existing gap found while
+    # adding np.isposinf/np.isneginf: np.inf (and np.Inf/np.NINF, and
+    # `from numpy import inf`) was ALWAYS lowered to huge(1.0_dp) -- the
+    # largest finite double -- rather than genuine IEEE infinity
+    # (ieee_value(0.0_dp, ieee_positive_inf), the same intrinsic
+    # np.nan already used for ieee_quiet_nan). Since huge(1.0_dp) is
+    # finite, ieee_is_finite/np.isinf/np.isfinite (already-existing,
+    # separately-implemented features) were silently wrong for any
+    # value that originated as an np.inf source literal -- e.g.
+    # np.isinf(np.array([np.inf]))[0] transpiled to False.
+    #
+    # Fixed by emitting real ieee_value(...)-constructed infinity
+    # instead (both codegen sites: the Attribute form np.inf and the
+    # `from numpy import inf` Name-alias form), and adding
+    # ieee_positive_inf/ieee_negative_inf to the ieee_arithmetic
+    # use-only import lists (and the matching unused-import pruning
+    # pass's tracked symbol set) alongside the symbols already used for
+    # np.nan.
+    #
+    # Verified this doesn't reintroduce an FPE crash under this
+    # project's -ffpe-trap=invalid,zero,overflow build: constructing
+    # infinity via ieee_value (not via an actual overflowing
+    # computation like 1.0/0.0) and ordinary arithmetic/comparisons on
+    # an already-infinite value do not raise IEEE exceptions.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_inf_literal.py",
+        [
+            "import numpy as np",
+            "",
+            "x = np.inf",
+            "y = -np.inf",
+            "print(x, y)",
+            "",
+            "a = np.array([1.0, np.inf, -np.inf, np.nan, -5.0])",
+            "print(np.isinf(a)[0], np.isinf(a)[1], np.isinf(a)[2], np.isinf(a)[3], np.isinf(a)[4])",
+            "print(np.isfinite(a)[0], np.isfinite(a)[1], np.isfinite(a)[2], np.isfinite(a)[3], np.isfinite(a)[4])",
+            "",
+            "b = 5.0 + x",
+            "c = x - 3.0",
+            "d = -x",
+            "print(b, c, d)",
+            "print(x > 1e300)",
+            "print(y < -1e300)",
+            "",
+            "vals = np.array([1.0, 50.0, -10.0])",
+            "clipped = np.clip(vals, 0.0, np.inf)",
+            "print(clipped[0], clipped[1], clipped[2])",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_dict_of_axis0_reductions_construct(tmp_path: Path) -> None:
+    # Regression test, surfaced by xpaths.py:
+    #   summary = pd.DataFrame({
+    #       "mean": price_paths.mean(axis=0),
+    #       "median": price_paths.median(axis=0),
+    #       "std": price_paths.std(axis=0, ddof=0),
+    #       "min": price_paths.min(axis=0),
+    #       "q1": price_paths.quantile(0.25, axis=0),
+    #       "q3": price_paths.quantile(0.75, axis=0),
+    #       "max": price_paths.max(axis=0),
+    #   })
+    # was unsupported -- the transposed-orientation sibling of the
+    # already-supported pd.DataFrame([df.mean(), df.std()],
+    # index=[...]) list form (_pandas_df_reduction_rows_construct_spec):
+    # here each DICT VALUE is a whole-DataFrame axis=0 column-wise
+    # reduction (dict key -> new column name, price_paths' own columns
+    # -> new row labels), rather than each LIST ELEMENT being one.
+    #
+    # New _pandas_df_reduction_cols_construct_spec recognizes this dict
+    # shape; also extends the shared _pandas_df_reduction_expr helper
+    # with two things the list form never needed: df.quantile(q, axis=0)
+    # (new "quantile" method, via the existing quantile_linear helper --
+    # same one df.median() already uses with q=0.5) and an explicit
+    # ddof= override for std/var (previously hardcoded to pandas'
+    # default ddof=1).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_summary_cols.py",
+        [
+            "import numpy as np",
+            "import pandas as pd",
+            "",
+            "price_paths = pd.DataFrame(",
+            "    {",
+            "        'Maximum': np.array([105.0, 110.0, 98.0, 120.0, 101.0]),",
+            "        'Minimum': np.array([95.0, 90.0, 88.0, 100.0, 97.0]),",
+            "        'Terminal': np.array([100.0, 105.0, 92.0, 115.0, 99.0]),",
+            "    }",
+            ")",
+            "",
+            "summary = pd.DataFrame(",
+            "    {",
+            "        'mean': price_paths.mean(axis=0),",
+            "        'median': price_paths.median(axis=0),",
+            "        'std': price_paths.std(axis=0, ddof=0),",
+            "        'min': price_paths.min(axis=0),",
+            "        'q1': price_paths.quantile(0.25, axis=0),",
+            "        'q3': price_paths.quantile(0.75, axis=0),",
+            "        'max': price_paths.max(axis=0),",
+            "    }",
+            ")",
+            "mean_col = summary['mean'].to_numpy()",
+            "std_col = summary['std'].to_numpy()",
+            "q1_col = summary['q1'].to_numpy()",
+            "print(mean_col[0], mean_col[1], mean_col[2])",
+            "print(std_col[0], std_col[1], std_col[2])",
+            "print(q1_col[0], q1_col[1], q1_col[2])",
+        ],
+    )
+
+
+def test_xp2f_dict_comprehension_over_list_consumed_via_items(tmp_path: Path) -> None:
+    # Regression test, surfaced by xpaths.py:
+    #   threshold_probs = {
+    #       threshold: (terminals > threshold).mean()
+    #       for threshold in TERMINAL_THRESHOLDS
+    #   }
+    #   for threshold, probability in threshold_probs.items():
+    #       ...
+    # was unsupported (dict comprehensions weren't supported at all).
+    #
+    # Narrow support added: a single-generator DictComp with no `if`
+    # filter, where the key is exactly the loop variable (the common
+    # `{k: f(k) for k in items}` idiom) -- modeled as a materialized
+    # values array (dict_comp_vars), not a real dict type, and only
+    # consumable later via `for k, v in D.items():` (not arbitrary key
+    # lookup D[key]). The value expression is evaluated inside a real
+    # Fortran DO loop (not the pre-existing, narrower ListComp
+    # machinery's vectorized-elemental-map strategy, which can't
+    # express a per-element reduction like `.mean()` at all).
+    #
+    # This is deliberately NOT the exact xpaths.py shape: that specific
+    # usage is a dict comprehension inside a local function (def
+    # main():) iterating a MODULE-LEVEL list global (TERMINAL_THRESHOLDS)
+    # -- which hits an entirely separate, pre-existing, and much wider
+    # limitation confirmed independently of dict comprehensions (a bare
+    # `for t in GLOBAL_LIST:` loop inside a local function already fails
+    # with "only for .. in range(..) or for .. in sorted(..) supported").
+    # This test instead exercises the dict-comprehension feature itself
+    # at the top level, where that separate limitation doesn't apply.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdictcomp_items.py",
+        [
+            "import numpy as np",
+            "",
+            "terminals = np.array([98.0, 101.0, 105.0, 99.0, 110.0])",
+            "TERMINAL_THRESHOLDS = [100.0, 104.0]",
+            "",
+            "threshold_probs = {",
+            "    threshold: (terminals > threshold).mean()",
+            "    for threshold in TERMINAL_THRESHOLDS",
+            "}",
+            "",
+            "for threshold, probability in threshold_probs.items():",
+            "    print(threshold, probability)",
+        ],
+    )

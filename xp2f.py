@@ -3802,7 +3802,7 @@ def remove_unused_ieee_arithmetic_use(lines):
     unit_start_re = re.compile(r"^\s*(program|module)\s+\w+", flags=re.IGNORECASE)
     unit_end_re = re.compile(r"^\s*end\s+(program|module)\b", flags=re.IGNORECASE)
     use_ieee_re = re.compile(r"^\s*use\s*,\s*intrinsic\s*::\s*ieee_arithmetic\b", flags=re.IGNORECASE)
-    ieee_syms = ("ieee_value", "ieee_quiet_nan", "ieee_is_finite", "ieee_is_nan")
+    ieee_syms = ("ieee_value", "ieee_quiet_nan", "ieee_is_finite", "ieee_is_nan", "ieee_positive_inf", "ieee_negative_inf")
 
     i = 0
     remove_idxs = set()
@@ -7632,6 +7632,7 @@ def detect_needed_helpers(tree):
         "savetxt": {"savetxt_real_2d"},
         "pad": {"pad2d_int", "pad2d_real"},
         "allclose": {"allclose"},
+        "isclose": {"isclose_real"},
         "isfinite": {"complex_isfinite"},
         "isinf": {"complex_isinf"},
         "isnan": {"complex_isnan"},
@@ -7642,6 +7643,10 @@ def detect_needed_helpers(tree):
         "digitize": {"digitize_real"},
         "load": {"np_load_1d_real"},
         "save": {"np_save_1d_real"},
+        "isin": {"isin_real", "isin_int"},
+        "in1d": {"isin_real", "isin_int"},
+        "isreal": {"ones_logical"},
+        "iscomplex": {"zeros_logical"},
     }
     np_reduceat_helper_map = {
         "add": {"reduceat_add"},
@@ -14734,6 +14739,7 @@ class translator(ast.NodeVisitor):
         # pandas_df_vars handles it), since a single column has no
         # separate label dimension to track.
         self.pandas_series_labels = {}
+        self.dict_comp_vars = {}
         # DataFrame variables whose row index is a SUBSET/reordering of the
         # source frame's row positions (from df.iloc[[i0,...]] / df.loc[[l0,
         # ...]] fancy row selection) -- i.e. row N of this frame is NOT
@@ -17448,6 +17454,17 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {
+                    "logical_not", "isreal", "iscomplex", "isposinf", "isneginf",
+                    "equal", "not_equal", "greater", "greater_equal", "less", "less_equal",
+                    "isin", "in1d",
+                }
+            ):
+                return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "allclose"
                 and len(node.args) >= 2
             ):
@@ -17628,6 +17645,14 @@ class translator(ast.NodeVisitor):
                 and node.func.value.id == "np"
                 and node.func.attr in {"all", "any", "isfinite", "isinf", "isnan"}
                 and len(node.args) >= 1
+            ):
+                return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "isclose"
+                and len(node.args) >= 2
             ):
                 return "logical"
             if (
@@ -19983,18 +20008,26 @@ class translator(ast.NodeVisitor):
             return None
         return {"index": index, "columns": columns}
 
-    def _pandas_df_reduction_expr(self, method, col_expr):
+    def _pandas_df_reduction_expr(self, method, col_expr, ddof=None, q_expr=None):
         # Fortran expression computing one of df.mean()/.std()/.min()/
-        # .max()/.sum()/.median() over a single column array -- shared by
-        # _emit_pandas_df_series_reduction_print (print(df.mean())) and
-        # _pandas_df_reduction_rows_construct_spec's codegen
-        # (pd.DataFrame([df.mean(), df.std()], index=[...])).
+        # .max()/.sum()/.median()/.quantile() over a single column array
+        # -- shared by _emit_pandas_df_series_reduction_print
+        # (print(df.mean())), _pandas_df_reduction_rows_construct_spec's
+        # codegen (pd.DataFrame([df.mean(), df.std()], index=[...])),
+        # and _pandas_df_reduction_cols_construct_spec's codegen
+        # (pd.DataFrame({"mean": df.mean(axis=0), ...})). ddof overrides
+        # the pandas-default sample ddof=1 for std/var (e.g. an explicit
+        # df.std(axis=0, ddof=0)); q_expr is the quantile probability
+        # expression text, required (and only meaningful) for method ==
+        # "quantile".
         if method == "mean":
             return f"mean_1d({col_expr})"
         if method == "median":
             return f"quantile_linear({col_expr}, 0.5_dp)"
+        if method == "quantile":
+            return f"quantile_linear({col_expr}, real({q_expr}, kind=dp))"
         if method == "std":
-            return f"std({col_expr}, 1)"
+            return f"std({col_expr}, {1 if ddof is None else ddof})"
         if method == "min":
             return f"minval({col_expr})"
         if method == "max":
@@ -20008,7 +20041,7 @@ class translator(ast.NodeVisitor):
             # own np.var() default of ddof=0, which is why the generic
             # (non-DataFrame) .var() handler needs an explicit ddof= to
             # get this same value; a bare df.var() always means ddof=1.
-            return f"var_1d({col_expr}, 1)"
+            return f"var_1d({col_expr}, {1 if ddof is None else ddof})"
         if method == "sem":
             # Standard error of the mean -- pandas' default ddof=1, same
             # sample-std convention as above.
@@ -20018,6 +20051,85 @@ class translator(ast.NodeVisitor):
         if method == "kurt":
             return f"kurt_1d({col_expr})"
         raise NotImplementedError(f"df.{method}() reduction not supported")
+
+    def _pandas_df_reduction_cols_construct_spec(self, v):
+        # X = pd.DataFrame({"mean": df.mean(axis=0), "std": df.std(axis=0,
+        # ddof=0), "q1": df.quantile(0.25, axis=0), ...}) -- the
+        # transposed-orientation sibling of
+        # _pandas_df_reduction_rows_construct_spec: one row per df's own
+        # column, one column per dict entry (dict key -> new column
+        # name; each dict value must be a whole-DataFrame column-wise
+        # reduction on the SAME source df, with an explicit axis=0).
+        # Unlike _pandas_df_reduction_series_spec (which only recognizes
+        # a bare df.mean(), no args/kwargs at all), this accepts axis=0
+        # (required -- this spec is specifically for the axis=0 case)
+        # and, for std/var, an optional integer ddof=; quantile takes its
+        # probability either positionally or as q=.
+        if not (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"pd", "pandas"}
+            and v.func.attr == "DataFrame"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Dict)
+            and v.args[0].keys
+            and all(is_const_str(k) for k in v.args[0].keys)
+        ):
+            return None
+        df_id = None
+        items = []
+        for k, val in zip(v.args[0].keys, v.args[0].values):
+            if not (
+                isinstance(val, ast.Call)
+                and isinstance(val.func, ast.Attribute)
+                and isinstance(val.func.value, ast.Name)
+                and val.func.value.id in self.pandas_df_vars
+            ):
+                return None
+            if df_id is None:
+                df_id = val.func.value.id
+            elif val.func.value.id != df_id:
+                return None
+            method = val.func.attr
+            axis_ok = False
+            q_node = None
+            ddof_node = None
+            if method == "quantile":
+                if val.args:
+                    q_node = val.args[0]
+                if len(val.args) >= 2 and isinstance(val.args[1], ast.Constant) and val.args[1].value == 0:
+                    axis_ok = True
+                for kw in val.keywords:
+                    if kw.arg == "q":
+                        q_node = kw.value
+                    elif kw.arg == "axis" and isinstance(kw.value, ast.Constant) and kw.value.value == 0:
+                        axis_ok = True
+                    else:
+                        return None
+                if q_node is None:
+                    return None
+            elif method in {"mean", "median", "min", "max", "sum", "prod", "std", "var", "sem", "skew", "kurt"}:
+                if val.args:
+                    return None
+                for kw in val.keywords:
+                    if kw.arg == "axis" and isinstance(kw.value, ast.Constant) and kw.value.value == 0:
+                        axis_ok = True
+                    elif kw.arg == "ddof" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, int):
+                        ddof_node = kw.value
+                    else:
+                        return None
+            else:
+                return None
+            if not axis_ok:
+                return None
+            items.append({"key": k.value, "method": method, "q_node": q_node, "ddof_node": ddof_node})
+        if df_id is None:
+            return None
+        cols = self.pandas_df_columns.get(df_id)
+        if not cols:
+            return None
+        return {"df_id": df_id, "items": items, "row_labels": list(cols)}
 
     def _pandas_df_reduction_series_spec(self, v):
         # X = df.mean() / df.std() / df.sum() / df.min() / df.max() /
@@ -21078,8 +21190,18 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr in {"minimum"} and len(node.args) >= 1:
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
-                if node.func.attr in {"add", "multiply", "maximum", "power", "logical_and", "logical_or", "logical_xor"} and len(node.args) >= 2:
+                if (
+                    node.func.attr in {
+                        "add", "multiply", "maximum", "power", "logical_and", "logical_or", "logical_xor", "isclose",
+                        "equal", "not_equal", "greater", "greater_equal", "less", "less_equal",
+                    }
+                    and len(node.args) >= 2
+                ):
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
+                if node.func.attr in {"isin", "in1d"} and len(node.args) >= 1:
+                    return max(1, self._rank_expr(node.args[0]))
+                if node.func.attr in {"logical_not", "isreal", "iscomplex", "isposinf", "isneginf"} and len(node.args) >= 1:
+                    return self._rank_expr(node.args[0])
                 if node.func.attr == "arange" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "ndim" and len(node.args) >= 1:
@@ -22183,7 +22305,7 @@ class translator(ast.NodeVisitor):
             if np_const == "nan":
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
             if np_const == "inf":
-                return "huge(1.0_dp)"
+                return "ieee_value(0.0_dp, ieee_positive_inf)"
             if node.id in self.pandas_date_array_aliases:
                 df_name = self._aliased_name(self.pandas_date_array_aliases[node.id])
                 return f"{df_name}%index"
@@ -25656,9 +25778,13 @@ class translator(ast.NodeVisitor):
                     return ".false."
                 if ra == 0:
                     return f"({a0} == {b0})"
-                shape_checks = [f"(size({a0},{d}) == size({b0},{d}))" for d in range(1, ra + 1)]
+                # No parens around each individual clause -- see the
+                # matching comment on np.array_equiv's codegen for why
+                # (avoids a pre-existing print-argument paren-stripping
+                # bug this shape triggers).
+                shape_checks = [f"size({a0},{d}) == size({b0},{d})" for d in range(1, ra + 1)]
                 shape_ok = " .and. ".join(shape_checks) if shape_checks else ".true."
-                return f"(({shape_ok}) .and. all({a0} == {b0}))"
+                return f"({shape_ok} .and. all({a0} == {b0}))"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -26489,6 +26615,189 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "logical_or":
                     return f"({l0} .or. {l1})"
                 return f"({l0} .neqv. {l1})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "logical_not"
+                and len(node.args) >= 1
+            ):
+                _a0 = self.expr(node.args[0])
+                _l0 = _a0 if self._expr_kind(node.args[0]) == "logical" else f"({_a0} /= 0)"
+                return f"(.not. {_l0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"isreal", "iscomplex"}
+                and len(node.args) >= 1
+            ):
+                # For a complex array this is a real elemental comparison
+                # (rank-correct for any rank); for a non-complex array
+                # every element is (trivially) real, so this reuses the
+                # same "constant array shaped like x" helpers zeros_like/
+                # ones_like already use elsewhere in this file -- which
+                # only produce a flat rank-1 result (size(x) elements),
+                # inheriting that same rank>=2 limitation here too.
+                _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex":
+                    _op = "==" if node.func.attr == "isreal" else "/="
+                    return f"(aimag({_a0}) {_op} 0.0_dp)"
+                _fn = "ones_logical" if node.func.attr == "isreal" else "zeros_logical"
+                return f"{_fn}(size({_a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"isposinf", "isneginf"}
+                and len(node.args) >= 1
+            ):
+                if self._expr_kind(node.args[0]) == "complex":
+                    raise NotImplementedError(f"np.{node.func.attr} does not support complex input")
+                _a0 = self.expr(node.args[0])
+                _sign_op = ">" if node.func.attr == "isposinf" else "<"
+                # Fortran's .and. is not guaranteed to short-circuit, so
+                # `x > 0.0_dp` would still be evaluated (elementally)
+                # even on a NaN element of x -- an ordered comparison
+                # against a real NaN raises IEEE's invalid-operation
+                # exception, which this project's -ffpe-trap=invalid
+                # build turns into a SIGFPE crash. Substitute NaN
+                # elements with a safe sentinel (0.0) before comparing;
+                # the separate ieee_is_nan check still correctly excludes
+                # them from the true/false result.
+                _safe = f"merge(0.0_dp, {_a0}, ieee_is_nan({_a0}))"
+                return f"((.not. ieee_is_finite({_a0})) .and. (.not. ieee_is_nan({_a0})) .and. ({_safe} {_sign_op} 0.0_dp))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {
+                    "equal", "not_equal", "greater", "greater_equal", "less", "less_equal",
+                }
+                and len(node.args) >= 2
+            ):
+                # Reuse the existing, already-correct Compare-node codegen
+                # (type promotion, casting, etc.) by building a synthetic
+                # Compare node from the two call arguments, rather than
+                # duplicating that logic here.
+                _cmp_op = {
+                    "equal": ast.Eq, "not_equal": ast.NotEq, "greater": ast.Gt,
+                    "greater_equal": ast.GtE, "less": ast.Lt, "less_equal": ast.LtE,
+                }[node.func.attr]()
+                _synthetic_cmp = ast.Compare(left=node.args[0], ops=[_cmp_op], comparators=[node.args[1]])
+                return self.expr(_synthetic_cmp)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"isin", "in1d"}
+                and len(node.args) >= 2
+            ):
+                # a[i] in b for every element of a, matching numpy's
+                # np.isin(a, b) (and its older alias np.in1d). Rank-1
+                # inputs only.
+                _a0 = self.expr(node.args[0])
+                _b0 = self.expr(node.args[1])
+                _ka = self._expr_kind(node.args[0])
+                _kb = self._expr_kind(node.args[1])
+                if _ka == "int" and _kb == "int":
+                    return f"isin_int({_a0}, {_b0})"
+                if _ka in {"int", "logical"}:
+                    _a0 = f"real({_a0}, kind=dp)"
+                if _kb in {"int", "logical"}:
+                    _b0 = f"real({_b0}, kind=dp)"
+                return f"isin_real({_a0}, {_b0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "array_equiv"
+                and len(node.args) >= 2
+            ):
+                # array_equal's broadcasting-aware sibling. Full N-D
+                # broadcast-shape-compatibility is not attempted -- only
+                # same-rank-and-shape (delegates to the exact same check
+                # array_equal uses) or one side being a scalar (trivial
+                # broadcast: every element of the array equals the
+                # scalar).
+                _a0 = self.expr(node.args[0])
+                _b0 = self.expr(node.args[1])
+                _ra = max(0, int(self._rank_expr(node.args[0])))
+                _rb = max(0, int(self._rank_expr(node.args[1])))
+                if _ra == 0 and _rb == 0:
+                    return f"({_a0} == {_b0})"
+                if _ra == 0:
+                    return f"all({_b0} == {_a0})"
+                if _rb == 0:
+                    return f"all({_a0} == {_b0})"
+                if _ra != _rb:
+                    raise NotImplementedError("np.array_equiv currently supports only same-rank arrays or one scalar operand")
+                # No parens around each individual clause (relational
+                # operators already bind tighter than .and. in Fortran,
+                # so they're not needed for correctness) -- avoids this
+                # expression starting with "(", which would otherwise
+                # make a pre-existing print-argument paren-stripping pass
+                # (_peel_print_arg_parens) try to peel a second,
+                # mismatched "outer" paren layer after correctly
+                # stripping this function's own single wrap, corrupting
+                # the expression.
+                _shape_checks = [f"size({_a0},{d}) == size({_b0},{d})" for d in range(1, _ra + 1)]
+                _shape_ok = " .and. ".join(_shape_checks) if _shape_checks else ".true."
+                return f"({_shape_ok} .and. all({_a0} == {_b0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "isclose"
+                and len(node.args) >= 2
+            ):
+                # Element-wise version of np.allclose's same tolerance
+                # test and NaN handling -- routed through the isclose_real
+                # helper (a loop with explicit if/else, like
+                # allclose_real) rather than an inline elemental
+                # abs(...)<=... expression: Fortran's .and. isn't
+                # guaranteed to short-circuit, so a naive
+                # "not-NaN .and. (comparison)" expression still evaluates
+                # the ordered comparison on a NaN element, which this
+                # project's -ffpe-trap=invalid build turns into a SIGFPE
+                # crash. Rank-0 (scalar) arguments are wrapped into
+                # length-1 arrays for the call (matching np.allclose's
+                # own codegen just below), broadcasting the same way
+                # numpy does for this call shape; when both arguments are
+                # scalar the (length-1 array) result is indexed back down
+                # to a plain scalar logical.
+                _a0_node, _a1_node = node.args[0], node.args[1]
+                _ra = self._rank_expr(_a0_node)
+                _rb = self._rank_expr(_a1_node)
+                _a0 = self.expr(_a0_node)
+                _a1 = self.expr(_a1_node)
+                _a0_txt = f"[real({_a0}, kind=dp)]" if _ra == 0 else f"real({_a0}, kind=dp)"
+                _a1_txt = f"[real({_a1}, kind=dp)]" if _rb == 0 else f"real({_a1}, kind=dp)"
+                _rtol = "1.0e-5_dp"
+                _atol = "1.0e-8_dp"
+                _equal_nan = ".false."
+                if len(node.args) >= 3:
+                    _rtol = self.expr(node.args[2])
+                if len(node.args) >= 4:
+                    _atol = self.expr(node.args[3])
+                for kw in node.keywords:
+                    if kw.arg == "rtol":
+                        _rtol = self.expr(kw.value)
+                    elif kw.arg == "atol":
+                        _atol = self.expr(kw.value)
+                    elif kw.arg == "equal_nan":
+                        if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                            _equal_nan = ".true." if kw.value.value else ".false."
+                        else:
+                            _ev = self.expr(kw.value)
+                            _equal_nan = _ev if self._expr_kind(kw.value) == "logical" else f"({_ev} /= 0)"
+                _call = (
+                    f"isclose_real({_a0_txt}, {_a1_txt}, "
+                    f"real({_rtol}, kind=dp), real({_atol}, kind=dp), {_equal_nan})"
+                )
+                if _ra == 0 and _rb == 0:
+                    return f"{_call}(1)"
+                return _call
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -29426,9 +29735,9 @@ class translator(ast.NodeVisitor):
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "nan":
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
             if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr in {"inf", "Inf"}:
-                return "huge(1.0_dp)"
+                return "ieee_value(0.0_dp, ieee_positive_inf)"
             if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr == "NINF":
-                return "(-huge(1.0_dp))"
+                return "ieee_value(0.0_dp, ieee_negative_inf)"
             if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
                 self.uses_sys_argv = True
                 self._mark_alloc_char("sys_argv", rank=1)
@@ -30973,6 +31282,29 @@ class translator(ast.NodeVisitor):
                     _src_cols = self.pandas_df_columns.get(_src_id)
                     if _src_cols is not None:
                         _selected = self._resolve_str_list_literal(v.slice)
+                        _missing = [_nm for _nm in _selected if _nm not in _src_cols]
+                        if _missing:
+                            # xp2f's static column tracking for _src_id didn't
+                            # include every selected name -- e.g. the
+                            # DataFrame was built from a list of dicts
+                            # returned by a function call, which this
+                            # tracking doesn't trace through. Surfaced by
+                            # option_pricing/xquad_option.py's
+                            # `curve_df[["distribution", ...]]`, where
+                            # curve_df = pd.DataFrame(curve_records) and
+                            # curve_records comes from
+                            # integrate_straddle_curve(...). Fail with a
+                            # clear message instead of the previous
+                            # unhandled `ValueError: 'name' is not in list`
+                            # from _src_cols.index(_nm) below.
+                            raise NotImplementedError(
+                                f"df[[...]] column selection on '{_src_id}': "
+                                f"column(s) {_missing} not found in xp2f's tracked "
+                                f"columns {_src_cols} for this DataFrame -- likely "
+                                "built in a way xp2f can't statically determine "
+                                "the columns for (e.g. from a list of dicts "
+                                "returned by a function call)"
+                            )
                         self.pandas_df_select_indices[t.id] = [
                             _src_cols.index(_nm) + 1 for _nm in _selected
                         ]
@@ -31529,6 +31861,82 @@ class translator(ast.NodeVisitor):
                         self.alloc_chars.discard(t.id)
                         self.alloc_complexes.discard(t.id)
                         continue
+
+                # X = pd.DataFrame({"mean": df.mean(axis=0), ...}) -- the
+                # transposed-orientation sibling just above: one row per
+                # df's own column, one column per dict entry.
+                if isinstance(t, ast.Name):
+                    _rc_spec = self._pandas_df_reduction_cols_construct_spec(v)
+                    if _rc_spec is not None:
+                        self.pandas_df_vars[t.id] = "DataFrame_str_index"
+                        self.pandas_df_columns[t.id] = [it["key"] for it in _rc_spec["items"]]
+                        self.ints.discard(t.id)
+                        self.reals.discard(t.id)
+                        self.logs.discard(t.id)
+                        self.chars.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_ints.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_logs.discard(t.id)
+                        self.alloc_chars.discard(t.id)
+                        self.alloc_complexes.discard(t.id)
+                        continue
+
+                # D = {k: expr(k) for k in ITER} -- narrow dict-comprehension
+                # support: single generator, no `if` filter, and the key is
+                # exactly the loop variable (the common `{k: f(k) for k in
+                # items}` idiom). Modeled as a materialized values array
+                # (dict_comp_vars) rather than a real dict type; only
+                # consumable later via `for k, v in D.items():` (see the
+                # matching ast.For prescan branch above and visit_For's
+                # codegen), not via arbitrary key lookup D[key].
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.DictComp)
+                    and len(v.generators) == 1
+                    and not v.generators[0].ifs
+                    and not v.generators[0].is_async
+                    and isinstance(v.generators[0].target, ast.Name)
+                    and isinstance(v.key, ast.Name)
+                    and v.key.id == v.generators[0].target.id
+                    and self._rank_expr(v.generators[0].iter) >= 1
+                ):
+                    _gen = v.generators[0]
+                    _var = _gen.target.id
+                    _iter_node = _gen.iter
+                    _key_kind = self._expr_kind(_iter_node) or "real"
+                    if _key_kind == "real":
+                        self._mark_real(_var)
+                    elif _key_kind == "logical":
+                        self._mark_log(_var)
+                    elif _key_kind == "complex":
+                        self._mark_complex(_var)
+                    elif _key_kind == "char":
+                        self._mark_char(_var)
+                    else:
+                        self._mark_int(_var)
+                    _value_kind = self._expr_kind(v.value) or "real"
+                    _values_name = f"{t.id}_dictcomp_values"
+                    if _value_kind == "real":
+                        self._mark_alloc_real(_values_name, rank=1)
+                    elif _value_kind == "logical":
+                        self._mark_alloc_log(_values_name, rank=1)
+                    elif _value_kind == "complex":
+                        self._mark_alloc_complex(_values_name, rank=1)
+                    elif _value_kind == "char":
+                        self._mark_alloc_char(_values_name, rank=1)
+                    else:
+                        self._mark_alloc_int(_values_name, rank=1)
+                    self.dict_comp_vars[t.id] = {
+                        "iter_node": _iter_node,
+                        "var_name": _var,
+                        "value_node": v.value,
+                        "values_name": _values_name,
+                        "key_kind": _key_kind,
+                        "value_kind": _value_kind,
+                    }
+                    self._mark_int(f"i_{t.id}_{getattr(node, 'lineno', 0)}")
+                    continue
 
                 # X = df.mean() / df.std() / df.sum() / df.min() / df.max()
                 # / df.median() -- assigned to a variable; a plain real
@@ -33497,6 +33905,44 @@ class translator(ast.NodeVisitor):
                                 self._mark_int(vnm)
                         else:
                             self._mark_int(vnm)
+                elif (
+                    isinstance(node.target, (ast.Tuple, ast.List))
+                    and len(node.target.elts) == 2
+                    and isinstance(node.iter, ast.Call)
+                    and isinstance(node.iter.func, ast.Attribute)
+                    and node.iter.func.attr == "items"
+                    and not node.iter.args
+                    and isinstance(node.iter.func.value, ast.Name)
+                    and node.iter.func.value.id in self.dict_comp_vars
+                ):
+                    # for k, v in D.items() where D = {k: expr(k) for k in
+                    # ITER} -- see the DictComp prescan branch below
+                    # (dict_comp_vars) for how D itself was materialized.
+                    t0, t1 = node.target.elts
+                    dc = self.dict_comp_vars[node.iter.func.value.id]
+                    if isinstance(t0, ast.Name) and t0.id != "_":
+                        if dc["key_kind"] == "real":
+                            self._mark_real(t0.id)
+                        elif dc["key_kind"] == "logical":
+                            self._mark_log(t0.id)
+                        elif dc["key_kind"] == "complex":
+                            self._mark_complex(t0.id)
+                        elif dc["key_kind"] == "char":
+                            self._mark_char(t0.id)
+                        else:
+                            self._mark_int(t0.id)
+                    if isinstance(t1, ast.Name) and t1.id != "_":
+                        if dc["value_kind"] == "real":
+                            self._mark_real(t1.id)
+                        elif dc["value_kind"] == "logical":
+                            self._mark_log(t1.id)
+                        elif dc["value_kind"] == "complex":
+                            self._mark_complex(t1.id)
+                        elif dc["value_kind"] == "char":
+                            self._mark_char(t1.id)
+                        else:
+                            self._mark_int(t1.id)
+                    self._mark_int(f"i_{node.iter.func.value.id}_{getattr(node, 'lineno', 0)}")
                 self.prescan(node.body)
 
             if isinstance(node, ast.If):
@@ -39251,6 +39697,51 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"{name}%values({_i}, {_j}) = {_val_expr}")
                 return
 
+        # X = pd.DataFrame({"mean": df.mean(axis=0), ...}) -- one row per
+        # df's original column, one column per dict entry.
+        if isinstance(t, ast.Name) and t.id in self.pandas_df_vars:
+            _rc_spec = self._pandas_df_reduction_cols_construct_spec(v)
+            if _rc_spec is not None:
+                name = self._aliased_name(t.id)
+                src_expr = self._aliased_name(_rc_spec["df_id"])
+                row_labels = _rc_spec["row_labels"]
+                items = _rc_spec["items"]
+                col_keys = [it["key"] for it in items]
+                col_len = max(10, max(len(c) for c in col_keys))
+                row_len = max(10, max(len(r) for r in row_labels))
+                columns_txt = ", ".join(fstr(c) for c in col_keys)
+                index_txt = ", ".join(fstr(r) for r in row_labels)
+                self.o.w(f"{name}%columns = [character(len={col_len}) :: {columns_txt}]")
+                self.o.w(f"{name}%index = [character(len={row_len}) :: {index_txt}]")
+                self.o.w(f"if (allocated({name}%values)) deallocate({name}%values)")
+                self.o.w(f"allocate({name}%values({len(row_labels)}, {len(items)}))")
+                for _j, _it in enumerate(items, start=1):
+                    _ddof = _it["ddof_node"].value if _it["ddof_node"] is not None else None
+                    _q_expr = self.expr(_it["q_node"]) if _it["q_node"] is not None else None
+                    for _i in range(1, len(row_labels) + 1):
+                        _col_expr = f"{src_expr}%values(:, {_i})"
+                        _val_expr = self._pandas_df_reduction_expr(_it["method"], _col_expr, ddof=_ddof, q_expr=_q_expr)
+                        self.o.w(f"{name}%values({_i}, {_j}) = {_val_expr}")
+                return
+
+        # D = {k: expr(k) for k in ITER} -- see the matching prescan branch
+        # (dict_comp_vars) and visit_For's `for k, v in D.items():` codegen.
+        if isinstance(t, ast.Name) and t.id in self.dict_comp_vars:
+            dc = self.dict_comp_vars[t.id]
+            iter_expr = self.expr(dc["iter_node"])
+            values_name = dc["values_name"]
+            var_name = self._aliased_name(dc["var_name"])
+            iv = f"i_{t.id}_{getattr(node, 'lineno', 0)}"
+            self.o.w(f"if (allocated({values_name})) deallocate({values_name})")
+            self.o.w(f"allocate({values_name}(1:size({iter_expr})))")
+            self.o.w(f"do {iv} = 1, size({iter_expr})")
+            self.o.push()
+            self.o.w(f"{var_name} = {iter_expr}({iv})")
+            self.o.w(f"{values_name}({iv}) = {self.expr(dc['value_node'])}")
+            self.o.pop()
+            self.o.w("end do")
+            return
+
         # X = df.mean() / df.std() / df.sum() / df.min() / df.max() / df.median()
         if isinstance(t, ast.Name) and t.id in self.pandas_series_labels:
             _sr_spec = self._pandas_df_reduction_series_spec(v)
@@ -41228,6 +41719,38 @@ class translator(ast.NodeVisitor):
             self.o.w("end if")
             self.o.pop()
             self.o.w("end block")
+            return
+
+        # for k, v in D.items() where D = {k: expr(k) for k in ITER} -- see
+        # dict_comp_vars (the DictComp assignment prescan/codegen).
+        if (
+            isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Attribute)
+            and node.iter.func.attr == "items"
+            and not node.iter.args
+            and isinstance(node.iter.func.value, ast.Name)
+            and node.iter.func.value.id in self.dict_comp_vars
+        ):
+            if not (isinstance(node.target, (ast.Tuple, ast.List)) and len(node.target.elts) == 2):
+                raise NotImplementedError("dict comprehension .items() target must be a 2-item tuple/list")
+            t_key, t_val = node.target.elts
+            if not (isinstance(t_key, ast.Name) and isinstance(t_val, ast.Name)):
+                raise NotImplementedError("dict comprehension .items() targets must be names")
+            dc = self.dict_comp_vars[node.iter.func.value.id]
+            iter_expr = self.expr(dc["iter_node"])
+            values_name = dc["values_name"]
+            key_var = self._aliased_name(t_key.id)
+            val_var = self._aliased_name(t_val.id)
+            iv = f"i_{node.iter.func.value.id}_{getattr(node, 'lineno', 0)}"
+            self.o.w(f"do {iv} = 1, size({iter_expr})")
+            self.o.push()
+            if t_key.id != "_":
+                self.o.w(f"{key_var} = {iter_expr}({iv})")
+            if t_val.id != "_":
+                self.o.w(f"{val_var} = {values_name}({iv})")
+            _visit_loop_body_and_close_rebinds()
+            self.o.pop()
+            self.o.w("end do")
             return
 
         # for i, j in enumerate(range(...), start=...)
@@ -56000,7 +56523,7 @@ def generate_flat(
             om.w("use lbfgsb_bridge_mod, only: lbfgsb_user_fn, lbfgsb_minimize")
         if _tree_uses_scipy_minimize_powell(_proc_use_scan_tree):
             om.w("use powell_bridge_mod, only: powell_user_fn, powell_minimize")
-        om.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
+        om.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan, ieee_positive_inf, ieee_negative_inf")
         om.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
         om.w("implicit none")
         om.w("private")
@@ -56426,7 +56949,7 @@ def generate_flat(
     # -- independent of whether any local function needed a proc
     # module. remove_unused_ieee_arithmetic_use prunes this back out
     # per program/module unit when its own body has no ieee symbols.
-    o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
+    o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan, ieee_positive_inf, ieee_negative_inf")
     if not use_proc_module:
         o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
     o.w("implicit none")
@@ -56787,7 +57310,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     for mod, syms in helper_uses.items():
         if syms:
             o.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
-    o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
+    o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan, ieee_positive_inf, ieee_negative_inf")
     o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
     o.w("implicit none")
     o.w("integer, parameter :: sp = real32")
