@@ -175,6 +175,11 @@ public :: index1
 public :: index2
 public :: slice1
 
+public :: rank_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='min') for a plain 1D real vector"
+public :: rank_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='max') for a plain 1D real vector"
+public :: rank_average_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='average') for a plain 1D real vector"
+public :: rank_first_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='first') for a plain 1D real vector"
+public :: rank_dense_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='dense') for a plain 1D real vector"
 public :: cumsum_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative sum of real vector"
 public :: cumsum_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative sum of real matrix along axis 0"
 public :: cumsum_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative sum of real matrix along axis 1"
@@ -4594,6 +4599,161 @@ contains
          end do
          str_isspace = .true.
       end function str_isspace
+
+      pure function rank_min_real(x) result(r)
+         ! pandas Series.rank(method="min"): tied values share the
+         ! smallest rank within their tie group -- rank(i) = 1 + (count
+         ! of non-NaN elements strictly less than x(i)). NaN entries are
+         ! excluded from ranking and stay NaN in the result, matching
+         ! pandas' default na_option="keep". O(n**2) is fine here --
+         ! .rank() is used on small per-model/per-symbol comparison
+         ! tables, not large simulation arrays.
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: i, j, n, c
+         n = size(x)
+         allocate(r(n))
+         do i = 1, n
+            if (ieee_is_nan(x(i))) then
+               r(i) = ieee_value(1.0_dp, ieee_quiet_nan)
+               cycle
+            end if
+            c = 0
+            do j = 1, n
+               if ((.not. ieee_is_nan(x(j))) .and. x(j) < x(i)) c = c + 1
+            end do
+            r(i) = real(c + 1, kind=dp)
+         end do
+      end function rank_min_real
+
+      pure function rank_max_real(x) result(r)
+         ! pandas Series.rank(method="max"): tied values share the
+         ! largest rank within their tie group -- rank(i) = count of
+         ! non-NaN elements <= x(i) (equivalently: 1 + count strictly
+         ! less + count of other tied elements). See rank_min_real for
+         ! the NaN/complexity notes, which apply here too.
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: i, j, n, c
+         n = size(x)
+         allocate(r(n))
+         do i = 1, n
+            if (ieee_is_nan(x(i))) then
+               r(i) = ieee_value(1.0_dp, ieee_quiet_nan)
+               cycle
+            end if
+            c = 0
+            do j = 1, n
+               if ((.not. ieee_is_nan(x(j))) .and. x(j) <= x(i)) c = c + 1
+            end do
+            r(i) = real(c, kind=dp)
+         end do
+      end function rank_max_real
+
+      pure function rank_average_real(x) result(r)
+         ! pandas Series.rank(method="average", the default): tied
+         ! values share the mean of the ranks they'd occupy, which is
+         ! just (rank_min(i) + rank_max(i)) / 2 for every tie group. See
+         ! rank_min_real for the NaN/complexity notes, which apply here
+         ! too.
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: i, j, n, c_lt, c_le
+         n = size(x)
+         allocate(r(n))
+         do i = 1, n
+            if (ieee_is_nan(x(i))) then
+               r(i) = ieee_value(1.0_dp, ieee_quiet_nan)
+               cycle
+            end if
+            c_lt = 0
+            c_le = 0
+            do j = 1, n
+               if (ieee_is_nan(x(j))) cycle
+               if (x(j) < x(i)) c_lt = c_lt + 1
+               if (x(j) <= x(i)) c_le = c_le + 1
+            end do
+            r(i) = (real(c_lt + 1, kind=dp) + real(c_le, kind=dp)) / 2.0_dp
+         end do
+      end function rank_average_real
+
+      pure function rank_first_real(x) result(r)
+         ! pandas Series.rank(method="first"): ties are broken by order
+         ! of appearance -- among equal values, the one occurring
+         ! earlier in x gets the lower rank. rank(i) = 1 + (count of
+         ! non-NaN elements strictly less than x(i)) + (count of earlier
+         ! non-NaN elements equal to x(i)). See rank_min_real for the
+         ! NaN/complexity notes, which apply here too.
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: i, j, n, c
+         n = size(x)
+         allocate(r(n))
+         do i = 1, n
+            if (ieee_is_nan(x(i))) then
+               r(i) = ieee_value(1.0_dp, ieee_quiet_nan)
+               cycle
+            end if
+            c = 0
+            do j = 1, n
+               if (ieee_is_nan(x(j))) cycle
+               if (x(j) < x(i)) then
+                  c = c + 1
+               else if (x(j) == x(i) .and. j < i) then
+                  c = c + 1
+               end if
+            end do
+            r(i) = real(c + 1, kind=dp)
+         end do
+      end function rank_first_real
+
+      pure function rank_dense_real(x) result(r)
+         ! pandas Series.rank(method="dense"): like method="min" but
+         ! without gaps between tie groups -- rank(i) = 1 + (count of
+         ! DISTINCT non-NaN values strictly less than x(i)). Builds the
+         ! distinct-value set first (O(n**2), same complexity budget as
+         ! rank_min_real) rather than checking distinctness inline
+         ! per-(i,j) pair, which would be O(n**3).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: r(:)
+         real(kind=dp), allocatable :: uniq(:)
+         logical, allocatable :: is_first(:)
+         integer :: i, j, n, nu, c
+         n = size(x)
+         allocate(r(n))
+         allocate(is_first(n))
+         do i = 1, n
+            is_first(i) = .not. ieee_is_nan(x(i))
+            if (is_first(i)) then
+               do j = 1, i - 1
+                  if ((.not. ieee_is_nan(x(j))) .and. x(j) == x(i)) then
+                     is_first(i) = .false.
+                     exit
+                  end if
+               end do
+            end if
+         end do
+         nu = count(is_first)
+         allocate(uniq(nu))
+         c = 0
+         do i = 1, n
+            if (is_first(i)) then
+               c = c + 1
+               uniq(c) = x(i)
+            end if
+         end do
+         do i = 1, n
+            if (ieee_is_nan(x(i))) then
+               r(i) = ieee_value(1.0_dp, ieee_quiet_nan)
+               cycle
+            end if
+            c = 0
+            do j = 1, nu
+               if (uniq(j) < x(i)) c = c + 1
+            end do
+            r(i) = real(c + 1, kind=dp)
+         end do
+      end function rank_dense_real
 
       pure function cumsum_real(x) result(y)
          real(kind=dp), intent(in) :: x(:)

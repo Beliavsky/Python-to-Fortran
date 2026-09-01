@@ -8563,3 +8563,361 @@ def test_xp2f_pd_dynamic_column_key_str_param_and_to_numpy(tmp_path: Path) -> No
     )
     f90_text = (tmp_path / "xdf_dyncol_p.f90").read_text(encoding="utf-8")
     assert "character(len=*), intent(in) :: symbol" in f90_text, f90_text
+
+
+def test_xp2f_pd_series_rank_all_methods(tmp_path: Path) -> None:
+    # Regression test: Series.rank(method=...) for all 5 pandas
+    # tie-breaking methods -- "average" (the default, used whether
+    # method= is omitted entirely or passed explicitly), "min", "max",
+    # "first", "dense". Each lowers to its own rank_*_real helper in
+    # python.f90 (RANK_METHOD_HELPERS maps method name -> helper name);
+    # all O(n**2), fine for the small per-model/per-symbol comparison
+    # tables .rank() is actually used on, not large simulation arrays.
+    # For [3.0, 1.0, 2.0, 1.0] (a value with a 2-way tie at the bottom):
+    #   average: [4.0, 1.5, 3.0, 1.5]  (tied values share the mean of
+    #            the ranks they'd occupy -- equivalently (min+max)/2)
+    #   min:     [4.0, 1.0, 3.0, 1.0]  (ties get the smallest rank)
+    #   max:     [4.0, 2.0, 3.0, 2.0]  (ties get the largest rank)
+    #   first:   [4.0, 1.0, 3.0, 2.0]  (ties broken by original order)
+    #   dense:   [3.0, 1.0, 2.0, 1.0]  (like min, but no gaps between
+    #            tie groups -- rank = 1 + count of distinct smaller
+    #            values, not count of smaller elements)
+    #
+    # Wired up in three places mirroring the existing df["col"].shift(
+    # ...) support: _plain_series_expr_text (codegen text), _expr_kind,
+    # and _rank_expr (both needed so `df["new_col"] = df["col"].rank(
+    # ...)` -- a NEW dict-DataFrame column -- infers real/rank-1
+    # correctly instead of raising "currently supports only real/int
+    # columns" or declaring a rank-mismatched temp). Also needed a new
+    # _series_base_or_literal_col_text helper: _plain_series_expr_text
+    # deliberately excludes the literal-string single-column case
+    # (df["col"], as opposed to a runtime-dynamic df[col]) since that
+    # has "more specific handling elsewhere" for its OTHER caller
+    # (.shift()) -- but .rank() is exercised on exactly that literal-
+    # column shape in real code, so its own resolution needed both.
+    #
+    # A dynamic (non-literal) method= and the grouped
+    # df.groupby(...)["col"].rank(...) form are still not supported.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_rank.py",
+        [
+            "import pandas as pd",
+            "",
+            "d = pd.DataFrame({'aic': [3.0, 1.0, 2.0, 1.0]})",
+            "d['r_avg'] = d['aic'].rank()",
+            "d['r_min'] = d['aic'].rank(method='min')",
+            "d['r_max'] = d['aic'].rank(method='max')",
+            "d['r_first'] = d['aic'].rank(method='first')",
+            "d['r_dense'] = d['aic'].rank(method='dense')",
+            "ravg = d['r_avg']",
+            "rmin = d['r_min']",
+            "rmax = d['r_max']",
+            "rfirst = d['r_first']",
+            "rdense = d['r_dense']",
+            "for i in range(4):",
+            "    print(ravg[i], rmin[i], rmax[i], rfirst[i], rdense[i])",
+        ],
+    )
+
+
+def test_xp2f_pd_dict_df_construct_rangeidx_from_appended_list(tmp_path: Path) -> None:
+    # Regression test: pd.DataFrame({"col": vals}) (no index= kwarg, so
+    # the RangeIndex/dict-construct codegen path) where `vals` is itself
+    # a variable built via .append() in a loop, not a list literal.
+    # Codegen synthesizes a per-column temp assignment (`z_a = vals` for
+    # column "a" of a DataFrame assigned to `z`) via a recursive
+    # self.visit_Assign(ast.Assign(...)) call -- but visit_Assign has
+    # its own "Python list aliasing semantics: x = v binds to the same
+    # list object" branch, which fires here (since `vals` is itself
+    # Python-list-tracked) and just records the alias without emitting
+    # any actual Fortran assignment, on the assumption every later
+    # reference to the synthetic name goes through the same alias
+    # resolution. The %values/%index construction right after did not
+    # do that -- it referenced the raw synthetic temp name directly, so
+    # it silently read a never-assigned variable:
+    #   real(kind=dp), allocatable :: z_a(:)   ! declared...
+    #   allocate(z%values(size(z_a), 1))       ! ...but never assigned
+    # which happened to build (uninitialized array size/contents) rather
+    # than fail loudly. Fixed by resolving each synthesized temp name
+    # through the same alias chain the rest of the file already uses
+    # (self._aliased_name(self._resolve_list_alias(name))) right after
+    # each synthetic assignment, so the construction code that follows
+    # references whatever name actually holds the data.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_dictdf_append.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def show_df(n: int) -> None:",
+            "    a_vals = []",
+            "    b_vals = []",
+            "    for i in range(n):",
+            "        a_vals.append(float(i) * 2.0)",
+            "        b_vals.append(float(i) + 10.0)",
+            "    z = pd.DataFrame({'a': a_vals, 'b': b_vals})",
+            "    ca = z['a']",
+            "    cb = z['b']",
+            "    print(ca[0], ca[1], ca[2])",
+            "    print(cb[0], cb[1], cb[2])",
+            "",
+            "",
+            "def main():",
+            "    show_df(3)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_pd_starred_unpack_module_list_in_column_selection(tmp_path: Path) -> None:
+    # Regression test: df[["date", *ESTIMATORS]] -- splicing a module-
+    # level list-of-strings constant into a column-selection list
+    # literal via Python's starred-unpack syntax. Surfaced two separate
+    # bugs, chased down together:
+    #
+    # 1. Even the simpler, non-starred df[ESTIMATORS] (selecting columns
+    #    by a bare module-level list-of-strings variable) was silently
+    #    broken: toplevel_shared_specs only ever taught a local
+    #    function's own fresh translator instance that ESTIMATORS is a
+    #    char ARRAY (for _rank_expr/_expr_kind's sake), never what its
+    #    actual literal VALUES are -- so _resolve_str_list_literal's
+    #    bare-Name branch (which needs self.pandas_str_list_values)
+    #    could never resolve it, _pandas_df_match's column-selection
+    #    matcher never fired, and it fell through to a generic, wrong
+    #    "subscript a DataFrame by an integer-array index" fallback --
+    #    `df(ESTIMATORS + 1)`, adding 1 to a string array. New
+    #    _toplevel_str_list_values() scans the top-level module body for
+    #    NAME = [str_literal, ...] assignments and seeds
+    #    self.pandas_str_list_values from it in _emit_local_function,
+    #    mirroring how df_arg_types/dict_arg_types already get seeded.
+    # 2. _resolve_str_list_literal itself only recognized a list/tuple
+    #    literal where EVERY element was a string constant -- a Starred
+    #    element made the whole match fail outright, even once (1) was
+    #    fixed. Extended it to accept a Starred element too, resolving
+    #    its inner value recursively through the same function (so it
+    #    can itself be a literal list, list("abc"), or -- thanks to (1)
+    #    -- a resolvable module-level list variable) and splicing the
+    #    result in.
+    # 3. Even with (1) and (2) fixed, prescan's Assign-handling still
+    #    crashed on this shape in scan-only translator instances that
+    #    predate the codegen tr instance's own (1)-fix seeding:
+    #    _extent_expr's "vector subscript" fallback (`size(self.expr(
+    #    node.slice))`) evaluates the whole List-with-Starred slice
+    #    directly rather than going through _pandas_df_match, hitting
+    #    the generic array-constructor code's own "unsupported expr:
+    #    Starred". Hardened with the same try/except-degrade-to-None
+    #    pattern already used for this function's Slice/Tuple branches
+    #    (see the df.iloc[lo:hi] and df.loc[:, col] regression tests
+    #    above).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_starred_cols.py",
+        [
+            "import pandas as pd",
+            "",
+            "ESTIMATORS = ['cc', 'co', 'oc']",
+            "",
+            "",
+            "def make_sub(df: pd.DataFrame) -> pd.DataFrame:",
+            "    return df[['date', *ESTIMATORS]]",
+            "",
+            "",
+            "def main():",
+            "    d = pd.DataFrame(",
+            "        {'date': [1.0, 2.0], 'cc': [3.0, 4.0], 'co': [5.0, 6.0], 'oc': [7.0, 8.0]}",
+            "    )",
+            "    sub = make_sub(d)",
+            "    col = sub['cc']",
+            "    print(col[0], col[1])",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_pd_dataframe_return_propagation(tmp_path: Path) -> None:
+    # Regression test: a local (non-inlined) function's pd.DataFrame
+    # return value wasn't tracked by the caller at all -- neither a
+    # plain `result = make_df(...)` nor a tuple-unpacked
+    # `z, k = make_stuff(...)`. A small enough helper gets fully inlined
+    # (the function boundary disappears, sidestepping the problem), but
+    # the moment it's complex enough to actually get emitted (a loop,
+    # here), the callee's own return type was declared correctly while
+    # the caller silently declared the assigned name plain int/real and
+    # generated nonsense for any subsequent use (`result("a" + 1)`,
+    # treating a DataFrame reference as an integer-indexed array).
+    #
+    # Root-caused to a chain of gaps, all fixed together:
+    # - local_df_return_info (existing machinery, previously scoped only
+    #   to a `pd.read_csv(...)`-traced return) is now also seeded from a
+    #   plain `-> pd.DataFrame` return annotation (_scan_local_df_return_
+    #   info's new fallback), covering the single-return case.
+    # - New _tuple_df_return_positions/_all_tuple_df_return_positions:
+    #   the tuple-return counterpart, reading `-> tuple[..., pd.
+    #   DataFrame, ...]` to find which positions are DataFrame-typed.
+    # - _emit_local_function's own translator instance never had
+    #   local_df_return_info threaded into it at all (only used
+    #   separately for declaring the CURRENT function's own return
+    #   type) -- prescan's `target = other_local_func(...)` recognition
+    #   reads it off self.local_df_return_info, which stayed empty.
+    # - That prescan branch was also missing its `continue`: once it
+    #   registered the target as a DataFrame, execution fell through to
+    #   the generic scalar-kind-inference fallback for the same
+    #   statement anyway, which doesn't know to skip an already-
+    #   recognized DataFrame target -- producing a conflicting
+    #   duplicate declaration.
+    # - Several independent, separately-duplicated copies of "mark each
+    #   tuple-unpack target's kind from the callee's out_kinds" (one in
+    #   the callee's own dummy-arg declaration loop, one in prescan, one
+    #   in a hint-scanning pass over tr_seed, one in codegen's rebind-
+    #   block detection) all needed the same tuple_df_return_positions
+    #   check added, since out_kinds itself has no DataFrame case and
+    #   each independently defaulted the target to real.
+    # - Several scan-only translator instances (_local_return_maps's own
+    #   tr, tr_local_scan, _tr_local_scan, tr_seed) needed both
+    #   local_df_return_info and tuple_df_return_positions seeded too,
+    #   the same recurring pattern as the parameter-passing fixes.
+    # - The (correctly declared, once reachable) DataFrame-typed
+    #   tuple-output dummy argument also needed excluding from the
+    #   generic "local pandas_df_vars not already a dummy arg" decl
+    #   loop, which didn't know about tuple-output names and re-
+    #   declared it as a conflicting duplicate local.
+    #
+    # Exercises both a single DataFrame return and a tuple return with
+    # two DataFrames at non-adjacent positions in one script.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_return_prop.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def make_df(n: int) -> pd.DataFrame:",
+            "    vals = []",
+            "    for i in range(n):",
+            "        vals.append(float(i) * 2.0)",
+            "    z = pd.DataFrame({'a': vals})",
+            "    return z",
+            "",
+            "",
+            "def make_stuff(n: int) -> tuple[pd.DataFrame, float, pd.DataFrame, int]:",
+            "    vals = []",
+            "    for i in range(n):",
+            "        vals.append(float(i) * 2.0)",
+            "    z = pd.DataFrame({'a': vals})",
+            "    w = pd.DataFrame({'b': vals})",
+            "    return z, 5.0, w, 7",
+            "",
+            "",
+            "def main():",
+            "    single = make_df(3)",
+            "    single_col = single['a']",
+            "    print(single_col[0], single_col[1], single_col[2])",
+            "    z, k, w, m = make_stuff(3)",
+            "    zc = z['a']",
+            "    wc = w['b']",
+            "    print(zc[0], zc[1], zc[2], k, wc[0], m)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_pd_series_dropna_and_to_numpy_passthrough(tmp_path: Path) -> None:
+    # Regression test: Series.dropna() -- drops NaN entries, shrinking
+    # the result -- on a runtime-dynamic single column (df[symbol],
+    # symbol a str function parameter), chained into .to_numpy(dtype=
+    # float). New _plain_series_expr_text "dropna" branch lowers it to
+    # Fortran's pack() intrinsic in one expression: pack(x, .not.
+    # ieee_is_nan(x)) compacts x down to just the non-NaN elements, no
+    # dedicated python.f90 helper needed (unlike rank_min_real/
+    # shift_1d) since pack() already does exactly this.
+    #
+    # Also needed .to_numpy() extended with a general "X is already a
+    # plain real array" passthrough case (checked via
+    # _plain_series_expr_text, covering both a bare variable and a
+    # chained .dropna()/.shift()/.rank() result) -- the existing to_numpy
+    # branches only covered a DataFrame-subscript base (df["col"]/
+    # df[name]) or a whole-DataFrame reference, neither of which matches
+    # a plain local variable assigned from dropna()'s result.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_dropna.py",
+        [
+            "import pandas as pd",
+            "import numpy as np",
+            "",
+            "",
+            "def get_clean(returns: pd.DataFrame, symbol: str) -> float:",
+            "    series = returns[symbol].dropna()",
+            "    eps = series.to_numpy(dtype=float) - 1.0",
+            "    return float(eps[0]) + float(eps[1]) + float(eps[2])",
+            "",
+            "",
+            "def main():",
+            "    d = pd.DataFrame({'a': [1.0, np.nan, 2.0, np.nan, 3.0]})",
+            "    print(get_clean(d, 'a'))",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_pd_chained_single_column_subscript(tmp_path: Path) -> None:
+    # Regression test: df["col"][i] / df[col][i] (col a runtime
+    # character-scalar expression too) -- a further single-element
+    # subscript chained directly onto a single-column selection, in one
+    # expression. df["col"] alone resolves to an array-SECTION
+    # expression (df%values(:, df%col_pos("col"))), and Fortran doesn't
+    # allow directly subscripting an array-section expression a second
+    # time (`d%values(:, ...)(1)` is a syntax error) -- reproduced
+    # (and worked around by splitting into two statements) repeatedly
+    # earlier in this session without ever being fixed.
+    #
+    # Two separate bugs, both in expr()'s Subscript dispatch:
+    # 1. _scalar_subscript_expr (the established "lower a chained
+    #    subscript into one valid Fortran expression instead of
+    #    emitting expr(i)" mechanism, already used for e.g. x[a:b][i])
+    #    had no case at all for a df[col] base -- added one that
+    #    combines both subscripts into a single direct 2D element
+    #    access, df%values(idx, df%col_pos(col)), instead of trying to
+    #    subscript the array-section result a second time. Scoped to a
+    #    non-negative/non-slice idx (the common case).
+    # 2. Before even reaching that, a separate, earlier "flatten chained
+    #    subscripts into multi-dim array access" optimization
+    #    (_flatten_subscript_chain, meant for ordinary nested numeric
+    #    indexing like matrix[i][j]) fired first and had no
+    #    pandas_df_vars exception -- it treated the DataFrame itself as
+    #    a plain 2D array, producing outright nonsense
+    #    (`df(col + 1, i + 1)`, calling a derived-type value as if it
+    #    were a function/array) that failed at build time with
+    #    "Dummy procedure 'df' ... must also be PURE". Fixed by
+    #    excluding any pandas_df_vars-tracked root base from that
+    #    optimization entirely.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_chain_subscript.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def get_val(df: pd.DataFrame, col: str, i: int) -> float:",
+            "    return df[col][i] + 1.0",
+            "",
+            "",
+            "def main():",
+            "    d = pd.DataFrame({'a': [1.0, 2.0, 3.0], 'b': [4.0, 5.0, 6.0]})",
+            "    print(get_val(d, 'a', 0), get_val(d, 'b', 2))",
+            "    print(d['a'][1] * 2.0)",
+            "",
+            "",
+            "main()",
+        ],
+    )

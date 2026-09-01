@@ -8695,6 +8695,26 @@ def detect_needed_helpers(tree):
                 needed.add("shift_1d")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "rank"
+                and len(node.args) == 0
+            ):
+                # method="min"/"max"/"average"/"first"/"dense" are each
+                # implemented as their own rank_*_real helper -- see
+                # _plain_series_expr_text and RANK_METHOD_HELPERS. Safe
+                # to add the specific one when the literal method= value
+                # is known here, or all five (harmless unused `use ...
+                # only:` entries) when it isn't (a dynamic method=, or
+                # the omitted-kwarg "average" default -- this walks the
+                # raw AST, before pandas_df_vars is populated, so
+                # _plain_series_expr_text's own fuller check can't run
+                # yet), same reasoning as shift_1d just above.
+                _rank_method_kw = next((kw.value for kw in node.keywords if kw.arg == "method"), None)
+                if is_const_str(_rank_method_kw) and _rank_method_kw.value in RANK_METHOD_HELPERS:
+                    needed.add(RANK_METHOD_HELPERS[_rank_method_kw.value])
+                else:
+                    needed.update(RANK_METHOD_HELPERS.values())
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "skew"
                 and len(node.args) == 0
             ):
@@ -10115,6 +10135,18 @@ def collect_sys_aliases(tree):
                     if nm in supported:
                         func_aliases[asn or nm] = nm
     return module_aliases, func_aliases
+
+
+RANK_METHOD_HELPERS = {
+    # pandas Series.rank(method=...) -> the python.f90 helper function
+    # implementing it. "average" is pandas' own default (used when
+    # method= is omitted entirely, not just when passed explicitly).
+    "average": "rank_average_real",
+    "min": "rank_min_real",
+    "max": "rank_max_real",
+    "first": "rank_first_real",
+    "dense": "rank_dense_real",
+}
 
 
 MATH_DIRECT_IMPORT_SUPPORTED = {
@@ -14774,6 +14806,7 @@ class translator(ast.NodeVisitor):
         local_return_ranks=None,
         tuple_return_out_kinds=None,
         tuple_return_out_ranks=None,
+        tuple_df_return_positions=None,
         dict_type_components=None,
         local_func_arg_ranks=None,
         local_func_arg_kinds=None,
@@ -14834,6 +14867,12 @@ class translator(ast.NodeVisitor):
         self.local_return_ranks = dict(local_return_ranks or {})
         self.tuple_return_out_kinds = dict(tuple_return_out_kinds or {})
         self.tuple_return_out_ranks = dict(tuple_return_out_ranks or {})
+        # fn_name -> {tuple_position: "DataFrame_str_index"} -- see
+        # _all_tuple_df_return_positions/_tuple_df_return_positions.
+        # Consulted alongside tuple_return_out_kinds wherever a tuple-
+        # unpack assignment target's kind is decided, since
+        # tuple_return_out_kinds itself has no DataFrame case.
+        self.tuple_df_return_positions = dict(tuple_df_return_positions or {})
         self.dict_return_types = dict(dict_return_types or {})
         self.dict_typed_vars = {}
         self.pandas_df_vars = {}
@@ -16268,6 +16307,35 @@ class translator(ast.NodeVisitor):
             # place instead of falling through to a generic (wrong)
             # default.
             return "real"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "rank"
+            and len(node.args) == 0
+            and self._plain_series_expr_text(node) is not None
+        ):
+            # X.rank(method="min") -- see rank_min_real /
+            # _series_base_or_literal_col_text; the same "is this
+            # actually a resolvable rank() call" check codegen uses is
+            # reused here rather than duplicating the method="min"
+            # keyword check. _plain_series_expr_text(node) (not
+            # _series_base_or_literal_col_text(node)) is correct here:
+            # node is the WHOLE rank() Call, and _plain_series_expr_text
+            # already has its own "rank" branch (added alongside this
+            # one) that resolves the inner base via
+            # _series_base_or_literal_col_text internally.
+            return "real"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "dropna"
+            and len(node.args) == 0
+            and not node.keywords
+            and self._plain_series_expr_text(node) is not None
+        ):
+            # X.dropna() -- see the matching pack()-based codegen in
+            # _plain_series_expr_text.
+            return "real"
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
                 return "logical"
@@ -16763,6 +16831,17 @@ class translator(ast.NodeVisitor):
                 # expression _pandas_df_match recognizes (a bare Name,
                 # df[["A","B"]] / df[names_var] / df.loc[:, [...]],
                 # df.iloc[rows, cols], df.head(n)/.tail(n)).
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_numpy"
+                and len(node.args) == 0
+                and self._plain_series_expr_text(node.func.value) is not None
+            ):
+                # X.to_numpy() where X is already a plain real array --
+                # e.g. a bare variable, or the result of .dropna()/
+                # .shift()/.rank() chained onto one -- a pure no-op
+                # passthrough (see the matching codegen case).
                 return "real"
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}:
                 return "char"
@@ -18271,7 +18350,17 @@ class translator(ast.NodeVisitor):
             # Vector subscript: x(idx_vec) has extent size(idx_vec).
             sr = self._rank_expr(node.slice)
             if sr > 0:
-                return f"size({self.expr(node.slice)})"
+                # Same best-effort degrade as the Slice/Tuple branches
+                # above -- e.g. df[["date", *ESTIMATORS]] has a List
+                # slice containing an ast.Starred element, which a
+                # not-yet-seeded prescan translator instance's generic
+                # array-constructor codegen can't evaluate (it isn't
+                # routed through _pandas_df_match/_resolve_str_list_
+                # literal, which do handle it, from here).
+                try:
+                    return f"size({self.expr(node.slice)})"
+                except NotImplementedError:
+                    return None
             return None
         if isinstance(node, ast.Attribute):
             if node.attr == "T":
@@ -19405,6 +19494,73 @@ class translator(ast.NodeVisitor):
             periods_node = node.args[0] if node.args else kwargs.get("periods")
             periods_txt = f", {self.expr(periods_node)}" if periods_node is not None else ""
             return f"shift_1d({inner_txt}{periods_txt})"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "rank"
+            and len(node.args) == 0
+        ):
+            # Series.rank(method=...) -- method="average" (pandas'
+            # default, used when method= is omitted entirely too),
+            # "min", "max", "first", and "dense" are all implemented
+            # (see RANK_METHOD_HELPERS); a dynamic (non-literal) method=
+            # is not.
+            kwargs = {kw.arg: kw.value for kw in node.keywords}
+            method_node = kwargs.get("method")
+            if method_node is None:
+                method = "average"
+            elif is_const_str(method_node):
+                method = method_node.value
+            else:
+                return None
+            helper = RANK_METHOD_HELPERS.get(method)
+            if helper is None:
+                return None
+            inner_txt = self._series_base_or_literal_col_text(node.func.value)
+            if inner_txt is None:
+                return None
+            return f"{helper}({inner_txt})"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "dropna"
+            and len(node.args) == 0
+            and not node.keywords
+        ):
+            # Series.dropna() -- drop NaN entries, shrinking the result.
+            # Fortran's pack() intrinsic does exactly this in one
+            # expression (no dedicated python.f90 helper needed, unlike
+            # rank_min_real/shift_1d): pack(x, mask) compacts x down to
+            # just the elements where mask is .true., and an allocatable
+            # target auto-sizes to the (data-dependent) result length.
+            inner_txt = self._series_base_or_literal_col_text(node.func.value)
+            if inner_txt is None:
+                return None
+            return f"pack({inner_txt}, .not. ieee_is_nan({inner_txt}))"
+        return None
+
+    def _series_base_or_literal_col_text(self, node):
+        # Like _plain_series_expr_text, but also accepts the literal-
+        # string single-column case (df["col"], as opposed to the
+        # runtime-dynamic df[col] that method already covers) --
+        # deliberately excluded from _plain_series_expr_text itself (see
+        # its own docstring: that case has "more specific handling
+        # elsewhere", namely the dedicated is_const_str branches in
+        # _expr_kind/expr()'s own Subscript dispatch). .rank() (unlike
+        # .shift(), _plain_series_expr_text's only other caller) is
+        # exercised on exactly this common literal-column shape in real
+        # code, so it needs both.
+        _txt = self._plain_series_expr_text(node)
+        if _txt is not None:
+            return _txt
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.pandas_df_vars
+            and is_const_str(node.slice)
+            and node.slice.value != self.pandas_df_index_label.get(node.value.id)
+        ):
+            return self.expr(node)
         return None
 
     def _plain_array_iloc_slice_spec(self, v):
@@ -20165,9 +20321,27 @@ class translator(ast.NodeVisitor):
         if (
             isinstance(node, (ast.List, ast.Tuple))
             and node.elts
-            and all(is_const_str(e) for e in node.elts)
+            and all(is_const_str(e) or isinstance(e, ast.Starred) for e in node.elts)
         ):
-            return [e.value for e in node.elts]
+            # A Starred element (e.g. ["date", *ESTIMATORS], splicing a
+            # module-level list-of-strings variable into a column-
+            # selection literal) is resolved recursively through this
+            # same function -- so it can itself be a literal list,
+            # list("abc"), or another already-resolved list variable --
+            # and its values spliced in. Any element that resolves to
+            # neither a literal string nor a resolvable Starred fails
+            # the whole match (all-or-nothing, like the plain-literal
+            # case above).
+            out = []
+            for e in node.elts:
+                if isinstance(e, ast.Starred):
+                    spliced = self._resolve_str_list_literal(e.value)
+                    if spliced is None:
+                        return None
+                    out.extend(spliced)
+                else:
+                    out.append(e.value)
+            return out
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -20849,6 +21023,16 @@ class translator(ast.NodeVisitor):
             # (see the matching _expr_kind case).
             return 2
         if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to_numpy"
+            and len(node.args) == 0
+            and self._plain_series_expr_text(node.func.value) is not None
+        ):
+            # X.to_numpy() where X is already a plain real array (see
+            # the matching _expr_kind case) -- already rank 1.
+            return 1
+        if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
             and node.value.id in self.pandas_df_vars
@@ -20869,6 +21053,25 @@ class translator(ast.NodeVisitor):
         ):
             # df[col] -- a single column selected by a runtime character-
             # scalar expression -- see the matching _expr_kind case.
+            return 1
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "rank"
+            and len(node.args) == 0
+            and self._plain_series_expr_text(node) is not None
+        ):
+            # X.rank(method="min") -- see the matching _expr_kind case.
+            return 1
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "dropna"
+            and len(node.args) == 0
+            and not node.keywords
+            and self._plain_series_expr_text(node) is not None
+        ):
+            # X.dropna() -- see the matching _expr_kind case.
             return 1
         if isinstance(node, ast.Name):
             if node.id in self.pandas_date_array_aliases:
@@ -22395,6 +22598,42 @@ class translator(ast.NodeVisitor):
                     return n
                 return ast.copy_location(ast.Subscript(value=n, slice=idx_node, ctx=ast.Load()), n)
 
+            if (
+                isinstance(base_node, ast.Subscript)
+                and isinstance(base_node.value, ast.Name)
+                and base_node.value.id in self.pandas_df_vars
+                and (
+                    is_const_str(base_node.slice)
+                    or (
+                        isinstance(base_node.slice, ast.Name)
+                        and self._expr_kind(base_node.slice) == "char"
+                        and self._rank_expr(base_node.slice) == 0
+                    )
+                )
+                and not isinstance(idx_node, ast.Slice)
+                and not (isinstance(idx_node, ast.UnaryOp) and isinstance(idx_node.op, ast.USub))
+            ):
+                # df[col][idx] -- chained single-element access on a
+                # single-column selection. df[col] alone resolves to an
+                # array-SECTION expression (df%values(:, df%col_pos(
+                # col))), and Fortran doesn't allow directly subscripting
+                # an array-section expression a second time
+                # (`d%values(:, ...)(1)` is a syntax error) -- combine
+                # both subscripts into one direct 2D element access
+                # instead. Scoped to a non-negative/non-slice idx_node
+                # (the common case); anything else falls through to the
+                # existing handling below.
+                _df_id = base_node.value.id
+                if not (
+                    is_const_str(base_node.slice)
+                    and base_node.slice.value == self.pandas_df_index_label.get(_df_id)
+                ):
+                    _df_expr = self.expr(base_node.value)
+                    _col_expr = fstr(base_node.slice.value) if is_const_str(base_node.slice) else self.expr(base_node.slice)
+                    _idx_expr = self.expr(idx_node)
+                    if self._expr_kind(idx_node) == "int":
+                        _idx_expr = f"({_idx_expr} + 1)"
+                    return f"{_df_expr}%values({_idx_expr}, {_df_expr}%col_pos({_col_expr}))"
             if isinstance(base_node, ast.Subscript) and isinstance(base_node.slice, ast.Slice):
                 slc = base_node.slice
                 step_node = copy.deepcopy(slc.step) if slc.step is not None else ast.Constant(value=1)
@@ -23737,7 +23976,7 @@ class translator(ast.NodeVisitor):
                     lo0, hi0 = trip0.split(":", 1)
                     return f"{base0}({hi0}:{lo0}:-1)"
             root_base, root_slices = self._flatten_subscript_chain(node)
-            if isinstance(root_base, ast.Name):
+            if isinstance(root_base, ast.Name) and root_base.id not in self.pandas_df_vars:
                 minfo = self._dict_array_map_info(root_base.id)
                 if minfo is not None and root_slices:
                     key_slice = root_slices[0]
@@ -24935,6 +25174,28 @@ class translator(ast.NodeVisitor):
                 _sh_txt = self._plain_series_expr_text(node)
                 if _sh_txt is not None:
                     return _sh_txt
+            # X.rank(method="min") -- Series.rank on a plain rank-1 array
+            # (a runtime-selected DataFrame column, or already a plain
+            # real array) -- see rank_min_real / _plain_series_expr_text.
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "rank"
+                and len(node.args) == 0
+            ):
+                _rk_txt = self._plain_series_expr_text(node)
+                if _rk_txt is not None:
+                    return _rk_txt
+            # X.dropna() -- Series.dropna on a plain rank-1 array -- see
+            # the matching pack()-based codegen in _plain_series_expr_text.
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "dropna"
+                and len(node.args) == 0
+                and not node.keywords
+            ):
+                _dn_txt = self._plain_series_expr_text(node)
+                if _dn_txt is not None:
+                    return _dn_txt
             # Method-call reductions: a.sum(), a.mean(), a.var(ddof=...)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -25040,6 +25301,19 @@ class translator(ast.NodeVisitor):
                     _df_expr2, _ = self._pandas_df_ref(node.func.value, node)
                     if _df_expr2 is not None:
                         return f"{_df_expr2}%values"
+                if (
+                    attr == "to_numpy"
+                    and len(node.args) == 0
+                    and self._plain_series_expr_text(node.func.value) is not None
+                ):
+                    # X.to_numpy() where X is already a plain real array
+                    # (a bare variable, or .dropna()/.shift()/.rank()
+                    # chained onto one) -- base_expr (computed above via
+                    # the ordinary self.expr(node.func.value) path,
+                    # which already resolves all of those shapes) is a
+                    # pure passthrough here, same reasoning as the
+                    # df["col"].to_numpy() case above.
+                    return base_expr
                 if attr == "index" and len(node.args) == 1:
                     arg0 = self.expr(node.args[0])
                     if self._rank_expr(node.func.value) == 0 and self._expr_kind(node.func.value) == "char":
@@ -31017,6 +31291,19 @@ class translator(ast.NodeVisitor):
                         self.alloc_logs.discard(_df_tgt)
                         self.alloc_chars.discard(_df_tgt)
                         self.alloc_complexes.discard(_df_tgt)
+                        # Without this, execution falls through to the
+                        # generic scalar-kind-inference fallback further
+                        # below for this same assignment, which doesn't
+                        # know to skip an already-recognized DataFrame
+                        # target -- it marks _df_tgt int/real/etc too
+                        # (the callee's own return kind is invisible to
+                        # that generic, pandas-unaware inference), and
+                        # the resulting declaration conflicts with the
+                        # correct one: "Symbol '...' already has basic
+                        # type of INTEGER". Every other DataFrame-
+                        # recognizing branch in this same function
+                        # already continues for exactly this reason.
+                        continue
                     # `X = Y` where Y is itself a tracked DataFrame -- e.g. the
                     # inlined form of a single-call-site helper function that
                     # returned a DataFrame collapses to `tmp = pd.read_csv(...)`
@@ -31115,10 +31402,30 @@ class translator(ast.NodeVisitor):
                             ar = int(self._rank_expr(a_arg))
                             if fr == 0 and ar > 0:
                                 vec_rank = max(vec_rank, ar)
+                    _df_positions = self.tuple_df_return_positions.get(node.value.func.id, {})
                     for j, e in enumerate(node.targets[0].elts):
                         if not isinstance(e, ast.Name):
                             continue
                         nm = self._aliased_name(e.id)
+                        if j in _df_positions:
+                            # This tuple-return position is
+                            # pd.DataFrame-annotated (see
+                            # tuple_df_return_positions) -- out_kinds has
+                            # no DataFrame case (it would otherwise land
+                            # in the "unknown tuple-output type: defer"
+                            # branch below and never get typed at all).
+                            self.pandas_df_vars[nm] = _df_positions[j]
+                            self.ints.discard(nm)
+                            self.reals.discard(nm)
+                            self.logs.discard(nm)
+                            self.chars.discard(nm)
+                            self.complexes.discard(nm)
+                            self.alloc_ints.discard(nm)
+                            self.alloc_reals.discard(nm)
+                            self.alloc_logs.discard(nm)
+                            self.alloc_chars.discard(nm)
+                            self.alloc_complexes.discard(nm)
+                            continue
                         k = out_kinds[j] if j < len(out_kinds) else None
                         rr = max(0, int(out_ranks[j])) if j < len(out_ranks) else 0
                         if vec_rank > rr:
@@ -35898,8 +36205,18 @@ class translator(ast.NodeVisitor):
                 )
             )
             out_name_pos = 0
+            _codegen_df_positions = self.tuple_df_return_positions.get(v.func.id, {})
             for e in t.elts:
                 if not isinstance(e, ast.Name):
+                    continue
+                if out_name_pos in _codegen_df_positions:
+                    # This tuple-return position is pd.DataFrame-
+                    # annotated -- already correctly typed via
+                    # pandas_df_vars by prescan; none of this numeric
+                    # kind/rank rebind machinery (which has no DataFrame
+                    # case) applies, and opening a rebind block here
+                    # would declare a conflicting, wrong-typed shadow.
+                    out_name_pos += 1
                     continue
                 rk = self._consume_type_rebind(e.id, getattr(node, "lineno", None))
                 raw_want_kind = rk[0] if rk is not None else None
@@ -40028,10 +40345,28 @@ class translator(ast.NodeVisitor):
                 name = self._aliased_name(t.id)
                 init_cols = _rangedf_spec["columns"]
                 init_vars = [f"{t.id}_{c}" for c in init_cols]
+                resolved_vars = []
                 for _var, _vnode in zip(init_vars, _rangedf_spec["value_nodes"]):
                     self.visit_Assign(
                         ast.Assign(targets=[ast.Name(id=_var, ctx=ast.Store())], value=_vnode)
                     )
+                    # visit_Assign may have treated this as pure Python
+                    # list-aliasing (its own "Python list aliasing
+                    # semantics: x = v binds to the same list object"
+                    # branch) rather than emitting an actual copy -- e.g.
+                    # when _vnode is itself a Python-list-tracked
+                    # variable, as in pd.DataFrame({"a": vals}) where
+                    # vals was built via .append() in a loop. That branch
+                    # records the alias and returns without emitting
+                    # anything, on the assumption every later reference
+                    # to _var goes through the same alias resolution --
+                    # but the %values/%index construction below was
+                    # referencing the raw synthetic name (z_a) directly,
+                    # which was then never actually assigned. Resolve
+                    # through the same chain the rest of this file uses
+                    # so it references the name that's actually assigned.
+                    resolved_vars.append(self._aliased_name(self._resolve_list_alias(_var)))
+                init_vars = resolved_vars
                 col_len = max(10, max(len(c) for c in init_cols))
                 columns_txt = ", ".join(fstr(c) for c in init_cols)
                 n_expr = f"size({init_vars[0]})"
@@ -46155,6 +46490,8 @@ def _emit_local_function(
     local_callback_actual_specs=None,
     local_df_return_info=None,
     toplevel_shared_specs=None,
+    toplevel_str_list_values=None,
+    tuple_df_return_positions=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -46511,6 +46848,30 @@ def _emit_local_function(
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
+    if local_df_return_info:
+        # local_df_return_info (see _scan_local_df_return_info) is
+        # precomputed once for the whole module and threaded in here as
+        # a plain parameter -- but the actual consumer, prescan's own
+        # Assign-handling (`target = some_local_func(...)`, recognizing
+        # the target as a tracked DataFrame when the callee is a known
+        # DataFrame-returning function), reads it off the translator
+        # INSTANCE attribute self.local_df_return_info, not this
+        # parameter. That attribute is otherwise only ever populated by
+        # prescan's own self-discovery when a DataFrame-returning nested
+        # function happens to be walked as part of the SAME prescan
+        # pass (true only in flat-whole-tree prescan modes) -- for this
+        # function's own, fresh, per-function translator instance it
+        # starts empty, so a call to a DataFrame-returning *sibling*
+        # local function was invisible here. Seed it from the
+        # precomputed, cross-function-aware parameter instead.
+        tr.local_df_return_info.update(local_df_return_info)
+    if tuple_df_return_positions:
+        # Same gap, tuple-return version: a call to a sibling local
+        # function returning a tuple with a DataFrame at some position
+        # (`x, y = other_func(...)`) needs tuple_df_return_positions
+        # seeded on this function's own tr the same way, or prescan's
+        # tuple-unpack handling can't recognize x/y as a DataFrame.
+        tr.tuple_df_return_positions.update(tuple_df_return_positions)
     if df_arg_types:
         # A pd.DataFrame-annotated parameter (see _df_arg_types_for_fn)
         # gets a real derived-type declaration below instead of falling
@@ -46619,6 +46980,31 @@ def _emit_local_function(
                     tr._mark_complex(_nm)
                 elif _gk == "char":
                     tr._mark_char(_nm)
+    if toplevel_str_list_values:
+        # ESTIMATORS = ["cc_corr", ...] at module level, referenced here
+        # for column selection (df[ESTIMATORS] or df[["date",
+        # *ESTIMATORS]]) -- see _toplevel_str_list_values. A fresh
+        # per-function translator instance's own pandas_str_list_values
+        # starts empty, so without this _resolve_str_list_literal can't
+        # resolve the name at all (the toplevel_shared_specs seeding
+        # just above only teaches _rank_expr/_expr_kind that it's a
+        # char array, not what its values are).
+        _locally_bound_sl = set(args)
+        for _n in ast.walk(fn):
+            if isinstance(_n, (ast.Assign, ast.AnnAssign, ast.For, ast.withitem)):
+                _targets = (
+                    _n.targets if isinstance(_n, ast.Assign)
+                    else [_n.target] if isinstance(_n, (ast.AnnAssign, ast.For))
+                    else [_n.optional_vars] if _n.optional_vars is not None else []
+                )
+                for _tgt in _targets:
+                    for _tn in ast.walk(_tgt):
+                        if isinstance(_tn, ast.Name) and isinstance(_tn.ctx, ast.Store):
+                            _locally_bound_sl.add(_tn.id)
+        for _nm, _vals in toplevel_str_list_values.items():
+            if _nm in _locally_bound_sl:
+                continue
+            tr.pandas_str_list_values[_nm] = list(_vals)
     for _st_nested_fn in fn.body:
         if isinstance(_st_nested_fn, ast.FunctionDef):
             _nested_lam = _simple_function_as_lambda(_st_nested_fn)
@@ -47340,10 +47726,17 @@ def _emit_local_function(
         _callee = _st.value.func.id
         _ok = list((tuple_return_out_kinds or {}).get(_callee, []))
         _or = list((tuple_return_out_ranks or {}).get(_callee, []))
+        _df_pos3 = tr.tuple_df_return_positions.get(_callee, {})
         for _j, _e in enumerate(_st.targets[0].elts):
             if not isinstance(_e, ast.Name):
                 continue
             _nm = _e.id
+            if _j in _df_pos3:
+                # This tuple-return position is pd.DataFrame-annotated
+                # -- out_kinds has no DataFrame case and would
+                # otherwise default this to "real".
+                tr.pandas_df_vars[_nm] = _df_pos3[_j]
+                continue
             _kind = _ok[_j] if _j < len(_ok) else None
             _rank = max(0, int(_or[_j])) if _j < len(_or) else 0
             if _kind == "alloc_real":
@@ -47464,6 +47857,8 @@ def _emit_local_function(
                 or _nm in tr.alloc_ints
                 or _nm in tr.alloc_logs
                 or _nm in tr.alloc_chars
+                or _nm in tr.pandas_df_vars
+                or _nm in tr.dict_typed_vars
             ):
                 continue
             assign_specs = []
@@ -50581,7 +50976,31 @@ def _emit_local_function(
                     tr._mark_complex(_nm)
                 elif _kind_hint == "char":
                     tr._mark_char(_nm)
+        _tuple_df_positions = _tuple_df_return_positions(fn)
         for idx_out, nm in enumerate(out_names):
+            if idx_out in _tuple_df_positions:
+                # This tuple-return position is pd.DataFrame-annotated
+                # (see _tuple_df_return_positions) -- give it a real
+                # derived-type intent(out) dummy declaration instead of
+                # falling into the numeric kind_hint dispatch below
+                # (which has no DataFrame case and would default it to
+                # real). Mirrors _sync_tuple_out_state's own bucket-
+                # clearing, but marks pandas_df_vars instead of a
+                # numeric kind.
+                _df_kind_out = _tuple_df_positions[idx_out]
+                tr.alloc_reals.discard(nm)
+                tr.alloc_ints.discard(nm)
+                tr.alloc_logs.discard(nm)
+                tr.alloc_complexes.discard(nm)
+                tr.alloc_chars.discard(nm)
+                tr.reals.discard(nm)
+                tr.ints.discard(nm)
+                tr.logs.discard(nm)
+                tr.complexes.discard(nm)
+                tr.chars.discard(nm)
+                tr.pandas_df_vars[nm] = _df_kind_out
+                o.w(f"type({_df_kind_out}), intent(out) :: {nm}")
+                continue
             kind_hint = None
             rank_hint = 0
             forced_tuple_rank = None
@@ -51481,7 +51900,9 @@ def _emit_local_function(
     # never declared at all: this is the only place in _emit_local_function
     # that emits declarations for pandas_df_vars-tracked names.
     local_pandas_df_vars = sorted(
-        (nm, tn) for nm, tn in tr.pandas_df_vars.items() if nm != ret_name and nm not in arg_set
+        (nm, tn)
+        for nm, tn in tr.pandas_df_vars.items()
+        if nm != ret_name and nm not in arg_set and nm not in set(out_names)
     )
     for nm, tn in local_pandas_df_vars:
         o.w(f"type({tn}) :: {nm}")
@@ -51719,6 +52140,85 @@ def _emit_local_function(
     o.w("")
 
 
+def _tuple_df_return_positions(fn):
+    # Which positions of a `-> tuple[..., pd.DataFrame, ...]` return
+    # annotation are themselves pd.DataFrame -- e.g.
+    #   def f(...) -> tuple[pd.DataFrame, dict[str, float]]:
+    # returns {0: "DataFrame_str_index"}. Used by _emit_local_function to
+    # declare that tuple-output dummy argument as a real derived type
+    # instead of falling through to the generic numeric kind_hint
+    # dispatch (which has no DataFrame case and defaults to real) --
+    # the return-side counterpart of _df_arg_types_for_fn, which does
+    # the same for a pd.DataFrame-annotated *parameter*. Always defaults
+    # to "DataFrame_str_index" (the one runtime-columns-aware kind),
+    # same reasoning as that function: the columns available at any
+    # given call site aren't knowable in general from the annotation
+    # alone.
+    ann = getattr(fn, "returns", None)
+    if not (isinstance(ann, ast.Subscript) and hasattr(ast, "unparse")):
+        return {}
+    base_txt = ast.unparse(ann.value).split(".")[-1].lower()
+    if base_txt != "tuple":
+        return {}
+    sl = ann.slice
+    elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+    out = {}
+    for i, e in enumerate(elts):
+        if isinstance(e, (ast.Attribute, ast.Name)) and ast.unparse(e).split(".")[-1] == "DataFrame":
+            out[i] = "DataFrame_str_index"
+    return out
+
+
+def _all_tuple_df_return_positions(local_funcs):
+    # {fn_name: {tuple_position: "DataFrame_str_index"}} for every local
+    # function with a tuple[..., pd.DataFrame, ...] return annotation --
+    # see _tuple_df_return_positions (computed per-function there; this
+    # just gathers it across the whole local-function set once, the same
+    # way _scan_local_df_return_info does for single-value returns).
+    out = {}
+    for fn in (local_funcs or []):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        pos = _tuple_df_return_positions(fn)
+        if pos:
+            out[fn.name] = pos
+    return out
+
+
+def _toplevel_str_list_values(tree_body):
+    # Scan the top-level module body (NOT inside any function) for
+    # NAME = [str_literal, ...] / NAME = (str_literal, ...) assignments
+    # -- a module-level constant like ESTIMATORS = ["cc_corr", ...] --
+    # so a local function referencing NAME for column selection
+    # (df[NAME], or splicing it via *NAME inside a list literal, e.g.
+    # df[["date", *ESTIMATORS]]) can be seeded with its actual values
+    # in self.pandas_str_list_values, the same way _emit_local_function
+    # already seeds pandas_df_vars from df_arg_types. Without this,
+    # _resolve_str_list_literal's bare-Name branch can't resolve NAME at
+    # all inside a fresh per-function translator instance (unlike
+    # toplevel_shared_specs, which teaches _rank_expr/_expr_kind that
+    # NAME is a char array, but not what its literal values are), so
+    # _pandas_df_match's column-selection matcher never fires -- and
+    # df[NAME] silently falls through to a generic, nonsensical
+    # "subscript a DataFrame by an integer-array index" fallback
+    # instead (adding 1 to a string array and indexing the DataFrame
+    # like a plain array). Only the LAST such assignment per name is
+    # kept, matching normal "last write wins" semantics for a
+    # genuinely-reassigned module global (rare, but cheap to get right).
+    out = {}
+    for st in tree_body or []:
+        if (
+            isinstance(st, ast.Assign)
+            and len(st.targets) == 1
+            and isinstance(st.targets[0], ast.Name)
+            and isinstance(st.value, (ast.List, ast.Tuple))
+            and st.value.elts
+            and all(is_const_str(e) for e in st.value.elts)
+        ):
+            out[st.targets[0].id] = [e.value for e in st.value.elts]
+    return out
+
+
 def _scan_local_df_return_info(local_funcs, extra_stmts=None):
     # Determine which local (helper) functions return a pandas DataFrame
     # produced via pd.read_csv(...), e.g.
@@ -51814,6 +52314,26 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
                 rnm = ret.value.id
                 if rnm in df_vars:
                     result[fn.name] = (df_vars[rnm], list(df_cols.get(rnm, [])), df_idx.get(rnm))
+    for fn in (local_funcs or []):
+        # Fallback for a function annotated `-> pd.DataFrame` whose
+        # return value's provenance isn't (or can't be) traced above --
+        # e.g. it's built via pd.DataFrame({...}) rather than
+        # pd.read_csv(...), or assembled across several statements/a
+        # loop rather than one direct `X = ...; return X`. The
+        # annotation alone is enough to know the CALLER's assigned name
+        # is a DataFrame; default to the same runtime-columns-aware kind
+        # _df_arg_types_for_fn uses for the analogous parameter case,
+        # with columns left unknown (every DataFrame-consuming codegen
+        # path this session's work has touched already tolerates that).
+        # Only used when nothing more precise was already found above.
+        if (
+            isinstance(fn, ast.FunctionDef)
+            and fn.name not in result
+            and fn.returns is not None
+            and hasattr(ast, "unparse")
+            and ast.unparse(fn.returns).split(".")[-1] == "DataFrame"
+        ):
+            result[fn.name] = ("DataFrame_str_index", [], None)
     return result
 
 
@@ -52243,6 +52763,19 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             scalar_or_array[fn.name] = "alloc_real"
             scalar_or_array_ranks[fn.name] = 2
 
+    # A pd.DataFrame-returning local function (see _scan_local_df_return_info)
+    # needs to be visible to tr.prescan below so a caller assignment like
+    # `result = make_df(...)` (elsewhere in the same local-function set) is
+    # recognized as a tracked DataFrame -- otherwise prescan's generic
+    # scalar-kind fallback marks `result` plain int/real, later conflicting
+    # with the DataFrame declaration _emit_local_function's own (separately
+    # seeded) translator instance correctly produces. Computed once here
+    # (extra_stmts omitted -- only the return-annotation fallback matters
+    # for this early pass, not module-level pd.read_csv literal-path
+    # tracing, which needs the full top-level tree this function doesn't
+    # receive).
+    _local_ret_df_info = _scan_local_df_return_info(local_funcs)
+    _local_ret_tuple_df_info = _all_tuple_df_return_positions(local_funcs)
     # Iterate to a fixed point so return-shape inference can use callee
     # return metadata discovered earlier in the same local-function set.
     max_iter = max(1, len(local_funcs or [])) + 2
@@ -52263,6 +52796,10 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 tuple_return_out_kinds=tuple_out,
                 tuple_return_out_ranks=tuple_out_ranks,
             )
+            if _local_ret_df_info:
+                tr.local_df_return_info.update(_local_ret_df_info)
+            if _local_ret_tuple_df_info:
+                tr.tuple_df_return_positions.update(_local_ret_tuple_df_info)
             # Seed argument rank/kind from call-site observations when available.
             rr_h = arg_rank_hints.get(fn.name, [])
             rk_h = arg_kind_hints.get(fn.name, [])
@@ -53703,6 +54240,8 @@ def generate_flat(
             # correct body-based rank guess.
             local_return_ranks=_prov_scalar_ranks,
         )
+        tr_seed.local_df_return_info.update(_scan_local_df_return_info(local_funcs))
+        tr_seed.tuple_df_return_positions.update(_all_tuple_df_return_positions(local_funcs))
         _top_level_scan_nodes = [st for st in tree.body if not isinstance(st, ast.FunctionDef)]
         tr_seed.prescan(_top_level_scan_nodes)
         def _promote_kind_hint(cur, newk):
@@ -54035,6 +54574,8 @@ def generate_flat(
         for st in _top_level_scan_nodes:
             _record_call_hints(st, tr_seed, None)
             _record_piecewise_call_hints(st, tr_seed)
+        _local_ret_df_info_scan = _scan_local_df_return_info(local_funcs)
+        _local_ret_tuple_df_info_scan = _all_tuple_df_return_positions(local_funcs)
         for _fn_scan in (local_funcs or []):
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
@@ -54053,6 +54594,10 @@ def generate_flat(
                 # inside ANOTHER local function's own body.
                 local_return_ranks=_prov_scalar_ranks,
             )
+            if _local_ret_df_info_scan:
+                tr_local_scan.local_df_return_info.update(_local_ret_df_info_scan)
+            if _local_ret_tuple_df_info_scan:
+                tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan)
             tr_local_scan.prescan(_fn_scan.body)
             _record_call_hints(_fn_scan, tr_local_scan, _fn_scan)
             _record_piecewise_call_hints(_fn_scan, tr_local_scan)
@@ -55280,10 +55825,17 @@ def generate_flat(
                     continue
                 _ok = list(tuple_return_out_kinds.get(_callee_name, []))
                 _or = list(tuple_return_out_ranks.get(_callee_name, []))
+                _df_pos2 = tr_seed.tuple_df_return_positions.get(_callee_name, {})
                 for _j, _e in enumerate(_st.targets[0].elts):
                     if not isinstance(_e, ast.Name):
                         continue
                     _nm = _e.id
+                    if _j in _df_pos2:
+                        # This tuple-return position is pd.DataFrame-
+                        # annotated -- out_kinds has no DataFrame case
+                        # and would otherwise default this to "real".
+                        tr_seed.pandas_df_vars[_nm] = _df_pos2[_j]
+                        continue
                     _kind = _ok[_j] if _j < len(_ok) else None
                     _rank = max(0, int(_or[_j])) if _j < len(_or) else 0
                     if _kind == "alloc_real":
@@ -56064,6 +56616,8 @@ def generate_flat(
                         triad_lists[_i].add((_ak, _ar, bool(tr_ctx._is_python_list_expr(_kw.value))))
         for _st in _top_level_scan_nodes:
             _record(_st, tr_seed, None)
+        _local_ret_df_info_scan2 = _scan_local_df_return_info(local_funcs)
+        _local_ret_tuple_df_info_scan2 = _all_tuple_df_return_positions(local_funcs)
         for _fn_scan in (local_funcs or []):
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
@@ -56081,6 +56635,10 @@ def generate_flat(
                 # construction, above.
                 local_return_ranks=_prov_scalar_ranks,
             )
+            if _local_ret_df_info_scan2:
+                _tr_local_scan.local_df_return_info.update(_local_ret_df_info_scan2)
+            if _local_ret_tuple_df_info_scan2:
+                _tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan2)
             _tr_local_scan.prescan(_fn_scan.body)
             _record(_fn_scan, _tr_local_scan, _fn_scan)
         return pair_lists, triad_lists, joint_calls
@@ -57314,6 +57872,8 @@ def generate_flat(
         om.w("contains")
         om.w("")
         _proc_mod_local_df_return_info = _scan_local_df_return_info(local_funcs, tree.body)
+        _proc_mod_toplevel_str_list_values = _toplevel_str_list_values(tree.body)
+        _proc_mod_tuple_df_return_positions = _all_tuple_df_return_positions(local_funcs)
         for fn in local_funcs:
             arg_dict_types = _arg_dict_types_for_fn(fn)
             arg_df_types = _df_arg_types_for_fn(fn)
@@ -57466,6 +58026,8 @@ def generate_flat(
                         local_callback_actual_specs=local_callback_actual_specs,
                         local_df_return_info=_proc_mod_local_df_return_info,
                         toplevel_shared_specs=module_global_decls,
+                        toplevel_str_list_values=_proc_mod_toplevel_str_list_values,
+                        tuple_df_return_positions=_proc_mod_tuple_df_return_positions,
                     )
             else:
                 _emit_local_function(
@@ -57509,6 +58071,8 @@ def generate_flat(
                     local_callback_actual_specs=local_callback_actual_specs,
                     local_df_return_info=_proc_mod_local_df_return_info,
                     toplevel_shared_specs=module_global_decls,
+                    toplevel_str_list_values=_proc_mod_toplevel_str_list_values,
+                    tuple_df_return_positions=_proc_mod_tuple_df_return_positions,
                 )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
@@ -57710,6 +58274,7 @@ def generate_flat(
         local_proc_name_aliases=fn_alias_map if use_proc_module else None,
     )
     tr.local_df_return_info.update(_scan_local_df_return_info(local_funcs, tree.body))
+    tr.tuple_df_return_positions.update(_all_tuple_df_return_positions(local_funcs))
     tr.prescan(tree.body)
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":
@@ -57921,6 +58486,7 @@ def generate_flat(
             tuple_return_out_kinds=tuple_return_out_kinds,
             tuple_return_out_ranks=tuple_return_out_ranks,
         )
+        _flat_toplevel_str_list_values = _toplevel_str_list_values(tree.body)
         for fn in local_funcs:
             arg_dict_types = _arg_dict_types_for_fn(fn)
             arg_df_types = _df_arg_types_for_fn(fn)
@@ -57962,6 +58528,8 @@ def generate_flat(
                 callback_scalar_actual_names=callback_scalar_actual_names,
                 local_callback_actual_specs=local_callback_actual_specs,
                 local_df_return_info=tr.local_df_return_info,
+                toplevel_str_list_values=_flat_toplevel_str_list_values,
+                tuple_df_return_positions=tr.tuple_df_return_positions,
             )
 
     o.pop()
