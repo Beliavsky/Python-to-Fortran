@@ -1742,6 +1742,122 @@ def rewrite_integer_quotient_seed_divisions(tree):
     return new_tree
 
 
+def rewrite_pandas_read_csv_set_index(tree):
+    """Collapse ``X = pd.read_csv(path, parse_dates=[col]); X = X.set_index(col)``
+    into the equivalent single-step ``pd.read_csv(path, index_col=col,
+    parse_dates=[col])``, which the transpiler already knows how to
+    construct directly as a date-indexed DataFrame -- .set_index(...)
+    itself is not otherwise supported (Fortran can't change a
+    variable's declared derived type at runtime, and a str-indexed vs.
+    date-indexed DataFrame are different Fortran types here), but this
+    specific two-statement idiom is common in code that reads a CSV
+    without index_col= up front and only later commits to using one
+    column as the row index.
+
+    `col` may be a literal string, or a local variable assigned exactly
+    once to a literal string before use -- the same "resolve a Name
+    back through a single literal assignment" technique
+    _scan_local_df_return_info already uses for a pd.read_csv path
+    argument.
+
+    Scoped deliberately narrowly: only fires when set_index's column is
+    one of read_csv's own parse_dates=[...] entries (so the result is
+    genuinely a date index, matching what the single-step form already
+    supports), read_csv doesn't already have its own index_col=, and
+    the set_index(...) call is the statement immediately following the
+    read_csv assignment (so there's no intervening reassignment of the
+    same name to worry about).
+    """
+
+    def _process_body(body):
+        literal_assigns = {}
+        for stmt in body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                literal_assigns.setdefault(stmt.targets[0].id, []).append(stmt.value)
+
+        def _resolve_lit(enode):
+            if isinstance(enode, ast.Constant) and isinstance(enode.value, str):
+                return enode
+            if isinstance(enode, ast.Name):
+                assigns = literal_assigns.get(enode.id)
+                if assigns and len(assigns) == 1:
+                    return assigns[0]
+            return None
+
+        def _same_column(a, b):
+            lit_a, lit_b = _resolve_lit(a), _resolve_lit(b)
+            if lit_a is not None and lit_b is not None:
+                return lit_a.value == lit_b.value
+            return isinstance(a, ast.Name) and isinstance(b, ast.Name) and a.id == b.id
+
+        new_body = []
+        i = 0
+        n = len(body)
+        while i < n:
+            stmt = body[i]
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and isinstance(stmt.value.func.value, ast.Name)
+                and stmt.value.func.value.id in {"pd", "pandas"}
+                and stmt.value.func.attr == "read_csv"
+                and not any(kw.arg == "index_col" for kw in stmt.value.keywords)
+            ):
+                parse_dates_kw = next((kw for kw in stmt.value.keywords if kw.arg == "parse_dates"), None)
+                tgt = stmt.targets[0].id
+                nxt = body[i + 1] if i + 1 < n else None
+                if (
+                    parse_dates_kw is not None
+                    and isinstance(parse_dates_kw.value, ast.List)
+                    and len(parse_dates_kw.value.elts) >= 1
+                    and isinstance(nxt, ast.Assign)
+                    and len(nxt.targets) == 1
+                    and isinstance(nxt.targets[0], ast.Name)
+                    and nxt.targets[0].id == tgt
+                    and isinstance(nxt.value, ast.Call)
+                    and isinstance(nxt.value.func, ast.Attribute)
+                    and nxt.value.func.attr == "set_index"
+                    and isinstance(nxt.value.func.value, ast.Name)
+                    and nxt.value.func.value.id == tgt
+                    and len(nxt.value.args) == 1
+                    and not nxt.value.keywords
+                    and any(_same_column(nxt.value.args[0], dc) for dc in parse_dates_kw.value.elts)
+                ):
+                    stmt.value.keywords.append(
+                        ast.keyword(arg="index_col", value=copy.deepcopy(nxt.value.args[0]))
+                    )
+                    new_body.append(stmt)
+                    i += 2
+                    continue
+            new_body.append(stmt)
+            i += 1
+        return new_body
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Module(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            return node
+
+        def visit_FunctionDef(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
 def _run_strict_check(src_text, path_label):
     diags = []
     diags.extend(_strict_mixed_numeric_literal_diagnostics(src_text))
@@ -10326,6 +10442,18 @@ def validate_no_duplicate_top_level_defs(tree):
             seen.add(node.name)
 
 
+# Modules whose own top-level import statement, inside a sibling module
+# being inlined by inline_local_from_imports below, needs to be carried
+# over into the merged tree -- because a downstream alias-collector
+# (collect_math_aliases here; collect_time_aliases/collect_sys_aliases/
+# collect_scipy_special_aliases/collect_statistics_aliases have the same
+# "only ever ast.walk()s the final tree" shape and would have the same
+# gap for their own modules, but only math/cmath has actually been hit
+# and verified in practice so far) needs to see it to recognize calls
+# like `math.sqrt(...)` inside an inlined function body.
+_CARRIED_MODULE_IMPORTS = {"math", "cmath"}
+
+
 def inline_local_from_imports(tree, py_path):
     """Inline simple sibling-module functions/constants imported by name or module."""
     base_dir = Path(py_path).resolve().parent
@@ -10360,6 +10488,7 @@ def inline_local_from_imports(tree, py_path):
             return None
         funcs = {}
         assigns = {}
+        extra_imports = []
         for st in mod_tree.body:
             if isinstance(st, ast.FunctionDef):
                 funcs[st.name] = st
@@ -10369,12 +10498,74 @@ def inline_local_from_imports(tree, py_path):
                         assigns[tgt.id] = st.value
             elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
                 assigns[st.target.id] = st.value
-        exports = {"funcs": funcs, "assigns": assigns}
+            elif (
+                isinstance(st, ast.Import)
+                and any((al.name or "").strip() in _CARRIED_MODULE_IMPORTS for al in st.names)
+            ) or (
+                isinstance(st, ast.ImportFrom)
+                and not getattr(st, "level", 0)
+                and (st.module or "").strip() in _CARRIED_MODULE_IMPORTS
+            ):
+                # Functions inlined from this module below keep referencing
+                # names like `math.sqrt` textually as-is (see the
+                # FunctionDef deepcopy just below) -- but the module's OWN
+                # `import math` statement that makes that reference valid
+                # was never itself carried over, so collect_math_aliases
+                # (and the sibling collect_*_aliases scanners) -- which
+                # only walk the FINAL merged tree, never re-parse a source
+                # module a function happened to be inlined from -- silently
+                # never learned "math" was ever imported at all. A function
+                # using `math.sqrt` inlined into a script with no `import
+                # math` of its own then hit a bare "unsupported call:
+                # math.sqrt(...)" even though the identical code, defined
+                # directly in the main script instead of imported, worked
+                # fine. Re-injected into new_body alongside the inlined
+                # functions below so the existing whole-tree alias scan
+                # picks it up the same way it would if the import had been
+                # written directly in the main script.
+                extra_imports.append(copy.deepcopy(st))
+        exports = {"funcs": funcs, "assigns": assigns, "extra_imports": extra_imports}
         module_cache[key] = exports
         return exports
 
     def _safe_import_prefix(name):
         return re.sub(r"\W+", "_", name).strip("_") or "mod"
+
+    def _referenced_module_names(fn_node, funcs, assigns):
+        # Other same-module function/constant names fn_node's body
+        # references -- either as a bare (unqualified) function call to
+        # another function defined in the same source module, or as a
+        # bare Name read of a module-level constant. Used to transitively
+        # pull in a helper a `from module import used_fn` statement never
+        # itself named -- e.g. simulate_figarch_1_1 (explicitly imported)
+        # internally calling figarch_lambda_weights_1_1 (never imported
+        # by name anywhere) within the same sibling module. Without this,
+        # only used_fn's own FunctionDef gets inlined and the helper call
+        # inside its body is left dangling -- unqualified, so it can't
+        # resolve to anything -- and flatly unsupported.
+        refs = set()
+        for n in ast.walk(fn_node):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in funcs:
+                refs.add(n.func.id)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in assigns:
+                refs.add(n.id)
+        return refs
+
+    carried_import_modules = set()
+
+    def _carry_extra_imports(exports):
+        nonlocal changed
+        for imp_st in exports.get("extra_imports", ()):
+            names = (
+                {(al.name or "").strip() for al in imp_st.names}
+                if isinstance(imp_st, ast.Import)
+                else {(imp_st.module or "").strip()}
+            )
+            if names & carried_import_modules:
+                continue
+            carried_import_modules.update(names)
+            new_body.append(copy.deepcopy(imp_st))
+            changed = True
 
     for st in tree.body:
         if isinstance(st, ast.Import):
@@ -10385,6 +10576,7 @@ def inline_local_from_imports(tree, py_path):
                 if exports is None:
                     keep_aliases.append(al)
                     continue
+                _carry_extra_imports(exports)
                 alias_name = al.asname or al.name.split(".", 1)[0]
                 prefix = _safe_import_prefix(alias_name)
                 for nm, fn_src in exports["funcs"].items():
@@ -10417,7 +10609,9 @@ def inline_local_from_imports(tree, py_path):
             if exports is None:
                 new_body.append(st)
                 continue
+            _carry_extra_imports(exports)
             imported = []
+            added_src_names = set()
             for al in st.names:
                 if al.name == "*":
                     continue
@@ -10426,6 +10620,7 @@ def inline_local_from_imports(tree, py_path):
                     fn = copy.deepcopy(exports["funcs"][al.name])
                     fn.name = local_name
                     imported.append(fn)
+                    added_src_names.add(al.name)
                 elif al.name in exports["assigns"]:
                     imported.append(
                         ast.Assign(
@@ -10433,6 +10628,34 @@ def inline_local_from_imports(tree, py_path):
                             value=copy.deepcopy(exports["assigns"][al.name]),
                         )
                     )
+                    added_src_names.add(al.name)
+
+            # Transitively pull in any other same-module function/constant
+            # that an explicitly-imported function's body calls/references
+            # but that this import statement never itself named -- see
+            # _referenced_module_names above. Kept under its ORIGINAL
+            # (unaliased) source name, matching how the calling function's
+            # body already references it unqualified: aliasing on import
+            # never changes how names resolve *inside* the source module.
+            pending = [n for n in imported if isinstance(n, ast.FunctionDef)]
+            while pending:
+                fn_node = pending.pop()
+                for ref_name in _referenced_module_names(fn_node, exports["funcs"], exports["assigns"]):
+                    if ref_name in added_src_names:
+                        continue
+                    added_src_names.add(ref_name)
+                    if ref_name in exports["funcs"]:
+                        dep_fn = copy.deepcopy(exports["funcs"][ref_name])
+                        imported.append(dep_fn)
+                        pending.append(dep_fn)
+                    else:
+                        imported.append(
+                            ast.Assign(
+                                targets=[ast.Name(id=ref_name, ctx=ast.Store())],
+                                value=copy.deepcopy(exports["assigns"][ref_name]),
+                            )
+                        )
+
             if imported:
                 new_body.extend(imported)
                 changed = True
@@ -16549,6 +16772,8 @@ class translator(ast.NodeVisitor):
                 return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in {"pi", "nan", "inf", "NINF"}:
                 return "real"
+            if isinstance(node.value, ast.Name) and node.value.id == "math" and node.attr in {"pi", "e", "tau", "nan", "inf", "Inf"}:
+                return "real"
             if (
                 node.attr in {"max", "eps", "tiny"}
                 and isinstance(node.value, ast.Call)
@@ -16566,6 +16791,15 @@ class translator(ast.NodeVisitor):
                 return "char"
             if node.attr == "columns" and self._is_pandas_df_ref_node(node.value):
                 return "char"
+            if node.attr == "index" and self._is_pandas_df_ref_node(node.value):
+                # df.index -- a character array for DataFrame_str_index,
+                # or a type(date)/type(datetime) array for the date-indexed
+                # kinds (which sit outside the plain int/real/char/logical
+                # kind system, like pandas_date_array_aliases Names do).
+                _idx_kind = self.pandas_df_vars.get(self._pandas_df_root_id(node.value))
+                if _idx_kind == "DataFrame_str_index":
+                    return "char"
+                return None
             return None
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.Not):
@@ -21303,6 +21537,17 @@ class translator(ast.NodeVisitor):
             return 1
         if isinstance(node, ast.Attribute) and node.attr == "columns" and self._is_pandas_df_ref_node(node.value):
             return 1
+        if isinstance(node, ast.Attribute) and node.attr == "index" and self._is_pandas_df_ref_node(node.value):
+            # Only claim rank=1 for the character-index kind here -- the
+            # date/datetime-index kinds are tracked purely via
+            # pandas_date_array_aliases (like a bare `pd.to_datetime(...)`
+            # result), which deliberately falls through to this function's
+            # default (scalar) rank so the generic real/int declaration
+            # fallback leaves them undeclared (see visit_Assign's alias
+            # skip-statement branch).
+            _idx_kind2 = self.pandas_df_vars.get(self._pandas_df_root_id(node.value))
+            if _idx_kind2 == "DataFrame_str_index":
+                return 1
         if isinstance(node, ast.Call):
             np_attr = self._numpy_call_attr(node.func)
             if np_attr in {"all", "any", "prod", "count_nonzero", "sum", "min", "max"} and len(node.args) >= 1:
@@ -30334,15 +30579,15 @@ class translator(ast.NodeVisitor):
                 return fstr("unknown")
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "pi":
                 return "acos(-1.0_dp)"
-            if isinstance(node.value, ast.Name) and node.value.id == "cmath" and node.attr == "pi":
+            if isinstance(node.value, ast.Name) and node.value.id in {"cmath", "math"} and node.attr == "pi":
                 return "acos(-1.0_dp)"
-            if isinstance(node.value, ast.Name) and node.value.id == "cmath" and node.attr == "e":
+            if isinstance(node.value, ast.Name) and node.value.id in {"cmath", "math"} and node.attr == "e":
                 return "exp(1.0_dp)"
-            if isinstance(node.value, ast.Name) and node.value.id == "cmath" and node.attr == "tau":
+            if isinstance(node.value, ast.Name) and node.value.id in {"cmath", "math"} and node.attr == "tau":
                 return "(2.0_dp * acos(-1.0_dp))"
-            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "nan":
+            if isinstance(node.value, ast.Name) and node.value.id in {"np", "math"} and node.attr == "nan":
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
-            if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr in {"inf", "Inf"}:
+            if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy", "math"} and node.attr in {"inf", "Inf"}:
                 return "ieee_value(0.0_dp, ieee_positive_inf)"
             if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr == "NINF":
                 return "ieee_value(0.0_dp, ieee_negative_inf)"
@@ -30403,6 +30648,10 @@ class translator(ast.NodeVisitor):
                     _col_len2 = max(len(c) for c in _cols2)
                     _col_lits = ", ".join(fstr(c) for c in _cols2)
                     return f"[character(len={_col_len2}) :: {_col_lits}]"
+            if node.attr == "index" and self._is_pandas_df_ref_node(node.value):
+                # df.index -- the vendored DataFrame types all expose the
+                # row labels as a public %index array component.
+                return f"{self.expr(node.value)}%index"
             attr_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported attribute expr: {attr_txt}")
 
@@ -33480,6 +33729,28 @@ class translator(ast.NodeVisitor):
                     self.alloc_complexes.discard(t.id)
                 if (
                     isinstance(t, ast.Name)
+                    and isinstance(v, ast.Attribute)
+                    and v.attr == "index"
+                    and isinstance(v.value, ast.Name)
+                    and v.value.id in self.pandas_df_vars
+                    and self.pandas_df_vars[v.value.id] in {"DataFrame_index_date", "DataFrame_index_datetime"}
+                ):
+                    # idx = df.index on a date/datetime-indexed frame --
+                    # same type(date)/type(datetime) array alias treatment
+                    # as the pd.to_datetime(df[label]) pattern above.
+                    self.pandas_date_array_aliases[t.id] = v.value.id
+                    self.ints.discard(t.id)
+                    self.reals.discard(t.id)
+                    self.logs.discard(t.id)
+                    self.chars.discard(t.id)
+                    self.complexes.discard(t.id)
+                    self.alloc_ints.discard(t.id)
+                    self.alloc_reals.discard(t.id)
+                    self.alloc_logs.discard(t.id)
+                    self.alloc_chars.discard(t.id)
+                    self.alloc_complexes.discard(t.id)
+                if (
+                    isinstance(t, ast.Name)
                     and isinstance(v, ast.DictComp)
                     and t.id in self.dict_typed_vars
                 ):
@@ -34975,6 +35246,36 @@ class translator(ast.NodeVisitor):
             # emits an assignment for the alias name either.
             return
         if (
+            isinstance(t, ast.Attribute)
+            and t.attr == "index"
+            and isinstance(t.value, ast.Name)
+            and t.value.id in self.pandas_df_vars
+            and isinstance(v, ast.Attribute)
+            and v.attr == "date"
+            and isinstance(v.value, ast.Attribute)
+            and v.value.attr == "index"
+            and isinstance(v.value.value, ast.Name)
+            and v.value.value.id == t.value.id
+        ):
+            # df.index = df.index.date -- pandas strips the time-of-day
+            # component off a DatetimeIndex, turning it into an
+            # object-dtype index of plain datetime.date values.
+            # DataFrame_index_date already stores a plain type(date)
+            # index with no time component at all (that's exactly what
+            # _detect_pandas_index_kind picked whenever the source dates
+            # carried no time), so this is a pure no-op here -- nothing
+            # to emit. DataFrame_index_datetime frames genuinely have a
+            # time component to truncate, which would need reconstructing
+            # the frame under a different static Fortran type; not
+            # attempted.
+            if self.pandas_df_vars[t.value.id] == "DataFrame_index_date":
+                return
+            raise NotImplementedError(
+                "df.index = df.index.date is only supported for a "
+                "DataFrame_index_date frame (no time-of-day component to "
+                "begin with); this frame is DataFrame_index_datetime"
+            )
+        if (
             isinstance(t, ast.Name)
             and t.id in self.pandas_df_vars
             and isinstance(v, ast.Call)
@@ -35034,6 +35335,16 @@ class translator(ast.NodeVisitor):
         ):
             # `dates` is tracked as a compile-time alias to the DataFrame's
             # date index (see pandas_date_array_aliases); no statement needed.
+            return
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.pandas_date_array_aliases
+            and isinstance(v, ast.Attribute)
+            and v.attr == "index"
+        ):
+            # `idx = df.index` on a date/datetime-indexed frame -- same
+            # compile-time-alias treatment as the pd.to_datetime(df[label])
+            # case just above; no statement needed.
             return
         if (
             isinstance(t, ast.Name)
@@ -43616,7 +43927,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(c.args[0].func, ast.Attribute)
                 and c.args[0].func.attr == "to_string"
                 and len(c.args[0].args) == 0
-                and all(kw.arg == "float_format" for kw in getattr(c.args[0], "keywords", []))
+                and all(kw.arg in ("float_format", "index") for kw in getattr(c.args[0], "keywords", []))
             ):
                 # `.to_string()` on our synthesized DataFrame-print helpers
                 # is a no-op wrapper (print() already stringifies); unwrap
@@ -43632,6 +43943,26 @@ class translator(ast.NodeVisitor):
                 # logic) can't be evaluated at transpile time, so it's
                 # dropped with a warning instead of rejecting the whole
                 # statement -- cosmetic only, values are unaffected.
+                #
+                # index= is accepted too -- printing the DataFrame always
+                # shows the row index already (there's no suppress-index
+                # code path in _emit_pandas_df_print, across its several
+                # runtime-dispatch/fixed-column-width print strategies),
+                # so a literal `index=False` is rejected explicitly rather
+                # than silently ignored; anything else (True, or a runtime
+                # expression that can't be evaluated at transpile time,
+                # such as a bool parameter defaulting to True) is treated
+                # as the already-correct default.
+                _index_kw = next((kw for kw in c.args[0].keywords if kw.arg == "index"), None)
+                if (
+                    _index_kw is not None
+                    and isinstance(_index_kw.value, ast.Constant)
+                    and _index_kw.value.value is False
+                ):
+                    raise NotImplementedError(
+                        "to_string(index=False) is not supported -- printing a "
+                        "DataFrame always includes its row index"
+                    )
                 _ff_kw = next((kw for kw in c.args[0].keywords if kw.arg == "float_format"), None)
                 _ff_ndigits = _extract_float_format_ndigits(_ff_kw.value) if _ff_kw is not None else None
                 if _ff_ndigits is not None and self._is_pandas_df_ref_node(c.args[0].func.value):
@@ -59180,6 +59511,7 @@ def _tree_uses_replayable_rng(tree):
 def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = ast.parse(src_text, filename=source_name)
     tree = rewrite_integer_quotient_seed_divisions(tree)
+    tree = rewrite_pandas_read_csv_set_index(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
     params = find_parameters(tree)
     list_counts = build_list_count_map(tree)
@@ -59484,6 +59816,7 @@ def transpile_file(
     stem = Path(py_path).stem
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
+    tree = rewrite_pandas_read_csv_set_index(tree)
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
     tree = inline_local_from_imports(tree, py_path)
@@ -59937,6 +60270,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     src = src_override if src_override is not None else src_path.read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
+    tree = rewrite_pandas_read_csv_set_index(tree)
     validate_imports_supported(tree, py_path)
 
     top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]

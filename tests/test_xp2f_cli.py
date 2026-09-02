@@ -3232,6 +3232,127 @@ def test_xp2f_inlines_local_sibling_from_import_function_and_constant(tmp_path: 
     assert "print" in out_text
 
 
+def test_xp2f_inlined_sibling_function_using_math_module(tmp_path: Path) -> None:
+    # Regression test: a sibling module's own `import math` statement was
+    # silently dropped when inline_local_from_imports copied a FunctionDef
+    # using math.sqrt(...) into the main script -- collect_math_aliases
+    # only ever ast.walk()s the FINAL merged tree, never re-parses the
+    # source module a function was inlined from, so it never learned
+    # "math" was imported at all unless the importing script *also*
+    # happened to write `import math` itself. The identical function
+    # defined directly in the main script (no cross-module import
+    # involved) always worked; only the inlined-from-a-sibling-module
+    # case raised "unsupported call: math.sqrt(...)". Fixed by having
+    # inline_local_from_imports also carry the source module's own
+    # math/cmath import statement into the merged tree (deduplicated)
+    # whenever it actually inlines something from that module.
+    (tmp_path / "mathmod.py").write_text(
+        "\n".join(
+            [
+                "import math",
+                "",
+                "def hypot2(a, b):",
+                "    return math.sqrt(a * a + b * b)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    src = tmp_path / "xmathmod.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from mathmod import hypot2",
+                "",
+                "print(hypot2(3.0, 4.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_inlines_transitively_called_sibling_helper(tmp_path: Path) -> None:
+    # Regression test: `from module import used_fn` only ever inlined
+    # used_fn's own FunctionDef -- if used_fn's body calls ANOTHER
+    # function defined in the same sibling module (e.g. a private helper
+    # never itself named in the import statement), that callee was never
+    # inlined at all, leaving an unqualified call to a name nothing
+    # resolves to -- flatly "unsupported call: helper(...)". Fixed by
+    # having inline_local_from_imports transitively pull in any other
+    # same-module function/constant an inlined function's body
+    # references, walking the dependency graph to a fixed point (kept
+    # under each dependency's original, unaliased name, matching how the
+    # calling function's body already references it unqualified).
+    (tmp_path / "transmod.py").write_text(
+        "\n".join(
+            [
+                "def helper(x):",
+                "    return x * 2.0",
+                "",
+                "def used_fn(x):",
+                "    return helper(x) + 1.0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    src = tmp_path / "xtransitive.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from transmod import used_fn",
+                "",
+                "print(used_fn(3.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_math_module_constants(tmp_path: Path) -> None:
+    # Regression test: math.pi (and math.e/math.tau/math.nan/math.inf)
+    # weren't recognized as expressions at all -- "unsupported attribute
+    # expr: math.pi" -- even though the identical np.pi/cmath.pi/cmath.e/
+    # cmath.tau were already supported. Extended the existing np/cmath
+    # Attribute-dispatch branches (in expr() and _expr_kind) to also
+    # match "math".
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xmath_consts.py",
+        [
+            "import math",
+            "",
+            "print(math.sqrt(2.0 / math.pi))",
+            "print(math.e)",
+            "print(math.tau)",
+        ],
+    )
+
+
 def test_xp2f_does_not_force_real_compare_arg_complex_via_numpy_sqrt(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
@@ -8921,3 +9042,228 @@ def test_xp2f_pd_chained_single_column_subscript(tmp_path: Path) -> None:
             "main()",
         ],
     )
+
+
+def test_xp2f_pandas_read_csv_then_set_index_collapsed(tmp_path: Path) -> None:
+    # Regression test: `X = pd.read_csv(path, parse_dates=[col]); X =
+    # X.set_index(col)` -- reading a CSV, then separately committing to
+    # one already-date-parsed column as the row index -- as opposed to
+    # passing index_col=col to pd.read_csv directly (already supported).
+    # X.set_index(...) is not itself implemented as a general runtime
+    # operation (Fortran can't change a variable's declared derived
+    # type at runtime, and a str-indexed vs. date-indexed DataFrame are
+    # different Fortran types here) -- instead, new
+    # rewrite_pandas_read_csv_set_index runs as an AST-level
+    # preprocessing pass (alongside rewrite_integer_quotient_seed_
+    # divisions, before any translator/prescan code runs) that
+    # recognizes this specific two-statement idiom and collapses it
+    # into the equivalent, already-working single-step
+    # pd.read_csv(path, index_col=col, parse_dates=[col]) form.
+    #
+    # col may be a literal string (df.set_index("Date")) or a local
+    # variable assigned exactly once to a literal string before use
+    # (date_label = "Date"; ...; df.set_index(date_label)) -- the same
+    # "resolve a Name back through a single literal assignment"
+    # technique _scan_local_df_return_info already uses for a
+    # pd.read_csv path argument. Exercises both shapes.
+    #
+    # Deliberately narrow: only fires when set_index's column is one of
+    # read_csv's own parse_dates=[...] entries and read_csv doesn't
+    # already have its own index_col= -- a set_index(...) on some other
+    # column (see test_xp2f_pandas_read_csv_set_index_on_non_date_
+    # column_still_unsupported below) still correctly reports
+    # unsupported rather than being silently mishandled.
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_read_csv_set_index.py",
+        [
+            "import pandas as pd",
+            "",
+            "",
+            "def read_prices_literal(filename):",
+            "    df = pd.read_csv(filename, parse_dates=['Date'])",
+            "    df = df.set_index('Date')",
+            "    return df",
+            "",
+            "",
+            "def read_prices_via_variable(filename):",
+            "    date_label = 'Date'",
+            "    df = pd.read_csv(filename, parse_dates=[date_label])",
+            "    df = df.set_index(date_label)",
+            "    return df",
+            "",
+            "",
+            "def main():",
+            "    d1 = read_prices_literal('prices.csv')",
+            "    d2 = read_prices_via_variable('prices.csv')",
+            "    print(d1.shape[0], d1.shape[1])",
+            "    print(d2.shape[0], d2.shape[1])",
+            "    print(d1['SPY'].to_numpy()[0], d2['EFA'].to_numpy()[2])",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_index_attribute(tmp_path: Path) -> None:
+    # Regression test: `df.index` as a general-purpose expression (not
+    # just as a construction kwarg or inside the narrow pd.to_datetime(
+    # df[label]) alias pattern) was entirely unsupported -- even a bare
+    # `idx = df.index` raised "unsupported attribute expr: df.index".
+    #
+    # Fixed with three additions: (1) expr()'s Attribute dispatch grew a
+    # `df.index` -> `{df_expr}%index` case (mirroring the pre-existing
+    # `df.columns` one); (2) _expr_kind/_rank_expr recognize the same
+    # shape, but only claim a concrete char rank-1 kind for
+    # DataFrame_str_index -- the date/datetime-index kinds are left
+    # kind=None/rank=0 (like a bare pd.to_datetime(...) call) so the
+    # generic declaration fallback doesn't wrongly force a real() array
+    # declaration onto a type(date)/type(datetime)-typed target; (3) a
+    # new prescan/visit_Assign pair recognizes `t = df.index` on a
+    # date/datetime-indexed frame and registers `t` as a
+    # pandas_date_array_aliases entry (exactly like the pre-existing
+    # `t = pd.to_datetime(df[label])` pattern), so `t` becomes a pure
+    # compile-time alias to `df%index` with no separate Fortran
+    # declaration or statement at all.
+    #
+    # Covers both the character-indexed (DataFrame_str_index, via a
+    # RangeIndex-default frame) and date-indexed (DataFrame_index_date,
+    # via read_csv+set_index) kinds, and both the bare `df.index` and
+    # `df.index[i]` subscript shapes. (An earlier, now-fixed draft of
+    # this change wrongly forced rank=1 for date-indexed frames too,
+    # corrupting unrelated declarations in the same program -- confirmed
+    # fixed by manually diffing df.head() output before/after, which
+    # isn't included in this test's own --run-diff since a named
+    # DatetimeIndex header row is a separate, pre-existing df.head()
+    # formatting gap unrelated to df.index itself.)
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_index_attr.py",
+        [
+            "import pandas as pd",
+            "",
+            "df_ri = pd.DataFrame({'a': [1.0, 2.0, 3.0]})",
+            "idx_ri = df_ri.index",
+            "print(len(idx_ri))",
+            "print(df_ri.index[0])",
+            "",
+            "df_dt = pd.read_csv('prices.csv', parse_dates=['Date'])",
+            "df_dt = df_dt.set_index('Date')",
+            "idx_dt = df_dt.index",
+            "print(len(idx_dt))",
+            "print(df_dt.index[0] < df_dt.index[1])",
+            "print(df_dt.index[-1] == df_dt.index[-1])",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_index_assign_date_noop(tmp_path: Path) -> None:
+    # Regression test: `df.index = df.index.date` -- real pandas strips
+    # the time-of-day component off a DatetimeIndex, turning it into an
+    # object-dtype index of plain datetime.date values. Our
+    # DataFrame_index_date already stores a plain type(date) index with
+    # no time component at all (that's exactly what
+    # _detect_pandas_index_kind picked, since this CSV's dates carry no
+    # time), so the statement is a pure no-op here -- new visit_Assign
+    # branch recognizes the `X.index = X.index.date` shape (target and
+    # source both referencing the same pandas_df_vars-tracked frame) and
+    # emits nothing at all, rather than raising "unsupported assign".
+    shutil.copy2(DATAFRAME_HELPER_PATH, tmp_path / "dataframe_index_date.f90")
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdf_index_assign_date.py",
+        [
+            "import pandas as pd",
+            "",
+            "df = pd.read_csv('prices.csv', parse_dates=['Date'])",
+            "df = df.set_index('Date')",
+            "df.index = df.index.date",
+            "print(len(df.index))",
+            "print(df.index[0] < df.index[1])",
+            "print(df['SPY'].to_numpy()[0])",
+        ],
+    )
+
+
+def test_xp2f_pandas_df_index_assign_date_on_datetime_index_still_unsupported(tmp_path: Path) -> None:
+    # Companion to the no-op test above: `df.index = df.index.date` must
+    # NOT be silently accepted on a DataFrame_index_datetime frame (a
+    # real time-of-day component present) -- truncating it would need
+    # reconstructing the frame under a different static Fortran type,
+    # which isn't attempted; this stays a clearly-reported unsupported
+    # assign instead.
+    (tmp_path / "prices_dt.csv").write_text(
+        "\n".join(
+            [
+                "Date,SPY",
+                "2020-01-01 09:30:00,300.0",
+                "2020-01-02 09:30:00,301.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    src = tmp_path / "xdf_index_assign_date_neg.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.read_csv('prices_dt.csv', parse_dates=['Date'])",
+                "df = df.set_index('Date')",
+                "df.index = df.index.date",
+                "print(df.head())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "Transpile: FAIL" in proc.stdout, proc.stdout + proc.stderr
+    assert "DataFrame_index_datetime" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_read_csv_set_index_on_non_date_column_still_unsupported(tmp_path: Path) -> None:
+    # Companion to the collapse test above: rewrite_pandas_read_csv_
+    # set_index must NOT fire when set_index's column isn't one of
+    # read_csv's own parse_dates=[...] entries (here, parse_dates is
+    # omitted entirely) -- this stays a genuinely unsupported call
+    # rather than being silently, incorrectly collapsed.
+    (tmp_path / "prices.csv").write_text("\n".join(_PANDAS_TEST_CSV_ROWS) + "\n", encoding="utf-8")
+    src = tmp_path / "xdf_read_csv_set_index_neg.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "df = pd.read_csv('prices.csv')",
+                "df = df.set_index('SPY')",
+                "print(df.shape)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "unsupported call" in proc.stdout, proc.stdout + proc.stderr
+    assert "set_index" in proc.stdout, proc.stdout + proc.stderr
