@@ -880,7 +880,7 @@ _DP_KIND_PRESERVING_INTRINSICS = frozenset(
     (
         "exp", "sqrt", "log", "log10", "sin", "cos", "tan", "asin", "acos", "atan",
         "atan2", "sinh", "cosh", "tanh", "abs", "dot_product", "sum", "product",
-        "minval", "maxval",
+        "minval", "maxval", "min", "max", "mod",
     )
 )
 
@@ -3364,6 +3364,319 @@ def rewrite_case_insensitive_name_collisions(tree):
     return tree
 
 
+def rewrite_nested_callback_functions_to_toplevel(tree):
+    """Hoist a Python function nested inside another (top-level) function
+    to module scope when it's later passed BY NAME as a callback value
+    (e.g. ``bracket_and_solve_root(f_right, x0, ...)``), rather than
+    called directly -- this codegen has no notion of a closure, so a
+    nested def used this way previously had its whole body silently
+    dropped while call sites still referenced the (never-defined)
+    procedure name, producing both "no IMPLICIT type" compile errors and
+    separately-corrupted control flow. Real trigger: xdelta_gamma.py's
+    ``f_right``/``f_left`` root-finding helpers, nested inside
+    ``piecewise_breakpoints_straddle`` and closing over its parameters.
+
+    Approach: hoist the nested def to a fresh top-level sibling with its
+    free (closure) variables renamed to fresh module-level globals
+    (``closure_{enclosing_name}_{var}``), and -- right before each
+    statement in the enclosing function that passes the nested def's
+    name as a value -- insert ``global closure_...; closure_... =
+    local_value`` snapshot assignments, reusing the SAME global-write
+    mechanism Python's own ``global`` keyword already gives this
+    transpiler (verified separately: a local function assigning to a
+    module-level global via ``global NAME`` already threads correctly
+    through to a plain module variable, read/write, in the existing
+    codegen). This also mirrors Python's own late-binding closure
+    semantics -- the callback sees whatever the enclosing local held at
+    the moment it was handed off, not some earlier or later value.
+
+    Deliberately narrow, matching this session's established pattern of
+    declining rather than guessing wrong: only one level of nesting
+    (a def directly inside a top-level function) is handled; a nested
+    def that itself contains a further nested def/class/lambda/
+    comprehension, or a `global`/`nonlocal` statement, is left
+    completely untouched (so it still fails exactly as before -- no
+    behavior change, no silent miscompile) rather than risk an unsound
+    hoist. A free variable that's already bound at true module level
+    (an existing global/top-level function/import alias) is left alone
+    rather than needlessly threaded, since it's already visible as-is
+    everywhere in the generated Fortran.
+    """
+
+    def _collect_import_aliases(body):
+        aliases = set()
+        for s in body:
+            if isinstance(s, ast.Import):
+                for a in s.names:
+                    aliases.add(a.asname or a.name.split(".")[0])
+            elif isinstance(s, ast.ImportFrom):
+                for a in s.names:
+                    aliases.add(a.asname or a.name)
+        return aliases
+
+    def _collect_module_level_names(body):
+        names = set()
+        for s in body:
+            if isinstance(s, ast.Assign):
+                for t in s.targets:
+                    if isinstance(t, ast.Name):
+                        names.add(t.id)
+            elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
+                names.add(s.target.id)
+            elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(s.name)
+            elif isinstance(s, ast.For) and isinstance(s.target, ast.Name):
+                names.add(s.target.id)
+        return names
+
+    excluded_names = (
+        _collect_import_aliases(tree.body)
+        | _collect_module_level_names(tree.body)
+        | {"np", "math", "random"}
+    )
+
+    def _free_vars(fn_node):
+        param_names = {
+            a.arg
+            for a in list(fn_node.args.posonlyargs)
+            + list(fn_node.args.args)
+            + list(fn_node.args.kwonlyargs)
+        }
+        bound = set(param_names)
+        free = []
+        seen = set()
+        ok = [True]
+
+        class _V(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):
+                ok[0] = False
+
+            def visit_AsyncFunctionDef(self, node):
+                ok[0] = False
+
+            def visit_ClassDef(self, node):
+                ok[0] = False
+
+            def visit_Lambda(self, node):
+                ok[0] = False
+
+            def visit_ListComp(self, node):
+                ok[0] = False
+
+            def visit_SetComp(self, node):
+                ok[0] = False
+
+            def visit_DictComp(self, node):
+                ok[0] = False
+
+            def visit_GeneratorExp(self, node):
+                ok[0] = False
+
+            def visit_Global(self, node):
+                ok[0] = False
+
+            def visit_Nonlocal(self, node):
+                ok[0] = False
+
+            def visit_Call(self, node):
+                if not (isinstance(node.func, ast.Name) and node.func.id not in bound):
+                    self.visit(node.func)
+                for a in node.args:
+                    self.visit(a)
+                for kw in node.keywords:
+                    self.visit(kw.value)
+
+            def visit_For(self, node):
+                for n in ast.walk(node.target):
+                    if isinstance(n, ast.Name):
+                        bound.add(n.id)
+                self.generic_visit(node)
+
+            def visit_ExceptHandler(self, node):
+                if node.name:
+                    bound.add(node.name)
+                self.generic_visit(node)
+
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Store):
+                    bound.add(node.id)
+                elif isinstance(node.ctx, ast.Load):
+                    if node.id in excluded_names:
+                        return
+                    if node.id not in bound and node.id not in seen:
+                        seen.add(node.id)
+                        free.append(node.id)
+
+        v = _V()
+        for stmt in fn_node.body:
+            v.visit(stmt)
+        if not ok[0]:
+            return None
+        return free
+
+    def _is_used_as_value(name, stmts):
+        found = [False]
+
+        class _V(ast.NodeVisitor):
+            def visit_Call(self, node):
+                if not (isinstance(node.func, ast.Name) and node.func.id == name):
+                    self.visit(node.func)
+                for a in node.args:
+                    self.visit(a)
+                for kw in node.keywords:
+                    self.visit(kw.value)
+
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Load) and node.id == name:
+                    found[0] = True
+
+        v = _V()
+        for s in stmts:
+            v.visit(s)
+        return found[0]
+
+    def _guess_kind(name, enclosing_fn):
+        args = list(enclosing_fn.args.args)
+        defaults = list(enclosing_fn.args.defaults)
+        pad = len(args) - len(defaults)
+        for a, d in zip(args[pad:], defaults):
+            if a.arg == name:
+                if isinstance(d, ast.Constant) and isinstance(d.value, int) and not isinstance(d.value, bool):
+                    return "int"
+                return "real"
+        for node in ast.walk(enclosing_fn):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name
+            ):
+                v = node.value
+                if isinstance(v, ast.Constant) and isinstance(v.value, int) and not isinstance(v.value, bool):
+                    return "int"
+                if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id in ("int", "len"):
+                    return "int"
+                return "real"
+        return "real"
+
+    def _rebuild_stmts(stmts, hoisted_names, defs_by_name, enclosing_name):
+        out = []
+        for stmt in stmts:
+            if isinstance(stmt, ast.FunctionDef) and stmt.name in hoisted_names:
+                continue
+            used_here = [nm for nm in hoisted_names if _is_used_as_value(nm, [stmt])]
+            if used_here:
+                targets = []
+                for nm in used_here:
+                    _, free = defs_by_name[nm]
+                    for fv in free:
+                        gname = f"closure_{enclosing_name}_{fv}"
+                        pair = (gname, fv)
+                        if pair not in targets:
+                            targets.append(pair)
+                if targets:
+                    g_stmt = ast.Global(names=[t[0] for t in targets])
+                    ast.copy_location(g_stmt, stmt)
+                    out.append(g_stmt)
+                    for gname, fv in targets:
+                        assign = ast.Assign(
+                            targets=[ast.Name(id=gname, ctx=ast.Store())],
+                            value=ast.Name(id=fv, ctx=ast.Load()),
+                        )
+                        ast.copy_location(assign, stmt)
+                        out.append(assign)
+            for field in ("body", "orelse", "finalbody"):
+                child = getattr(stmt, field, None)
+                if isinstance(child, list):
+                    setattr(stmt, field, _rebuild_stmts(child, hoisted_names, defs_by_name, enclosing_name))
+            if isinstance(stmt, ast.Try):
+                for h in stmt.handlers:
+                    h.body = _rebuild_stmts(h.body, hoisted_names, defs_by_name, enclosing_name)
+            out.append(stmt)
+        return out
+
+    def _find_hoistable(fn):
+        found = []
+
+        def _scan(stmts):
+            for stmt in stmts:
+                if isinstance(stmt, ast.FunctionDef):
+                    if _is_used_as_value(stmt.name, fn.body):
+                        found.append(stmt)
+                    continue
+                for field in ("body", "orelse", "finalbody"):
+                    child = getattr(stmt, field, None)
+                    if isinstance(child, list):
+                        _scan(child)
+                if isinstance(stmt, ast.Try):
+                    for h in stmt.handlers:
+                        _scan(h.body)
+
+        _scan(fn.body)
+        return found
+
+    new_body = []
+    for stmt in tree.body:
+        if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            new_body.append(stmt)
+            continue
+
+        to_hoist = _find_hoistable(stmt)
+        if not to_hoist:
+            new_body.append(stmt)
+            continue
+
+        defs_by_name = {}
+        ok_all = True
+        for def_node in to_hoist:
+            free = _free_vars(def_node)
+            if free is None:
+                ok_all = False
+                break
+            defs_by_name[def_node.name] = (def_node, free)
+
+        if not ok_all:
+            new_body.append(stmt)
+            continue
+
+        enclosing_name = stmt.name
+        hoisted_defs = []
+        init_stmts = []
+        for name, (def_node, free) in defs_by_name.items():
+            rename_map = {fv: f"closure_{enclosing_name}_{fv}" for fv in free}
+
+            class _Ren(ast.NodeTransformer):
+                def visit_Name(self, n):
+                    if n.id in rename_map:
+                        n.id = rename_map[n.id]
+                    return n
+
+            new_def = copy.deepcopy(def_node)
+            new_def = _Ren().visit(new_def)
+            ast.fix_missing_locations(new_def)
+            hoisted_defs.append(new_def)
+
+            for fv in free:
+                kind = _guess_kind(fv, stmt)
+                init_val = ast.Constant(value=0 if kind == "int" else 0.0)
+                init_stmt = ast.Assign(
+                    targets=[ast.Name(id=rename_map[fv], ctx=ast.Store())],
+                    value=init_val,
+                )
+                ast.copy_location(init_stmt, stmt)
+                init_stmts.append(init_stmt)
+
+        stmt.body = _rebuild_stmts(stmt.body, set(defs_by_name.keys()), defs_by_name, enclosing_name)
+
+        new_body.extend(init_stmts)
+        new_body.extend(hoisted_defs)
+        new_body.append(stmt)
+
+    tree.body = new_body
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_pandas_read_csv_set_index(tree):
     """Collapse ``X = pd.read_csv(path, parse_dates=[col]); X = X.set_index(col)``
     into the equivalent single-step ``pd.read_csv(path, index_col=col,
@@ -4272,10 +4585,17 @@ def rename_conflicting_identifiers(src_text):
             # subroutine invocation (`call subname(...)`), never a
             # reference to the variable, which real bug this guards
             # against: renaming that keyword corrupts the statement into
-            # invalid Fortran (e.g. "call_ subname(...)").
+            # invalid Fortran (e.g. "call_ subname(...)"). Also covers a
+            # type-bound procedure invocation (`call df%display(...)`) --
+            # the original guard only matched a bare "IDENTIFIER(" tail,
+            # so it missed the "IDENTIFIER%member(" shape and wrongly
+            # renamed the statement keyword to "call_ df%display(...)"
+            # (invalid Fortran) whenever some OTHER local variable also
+            # happened to be named "call" (e.g. a Python `call, put = ...`
+            # tuple-unpack) and needed renaming elsewhere in the same file.
             if nm.lower() == "call":
                 tail = code[m.end() :]
-                if re.match(r"^\s+[A-Za-z_]\w*\s*\(", tail):
+                if re.match(r"^\s+[A-Za-z_]\w*(?:\s*%\s*[A-Za-z_]\w*)*\s*\(", tail):
                     return nm
             # Keep function/intrinsic call forms untouched -- but only
             # outside a declaration line, where `name(` is always a
@@ -45913,6 +46233,15 @@ class translator(ast.NodeVisitor):
             # pandas_df_vars name's column list can change over the
             # program's dataflow (e.g. reassigned via `df = df[[...]]`).
             orig_call = c
+            # Set when the printed value is `.to_string()` (with or
+            # without float_format=/index= keywords): threaded through as
+            # full= to every _emit_pandas_df_print call this print()
+            # might still reach below, since to_string() means "every
+            # row, no truncation, no trailing [N rows x M columns]
+            # footer" -- matching pandas exactly, and DISTINCT from plain
+            # print(df), which truncates once the frame exceeds pandas'
+            # own default display.max_rows (60).
+            _print_full = False
             if (
                 len(c.args) == 1
                 and isinstance(c.args[0], ast.Call)
@@ -45921,6 +46250,7 @@ class translator(ast.NodeVisitor):
                 and len(c.args[0].args) == 0
                 and all(kw.arg in ("float_format", "index") for kw in getattr(c.args[0], "keywords", []))
             ):
+                _print_full = True
                 # `.to_string()` on our synthesized DataFrame-print helpers
                 # is a no-op wrapper (print() already stringifies); unwrap
                 # it so the patterns below still match. A float_format=
@@ -45958,7 +46288,9 @@ class translator(ast.NodeVisitor):
                 _ff_kw = next((kw for kw in c.args[0].keywords if kw.arg == "float_format"), None)
                 _ff_ndigits = _extract_float_format_ndigits(_ff_kw.value) if _ff_kw is not None else None
                 if _ff_ndigits is not None and self._is_pandas_df_ref_node(c.args[0].func.value):
-                    self._emit_pandas_df_print(c.args[0].func.value, ndigits=_ff_ndigits, context_node=orig_call)
+                    self._emit_pandas_df_print(
+                        c.args[0].func.value, ndigits=_ff_ndigits, context_node=orig_call, full=_print_full
+                    )
                     return
                 if _ff_kw is not None and _ff_ndigits is None:
                     print(
@@ -46156,10 +46488,12 @@ class translator(ast.NodeVisitor):
                     and isinstance(c.args[0].args[0].value, int)
                 ):
                     ndigits = int(c.args[0].args[0].value)
-                self._emit_pandas_df_print(c.args[0].func.value, ndigits=ndigits, context_node=orig_call)
+                self._emit_pandas_df_print(
+                    c.args[0].func.value, ndigits=ndigits, context_node=orig_call, full=_print_full
+                )
                 return
             if len(c.args) == 1 and self._is_pandas_df_ref_node(c.args[0]):
-                self._emit_pandas_df_print(c.args[0], context_node=orig_call)
+                self._emit_pandas_df_print(c.args[0], context_node=orig_call, full=_print_full)
                 return
             if (
                 len(c.args) == 1
@@ -47450,7 +47784,16 @@ class translator(ast.NodeVisitor):
         self.o.pop()
         self.o.w("end block")
 
-    def _emit_pandas_df_print(self, df_node, ndigits=6, context_node=None):
+    def _emit_pandas_df_print(self, df_node, ndigits=6, context_node=None, full=False):
+        # full=True (from print(df.to_string())) prints every row with no
+        # truncation and no trailing "[N rows x M columns]" footer,
+        # matching pandas' own to_string() exactly. Otherwise (plain
+        # print(df)), mirrors pandas' default display.max_rows=60/
+        # min_rows=10: a frame of 60 rows or fewer prints in full with no
+        # footer either (pandas only shows the footer when it actually
+        # truncates); a longer frame shows the first/last 5 rows with a
+        # "..." row between them, then the footer.
+        full_lit = ".true." if full else ".false."
         df_expr, col_names = self._pandas_df_ref(df_node, context_node)
         df_id = self._pandas_df_root_id(df_node)
         df_kind = self.pandas_df_vars.get(df_id)
@@ -47482,7 +47825,7 @@ class translator(ast.NodeVisitor):
                 self.o.push()
             df_expr, needs_assign = self._pandas_df_materialize_decl(df_expr, kind="DataFrame_str_index")
             self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
-            self.o.w(f"call {df_expr}%display({ndigits})")
+            self.o.w(f"call {df_expr}%display({ndigits}, {full_lit})")
             if needs_block:
                 self.o.pop()
                 self.o.w("end block")
@@ -47498,9 +47841,9 @@ class translator(ast.NodeVisitor):
             # and uses a different, non-pandas-matching layout, so it's
             # not reused here).
             if df_kind == "DataFrame_index_datetime":
-                self.o.w(f"call {df_expr}%display({ndigits})")
+                self.o.w(f"call {df_expr}%display({ndigits}, {full_lit})")
             else:
-                self.o.w(f"call {df_expr}%display_pdf({ndigits})")
+                self.o.w(f"call {df_expr}%display_pdf({ndigits}, {full_lit})")
             return
         if not col_names:
             raise NotImplementedError(
@@ -47535,7 +47878,7 @@ class translator(ast.NodeVisitor):
         self._pandas_df_materialize_assign(orig_df_expr, needs_assign)
         self.o.w(f"pdf_n = nrow({df_expr})")
         self.o.w(f"write(*,{header_fmt}) '', {header_args}")
-        self.o.w("if (pdf_n <= 10) then")
+        self.o.w(f"if ({full_lit} .or. pdf_n <= 60) then")
         self.o.push()
         self.o.w("do pdf_i = 1, pdf_n")
         self.o.push()
@@ -47565,10 +47908,10 @@ class translator(ast.NodeVisitor):
         )
         self.o.pop()
         self.o.w("end do")
-        self.o.pop()
-        self.o.w("end if")
         self.o.w("write(*,*)")
         self.o.w(f"write(*,'(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', {n_cols}, ' columns]'")
+        self.o.pop()
+        self.o.w("end if")
         self.o.pop()
         self.o.w("end block")
 
@@ -56820,18 +57163,23 @@ def generate_flat(
                                 best_kind = "int"
                                 best_is_sentinel = False
                 if not saw:
-                    # Not assigned locally in this function: fall back to a
-                    # module-level constant of the same name (e.g. a
-                    # default/actual argument referencing a global like
-                    # `rho=pairwise_corr`), which only tr_seed has scanned.
-                    _global_specs = _name_possible_specs(tr_seed, _name)
-                    if _global_specs:
-                        _gk, _gr = sorted(_global_specs, key=lambda kr: -kr[1])[0]
-                        return (_gk, _gr)
                     # `_name` may itself be a formal parameter of fn_node
                     # (e.g. the source array of a tuple-unpack, `a, b = arg`)
-                    # rather than something locally assigned -- fall back to
-                    # fn_node's own usage-based argument-kind inference.
+                    # rather than something locally assigned. Check this
+                    # FIRST, unconditionally ahead of the same-named-global
+                    # fallback below: Python scoping means a function's own
+                    # parameter ALWAYS shadows an outer/global name of the
+                    # same spelling, no matter what this project's own
+                    # analysis happens to have prescanned about that outer
+                    # name. Real trigger: a local function parameter named
+                    # "S" collided (in spelling only, not in binding) with
+                    # an unrelated top-level global array also named "S" --
+                    # checking the same-named-global fallback first
+                    # (as this code used to) leaked that global's array
+                    # rank onto every local function's OWN inferred "S"
+                    # parameter rank via this same call-site scan,
+                    # corrupting each function's signature even though none
+                    # of them was ever actually called with an array.
                     _fn_params = list(fn_node.args.args) + list(fn_node.args.kwonlyargs)
                     if _name in {a.arg for a in _fn_params}:
                         # Prefer fn_node's OWN already-inferred call-site
@@ -56864,6 +57212,16 @@ def generate_flat(
                                 _pk = None
                         if _pk in {"int", "real", "logical", "char", "complex"}:
                             return (_pk, 0)
+                        return (None, 0)
+                    # Not assigned locally in this function, and not one of
+                    # its own parameters either: fall back to a module-level
+                    # constant of the same name (e.g. a default/actual
+                    # argument referencing a global like `rho=pairwise_
+                    # corr`), which only tr_seed has scanned.
+                    _global_specs = _name_possible_specs(tr_seed, _name)
+                    if _global_specs:
+                        _gk, _gr = sorted(_global_specs, key=lambda kr: -kr[1])[0]
+                        return (_gk, _gr)
                     return (None, 0)
                 return (best_kind, best_rank)
             return _infer(name_nm)
@@ -61714,6 +62072,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
+    tree = rewrite_nested_callback_functions_to_toplevel(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
     params = find_parameters(tree)
     list_counts = build_list_count_map(tree)
@@ -62023,6 +62382,7 @@ def transpile_file(
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
+    tree = rewrite_nested_callback_functions_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
     tree = inline_local_from_imports(tree, py_path)
@@ -62557,6 +62917,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
+    tree = rewrite_nested_callback_functions_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
 
     top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]

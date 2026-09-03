@@ -469,15 +469,22 @@ contains
    ! pandas-style print(df): index label (yyyy-mm-dd hh:mm:ss) + one
    ! right-justified column per %columns entry, computed at runtime --
    ! see dataframe_str_index.f90's display_str_index for the same idea.
-   subroutine display_datetime(self, ndigits)
+   subroutine display_datetime(self, ndigits, full)
+      ! See display_str_index (dataframe_str_index.f90) for the full=
+      ! semantics and the pandas max_rows=60/min_rows=10-matching
+      ! truncation this mirrors.
       class(DataFrame_index_datetime), intent(in) :: self
       integer, intent(in), optional :: ndigits
+      logical, intent(in), optional :: full
       integer :: nd, col_width, n_cols, pdf_n, pdf_i
+      logical :: full_
       character(len=:), allocatable :: header_fmt, row_fmt, dots_fmt
       character(len=32) :: nc_str, cw_str, nd_str
 
       nd = 6
       if (present(ndigits)) nd = ndigits
+      full_ = .false.
+      if (present(full)) full_ = full
       col_width = max(10, nd + 8)
       n_cols = size(self%columns)
       pdf_n = nrow(self)
@@ -491,7 +498,7 @@ contains
       dots_fmt = '(A19,'//trim(nc_str)//'A'//trim(cw_str)//')'
 
       write (*, header_fmt) '', (trim(self%columns(pdf_i)), pdf_i=1, n_cols)
-      if (pdf_n <= 10) then
+      if (full_ .or. pdf_n <= 60) then
          do pdf_i = 1, pdf_n
             write (*, row_fmt) self%index(pdf_i)%to_str(), self%values(pdf_i, :)
          end do
@@ -503,9 +510,9 @@ contains
          do pdf_i = pdf_n - 4, pdf_n
             write (*, row_fmt) self%index(pdf_i)%to_str(), self%values(pdf_i, :)
          end do
+         write (*, *)
+         write (*, '(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', n_cols, ' columns]'
       end if
-      write (*, *)
-      write (*, '(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', n_cols, ' columns]'
    end subroutine display_datetime
 
 end module dataframe_index_datetime_mod

@@ -1924,6 +1924,242 @@ def test_fortran_rewrite_case_insensitive_name_collisions_leaves_unrelated_scope
     assert "s_cs" in dumped2, dumped2
 
 
+def test_xp2f_local_function_param_same_name_as_unrelated_global_array_stays_scalar(
+    tmp_path: Path,
+) -> None:
+    # User-reported real failure (xdelta_gamma.py's bs_call_put_price/
+    # bs_straddle_value): a local function's OWN parameter can share a
+    # spelling with an entirely unrelated top-level global array (here,
+    # both named "S") without the two ever being the same binding --
+    # Python scoping means the parameter always shadows the global
+    # within the function's own body. This project's own call-site rank-
+    # inference (used to guess an UNANNOTATED local function's parameter
+    # ranks) had a name-based fallback that ignored that scoping rule: a
+    # helper (`_name_direct_assign_spec`, inside `_local_return_maps`'s
+    # caller in xp2f.py) checked "is this name a known module-level
+    # constant?" BEFORE checking "is this name actually one of the
+    # CALLING function's own parameters?" -- so whenever a local
+    # function's parameter happened to share a spelling with a genuine
+    # top-level global, the global's rank leaked onto the (unrelated)
+    # parameter's inferred rank, even though the function was never
+    # called with an array anywhere. That corrupted the function's own
+    # Fortran signature (S(:) instead of scalar S), which then cascaded
+    # into every caller passing it a scalar -- including a tuple-return
+    # helper's own local variables receiving the promoted callee's
+    # output, producing "Rank mismatch in argument ... (rank-1 and
+    # scalar)" at compile time. Fixed by checking "is `_name` one of
+    # fn_node's own parameters?" FIRST, unconditionally ahead of the
+    # same-named-global fallback.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlocal_param_global_name_collision.py",
+        [
+            "import numpy as np",
+            "",
+            "def bs_call_put_price(S, K):",
+            "    call = S + K",
+            "    put = K - S",
+            "    return call, put",
+            "",
+            "def bs_straddle_value(S, K):",
+            "    c, p = bs_call_put_price(S, K)",
+            "    return c + p",
+            "",
+            "S0 = 100.0",
+            "K = 100.0",
+            "V0 = bs_straddle_value(S0, K)",
+            "",
+            "S = np.linspace(60.0, 140.0, 5)",
+            "pnl = np.array([bs_straddle_value(float(Si), K) - V0 for Si in S])",
+            "print(V0)",
+            "print(pnl)",
+        ],
+    )
+
+
+def test_xp2f_rename_conflicting_call_variable_preserves_type_bound_call_statement(
+    tmp_path: Path,
+) -> None:
+    # Real trigger found alongside the rank-collision fix above, in the
+    # same file (xdelta_gamma.py): a Python local variable literally
+    # named "call" (from `call, put = ...`) forces
+    # rename_conflicting_identifiers to rewrite every reference to
+    # "call" as "call_" -- including, wrongly, a TYPE-BOUND procedure
+    # invocation elsewhere in the same file (`print(df)` emitted as
+    # `call df%display(...)`), corrupting the Fortran CALL STATEMENT
+    # keyword into "call_ df%display(...)" (invalid syntax). The
+    # existing guard against this (added earlier this session for the
+    # plain `call subname(...)` shape) only matched a bare
+    # "IDENTIFIER(" tail, missing the "IDENTIFIER%member(" shape a
+    # type-bound call uses. Fixed by extending that guard's regex to
+    # allow one or more `%member` segments before the final `(`.
+    #
+    # Checks the generated source and a plain compile directly (rather
+    # than the usual _run_xp2f_compile_diff run-diff comparison): pandas'
+    # own DataFrame repr and this project's df%display use different
+    # float formatting for a printed DataFrame, a separate, pre-existing,
+    # purely cosmetic display difference unrelated to this fix.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xcall_var_type_bound_call.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "",
+                "def bs_price(S, K):",
+                "    call = S + K",
+                "    put = K - S",
+                "    return call, put",
+                "",
+                "df = pd.DataFrame({'a': [1.0, 2.0, 3.0]})",
+                "print(df)",
+                "c, p = bs_price(1.0, 2.0)",
+                "print(c, p)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    out_f90 = (tmp_path / "xcall_var_type_bound_call_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"\bcall\s+df\s*%\s*display\s*\(", out_f90), out_f90
+    assert "call_ df" not in out_f90, out_f90
+    assert re.search(r"\bcall_\s*=", out_f90), out_f90
+
+
+def test_xp2f_compiles_nested_function_used_as_callback(tmp_path: Path) -> None:
+    # User-reported real failure (xdelta_gamma.py's f_right/f_left, nested
+    # inside piecewise_breakpoints_straddle and passed BY NAME to a
+    # root-finder): a Python function defined INSIDE another function and
+    # later passed as a bare callback VALUE (not called immediately) is a
+    # closure this transpiler previously had no notion of at all -- the
+    # codegen silently dropped the nested function's whole body (down to
+    # a valueless `return`) while call sites still referenced the never-
+    # defined procedure name, producing both "no IMPLICIT type" compile
+    # errors and separately-corrupted control flow.
+    #
+    # Fixed with a new early tree-rewrite,
+    # rewrite_nested_callback_functions_to_toplevel: the nested def is
+    # hoisted to a fresh top-level sibling, its free (closure) variables
+    # renamed to fresh module-level globals (closure_{enclosing}_{var}),
+    # and a `global ...; closure_... = local_value` snapshot is inserted
+    # right before each call site that hands the nested def off as a
+    # value -- reusing this project's own pre-existing, already-correct
+    # `global`-write-to-module-variable codegen. This mirrors Python's
+    # own late-binding closure semantics (the callback sees whatever the
+    # enclosing local held at hand-off time).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnested_callback_closure.py",
+        [
+            "def bisect_root(f, a, b):",
+            "    fa = f(a)",
+            "    for i in range(60):",
+            "        mid = (a + b) / 2.0",
+            "        fm = f(mid)",
+            "        if fa * fm > 0.0:",
+            "            a = mid",
+            "            fa = fm",
+            "        else:",
+            "            b = mid",
+            "    return (a + b) / 2.0",
+            "",
+            "def find_root_near(target, lo, hi):",
+            "    def diff(x):",
+            "        return x * x - target",
+            "    return bisect_root(diff, lo, hi)",
+            "",
+            "result = find_root_near(2.0, 0.0, 10.0)",
+            "print(result)",
+        ],
+    )
+
+
+def test_fortran_rewrite_nested_callback_functions_hoists_and_threads_closure() -> None:
+    # Companion direct unit test: confirms the rewrite actually fires --
+    # the nested def moves to module (tree.body) scope, its closure
+    # variable is renamed consistently inside the hoisted body, and the
+    # enclosing function gets a `global` + snapshot-assignment statement
+    # inserted before the call site that hands the callback off.
+    src = (
+        "def outer(target, lo, hi):\n"
+        "    def diff(x):\n"
+        "        return x - target\n"
+        "    return solve(diff, lo, hi)\n"
+    )
+    tree = ast.parse(src)
+    new_tree = xp2f.rewrite_nested_callback_functions_to_toplevel(tree)
+    top_level_names = [
+        s.name for s in new_tree.body if isinstance(s, ast.FunctionDef)
+    ]
+    assert "diff" in top_level_names, top_level_names
+    assert top_level_names.index("diff") < top_level_names.index("outer"), top_level_names
+
+    hoisted = next(s for s in new_tree.body if isinstance(s, ast.FunctionDef) and s.name == "diff")
+    dumped_hoisted = ast.dump(hoisted)
+    assert "closure_outer_target" in dumped_hoisted, dumped_hoisted
+    assert "id='target'" not in dumped_hoisted, dumped_hoisted
+
+    outer_fn = next(s for s in new_tree.body if isinstance(s, ast.FunctionDef) and s.name == "outer")
+    dumped_outer = ast.dump(outer_fn)
+    assert "Global(names=['closure_outer_target'])" in dumped_outer, dumped_outer
+    assert "closure_outer_target" in dumped_outer, dumped_outer
+
+
+def test_fortran_rewrite_nested_callback_functions_leaves_directly_called_nested_def_alone() -> None:
+    # A nested def that's only ever CALLED directly (never handed off as
+    # a bare value) is left completely untouched -- this is the existing,
+    # already-working local-nested-function path, and must not be
+    # disturbed by the new closure-hoisting rewrite.
+    src = (
+        "def outer(x):\n"
+        "    def helper(y):\n"
+        "        return y * 2.0\n"
+        "    return helper(x)\n"
+    )
+    tree = ast.parse(src)
+    new_tree = xp2f.rewrite_nested_callback_functions_to_toplevel(tree)
+    top_level_names = [
+        s.name for s in new_tree.body if isinstance(s, ast.FunctionDef)
+    ]
+    assert top_level_names == ["outer"], top_level_names
+    outer_fn = new_tree.body[0]
+    nested_names = [s.name for s in outer_fn.body if isinstance(s, ast.FunctionDef)]
+    assert nested_names == ["helper"], nested_names
+
+
+def test_fortran_rewrite_nested_callback_functions_declines_on_further_nesting() -> None:
+    # Deliberately narrow (matching this session's established pattern):
+    # a nested def that itself contains a further nested def/lambda/
+    # comprehension is left completely untouched rather than risk an
+    # unsound hoist -- it still fails exactly as before, no silent
+    # miscompile.
+    src = (
+        "def outer(target, lo, hi):\n"
+        "    def diff(x):\n"
+        "        def inner():\n"
+        "            return 1.0\n"
+        "        return x - target + inner()\n"
+        "    return solve(diff, lo, hi)\n"
+    )
+    tree = ast.parse(src)
+    new_tree = xp2f.rewrite_nested_callback_functions_to_toplevel(tree)
+    top_level_names = [
+        s.name for s in new_tree.body if isinstance(s, ast.FunctionDef)
+    ]
+    assert top_level_names == ["outer"], top_level_names
+
+
 def test_xp2f_compiles_bare_sqrt_and_sum_calls(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xbare_math_small.py"
@@ -4559,6 +4795,40 @@ def test_fortran_simplify_redundant_dp_cast_general_covers_compound_expressions(
     for name in ("eh", "eh2", "emp_var_r2", "emp_kurt"):
         assign_line = next(ln for ln in out if re.match(rf"^\s*{name}\s*=", ln))
         assert "real(" not in assign_line, assign_line
+
+
+def test_fortran_simplify_redundant_dp_cast_general_covers_min_max_mod() -> None:
+    # Regression test: _DP_KIND_PRESERVING_INTRINSICS originally omitted
+    # min/max/mod (multi-arg intrinsics, more type-mixing risk than a
+    # single-arg one like exp/sqrt) out of caution. They belong: this
+    # pass's own job is only "does removing the OUTER real(..., kind=dp)
+    # cast change the expression's result kind" -- it never touches the
+    # call's own arguments, so whatever type-mixing risk the inner call
+    # already carried is a pre-existing property of the generated code,
+    # completely unaffected by whether the redundant outer cast stays or
+    # goes. Also confirms the cast is correctly PRESERVED when every
+    # argument is genuinely integer (the cast is then doing real work,
+    # not wrapping an already-dp value).
+    lines = [
+        "pure function f(a, b, c) result(z)",
+        "   real(kind=dp), intent(in) :: a, b, c",
+        "   real(kind=dp) :: z",
+        "   z = real(min(a, b), kind=dp)",
+        "   z = real(max(a, b), kind=dp) + real(mod(a, c), kind=dp)",
+        "end function f",
+        "pure function g(a, b) result(z)",
+        "   integer, intent(in) :: a, b",
+        "   real(kind=dp) :: z",
+        "   z = real(min(a, b), kind=dp)",
+        "end function g",
+    ]
+    out = xp2f.simplify_redundant_dp_cast_general(lines)
+    joined = "\n".join(out)
+    assert "z = min(a, b)" in joined, joined
+    assert "z = max(a, b) + mod(a, c)" in joined, joined
+    # The all-integer case in g() keeps its cast -- min(a,b) there is
+    # genuinely integer-typed, so the cast is doing real work.
+    assert "real(min(a, b), kind=dp)" in joined, joined
 
 
 def test_xp2f_simplifies_redundant_dp_cast_general_end_to_end(tmp_path: Path) -> None:
@@ -9750,6 +10020,113 @@ def test_xp2f_df_to_string_float_format_unrecognized_ignored_with_warning(tmp_pa
     assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
     assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
     assert "ignoring unsupported to_string(float_format=...)" in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_xp2f_pandas_df_print_truncates_and_to_string_prints_everything(tmp_path: Path) -> None:
+    # User-asked-for feature, surfaced while diagnosing xdelta_gamma.py:
+    # this project's DataFrame display() procedures already ATTEMPTED
+    # pandas-style truncation for plain print(df), but two things were
+    # wrong: (1) the trigger was "more than 10 rows", not pandas' actual
+    # default (display.max_rows=60) -- any 11-60 row frame was wrongly
+    # truncated; (2) the "[N rows x M columns]" footer was printed
+    # UNCONDITIONALLY, even for an untruncated frame, where real pandas
+    # never shows it. Separately, df.to_string() -- which real pandas
+    # always prints in FULL, no truncation, no footer -- was a no-op
+    # unwrap straight into the same (buggy) truncating print path, so it
+    # didn't actually behave like to_string() at all once a frame grew
+    # past the wrong 10-row trigger.
+    #
+    # Fixed: the trigger is now pdf_n > 60 (matching pandas' default
+    # max_rows), the footer only prints in the truncating branch, and
+    # print(df.to_string()) threads a new full=.true. argument through
+    # display()/display_pdf()/display_datetime() (all three DataFrame
+    # kinds' runtime procedures, plus xp2f.py's own inline codegen path
+    # for a known-column-list frame) to always print every row with no
+    # footer, regardless of row count.
+    #
+    # Not run through _run_xp2f_compile_diff/--run-diff: DataFrame print
+    # output has a known, pre-existing cosmetic float-formatting gap from
+    # Python's exact column widths (e.g. "1.0" vs "1.000000") -- unrelated
+    # to truncation, so this checks the truncation/footer/full-row
+    # structure directly instead.
+    # Two separate scripts (rather than one with both print(df_big) and
+    # print(df_big.to_string())): row 30 needs to be checked ABSENT from
+    # the plain-print output and PRESENT in the to_string() output, which
+    # a single concatenated stdout can't distinguish once both calls have
+    # run.
+    src_plain = tmp_path / "xdf_print_truncation_plain.py"
+    src_plain.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "",
+                "df_small = pd.DataFrame({'a': np.arange(30, dtype=float)})",
+                "print(df_small)",
+                "df_big = pd.DataFrame({'a': np.arange(70, dtype=float)})",
+                "print(df_big)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc_plain = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src_plain), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_plain.returncode == 0, proc_plain.stdout + proc_plain.stderr
+    assert "Build: PASS" in proc_plain.stdout, proc_plain.stdout + proc_plain.stderr
+    assert "Run: PASS" in proc_plain.stdout, proc_plain.stdout + proc_plain.stderr
+    out_plain = proc_plain.stdout
+
+    # df_small (30 rows, <= max_rows=60): printed in full, no footer --
+    # e.g. row 15 (a value this session's earlier bug would have cut,
+    # since it wrongly truncated past 10 rows) is present.
+    assert "15.000000" in out_plain, out_plain
+    assert "29.000000" in out_plain, out_plain
+    assert "[30 rows" not in out_plain, out_plain
+
+    # df_big (70 rows > 60): truncated to first/last 5, WITH the footer,
+    # and a row from the omitted middle (row 30) absent.
+    assert "[70 rows x 1 columns]" in out_plain, out_plain
+    assert "4.000000" in out_plain, out_plain
+    assert "65.000000" in out_plain, out_plain
+    assert "30.000000" not in out_plain, out_plain
+
+    src_tostr = tmp_path / "xdf_print_truncation_to_string.py"
+    src_tostr.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "import pandas as pd",
+                "",
+                "df_big = pd.DataFrame({'a': np.arange(70, dtype=float)})",
+                "print(df_big.to_string())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc_tostr = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src_tostr), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_tostr.returncode == 0, proc_tostr.stdout + proc_tostr.stderr
+    assert "Build: PASS" in proc_tostr.stdout, proc_tostr.stdout + proc_tostr.stderr
+    assert "Run: PASS" in proc_tostr.stdout, proc_tostr.stdout + proc_tostr.stderr
+    out_tostr = proc_tostr.stdout
+
+    # df_big.to_string(): every row present (row 30, cut from the plain
+    # print(df) above, now appears), and no footer at all.
+    assert "30.000000" in out_tostr, out_tostr
+    assert "69.000000" in out_tostr, out_tostr
+    assert "[70 rows" not in out_tostr, out_tostr
 
 
 def test_xp2f_rng_normal_positional_loc_scale_applied(tmp_path: Path) -> None:

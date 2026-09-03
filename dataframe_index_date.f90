@@ -2415,7 +2415,7 @@ self%values = vtmp
 deallocate(vtmp, perm)
 end subroutine sort_values
 
-subroutine display_pdf_date(self, ndigits)
+subroutine display_pdf_date(self, ndigits, full)
 ! pandas-style print(df): reads %columns from runtime data rather than a
 ! caller-supplied format string, so it works even when the column list
 ! is only known at runtime (e.g. after df.dropna(axis=1), whose
@@ -2425,13 +2425,25 @@ subroutine display_pdf_date(self, ndigits)
 ! in that situation. Distinct from the pre-existing display=>display_data
 ! binding, which predates pandas-print support and uses a different,
 ! non-pandas-matching layout.
+!
+! full=.true. (used for df.to_string()) prints every row with no
+! truncation and no trailing "[N rows x M columns]" footer, matching
+! pandas' own to_string() exactly. Otherwise (plain print(df)), mirrors
+! pandas' default display.max_rows=60/min_rows=10: a frame of 60 rows or
+! fewer prints in full with no footer either (pandas only shows the
+! footer when it actually truncates); a longer frame shows the first/
+! last 5 rows with a "..." row between them, then the footer.
 class(DataFrame_index_date), intent(in) :: self
 integer, intent(in), optional :: ndigits
+logical, intent(in), optional :: full
 integer :: nd, col_width, n_cols, pdf_n, pdf_i
+logical :: full_
 character(len=:), allocatable :: header_fmt, row_fmt, dots_fmt
 character(len=32) :: nc_str, cw_str, nd_str
 
 nd = default(6, ndigits)
+full_ = .false.
+if (present(full)) full_ = full
 col_width = max(10, nd + 8)
 n_cols = size(self%columns)
 pdf_n = nrow(self)
@@ -2445,7 +2457,7 @@ row_fmt = '(A10,'//trim(nc_str)//'F'//trim(cw_str)//'.'//trim(nd_str)//')'
 dots_fmt = '(A10,'//trim(nc_str)//'A'//trim(cw_str)//')'
 
 write (*, header_fmt) '', (trim(self%columns(pdf_i)), pdf_i=1, n_cols)
-if (pdf_n <= 10) then
+if (full_ .or. pdf_n <= 60) then
    do pdf_i = 1, pdf_n
       write (*, row_fmt) self%index(pdf_i)%to_str(), self%values(pdf_i, :)
    end do
@@ -2457,9 +2469,9 @@ else
    do pdf_i = pdf_n - 4, pdf_n
       write (*, row_fmt) self%index(pdf_i)%to_str(), self%values(pdf_i, :)
    end do
+   write (*, *)
+   write (*, '(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', n_cols, ' columns]'
 end if
-write (*, *)
-write (*, '(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', n_cols, ' columns]'
 end subroutine display_pdf_date
 
 pure function reindex(self, new_index, method, fill_value) result(df_new)

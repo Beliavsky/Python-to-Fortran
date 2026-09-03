@@ -551,15 +551,29 @@ contains
    ! %columns entry (read at runtime, not baked into a literal format string
    ! per call site -- see xp2f.py's _emit_pandas_df_print, which used to
    ! inline this whole block at every print(df) call).
-   subroutine display_str_index(self, ndigits)
+   subroutine display_str_index(self, ndigits, full)
+      ! full=.true. (used for df.to_string()) prints every row with no
+      ! truncation and no trailing "[N rows x M columns]" footer, matching
+      ! pandas' own to_string() exactly. Otherwise (plain print(df)),
+      ! mirrors pandas' default display.max_rows=60/min_rows=10: a frame
+      ! of 60 rows or fewer prints in full with no footer either (pandas
+      ! only shows the footer when it actually truncates); a longer frame
+      ! shows the first/last 5 rows with a "..." row between them, then
+      ! the footer. The previous threshold (truncate whenever pdf_n > 10)
+      ! didn't match pandas' real trigger (> max_rows, i.e. > 60) and
+      ! always printed the footer even when nothing was cut.
       class(DataFrame_str_index), intent(in) :: self
       integer, intent(in), optional :: ndigits
+      logical, intent(in), optional :: full
       integer :: nd, col_width, idx_width, n_cols, pdf_n, pdf_i
+      logical :: full_
       character(len=:), allocatable :: header_fmt, row_fmt, dots_fmt
       character(len=32) :: nc_str, cw_str, iw_str, nd_str
 
       nd = 6
       if (present(ndigits)) nd = ndigits
+      full_ = .false.
+      if (present(full)) full_ = full
       col_width = max(10, nd + 8)
       idx_width = 24
       n_cols = size(self%columns)
@@ -575,7 +589,7 @@ contains
       dots_fmt = '(A'//trim(iw_str)//','//trim(nc_str)//'A'//trim(cw_str)//')'
 
       write (*, header_fmt) '', (trim(self%columns(pdf_i)), pdf_i=1, n_cols)
-      if (pdf_n <= 10) then
+      if (full_ .or. pdf_n <= 60) then
          do pdf_i = 1, pdf_n
             write (*, row_fmt) trim(self%index(pdf_i)), self%values(pdf_i, :)
          end do
@@ -583,13 +597,23 @@ contains
          do pdf_i = 1, 5
             write (*, row_fmt) trim(self%index(pdf_i)), self%values(pdf_i, :)
          end do
-         write (*, dots_fmt) '...', ('...', pdf_i=1, n_cols)
+         ! Real pandas' truncation-row index-column ellipsis marker is ".."
+         ! (two dots) for the common case this type represents -- a
+         ! DataFrame with no explicit index= (stringified default
+         ! RangeIndex), verified directly against a live pandas repr.
+         ! pandas' marker for a GENUINE string/object-labeled index isn't
+         ! consistently ".." or "..." (observed both, depending on the
+         ! label values themselves, in a way not worth chasing further for
+         ! one truncation-row's cosmetic index label) -- this project
+         ! doesn't distinguish that case from a stringified RangeIndex at
+         ! the type level, so ".." is used uniformly here.
+         write (*, dots_fmt) '..', ('...', pdf_i=1, n_cols)
          do pdf_i = pdf_n - 4, pdf_n
             write (*, row_fmt) trim(self%index(pdf_i)), self%values(pdf_i, :)
          end do
+         write (*, *)
+         write (*, '(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', n_cols, ' columns]'
       end if
-      write (*, *)
-      write (*, '(A,I0,A,I0,A)') '[', pdf_n, ' rows x ', n_cols, ' columns]'
    end subroutine display_str_index
 
 end module dataframe_str_index_mod
