@@ -1098,14 +1098,30 @@ def simplify_redundant_parens_in_stmt(stmt: str) -> str:
     return s
 
 
+_SIGNED_ATOM_RE = re.compile(
+    r"[a-z][a-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[de][+-]?[0-9]+)?(?:_[a-z][a-z0-9_]*)?",
+    re.IGNORECASE,
+)
+
+
 def _can_drop_inline_parens(expr: str) -> bool:
     """Conservatively decide whether `(expr)` can be inlined in arithmetic."""
     s = expr.strip()
     if not s:
         return False
     # Keep conservative: avoid cases with + or - inside, commas, relations, logicals.
-    if re.search(r"[,+<>=]|\.and\.|\.or\.|\.not\.", s, re.IGNORECASE):
+    if re.search(r"[,<>=]|\.and\.|\.or\.|\.not\.", s, re.IGNORECASE):
         return False
+    # A single LEADING unary sign on an otherwise plain atom (e.g. "-a",
+    # "+1.5_dp") is always safe to inline -- unary +/- binds tighter than
+    # */÷ in Fortran, same as most languages, so a paren wrapping just
+    # that was never load-bearing as an operand of a multiplicative
+    # expression. Only a sign that's the very first character, on a
+    # SINGLE token with nothing else after it, qualifies; a genuine
+    # binary +/- appearing anywhere else in the expression still
+    # disqualifies it below, same as before this carve-out.
+    if s[0] in "+-" and _SIGNED_ATOM_RE.fullmatch(s[1:]):
+        return True
     if "+" in s or "-" in s:
         return False
     return True
@@ -1131,9 +1147,14 @@ def simplify_redundant_parens_in_line(line: str) -> str:
         s = ns
 
     # Remove parentheses around inline multiplicative/power expressions in
-    # arithmetic contexts, e.g. "(b**2) - ((4.0_dp * a) * c)".
+    # arithmetic contexts, e.g. "(b**2) - ((4.0_dp * a) * c)". Boundary
+    # classes include "(" (lookbehind) and ")" (lookahead) too, matching
+    # atom_pat just above -- without them, a nested group immediately
+    # inside an enclosing call/group, e.g. "exp((-a) * b)"'s "(-a)"
+    # (preceded by exp's own opening paren), was never even considered a
+    # candidate at all.
     inline_expr_pat = re.compile(
-        r"(?:(?<=^)|(?<=[\s=,+\-*/]))\(\s*([^()]+?)\s*\)(?:(?=$)|(?=[\s,+\-*/]))",
+        r"(?:(?<=^)|(?<=[\s=,+\-*/(]))\(\s*([^()]+?)\s*\)(?:(?=$)|(?=[\s,+\-*/)]))",
         re.IGNORECASE,
     )
 
@@ -1150,8 +1171,14 @@ def simplify_redundant_parens_in_line(line: str) -> str:
 
     # Unwrap one redundant nested layer around multiplicative groups:
     # "((X) * Y)" -> "(X) * Y", then previous passes can simplify further.
+    # The operator group tries "**" before a lone "*"/"/" -- otherwise, on
+    # e.g. "((z_prev - theta) ** 2)", `[*/]` (a single character class)
+    # matched only the FIRST "*" of "**" as the "operator", leaving the
+    # second "*" to be swept into group 3's `[^()]+?` capture instead,
+    # and the substitution reproduced it as a corrupt "* *" -- a genuine
+    # syntax error, not just a style regression.
     nested_mul_pat = re.compile(
-        r"\(\s*\(\s*([^()]+?)\s*\)\s*([*/])\s*([^()]+?)\s*\)",
+        r"\(\s*\(\s*([^()]+?)\s*\)\s*(\*\*|[*/])\s*([^()]+?)\s*\)",
         re.IGNORECASE,
     )
     prev = None
@@ -1752,8 +1779,20 @@ def coalesce_simple_declarations(
     - only one declared entity per line
     - entity may include simple shape, e.g. `a(:)` or `x(1:n)`
     - skips lines with inline comments
-    - skips initialized entities (`= ...`)
+    - skips ARRAY-shaped initialized entities (`x(3) = [1, 2, 3]`), since
+      lining up a shape spec with its initializer across a merged comma
+      list isn't attempted here
     - preserves non-declaration lines and order
+
+    A SCALAR initialized entity (`NAME = VALUE`) merges freely with other
+    entities of the same type-spec, initialized or not -- Fortran applies
+    (implicit or explicit) SAVE per-entity, not per-statement, so an
+    uninitialized entity sharing a merged line with an initialized one
+    never itself acquires SAVE just from the proximity; splitting or
+    combining these is a purely cosmetic rewrite. E.g. `real, save :: x =
+    1.0` / `real, save :: y = 2.0` merge into `real, save :: x = 1.0, y =
+    2.0`, and `real :: x` / `real :: y = 3.0` merge into `real :: x, y =
+    3.0`.
 
     `never_merge_names` (matched case-insensitively against each entity's
     bare name) are never combined onto a shared line with anything else --
@@ -1764,7 +1803,7 @@ def coalesce_simple_declarations(
     out: List[str] = []
     i = 0
     decl_re = re.compile(
-        r"^(\s*)([^:][^:]*)\s*::\s*([a-z][a-z0-9_]*(?:\s*\([^)]*\))?)\s*$",
+        r"^(\s*)([^:][^:]*)\s*::\s*([a-z][a-z0-9_]*(?:\s*\([^)]*\))?(?:\s*=\s*.+)?)\s*$",
         re.IGNORECASE,
     )
     while i < len(lines):
@@ -1785,15 +1824,25 @@ def coalesce_simple_declarations(
         indent = m.group(1)
         spec = m.group(2).strip()
         entity = m.group(3).strip()
+        def _name_part(ent: str) -> str:
+            # Everything before a scalar initializer's "=" -- the bare
+            # name plus any array-shape suffix. (entity may legally
+            # contain commas inside a shape, e.g. a(:,:), so this can't
+            # just split on the first "=" blindly if a shape's own
+            # bounds expression somehow contained one -- in practice
+            # shape bounds never do, so a plain split is safe here.)
+            return ent.split("=", 1)[0].strip() if "=" in ent else ent
         def _shape_sig(ent: str) -> str:
-            mm = re.match(r"\s*[a-z][a-z0-9_]*(.*)\s*$", ent, re.IGNORECASE)
+            mm = re.match(r"\s*[a-z][a-z0-9_]*(.*)\s*$", _name_part(ent), re.IGNORECASE)
             return (mm.group(1).strip() if mm else "").lower()
         def _bare_name(ent: str) -> str:
-            return ent.split("(", 1)[0].strip().lower()
+            return _name_part(ent).split("(", 1)[0].strip().lower()
+        def _is_array_initialized(ent: str) -> bool:
+            # A shape-and-initializer combo (`x(3) = [1, 2, 3]`) is left
+            # alone -- see docstring.
+            return "=" in ent and "(" in _name_part(ent)
         shape_sig = _shape_sig(entity)
-        # Skip initialized declarations.
-        # Note: entity may legally contain commas inside shape, e.g. a(:,:).
-        if "=" in entity:
+        if _is_array_initialized(entity):
             out.append(line)
             i += 1
             continue
@@ -1818,7 +1867,7 @@ def coalesce_simple_declarations(
             entj = mj.group(3).strip()
             if _shape_sig(entj) != shape_sig:
                 break
-            if "=" in entj:
+            if _is_array_initialized(entj):
                 break
             if _bare_name(entj) in never_merge:
                 break
@@ -4130,6 +4179,19 @@ def remove_empty_if_blocks(lines: List[str]) -> List[str]:
 def wrap_long_fortran_line(body: str, max_len: int = 80) -> Optional[List[str]]:
     """Wrap one long free-form Fortran line with `&` continuation.
 
+    Prefers an ordinary break outside any quoted string (between tokens,
+    after a comma, etc. -- see _break_candidates_for_wrap). When the
+    overflow is caused by a single quoted string literal too long to fit
+    in the column budget on its own (e.g. a long `write(*, "(...)")`
+    format descriptor) and no such outside-quote break exists, falls
+    back to splitting INSIDE the string using Fortran's own string-
+    continuation rule: end the line with `&` while still inside the
+    quotes, and resume on a line whose first non-blank character is also
+    `&` -- literal content resumes IMMEDIATELY after that second `&`,
+    with NO characters (not even a space) inserted, unlike an ordinary
+    code continuation's `& ` convention. The interior cut point is never
+    placed between the two halves of a doubled ''/"" escaped quote.
+
     Returns `None` when no conservative wrap point is found.
     """
     if len(body) <= max_len:
@@ -4142,30 +4204,83 @@ def wrap_long_fortran_line(body: str, max_len: int = 80) -> Optional[List[str]]:
     lines: List[str] = []
     cur = body
     first = True
+    # None outside any string; the quote character ('/") when `cur`
+    # begins already inside a string literal resumed from the previous
+    # continuation line (content starts right at `scan_from`, past the
+    # literal "cont_indent&" continuation marker -- never itself part of
+    # the string).
+    resuming_quote: Optional[str] = None
 
     while len(cur) > max_len:
-        prefix = indent if first else (cont_indent + "& ")
+        if first:
+            prefix = indent
+            scan_from = 0
+        elif resuming_quote:
+            prefix = cont_indent + "&"
+            scan_from = len(prefix)
+        else:
+            prefix = cont_indent + "& "
+            scan_from = 0
         min_split = len(prefix) + 8
-        max_split = max_len - 2  # reserve for trailing " &"
+        max_split = max_len - 2  # reserve for trailing " &" (or "&" when string-internal)
         if max_split <= min_split:
             return None
-        cands = _break_candidates_for_wrap(cur, min_split, max_split)
-        if not cands:
-            return None
-        cut = _preferred_named_arg_break(cur, min_split, max_split)
+        cands = _break_candidates_for_wrap(cur, min_split, max_split, scan_from=scan_from, initial_quote=resuming_quote)
+        cut: Optional[int] = None
+        cut_quote: Optional[str] = None
+        if cands:
+            cut = _preferred_named_arg_break(cur, min_split, max_split, scan_from=scan_from, initial_quote=resuming_quote)
+            if cut is None:
+                # Prefer the rightmost candidate (closest to the column
+                # limit, as before), but never one that strands a bare
+                # closing paren/bracket alone at the start of the
+                # continuation line -- a run of several consecutive
+                # ")"/"]" (e.g. "theta * theta)))") can leave the
+                # *individually* preferred cut sitting between two of
+                # them even though no single ")" is itself a break
+                # candidate anymore. Walk backward through the
+                # candidates for the first one that doesn't have this
+                # problem; fall back to the original rightmost choice if
+                # every candidate does (an ugly wrap is still far better
+                # than failing to wrap the line at all).
+                cut = cands[-1]
+                for _c in reversed(cands):
+                    if not cur[_c:].lstrip().startswith((")", "]")):
+                        cut = _c
+                        break
+        else:
+            string_cut = _string_internal_cut(cur, min_split, max_split, scan_from=scan_from, initial_quote=resuming_quote)
+            if string_cut is not None:
+                cut, cut_quote = string_cut
+
         if cut is None:
-            cut = cands[-1]
-        left = cur[:cut].rstrip()
-        right = cur[cut:].lstrip()
-        if not left or not right:
             return None
-        lines.append(f"{left} &")
-        cur = f"{cont_indent}& {right}"
+
+        if cut_quote is not None:
+            # Splitting INSIDE a string literal: every character on both
+            # sides is significant literal content (or, on the left, the
+            # untouched "cont_indent&" resume marker) -- never
+            # rstrip/lstrip, and the continuation "&" gets no trailing
+            # space, unlike an ordinary code continuation.
+            left, right = cur[:cut], cur[cut:]
+            if not left or not right:
+                return None
+            lines.append(f"{left}&")
+            cur = f"{cont_indent}&{right}"
+            resuming_quote = cut_quote
+        else:
+            left = cur[:cut].rstrip()
+            right = cur[cut:].lstrip()
+            if not left or not right:
+                return None
+            lines.append(f"{left} &")
+            cur = f"{cont_indent}& {right}"
+            resuming_quote = None
         first = False
 
     lines.append(cur)
     return lines
-    
+
 def wrap_long_fortran_lines(lines: List[str], max_len: int = 80) -> List[str]:
     """Wrap long free-form Fortran lines; keep unwrappable lines unchanged."""
     out: List[str] = []
@@ -4188,12 +4303,24 @@ def _is_comment_or_preproc_body(body: str) -> bool:
         return False
     return s.startswith("!") or s.startswith("#")
 
-def _break_candidates_for_wrap(body: str, start: int, end: int) -> List[int]:
-    """Safe split points outside quoted strings."""
+def _break_candidates_for_wrap(
+    body: str, start: int, end: int, scan_from: int = 0, initial_quote: Optional[str] = None
+) -> List[int]:
+    """Safe split points outside quoted strings.
+
+    `scan_from`/`initial_quote`: when `body` itself begins already
+    inside a string literal resumed from a previous continuation line
+    (see wrap_long_fortran_line), quote-state tracking must start at
+    `scan_from` (skipping over the literal "cont_indent&" resume marker,
+    which is continuation syntax, never string content) already inside
+    `initial_quote` -- otherwise the first real quote character
+    encountered (the string's own closing quote) would be misread as
+    opening a brand new string.
+    """
     out: List[int] = []
-    in_single = False
-    in_double = False
-    i = 0
+    in_single = initial_quote == "'"
+    in_double = initial_quote == '"'
+    i = scan_from
     while i < len(body):
         ch = body[i]
         if ch == "'" and not in_double:
@@ -4234,26 +4361,47 @@ def _break_candidates_for_wrap(body: str, start: int, end: int) -> List[int]:
                     if k >= 0 and (body[k].isdigit() or body[k] == "."):
                         i += 1
                         continue
-            if ch == ",":
-                # Break right after the comma, not at it: cur[:cut]/
-                # cur[cut:] slicing in wrap_long_fortran_line means a
-                # cut *at* the comma index puts the comma on the
-                # continuation line (`... item &` / `& , next`), which
-                # reads oddly -- Fortran style, like most languages,
-                # keeps a trailing comma attached to the item before
-                # it (`... item, &` / `& next`).
-                out.append(i + 1)
-            elif ch.isspace() or ch in "+-*/)=]":
+            if ch in ",)]":
+                # Break right after a comma/closing-paren/closing-bracket,
+                # not at it: cur[:cut]/cur[cut:] slicing in
+                # wrap_long_fortran_line means a cut *at* the character's
+                # own index puts IT on the continuation line (`... item &`
+                # / `& , next` or `& ) next`), which reads oddly -- Fortran
+                # style, like most languages, keeps a trailing delimiter
+                # attached to what precedes it (`... item, &` / `& next`,
+                # or `... f(x) &` / `& + y` rather than stranding a lone
+                # `)` at the start of the continuation line). The
+                # resulting candidate is i+1, not i -- only offer it when
+                # i+1 still fits the window (i == end would otherwise
+                # silently produce a cut one column past the budget).
+                if i + 1 <= end:
+                    out.append(i + 1)
+            elif ch.isspace() or ch in "+-*/=":
+                if ch == "=" and i > 0 and body[i - 1] in "<>=/":
+                    # Never split between the two characters of a
+                    # combined comparison operator ("<=", ">=", "==",
+                    # "/=") -- offering the "=" itself as a break point
+                    # puts it alone at the START of the continuation
+                    # line, stranding "<"/">"/"="/"/" at the end of the
+                    # PREVIOUS line as an invalid, syntactically
+                    # different token on its own.
+                    i += 1
+                    continue
                 out.append(i)
         i += 1
     return out
 
-def _preferred_named_arg_break(body: str, start: int, end: int) -> Optional[int]:
-    """Prefer wrapping after a comma before a `name = value` argument."""
-    in_single = False
-    in_double = False
+def _preferred_named_arg_break(
+    body: str, start: int, end: int, scan_from: int = 0, initial_quote: Optional[str] = None
+) -> Optional[int]:
+    """Prefer wrapping after a comma before a `name = value` argument.
+
+    See _break_candidates_for_wrap for what scan_from/initial_quote do.
+    """
+    in_single = initial_quote == "'"
+    in_double = initial_quote == '"'
     best: Optional[int] = None
-    i = 0
+    i = scan_from
     n = len(body)
     while i < n:
         ch = body[i]
@@ -4279,6 +4427,77 @@ def _preferred_named_arg_break(body: str, start: int, end: int) -> Optional[int]
                 best = i + 1  # keep comma on the left line
         i += 1
     return best
+
+
+def _quoted_spans(body: str, scan_from: int = 0, initial_quote: Optional[str] = None) -> List[Tuple[int, int, str]]:
+    """Return (start, end_exclusive, quote_char) for each top-level
+    quoted string literal in body[scan_from:], honoring doubled-quote
+    ('' / "") escapes. `start` is the index of the opening quote (or, if
+    `initial_quote` is set and the span is the one already open at
+    `scan_from`, just `scan_from` itself -- there's no real opening
+    quote character there, it opened on a previous continuation line).
+    `end_exclusive` is one past the closing quote, or `len(body)` for a
+    trailing string that isn't closed within body (still open at the
+    end -- needs yet another continuation).
+    """
+    spans: List[Tuple[int, int, str]] = []
+    n = len(body)
+    i = scan_from
+    q = initial_quote
+    span_start = scan_from if initial_quote else None
+    while i < n:
+        ch = body[i]
+        if q is None:
+            if ch in "'\"":
+                q = ch
+                span_start = i
+            i += 1
+            continue
+        if ch == q:
+            if i + 1 < n and body[i + 1] == q:
+                i += 2
+                continue
+            spans.append((span_start, i + 1, q))
+            q = None
+            span_start = None
+            i += 1
+            continue
+        i += 1
+    if q is not None:
+        spans.append((span_start, n, q))
+    return spans
+
+
+def _string_internal_cut(
+    body: str, min_split: int, max_split: int, scan_from: int = 0, initial_quote: Optional[str] = None
+) -> Optional[Tuple[int, str]]:
+    """A safe index to split INSIDE a quoted-string literal spanning
+    across max_split, for use as a last resort when
+    _break_candidates_for_wrap finds no safe break outside any string
+    (e.g. a long `write(*, "(...)")` format descriptor). Fortran's
+    string-continuation rule resumes with NO inserted characters, so the
+    cut must never land between the two halves of a doubled ''/""
+    escape. Returns (cut_index, quote_char), or None if max_split
+    doesn't fall inside an open string, or no safe interior cut exists.
+    """
+    for s, e, q in _quoted_spans(body, scan_from=scan_from, initial_quote=initial_quote):
+        if not (s < max_split < e):
+            continue
+        # The first valid interior cut is right after the real opening
+        # quote (s + 1) -- unless this is the span already open at
+        # scan_from (initial_quote case), which has no real opening
+        # quote character occupying a slot, so content starts at s itself.
+        first_content = s if (initial_quote and s == scan_from) else s + 1
+        lo = max(first_content, min_split)
+        hi = min(e - 1, max_split)
+        for cut in range(hi, lo - 1, -1):
+            if cut <= 0 or cut >= len(body):
+                continue
+            if body[cut - 1] == q and body[cut] == q:
+                continue
+            return cut, q
+        return None
+    return None
 
 
 def simplify_negated_relational_conditions_in_line(line: str) -> str:

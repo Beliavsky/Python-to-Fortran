@@ -37,6 +37,7 @@ from datetime import datetime
 from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import fortran_output as fout
 import fortran_post as fpost
+import fortran_purity as fpurity
 from fortran_scan import (
     _is_wrapped_by_outer_parens,
     coalesce_simple_declarations,
@@ -56,6 +57,61 @@ PERCENT_FLOAT_INT_FORMAT = False
 _ROUND_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
 )
+
+# Vendored runtime .f90 helper files a generated program may end up linked
+# against (see the "Auto helper files:" mechanism). Their OWN pure/non-pure
+# declarations are read directly as ground truth for
+# fortran_purity.mark_pure_where_provable's external-call registry, rather
+# than a separately hand-maintained guess -- loaded once and cached, since
+# these files don't change over the life of one interpreter run.
+_VENDORED_RUNTIME_HELPER_FILENAMES = (
+    "python.f90",
+    "lapack_d.f90",
+    "lbfgsb.f90",
+    "bfgs.f90",
+    "fmin.f90",
+    "minpack.f90",
+    "dataframe_index_date.f90",
+    "dataframe_index_datetime.f90",
+    "dataframe_str_index.f90",
+    "bfgs_bridge.f90",
+    "lbfgsb_bridge.f90",
+    "brentq_bridge.f90",
+    "powell_bridge.f90",
+    "curvefit_bridge.f90",
+    "fsolve_bridge.f90",
+    "root.f90",
+)
+_vendored_purity_registry_cache = None
+
+
+def _vendored_purity_registry():
+    global _vendored_purity_registry_cache
+    if _vendored_purity_registry_cache is None:
+        paths = [
+            Path(__file__).resolve().with_name(nm)
+            for nm in _VENDORED_RUNTIME_HELPER_FILENAMES
+        ]
+        _vendored_purity_registry_cache = fpurity.load_external_purity_registry(paths)
+    return _vendored_purity_registry_cache
+
+
+_vendored_dp_returning_registry_cache = None
+
+
+def _vendored_dp_returning_registry():
+    global _vendored_dp_returning_registry_cache
+    if _vendored_dp_returning_registry_cache is None:
+        names = set()
+        for nm in _VENDORED_RUNTIME_HELPER_FILENAMES:
+            path = Path(__file__).resolve().with_name(nm)
+            try:
+                text = path.read_text(encoding="utf-8-sig")
+            except OSError:
+                continue
+            names |= fpurity.collect_dp_returning_function_names(text.splitlines())
+        _vendored_dp_returning_registry_cache = names
+    return _vendored_dp_returning_registry_cache
 
 
 def _round_float_token(token: str, digits: int) -> str:
@@ -88,6 +144,1264 @@ def normalize_numpy_removed_aliases(src_text):
         return alias_map[attr].format(root=root)
 
     return pat.sub(_repl, src_text)
+
+
+def simplify_narrow_redundant_arith_parens(lines):
+    """Strip parentheses in three narrow, hand-verified-safe shapes:
+
+    (1) A single negated bare atom, `(-NAME)` or `(-NUMBER)`, unwrapped to
+        `-NAME`/`-NUMBER` -- unary minus always binds tighter than every
+        binary operator in Fortran, and negating a SINGLE atom has no
+        internal structure or associativity to disturb, so this is safe
+        in any context except immediately after another +/- (which could
+        otherwise create an ambiguous double-sign token run like `- -a`).
+
+    (2) A `*`/`/`-only sub-expression (no top-level +/-/, inside) as the
+        right-hand operand of a genuinely BINARY `+` or `-`, unwrapped to
+        drop its parens -- `+`/`-` bind lower than `*`/`/`, so the
+        grouped sub-expression evaluates as a unit either way, with NO
+        change to floating-point evaluation order.
+
+    (3) A single UNSIGNED bare atom, `(NAME)` or `(NUMBER)` with no
+        internal `-`, unwrapped to `NAME`/`NUMBER` in ANY context (not
+        just after +/-) -- a lone token has no internal structure or
+        associativity to disturb no matter what surrounds it, e.g.
+        `size(x) - (k)` -> `size(x) - k`. Still guarded against a
+        function/array-call's own argument-list parens (never touched --
+        see the same check in rule (1)).
+
+    Deliberately narrower than it might look: an earlier attempt reused
+    fortran_scan's existing (but never previously wired in anywhere)
+    simplify_redundant_parens_in_line for this, and wiring it in surfaced
+    a real, silent correctness bug -- it stripped parens around a `*`/`/`
+    group regardless of what operator preceded it, including `eh2 / (eh *
+    eh)` -> `eh2 / eh * eh`. Division is left-associative at the SAME
+    precedence as multiplication, so that change is NOT equivalent (`/eh
+    * eh` cancels to a no-op instead of dividing by eh squared) -- a
+    silent wrong-value bug, not just a style regression, only caught by
+    diffing full program output against Python. Even where mathematically
+    equivalent for real numbers (e.g. `X * (A / B)` vs `X * A / B`),
+    reordering floating-point operations can shift the last few bits of
+    a result, which this project's --run-diff verification against real
+    Python treats as a genuine mismatch. Restricting pattern (2) to a
+    `+`/`-` (never `*`/`/`) preceding context sidesteps both risks
+    entirely: the grouped sub-expression always computes in the exact
+    same internal order whether or not the decorative parens are there.
+    """
+    neg_atom_re = re.compile(
+        r"\(-([A-Za-z][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eEdD][+-]?[0-9]+)?(?:_[A-Za-z]\w*)?)\)"
+    )
+    bare_atom_re = re.compile(
+        r"\(\s*([A-Za-z][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]*)?(?:[eEdD][+-]?[0-9]+)?(?:_[A-Za-z]\w*)?)\s*\)"
+    )
+    # Fortran statement keywords whose very next "(" is MANDATORY syntax
+    # (the condition/mask delimiter), never a decorative/redundant
+    # grouping paren -- "if (x) then" -> "if x then" is not a style
+    # regression, it's invalid Fortran. Checked against the WORD
+    # immediately before the "(" (skipping whitespace), so "elseif"/
+    # "else if" (last word "if"), "do while" (last word "while"), and
+    # "select case"/"case" are all covered by their own last word.
+    _MANDATORY_PAREN_KEYWORDS = {"if", "where", "elsewhere", "while", "select", "case", "forall"}
+
+    def _preceded_by_mandatory_paren_keyword(code, paren_idx):
+        j = paren_idx - 1
+        while j >= 0 and code[j] in " \t":
+            j -= 1
+        if j < 0:
+            return False
+        k = j
+        while k >= 0 and (code[k].isalnum() or code[k] == "_"):
+            k -= 1
+        word = code[k + 1 : j + 1]
+        return word.lower() in _MANDATORY_PAREN_KEYWORDS
+
+    def _string_mask(code):
+        # True at every index that lies inside a '...'/"..." string
+        # literal (Fortran doubled-quote escape honored) -- both rewrite
+        # rules below must never touch a "(" that's really just text
+        # inside a quoted literal, e.g. the "(a)" format descriptor in
+        # `write(*, "(a)") ...`.
+        mask = [False] * len(code)
+        in_single = in_double = False
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if ch == "'" and not in_double:
+                mask[i] = True
+                if in_single and i + 1 < n and code[i + 1] == "'":
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                mask[i] = True
+                if in_double and i + 1 < n and code[i + 1] == '"':
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                mask[i] = True
+            i += 1
+        return mask
+
+    def _process_code(code):
+        neg_mask = _string_mask(code)
+
+        def _neg_repl(m):
+            if neg_mask[m.start()]:
+                return m.group(0)
+            # A "(" immediately (no whitespace) preceded by an
+            # identifier character is a function/array-call's own
+            # argument-list paren -- e.g. "acos(-1.0_dp)" -- never a
+            # decorative wrapper to strip; removing it would delete the
+            # call's parens entirely, not just some redundant grouping.
+            if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] == "_"):
+                return m.group(0)
+            if _preceded_by_mandatory_paren_keyword(code, m.start()):
+                return m.group(0)
+            j = m.start() - 1
+            while j >= 0 and code[j] in " \t":
+                j -= 1
+            if j >= 0 and code[j] in "+-":
+                return m.group(0)
+            return f"-{m.group(1)}"
+
+        code = neg_atom_re.sub(_neg_repl, code)
+
+        atom_mask = _string_mask(code)
+
+        def _atom_repl(m):
+            if atom_mask[m.start()]:
+                return m.group(0)
+            # Same call-paren exclusion as _neg_repl above: a "(" with no
+            # whitespace immediately before it, preceded by an identifier
+            # character, belongs to a function/array-call's own
+            # argument-list, e.g. "size(k)" or "sqrt(n)" -- never strip
+            # that. A decorative wrapper always has something else (an
+            # operator, comma, "=", "(", or start-of-line) right before
+            # it once whitespace is skipped.
+            if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] == "_"):
+                return m.group(0)
+            if _preceded_by_mandatory_paren_keyword(code, m.start()):
+                return m.group(0)
+            return m.group(1)
+
+        code = bare_atom_re.sub(_atom_repl, code)
+
+        matches = []
+        i = 0
+        n = len(code)
+        while i < n:
+            if code[i] != "(":
+                i += 1
+                continue
+            j = i - 1
+            while j >= 0 and code[j] in " \t":
+                j -= 1
+            if j < 0 or code[j] not in "+-":
+                i += 1
+                continue
+            # Require the +/- found just before "(" to be genuinely
+            # BINARY (a real "add/subtract this term" use), not a unary
+            # sign itself -- i.e. the character before THAT +/- must not
+            # itself be an operator/comma/open-paren/start-of-statement.
+            k = j - 1
+            while k >= 0 and code[k] in " \t":
+                k -= 1
+            if k < 0 or code[k] in "+-*/(,=":
+                i += 1
+                continue
+            depth = 0
+            p = i
+            while p < n:
+                if code[p] == "(":
+                    depth += 1
+                elif code[p] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                p += 1
+            if p >= n:
+                i += 1
+                continue
+            inner = code[i + 1:p].strip()
+            if not inner or re.search(r"[+\-,]", inner) or ".and." in inner.lower() or ".or." in inner.lower():
+                i = p + 1
+                continue
+            if not re.search(r"[*/]", inner):
+                i = p + 1
+                continue
+            matches.append((i, p, inner))
+            i = p + 1
+
+        if not matches:
+            return code
+        pieces = []
+        last = 0
+        for start, end, inner in matches:
+            pieces.append(code[last:start])
+            pieces.append(inner)
+            last = end + 1
+        pieces.append(code[last:])
+        return "".join(pieces)
+
+    out = []
+    for raw in lines:
+        code, sep, comment = raw.partition("!")
+        new_code = _process_code(code)
+        out.append(f"{new_code}!{comment}" if sep else new_code)
+    return out
+
+
+def fuse_bare_copy_into_next_self_referential_assignment(lines):
+    """Fuse `NAME = SOURCE` immediately followed by `NAME = <expr using
+    NAME>` into one `NAME = <expr with NAME replaced by SOURCE>`.
+
+    This shape comes from translating two separate Python statements that
+    both happen to bind the same (renamed) target -- e.g. `x = np.asarray(
+    x, dtype=float)` followed by `x = x - x.mean()`, both lowered onto the
+    same locally-shadowed `x_local` (see the argument-reassignment shadow-
+    copy pattern: a Python function reassigning one of its own parameters
+    can't write the actual INTENT(IN) dummy, so the codegen always routes
+    it through a fresh `_local` variable instead) -- as two adjacent
+    Fortran statements, `x_local = x` then `x_local = x_local -
+    mean_1d(x_local)`. The first assignment's only reason for existing is
+    to seed the second statement's own self-reference; nothing ever reads
+    NAME in its bare "= SOURCE" state, so the two collapse into one with
+    no semantic change.
+
+    Deliberately narrow: SOURCE must be a single bare identifier (never a
+    compound expression), so substituting it into NAME's every occurrence
+    on the second line can never change operator precedence -- a single
+    token has no internal structure to disturb, so no parenthesization is
+    ever needed around it. Also declines whenever either line is part of a
+    wrapped (`&`) multi-line statement, since a single-line text
+    substitution could then miss an occurrence of NAME sitting on a later
+    continuation line.
+    """
+    out = list(lines)
+    bare_copy_re = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*$")
+    i = 0
+    n = len(out)
+    while i < n - 1:
+        code_i = out[i].split("!", 1)[0]
+        if code_i.rstrip().endswith("&") or code_i.lstrip().startswith("&"):
+            i += 1
+            continue
+        m = bare_copy_re.match(code_i)
+        if m is None:
+            i += 1
+            continue
+        target, source = m.group(2), m.group(3)
+        if target.lower() == source.lower():
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not out[j].strip():
+            j += 1
+        if j >= n:
+            i += 1
+            continue
+        code_j, sep, comment_j = out[j].partition("!")
+        if code_j.rstrip().endswith("&") or code_j.lstrip().startswith("&"):
+            i += 1
+            continue
+        m2 = re.match(rf"^(\s*){re.escape(target)}\s*=\s*(.+)$", code_j, flags=re.IGNORECASE)
+        if m2 is None:
+            i += 1
+            continue
+        rhs = m2.group(2)
+        tgt_tok_re = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(target)}(?![A-Za-z0-9_])")
+        if not tgt_tok_re.search(rhs):
+            i += 1
+            continue
+        new_rhs = tgt_tok_re.sub(source, rhs)
+        indent_j = m2.group(1)
+        out[j] = f"{indent_j}{target} = {new_rhs}{('!' + comment_j) if sep else ''}"
+        out[i] = ""
+        i = j + 1
+    return [ln for ln in out if ln != ""]
+
+
+def eliminate_redundant_readonly_param_shadow_copies(lines):
+    """Remove a `NAME_local` shadow-copy local that turns out to be a
+    pure, read-only alias for its originating `intent(in)` dummy `NAME`.
+
+    The codegen creates a `NAME_local` shadow whenever a Python function
+    reassigns one of its own parameters ANYWHERE in its body -- Fortran
+    can't write to an INTENT(IN) dummy, so every write gets routed onto a
+    fresh local instead -- e.g. `x = np.asarray(x, dtype=float)` seeds
+    `x_local = x`, and every later Python use of `x` becomes a use of
+    `x_local`. But when that seed copy turns out to be the ONLY write to
+    the shadow anywhere in the procedure (the "reassignment" the codegen
+    saw was really just a no-op cast/copy, and `x` is never written to
+    again), the shadow is a pure alias: computing from `x_local` produces
+    bit-identical results to computing from `x` directly, and the copy --
+    for an array, a real memory copy, not free -- was unnecessary. E.g.
+
+        real(kind=dp), intent(in) :: x(:)
+        ...
+        real(kind=dp), allocatable :: x_local(:)
+        x_local = x
+        x0 = x_local - mean_1d(x_local)
+            --> (x_local declaration and seed copy removed)
+        x0 = x - mean_1d(x)
+
+    Conservative scope: only fires when
+    - `NAME` is an `intent(in)` dummy and `NAME_local` a plain (non-
+      parameter) local of the exact same base type/kind and array shape,
+      each declared alone on its own single-entity declaration line
+      (run early, right after split_declarations_to_single_names, so
+      this always holds for a freshly generated file),
+    - the shadow is written exactly once, via a bare `NAME_local = NAME`
+      statement with nothing else on either side,
+    - every OTHER appearance of `NAME_local` in the procedure is a pure
+      read: never an assignment target (whole-array or subscripted, even
+      guarded by a single-line `if (...)`), never inside a `call`
+      statement's argument list (can't rule out an INTENT(OUT)/INOUT
+      dummy on the other end without resolving the callee), never inside
+      `allocate`/`deallocate`, and never passed to `allocated()` (`x`
+      itself, an assumed-shape INTENT(IN) dummy, isn't allocatable).
+    When all of that holds, the shadow's declaration and the seed
+    assignment are deleted, and every remaining `NAME_local` token in the
+    procedure is rewritten to `NAME`.
+    """
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    decl_re = re.compile(r"^(\s*)(.+?)\s*::\s*(.+)$", re.IGNORECASE)
+    typespec_re = re.compile(
+        r"^\s*(character\s*\([^)]*\)|real\s*\(\s*kind\s*=\s*\w+\s*\)|integer\s*\(\s*kind\s*=\s*\w+\s*\)"
+        r"|complex\s*\(\s*kind\s*=\s*\w+\s*\)|real|integer|logical|complex"
+        r"|type\s*\([^)]*\)|class\s*\([^)]*\))",
+        re.IGNORECASE,
+    )
+    entity_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*(\(.*\))?\s*$")
+
+    def _norm_typespec(attrs):
+        m = typespec_re.match(attrs)
+        if not m:
+            return None
+        return re.sub(r"\s+", "", m.group(1)).lower()
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    out = list(lines)
+
+    def _process_unit(u0, u1):
+        param_info = {}  # name -> (typespec, shape)
+        local_info = {}  # name -> (line_idx, indent, attrs, entity_text)
+        for k in range(u0, u1 + 1):
+            raw = out[k]
+            if _ends_continued(raw) or raw.lstrip().startswith("&"):
+                continue
+            code = raw.split("!", 1)[0].rstrip("\r\n")
+            if not code.strip():
+                continue
+            m = decl_re.match(code)
+            if not m:
+                continue
+            indent, attrs, entity = m.group(1), m.group(2).strip(), m.group(3).strip()
+            if re.match(r"^use\b", attrs, re.IGNORECASE):
+                continue
+            entity_parts = fpurity.split_top_level_commas(entity)
+            if len(entity_parts) != 1:
+                # A declaration with more than one entity (not expected
+                # this early in the pipeline, but skip rather than guess
+                # if it somehow occurs).
+                continue
+            entity = entity_parts[0]
+            if "=" in entity:
+                continue
+            typespec = _norm_typespec(attrs)
+            if typespec is None:
+                continue
+            em = entity_re.match(entity)
+            if not em:
+                continue
+            nm, shape = em.group(1).lower(), (em.group(2) or "").replace(" ", "")
+            is_intent_in = re.search(r"intent\s*\(\s*in\s*\)", attrs, re.IGNORECASE) is not None
+            if is_intent_in:
+                param_info.setdefault(nm, (typespec, shape))
+            elif nm.endswith("_local") and "parameter" not in attrs.lower():
+                local_info.setdefault(nm, (k, indent, attrs, typespec, shape))
+
+        if not local_info:
+            return
+
+        candidates = []
+        for shadow, (line_idx, indent, attrs, typespec, shape) in local_info.items():
+            base = shadow[: -len("_local")]
+            if not base or base not in param_info:
+                continue
+            p_typespec, p_shape = param_info[base]
+            if typespec != p_typespec or shape != p_shape:
+                continue
+            candidates.append((base, shadow, line_idx, indent, attrs))
+
+        if not candidates:
+            return
+
+        stmts = fpurity.iter_fortran_statements(out[u0:u1 + 1])
+
+        for base, shadow, line_idx, indent, attrs in candidates:
+            seed_re = re.compile(
+                rf"^\s*{re.escape(shadow)}\s*=\s*{re.escape(base)}\s*$", re.IGNORECASE
+            )
+            seed_stmts = [s for s in stmts if seed_re.match(s[1])]
+            if len(seed_stmts) != 1:
+                continue
+            seed_stmt = seed_stmts[0]
+            seed_line_abs = u0 + seed_stmt[0] - 1
+
+            tok_re = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(shadow)}(?![A-Za-z0-9_])", re.IGNORECASE)
+            assign_lhs_re = re.compile(rf"^\s*{re.escape(shadow)}\s*(\(.*\))?\s*=(?!=)", re.IGNORECASE)
+            allocated_re = re.compile(rf"\ballocated\s*\(\s*{re.escape(shadow)}\b", re.IGNORECASE)
+
+            disqualified = False
+            for stmt in stmts:
+                if stmt == seed_stmt:
+                    continue
+                _, txt = stmt
+                if not tok_re.search(txt):
+                    continue
+                if allocated_re.search(txt):
+                    disqualified = True
+                    break
+                action = fpurity.executable_action(txt)
+                if assign_lhs_re.match(action):
+                    disqualified = True
+                    break
+                action_low = action.strip().lower()
+                if re.match(r"^call\b", action_low) and tok_re.search(action):
+                    disqualified = True
+                    break
+                if re.search(r"\b(?:allocate|deallocate)\s*\(", action_low) and tok_re.search(action):
+                    disqualified = True
+                    break
+            if disqualified:
+                continue
+
+            # -- eliminate: drop the declaration and the seed copy, then
+            # rewrite every remaining occurrence of the shadow to the
+            # original dummy's name.
+            out[line_idx] = ""
+            out[seed_line_abs] = ""
+            for k in range(u0, u1 + 1):
+                if k == line_idx or k == seed_line_abs:
+                    continue
+                code_k, sep_k, comment_k = out[k].partition("!")
+                if not tok_re.search(code_k):
+                    continue
+                new_code = tok_re.sub(base, code_k)
+                out[k] = f"{new_code}!{comment_k}" if sep_k else new_code
+
+    i = 0
+    n = len(out)
+    while i < n:
+        if not unit_start_re.match(out[i].split("!", 1)[0]):
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not unit_end_re.match(out[j].split("!", 1)[0]):
+            j += 1
+        end = min(j, n - 1)
+        _process_unit(i, end)
+        i = end + 1
+
+    return [ln for ln in out if ln != ""]
+
+
+def simplify_redundant_dp_cast_around_dot_product(lines):
+    """Strip a redundant `real(..., kind=dp)` cast around `dot_product`
+    of two arrays already declared `real(kind=dp)`, and (once that
+    numerator is bare) the matching redundant cast on a `/` divisor,
+    e.g. -- user-reported real example --
+
+        emp_autocov_abs(1) = real(dot_product(absc, absc), &
+           & kind=dp) / real(size(absc), kind=dp)
+            --> emp_autocov_abs(1) = dot_product(absc, absc) / size(absc)
+
+    Two provably-safe simplifications, chained:
+
+    (1) `real(dot_product(A, B), kind=dp)` -> `dot_product(A, B)`: the
+        `dot_product` intrinsic's result already has the SAME numeric
+        type/kind as its (matching) array arguments, so once A and B are
+        confirmed `real(kind=dp)` declarations in this procedure's own
+        scope, the cast changes nothing and is pure noise.
+
+    (2) `dot_product(A, B) / real(C, kind=dp)` -> `dot_product(A, B) /
+        C`: Fortran's mixed real/other-numeric-type division always
+        promotes the other operand to (at least) the real operand's own
+        kind, so wrapping the divisor in the SAME kind as the (already
+        real(kind=dp)) dividend can never change the division's result --
+        true whether C itself is integer (needs promoting to real
+        either way) or already real of any kind (mixed-kind arithmetic
+        promotes to the wider of the two, and dp is this project's one
+        working precision).
+
+    Scoped per procedure/program unit; A and B must each be a bare
+    identifier or a simple identifier(slice) actual argument (the shapes
+    this project's own codegen emits for dot_product), and must be
+    declared `real(kind=dp)` (any rank) somewhere in the unit's own
+    declarations -- anything else is left untouched rather than guessed.
+    """
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    decl_re = re.compile(r"^(\s*)(.+?)\s*::\s*(.+)$", re.IGNORECASE)
+    dp_type_re = re.compile(r"^\s*real\s*\(\s*kind\s*=\s*dp\s*\)", re.IGNORECASE)
+    # Allows one extra level of nested parens inside the slice, e.g.
+    # "absc(k + 1:size(absc))" -- a slice bound computed via a function
+    # call, exactly this project's own dot_product argument shape.
+    arg_pat = r"[A-Za-z_]\w*(?:\((?:[^()]|\([^()]*\))*\))?"
+    dot_re = re.compile(
+        rf"\breal\(\s*dot_product\(\s*({arg_pat})\s*,\s*({arg_pat})\s*\)\s*,\s*kind\s*=\s*dp\s*\)"
+        rf"(\s*/\s*real\(\s*((?:[^()]|\([^()]*\))*)\s*,\s*kind\s*=\s*dp\s*\))?",
+        re.IGNORECASE,
+    )
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def _join_stmt(ls, k0):
+        parts = []
+        k = k0
+        n_ls = len(ls)
+        while True:
+            code = ls[k].split("!", 1)[0].rstrip("\r\n").strip()
+            if k > k0 and code.startswith("&"):
+                code = code[1:].strip()
+            cont = code.endswith("&")
+            if cont:
+                code = code[:-1].rstrip()
+            parts.append(code)
+            if not cont or k + 1 >= n_ls:
+                break
+            k += 1
+        return " ".join(p for p in parts if p), k
+
+    out = list(lines)
+    i = 0
+    n = len(out)
+    while i < n:
+        if not unit_start_re.match(out[i].split("!", 1)[0]):
+            i += 1
+            continue
+        u0 = i
+        j = i + 1
+        while j < n and not unit_end_re.match(out[j].split("!", 1)[0]):
+            j += 1
+        u1 = min(j, n - 1)
+
+        dp_names = set()
+        for k in range(u0, u1 + 1):
+            if _ends_continued(out[k]) or out[k].lstrip().startswith("&"):
+                continue
+            code = out[k].split("!", 1)[0].rstrip("\r\n")
+            m = decl_re.match(code)
+            if not m or not dp_type_re.match(m.group(2).strip()):
+                continue
+            for ent in fpurity.split_top_level_commas(m.group(3)):
+                em = re.match(r"^\s*([A-Za-z_]\w*)", ent)
+                if em:
+                    dp_names.add(em.group(1).lower())
+
+        if dp_names:
+            def _repl(m):
+                a, b, div_group, denom = m.group(1), m.group(2), m.group(3), m.group(4)
+                if a.split("(", 1)[0].lower() not in dp_names or b.split("(", 1)[0].lower() not in dp_names:
+                    return m.group(0)
+                if div_group:
+                    return f"dot_product({a}, {b}) / {denom.strip()}"
+                return f"dot_product({a}, {b})"
+
+            k = u0
+            while k <= u1:
+                code0 = out[k].split("!", 1)[0]
+                if not code0.strip() or "dot_product" not in code0.lower():
+                    k += 1
+                    continue
+                stmt, last_k = _join_stmt(out, k)
+                new_stmt = dot_re.sub(_repl, stmt)
+                if new_stmt != stmt:
+                    indent = re.match(r"^(\s*)", out[k]).group(1)
+                    eol = _line_eol(out[last_k])
+                    out[k] = f"{indent}{new_stmt}{eol}"
+                    for t in range(k + 1, last_k + 1):
+                        out[t] = None
+                k = last_k + 1
+        i = u1 + 1
+
+    return [ln for ln in out if ln is not None]
+
+
+def simplify_redundant_dp_cast_around_dp_returning_calls(lines):
+    """Strip a redundant `real(FUNC(...), kind=dp)` cast when FUNC is a
+    KNOWN scalar real(kind=dp)-returning function -- either one this same
+    run also generated, or one of the vendored runtime helpers (mean_1d,
+    mean, var, var_1d, special_factorial, ...). User-reported example:
+
+        eh32 = real(mean_1d(h ** 1.5_dp), kind=dp)
+            --> eh32 = mean_1d(h ** 1.5_dp)
+
+    `mean_1d` is declared `pure real(kind=dp) function mean_1d(x)` in
+    python.f90, so its result is ALREADY real(kind=dp); wrapping it in
+    another cast to that same kind is pure noise (general principle, in
+    the user's own words: don't use int()/real(..., kind=dp) when the
+    expression inside already has that type). See
+    fortran_purity.collect_dp_returning_function_names for exactly which
+    signature shapes are recognized -- kept to a plain SCALAR return
+    (never an array), since that's what a scalar `real(x, kind=dp)` cast
+    implies.
+
+    Scoped to a bare `real(NAME(...), kind=dp)` call -- NAME's own
+    argument list may be an arbitrary, arbitrarily-nested expression
+    (e.g. `h ** 1.5_dp`, or a slice bound like `absc(k + 1:size(absc))`)
+    since it's matched by real paren-depth tracking, not a regex with a
+    fixed nesting limit; only the outer `real(..., kind=dp)` shape
+    itself needs to match.
+    """
+    dp_names = fpurity.collect_dp_returning_function_names(lines) | _vendored_dp_returning_registry()
+    if not dp_names:
+        return list(lines)
+
+    outer_re = re.compile(r"\breal\(\s*([A-Za-z_]\w*)\(", re.IGNORECASE)
+    # No leading "^": Pattern.match(string, pos) already anchors the
+    # match to start exactly at pos -- "^" would additionally require
+    # pos==0 (or MULTILINE + a preceding newline), silently failing to
+    # match anywhere else in the statement.
+    tail_re = re.compile(r"\s*,\s*kind\s*=\s*dp\s*\)", re.IGNORECASE)
+
+    def _find_matching_paren(text, open_idx):
+        depth = 0
+        i = open_idx
+        n_t = len(text)
+        while i < n_t:
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    def _process_stmt(stmt):
+        parts = []
+        i = 0
+        n_s = len(stmt)
+        changed = False
+        while i < n_s:
+            m = outer_re.search(stmt, i)
+            if not m:
+                parts.append(stmt[i:])
+                break
+            inner_open = m.end() - 1
+            inner_close = _find_matching_paren(stmt, inner_open)
+            if inner_close == -1:
+                parts.append(stmt[i : m.end()])
+                i = m.end()
+                continue
+            tail_m = tail_re.match(stmt, inner_close + 1)
+            func = m.group(1)
+            if tail_m and func.lower() in dp_names:
+                args = stmt[inner_open + 1 : inner_close]
+                parts.append(stmt[i : m.start()])
+                parts.append(f"{func}({args})")
+                i = tail_m.end()
+                changed = True
+                continue
+            parts.append(stmt[i : m.end()])
+            i = m.end()
+        return "".join(parts), changed
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def _join_stmt(ls, k0):
+        parts = []
+        k = k0
+        n_ls = len(ls)
+        while True:
+            code = ls[k].split("!", 1)[0].rstrip("\r\n").strip()
+            if k > k0 and code.startswith("&"):
+                code = code[1:].strip()
+            cont = code.endswith("&")
+            if cont:
+                code = code[:-1].rstrip()
+            parts.append(code)
+            if not cont or k + 1 >= n_ls:
+                break
+            k += 1
+        return " ".join(p for p in parts if p), k
+
+    out = list(lines)
+    k = 0
+    n = len(out)
+    while k < n:
+        code0 = out[k].split("!", 1)[0]
+        if not code0.strip() or "real(" not in code0.lower():
+            k += 1
+            continue
+        stmt, last_k = _join_stmt(out, k)
+        new_stmt, changed = _process_stmt(stmt)
+        if changed:
+            indent = re.match(r"^(\s*)", out[k]).group(1)
+            eol = _line_eol(out[last_k])
+            out[k] = f"{indent}{new_stmt}{eol}"
+            for t in range(k + 1, last_k + 1):
+                out[t] = None
+        k = last_k + 1
+
+    return [ln for ln in out if ln is not None]
+
+
+_DP_KIND_PRESERVING_INTRINSICS = frozenset(
+    (
+        "exp", "sqrt", "log", "log10", "sin", "cos", "tan", "asin", "acos", "atan",
+        "atan2", "sinh", "cosh", "tanh", "abs", "dot_product", "sum", "product",
+        "minval", "maxval",
+    )
+)
+
+
+def simplify_redundant_dp_cast_general(lines):
+    """Strip a redundant `real(EXPR, kind=dp)` cast whenever EXPR is
+    PROVABLY already real(kind=dp) -- a more general successor to
+    simplify_redundant_dp_cast_around_dot_product/_dp_returning_calls,
+    covering arithmetic combinations, kind-preserving intrinsics, and a
+    bare already-dp variable/array-element, not just a single bare call.
+    User-reported real examples:
+
+        eh = real(exp(mean_x + 0.5_dp * var_x), kind=dp)
+            --> eh = exp(mean_x + 0.5_dp * var_x)
+        emp_var_r2 = real(emp_acv_r2(1), kind=dp)
+            --> emp_var_r2 = emp_acv_r2(1)
+        emp_kurt = real(mean_1d(eps ** 4) / (mean_1d(eps ** 2) ** 2), kind=dp)
+            --> emp_kurt = mean_1d(eps ** 4) / (mean_1d(eps ** 2) ** 2)
+
+    Provability is a small, conservative, RECURSIVE type check over the
+    expression text (see _dp_expr_type): every top-level +, -, *, /, **
+    operand must itself resolve to "dp" or "integer" (real/integer mixed
+    arithmetic always promotes to the real operand's own kind -- true
+    regardless of which side the integer is on), with AT LEAST ONE
+    operand "dp", where a single term resolves to "dp" when it's a dp-
+    suffixed literal (`0.5_dp`), a bare dp-declared identifier or array
+    element (`emp_acv_r2(1)`, when `emp_acv_r2` is declared real(kind
+    =dp)), a call to a known dp-returning function (this run's own, or a
+    vendored helper -- see fortran_purity.collect_dp_returning_function_
+    names), or a call to a kind-preserving intrinsic (exp, sqrt,
+    dot_product, sum, ...) whose own arguments recursively satisfy the
+    same rule. Anything that can't be resolved this way (an unknown
+    function, a plain integer-only expression, character/logical
+    content) is left untouched rather than guessed at.
+    """
+    dp_funcs_global = _vendored_dp_returning_registry() | fpurity.collect_dp_returning_function_names(lines)
+
+    unit_start_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|^\s*program\b",
+        re.IGNORECASE,
+    )
+    unit_end_re = re.compile(r"^\s*end\s+(?:function|subroutine|program)\b", re.IGNORECASE)
+    decl_re = re.compile(r"^(\s*)(.+?)\s*::\s*(.+)$", re.IGNORECASE)
+    typespec_re = re.compile(
+        r"^\s*(real\s*\(\s*kind\s*=\s*dp\s*\)|integer(?:\s*\(\s*kind\s*=\s*\w+\s*\))?)",
+        re.IGNORECASE,
+    )
+    num_re = re.compile(
+        r"^[+-]?(\d+(\.\d*)?|\.\d+)([eEdD][+-]?\d+)?(_([A-Za-z]\w*))?$"
+    )
+
+    def _is_fully_wrapped(text):
+        if not (text.startswith("(") and text.endswith(")")):
+            return False
+        depth = 0
+        for idx, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and idx != len(text) - 1:
+                    return False
+        return depth == 0
+
+    def _split_top_level_operands(expr):
+        leaves = []
+        depth = 0
+        cur_start = 0
+        i = 0
+        n_e = len(expr)
+        in_quote = None
+        while i < n_e:
+            ch = expr[i]
+            if in_quote:
+                if ch == in_quote:
+                    in_quote = None
+                i += 1
+                continue
+            if ch in "'\"":
+                in_quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth -= 1
+                i += 1
+                continue
+            if depth == 0 and ch in "+-*/":
+                if ch == "*" and i + 1 < n_e and expr[i + 1] == "*":
+                    # "**" IS a valid split point (real(dp) ** integer,
+                    # or real(dp) ** real(dp), both stay real(dp)) --
+                    # just a two-character one; a lone "*" is never
+                    # unary, so no unary check needed here.
+                    leaves.append(expr[cur_start:i].strip())
+                    i += 2
+                    cur_start = i
+                    continue
+                if ch == "/" and i + 1 < n_e and expr[i + 1] == "/":
+                    # String concatenation -- not a numeric operator;
+                    # leave unsplit so the whole expression falls through
+                    # to "unknown" rather than being misread as division.
+                    i += 2
+                    continue
+                j = i - 1
+                while j >= 0 and expr[j] in " \t":
+                    j -= 1
+                is_unary = j < 0 or expr[j] in "+-*/(,"
+                if not is_unary:
+                    leaves.append(expr[cur_start:i].strip())
+                    cur_start = i + 1
+            i += 1
+        tail = expr[cur_start:].strip()
+        if tail:
+            leaves.append(tail)
+        return [l for l in leaves if l]
+
+    def _split_top_level_commas_expr(text):
+        return fpurity.split_top_level_commas(text)
+
+    def _expr_type(expr, dp_names, int_names, dp_funcs, depth=0):
+        expr = expr.strip()
+        if not expr or depth > 40:
+            return "unknown"
+        leaves = _split_top_level_operands(expr)
+        if len(leaves) > 1:
+            types = {_expr_type(l, dp_names, int_names, dp_funcs, depth + 1) for l in leaves}
+            if "unknown" in types:
+                return "unknown"
+            if "dp" in types:
+                return "dp"
+            if types == {"integer"}:
+                return "integer"
+            return "unknown"
+
+        leaf = leaves[0] if leaves else expr
+        if num_re.match(leaf):
+            m = num_re.match(leaf)
+            kind = m.group(5)
+            if kind:
+                return "dp" if kind.lower() == "dp" else "unknown"
+            if m.group(2) or m.group(3):
+                return "unknown"  # a real literal with no _dp suffix -- ambiguous default-real kind
+            return "integer"
+
+        if leaf.startswith("(") and leaf.endswith(")") and _is_fully_wrapped(leaf):
+            return _expr_type(leaf[1:-1], dp_names, int_names, dp_funcs, depth + 1)
+
+        m_sign = re.match(r"^[+-]\s*(.+)$", leaf, re.DOTALL)
+        if m_sign:
+            return _expr_type(m_sign.group(1), dp_names, int_names, dp_funcs, depth + 1)
+
+        m_call = re.match(r"^([A-Za-z_]\w*)\s*(\(.*\))$", leaf, re.DOTALL)
+        if m_call and _is_fully_wrapped(m_call.group(2)):
+            name, argtext = m_call.group(1).lower(), m_call.group(2)[1:-1]
+            if name in dp_names:
+                return "dp"
+            if name in int_names:
+                return "integer"
+            if name in dp_funcs:
+                return "dp"
+            if name in _DP_KIND_PRESERVING_INTRINSICS:
+                args = _split_top_level_commas_expr(argtext)
+                if not args:
+                    return "unknown"
+                arg_types = {_expr_type(a, dp_names, int_names, dp_funcs, depth + 1) for a in args}
+                if "unknown" in arg_types:
+                    return "unknown"
+                if "dp" in arg_types:
+                    return "dp"
+                return "unknown"
+            return "unknown"
+
+        m_name = re.match(r"^[A-Za-z_]\w*$", leaf)
+        if m_name:
+            low = leaf.lower()
+            if low in dp_names:
+                return "dp"
+            if low in int_names:
+                return "integer"
+            return "unknown"
+
+        return "unknown"
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def _join_stmt(ls, k0):
+        parts = []
+        k = k0
+        n_ls = len(ls)
+        while True:
+            code = ls[k].split("!", 1)[0].rstrip("\r\n").strip()
+            if k > k0 and code.startswith("&"):
+                code = code[1:].strip()
+            cont = code.endswith("&")
+            if cont:
+                code = code[:-1].rstrip()
+            parts.append(code)
+            if not cont or k + 1 >= n_ls:
+                break
+            k += 1
+        return " ".join(p for p in parts if p), k
+
+    def _find_matching_paren(text, open_idx):
+        depth = 0
+        i = open_idx
+        n_t = len(text)
+        while i < n_t:
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    real_open_re = re.compile(r"\breal\(", re.IGNORECASE)
+
+    def _process_stmt(stmt, dp_names, int_names):
+        parts = []
+        i = 0
+        n_s = len(stmt)
+        changed = False
+        while i < n_s:
+            m = real_open_re.search(stmt, i)
+            if not m:
+                parts.append(stmt[i:])
+                break
+            open_idx = m.end() - 1
+            close = _find_matching_paren(stmt, open_idx)
+            if close == -1:
+                parts.append(stmt[i : m.end()])
+                i = m.end()
+                continue
+            # `real(`'s own full argument list is stmt[open_idx+1:close];
+            # it must be exactly "EXPR, kind=dp" at ITS OWN top level.
+            inner = stmt[open_idx + 1 : close]
+            comma_parts = fpurity.split_top_level_commas(inner)
+            if len(comma_parts) >= 2 and comma_parts[-1].strip().lower() == "kind=dp":
+                expr_text = ", ".join(comma_parts[:-1])
+                if _expr_type(expr_text, dp_names, int_names, dp_funcs_global) == "dp":
+                    parts.append(stmt[i : m.start()])
+                    parts.append(expr_text)
+                    i = close + 1
+                    changed = True
+                    continue
+            parts.append(stmt[i : m.end()])
+            i = m.end()
+        return "".join(parts), changed
+
+    out = list(lines)
+    i = 0
+    n = len(out)
+    while i < n:
+        if not unit_start_re.match(out[i].split("!", 1)[0]):
+            i += 1
+            continue
+        u0 = i
+        j = i + 1
+        while j < n and not unit_end_re.match(out[j].split("!", 1)[0]):
+            j += 1
+        u1 = min(j, n - 1)
+
+        dp_names = set()
+        int_names = set()
+        for k in range(u0, u1 + 1):
+            if _ends_continued(out[k]) or out[k].lstrip().startswith("&"):
+                continue
+            code = out[k].split("!", 1)[0].rstrip("\r\n")
+            m = decl_re.match(code)
+            if not m:
+                continue
+            attrs = m.group(2).strip()
+            ts = typespec_re.match(attrs)
+            if not ts:
+                continue
+            is_dp = ts.group(1).lower().replace(" ", "").startswith("real(kind=dp)")
+            for ent in fpurity.split_top_level_commas(m.group(3)):
+                em = re.match(r"^\s*([A-Za-z_]\w*)", ent)
+                if not em:
+                    continue
+                (dp_names if is_dp else int_names).add(em.group(1).lower())
+
+        if dp_names:
+            k = u0
+            while k <= u1:
+                code0 = out[k].split("!", 1)[0]
+                if not code0.strip() or "real(" not in code0.lower():
+                    k += 1
+                    continue
+                stmt, last_k = _join_stmt(out, k)
+                new_stmt, changed = _process_stmt(stmt, dp_names, int_names)
+                if changed:
+                    indent = re.match(r"^(\s*)", out[k]).group(1)
+                    eol = _line_eol(out[last_k])
+                    out[k] = f"{indent}{new_stmt}{eol}"
+                    for t in range(k + 1, last_k + 1):
+                        out[t] = None
+                k = last_k + 1
+        i = u1 + 1
+
+    return [ln for ln in out if ln is not None]
+
+
+def simplify_format_string_space_literals_and_fold_repeats(lines):
+    """Tidy a `write`/`read` inline FORMAT string in two steps, e.g.
+
+        "(a,'  ',a,'  ',a,'  ',a)"
+            --> "(a, 2x, a, 2x, a, 2x, a)"    -- step 1
+            --> "(3(a, 2x), a)"               -- step 2
+
+    (1) A comma-separated literal item that's ENTIRELY N space
+        characters (`'  '`) is replaced with the equivalent `Nx` edit
+        descriptor -- Fortran's `nX` control descriptor means exactly
+        "output n blank characters", identical to printing a literal
+        string of n spaces, so this changes nothing about the output.
+
+    (2) Once every item is a plain edit descriptor (no embedded commas
+        of its own), a maximal run of L items repeating R times back to
+        back (R >= 2) is folded into a single `R(item1, item2, ...)`
+        repeat group -- standard Fortran format syntax, and, again,
+        prints byte-for-byte the same thing.
+
+    Scoped to a double-quoted string, appearing as the format argument
+    of a `write(`/`read(` statement, whose content both starts with "("
+    and ends with ")" -- this project's own codegen's own inline-format
+    shape (never a bare PRINT string, which never happens to look like
+    that here) -- so nothing outside an actual format spec is ever
+    touched. Only single-quoted items are treated as string literals for
+    step (1) (this project's own established convention: outer format
+    strings are always double-quoted, inner literal pieces single-
+    quoted) -- a double-quoted item nested inside (via `""`-escaping)
+    is left alone rather than guessed at.
+    """
+    write_re = re.compile(r"\b(?:write|read)\s*\(", re.IGNORECASE)
+
+    def _find_matching_quote(text, open_idx, q):
+        i = open_idx + 1
+        n_t = len(text)
+        while i < n_t:
+            if text[i] == q:
+                if i + 1 < n_t and text[i + 1] == q:
+                    i += 2
+                    continue
+                return i
+            i += 1
+        return -1
+
+    def _split_top_level_format_items(inner_text):
+        items = []
+        cur = []
+        depth = 0
+        in_quote = None
+        i = 0
+        n_t = len(inner_text)
+        while i < n_t:
+            ch = inner_text[i]
+            if in_quote:
+                cur.append(ch)
+                if ch == in_quote:
+                    if i + 1 < n_t and inner_text[i + 1] == in_quote:
+                        cur.append(inner_text[i + 1])
+                        i += 2
+                        continue
+                    in_quote = None
+                i += 1
+                continue
+            if ch in "'\"":
+                in_quote = ch
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == ")":
+                depth -= 1
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "," and depth == 0:
+                items.append("".join(cur).strip())
+                cur = []
+                i += 1
+                continue
+            cur.append(ch)
+            i += 1
+        tail = "".join(cur).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    space_lit_re = re.compile(r"^'( +)'$")
+
+    def _to_edit_descriptor(item):
+        m = space_lit_re.match(item)
+        if not m:
+            return item
+        return f"{len(m.group(1))}x"
+
+    def _fold_repeats(items):
+        out_items = []
+        i = 0
+        n_i = len(items)
+        while i < n_i:
+            best = None  # (cycle_len, repeat_count), maximizing items consumed
+            max_len = (n_i - i) // 2
+            for cyc_len in range(1, max_len + 1):
+                r = 1
+                while (
+                    i + (r + 1) * cyc_len <= n_i
+                    and items[i + r * cyc_len : i + (r + 1) * cyc_len] == items[i : i + cyc_len]
+                ):
+                    r += 1
+                if r >= 2 and (best is None or cyc_len * r > best[0] * best[1]):
+                    best = (cyc_len, r)
+            if best:
+                cyc_len, r = best
+                cycle = items[i : i + cyc_len]
+                out_items.append(f"{r}({', '.join(cycle)})")
+                i += cyc_len * r
+            else:
+                out_items.append(items[i])
+                i += 1
+        return out_items
+
+    def _process_code(code):
+        if not write_re.search(code):
+            return code
+        out_parts = []
+        pos = 0
+        i = 0
+        n_c = len(code)
+        while i < n_c:
+            if code[i] != '"':
+                i += 1
+                continue
+            close = _find_matching_quote(code, i, '"')
+            if close == -1:
+                i += 1
+                continue
+            raw_content = code[i + 1 : close]
+            content = raw_content.replace('""', '"')
+            if not (content.startswith("(") and content.endswith(")")):
+                i = close + 1
+                continue
+            items = _split_top_level_format_items(content[1:-1])
+            if not items:
+                i = close + 1
+                continue
+            items = [_to_edit_descriptor(it) for it in items]
+            # Only fold if every item is now comma-free at the top level
+            # (a nested repeat group like an existing "2(a,'  ')" has its
+            # own internal commas -- folding around it is skipped rather
+            # than guessed at).
+            folded = _fold_repeats(items)
+            new_content = "(" + ", ".join(folded) + ")"
+            if new_content == content:
+                i = close + 1
+                continue
+            out_parts.append(code[pos:i])
+            out_parts.append('"' + new_content.replace('"', '""') + '"')
+            pos = close + 1
+            i = close + 1
+        if not out_parts:
+            return code
+        out_parts.append(code[pos:])
+        return "".join(out_parts)
+
+    def _ends_continued(ln):
+        return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def _join_stmt(ls, k0):
+        parts = []
+        k = k0
+        n_ls = len(ls)
+        while True:
+            code = ls[k].split("!", 1)[0].rstrip("\r\n").strip()
+            if k > k0 and code.startswith("&"):
+                code = code[1:].strip()
+            cont = code.endswith("&")
+            if cont:
+                code = code[:-1].rstrip()
+            parts.append(code)
+            if not cont or k + 1 >= n_ls:
+                break
+            k += 1
+        return " ".join(p for p in parts if p), k
+
+    out = list(lines)
+    k = 0
+    n = len(out)
+    while k < n:
+        code0 = out[k].split("!", 1)[0]
+        if not re.search(r"\b(?:write|read)\s*\(", code0, re.IGNORECASE):
+            k += 1
+            continue
+        stmt, last_k = _join_stmt(out, k)
+        new_stmt = _process_code(stmt)
+        if new_stmt != stmt:
+            indent = re.match(r"^(\s*)", out[k]).group(1)
+            eol = _line_eol(out[last_k])
+            out[k] = f"{indent}{new_stmt}{eol}"
+            for t in range(k + 1, last_k + 1):
+                out[t] = None
+        k = last_k + 1
+
+    return [ln for ln in out if ln is not None]
 
 
 def remove_allocatable_shadow_decls(lines):
@@ -1742,6 +3056,314 @@ def rewrite_integer_quotient_seed_divisions(tree):
     return new_tree
 
 
+def rewrite_listcomp_array_assign_calls_to_loop(tree):
+    """Rewrite `TARGET = np.array([ELT for VAR in ITERABLE])` (or
+    np.asarray(...)) into an equivalent explicit loop, ONLY when ELT
+    contains a call that this project's own inline elementwise ListComp
+    lowering (the ast.Call handling inside expr()'s ast.ListComp branch)
+    can't possibly support. That lowering only ever accepts a handful of
+    narrow call shapes: str/int/float/bool applied directly to the bare
+    loop variable, max/min without keywords, or a bare 0-arg strip/
+    lstrip/rstrip method -- so ANY OTHER call (in particular, calling an
+    arbitrary user-defined function -- even a single bare `f(v)`, with
+    or without keyword arguments) is rewritten here, before it ever
+    reaches that lowering, into:
+
+        TARGET = np.empty(len(ITERABLE))
+        for LC_IDX, VAR in enumerate(ITERABLE):
+            TARGET[LC_IDX] = ELT
+
+    reusing this project's own already-correct enumerate/For/Subscript-
+    assignment codegen wholesale for the loop body, rather than teaching
+    the inline lowering about arbitrary function calls (which would
+    additionally require the callee to be ELEMENTAL -- an opt-in,
+    postprocessing-only promotion nothing this early in the pipeline can
+    rely on). Runs BEFORE this project's own prescan (which is what
+    actually decides every local variable's Fortran type/declaration
+    from the ORIGINAL tree) -- LC_IDX must exist in the tree prescan
+    sees, or it comes out the other end undeclared.
+
+    Deliberately conservative in the OTHER direction too: only a single-
+    generator, unfiltered comprehension is rewritten (matching what the
+    inline lowering itself requires); anything else -- including a False
+    positive from _needs_loop's own conservative bias (an unusual call
+    shape it doesn't recognize as ALWAYS-safe, even if the inline path
+    could actually have handled it) -- is left alone for the existing
+    lowering, correctness-preserving either way (an explicit loop is
+    never wrong, just occasionally less idiomatic than the vectorized
+    form it replaces).
+    """
+    SIMPLE_BUILTINS = {"str", "int", "float", "bool"}
+
+    def _needs_loop(elt, loop_var):
+        for n in ast.walk(elt):
+            if not isinstance(n, ast.Call):
+                continue
+            if isinstance(n.func, ast.Name):
+                if n.func.id in {"max", "min"} and not n.keywords:
+                    continue
+                if (
+                    n.func.id in SIMPLE_BUILTINS
+                    and len(n.args) == 1
+                    and not n.keywords
+                    and isinstance(n.args[0], ast.Name)
+                    and n.args[0].id == loop_var
+                ):
+                    continue
+                return True
+            if (
+                isinstance(n.func, ast.Attribute)
+                and len(n.args) == 0
+                and not n.keywords
+                and n.func.attr in {"strip", "lstrip", "rstrip"}
+            ):
+                continue
+            return True
+        return False
+
+    counter = [0]
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            self.generic_visit(node)
+            if not (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr in {"array", "asarray"}
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id in {"np", "numpy"}
+                and len(node.value.args) >= 1
+                and isinstance(node.value.args[0], ast.ListComp)
+            ):
+                return node
+            lc = node.value.args[0]
+            if len(lc.generators) != 1 or lc.generators[0].ifs:
+                return node
+            gen = lc.generators[0]
+            if not isinstance(gen.target, ast.Name):
+                return node
+            if not _needs_loop(lc.elt, gen.target.id):
+                return node
+            counter[0] += 1
+            idx_name = f"lc_idx_{node.lineno}_{counter[0]}"
+            t_name = node.targets[0].id
+            alloc_stmt = ast.Assign(
+                targets=[ast.Name(id=t_name, ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="empty", ctx=ast.Load()),
+                    args=[ast.Call(func=ast.Name(id="len", ctx=ast.Load()), args=[gen.iter], keywords=[])],
+                    keywords=[],
+                ),
+            )
+            assign_elem = ast.Assign(
+                targets=[
+                    ast.Subscript(
+                        value=ast.Name(id=t_name, ctx=ast.Load()),
+                        slice=ast.Name(id=idx_name, ctx=ast.Load()),
+                        ctx=ast.Store(),
+                    )
+                ],
+                value=lc.elt,
+            )
+            for_stmt = ast.For(
+                target=ast.Tuple(elts=[ast.Name(id=idx_name, ctx=ast.Store()), gen.target], ctx=ast.Store()),
+                iter=ast.Call(func=ast.Name(id="enumerate", ctx=ast.Load()), args=[gen.iter], keywords=[]),
+                body=[assign_elem],
+                orelse=[],
+            )
+            for new_node in (alloc_stmt, assign_elem, for_stmt):
+                ast.copy_location(new_node, node)
+            ast.fix_missing_locations(alloc_stmt)
+            ast.fix_missing_locations(for_stmt)
+            return [alloc_stmt, for_stmt]
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
+def rewrite_case_insensitive_name_collisions(tree):
+    """Rename one spelling of a same-scope, case-only name collision
+    before translation, since Fortran is case-insensitive but Python
+    isn't -- e.g. a module-level array `S` and a for-loop variable `s`
+    at top level both resolve to the SAME Fortran identifier.
+
+    User-reported real trigger, and why this is fixed HERE (an early
+    tree rewrite) rather than patched at each Fortran-emission site: the
+    codegen's own name-collision-avoidance (_aliased_name, keyed on
+    lower-cased spelling) already exists and, USED consistently, already
+    prevents this -- but at least one emission site (a for-loop's own
+    target-variable assignment) writes the raw Python name directly
+    rather than resolving it through that same alias table, so `s`'s
+    every OTHER reference resolves to a disambiguated alias while its
+    own loop-bound assignment silently writes to a DIFFERENT (never
+    otherwise touched) Fortran variable -- no compile error, just
+    silently wrong results (confirmed with a bare `for s in S: total =
+    total + s`, no list comprehension involved at all). Hunting down
+    every such emission site across this project's own codegen would be
+    both harder to be sure is complete and easier to regress than
+    guaranteeing the ORIGINAL tree this codegen ever sees never contains
+    the collision to begin with.
+
+    Scoped per TOP-LEVEL Fortran scope this project's own codegen
+    actually creates: the module-level script body becomes one PROGRAM,
+    and each function becomes its own separate PROCEDURE -- so a
+    collision is only rewritten when both spellings are bound in the
+    SAME one of those (a module-level name and an unrelated function's
+    own local sharing a spelling never actually collide in the emitted
+    Fortran, since they're different, non-overlapping program units).
+    Within a colliding group, the FIRST-bound spelling (source order) is
+    left untouched and every other spelling is renamed throughout that
+    scope -- source order prefers keeping a function/global's own name
+    intact over a later, narrower local shadowing it, matching how the
+    collision would read in the original Python.
+    """
+
+    def _fresh_name(old, taken_lower):
+        cand = f"{old}_cs"
+        k = 2
+        while cand.lower() in taken_lower:
+            cand = f"{old}_cs{k}"
+            k += 1
+        return cand
+
+    class _ScopeCollector(ast.NodeVisitor):
+        """Collect every Store-context binding within ONE scope's own
+        statements, WITHOUT descending into a nested function/class's
+        own body (each gets its own separate, later collection pass) --
+        only that nested def's OWN NAME is bound here, in the outer
+        scope, like Python's actual scoping."""
+
+        def __init__(self):
+            self.names = []
+
+        def visit_FunctionDef(self, node):
+            self.names.append(node.name)
+
+        def visit_AsyncFunctionDef(self, node):
+            self.names.append(node.name)
+
+        def visit_ClassDef(self, node):
+            self.names.append(node.name)
+
+        def visit_Lambda(self, node):
+            return
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Store):
+                self.names.append(node.id)
+
+        def visit_ExceptHandler(self, node):
+            if node.name:
+                self.names.append(node.name)
+            self.generic_visit(node)
+
+    class _ScopeRenamer(ast.NodeTransformer):
+        """Apply a computed {old_spelling: new_spelling} map within ONE
+        scope's own statements -- same non-descent rule as the
+        collector: a nested def's own body is a separate scope, handled
+        by its own separate renamer call, but the def's OWN name (and
+        its decorators/defaults, evaluated in the OUTER scope) still
+        needs fixing up here."""
+
+        def __init__(self, renames):
+            self.renames = renames
+
+        def visit_Name(self, node):
+            if node.id in self.renames:
+                node.id = self.renames[node.id]
+            return node
+
+        def visit_ExceptHandler(self, node):
+            if node.name in self.renames:
+                node.name = self.renames[node.name]
+            self.generic_visit(node)
+            return node
+
+        def _fixup_def_signature(self, node):
+            if node.name in self.renames:
+                node.name = self.renames[node.name]
+            node.args.defaults = [self.visit(d) for d in node.args.defaults]
+            node.args.kw_defaults = [
+                (self.visit(d) if d is not None else None) for d in node.args.kw_defaults
+            ]
+            node.decorator_list = [self.visit(d) for d in node.decorator_list]
+            return node
+
+        def visit_FunctionDef(self, node):
+            return self._fixup_def_signature(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            return self._fixup_def_signature(node)
+
+        def visit_ClassDef(self, node):
+            if node.name in self.renames:
+                node.name = self.renames[node.name]
+            return node
+
+    def _compute_renames(names):
+        by_lower = {}
+        for nm in names:
+            spellings = by_lower.setdefault(nm.lower(), [])
+            if nm not in spellings:
+                spellings.append(nm)
+        renames = {}
+        taken_lower = set(by_lower.keys())
+        for spellings in by_lower.values():
+            if len(spellings) < 2:
+                continue
+            for other in spellings[1:]:
+                renames[other] = _fresh_name(other, taken_lower)
+                taken_lower.add(renames[other].lower())
+        return renames
+
+    def _apply_renames_to_stmts(stmts, renames):
+        renamer = _ScopeRenamer(renames)
+        for i, s in enumerate(stmts):
+            stmts[i] = renamer.visit(s)
+
+    def _process_top_level_scope(stmts):
+        collector = _ScopeCollector()
+        for s in stmts:
+            collector.visit(s)
+        renames = _compute_renames(collector.names)
+        if renames:
+            _apply_renames_to_stmts(stmts, renames)
+        for s in stmts:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _process_function_scope(s)
+
+    def _process_function_scope(fn):
+        arg_objs = (
+            list(getattr(fn.args, "posonlyargs", []))
+            + list(fn.args.args)
+            + list(fn.args.kwonlyargs)
+        )
+        if fn.args.vararg:
+            arg_objs.append(fn.args.vararg)
+        if fn.args.kwarg:
+            arg_objs.append(fn.args.kwarg)
+        collector = _ScopeCollector()
+        collector.names.extend(a.arg for a in arg_objs)
+        for s in fn.body:
+            collector.visit(s)
+        renames = _compute_renames(collector.names)
+        if renames:
+            for a in arg_objs:
+                if a.arg in renames:
+                    a.arg = renames[a.arg]
+            _apply_renames_to_stmts(fn.body, renames)
+        for s in fn.body:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _process_function_scope(s)
+
+    _process_top_level_scope(tree.body)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_pandas_read_csv_set_index(tree):
     """Collapse ``X = pd.read_csv(path, parse_dates=[col]); X = X.set_index(col)``
     into the equivalent single-step ``pd.read_csv(path, index_col=col,
@@ -2641,6 +4263,19 @@ def rename_conflicting_identifiers(src_text):
                 if re.search(r"intent\s*\(\s*$", head, flags=re.IGNORECASE) and re.match(
                     r"^\s*\)", tail
                 ):
+                    return nm
+            # Do not rewrite the Fortran CALL STATEMENT keyword itself,
+            # even when a variable/dummy-argument named "call" ALSO needs
+            # renaming elsewhere (exactly why "call" is forbidden as a
+            # name to begin with) -- a bare "call" immediately followed
+            # by "IDENTIFIER(" is always the statement introducing a
+            # subroutine invocation (`call subname(...)`), never a
+            # reference to the variable, which real bug this guards
+            # against: renaming that keyword corrupts the statement into
+            # invalid Fortran (e.g. "call_ subname(...)").
+            if nm.lower() == "call":
+                tail = code[m.end() :]
+                if re.match(r"^\s+[A-Za-z_]\w*\s*\(", tail):
                     return nm
             # Keep function/intrinsic call forms untouched -- but only
             # outside a declaration line, where `name(` is always a
@@ -4203,6 +5838,168 @@ def remove_unused_use_only_imports(lines):
     return [ln for ln in out if ln != ""]
 
 
+def collapse_large_use_only_imports(lines, max_entities):
+    """Collapse a `use MOD, only: a, b, c, ...` statement into a bare
+    `use MOD ! imports N entities` once its only-list exceeds
+    `max_entities` names -- opt-in via --max-use-only, since a long
+    only-list, however correctly wrapped across continuation lines, can
+    still be hard to scan at a glance (user-reported: a real generated
+    program's `use xgarch_acf_proc_mod, only: ...` importing 30 names).
+
+    Trades that for the (unrestricted) risk `use MOD` carries: it now
+    additionally exposes every OTHER public entity of MOD, not just the
+    ones originally listed, and any of those could collide with
+    something else visible in the importing scope -- exactly what
+    `only:` exists to prevent. To keep this safe, the pass is scoped to
+    a `use MOD` where MOD is a module THIS SAME run also generated (a
+    `module NAME ... end module NAME` block found elsewhere in `lines`)
+    -- only then is MOD's own full public entity list actually visible
+    here to check against. For each such use statement, every "extra"
+    entity MOD would now additionally export (its full public list minus
+    the names already in the only-list) is checked, as a whole-word
+    token, against every OTHER line in the use statement's own enclosing
+    top-level unit (module/program, including any nested `contains`-ed
+    procedures, since Fortran host association makes an outer `use`
+    visible there too). A name that never appears anywhere in that scope
+    -- not declared, not referenced -- can't collide with anything, so
+    this textual absence check is a safe, if conservative (some
+    unrelated same-named token elsewhere in a large program can block an
+    otherwise-safe collapse), proxy for "no collision possible". A `use`
+    of a module NOT generated in this same run (python_mod, iso_
+    fortran_env, ...) is never touched, since its full export surface
+    isn't visible here to verify against.
+    """
+    unit_start_re = re.compile(r"^\s*(program|module)\s+\w+", flags=re.IGNORECASE)
+    unit_end_re = re.compile(r"^\s*end\s+(program|module)\b", flags=re.IGNORECASE)
+    module_start_re = re.compile(r"^\s*module\s+(\w+)\b", flags=re.IGNORECASE)
+    module_end_re = re.compile(r"^\s*end\s+module\b", flags=re.IGNORECASE)
+    public_re = re.compile(r"^\s*public\s*(?:::)?\s*(.+)$", flags=re.IGNORECASE)
+    use_only_re = re.compile(
+        r"^(\s*)use\s*(?:,\s*intrinsic\s*)?(?:::)?\s*([A-Za-z_]\w*)\s*,\s*only\s*:\s*(.*)$",
+        flags=re.IGNORECASE,
+    )
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    def _join_stmt(ls, k0):
+        # Join a (possibly "&"-continued) statement starting at physical
+        # line k0; returns (joined_text, last_physical_line_index).
+        parts = []
+        k = k0
+        n_ls = len(ls)
+        while True:
+            code = ls[k].split("!", 1)[0].rstrip("\r\n").strip()
+            if k > k0 and code.startswith("&"):
+                code = code[1:].strip()
+            cont = code.endswith("&")
+            if cont:
+                code = code[:-1].rstrip()
+            parts.append(code)
+            if not cont or k + 1 >= n_ls:
+                break
+            k += 1
+        return " ".join(p for p in parts if p), k
+
+    def _module_side_name(item):
+        # For a rename `local => original`, the MODULE's own exported
+        # name is on the right; otherwise the item itself.
+        return (item.split("=>", 1)[1] if "=>" in item else item).strip().lower()
+
+    # -- pass 1: every same-run module's own full public entity set --
+    module_public = {}
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = module_start_re.match(lines[i].split("!", 1)[0])
+        if not m:
+            i += 1
+            continue
+        mod_name = m.group(1).lower()
+        j = i + 1
+        pub = set()
+        while j < n and not module_end_re.match(lines[j].split("!", 1)[0]):
+            if public_re.match(lines[j].split("!", 1)[0]):
+                stmt, last_j = _join_stmt(lines, j)
+                pm = public_re.match(stmt)
+                if pm:
+                    for item in pm.group(1).split(","):
+                        nm = item.strip()
+                        if nm:
+                            pub.add(nm.split("=>", 1)[0].strip().lower())
+                j = last_j + 1
+                continue
+            j += 1
+        module_public[mod_name] = pub
+        i = min(j, n - 1) + 1
+
+    if not module_public:
+        return list(lines)
+
+    # -- pass 2: collapse eligible use-only statements, scoped per
+    # enclosing top-level unit (module/program) --
+    out = list(lines)
+    i = 0
+    while i < n:
+        um = unit_start_re.match(out[i].split("!", 1)[0])
+        if not um:
+            i += 1
+            continue
+        u0 = i
+        j = i + 1
+        while j < n and not unit_end_re.match(out[j].split("!", 1)[0]):
+            j += 1
+        u1 = min(j, n - 1)
+
+        k = u0
+        while k <= u1:
+            if not use_only_re.match(out[k].split("!", 1)[0]):
+                k += 1
+                continue
+            stmt, last_k = _join_stmt(out, k)
+            sm = use_only_re.match(stmt)
+            if sm is None:
+                k = last_k + 1
+                continue
+            # _join_stmt strips each physical line before joining, so the
+            # match's own leading-whitespace group is always empty --
+            # take the real indent from the original first physical line.
+            indent = re.match(r"^(\s*)", out[k]).group(1)
+            mod_name, payload = sm.group(2), sm.group(3)
+            pub = module_public.get(mod_name.lower())
+            if pub is None:
+                k = last_k + 1
+                continue
+            items = [p.strip() for p in payload.split(",") if p.strip()]
+            if len(items) <= max_entities:
+                k = last_k + 1
+                continue
+            imported = {_module_side_name(it) for it in items}
+            extra = pub - imported
+            other_text = "\n".join(out[u0:k] + out[last_k + 1 : u1 + 1])
+            collision = any(
+                re.search(rf"(?<![A-Za-z0-9_]){re.escape(nm)}(?![A-Za-z0-9_])", other_text, re.IGNORECASE)
+                for nm in extra
+            )
+            if not collision:
+                eol = _line_eol(out[last_k])
+                noun = "entity" if len(items) == 1 else "entities"
+                out[k] = f"{indent}use {mod_name} ! imports {len(items)} {noun}{eol}"
+                # Deletion sentinel is None, NOT "" -- f90_lines represents
+                # a genuine BLANK line as bare "" (the pipeline joins with
+                # "\n" at the very end, so no element carries its own
+                # newline), and this pass runs LATE, after the pipeline's
+                # own blank-line normalization -- filtering on "" here
+                # would silently strip every blank line in the whole file
+                # with nothing downstream left to restore them.
+                for t in range(k + 1, last_k + 1):
+                    out[t] = None
+            k = last_k + 1
+        i = u1 + 1
+
+    return [ln for ln in out if ln is not None]
+
+
 def ensure_blank_line_between_procedures(lines):
     """Ensure one blank line between consecutive procedure definitions."""
     out = []
@@ -4471,6 +6268,154 @@ def remove_unused_named_constants(lines):
         return [x for x in out if x]
 
     out = list(lines)
+
+    def _process_unit(u0, u1):
+        # Recurse into each subroutine/function nested (via `contains`)
+        # inside this unit FIRST, treating each one as its own independent
+        # scope -- Fortran scoping means a local `parameter` declared
+        # identically in two different nested procedures (e.g. this
+        # project's `integer, parameter :: rng = 0` RNG-state placeholder,
+        # named the same in every simulate_* subroutine of one generated
+        # module) are two completely unrelated names, never to be
+        # conflated. Without this, matching `unit_start_re` against
+        # `module ... end module` (which happens first, since it's
+        # outermost) swallowed every contained procedure's body into ONE
+        # flat scan -- "keep first declaration if duplicates appear" then
+        # kept only the FIRST subroutine's `rng`, and every OTHER
+        # subroutine's own (individually genuinely dead) `rng`
+        # declaration line was misread as a "use" of that first one,
+        # since it's just another line containing the token "rng".
+        nested_spans = []
+        k = u0
+        while k <= u1:
+            code_k = out[k].split("!", 1)[0].strip()
+            m_nested = unit_start_re.match(code_k) if k != u0 else None
+            if m_nested:
+                nested_kind = m_nested.group(1).lower()
+                nested_end_re = re.compile(rf"^\s*end\s+{re.escape(nested_kind)}\b", flags=re.IGNORECASE)
+                e = k + 1
+                while e <= u1 and not nested_end_re.match(out[e].split("!", 1)[0].strip()):
+                    e += 1
+                e = min(e, u1)
+                nested_spans.append((k, e))
+                k = e + 1
+                continue
+            k += 1
+        for ns0, ns1 in nested_spans:
+            _process_unit(ns0, ns1)
+        excluded_for_candidates = set()
+        for ns0, ns1 in nested_spans:
+            excluded_for_candidates.update(range(ns0, ns1 + 1))
+
+        # Candidate: a name in a `parameter` declaration, at THIS level
+        # only (a candidate found inside a nested procedure was already
+        # handled by that procedure's own recursive call above; a true
+        # unit-level constant like a module's `dp` kind parameter is
+        # still found and tracked here, with reads counted across the
+        # WHOLE unit including inside nested procedure bodies, below --
+        # it really is visible there). A declaration line can combine
+        # several names (`integer, parameter :: sp = real32, dp =
+        # real64`, e.g. after coalesce_nonadjacent_declarations merges
+        # same-type parameter declarations onto one line) -- each is its
+        # own independent candidate, tracked by (line, entity index) so
+        # an unused one can be pulled OUT of a still-otherwise-used
+        # line, not just used to disqualify the whole line from
+        # consideration the way a single-name-only check would.
+        cand_info = {}  # name -> (line_idx, entity_idx)
+        line_entities = {}  # line_idx -> list of entity text (only for candidate lines)
+        for k in range(u0, u1 + 1):
+            if k in excluded_for_candidates:
+                continue
+            code = out[k].split("!", 1)[0].strip()
+            if not code or "::" not in code:
+                continue
+            m = decl_re.match(code)
+            if not m:
+                continue
+            attrs = m.group(1).lower()
+            if "parameter" not in attrs:
+                continue
+            payload = m.group(2).strip()
+            items = _split_top_level_commas(payload)
+            if not items:
+                continue
+            entity_names = []
+            for it in items:
+                mi = item_re.match(it)
+                if not mi:
+                    entity_names = None
+                    break
+                entity_names.append(mi.group(1).lower())
+            if entity_names is None:
+                continue
+            line_entities[k] = items
+            for idx, nm in enumerate(entity_names):
+                # Conservative: keep first declaration if duplicates appear.
+                cand_info.setdefault(nm, (k, idx))
+
+        if cand_info:
+            reads = {nm: 0 for nm in cand_info}
+            line_self_names = {}
+            for nm, (kline, _idx) in cand_info.items():
+                line_self_names.setdefault(kline, set()).add(nm)
+            for k in range(u0, u1 + 1):
+                code = out[k].split("!", 1)[0]
+                if not code.strip():
+                    continue
+                # A candidate's own declaration line must still be scanned --
+                # its RHS may reference ANOTHER candidate constant (a chained
+                # definition like `b = a + 1`), and that reference is a real
+                # use. Only the name(s) being DECLARED on this line are
+                # excluded, so a parameter doesn't count as "used" purely by
+                # naming itself (or a sibling on the same combined line) on
+                # its own declaration line.
+                self_names = line_self_names.get(k, ())
+                for tok in tok_re.findall(code):
+                    tl = tok.lower()
+                    if tl in self_names:
+                        continue
+                    if tl in reads:
+                        reads[tl] += 1
+                for nm in reads:
+                    if nm in self_names:
+                        continue
+                    # Kind-suffix usage (e.g. `1.0_dp` "using" a constant
+                    # named dp) only counts as a real use when `_name`
+                    # directly follows an actual numeric-literal token
+                    # (digits, optional decimal part, optional exponent).
+                    # A bare `_{name}\b` substring match (the previous
+                    # check) also matched inside any UNRELATED identifier
+                    # that merely happens to END in "_name" -- e.g. the
+                    # runtime helper call `seed_rng(...)` was seen as
+                    # "using" a same-named local constant `rng`, even
+                    # though seed_rng has nothing to do with it.
+                    if re.search(
+                        rf"(?<![A-Za-z0-9_])[0-9]+(?:\.[0-9]*)?(?:[eEdD][+-]?[0-9]+)?_{re.escape(nm)}\b",
+                        code,
+                        flags=re.IGNORECASE,
+                    ):
+                        reads[nm] += 1
+
+            to_remove_by_line = {}
+            for nm, cnt in reads.items():
+                if cnt == 0:
+                    kline, idx = cand_info[nm]
+                    to_remove_by_line.setdefault(kline, set()).add(idx)
+            for kline, remove_idxs in to_remove_by_line.items():
+                items = line_entities[kline]
+                kept = [it for idx, it in enumerate(items) if idx not in remove_idxs]
+                if not kept:
+                    out[kline] = ""
+                    continue
+                orig = out[kline]
+                indent = re.match(r"^(\s*)", orig).group(1)
+                code0, sep0, comment0 = orig.partition("!")
+                dm = decl_re.match(code0.strip())
+                spec = dm.group(1).strip()
+                eol = "\r\n" if orig.endswith("\r\n") else ("\n" if orig.endswith("\n") else "")
+                new_code = f"{indent}{spec} :: {', '.join(kept)}"
+                out[kline] = f"{new_code}!{comment0}" if sep0 else f"{new_code}{eol}"
+
     i = 0
     n = len(out)
     while i < n:
@@ -4488,59 +6433,7 @@ def remove_unused_named_constants(lines):
             j += 1
         u0 = i
         u1 = min(j, n - 1)
-
-        # Candidate: single-name parameter declaration.
-        cand_line_by_name = {}
-        for k in range(u0, u1 + 1):
-            code = out[k].split("!", 1)[0].strip()
-            if not code or "::" not in code:
-                continue
-            m = decl_re.match(code)
-            if not m:
-                continue
-            attrs = m.group(1).lower()
-            if "parameter" not in attrs:
-                continue
-            payload = m.group(2).strip()
-            items = _split_top_level_commas(payload)
-            if len(items) != 1:
-                continue
-            mi = item_re.match(items[0])
-            if not mi:
-                continue
-            nm = mi.group(1).lower()
-            # Conservative: keep first declaration if duplicates appear.
-            cand_line_by_name.setdefault(nm, k)
-
-        if cand_line_by_name:
-            reads = {nm: 0 for nm in cand_line_by_name}
-            cand_lines = set(cand_line_by_name.values())
-            line_self_name = {kline: nm for nm, kline in cand_line_by_name.items()}
-            for k in range(u0, u1 + 1):
-                code = out[k].split("!", 1)[0]
-                if not code.strip():
-                    continue
-                # A candidate's own declaration line must still be scanned --
-                # its RHS may reference ANOTHER candidate constant (a chained
-                # definition like `b = a + 1`), and that reference is a real
-                # use. Only the name being DECLARED on this line is excluded,
-                # so a parameter doesn't count as "used" purely by naming
-                # itself on its own declaration line.
-                self_name = line_self_name.get(k)
-                for tok in tok_re.findall(code):
-                    tl = tok.lower()
-                    if tl == self_name:
-                        continue
-                    if tl in reads:
-                        reads[tl] += 1
-                for nm in reads:
-                    if nm == self_name:
-                        continue
-                    if re.search(rf"_{re.escape(nm)}\b", code, flags=re.IGNORECASE):
-                        reads[nm] += 1
-            for nm, cnt in reads.items():
-                if cnt == 0:
-                    out[cand_line_by_name[nm]] = ""
+        _process_unit(u0, u1)
         i = j + 1
 
     return [ln for ln in out if ln != ""]
@@ -6131,8 +8024,32 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
     covers the common remaining case, scoped per procedure so
     declarations from different functions can never be merged together.
 
-    Same conservative rule as coalesce_simple_declarations: skips any
-    statement with an inline comment or an initialized entity (`= ...`).
+    Skips any statement with an inline comment. A scalar initialized
+    entity (`NAME = VALUE`, no array shape on the name) CAN merge with
+    other entities of the same type-spec -- initialized or not, `save`/
+    `parameter` or plain -- since Fortran applies (implicit or explicit)
+    SAVE per-entity, not per-statement: an uninitialized entity sitting
+    on the same merged line as an initialized one never itself acquires
+    SAVE just from the proximity, so splitting or combining these onto
+    one declaration statement is a purely cosmetic, meaning-preserving
+    rewrite either way. This covers all of:
+
+        real(kind=dp), parameter :: d = 0.3_dp
+        real(kind=dp), parameter :: mu = 0.0_dp
+            --> real(kind=dp), parameter :: d = 0.3_dp, mu = 0.0_dp
+
+        real, save :: x = 1.0
+        real, save :: y = 2.0
+            --> real, save :: x = 1.0, y = 2.0
+
+        real :: x
+        real :: y
+        real :: z = 3.0
+            --> real :: x, y, z = 3.0
+
+    Array-shaped initialized entities (e.g. `x(3) = [1, 2, 3]`) are still
+    left alone, since lining up a shape spec with its initializer across
+    a merged comma list isn't attempted here.
     """
     unit_start_re = re.compile(
         r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
@@ -6157,7 +8074,12 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
         return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
 
     def entity_has_parens_suffix(entity):
-        return "(" in entity
+        # For an initialized entity (`NAME = VALUE`), only the NAME part
+        # can carry an array-shape suffix -- a `(` inside the VALUE
+        # expression (e.g. `d = sqrt(0.3_dp)`) is not an array shape and
+        # must not make this look like an array entity.
+        name_part = entity.split("=", 1)[0] if "=" in entity else entity
+        return "(" in name_part
 
     def _split_entities(text):
         parts = []
@@ -6209,8 +8131,20 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
         indent = stmt_lines[0][: len(stmt_lines[0]) - len(stmt_lines[0].lstrip())]
         spec = m.group(2).strip()
         entities = _split_entities(m.group(3).strip())
-        if not entities or any("=" in e for e in entities):
+        if not entities:
             return None
+        for e in entities:
+            if "=" in e and "(" in e.split("=", 1)[0]:
+                # An array-shaped initialized entity (e.g. `x(3) = [1, 2,
+                # 3]`) is left alone -- lining up a shape spec with its
+                # initializer across a merged comma list isn't attempted
+                # here. A scalar initialized entity has no such issue and
+                # is otherwise treated exactly like a bare entity (see
+                # the docstring: SAVE applies per-entity, not per-
+                # statement, so merging it alongside bare or other
+                # initialized entities of the same type-spec changes
+                # nothing about what gets saved).
+                return None
         return indent, spec, entities
 
     result_name_re = re.compile(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", re.IGNORECASE)
@@ -24008,12 +25942,35 @@ class translator(ast.NodeVisitor):
             _l_real = self._expr_kind(node.left) == "real"
             _r_real = self._expr_kind(node.comparators[0]) == "real"
             if _l_real or _r_real:
-                _nan_result = ".true." if op is ast.NotEq else ".false."
-                _a_safe = f"merge(0.0_dp, {a}, ieee_is_nan({a}))" if _l_real else a
-                _b_safe = f"merge(0.0_dp, {b}, ieee_is_nan({b}))" if _r_real else b
-                _nan_mask_parts = [p for p, r in ((f"ieee_is_nan({a})", _l_real), (f"ieee_is_nan({b})", _r_real)) if r]
-                _nan_mask = " .or. ".join(_nan_mask_parts)
-                return f"merge({_nan_result}, ({_a_safe} {opmap[op]} {_b_safe}), {_nan_mask})"
+                # A literal numeric constant (e.g. the `0.0` in `s2 <=
+                # 0.0`) can never be NaN, so it needs no ieee_is_nan guard
+                # of its own -- skip it entirely on that side rather than
+                # wrapping it in the same merge()/ieee_is_nan() machinery
+                # a genuine variable operand needs. Without this, both
+                # operands got guarded unconditionally, including a
+                # needless `merge(0.0_dp, 0.0_dp, ieee_is_nan(0.0_dp))`
+                # sub-expression (always just 0.0_dp, regardless of the
+                # condition -- true/false sources identical) plus its own
+                # redundant `ieee_is_nan(0.0_dp)` test (always false) in
+                # the OR-mask.
+                def _is_never_nan_literal(anode):
+                    while isinstance(anode, ast.UnaryOp) and isinstance(anode.op, (ast.USub, ast.UAdd)):
+                        anode = anode.operand
+                    return (
+                        isinstance(anode, ast.Constant)
+                        and isinstance(anode.value, (int, float))
+                        and not isinstance(anode.value, bool)
+                        and not (isinstance(anode.value, float) and anode.value != anode.value)
+                    )
+                _l_guard = _l_real and not _is_never_nan_literal(node.left)
+                _r_guard = _r_real and not _is_never_nan_literal(node.comparators[0])
+                if _l_guard or _r_guard:
+                    _nan_result = ".true." if op is ast.NotEq else ".false."
+                    _a_safe = f"merge(0.0_dp, {a}, ieee_is_nan({a}))" if _l_guard else a
+                    _b_safe = f"merge(0.0_dp, {b}, ieee_is_nan({b}))" if _r_guard else b
+                    _nan_mask_parts = [p for p, r in ((f"ieee_is_nan({a})", _l_guard), (f"ieee_is_nan({b})", _r_guard)) if r]
+                    _nan_mask = " .or. ".join(_nan_mask_parts)
+                    return f"merge({_nan_result}, ({_a_safe} {opmap[op]} {_b_safe}), {_nan_mask})"
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
@@ -41179,6 +43136,12 @@ class translator(ast.NodeVisitor):
             and len(v.args) >= 1
             and isinstance(v.args[0], ast.ListComp)
         ):
+            # An element expression this project's own rewrite_listcomp_
+            # array_assign_calls_to_loop couldn't statically prove would
+            # need the explicit-loop fallback (see that function) still
+            # goes through the normal inline elementwise lowering here;
+            # if IT can't handle it either, the error is unchanged from
+            # before that fallback existed.
             self.o.w(f"{t.id} = {self.expr(v.args[0])}")
             return
 
@@ -42278,6 +44241,35 @@ class translator(ast.NodeVisitor):
 
         if node.value is not None:
             if self.tuple_return_out_names:
+                if (
+                    isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in self.tuple_return_funcs
+                ):
+                    # `return other_tuple_func(...)` -- a pure passthrough
+                    # of another local tuple-return function's result (see
+                    # the matching whole-program tuple_return_funcs/
+                    # local_tuple_return_out_names classification, which
+                    # includes this passthrough shape). Reuse the general
+                    # tuple-unpack-from-call codegen in visit_Assign by
+                    # synthesizing an Assign straight into this function's
+                    # own intent(out) dummy arguments -- they're already
+                    # declared with the matching kind/rank (copied from
+                    # the callee's own out_kinds/out_ranks for exactly
+                    # this case; see _local_return_maps), so assigning
+                    # into them directly needs no separate temp variables.
+                    synthetic_assign = ast.Assign(
+                        targets=[ast.Tuple(
+                            elts=[ast.Name(id=nm, ctx=ast.Store()) for nm in self.tuple_return_out_names],
+                            ctx=ast.Store(),
+                        )],
+                        value=node.value,
+                    )
+                    ast.copy_location(synthetic_assign, node)
+                    ast.fix_missing_locations(synthetic_assign)
+                    self.visit_Assign(synthetic_assign)
+                    self.o.w("return")
+                    return
                 if not isinstance(node.value, (ast.Tuple, ast.List)):
                     self.o.w("return")
                     return
@@ -46777,6 +48769,60 @@ def _arg_has_rank1_subscript_use(fn, name):
     return saw_rank1
 
 
+def _none_default_arg_is_pure_forward(fn, arg_name):
+    """True if `arg_name` (one of fn's own None-default parameters) is
+    NEVER used within fn's body except as a bare Name passed directly as
+    a positional or keyword argument to some call -- fn never branches on
+    `arg_name is None`, never reassigns it, and never uses it in any
+    other expression context of its own.
+
+    Motivating bug: a Python function that does nothing with an
+    `x=None`-default parameter except forward it verbatim to another
+    function's OWN `x=None`-default parameter (e.g. `def
+    autocov_abs_garch_1_1(..., ez_abs=None): ...; return
+    autocov_abs_from_pq(..., ez_abs=ez_abs)`) had its `ez_abs` PREMATURELY
+    resolved to a generic numeric placeholder (`optval(ez_abs, 0.0_dp)`)
+    before being forwarded -- as an always-PRESENT local, not the
+    original possibly-ABSENT dummy -- defeating the callee's OWN, correct
+    `if ez_abs is None: ez_abs = <real default>` resolution (which relies
+    on `present(ez_abs)` still reflecting whether the ORIGINAL top-level
+    caller ever supplied a value at all). Silently wrong, not a compile
+    error: the callee's `present()` check simply always saw "supplied"
+    and used the wrong (0.0) value.
+
+    Used to decide whether a local alias/materialization is needed for
+    `arg_name` at all -- when it's provably a pure forward, skipping the
+    alias entirely means the RAW (still-optional, still-absence-tracking)
+    Fortran dummy gets used wherever `arg_name` is referenced, which is
+    exactly the one place it's used: the forwarding call.
+    """
+    class _Checker(ast.NodeVisitor):
+        def __init__(self):
+            self.pure_forward = True
+
+        def visit_Call(self, node):
+            if not self.pure_forward:
+                return
+            for a in node.args:
+                if isinstance(a, ast.Name) and a.id == arg_name:
+                    continue
+                self.visit(a)
+            for kw in node.keywords:
+                if isinstance(kw.value, ast.Name) and kw.value.id == arg_name:
+                    continue
+                self.visit(kw.value)
+            self.visit(node.func)
+
+        def visit_Name(self, node):
+            if node.id == arg_name:
+                self.pure_forward = False
+
+    checker = _Checker()
+    for st in fn.body:
+        checker.visit(st)
+    return checker.pure_forward
+
+
 def _emit_local_function(
     o,
     fn,
@@ -49343,10 +51389,29 @@ def _emit_local_function(
                     nm = f"{proc_name}_out_{j + 1}"
                 if nm in {"dp", "eye"}:
                     nm = f"{nm}_v"
+                # A tuple can legally return the SAME variable twice in
+                # Python (`return gamma0, gamma0`), but Fortran's formal
+                # argument list can't declare the same dummy name twice
+                # -- fall back to the same disambiguated name already
+                # used above for an args-collision.
+                if nm in out_names:
+                    nm = f"{proc_name}_out_{j + 1}"
                 out_names.append(nm)
             else:
                 tuple_ret_src_names.append(None)
                 out_names.append(f"{proc_name}_out_{j + 1}")
+    elif fn.name in (tuple_return_funcs or set()):
+        # A pure "return other_tuple_func(...)" passthrough (see the
+        # matching classification pass building tuple_return_funcs/
+        # local_tuple_return_out_names before local functions are
+        # emitted) -- fn's own return value is a Call, not a literal
+        # Tuple/List, so the tuple_return_seed search above never finds
+        # anything to walk .elts over. Its out-arg names were already
+        # precomputed there; pull them directly instead. No per-index
+        # source name applies (forwarding-only, nothing named locally).
+        tuple_return = True
+        out_names = list((local_tuple_return_out_names or {}).get(fn.name, []))
+        tuple_ret_src_names = [None] * len(out_names)
     tr.tuple_return_out_names = list(out_names)
     tr.tuple_return_src_names = [nm for nm in tuple_ret_src_names if isinstance(nm, str)] if tuple_return else []
     if returns and (not tuple_return) and (not dict_return):
@@ -51208,6 +53273,15 @@ def _emit_local_function(
     for arg in optional_args:
         if arg in defaults_map and (not is_none(defaults_map[arg])):
             continue
+        # A None-default parameter this function's own body does NOTHING
+        # with except forward unchanged to another call needs no local
+        # alias/materialization at all -- see _none_default_arg_is_pure_
+        # forward's docstring for the bug this avoids. Skipping the alias
+        # leaves `arg` resolving to the raw (still-optional, still-
+        # absence-tracking) Fortran dummy wherever it's referenced, which
+        # is exactly the one place it's used: the forwarding call.
+        if _none_default_arg_is_pure_forward(fn, arg):
+            continue
         # `_aliased_name()` may already have inserted an identity mapping
         # (`arg -> arg`). That must not suppress optional-local alias creation.
         if arg in tr.name_aliases and tr.name_aliases.get(arg) != arg:
@@ -52377,6 +54451,37 @@ def _emit_local_function(
             # Avoid emitting a redundant RETURN when this is the final statement.
             if s.value is not None:
                 if tuple_return:
+                    if (
+                        isinstance(s.value, ast.Call)
+                        and isinstance(s.value.func, ast.Name)
+                        and s.value.func.id in tr.tuple_return_funcs
+                    ):
+                        # `return other_tuple_func(...)` -- a pure
+                        # passthrough of another local tuple-return
+                        # function's result (see the matching
+                        # translator.visit_Return case and the whole-
+                        # program tuple_return_funcs/
+                        # local_tuple_return_out_names classification,
+                        # which includes this passthrough shape). Reuse
+                        # the general tuple-unpack-from-call codegen in
+                        # visit_Assign by synthesizing an Assign straight
+                        # into this function's own out_names -- already
+                        # declared with the matching kind/rank (copied
+                        # from the callee's own out_kinds/out_ranks for
+                        # exactly this case; see _local_return_maps).
+                        synthetic_assign = ast.Assign(
+                            targets=[ast.Tuple(
+                                elts=[ast.Name(id=nm, ctx=ast.Store()) for nm in out_names],
+                                ctx=ast.Store(),
+                            )],
+                            value=s.value,
+                        )
+                        ast.copy_location(synthetic_assign, s)
+                        ast.fix_missing_locations(synthetic_assign)
+                        tr.visit_Assign(synthetic_assign)
+                        if i != len(fn.body) - 1:
+                            o.w("return")
+                        continue
                     if not isinstance(s.value, (ast.Tuple, ast.List)):
                         if i != len(fn.body) - 1:
                             o.w("return")
@@ -53452,6 +55557,35 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                             else:
                                 kinds.append("real")
                             ranks.append(0)
+                if tuple_out.get(fn.name) != kinds or tuple_out_ranks.get(fn.name) != ranks:
+                    changed = True
+                tuple_out[fn.name] = kinds
+                tuple_out_ranks[fn.name] = ranks
+                continue
+            if (
+                isinstance(r0, ast.Call)
+                and isinstance(r0.func, ast.Name)
+                and r0.func.id in tuple_out
+            ):
+                # `return other_tuple_func(...)` -- a pure passthrough of
+                # another local function's tuple return (a thin wrapper
+                # that just forwards/adds args, e.g. acf_abs_garch_1_1(...)
+                # -> return acf_abs_from_pq(...)). Nothing in fn's OWN body
+                # builds a Tuple literal, so the isinstance(r0, ast.Tuple)
+                # branch above never fires; without this, it fell through
+                # to the generic scalar-spec inference below, which
+                # defaulted to a single real return instead of the true
+                # tuple shape -- surfacing downstream as "unsupported
+                # assign: a, b, c = wrapper(...)" at the call site. Copy
+                # the callee's already-inferred out_kinds/out_ranks
+                # directly; this whole loop is already a fixed-point
+                # iteration (see max_iter above), so if the callee hasn't
+                # been classified yet on this pass, fn simply falls
+                # through to the scalar path for this iteration and gets
+                # correctly reclassified once the callee's own tuple_out
+                # entry is populated on a later one.
+                kinds = list(tuple_out[r0.func.id])
+                ranks = list(tuple_out_ranks.get(r0.func.id, [0] * len(kinds)))
                 if tuple_out.get(fn.name) != kinds or tuple_out_ranks.get(fn.name) != ranks:
                     changed = True
                 tuple_out[fn.name] = kinds
@@ -56705,10 +58839,25 @@ def generate_flat(
             ):
                 observed_unpack_arities.setdefault(st.value.func.id, set()).add(len(st.targets[0].elts))
     for fn in (local_funcs or []):
-        rets = [
-            st for st in ast.walk(fn)
-            if isinstance(st, ast.Return) and st.value is not None
-        ]
+        # Source-order (depth-first), NOT ast.walk's breadth-first order --
+        # must match _emit_local_function's own _value_returns_excluding_
+        # nested(fn) call exactly. A function with more than one
+        # value-returning Return statement at different nesting depths
+        # (e.g. an early `if burn: return eps[burn:], h[burn:]` followed
+        # by a final `return eps, h`) picks a DIFFERENT "first" tuple
+        # return under BFS than under source order -- ast.walk visits ALL
+        # of a node's immediate (depth-1) children, including a LATER
+        # top-level Return, before descending into an EARLIER sibling's
+        # (depth-2) nested Return. That previously desynced this
+        # classification's out_names (used to build the keyword argument
+        # names at every CALL site) from _emit_local_function's own
+        # out_names (used for the actual subroutine's dummy-argument
+        # declarations) -- the call site ended up passing keyword names
+        # that didn't exist in the callee's signature at all (a hard
+        # gfortran compile error), whenever a real-world function like
+        # this had both an early-return guard clause and a final return,
+        # both tuples of the same arity.
+        rets = _value_returns_excluding_nested(fn)
         tuple_rets = [
             st for st in rets
             if isinstance(getattr(st, "value", None), (ast.Tuple, ast.List))
@@ -56744,12 +58893,63 @@ def generate_flat(
                     nm = f"{fn.name}_out_{j + 1}"
                 if nm in {"dp", "eye"}:
                     nm = f"{nm}_v"
+                # Same fallback as an args-collision: a tuple can legally
+                # return the SAME variable twice in Python (`return
+                # gamma0, gamma0`), but Fortran's formal argument list
+                # can't declare the same dummy name twice.
+                if nm in out_names:
+                    nm = f"{fn.name}_out_{j + 1}"
                 out_names.append(nm)
             else:
                 src_names.append(None)
                 out_names.append(f"{fn.name}_out_{j + 1}")
         local_tuple_return_out_names[fn.name] = out_names
         local_tuple_return_src_names[fn.name] = src_names
+
+    # Second pass: recognize a pure "return other_tuple_func(...)"
+    # passthrough -- a thin wrapper forwarding/adding args (e.g.
+    # `def acf_abs_garch_1_1(...): ...; return acf_abs_from_pq(...)`)
+    # whose own single return value is a Call, not a literal Tuple/List,
+    # so the scan above never finds anything to classify it from. Without
+    # this, such a wrapper is left out of tuple_return_funcs entirely and
+    # every call site unpacking its result (`a, b, c = wrapper(...)`)
+    # raises "unsupported assign". Iterate to a fixed point so a chain of
+    # wrappers (A passes through to B, which passes through to C)
+    # resolves regardless of local_funcs ordering.
+    _passthrough_max_iter = max(1, len(local_funcs or [])) + 1
+    for _ in range(_passthrough_max_iter):
+        _changed = False
+        for fn in (local_funcs or []):
+            if fn.name in tuple_return_funcs:
+                continue
+            _rets = [
+                st for st in ast.walk(fn)
+                if isinstance(st, ast.Return) and st.value is not None
+            ]
+            if len(_rets) != 1:
+                continue
+            _rv = _rets[0].value
+            if not (
+                isinstance(_rv, ast.Call)
+                and isinstance(_rv.func, ast.Name)
+                and _rv.func.id in tuple_return_funcs
+            ):
+                continue
+            _callee_out_names = local_tuple_return_out_names.get(_rv.func.id, [])
+            if not _callee_out_names:
+                continue
+            _arity = len(_callee_out_names)
+            tuple_return_funcs.add(fn.name)
+            # No meaningful per-index source name here -- fn's body never
+            # names these values itself, it just forwards the callee's
+            # outputs -- so every source name is None, matching the
+            # existing convention for a non-Name tuple element above.
+            local_tuple_return_out_names[fn.name] = [f"{fn.name}_out_{j + 1}" for j in range(_arity)]
+            local_tuple_return_src_names[fn.name] = [None] * _arity
+            _changed = True
+        if not _changed:
+            break
+
     local_void_funcs = set()
     def _has_value_return_in_body(stmts):
         for st in stmts:
@@ -59512,6 +61712,8 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = ast.parse(src_text, filename=source_name)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = rewrite_case_insensitive_name_collisions(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
     params = find_parameters(tree)
     list_counts = build_list_count_map(tree)
@@ -59808,6 +62010,8 @@ def transpile_file(
     list_directed_io=False,
     rng_replay_path=None,
     src_override=None,
+    elemental_pass=False,
+    max_use_only=None,
 ):
     if src_override is not None:
         src = normalize_numpy_removed_aliases(src_override)
@@ -59817,6 +62021,8 @@ def transpile_file(
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = rewrite_case_insensitive_name_collisions(tree)
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
     tree = inline_local_from_imports(tree, py_path)
@@ -60134,6 +62340,7 @@ def transpile_file(
     # output is readable even without full --postprocess rewrites.
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_redundant_nested_arith_parens(f90_lines)
+    f90_lines = simplify_narrow_redundant_arith_parens(f90_lines)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
     f90_lines = combine_parenthesized_integer_offset(f90_lines)
     f90_lines = simplify_paren_group_before_addsub(f90_lines)
@@ -60159,6 +62366,7 @@ def transpile_file(
     # coalesce_nonadjacent_declarations below regroups whatever the promote
     # passes didn't touch.
     f90_lines = split_declarations_to_single_names(f90_lines)
+    f90_lines = eliminate_redundant_readonly_param_shadow_copies(f90_lines)
     f90_lines = promote_immediate_scalar_constants(f90_lines)
     f90_lines = promote_immediate_array_constants(f90_lines)
     f90_lines = promote_immediate_2d_array_constants(f90_lines)
@@ -60175,6 +62383,16 @@ def transpile_file(
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = rebase_argsort_output_to_one_based(f90_lines)
     f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
+    f90_lines = fuse_bare_copy_into_next_self_referential_assignment(f90_lines)
+    f90_lines = simplify_redundant_dp_cast_around_dot_product(f90_lines)
+    f90_lines = simplify_redundant_dp_cast_around_dp_returning_calls(f90_lines)
+    f90_lines = simplify_redundant_dp_cast_general(f90_lines)
+    # Runs BEFORE the wrap passes later in this pipeline: this pass's own
+    # continuation-joining is naive (space-joins fragments), which would
+    # corrupt a format string that had ALREADY been split via the
+    # zero-inserted-characters string-continuation rule if it ran after
+    # wrap_long_lines produced one.
+    f90_lines = simplify_format_string_space_literals_and_fold_repeats(f90_lines)
     f90_lines = remove_write_only_scalar_locals(f90_lines)
     f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
     if postprocess:
@@ -60208,7 +62426,6 @@ def transpile_file(
         # Final loop-index normalization pass after all other line rewrites.
         f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
         f90_lines = fpost.simplify_do_while_true(f90_lines)
-        f90_lines = simplify_redundant_int_casts(f90_lines)
         f90_lines = promote_immediate_scalar_constants(f90_lines)
         f90_lines = normalize_string_concat_operator(f90_lines)
         f90_lines = normalize_split_relational_operators(f90_lines)
@@ -60233,12 +62450,26 @@ def transpile_file(
     else:
         # Default path prioritizes semantic stability over stylistic rewrites.
         # Keep only compile-safety wrapping, dead constant/import pruning, and
-        # basic comment spacing.
+        # basic comment spacing. hoist_module_use_only_imports is included
+        # here too despite that -- it's purely structural (Fortran scoping
+        # means a locally-declared entity always shadows a host-associated
+        # one of the same name, so hoisting a duplicate per-procedure `use
+        # X, only: Y` to module scope can't change what any OTHER procedure
+        # sees), and removes a genuinely confusing duplication (the same
+        # `use python_mod, only: optval` line repeated once per procedure
+        # that needs it) rather than a stylistic preference.
         f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
         f90_lines = normalize_split_relational_operators(f90_lines)
         f90_lines = remove_unused_named_constants(f90_lines)
         f90_lines = remove_unused_use_only_imports(f90_lines)
         f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
+        f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
+    # Moved out of the --postprocess-only block above: scoped per unit
+    # (never conflates a same-named integer in one procedure with a
+    # real in another) and purely removes noise (`int(k)` -> `k` when k
+    # is already declared integer), so it belongs in the default path
+    # too, not just full postprocessing.
+    f90_lines = simplify_redundant_int_casts(f90_lines)
     if list_directed_io:
         f90_lines = rewrite_to_list_directed_io(f90_lines)
     f90_lines = remove_allocatable_shadow_decls(f90_lines)
@@ -60249,9 +62480,62 @@ def transpile_file(
     f90_lines = enforce_space_before_inline_comments(f90_lines)
     if explain_inference:
         f90_lines = add_inference_explanation_comments(f90_lines, tree, comment_map)
+    # Promote any procedure not already marked pure/elemental to `pure`
+    # wherever the EMITTED Fortran itself proves it's safe -- ground truth
+    # on the generated code, not a heuristic scan of the Python source that
+    # produced it (see fortran_purity.py's module docstring). Strictly
+    # additive on top of whatever the Python-AST-driven passes above
+    # already decided: only ever adds `pure `, never removes one already
+    # present, so a gap or bug here can only mean a missed opportunity
+    # (caught immediately by the very next compile in this same run, since
+    # Fortran itself rejects a wrongly-promoted `pure` that calls something
+    # actually impure), never a silently wrong build.
+    try:
+        f90_lines = fpurity.mark_pure_where_provable(
+            f90_lines, external_name_status=_vendored_purity_registry()
+        )
+    except Exception:
+        pass
+    # Unlike the always-on PURE pass just above, ELEMENTAL is opt-in
+    # (--elemental): it isn't a pure upside the way PURE is -- it carries
+    # a real usage constraint (an elemental procedure can never be passed
+    # where a procedure dummy is expected) and only pays off if a caller
+    # could actually exploit automatic array broadcasting, so it's
+    # offered as a choice rather than always applied. Runs after the PURE
+    # pass so it can see the now-fully-resolved purity state directly in
+    # the text.
+    if elemental_pass:
+        try:
+            f90_lines = fpurity.mark_elemental_where_provable(f90_lines)
+        except Exception:
+            pass
     # Apply final structural whitespace consistently for default and
     # postprocessed output.
     f90_lines = fpost.ensure_blank_lines_around_units_and_procedures(f90_lines)
+    # Opt-in (--max-use-only N): collapse a same-run-generated module's
+    # `use MOD, only: ...` down to `use MOD ! imports N entities` once
+    # its only-list exceeds N names -- see collapse_large_use_only_
+    # imports for the safety scoping. Runs after every pass above that
+    # can add/remove names from a `use ... only:` list (remove_unused_
+    # use_only_imports, hoist_module_use_only_imports), so it sees the
+    # FINAL entity count.
+    if max_use_only is not None:
+        try:
+            f90_lines = collapse_large_use_only_imports(f90_lines, max_use_only)
+        except Exception:
+            pass
+    # Final line-length pass, run LAST regardless of --postprocess: both
+    # branches above already call this once, but several passes after
+    # that first call can re-lengthen a line past 80 columns again --
+    # most visibly remove_unused_use_only_imports, which rebuilds a
+    # `use ..., only: ...` statement as ONE unwrapped line when trimming
+    # an unused name from it (even if the original was already wrapped
+    # across several continuation lines), and mark_pure_where_provable/
+    # mark_elemental_where_provable, which can push a signature line past
+    # 80 columns by prepending "pure "/"elemental ". Re-running the
+    # wrapper here is a no-op for any line that's already short enough,
+    # so this only ever affects lines a later pass left too long.
+    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     out_path = Path(out_path) if out_path else Path(py_path).with_name(f"{Path(py_path).stem}_p.f90")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -60271,6 +62555,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = rewrite_case_insensitive_name_collisions(tree)
     validate_imports_supported(tree, py_path)
 
     top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
@@ -60422,6 +62708,8 @@ def main():
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
     ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
     ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
+    ap.add_argument("--elemental", action="store_true", help="also declare a PURE procedure ELEMENTAL where the emitted Fortran proves it's safe (scalar dummies/result, no procedure dummy, never passed as a callback)")
+    ap.add_argument("--max-use-only", type=int, default=None, metavar="N", help="collapse a `use MOD, only: a, b, ...` statement with more than N names into a bare `use MOD ! imports K entities` -- only for a module this same run also generated, and only when doing so can't collide with anything else visible in that use statement's own enclosing module/program")
     ap.add_argument("--list-directed-io", action="store_true", help="rewrite formatted write/print to list-directed output")
     ap.add_argument("--compile", action="store_true", help="compile transpiled source with helper files")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
@@ -60864,6 +63152,8 @@ def main():
             postprocess=args.postprocess,
             list_directed_io=args.list_directed_io,
             src_override=transpile_src_text,
+            elemental_pass=args.elemental,
+            max_use_only=args.max_use_only,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:
@@ -61154,6 +63444,32 @@ def main():
                         return True
                     _num_core = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?|(?:inf|nan)"
                     _signed_num = rf"[+-]?(?:{_num_core})"
+
+                    # A "label=value" token (e.g. "omega=0.1" from Python's
+                    # "omega=%.6g" % omega, vs. Fortran's g0-formatted
+                    # "omega=0.10000000000000001") stays fused as ONE token
+                    # here -- _line_parts only splits on whitespace/comma,
+                    # not "=" -- so without this, the numeric parsing below
+                    # (which requires the WHOLE token to be numeric) always
+                    # fails on both sides and the pair is reported as a raw
+                    # string mismatch even when the underlying values are
+                    # identical, just printed at different precision. Peel
+                    # off a matching "label=" prefix (an identical prefix on
+                    # both sides only -- a differing label, or a label on
+                    # only one side, is a real mismatch and still returns
+                    # False) and compare just the trailing value.
+                    _kv_re = re.compile(r"^([A-Za-z_][\w.]*=)(.*)$")
+                    a_m = _kv_re.match(a)
+                    b_m = _kv_re.match(b)
+                    a_prefix = a_m.group(1) if a_m else ""
+                    b_prefix = b_m.group(1) if b_m else ""
+                    if a_prefix or b_prefix:
+                        if a_prefix != b_prefix:
+                            return False
+                        a = a_m.group(2)
+                        b = b_m.group(2)
+                        if a == b:
+                            return True
 
                     def _parse_bool_tok(tok):
                         t = tok.strip().strip("[],").lower()
@@ -61511,7 +63827,19 @@ def main():
                         first = None
                         nmin = min(len(py_lines), len(ft_lines))
                         for i in range(nmin):
-                            if py_lines[i] != ft_lines[i]:
+                            # Skip a line that's only numerically-close
+                            # (e.g. a "label=value" precision difference
+                            # like "omega=0.1" vs "omega=0.1000...1" --
+                            # see _tok_close/_lines_close) even though the
+                            # OVERALL run is a genuine DIFF (typically
+                            # because Python's and Fortran's independent
+                            # RNG streams diverge later in the output, for
+                            # a Monte-Carlo-style script) -- so this
+                            # diagnostic points at the first ACTUALLY
+                            # different line instead of a merely
+                            # differently-formatted one that happens to
+                            # appear first in the file.
+                            if py_lines[i] != ft_lines[i] and not _lines_close([py_lines[i]], [ft_lines[i]]):
                                 first = i
                                 break
                         if first is None:

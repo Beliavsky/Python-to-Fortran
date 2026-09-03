@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import math
 import re
@@ -15,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 import fortran_output as fout
 import fortran_post as fpost
+import fortran_scan as fscan
 import xp2f
 
 XP2F_PATH = REPO_ROOT / "xp2f.py"
@@ -1225,6 +1227,93 @@ def test_xp2f_runs_numpy_array_listcomps_with_direct_pi(tmp_path: Path) -> None:
     assert "c = repeat_int(arange_int(1, 7, 1), size(arange_int(1, 4, 1)))" in out_text
 
 
+def test_xp2f_falls_back_to_loop_for_listcomp_calling_local_function(tmp_path: Path) -> None:
+    # User-reported real failure: `pnl_exact = np.array([bs_straddle_
+    # value(float(Si), K, T, sigma, r=r, q=q) - V0 for Si in S])` failed
+    # transpilation with "ListComp currently supports only single-
+    # generator form" -- a misleading message: it's not about multiple
+    # generators at all (this comprehension has exactly one). The
+    # inline elementwise ListComp lowering (self.expr()'s ast.Call
+    # handling for a ListComp element) only ever accepts a few narrow
+    # call shapes (str/int/float/bool applied directly to the bare loop
+    # variable, max/min, or a bare 0-arg strip method) -- calling ANY
+    # user-defined function fails identically, even the simplest
+    # `[f(v) for v in arr]`, since that inline path relies on every
+    # operator/call in the element being Fortran-ELEMENTAL, which a
+    # local function generally isn't (elemental promotion is opt-in,
+    # postprocessing-only, and not decided yet this early anyway).
+    #
+    # Fixed with a new EARLY (pre-prescan) tree-rewrite pass,
+    # rewrite_listcomp_array_assign_calls_to_loop: when a `TARGET =
+    # np.array([ELT for VAR in ITERABLE])` assignment's ELT contains a
+    # call the inline lowering can't possibly support, it's rewritten
+    # into the equivalent explicit loop
+    #     TARGET = np.empty(len(ITERABLE))
+    #     for LC_IDX, VAR in enumerate(ITERABLE):
+    #         TARGET[LC_IDX] = ELT
+    # reusing this project's own already-correct enumerate/For/
+    # Subscript-assignment codegen. Must run BEFORE this project's own
+    # prescan (which decides every local variable's Fortran declaration
+    # from the ORIGINAL tree) -- doing this synthesis later, live during
+    # codegen, was tried first and produces a variable with no IMPLICIT
+    # type, since prescan never saw it.
+    #
+    # Deliberately uses non-case-colliding names (`Sv`/`si`, not `S`/
+    # `s`): Fortran is case-insensitive, and this project has a
+    # SEPARATE, pre-existing, unrelated bug where a for-loop variable
+    # differing from another in-scope name ONLY by case silently reads
+    # as zero -- not this fix's concern, and reproducible with a bare
+    # `for s in S: total = total + s` with no list comprehension
+    # involved at all.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlistcomp_local_func_call.py",
+        [
+            "import numpy as np",
+            "",
+            "def f(x, y=1.0):",
+            "    return x + y",
+            "",
+            "Sv = np.linspace(1.0, 5.0, 5)",
+            "out = np.array([f(float(si), y=2.0) for si in Sv])",
+            "print(out)",
+        ],
+    )
+    out_f90 = (tmp_path / "xlistcomp_local_func_call_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"\blc_idx_\d+_\d+\s*=\s*\d+\s*\+", out_f90), out_f90
+    assert re.search(r"\bf\(x=si,\s*y=2\.0_dp\)", out_f90, re.IGNORECASE), out_f90
+
+
+def test_fortran_rewrite_listcomp_array_assign_preserves_vectorized_form_when_possible() -> None:
+    # Regression test (direct unit test of rewrite_listcomp_array_assign_
+    # calls_to_loop): confirms the new explicit-loop fallback is used
+    # ONLY when genuinely needed -- a pure-arithmetic comprehension
+    # (already fully supported by the existing inline elementwise
+    # lowering) must be left completely untouched by this rewrite, so it
+    # still gets the more idiomatic vectorized Fortran form
+    # (`out = S + 1.0`) instead of an unnecessary loop.
+    src = "S = [0.0]\nout = np.array([s + 1.0 for s in S])\n"
+    tree = ast.parse(src)
+    new_tree = xp2f.rewrite_listcomp_array_assign_calls_to_loop(tree)
+    dumped = ast.dump(new_tree)
+    assert "ListComp" in dumped, dumped
+    assert "For(" not in dumped, dumped
+
+
+def test_fortran_rewrite_listcomp_array_assign_rewrites_unsupported_call() -> None:
+    # Companion direct unit test: a comprehension calling an arbitrary
+    # (non-builtin) function IS rewritten into the explicit alloc + for/
+    # enumerate/Subscript-assign form.
+    src = "S = [0.0]\nout = np.array([f(s) for s in S])\n"
+    tree = ast.parse(src)
+    new_tree = xp2f.rewrite_listcomp_array_assign_calls_to_loop(tree)
+    dumped = ast.dump(new_tree)
+    assert "ListComp" not in dumped, dumped
+    assert "For(" in dumped, dumped
+    assert "enumerate" in dumped, dumped
+
+
 def test_xp2f_runs_masked_assignment_into_numpy_empty_array(tmp_path: Path) -> None:
     src = tmp_path / "xmasked_empty_assign.py"
     src.write_text(
@@ -1679,6 +1768,162 @@ def test_xp2f_aliases_fortran_keyword_data_name(tmp_path: Path) -> None:
     assert "\ndata =" not in out_text
 
 
+def test_xp2f_rename_conflicting_call_variable_preserves_call_statement_keyword(tmp_path: Path) -> None:
+    # Regression test: user-reported real example -- a Python function
+    # with a LOCAL VARIABLE (here, one of a tuple return's elements)
+    # literally named `call` (a valid Python identifier, but a reserved
+    # Fortran keyword) gets renamed to `call_` by rename_conflicting_
+    # identifiers, correctly, everywhere `call` appears as a VARIABLE
+    # reference. But that rename is a blanket, word-boundary text
+    # substitution with no guard excluding the actual Fortran CALL
+    # STATEMENT keyword (`call subname(...)`) -- which is ALSO just the
+    # bare word "call" followed by whitespace then an identifier. Every
+    # call site invoking such a function got corrupted from
+    # `call subname(...)` into the syntactically invalid `call_
+    # subname(...)`. Fixed by recognizing "call" immediately followed by
+    # "IDENTIFIER(" as always being the statement keyword, never a
+    # variable reference, and leaving it untouched.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xcall_keyword_var.py",
+        [
+            "def split_call_put(x):",
+            "    call = x + 1.0",
+            "    put = x - 1.0",
+            "    return call, put",
+            "",
+            "def total(x):",
+            "    c, p = split_call_put(x)",
+            "    return c + p",
+            "",
+            "print(total(5.0))",
+        ],
+    )
+    out_f90 = (tmp_path / "xcall_keyword_var_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"^\s*call\s+split_call_put\(", out_f90, re.MULTILINE), out_f90
+    assert "call_ split_call_put" not in out_f90, out_f90
+
+
+def test_xp2f_disambiguates_tuple_return_repeating_same_variable_name(tmp_path: Path) -> None:
+    # Regression test: user-reported real example -- `return S0 + x_L,
+    # S0 + x_R, gamma0, gamma0` (the SAME local variable returned twice
+    # in one tuple, legal Python) produced a Fortran subroutine
+    # declaring the SAME dummy-argument name ("gamma0") twice in its own
+    # formal argument list -- "Duplicate symbol 'gamma0' in formal
+    # argument list", a compile error. The out-parameter-naming logic
+    # (in two parallel places: the pre-pass that predicts a local
+    # function's out-names for call sites processed before it, and the
+    # pass that actually emits its signature) already guarded against a
+    # returned name colliding with one of the function's OWN parameters,
+    # but never against colliding with an EARLIER tuple element's own
+    # chosen out-name. Fixed by falling back to the same disambiguated
+    # `funcname_out_N` name already used for the args-collision case.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtuple_return_dup_name.py",
+        [
+            "def bounds(x0, dx):",
+            "    lo = x0 - dx",
+            "    hi = x0 + dx",
+            "    gamma0 = dx * 2.0",
+            "    return lo, hi, gamma0, gamma0",
+            "",
+            "a, b, g1, g2 = bounds(10.0, 2.0)",
+            "print(a, b, g1, g2)",
+        ],
+    )
+    out_f90 = (tmp_path / "xtuple_return_dup_name_p.f90").read_text(encoding="utf-8")
+    m = re.search(r"subroutine bounds\(([^)]*)\)", out_f90)
+    assert m, out_f90
+    formals = [p.strip() for p in m.group(1).split(",")]
+    assert len(formals) == len(set(formals)), out_f90
+
+
+def test_xp2f_renames_case_only_collision_between_global_and_loop_variable(tmp_path: Path) -> None:
+    # User-reported real bug (found while verifying an earlier fix, on a
+    # SEPARATE file where the user's own array/loop-variable naming
+    # happened to collide only by case) -- Fortran is case-insensitive,
+    # Python isn't. Bare reproduction: `for s in S: total = total + s`,
+    # where `S` (module-level array) and `s` (for-loop variable) both
+    # resolve to the SAME Fortran identifier, silently gave 0.0 instead
+    # of the correct sum -- no compile error, just a silently wrong
+    # answer.
+    #
+    # Root cause: the codegen's own case-insensitive name-collision
+    # table (_aliased_name) already exists and, used consistently,
+    # already prevents this -- but a for-loop's own target-variable
+    # assignment writes the raw Python name directly rather than
+    # resolving it through that same table, so the loop var's every
+    # OTHER reference resolved to a disambiguated alias while its own
+    # loop-bound write silently landed on a different, never-otherwise-
+    # touched Fortran variable.
+    #
+    # User's own suggestion (rather than hunting down every possibly-
+    # incomplete emission site individually): "maybe the python code
+    # should be rewritten internally ... before translation." Fixed
+    # exactly that way: a new early tree-rewrite pass,
+    # rewrite_case_insensitive_name_collisions, renames every spelling
+    # but the first-bound one within each of this project's own actual
+    # Fortran scopes (the module-level script becomes one PROGRAM; each
+    # function its own separate procedure) whenever two Python names in
+    # the SAME such scope differ only by case -- guaranteeing the
+    # ORIGINAL tree this codegen ever sees never contains the collision
+    # to begin with, regardless of which emission sites do or don't
+    # consistently use the alias table.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xcase_collision_loop.py",
+        [
+            "import numpy as np",
+            "",
+            "S = np.linspace(1.0, 5.0, 5)",
+            "total = 0.0",
+            "for s in S:",
+            "    total = total + s",
+            "print(total)",
+        ],
+    )
+    out_f90 = (tmp_path / "xcase_collision_loop_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"\bS\(", out_f90) or re.search(r"\bS\b", out_f90), out_f90
+
+
+def test_fortran_rewrite_case_insensitive_name_collisions_leaves_unrelated_scopes_alone() -> None:
+    # Companion direct unit test: a case-only collision is renamed ONLY
+    # when both spellings are bound in the SAME scope this project's own
+    # codegen actually creates (module-level script body, or one
+    # function's own params+locals) -- a function parameter that only
+    # case-insensitively collides with an UNRELATED module-level global
+    # (different, non-overlapping Fortran program units; Fortran's own
+    # scoping already lets a dummy argument safely shadow a host-
+    # associated global of the same name with no rename needed, per the
+    # existing, separate test
+    # test_xp2f_local_function_param_case_insensitive_collision_with_
+    # module_global) must be left untouched by this pass.
+    src = (
+        "PRICE = 100.0\n"
+        "def scale(price, factor):\n"
+        "    return price * factor\n"
+    )
+    tree = ast.parse(src)
+    new_tree = xp2f.rewrite_case_insensitive_name_collisions(tree)
+    dumped = ast.dump(new_tree)
+    assert "_cs" not in dumped, dumped
+
+    # But two names colliding WITHIN the same scope (both module-level,
+    # here) ARE renamed, with the first-bound spelling (source order)
+    # left untouched.
+    src2 = "S = 1.0\nfor s in [1, 2, 3]:\n    print(s)\n"
+    tree2 = ast.parse(src2)
+    new_tree2 = xp2f.rewrite_case_insensitive_name_collisions(tree2)
+    dumped2 = ast.dump(new_tree2)
+    assert "id='S'" in dumped2, dumped2
+    assert "id='s'" not in dumped2, dumped2
+    assert "s_cs" in dumped2, dumped2
+
+
 def test_xp2f_compiles_bare_sqrt_and_sum_calls(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xbare_math_small.py"
@@ -1805,7 +2050,14 @@ def test_xp2f_old_style_percent_d_casts_real_args_for_write(tmp_path: Path) -> N
     out_f90 = tmp_path / "xpercent_d_float_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert 'write(*,"(\'  \',i2,\'  \',i2,\'  \',f10.4,\'  \',g14.6,\' \')")' in out_text
+    # simplify_format_string_space_literals_and_fold_repeats (added
+    # later, per a separate user request) now converts each literal
+    # `'  '`/`' '` space run into the equivalent `Nx` edit descriptor and
+    # folds the resulting repeated `2x, i2` pair -- byte-for-byte the
+    # same output, confirmed by this test's own successful --compile
+    # (and, more directly, by that pass's own dedicated regression
+    # tests' run-diff checks).
+    assert 'write(*,"(2(2x, i2), 2x, f10.4, 2x, g14.6, 1x)")' in out_text
     assert "int(vals(1))" in out_text
     assert "int(vals(2))" in out_text
 
@@ -1939,7 +2191,12 @@ def test_xp2f_compiles_np_hypot_call(tmp_path: Path) -> None:
     out_f90 = tmp_path / "xhypot_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "sqrt((" in out_text
+    # simplify_redundant_nested_arith_parens (pre-existing, unrelated to
+    # any recent change) flattens a call's own redundant argument-
+    # wrapping parens -- `sqrt((a**2 + b**2))` -> `sqrt(a**2 + b**2)`,
+    # mathematically identical, just without the doubled-up parens this
+    # assertion was originally written against.
+    assert "sqrt(a**2 + b**2)" in out_text, out_text
 
 
 def test_xp2f_compiles_numpy_rounding_family_calls(tmp_path: Path) -> None:
@@ -2756,6 +3013,103 @@ def test_xp2f_run_diff_ignores_elapsed_time_seconds_line(tmp_path: Path) -> None
     assert "Run diff: MATCH" in proc.stdout
 
 
+def test_xp2f_run_diff_tolerates_close_values_in_label_equals_value_tokens(tmp_path: Path) -> None:
+    # Regression test: a "label=value" printed token (e.g. Python's
+    # "omega=%.6g" % omega -> "omega=0.1") stays fused as ONE token in
+    # run-diff's line tokenizer (it only splits on whitespace/comma, not
+    # "="). Fortran's default g0-formatted equivalent prints the SAME
+    # underlying value at full precision ("omega=0.10000000000000001"),
+    # and _tok_close's numeric comparison requires the WHOLE token to
+    # parse as a number -- "omega=0.1" fails that check on both sides, so
+    # the pair fell straight through to a raw string-inequality mismatch
+    # even though 0.1 and 0.10000000000000001 are identical within
+    # run-diff's own default tolerance. Real-world trigger: garch_acf.py
+    # (a GARCH ACF/autocov helper library on GitHub) prints "omega=%.6g
+    # alpha=%.6g beta=%.6g" % (...), which reported "Run diff: DIFF" even
+    # though the actual simulated values were bit-for-bit deterministic
+    # and identical. Fixed by peeling off a matching "label=" prefix (an
+    # IDENTICAL prefix on both sides only -- a differing label, or a
+    # label on only one side, is still correctly reported as a mismatch)
+    # before the existing numeric-tolerance comparison runs on the
+    # trailing value.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xlabeled_float_fmt.py"
+    src.write_text(
+        "\n".join(
+            [
+                "omega = 0.1",
+                "alpha = 0.1",
+                "beta = 0.85",
+                'print("omega=%.6g alpha=%.6g beta=%.6g" % (omega, alpha, beta))',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_run_diff_first_mismatch_line_skips_merely_close_lines(tmp_path: Path) -> None:
+    # Regression test: the "first mismatch line" diagnostic printed
+    # alongside "Run diff: DIFF" used raw `py_lines[i] != ft_lines[i]`
+    # string inequality, completely bypassing the tolerance-aware
+    # _lines_close/_tok_close comparison the overall MATCH/DIFF verdict
+    # already uses. A script whose FIRST line happens to be only
+    # numerically-close (e.g. the "label=value" precision case fixed
+    # just above) but whose output genuinely diverges further down (the
+    # realistic trigger: Python's random/numpy RNG and this transpiler's
+    # Fortran RNG runtime are different algorithms, so any
+    # Monte-Carlo-style script's later lines are expected to differ even
+    # in a perfectly-correct transpile) pointed this diagnostic at the
+    # harmless close-but-not-identical first line instead of the actual
+    # first genuine divergence -- misleading when debugging a real
+    # mismatch. Fixed by skipping a line pair the tolerance-aware
+    # _lines_close (applied to just that one line) already considers
+    # close, so the diagnostic reports the real divergence instead.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xfirst_mismatch_skips_close.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import random",
+                "",
+                "omega = 0.1",
+                'print("omega=%.6g" % omega)',
+                "random.seed(1)",
+                "print(random.random())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: DIFF" in proc.stdout, proc.stdout + proc.stderr
+    # Python's random and the Fortran RNG runtime are different
+    # algorithms -- line 2 (the random draw) is expected to genuinely
+    # differ, and that's what "first mismatch line" should point at, NOT
+    # line 1 (the omega= line, merely a formatting-precision difference).
+    assert "first mismatch line: 2" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_xp2f_numeric_diff_ignores_version_lines(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     shutil.copy2(REPO_ROOT / "lapack_d.f90", tmp_path / "lapack_d.f90")
@@ -3331,6 +3685,1237 @@ def test_xp2f_inlines_transitively_called_sibling_helper(tmp_path: Path) -> None
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_marks_pure_from_emitted_fortran_not_python_source(tmp_path: Path) -> None:
+    # Regression test: purity was determined by a Python-AST heuristic
+    # (function_is_pure) that has two concrete gaps, both real-world
+    # (from garch_acf.py, a GARCH ACF/autocov helper library on GitHub):
+    # (1) it has a dedicated np.X(...) recognition path but nothing for
+    # math.X(...) -- bare math.sqrt(...)/math.erf(...) etc. fell straight
+    # to the "unknown attribute call -> impure" fallback, even though
+    # they're genuinely pure and lower to Fortran's own pure intrinsics;
+    # (2) it conservatively disqualifies ANY assignment whose target is
+    # one of the function's own argument names (e.g. `x = np.asarray(x,
+    # ...)`), on the theory that it might translate into writing an
+    # INTENT(IN) dummy -- but the codegen already ALWAYS shadow-copies
+    # such reassignment into a fresh `x_local`, so the dummy is never
+    # actually touched, making the check needlessly conservative.
+    #
+    # Fixed not by patching those two gaps in the Python-side heuristic
+    # (which would just be two more entries in a structurally open-ended
+    # list), but by adding a SEPARATE, additive post-processing pass
+    # (fortran_purity.py, ported from the sibling xpure.py static
+    # analyzer) that determines purity from the EMITTED FORTRAN directly
+    # -- a small, fixed vocabulary (no write to an INTENT(IN) dummy, no
+    # I/O, no call to a known-impure procedure) that needs no per-Python-
+    # feature special-casing at all, and catches both gaps for free. Only
+    # ever ADDS `pure `, on top of whatever the existing Python-AST pass
+    # already decided -- never removes one.
+    #
+    # This one function combines both original gaps: math.sqrt (gap 1)
+    # applied to a reassigned argument (gap 2, via mean_1d-analogous
+    # numpy .mean()... kept plain here to avoid a pandas/numpy runtime-
+    # helper dependency) -- neither gap alone was needed for the old
+    # heuristic to reject it; either one was already sufficient.
+    src = tmp_path / "xpure_from_fortran.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import math",
+                "",
+                "def f(x):",
+                "    x = x + 0.0",
+                "    return math.sqrt(x * x)",
+                "",
+                "print(f(4.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out_f90 = (tmp_path / "xpure_from_fortran_p.f90").read_text(encoding="utf-8")
+    assert "pure function f(" in out_f90, out_f90
+
+
+def test_xp2f_elemental_flag_promotes_scalar_pure_functions_only(tmp_path: Path) -> None:
+    # Regression test for the --elemental flag: a PURE procedure with
+    # only scalar dummy arguments (and, for a function, a scalar result)
+    # is eligible for the further PURE ELEMENTAL promotion -- letting
+    # callers invoke it directly on whole arrays via Fortran's automatic
+    # elemental broadcasting -- but one with an ARRAY dummy is not
+    # (ELEMENTAL requires every dummy to be scalar). --elemental is
+    # opt-in (unlike the always-on PURE pass): unlike PURE, ELEMENTAL
+    # carries a real usage constraint (an elemental procedure can never
+    # be supplied as a callback/procedure actual argument), so it's
+    # offered as a choice rather than applied automatically. Also checks
+    # that --elemental produces IDENTICAL program output to the default
+    # (non-elemental) build -- it's purely a declaration-level
+    # annotation, never a computation change.
+    src = tmp_path / "xelemental_flag.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def scalar_fn(x):",
+                "    return x * x + 1.0",
+                "",
+                "def array_sum(x):",
+                "    total = 0.0",
+                "    for i in range(len(x)):",
+                "        total = total + x[i]",
+                "    return total",
+                "",
+                "print(scalar_fn(3.0))",
+                "print(array_sum([1.0, 2.0, 3.0]))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc_default = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_default.returncode == 0, proc_default.stdout + proc_default.stderr
+    assert "Run diff: MATCH" in proc_default.stdout, proc_default.stdout + proc_default.stderr
+    default_f90 = (tmp_path / "xelemental_flag_p.f90").read_text(encoding="utf-8")
+    assert "pure function scalar_fn(" in default_f90, default_f90
+    assert "pure elemental" not in default_f90.lower(), default_f90
+
+    proc_elem = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff", "--elemental"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_elem.returncode == 0, proc_elem.stdout + proc_elem.stderr
+    assert "Run diff: MATCH" in proc_elem.stdout, proc_elem.stdout + proc_elem.stderr
+    elem_f90 = (tmp_path / "xelemental_flag_p.f90").read_text(encoding="utf-8")
+    assert "pure elemental function scalar_fn(" in elem_f90, elem_f90
+    # array_sum takes a rank-1 array dummy -- must stay plain pure, never
+    # promoted to elemental.
+    assert re.search(r"pure elemental function array_sum\(", elem_f90) is None, elem_f90
+    assert re.search(r"pure function array_sum\(", elem_f90) is not None, elem_f90
+
+
+def test_xp2f_purity_registry_resolves_generic_interface_names(tmp_path: Path) -> None:
+    # Regression test: load_external_purity_registry only ever walked
+    # TOP-LEVEL concrete function/subroutine bodies in the vendored
+    # runtime helper files -- but python.f90's `optval` (needed by any
+    # function using a Python default-argument value) is a GENERIC
+    # INTERFACE name (`interface optval / module procedure optval_int,
+    # optval_real, optval_logical, optval_char / end interface`), never
+    # itself a concrete procedure with a body. Generated code only ever
+    # calls the generic name `optval(...)`, never `optval_real(...)`
+    # directly, so the registry never had an entry for the name actually
+    # used -- every caller of `optval` was rejected as "invokes imported
+    # entity 'optval' whose purity is unknown", even though all four of
+    # its real implementations are pure. Real-world trigger: this
+    # affected EVERY function using a Python default-argument value in a
+    # GARCH ACF/autocov helper library on GitHub (garch_acf.py) --
+    # v_egarch_expx_moment_normal among them, confirmed to compile fine
+    # when manually marked pure. Fixed by also parsing named `interface
+    # NAME ... module procedure ... end interface` blocks in each
+    # vendored file and registering the generic NAME as pure only when
+    # ALL of its constituent targets are.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xoptval_purity.py",
+        [
+            "def f(a, b=1.0):",
+            "    return a + b",
+            "",
+            "print(f(3.0))",
+            "print(f(3.0, 5.0))",
+        ],
+    )
+    out_f90 = (tmp_path / "xoptval_purity_p.f90").read_text(encoding="utf-8")
+    assert "pure function f(" in out_f90, out_f90
+
+
+def test_xp2f_forwards_none_default_optional_without_premature_default(tmp_path: Path) -> None:
+    # Regression test: a function that does NOTHING with its own
+    # None-default parameter except forward it unchanged as a keyword
+    # argument to another function's OWN same-named None-default
+    # parameter (`def wrapper(x, ez=None): return inner(x, ez=ez)`) had
+    # `ez` PREMATURELY resolved to a generic numeric placeholder
+    # (`ez_opt = optval(ez, 0.0_dp)`) inside `wrapper`, and THAT
+    # always-present local -- not the original possibly-absent dummy --
+    # got forwarded to `inner`. This defeated `inner`'s own, correct `if
+    # ez is None: ez = <real default>` resolution, since `present(ez)`
+    # inside `inner` then always saw "supplied" and silently used the
+    # wrong value (0.0) instead of inner's real default -- no compile
+    # error, just a wrong number. Real-world trigger: a GARCH ACF/autocov
+    # helper library on GitHub (garch_acf.py)'s autocov_abs_garch_1_1(...,
+    # ez_abs=None) forwarding straight to autocov_abs_from_pq(...,
+    # ez_abs=ez_abs), which produced degenerate th=0.0/th=2.0 theoretical
+    # values (correct: ~1.0965/~0.7978) whenever the top-level caller
+    # never supplied ez_abs itself. Fixed by skipping the local alias/
+    # materialization entirely for a None-default parameter whose body
+    # never does anything with it except a direct, unmodified forward --
+    # the raw (still-optional, still-absence-tracking) Fortran dummy is
+    # used wherever it's referenced instead.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xforward_none_default.py",
+        [
+            "import math",
+            "",
+            "def inner(x, ez=None):",
+            "    if ez is None:",
+            "        ez = math.sqrt(2.0)",
+            "    return x * ez",
+            "",
+            "def wrapper(x, ez=None):",
+            "    return inner(x, ez=ez)",
+            "",
+            "print(wrapper(3.0))",
+            "print(wrapper(3.0, 5.0))",
+        ],
+    )
+    out_f90 = (tmp_path / "xforward_none_default_p.f90").read_text(encoding="utf-8")
+    # `inner` genuinely uses ez (the `if ez is None:` check), so it
+    # legitimately keeps its own ez_opt materialization -- only
+    # `wrapper`'s (a pure forward) should be gone, and it should forward
+    # the raw `ez` dummy, not a locally-resolved `ez_opt`.
+    wrapper_body = out_f90.split("function wrapper(", 1)[1].split("end function wrapper", 1)[0]
+    assert "ez_opt" not in wrapper_body, out_f90
+    assert re.search(r"inner\(x=x,\s*ez=ez\)", wrapper_body), out_f90
+
+
+def test_xp2f_hoists_duplicate_use_only_optval_to_module_scope(tmp_path: Path) -> None:
+    # Regression test: `use python_mod, only: optval` (needed by any
+    # function using a Python default-argument value) was emitted once
+    # per PROCEDURE that needs it -- fpost.hoist_module_use_only_imports
+    # already existed and already fixes exactly this, but only ran under
+    # the opt-in --postprocess flag; the default path never hoisted
+    # anything, so the same duplicate line appeared once per function.
+    # Now runs in the default path too (purely structural -- Fortran
+    # scoping means a locally-declared entity always shadows a host-
+    # associated one of the same name, so hoisting duplicates to module
+    # scope can't change what any OTHER procedure sees).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xhoist_optval.py",
+        [
+            "def f(a, b=1):",
+            "    return a + b",
+            "",
+            "def g(a, b=2):",
+            "    return a - b",
+            "",
+            "print(f(3), g(3))",
+        ],
+    )
+    out_f90 = (tmp_path / "xhoist_optval_p.f90").read_text(encoding="utf-8")
+    assert out_f90.count("use python_mod, only:") == 1, out_f90
+    assert "optval" in out_f90.split("use python_mod, only:", 1)[1].split("\n", 1)[0], out_f90
+
+
+def test_xp2f_removes_same_named_dead_constant_in_separate_procedures(tmp_path: Path) -> None:
+    # Regression test: remove_unused_named_constants's outer unit-scan
+    # matched "module ... end module" FIRST (since it's outermost),
+    # swallowing every contained procedure's body into ONE flat scan --
+    # "keep first declaration if duplicates appear" then kept only the
+    # FIRST procedure's copy of a same-named dead local constant, and
+    # every OTHER procedure's own (individually genuinely dead) copy of
+    # it was misread as a "use" of that first one, since it's just
+    # another line containing the same token. Two DIFFERENT functions
+    # here each get an identically-named, individually-dead local
+    # constant (mirroring garch_acf.py's `integer, parameter :: rng = 0`
+    # placeholder, repeated once per simulate_* function). Fixed by
+    # recursing into each nested subroutine/function as its own
+    # independent scope before scanning the enclosing unit.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdead_dup_const.py",
+        [
+            "import numpy as np",
+            "",
+            "def f(seed):",
+            "    rng = np.random.default_rng(seed)",
+            "    return float(rng.standard_normal())",
+            "",
+            "def g(seed):",
+            "    rng = np.random.default_rng(seed)",
+            "    return float(rng.standard_normal())",
+            "",
+            "print(f(1) == f(1))",
+            "print(g(2) == g(2))",
+        ],
+    )
+    out_f90 = (tmp_path / "xdead_dup_const_p.f90").read_text(encoding="utf-8")
+    assert "rng" not in out_f90.lower() or "parameter :: rng" not in out_f90.lower(), out_f90
+
+
+def test_xp2f_fuses_bare_copy_into_self_referential_assignment(tmp_path: Path) -> None:
+    # Regression test: `x = np.asarray(x, dtype=float)` followed by
+    # `x = x - x.mean()` (both reassigning the same argument -- lowered
+    # onto the same locally-shadowed `x_local`, since an intent(in) dummy
+    # can't be written) generated two adjacent Fortran statements,
+    # `x_local = x` then `x_local = x_local - mean_1d(x_local)`, where
+    # the first line's ENTIRE purpose is to seed the second line's own
+    # self-reference. Fixed by fusing them into one statement whenever
+    # the source of the first assignment is a single bare identifier
+    # (never needs parenthesizing when substituted in).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xfuse_bare_copy.py",
+        [
+            "import numpy as np",
+            "",
+            "def demean(x):",
+            "    x = np.asarray(x, dtype=float)",
+            "    x = x - x.mean()",
+            "    return x",
+            "",
+            "def make_arr():",
+            "    a = np.empty(4, dtype=float)",
+            "    a[0] = 1.0",
+            "    a[1] = 2.0",
+            "    a[2] = 3.0",
+            "    a[3] = 4.0",
+            "    return a",
+            "",
+            "arr = make_arr()",
+            "print(demean(arr))",
+        ],
+    )
+    out_f90 = (tmp_path / "xfuse_bare_copy_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"x_local\s*=\s*x\s*$", out_f90, re.MULTILINE) is None, out_f90
+
+
+def test_xp2f_eliminates_shadow_copy_of_never_reassigned_param(tmp_path: Path) -> None:
+    # Regression test: user-reported example from a real GARCH ACF/autocov
+    # helper library on GitHub (garch_acf.py)'s `_autocov_biased`:
+    #     def _autocov_biased(x, nlags):
+    #         x = np.asarray(x, dtype=float)
+    #         x0 = x - x.mean()
+    #         ...
+    # `x = np.asarray(x, dtype=float)` reassigns the parameter, which the
+    # codegen ALWAYS routes through a fresh `x_local` shadow (an
+    # intent(in) dummy can't be written directly) -- producing
+    # `x_local = x` followed by every later use of `x` rewritten to
+    # `x_local`. But `x` is never reassigned again after that first
+    # (no-op, for a real(dp) array) cast/copy, so `x_local` ends up a
+    # pure read-only alias for `x`: an entire unnecessary array copy.
+    # User pointed this out directly ("you can use x directly and do not
+    # need to define x_local. Agree?"). Fixed with a new pass,
+    # eliminate_redundant_readonly_param_shadow_copies, that removes a
+    # `NAME_local` shadow (and its seed copy) whenever it's written
+    # exactly once via a bare `NAME_local = NAME` and never appears
+    # anywhere else except as a pure read (never reassigned, never
+    # passed to a `call`, `allocate`/`deallocate`, or `allocated()`),
+    # rewriting every remaining use back onto `NAME` directly.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xshadow_copy_elim.py",
+        [
+            "import numpy as np",
+            "",
+            "def autocov_biased(x, nlags):",
+            "    x = np.asarray(x, dtype=float)",
+            "    x0 = x - x.mean()",
+            "    out = np.empty(nlags + 1, dtype=float)",
+            "    out[0] = np.mean(x0 * x0)",
+            "    for k in range(1, nlags + 1):",
+            "        out[k] = np.mean(x0[:-k] * x0[k:])",
+            "    return out",
+            "",
+            "def make_arr():",
+            "    a = np.empty(5, dtype=float)",
+            "    a[0] = 1.0",
+            "    a[1] = 2.0",
+            "    a[2] = 3.0",
+            "    a[3] = 4.0",
+            "    a[4] = 5.0",
+            "    return a",
+            "",
+            "arr = make_arr()",
+            "result = autocov_biased(arr, 3)",
+            "for v in result:",
+            "    print(v)",
+        ],
+    )
+    out_f90 = (tmp_path / "xshadow_copy_elim_p.f90").read_text(encoding="utf-8")
+    assert "x_local" not in out_f90, out_f90
+    assert re.search(r"\bx0\s*=\s*x\s*-\s*mean_1d\s*\(\s*x\s*\)", out_f90), out_f90
+
+
+def test_xp2f_skips_nan_guard_on_literal_comparison_operand(tmp_path: Path) -> None:
+    # Regression test: a NaN-safe comparison (needed under this project's
+    # -ffpe-trap=invalid builds, where an ordered comparison against NaN
+    # would otherwise trap/crash rather than quietly evaluate to False
+    # like Python) wrapped BOTH operands in the same merge()/
+    # ieee_is_nan() guard machinery even when one operand was a literal
+    # numeric constant that can never be NaN -- producing a needless
+    # `merge(0.0_dp, 0.0_dp, ieee_is_nan(0.0_dp))` sub-expression (always
+    # just 0.0_dp, true/false sources identical regardless of the
+    # condition) plus its own redundant `ieee_is_nan(0.0_dp)` (always
+    # false) in the OR-mask. Fixed by only guarding an operand that's
+    # NOT a compile-time-safe literal.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnan_guard_literal.py",
+        [
+            "def f(x):",
+            "    if x <= 0.0:",
+            "        return -1.0",
+            "    return x",
+            "",
+            "print(f(2.0), f(-3.0), f(0.0))",
+        ],
+    )
+    out_f90 = (tmp_path / "xnan_guard_literal_p.f90").read_text(encoding="utf-8")
+    assert "ieee_is_nan(0.0_dp)" not in out_f90, out_f90
+
+
+def test_xp2f_wrap_long_lines_never_strands_bare_closing_paren(tmp_path: Path) -> None:
+    # Regression test: the long-line wrapper's break-candidate scan
+    # allowed cutting immediately BEFORE a ")"/"]", putting it alone at
+    # the start of the continuation line (`... &` / `& ) + ...`) -- valid
+    # Fortran, but poor style. Moving that candidate to just AFTER the
+    # closing delimiter (mirroring the pre-existing rule for a trailing
+    # comma) fixed the simple case, but a RUN of several consecutive
+    # closing parens (e.g. "theta * theta)))") could still strand the
+    # LAST one alone if the ideal cut fell in the middle of the run --
+    # each ")" independently contributes an "after me" candidate, so the
+    # width-based choice needed its own fallback: walk backward through
+    # candidates for the first one that doesn't leave the continuation
+    # starting with ")"/"]".
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xwrap_no_stranded_paren.py",
+        [
+            "def f(theta, alpha, beta):",
+            "    p2 = (beta * beta + (((2.0 * alpha) * beta) * (1.0 + (theta * theta)))) + (",
+            "        (alpha * alpha) * (3.0 + ((6.0 * theta) * theta) + (theta ** 4))",
+            "    )",
+            "    return p2",
+            "",
+            "print(f(0.2, 0.1, 0.85))",
+        ],
+    )
+    out_f90 = (tmp_path / "xwrap_no_stranded_paren_p.f90").read_text(encoding="utf-8")
+    for line in out_f90.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("&"):
+            after_amp = stripped[1:].strip()
+            assert not after_amp.startswith((")", "]")), out_f90
+
+
+def test_fortran_wrap_splits_inside_long_string_literal_without_corruption() -> None:
+    # Regression test (direct unit test of wrap_long_fortran_line): a
+    # `write(*, "(...)")` format descriptor long enough on its own that
+    # NO safe break point exists outside the quotes within the column
+    # budget returned None (left completely unwrapped, however long) --
+    # user-reported real example from a GARCH ACF/autocov helper library
+    # on GitHub, a >200-column `write(*,"('kappa=',g0,...)") kappa, ...`
+    # line sitting right next to other statements that WERE wrapped to
+    # 80 columns, an inconsistency the user flagged directly. Fixed by
+    # adding a last-resort fallback that splits INSIDE the string using
+    # Fortran's own string-continuation rule: end the line with "&"
+    # while still inside the quotes, resume on a line whose first
+    # non-blank character is also "&" -- content resumes IMMEDIATELY
+    # after that second "&", with NO inserted characters (unlike an
+    # ordinary code continuation's "& " convention, which SPACES after
+    # the "&" and would corrupt string content if reused verbatim here).
+    # The interior cut point is also never placed between the two halves
+    # of a doubled ''/"" escaped quote.
+    line = (
+        "   write(*,\"('kappa=',g0,'  mean(|eps|): emp=',g0,' th=',g0,"
+        "'  var(|eps|): emp=',g0,' th=',g0)\") kappa, real(mean_1d(abs_eps), "
+        "kind=dp), th_mean_abs, real(var_1d(reshape(abs_eps, [size(abs_eps)])), "
+        "kind=dp), th_var_abs"
+    )
+    result = fscan.wrap_long_fortran_line(line, max_len=80)
+    assert result is not None, "expected a fallback string-internal wrap, got None"
+    assert all(len(ln) <= 80 for ln in result), result
+    assert len(result) > 1, result
+    joined = "\n".join(result)
+    assert joined.count('"') == 2, joined  # the format string's own open/close quote, nothing extra
+    # Reconstruct the STRING LITERAL's own content exactly as Fortran's
+    # continuation rule defines it: from the line starting the string,
+    # everything up to (and not including) a trailing "&" is real
+    # content; on every following line that's STILL part of the string
+    # (i.e. doesn't yet contain the closing quote), content resumes
+    # IMMEDIATELY after that line's own leading "&" -- no lstrip, no
+    # space, unlike an ordinary code continuation. This must exactly
+    # reproduce the original quoted text, proving no characters were
+    # dropped, added, or reordered inside the literal by the split
+    # (whitespace-insensitive CODE around the split, e.g. extra spaces
+    # where an ordinary code-level break also lands, is not checked here
+    # -- Fortran doesn't care, and that's covered by an actual compile
+    # + run-diff in the companion end-to-end test).
+    orig_str_start = line.index('"')
+    orig_str_end = line.index('"', orig_str_start + 1)
+    orig_content = line[orig_str_start:orig_str_end + 1]
+
+    rebuilt_content = ""
+    in_string = False
+    for ln in result:
+        if not in_string:
+            if '"' not in ln:
+                continue
+            q = ln.index('"')
+            text = ln[q:]
+            in_string = True
+        else:
+            stripped = ln.lstrip()
+            assert stripped.startswith("&"), result
+            text = stripped[1:]
+        if '"' in text[1:]:
+            # the string closes somewhere in this fragment -- keep only
+            # up through the closing quote; anything after it is CODE
+            # (e.g. this line's own trailing "&", if any, is then an
+            # ordinary code continuation, not part of the string).
+            close_rel = text.index('"', 1)
+            rebuilt_content += text[: close_rel + 1]
+            break
+        # still open: this fragment must end with "&" (string continues
+        # on the next physical line).
+        assert text.endswith("&"), result
+        rebuilt_content += text[:-1]
+    assert rebuilt_content == orig_content, (rebuilt_content, orig_content)
+
+
+def test_xp2f_wraps_long_format_string_print_consistently(tmp_path: Path) -> None:
+    # Companion end-to-end test to test_fortran_wrap_splits_inside_long_
+    # string_literal_without_corruption, exercising the same fallback
+    # through the full pipeline with the user's actual real-world
+    # trigger shape: a Python %-format print whose generated Fortran
+    # `write` statement's format descriptor alone is too long to fit
+    # inside the column budget outside the quotes.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xwrap_long_format_string.py",
+        [
+            "kappa = 3.0",
+            "mean_abs = 1.0965",
+            "th_mean_abs = 1.0965",
+            "var_abs = 0.7978",
+            "th_var_abs = 0.7978",
+            "print(",
+            "    'kappa=%.6g  mean(|eps|): emp=%.8g th=%.8g  "
+            "var(|eps|): emp=%.8g th=%.8g'",
+            "    % (kappa, mean_abs, th_mean_abs, var_abs, th_var_abs)",
+            ")",
+        ],
+    )
+    out_f90 = (tmp_path / "xwrap_long_format_string_p.f90").read_text(encoding="utf-8")
+    for line in out_f90.splitlines():
+        assert len(line) <= 80, out_f90
+
+
+def test_xp2f_max_use_only_collapses_large_import_list(tmp_path: Path) -> None:
+    # User request: a `use foo_mod, only: a, b, c, ...` importing dozens
+    # of names (a real generated program's own proc-module import list
+    # ran to 30 names) is hard to scan even correctly wrapped across
+    # many continuation lines. New opt-in --max-use-only N flag collapses
+    # it to `use foo_mod ! imports N entities` once the list exceeds N.
+    # This end-to-end test just confirms the flag is wired through the
+    # CLI and produces a collapsed line with a correct count for a
+    # program with more than a couple of module-level functions, and
+    # that program behavior is unaffected (byte-identical run output is
+    # implied by _run_xp2f_compile_diff's own run-diff check). The
+    # underlying safety guard itself (never collapse when doing so could
+    # collide with something else visible in scope) is unit-tested
+    # directly in test_xp2f_max_use_only_declines_on_name_collision,
+    # since it needs a hand-crafted Fortran collision the transpiler
+    # itself wouldn't naturally produce.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xmax_use_only.py"
+    helper_lines = []
+    for i in range(1, 6):
+        helper_lines += [f"def helper{i:02d}(x):", f"    return x + {i}.0", ""]
+    # Call every helper DIRECTLY from top-level program code (not
+    # through one intermediate wrapper function) -- only names the
+    # PROGRAM itself references directly end up in its own `use ...,
+    # only:` list; a call routed through one module-internal wrapper
+    # function would only ever import that one wrapper name.
+    main_lines = ["total = 0.0"] + [f"total = total + helper{i:02d}(1.0)" for i in range(1, 6)] + ["print(total)"]
+    src.write_text("\n".join(helper_lines + main_lines), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff", "--max-use-only", "3"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out_f90 = (tmp_path / "xmax_use_only_p.f90").read_text(encoding="utf-8")
+    m = re.search(r"^\s*use xmax_use_only_proc_mod(.*)$", out_f90, re.MULTILINE)
+    assert m, out_f90
+    assert re.match(r"\s*! imports \d+ entit(y|ies)\s*$", m.group(1)), out_f90
+
+
+def test_xp2f_max_use_only_declines_on_name_collision() -> None:
+    # Regression test for collapse_large_use_only_imports's safety
+    # guard: `use MOD, only: wrapper` is left UNTOUCHED (not collapsed
+    # to a bare `use MOD`) when the importing scope already declares
+    # something (here a local variable) with the exact same name as one
+    # of MOD's OTHER public entities that a bare `use MOD` would newly
+    # expose -- exactly the collision `only:` exists to prevent. A
+    # sibling program with no such name anywhere in scope DOES collapse,
+    # confirming the guard is name-specific, not a blanket refusal.
+    collides = """\
+module foo_proc_mod
+   implicit none
+   private
+   public :: dp, wrapper, helper_extra
+contains
+   function wrapper(x) result(y)
+      real :: x, y
+      y = x + 1.0
+   end function wrapper
+   function helper_extra(x) result(y)
+      real :: x, y
+      y = x + 2.0
+   end function helper_extra
+end module foo_proc_mod
+program main
+   use foo_proc_mod, only: wrapper
+   implicit none
+   real :: helper_extra
+   helper_extra = 5.0
+   print *, wrapper(1.0) + helper_extra
+end program main
+""".splitlines(keepends=True)
+    out_collides = xp2f.collapse_large_use_only_imports(collides, max_entities=0)
+    assert "use foo_proc_mod, only: wrapper" in "".join(out_collides), "".join(out_collides)
+
+    clean = """\
+module foo_proc_mod
+   implicit none
+   private
+   public :: dp, wrapper, helper_extra
+contains
+   function wrapper(x) result(y)
+      real :: x, y
+      y = x + 1.0
+   end function wrapper
+   function helper_extra(x) result(y)
+      real :: x, y
+      y = x + 2.0
+   end function helper_extra
+end module foo_proc_mod
+program main
+   use foo_proc_mod, only: wrapper
+   implicit none
+   real :: z
+   z = 5.0
+   print *, wrapper(1.0) + z
+end program main
+""".splitlines(keepends=True)
+    out_clean = xp2f.collapse_large_use_only_imports(clean, max_entities=0)
+    assert "use foo_proc_mod ! imports 1 entity" in "".join(out_clean), "".join(out_clean)
+
+
+def test_xp2f_max_use_only_preserves_blank_lines() -> None:
+    # Regression test: user-reported real example -- `xp2f.py ... --out
+    # temp.f90 --compile --elemental --max-use-only 10` produced
+    #     end function v_autocov_biased
+    #     end module xgarch_acf_proc_mod
+    #     program xgarch_acf
+    # with NO blank line between "end module" and "program" (present
+    # without --max-use-only). Root cause: collapse_large_use_only_
+    # imports's deleted-continuation-line sentinel was "" -- but
+    # f90_lines represents a genuine BLANK line as bare "" too (the
+    # pipeline only joins lines with "\n" at the very end, so no element
+    # carries its own newline), and this pass runs LATE, after the
+    # pipeline's own blank-line normalization (ensure_blank_lines_
+    # around_units_and_procedures) -- so its final `[ln for ln in out if
+    # ln != ""]` filter silently stripped EVERY blank line in the WHOLE
+    # FILE, not just its own deleted lines, with nothing running
+    # afterward to restore them. Fixed by using `None` as the deletion
+    # sentinel instead (filtering `is not None`), which can never
+    # collide with a real blank line. This is a direct unit test (using
+    # bare, no-trailing-newline line strings, matching f90_lines' own
+    # convention -- unlike a plain .splitlines(keepends=True) fixture,
+    # which wouldn't reproduce the bug since a blank line there is "\n",
+    # not "") since the CLI's own compile+run-diff path doesn't inspect
+    # blank-line counts.
+    lines = [
+        "module foo_proc_mod",
+        "   implicit none",
+        "   private",
+        "   public :: dp, wrapper, helper_extra",
+        "contains",
+        "   function wrapper(x) result(y)",
+        "      real :: x, y",
+        "      y = x + 1.0",
+        "   end function wrapper",
+        "end module foo_proc_mod",
+        "",  # <- must survive
+        "program main",
+        "   use foo_proc_mod, only: wrapper",
+        "   implicit none",
+        "   real :: z",
+        "   z = 5.0",
+        "",  # <- must survive
+        "   print *, wrapper(1.0) + z",
+        "end program main",
+    ]
+    out = xp2f.collapse_large_use_only_imports(lines, max_entities=0)
+    assert any("use foo_proc_mod ! imports 1 entity" in ln for ln in out), out
+    end_idx = out.index("end module foo_proc_mod")
+    assert out[end_idx + 1] == "", out
+    z_idx = out.index("   z = 5.0")
+    assert out[z_idx + 1] == "", out
+
+
+def test_xp2f_simplifies_redundant_dp_cast_around_dot_product(tmp_path: Path) -> None:
+    # Regression test: user-reported real example from a GARCH ACF/
+    # autocov helper library on GitHub (garch_acf.py) -- a sample
+    # autocovariance computed as `np.dot(x0[k:], x0[:n-k]) / (n-k)`
+    # produced
+    #     emp_autocov_abs(1) = real(dot_product(absc, absc), &
+    #        & kind=dp) / real(size(absc), kind=dp)
+    # -- two redundant `real(..., kind=dp)` casts. (1) dot_product's
+    # result already has the same type/kind as its (matching)
+    # real(kind=dp) array arguments, so wrapping it in another cast to
+    # that SAME kind is a no-op. (2) Fortran's mixed real/integer
+    # division always promotes the integer operand to (at least) the
+    # real operand's own kind, so once the numerator is confirmed
+    # real(kind=dp), wrapping the divisor in a cast to that same kind
+    # changes nothing about the division's result either. User: "since
+    # dot_product(x, x) is real(kind=dp) if x is real(kind=dp) and
+    # denominator can be just size(absc) since real(kind=dp)/integer is
+    # converted to real(kind=dp)". Verified (outside this test, since
+    # run-diff alone wouldn't distinguish the two casting routes) to
+    # produce BYTE-IDENTICAL runtime output with the pass disabled.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdot_product_cast.py",
+        [
+            "import numpy as np",
+            "",
+            "def autocov0(x):",
+            "    x = np.asarray(x, dtype=float)",
+            "    n = x.shape[0]",
+            "    return np.dot(x, x) / n",
+            "",
+            "def make_arr():",
+            "    a = np.empty(4, dtype=float)",
+            "    a[0] = 1.0",
+            "    a[1] = 2.0",
+            "    a[2] = 3.0",
+            "    a[3] = 4.0",
+            "    return a",
+            "",
+            "print(autocov0(make_arr()))",
+        ],
+    )
+    out_f90 = (tmp_path / "xdot_product_cast_p.f90").read_text(encoding="utf-8")
+    assert "real(dot_product" not in out_f90, out_f90
+    assert re.search(r"dot_product\([a-z_]\w*,\s*[a-z_]\w*\)\s*/\s*[a-z_]\w*\b", out_f90, re.IGNORECASE), out_f90
+
+
+def test_xp2f_simplify_redundant_int_casts_runs_in_default_path(tmp_path: Path) -> None:
+    # Regression test: user-reported real example -- generated code had
+    # several `int(k)`/`int(n_terms)`/`int(n)` casts around variables
+    # ALREADY declared integer (Python's own `int(...)` calls on values
+    # already integer-typed at the Fortran level are pure noise). The
+    # function that strips exactly this, simplify_redundant_int_casts,
+    # already existed and is scoped per procedure/program unit (so a
+    # same-named integer in one unit can never wrongly strip a genuinely
+    # -needed int() cast in another unit where that name is real) -- but
+    # it only ran under the opt-in --postprocess flag, so it never fired
+    # for a default-path build (which is what produced the user's
+    # temp.f90). Moved to the always-on default path too.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdefault_int_cast.py",
+        [
+            "def f(k, n):",
+            "    total = 0",
+            "    for i in range(k):",
+            "        total = total + i",
+            "    print(k, n, total)",
+            "",
+            "f(3, 5)",
+        ],
+    )
+    out_f90 = (tmp_path / "xdefault_int_cast_p.f90").read_text(encoding="utf-8")
+    assert "int(k)" not in out_f90, out_f90
+    assert "int(n)" not in out_f90, out_f90
+
+
+def test_xp2f_simplifies_redundant_dp_cast_around_known_dp_returning_call(tmp_path: Path) -> None:
+    # Regression test: user-reported real example --
+    #     eh32 = real(mean_1d(h ** 1.5_dp), kind=dp)
+    # -- a redundant cast around a call to mean_1d, which python.f90
+    # already declares `pure real(kind=dp) function mean_1d(x)`, so its
+    # result is ALREADY real(kind=dp). User: "In general do not use
+    # int() or real(..., kind=dp) when the expression inside already has
+    # that type." Also exercises the SAME-FILE half of the registry
+    # (fortran_purity.collect_dp_returning_function_names) via a local
+    # helper function using the `result(...)` + separate scalar
+    # real(kind=dp) declaration shape this project's own codegen emits,
+    # not just the vendored inline-type shape mean_1d itself uses. The
+    # argument to mean_1d here (`h ** 1.5_dp`) is a compound expression,
+    # not a bare identifier -- exercises the real-paren-depth-tracking
+    # scan (not a fixed-nesting regex) that replaced an earlier, buggier
+    # attempt.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdp_returning_call_cast.py",
+        [
+            "import numpy as np",
+            "",
+            "def make_arr():",
+            "    a = np.empty(3, dtype=float)",
+            "    a[0] = 1.0",
+            "    a[1] = 2.0",
+            "    a[2] = 4.0",
+            "    return a",
+            "",
+            "h = make_arr()",
+            "eh32 = np.mean(h ** 1.5)",
+            "print(eh32)",
+        ],
+    )
+    out_f90 = (tmp_path / "xdp_returning_call_cast_p.f90").read_text(encoding="utf-8")
+    assert "real(mean_1d" not in out_f90, out_f90
+
+
+def test_fortran_simplify_redundant_dp_cast_general_covers_compound_expressions() -> None:
+    # Regression test (direct unit test): user-reported real examples,
+    # a further generalization beyond simplify_redundant_dp_cast_around_
+    # dot_product/_dp_returning_calls (which only strip a cast around a
+    # single BARE call) --
+    #     eh = real(exp(mean_x + 0.5_dp * var_x), kind=dp)
+    #         --> eh = exp(mean_x + 0.5_dp * var_x)          [kind-preserving intrinsic]
+    #     emp_var_r2 = real(emp_acv_r2(1), kind=dp)
+    #         --> emp_var_r2 = emp_acv_r2(1)                  [bare dp array element, no call at all]
+    #     emp_kurt = real(mean_1d(eps**4) / (mean_1d(eps**2)**2), kind=dp)
+    #         --> emp_kurt = mean_1d(eps**4) / (mean_1d(eps**2)**2)  [compound expression, incl. `**`]
+    # The third case caught a real bug during development: the top-
+    # level-operand splitter treated "**" as something to skip over
+    # entirely rather than as a valid split point, so "A ** B" was never
+    # split into two operands -- a compound expression containing "**"
+    # that wasn't ALSO a single bare call/name/literal silently fell
+    # through to "unknown" (correctly conservative, but missed this
+    # case) until fixed to register "**" as a genuine (two-character)
+    # split point, exactly like the single-character operators.
+    lines = [
+        "pure function f(mean_x, var_x, eps, emp_acv_r2) result(z)",
+        "   real(kind=dp), intent(in) :: mean_x, var_x",
+        "   real(kind=dp), intent(in) :: eps(:)",
+        "   real(kind=dp), intent(in) :: emp_acv_r2(:)",
+        "   real(kind=dp) :: eh, eh2, emp_var_r2, emp_kurt, z",
+        "   eh = real(exp(mean_x + 0.5_dp * var_x), kind=dp)",
+        "   eh2 = real(exp(2.0_dp * mean_x + 2.0_dp * var_x), kind=dp)",
+        "   emp_var_r2 = real(emp_acv_r2(1), kind=dp)",
+        "   emp_kurt = real(mean_1d(eps ** 4) / (mean_1d(eps ** 2) ** 2), kind=dp)",
+        "   z = eh + eh2 + emp_var_r2 + emp_kurt",
+        "end function f",
+    ]
+    # mean_1d isn't defined in this snippet -- register it directly the
+    # way the real pipeline would via the vendored-helper registry, by
+    # monkeypatching xp2f's cache for the duration of this call.
+    orig_cache = xp2f._vendored_dp_returning_registry_cache
+    xp2f._vendored_dp_returning_registry_cache = {"mean_1d"}
+    try:
+        out = xp2f.simplify_redundant_dp_cast_general(lines)
+    finally:
+        xp2f._vendored_dp_returning_registry_cache = orig_cache
+    joined = "\n".join(out)
+    assert "eh = exp(mean_x + 0.5_dp * var_x)" in joined, joined
+    assert "eh2 = exp(2.0_dp * mean_x + 2.0_dp * var_x)" in joined, joined
+    assert "emp_var_r2 = emp_acv_r2(1)" in joined, joined
+    assert "emp_kurt = mean_1d(eps ** 4) / (mean_1d(eps ** 2) ** 2)" in joined, joined
+    # No cast remains on any of the four rewritten ASSIGNMENT lines
+    # (declarations legitimately still say "real(kind=dp) ::").
+    for name in ("eh", "eh2", "emp_var_r2", "emp_kurt"):
+        assign_line = next(ln for ln in out if re.match(rf"^\s*{name}\s*=", ln))
+        assert "real(" not in assign_line, assign_line
+
+
+def test_xp2f_simplifies_redundant_dp_cast_general_end_to_end(tmp_path: Path) -> None:
+    # Companion end-to-end test: real(exp(...), kind=dp) and
+    # real(array_element, kind=dp) shapes, run through the full
+    # pipeline, confirming build success and byte-identical run output
+    # (via _run_xp2f_compile_diff's own run-diff check).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xdp_cast_general.py",
+        [
+            "import math",
+            "",
+            "def make_arr():",
+            "    a = [0.0] * 3",
+            "    a[0] = 1.0",
+            "    a[1] = 2.0",
+            "    a[2] = 3.0",
+            "    return a",
+            "",
+            "def f(mean_x, var_x):",
+            "    return math.exp(mean_x + 0.5 * var_x)",
+            "",
+            "arr = make_arr()",
+            "eh = f(0.1, 0.2)",
+            "first = arr[0]",
+            "print(eh, first)",
+        ],
+    )
+    out_f90 = (tmp_path / "xdp_cast_general_p.f90").read_text(encoding="utf-8")
+    assert "real(exp(" not in out_f90, out_f90
+
+
+def test_fortran_narrow_paren_simplification_never_strips_mandatory_if_where_parens() -> None:
+    # Regression test: user's own full-suite `pytest -q` run surfaced a
+    # real, invalid-Fortran-producing bug in simplify_narrow_redundant_
+    # arith_parens' bare-atom rule (added for `size(x) - (k)` -> `size(x)
+    # - k`, earlier this same session): it doesn't distinguish a
+    # decorative grouping paren from the MANDATORY condition/mask
+    # delimiter Fortran's own `if (...)`, `where (...)`, `elsewhere
+    # (...)`, `do while (...)`, `select case (...)` statement syntax
+    # requires -- `if (x) then` -> `if x then` isn't a style
+    # simplification, it's a syntax error (confirmed: this exact bug
+    # broke real generated code from a `globals()` membership check, a
+    # `where`-masked array assignment, and a `result.success`-style
+    # optimizer-result check -- none involving anything unusual, just an
+    # ordinary single bare-name condition). Fixed by never stripping a
+    # bare-atom (or negated-atom) paren immediately preceded by one of
+    # those statement keywords, while every genuinely-decorative case
+    # (arithmetic grouping, a call's own argument-list parens) is still
+    # simplified exactly as before.
+    lines = [
+        "   if (xp2f_has_global_x) then",
+        "      print *, 1",
+        "   end if",
+        "   where (keep)",
+        "      out = raw",
+        "   end where",
+        "   elsewhere (mask)",
+        "      out = 0",
+        "   end where",
+        "   do while (n)",
+        "      n = n - 1",
+        "   end do",
+        "   if (result_success) print *, 1",
+        "   x = size(y) - (k)",
+        "   z = (-w)",
+    ]
+    out = xp2f.simplify_narrow_redundant_arith_parens(lines)
+    assert out[0] == "   if (xp2f_has_global_x) then", out
+    assert out[3] == "   where (keep)", out
+    assert out[6] == "   elsewhere (mask)", out
+    assert out[9] == "   do while (n)", out
+    assert out[12] == "   if (result_success) print *, 1", out
+    # Genuinely decorative parens are still simplified.
+    assert out[13] == "   x = size(y) - k", out
+    assert out[14] == "   z = -w", out
+
+
+def test_fortran_wrap_never_splits_two_character_comparison_operator() -> None:
+    # Regression test: user's own full-suite run surfaced a second real
+    # bug -- the long-line wrapper's break-candidate scan offered "="
+    # as a break point whenever it appeared, without checking whether it
+    # was actually the SECOND character of a two-character comparison
+    # operator ("<=", ">=", "==", "/="). Splitting there stranded the
+    # operator's own first character ("<", ">", "=", "/") alone at the
+    # end of one line and its second character ("=") alone at the start
+    # of the next -- e.g. a `parity_error <= tolerance` comparison
+    # emitted as `... <\n   & = tolerance ...`, a syntax error, not
+    # merely a style regression (confirmed against a real generated
+    # `merge(...) <= merge(...)` NaN-safe comparison guard). Fixed by
+    # never offering "=" as a break point when the character right
+    # before it is "<", ">", "=", or "/".
+    long_expr = (
+        "   if (merge(.false., merge(0.0_dp, parity_error, ieee_is_nan(parity_error)) "
+        "<= merge(0.0_dp, tolerance, ieee_is_nan(tolerance)), ieee_is_nan(parity_error) "
+        '.or. ieee_is_nan(tolerance))) write(*,"(a)") "ok"'
+    )
+    wrapped = fscan.wrap_long_fortran_line(long_expr, max_len=80)
+    assert wrapped is not None, long_expr
+    for ln in wrapped:
+        assert len(ln) <= 80, wrapped
+    joined = " ".join(s.strip().lstrip("&").strip() for s in wrapped)
+    assert "< =" not in joined and "<=" in joined.replace("< =", "<="), wrapped
+    # No line's own trailing "&" leaves a bare "<", ">", "=", or "/"
+    # dangling as the very last non-"&" character (i.e. never the sole
+    # first half of a two-char operator stranded alone).
+    for ln in wrapped[:-1]:
+        stripped = ln.rstrip()
+        assert stripped.endswith("&")
+        before_amp = stripped[:-1].rstrip()
+        assert not (before_amp and before_amp[-1] in "<>=/" and not before_amp.endswith(("<=", ">=", "==", "/="))), wrapped
+
+
+def test_xp2f_removes_unused_entity_from_combined_parameter_declaration(tmp_path: Path) -> None:
+    # Regression test: user's own full-suite run surfaced a third real
+    # issue -- combining same-type `parameter` declarations onto one
+    # line (this session's own earlier "should named constants of the
+    # same type be combined" fix) interacted badly with remove_unused_
+    # named_constants, which only ever recognized a SINGLE-entity
+    # `parameter` declaration as a removal candidate (`if len(items) !=
+    # 1: continue`). Once `sp`/`dp` (or any other pair) landed on one
+    # combined line, an unused `sp` sitting next to a used `dp` could
+    # never be pruned again -- not a compile error, just permanently
+    # reintroduced dead code the SAME pass used to correctly clean up.
+    # Fixed by tracking each entity on a multi-entity `parameter` line as
+    # its own independent candidate (by line + position), so an unused
+    # one is surgically removed from the comma list while a used sibling
+    # on the SAME line is left in place.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xunused_sp_removal.py",
+        [
+            "xsum = 0.0",
+            "for i in range(10):",
+            "    xsum = xsum + i",
+            "print(xsum)",
+        ],
+    )
+    out_f90 = (tmp_path / "xunused_sp_removal_p.f90").read_text(encoding="utf-8")
+    assert "sp = real32" not in out_f90, out_f90
+    assert "dp = real64" in out_f90, out_f90
+
+
+def test_fortran_format_string_space_literals_convert_and_fold() -> None:
+    # Regression test (direct unit test): user-reported real example --
+    #     write(*,"(a,'  ',a,'  ',a,'  ',a)") "lag", "empirical", ...
+    # -- a comma-item that's a literal string of N spaces is equivalent
+    # to Fortran's own `Nx` edit descriptor (outputs N blanks, byte-for-
+    # byte the same as printing the literal), and once every item is a
+    # plain edit descriptor, a run of L items repeating R times (R>=2)
+    # folds into `R(item1, item2, ...)`. User: "(a,'  ',a,'  ',a,'  ',a)"
+    # can be "(a, 2x, a, 2x, a, 2x,a)" and then "(3(a, 2x), a)"'. Also
+    # exercises: (a) an item that ISN'T pure spaces (`'kappa='`) is left
+    # as a literal, never converted; (b) an `i3` edit descriptor
+    # interleaved with repeated `2x, f14.8` pairs folds correctly
+    # (`i3, 3(2x, f14.8)`) -- the leading non-repeating item is kept
+    # bare, only the REPEATING tail is grouped.
+    lines = [
+        "   write(*,\"(a,'  ',a,'  ',a,'  ',a)\") \"lag\", \"empirical\", "
+        '"theoretical", "emp-th"',
+        "   write(*,\"(i3,'  ',f14.8,'  ',f14.8,'  ',f14.8)\") k, a, b, c",
+        "   write(*,\"('kappa=',g0)\") kappa",
+    ]
+    out = xp2f.simplify_format_string_space_literals_and_fold_repeats(lines)
+    assert '"(3(a, 2x), a)"' in out[0], out
+    assert '"(i3, 3(2x, f14.8))"' in out[1], out
+    # A non-space literal is never touched.
+    assert "'kappa='" in out[2], out
+
+
+def test_xp2f_simplifies_format_string_space_literals_end_to_end(tmp_path: Path) -> None:
+    # Companion end-to-end test: an old-style "%" print format (this
+    # project's own real-world trigger shape, per xgarch_acf.py's own
+    # `print("%3s  %14s  %14s  %14s" % (...))`) generates a Fortran
+    # format string with multi-space literal items between numeric
+    # fields -- confirms the simplification fires through the full
+    # pipeline and preserves output exactly (run-diff MATCH), plus a
+    # direct check that the emitted format string was actually folded.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xformat_fold.py",
+        [
+            "print('%3s  %10s  %10s' % ('lag', 'empirical', 'theoretical'))",
+            "for k in range(1, 4):",
+            "    print('%3d  %10.4f  %10.4f' % (k, float(k), float(k) * 2.0))",
+        ],
+    )
+    out_f90 = (tmp_path / "xformat_fold_p.f90").read_text(encoding="utf-8")
+    assert "'  '" not in out_f90, out_f90
+    assert re.search(r"\d+x\b", out_f90, re.IGNORECASE), out_f90
+
+
+def test_xp2f_narrow_paren_simplification_preserves_call_and_division_grouping(tmp_path: Path) -> None:
+    # Regression test: an initial attempt at simplifying `exp((-a) *
+    # ez_abs)` -> `exp(-a * ez_abs)` and `1.0 + (c * a)` -> `1.0 + c * a`
+    # reused fortran_scan's pre-existing (but never previously wired in
+    # anywhere) simplify_redundant_parens_in_line -- wiring it in
+    # surfaced TWO real, silent correctness bugs: (1) it stripped parens
+    # around a `*`/`/` group regardless of what operator preceded it,
+    # turning `eh2 / (eh * eh)` into `eh2 / eh * eh` -- division is
+    # left-associative at the SAME precedence as multiplication, so
+    # `/eh * eh` cancels to a no-op instead of dividing by eh squared;
+    # (2) its negated-atom handling didn't check whether the "(" it was
+    # about to strip was actually a FUNCTION CALL's own mandatory
+    # argument-list paren, turning `acos(-1.0_dp)` into the syntactically
+    # invalid `acos-1.0_dp`. Replaced with a narrower, hand-verified
+    # simplification restricted to two provably-safe shapes: a negated
+    # bare atom (unary minus has no associativity to disturb) unwrapped
+    # anywhere except immediately after another +/- or inside a call's
+    # own parens, and a `*`/`/`-only group unwrapped ONLY as the operand
+    # of a genuinely binary `+`/`-` (never `*`/`/`, which is exactly the
+    # unsafe division-reordering case above).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnarrow_paren.py",
+        [
+            "import math",
+            "",
+            "def f(a, ez_abs, c, kappa, eh, eh2):",
+            "    m = math.exp((-a) * ez_abs)",
+            "    x = 1.0 + (c * a)",
+            "    kurt = (kappa * eh2) / (eh * eh)",
+            "    pi_val = math.sqrt(2.0 / math.acos(-1.0))",
+            "    return m, x, kurt, pi_val",
+            "",
+            "m, x, kurt, pi_val = f(0.3, 1.2, 0.5, 3.0, 1.1, 2.4)",
+            "print(m, x, kurt, pi_val)",
+        ],
+    )
+    out_f90 = (tmp_path / "xnarrow_paren_p.f90").read_text(encoding="utf-8")
+    assert "acos-1.0" not in out_f90, out_f90
+    assert re.search(r"eh2\s*/\s*eh\s*\*\s*eh\b", out_f90) is None, out_f90
+
+
+def test_xp2f_strips_parens_around_bare_atom() -> None:
+    # Regression test: user-reported example from a real cross-
+    # correlation routine's generated Fortran --
+    #     out_(k + 1) = dot_product(x_local(1:size(x_local) - (k)), ...)
+    # -- a single bare, unsigned variable/number wrapped in redundant
+    # parens. Unlike the `*`/`/`-group case above, a LONE token has no
+    # internal structure or associativity to disturb no matter what
+    # operator precedes it, so this is safe to strip unconditionally
+    # (rule 3 of simplify_narrow_redundant_arith_parens), not just after
+    # a binary +/-. Also verifies the fix doesn't touch: (a) a genuine
+    # function/array-call's own argument-list parens (`size(k)`), and
+    # (b) a "(" that's really just literal text inside a quoted string
+    # (e.g. a `write(*, "(a)")` format descriptor) -- an early version of
+    # this fix, tried without a string-literal guard, corrupted exactly
+    # that into the syntactically invalid `write(*, "a")`.
+    lines = [
+        "      out_(k + 1) = dot_product(x_local(1:size(x_local) - (k)), y_local(k + &",
+        "         & 1:size(y_local))) / denom",
+        "      x = (5)",
+        "      n = size(k)",
+        '      write(*,"(a)") "symmetric garch(1,1)"',
+    ]
+
+    out = xp2f.simplify_narrow_redundant_arith_parens(lines)
+
+    assert "size(x_local) - k)" in out[0], out
+    assert "x = 5" in out[2], out
+    assert "n = size(k)" in out[3], out
+    assert out[4] == lines[4], out
+
+
+def test_xp2f_coalesces_adjacent_scalar_parameter_declarations() -> None:
+    # Regression test: user-reported example from a real generated
+    # program --
+    #     real(kind=dp), parameter :: d = 0.3_dp
+    #     real(kind=dp), parameter :: mu = 0.0_dp
+    #     real(kind=dp), parameter :: phi = 0.97_dp
+    #     real(kind=dp), parameter :: sigma_eta = 0.2_dp
+    #     real(kind=dp), parameter :: theta = 0.2_dp
+    # -- five same-type `parameter` declarations left unmerged, even
+    # though ordinary (non-parameter) same-type locals were already
+    # combined by this same pass. coalesce_nonadjacent_declarations
+    # blanket-excluded ANY initialized entity (`= ...`) from merging.
+    # First fix narrowed the exclusion to `parameter`-only; user then
+    # pointed out this is needlessly narrow -- `real, save :: x = 1.0, y
+    # = 2.0` is equally valid Fortran, and so is mixing bare and
+    # initialized entities on one line (`real :: x, y, z = 3.0`), since
+    # Fortran applies (implicit or explicit) SAVE per-entity, not per-
+    # statement: an uninitialized entity sharing a merged line with an
+    # initialized one never itself acquires SAVE. Generalized to allow
+    # ANY scalar initialized entity to merge with anything of the same
+    # type-spec, dropping the parameter-only gate entirely -- only an
+    # ARRAY-shaped initialized entity (shape+initializer ordering isn't
+    # attempted) is still left alone.
+    lines = [
+        "program p",
+        "   implicit none",
+        "   real(kind=dp), parameter :: d = 0.3_dp",
+        "   real(kind=dp), parameter :: mu = 0.0_dp",
+        "   real(kind=dp), parameter :: phi = 0.97_dp",
+        "   real(kind=dp), parameter :: sigma_eta = 0.2_dp",
+        "   real(kind=dp), parameter :: theta = 0.2_dp",
+        "   integer, parameter :: shape_arr(2) = [1, 2]",
+        "   integer, parameter :: shape_arr2(2) = [3, 4]",
+        "   integer, save :: counter",
+        "   integer, save :: total = 0",
+        "   real :: x",
+        "   real :: y",
+        "   real :: z = 3.0",
+        "   print *, d, mu, phi, sigma_eta, theta, x, y, z",
+        "end program p",
+    ]
+
+    out = xp2f.coalesce_nonadjacent_declarations(lines)
+    joined = "\n".join(out)
+
+    assert (
+        "real(kind=dp), parameter :: d = 0.3_dp, mu = 0.0_dp, phi = 0.97_dp, "
+        "sigma_eta = 0.2_dp, theta = 0.2_dp" in joined
+    ), joined
+    # Array-shaped parameter entities are never merged (no attempt made
+    # to line up a shape spec with a merged initializer list).
+    assert "integer, parameter :: shape_arr(2) = [1, 2]" in joined, joined
+    assert "integer, parameter :: shape_arr2(2) = [3, 4]" in joined, joined
+    # A bare entity ("counter") merges with an initialized one of the
+    # same spec ("total = 0") -- SAVE still only applies to "total".
+    assert "integer, save :: counter, total = 0" in joined, joined
+    # Two bare entities merge with a trailing initialized one, all on
+    # one line, exactly as the user described for a main-program context
+    # where SAVE isn't a consideration.
+    assert "real :: x, y, z = 3.0" in joined, joined
+
+
+def test_xp2f_coalesce_simple_declarations_merges_scalar_initializer() -> None:
+    # Companion to test_xp2f_coalesces_adjacent_scalar_parameter_
+    # declarations, but for fortran_scan.coalesce_simple_declarations --
+    # the simpler, adjacent-only, single-entity-per-line sibling pass
+    # that runs right after coalesce_nonadjacent_declarations in the
+    # default pipeline (covers declarations coalesce_nonadjacent_
+    # declarations doesn't reach, e.g. module-level declarations outside
+    # any function/subroutine/program unit). Its own decl_re previously
+    # had no way to even match a "NAME = VALUE" entity, so the "skip
+    # initialized entities" check was dead code; extended the regex to
+    # capture an optional scalar initializer and merge it like any other
+    # entity of the same type-spec, while still declining to merge an
+    # ARRAY-shaped initialized entity.
+    lines = [
+        "real, save :: x = 1.0",
+        "real, save :: y = 2.0",
+        "real, save :: z = 3.0",
+        "integer, parameter :: shape_arr(2) = [1, 2]",
+    ]
+
+    out = xp2f.coalesce_simple_declarations(lines, max_len=10**9)
+    joined = "\n".join(out)
+
+    assert "real, save :: x = 1.0, y = 2.0, z = 3.0" in joined, joined
+    assert "integer, parameter :: shape_arr(2) = [1, 2]" in joined, joined
 
 
 def test_xp2f_math_module_constants(tmp_path: Path) -> None:
@@ -3942,6 +5527,101 @@ def test_xp2f_promotes_int_seeded_tuple_output_to_real_when_accumulated_from_rea
     out_f90 = tmp_path / "xaccumulate_real_from_int_seed_p.f90"
     out_text = out_f90.read_text(encoding="utf-8")
     assert "real(kind=dp), intent(out) :: vmax" in out_text
+
+
+def test_xp2f_unpacks_tuple_return_passthrough_wrapper(tmp_path: Path) -> None:
+    # Regression test: a thin wrapper whose ONLY return statement forwards
+    # another local function's tuple return directly (`def wrapper(a, b):
+    # return inner(a, b)`, as opposed to a literal `return a, b, c` tuple
+    # built from wrapper's own locals) was invisible to the whole-program
+    # tuple_return_funcs classification entirely -- its return value is
+    # an ast.Call, not an ast.Tuple/List, which is all that classification
+    # scanned for. A call-site tuple-unpack of wrapper's result
+    # (`x, y, z = wrapper(3.0, 2.0)`) then raised a flat "unsupported
+    # assign", and even after threading the classification through (see
+    # _local_return_maps's own separate, now-fixed passthrough case),
+    # wrapper's generated subroutine body came out completely EMPTY --
+    # the dedicated ast.Return handling inside _emit_local_function's own
+    # body-visiting loop (a second, separate copy of the same
+    # Tuple/List-only check, not translator.visit_Return) silently
+    # skipped a Call-valued return with no assignment to wrapper's own
+    # out-args at all, leaving them uninitialized. Real-world pattern
+    # this came from: garch_acf.py's acf_abs_garch_1_1(...) -> return
+    # acf_abs_from_pq(...) (a GARCH ACF/autocov helper library on
+    # GitHub). Fixed with three changes: (1) the whole-program
+    # tuple_return_funcs/local_tuple_return_out_names classification now
+    # recognizes this passthrough shape via a fixed-point pass (handles
+    # a chain of wrappers regardless of local_funcs ordering); (2)
+    # _emit_local_function's own tuple_return_seed derivation falls back
+    # to the precomputed out-names for a passthrough function instead of
+    # trying to walk .elts on a non-existent literal tuple; (3) BOTH the
+    # dedicated ast.Return handling inside _emit_local_function's body
+    # loop AND translator.visit_Return itself now recognize a passthrough
+    # Call and synthesize an Assign straight into the function's own
+    # already-declared intent(out) dummy arguments, reusing the general
+    # tuple-unpack-from-call codegen in visit_Assign.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtuple_passthrough_wrapper.py",
+        [
+            "def inner(a, b):",
+            "    return a + b, a - b, a * b",
+            "",
+            "def wrapper(a, b):",
+            "    return inner(a, b)",
+            "",
+            "x, y, z = wrapper(3.0, 2.0)",
+            "print(x, y, z)",
+        ],
+    )
+
+
+def test_xp2f_matches_out_names_across_multiple_tuple_return_statements(tmp_path: Path) -> None:
+    # Regression test: a function with TWO value-returning tuple Return
+    # statements at different AST nesting depths (an early guard-clause
+    # `if burn: return eps[burn:], h[burn:]` followed by a final, plain
+    # `return eps, h`) desynced two independent whole-program scans that
+    # are each supposed to agree on the function's out-argument names:
+    # the classification loop feeding local_tuple_return_out_names (used
+    # to build the keyword argument names at every CALL site) walked
+    # ast.walk(fn)'s BREADTH-first order, which visits a LATER top-level
+    # Return before an EARLIER but more deeply nested one -- picking
+    # `return eps, h` (Name elts -> out_names ["eps", "h"]) as "first".
+    # _emit_local_function's own out-name derivation (used for the
+    # actual subroutine's dummy-argument declarations) instead uses
+    # _value_returns_excluding_nested, true DEPTH-first SOURCE order --
+    # picking the textually-earlier `return eps[burn:], h[burn:]` (
+    # Subscript elts -> out_names ["sim_out_1", "sim_out_2"]) as "first".
+    # The call site then emitted `call sim(..., eps=eps, h=h)` against a
+    # subroutine whose real dummy arguments were named sim_out_1/
+    # sim_out_2 -- a hard gfortran "Keyword argument ... is not in the
+    # procedure" compile error. Fixed by switching the classification
+    # loop to the same _value_returns_excluding_nested source-order scan
+    # _emit_local_function already uses, so both agree on which Return
+    # is "first" regardless of AST nesting depth.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xmultiret_order.py",
+        [
+            "import numpy as np",
+            "",
+            "def sim(n, burn=0):",
+            "    eps = np.empty(n + burn, dtype=float)",
+            "    h = np.empty(n + burn, dtype=float)",
+            "    for i in range(n + burn):",
+            "        eps[i] = float(i)",
+            "        h[i] = float(i) * 2.0",
+            "    if burn:",
+            "        return eps[burn:], h[burn:]",
+            "    return eps, h",
+            "",
+            "eps, h = sim(5, burn=2)",
+            "print(eps)",
+            "print(h)",
+        ],
+    )
 
 
 def test_xp2f_infers_rank_one_for_rng_permutation_result(tmp_path: Path) -> None:
