@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+import fortran_scan as fscan
+
 PROC_START_RE = re.compile(
     r"^\s*(?P<preprefix>(?:(?:pure|elemental|impure|recursive|module)\s+)*)"
     r"(?P<lead>(?:(?:double\s+precision|integer|real|logical|complex|character\b(?:\s*\([^)]*\))?"
@@ -71,6 +73,7 @@ INTERFACE_START_RE = re.compile(r"^\s*(abstract\s+)?interface\b(?:\s+([a-z][a-z0
 END_INTERFACE_RE = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
 MODULE_PROCEDURE_RE = re.compile(r"^\s*module\s+procedure\b(.+)$", re.IGNORECASE)
 PROCEDURE_DECL_RE = re.compile(r"^\s*procedure\s*\(", re.IGNORECASE)
+PROCEDURE_DECL_IFACE_RE = re.compile(r"^\s*procedure\s*\(\s*([a-z_]\w*)\s*\)", re.IGNORECASE)
 EXTERNAL_STMT_RE = re.compile(r"^\s*external\b(?P<rhs>.*)$", re.IGNORECASE)
 PROCEDURE_BINDING_ALIAS_RE = re.compile(r"^\s*procedure\b(?:\s*,[^:]*)?\s*::\s*(.+)$", re.IGNORECASE)
 USE_ONLY_RE = re.compile(r"^\s*use\b.*?\bonly\s*:\s*(.+)$", re.IGNORECASE)
@@ -443,6 +446,193 @@ def procedure_dummy_procedures(proc: Procedure) -> Set[Tuple[int, str]]:
         for name in declared & proc.dummy_names:
             procedure_dummies.add((positions[name], name))
     return procedure_dummies
+
+
+def procedure_dummy_interface_map(proc: Procedure) -> Dict[str, str]:
+    """Map dummy_name -> interface_name for proc's own procedure-type
+    dummy arguments, from a `procedure(IFACE_NAME) :: dummy` declaration.
+
+    Skips a declaration line whose declared names are NOT purely a
+    subset of proc's own dummy arguments (e.g. `procedure(iface),
+    pointer :: p` declaring a local procedure POINTER, not a dummy) --
+    only a genuine dummy-argument declaration is meaningful for the
+    callback-interface-purity analysis below, since only THOSE names are
+    backed by a caller-supplied actual argument at every call site.
+    """
+    out: Dict[str, str] = {}
+    for _, code in proc.body:
+        low = code.lower()
+        m = PROCEDURE_DECL_IFACE_RE.match(low)
+        if not m:
+            continue
+        declared_here = parse_declared_names_any(low)
+        dummy_declared = declared_here & proc.dummy_names
+        if not dummy_declared or declared_here != dummy_declared:
+            continue
+        iface_name = m.group(1).lower()
+        for name in dummy_declared:
+            out[name] = iface_name
+    return out
+
+
+def _extract_actual_for_dummy(
+    actuals: List[str], dummy_order: List[str], dummy_name: str
+) -> Optional[str]:
+    """From one call's actual-argument list, find the actual expression
+    text passed for `dummy_name` -- by keyword match first (`dummy_name=
+    EXPR` can appear anywhere in the list), else by plain position
+    (sound because Fortran never allows a positional actual after a
+    keyword one, so if the slot at dummy_name's own position is itself
+    unclaimed by a DIFFERENT keyword, it must be this one). Returns None
+    when the call doesn't supply this dummy at all (e.g. an optional
+    argument omitted) or the actual can't be resolved.
+    """
+    for actual in actuals:
+        actual = actual.strip()
+        m = re.match(r"^([a-z][a-z0-9_]*)\s*=(?!=)\s*(.*)$", actual, re.IGNORECASE)
+        if m and m.group(1).lower() == dummy_name:
+            return m.group(2).strip()
+    if dummy_name not in dummy_order:
+        return None
+    idx = dummy_order.index(dummy_name)
+    if idx >= len(actuals):
+        return None
+    actual = actuals[idx].strip()
+    m = re.match(r"^([a-z][a-z0-9_]*)\s*=(?!=)\s*", actual, re.IGNORECASE)
+    if m and m.group(1).lower() in dummy_order:
+        return None  # this positional slot is really someone ELSE's keyword actual
+    return actual or None
+
+
+def find_pure_promotable_callback_interfaces(
+    lines: List[str],
+    parsed: List[Procedure],
+    is_name_pure,
+) -> Set[str]:
+    """Determine which named callback interfaces (each backing one or
+    more `procedure(IFACE) :: dummy` dummy-argument declarations
+    somewhere in this file) can safely be declared `pure` -- Fortran
+    requires that BEFORE a procedure taking one as a dummy argument can
+    itself be `pure` (12.6/C1592: a pure procedure's dummy procedure
+    argument must have a pure interface).
+
+    An interface is safe when EVERY call site of every procedure using
+    it, anywhere in the whole file (procedure bodies AND the top-level
+    program), passes an actual argument for that dummy that's ITSELF
+    provably pure -- either a concrete top-level name `is_name_pure`
+    confirms, or a PASS-THROUGH of the calling procedure's own
+    procedure-dummy argument (e.g. `_bracket_and_solve_positive_root(f,
+    x0, x1, x_max)` calling `_bisect_root(f, a, b)`, handing its own `f`
+    straight through) -- in which case safety instead depends,
+    transitively, on the CALLER's own interface for that dummy also
+    ending up in the safe set. Resolved as a fixed point over ALL
+    interfaces at once, since two (or more) interfaces can depend on
+    each other exactly this way.
+
+    Conservative by construction: an interface is excluded (never
+    considered safe) the moment ANY call site can't be resolved this way
+    at all -- an actual that isn't a bare name, an omitted/unresolvable
+    argument, or simply never being called anywhere (nothing to prove
+    safety from). A false negative here just means a procedure stays
+    exactly as un-promoted as before this analysis existed; the risk
+    runs only one direction.
+    """
+    proc_iface_map: Dict[str, Dict[str, str]] = {}
+    for proc in parsed:
+        m = procedure_dummy_interface_map(proc)
+        if m:
+            proc_iface_map[proc.name.lower()] = m
+
+    all_iface_names = {iface for m in proc_iface_map.values() for iface in m.values()}
+    if not all_iface_names:
+        return set()
+
+    target_names = set(proc_iface_map.keys())
+    dummy_order_by_name = {p.name.lower(): p.dummy_args for p in parsed}
+    proc_ranges = [(p.start, p.end, p.name.lower()) for p in parsed]
+
+    def _enclosing_proc_name(lineno: int) -> Optional[str]:
+        for start, end, name in proc_ranges:
+            if start <= lineno <= end:
+                return name
+        return None
+
+    poisoned: Set[str] = set()
+    concrete_deps: Dict[str, Set[str]] = {i: set() for i in all_iface_names}
+    iface_deps: Dict[str, Set[str]] = {i: set() for i in all_iface_names}
+    exercised: Set[str] = set()
+
+    for lineno, stmt in iter_fortran_statements(lines):
+        low = stmt.lower()
+        if PROC_START_RE.match(low):
+            continue
+        caller_name = _enclosing_proc_name(lineno)
+        caller_iface_map = proc_iface_map.get(caller_name, {}) if caller_name else {}
+        for m in INVOCATION_RE.finditer(low):
+            callee = m.group(1).lower()
+            if callee not in target_names:
+                continue
+            actuals = call_actual_arguments(low, m)
+            dummy_order = dummy_order_by_name.get(callee, [])
+            for dummy_name, iface_name in proc_iface_map[callee].items():
+                exercised.add(iface_name)
+                actual_txt = _extract_actual_for_dummy(actuals, dummy_order, dummy_name)
+                if actual_txt is None or not re.match(r"^[a-z_]\w*$", actual_txt, re.IGNORECASE):
+                    poisoned.add(iface_name)
+                    continue
+                actual_name = actual_txt.lower()
+                if actual_name in caller_iface_map:
+                    iface_deps[iface_name].add(caller_iface_map[actual_name])
+                else:
+                    concrete_deps[iface_name].add(actual_name)
+
+    candidates = (all_iface_names & exercised) - poisoned
+    changed = True
+    while changed:
+        changed = False
+        for iface_name in list(candidates):
+            if any(not is_name_pure(n) for n in concrete_deps[iface_name]):
+                candidates.discard(iface_name)
+                changed = True
+                continue
+            if any(dep not in candidates for dep in iface_deps[iface_name]):
+                candidates.discard(iface_name)
+                changed = True
+    return candidates
+
+
+def mark_callback_interfaces_pure(lines: List[str], iface_names: Set[str]) -> List[str]:
+    """Add `pure` to the `function`/`subroutine` declaration of each
+    named abstract interface (used by a `procedure(IFACE) :: dummy`
+    dummy-argument declaration elsewhere) -- see
+    find_pure_promotable_callback_interfaces for how `iface_names` is
+    proven safe. A no-op unless the interface's own declaration isn't
+    already pure/elemental/impure, matching add_pure_to_declaration's
+    own idempotence.
+    """
+    if not iface_names:
+        return lines
+    updated = list(lines)
+    depth = 0
+    i = 0
+    n = len(updated)
+    while i < n:
+        code, _ = split_code_comment(updated[i])
+        low = code.strip().lower()
+        if re.match(r"^\s*(abstract\s+)?interface\b", low):
+            depth += 1
+            i += 1
+            continue
+        if END_INTERFACE_RE.match(low):
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if depth > 0:
+            m = re.match(r"^\s*(function|subroutine)\s+([a-z][a-z0-9_]*)\b", low, re.IGNORECASE)
+            if m and m.group(2).lower() in iface_names:
+                apply_decl_edit_at_or_continuation(updated, i, add_pure_to_declaration)
+        i += 1
+    return updated
 
 
 def call_actual_arguments(line: str, call_match: "re.Match[str]") -> List[str]:
@@ -819,6 +1009,7 @@ def analyze_lines(
     imported_names: Optional[Set[str]] = None,
     strict_unknown_calls: bool = False,
     assumed_pure_selectors: Optional[Set[str]] = None,
+    pure_callback_interfaces: Optional[Set[str]] = None,
 ) -> AnalysisResult:
     """Analyze procedures and classify likely pure candidates or rejections.
 
@@ -826,11 +1017,18 @@ def analyze_lines(
     procedure in that set is provisionally treated as pure when resolving
     calls, but it is still analyzed and returned as a candidate only if it
     has no direct or propagated purity blockers.
+
+    ``pure_callback_interfaces`` names abstract interfaces (see
+    find_pure_promotable_callback_interfaces) already proven safe to
+    declare `pure` -- a procedure whose OWN dummy procedure argument
+    declaration uses one of them is exempted from the usual blanket
+    "any procedure dummy argument disqualifies pure" rejection.
     """
     procs = parse_procedures(lines)
     if not procs:
         return AnalysisResult(procs, [], [])
 
+    pure_ifaces = pure_callback_interfaces or set()
     assumed_pure = {selector.lower() for selector in (assumed_pure_selectors or set())}
 
     def is_known_pure(proc: Procedure) -> bool:
@@ -880,6 +1078,18 @@ def analyze_lines(
         dummy_intent: Dict[str, str] = {}
         character_names: Set[str] = set()
         external_proc_names: Set[str] = set()
+        # Dummy PROCEDURE arguments never carry INTENT in Fortran (it's a
+        # data-object-only attribute) -- exempt them from the two
+        # INTENT-presence checks below, which would otherwise flag every
+        # one as "missing" unconditionally. proc_dummy_iface is ALSO used
+        # by the "procedure dummy/pointer declaration" blocker further
+        # down: a dummy declared with an interface in pure_ifaces (see
+        # find_pure_promotable_callback_interfaces) is exempted from
+        # that blanket rejection too.
+        proc_dummy_iface = procedure_dummy_interface_map(proc)
+        proc_dummy_proc_names = set(proc_dummy_iface.keys()) | {
+            name for _, name in procedure_dummy_procedures(proc)
+        }
 
         children = [p for p in procs if p.parent and p.parent.lower() == proc.name.lower()]
         nonpure_children = [c.name for c in children if not is_known_pure(c)]
@@ -919,9 +1129,20 @@ def analyze_lines(
                                 dummy_with_intent_or_value.add(d)
 
             if PROCEDURE_DECL_RE.match(low):
-                reasons.append(
-                    f"line {ln}: procedure dummy/pointer declaration (conservatively treated as non-pure candidate)"
+                m_iface = PROCEDURE_DECL_IFACE_RE.match(low)
+                declared_here = parse_declared_names_any(low)
+                dummy_declared = declared_here & proc.dummy_names
+                exempt = (
+                    m_iface is not None
+                    and dummy_declared
+                    and declared_here == dummy_declared
+                    and all(proc_dummy_iface.get(d) == m_iface.group(1).lower() for d in dummy_declared)
+                    and m_iface.group(1).lower() in pure_ifaces
                 )
+                if not exempt:
+                    reasons.append(
+                        f"line {ln}: procedure dummy/pointer declaration (conservatively treated as non-pure candidate)"
+                    )
 
             if SAVE_STMT_RE.match(low):
                 reasons.append(f"line {ln}: SAVE statement")
@@ -1091,13 +1312,13 @@ def analyze_lines(
                 reasons.append(f"line {ln}: invokes imported entity '{callee}' whose purity is unknown")
 
         if proc.kind == "subroutine":
-            for d in sorted(proc.dummy_names):
+            for d in sorted(proc.dummy_names - proc_dummy_proc_names):
                 if d not in dummy_with_intent_or_value:
                     reasons.append(
                         f"dummy argument '{d}' lacks explicit INTENT/VALUE declaration (conservative pure check)"
                     )
         elif proc.kind == "function":
-            for d in sorted(proc.dummy_names):
+            for d in sorted(proc.dummy_names - proc_dummy_proc_names):
                 dint = dummy_intent.get(d, "")
                 if dint not in {"in", "value"}:
                     reasons.append(
@@ -1217,38 +1438,76 @@ def add_elemental_to_declaration(line: str) -> Tuple[str, bool]:
 
 
 def apply_decl_edit_at_or_continuation(lines: List[str], idx: int, editor) -> bool:
-    """Apply declaration editor at idx, or on a continued signature line."""
+    """Apply a declaration editor to the statement starting at `idx`,
+    which may already span several `&`-continued physical lines.
+
+    Rejoins the WHOLE statement into one flat logical line first, applies
+    `editor` to that, and -- if it changed anything -- re-wraps the
+    edited flat line from scratch and splices the fresh result back in
+    place of the entire original physical-line range. Editing (and,
+    where needed, re-wrapping) just ONE physical line in isolation --
+    the previous approach -- could lengthen that one line just enough to
+    need re-wrapping on its own, while the other, already-fine physical
+    lines of the SAME statement were left completely untouched: a
+    locally valid but needlessly fragmented result (an extra, under-
+    filled continuation line) instead of the same statement's single,
+    cleanly repacked wrap. Real trigger: --elemental inserting "elemental
+    " into an already-wrapped `pure function foo(a, b, &\n   & c, d) &\n
+    & result(...)`, pushing line 1 over budget and re-splitting it
+    in place while lines 2-3 stayed as they were.
+    """
     if idx < 0 or idx >= len(lines):
         return False
 
-    new_line, did_change = editor(lines[idx])
-    if did_change:
+    end = idx
+    code0, _ = split_code_comment(lines[idx])
+    while code0.rstrip().endswith("&") and end + 1 < len(lines):
+        end += 1
+        code0, _ = split_code_comment(lines[end])
+
+    if end == idx:
+        new_line, did_change = editor(lines[idx])
+        if not did_change:
+            return False
         lines[idx] = new_line
         return True
 
-    code0, _comment0 = split_code_comment(lines[idx])
-    if not code0.rstrip().endswith("&"):
+    # Rejoin lines[idx:end+1] into one flat logical statement -- strip
+    # each physical line's own leading "&" resume marker and trailing "&"
+    # continuation marker, matching this project's own established
+    # _join_stmt convention (see xp2f.py). These are freshly generated
+    # procedure-signature lines, never a continuation resumed mid-string-
+    # literal, so a plain single-space join is always safe here.
+    parts: List[str] = []
+    trailing_comment = ""
+    for k in range(idx, end + 1):
+        code, comment = split_code_comment(lines[k])
+        code = code.rstrip()
+        if k > idx and code.lstrip().startswith("&"):
+            code = code.lstrip()[1:].lstrip()
+        if code.endswith("&"):
+            code = code[:-1].rstrip()
+        if code:
+            parts.append(code)
+        if comment.strip():
+            trailing_comment = comment
+    joined = " ".join(parts)
+
+    new_joined, did_change = editor(joined)
+    if not did_change:
         return False
 
-    j = idx + 1
-    while j < len(lines):
-        raw = lines[j]
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("!"):
-            j += 1
-            continue
-        codej, commentj = split_code_comment(raw)
-        m = re.match(r"^(\s*&?\s*)(.*)$", codej)
-        if not m:
-            return False
-        lead = m.group(1)
-        core = m.group(2)
-        edited_core, did_change_core = editor(core)
-        if not did_change_core:
-            return False
-        lines[j] = f"{lead}{edited_core}{commentj}"
-        return True
-    return False
+    max_len = 80
+    if len(new_joined) <= max_len:
+        rewrapped = [new_joined]
+    else:
+        rewrapped = fscan.wrap_long_fortran_line(new_joined, max_len=max_len)
+        if rewrapped is None:
+            rewrapped = [new_joined]
+    if trailing_comment:
+        rewrapped[-1] = f"{rewrapped[-1]}{trailing_comment}"
+    lines[idx : end + 1] = rewrapped
+    return True
 
 
 _GENERIC_INTERFACE_START_RE = re.compile(r"^\s*interface\s+([a-z][a-z0-9_]*)\s*$", re.IGNORECASE)
@@ -1421,8 +1680,21 @@ def mark_pure_where_provable(
         proc.selector.lower() for proc in parsed if not proc.is_pure_or_elemental and "impure" not in proc.attrs
     }
 
+    def _is_name_pure(name: str, _assumed: Set[str] = assumed) -> bool:
+        matches = [p for p in parsed if p.name.lower() == name]
+        if matches:
+            return all(p.is_pure_or_elemental or p.selector.lower() in _assumed for p in matches)
+        return external_status.get(name, False)
+
     result: Optional[AnalysisResult] = None
+    pure_ifaces: Set[str] = set()
     for _ in range(max(1, len(parsed)) + 1):
+        # Recomputed each iteration against the CURRENT `assumed` set --
+        # an actual argument passed to a callback parameter can itself
+        # be a procedure this same fixed point is still deciding on
+        # (see find_pure_promotable_callback_interfaces's docstring for
+        # the pass-through case this matters for).
+        pure_ifaces = find_pure_promotable_callback_interfaces(f90_lines, parsed, _is_name_pure)
         result = analyze_lines(
             f90_lines,
             external_name_status=external_status,
@@ -1432,6 +1704,7 @@ def mark_pure_where_provable(
             imported_names=use_only_names,
             strict_unknown_calls=strict_unknown_calls,
             assumed_pure_selectors=assumed,
+            pure_callback_interfaces=pure_ifaces,
         )
         viable = {proc.selector.lower() for proc in result.candidates}
         next_assumed = assumed & viable
@@ -1446,6 +1719,7 @@ def mark_pure_where_provable(
     for proc in result.candidates:
         idx = proc.start - 1
         apply_decl_edit_at_or_continuation(updated, idx, add_pure_to_declaration)
+    updated = mark_callback_interfaces_pure(updated, pure_ifaces)
     return updated
 
 

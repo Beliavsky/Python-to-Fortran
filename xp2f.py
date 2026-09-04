@@ -53,6 +53,15 @@ SHOW_TRANSLATION_NOTES = False
 AUTO_ELEMENTAL = False
 SHOW_NOOP_NOTES = False
 PERCENT_FLOAT_INT_FORMAT = False
+# When True (the default), a real-valued comparison (<, <=, >, >=, ==, /=)
+# is wrapped in a merge()/ieee_is_nan() guard so a NaN operand quietly
+# evaluates the way Python/pandas would (False, or True for !=) instead of
+# tripping -ffpe-trap=invalid -- see the ast.Compare codegen and
+# _pandas_df_compare_spec's caller. Set False by --no-nan-safe-compare for
+# plain, idiomatic `if (x <= y) then` output instead, at the cost of that
+# NaN-safety (a NaN operand can then crash a strict-FPE build where Python
+# wouldn't have raised at all).
+NAN_SAFE_COMPARISONS = True
 
 _ROUND_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
@@ -147,7 +156,7 @@ def normalize_numpy_removed_aliases(src_text):
 
 
 def simplify_narrow_redundant_arith_parens(lines):
-    """Strip parentheses in three narrow, hand-verified-safe shapes:
+    """Strip parentheses in four narrow, hand-verified-safe shapes:
 
     (1) A single negated bare atom, `(-NAME)` or `(-NUMBER)`, unwrapped to
         `-NAME`/`-NUMBER` -- unary minus always binds tighter than every
@@ -169,6 +178,46 @@ def simplify_narrow_redundant_arith_parens(lines):
         `size(x) - (k)` -> `size(x) - k`. Still guarded against a
         function/array-call's own argument-list parens (never touched --
         see the same check in rule (1)).
+
+    (4) Parens wrapping an ENTIRE operand (either side) of a relational
+        operator (`<`, `<=`, `>`, `>=`, `==`, `/=`), unwrapped -- every
+        arithmetic operator binds tighter than every relational one in
+        Fortran, so `(0.5_dp * (b - a)) < tol` and `0.5_dp * (b - a) <
+        tol` parse identically, and `(fa * fm) <= 0` and `fa * fm <= 0`
+        likewise. User-reported real trigger: exactly these two shapes,
+        both survivors of the codegen's own worst-case parenthesization.
+        Unlike rule (2), this carries NO floating-point-reordering risk
+        regardless of what's INSIDE the wrapped operand (+, -, *, or /
+        at its own top level) -- the parens being removed are purely an
+        outer wrapper around a relational operator's whole operand,
+        never touching that operand's own internal grouping. Declines
+        (leaves parens alone) whenever the wrapped content itself
+        contains another relational or logical operator or a top-level
+        comma -- deliberately simple substring checks, not depth-aware,
+        matching this function's established conservative style: a
+        false "unsafe" from a nested call that happens to also contain
+        one of these tokens just leaves that operand alone, never a
+        wrong strip. Still guarded against a function/array-call's own
+        argument-list parens (same check as rules (1)/(3)).
+
+    (5) Parens wrapping an ENTIRE expression immediately followed by a
+        genuine binary `+` or `-`, unwrapped -- e.g. `(delta0 * x) +
+        ((0.5_dp * gamma0) * x) * x` -> `delta0 * x + ((0.5_dp * gamma0)
+        * x) * x`. `+`/`-` are the LOWEST-precedence arithmetic
+        operators, so closing a group right before one is redundant
+        regardless of what's INSIDE it -- even another top-level +/-:
+        `(A - B) + C` and `A - B + C` compute in the exact same left-to-
+        right order, since Fortran evaluates a left-associative same-
+        precedence +/- chain that way whether or not the parens are
+        there (unlike being the right-hand operand of a MINUS -- rule
+        (2) -- where an internal +/- would flip a sign on removal; here
+        the group is the FIRST-encountered operand, so nothing gets
+        redistributed). The only thing that matters is what precedes
+        the OPENING paren: `*`, `/`, or the second `*` of `**` (a
+        higher-precedence operator) or a function/array call's own
+        argument-list paren leaves it alone, since removing THOSE
+        parens would change what's actually being multiplied/divided or
+        delete a call's own parens outright.
 
     Deliberately narrower than it might look: an earlier attempt reused
     fortran_scan's existing (but never previously wired in anywhere)
@@ -340,14 +389,337 @@ def simplify_narrow_redundant_arith_parens(lines):
             matches.append((i, p, inner))
             i = p + 1
 
-        if not matches:
+        if matches:
+            pieces = []
+            last = 0
+            for start, end, inner in matches:
+                pieces.append(code[last:start])
+                pieces.append(inner)
+                last = end + 1
+            pieces.append(code[last:])
+            code = "".join(pieces)
+
+        # (5) Parens wrapping an ENTIRE expression immediately followed
+        # by a genuine binary + or -, unwrapped -- see the docstring for
+        # why this is always safe regardless of what's inside, as long
+        # as what precedes the OPENING paren isn't a higher-precedence
+        # operator or a call's own argument-list paren. A ")" can never
+        # be directly followed by a UNARY sign in valid Fortran (a
+        # unary sign never directly follows a completed operand without
+        # an operator between them), so a +/- found right after one is
+        # always genuinely binary -- no extra check needed there, unlike
+        # rule (2)'s own "is the preceding +/- really binary" guard.
+        rule5_mask = _string_mask(code)
+        n5 = len(code)
+
+        def _is_call_paren_at5(open_idx):
+            return open_idx > 0 and (code[open_idx - 1].isalnum() or code[open_idx - 1] == "_")
+
+        def _matching_close5(open_idx):
+            depth = 0
+            p = open_idx
+            while p < n5:
+                if not rule5_mask[p]:
+                    if code[p] == "(":
+                        depth += 1
+                    elif code[p] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            return p
+                p += 1
+            return None
+
+        removals5 = []
+        qi = 0
+        while qi < n5:
+            if rule5_mask[qi] or code[qi] != "(":
+                qi += 1
+                continue
+            open_idx = qi
+            if _is_call_paren_at5(open_idx):
+                qi += 1
+                continue
+            pj = open_idx - 1
+            while pj >= 0 and code[pj] in " \t":
+                pj -= 1
+            prev_ch = code[pj] if pj >= 0 else ""
+            if prev_ch in "*/":
+                qi += 1
+                continue
+            if _preceded_by_mandatory_paren_keyword(code, open_idx):
+                qi += 1
+                continue
+            close_idx = _matching_close5(open_idx)
+            if close_idx is None:
+                qi += 1
+                continue
+            fk = close_idx + 1
+            while fk < n5 and code[fk] in " \t":
+                fk += 1
+            if fk < n5 and not rule5_mask[fk] and code[fk] in "+-":
+                inner = code[open_idx + 1 : close_idx].strip()
+                # A "(" immediately preceded by "-" needs the SAME
+                # safety check rule (2) already applies to ITS mirror-
+                # image case: subtracting an entire group is only
+                # equivalent to dropping its parens when the group has
+                # NO top-level +/- of its own to have its sign flipped
+                # -- `x - (a - b) + c` is NOT `x - a - b + c` (10 vs 6
+                # for x=10,a=3,b=2,c=1). Preceded by "+" (or "(", ",",
+                # "=", start-of-line) carries no such risk: distributing
+                # a "+" over a group never changes any term's sign.
+                minus_sign_flip_risk = prev_ch == "-" and re.search(r"[+\-,]", inner)
+                if inner and not minus_sign_flip_risk:
+                    removals5.append((open_idx, close_idx))
+            qi = open_idx + 1
+
+        if removals5:
+            pieces5 = []
+            last5 = 0
+            for o, c in removals5:
+                pieces5.append(code[last5:o])
+                pieces5.append(code[o + 1 : c])
+                last5 = c + 1
+            pieces5.append(code[last5:])
+            code = "".join(pieces5)
+
+        # (4) Parens wrapping an ENTIRE operand (either side) of a
+        # relational operator (<, <=, >, >=, ==, /=), unwrapped -- every
+        # arithmetic operator binds tighter than every relational one in
+        # Fortran, so `(0.5_dp * (b - a)) < tol` and `0.5_dp * (b - a) <
+        # tol` parse identically. Unlike rule (2), this carries NO
+        # floating-point-reordering risk at all regardless of what's
+        # INSIDE the wrapped operand (+, -, *, or / at its own top
+        # level): the parens being removed are purely an outer wrapper
+        # around a relational operator's whole operand, never touching
+        # the wrapped expression's own internal grouping.
+        cmp_mask = _string_mask(code)
+        n2 = len(code)
+
+        def _is_call_paren_at(open_idx):
+            return open_idx > 0 and (code[open_idx - 1].isalnum() or code[open_idx - 1] == "_")
+
+        def _matching_open(close_idx):
+            depth = 0
+            p = close_idx
+            while p >= 0:
+                if not cmp_mask[p]:
+                    if code[p] == ")":
+                        depth += 1
+                    elif code[p] == "(":
+                        depth -= 1
+                        if depth == 0:
+                            return p
+                p -= 1
+            return None
+
+        def _matching_close(open_idx):
+            depth = 0
+            p = open_idx
+            while p < n2:
+                if not cmp_mask[p]:
+                    if code[p] == "(":
+                        depth += 1
+                    elif code[p] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            return p
+                p += 1
+            return None
+
+        def _safe_cmp_operand(inner):
+            # Deliberately simple substring checks (not depth-aware),
+            # matching this function's established conservative style
+            # elsewhere (see rule (2) just above): a false "unsafe" from
+            # a nested call that happens to also contain one of these
+            # tokens just means this operand is left alone, never a
+            # wrong strip.
+            if not inner.strip():
+                return False
+            if "<" in inner or ">" in inner or "==" in inner or "/=" in inner or "," in inner:
+                return False
+            low = inner.lower()
+            return not any(tok in low for tok in (".and.", ".or.", ".not.", ".eqv.", ".neqv."))
+
+        cmp_op_re = re.compile(r"<=|>=|==|/=|<|>")
+        ops = []
+        oi = 0
+        while oi < n2:
+            if cmp_mask[oi]:
+                oi += 1
+                continue
+            m_op = cmp_op_re.match(code, oi)
+            if m_op:
+                ops.append((m_op.start(), m_op.end()))
+                oi = m_op.end()
+            else:
+                oi += 1
+
+        removals = []
+        for op_start, op_end in ops:
+            j = op_start - 1
+            while j >= 0 and code[j] in " \t":
+                j -= 1
+            if j >= 0 and not cmp_mask[j] and code[j] == ")":
+                open_idx = _matching_open(j)
+                if (
+                    open_idx is not None
+                    and not _is_call_paren_at(open_idx)
+                    and not _preceded_by_mandatory_paren_keyword(code, open_idx)
+                    and _safe_cmp_operand(code[open_idx + 1 : j])
+                ):
+                    removals.append(open_idx)
+                    removals.append(j)
+            k = op_end
+            while k < n2 and code[k] in " \t":
+                k += 1
+            if k < n2 and not cmp_mask[k] and code[k] == "(" and not _is_call_paren_at(k):
+                close_idx = _matching_close(k)
+                if (
+                    close_idx is not None
+                    and not _preceded_by_mandatory_paren_keyword(code, k)
+                    and _safe_cmp_operand(code[k + 1 : close_idx])
+                ):
+                    removals.append(k)
+                    removals.append(close_idx)
+
+        if removals:
+            drop = set(removals)
+            code = "".join(ch for idx, ch in enumerate(code) if idx not in drop)
+
+        return code
+
+    out = []
+    for raw in lines:
+        code, sep, comment = raw.partition("!")
+        new_code = _process_code(code)
+        out.append(f"{new_code}!{comment}" if sep else new_code)
+    return out
+
+
+def simplify_additive_zero_identity(lines):
+    """Drop a redundant `0 + (EXPR)` down to just `EXPR` (or, when
+    something else on the line still needs the grouping, down to just
+    `(EXPR)` with the "0 + " itself removed) -- e.g. `idx_1 = 0 +
+    (i_iter_175 - 1)` -> `idx_1 = i_iter_175 - 1`. `0 + X` is
+    exactly `X` for any integer X; this is leftover noise from how the
+    codegen builds a synthesized index/offset expression, not something
+    a human would write.
+
+    Deliberately narrow: only a BARE, unsuffixed "0" (never "0.0",
+    "0_dp", or any other real-typed zero -- the regex's own shape,
+    requiring "0" to be followed immediately by whitespace/"+"/"(",
+    already excludes those; a real literal always has more characters
+    glued directly onto the "0") qualifies, and the parenthesized
+    operand being added to it must itself look purely integer (no
+    decimal point, no NUMBER_kind-suffix pattern, no exponent marker).
+    Fortran's mixed-mode arithmetic rules mean "0 + X" for a REAL X
+    still converts 0 to 0.0 first, and while `0.0 + X` equals X for
+    every finite X under IEEE 754, it does NOT for X = -0.0 (0.0 +
+    (-0.0) = +0.0, not -0.0) -- an obscure but real corner case this
+    project's own byte-exact --run-diff philosophy treats as seriously
+    as any other floating-point reordering risk elsewhere in this file.
+    Restricting to operands that look purely integer (Fortran's default
+    INTEGER kind, exact arithmetic, no such corner case at all)
+    sidesteps it entirely.
+
+    Also deliberately narrow in shape: only matches "0 + (" specifically
+    (an opening paren immediately after the "+"), not "0 + bare_name" --
+    the one real trigger for this pass is a synthesized `0 + (a - b)`-
+    style offset, and requiring the parenthesized shape keeps the
+    matching, and the "does anything else still need these parens"
+    decision below, simple and unambiguous.
+    """
+    zero_plus_re = re.compile(r"(?<![\w.])0\s*\+\s*\(")
+
+    def _string_mask(code):
+        mask = [False] * len(code)
+        in_single = in_double = False
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if ch == "'" and not in_double:
+                mask[i] = True
+                if in_single and i + 1 < n and code[i + 1] == "'":
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                mask[i] = True
+                if in_double and i + 1 < n and code[i + 1] == '"':
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                mask[i] = True
+            i += 1
+        return mask
+
+    def _looks_purely_integer(text):
+        if "." in text:
+            return False
+        if re.search(r"\d_[A-Za-z]", text):
+            return False
+        if re.search(r"\d[eEdD][+-]?\d", text):
+            return False
+        return True
+
+    def _process_code(code):
+        mask = _string_mask(code)
+        n = len(code)
+        replacements = []
+        i = 0
+        while i < n:
+            if mask[i]:
+                i += 1
+                continue
+            m = zero_plus_re.match(code, i)
+            if not m:
+                i += 1
+                continue
+            zero_start = m.start()
+            open_paren = m.end() - 1
+            depth = 0
+            p = open_paren
+            close_paren = None
+            while p < n:
+                if not mask[p]:
+                    if code[p] == "(":
+                        depth += 1
+                    elif code[p] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            close_paren = p
+                            break
+                p += 1
+            if close_paren is None:
+                i = m.end()
+                continue
+            inner = code[open_paren + 1 : close_paren]
+            if not inner.strip() or not _looks_purely_integer(inner):
+                i = close_paren + 1
+                continue
+            fk = close_paren + 1
+            while fk < n and code[fk] in " \t":
+                fk += 1
+            replacement = inner.strip() if fk >= n else f"({inner})"
+            replacements.append((zero_start, close_paren + 1, replacement))
+            i = close_paren + 1
+
+        if not replacements:
             return code
         pieces = []
         last = 0
-        for start, end, inner in matches:
+        for start, end, repl in replacements:
             pieces.append(code[last:start])
-            pieces.append(inner)
-            last = end + 1
+            pieces.append(repl)
+            last = end
         pieces.append(code[last:])
         return "".join(pieces)
 
@@ -357,6 +729,207 @@ def simplify_narrow_redundant_arith_parens(lines):
         new_code = _process_code(code)
         out.append(f"{new_code}!{comment}" if sep else new_code)
     return out
+
+
+def vectorize_rank1_elemental_call_loops(lines):
+    """Collapse a per-element `do IV = 1, size(SRC) / TARGET(IV) = RHS /
+    end do` loop (wrapped in its own `block`, with no other declarations
+    besides `integer :: IV` -- exactly the shape
+    translator._emit_for_over_rank1_iter's own listcomp-loop-rewrite
+    fusion produces) into a single vectorized statement `TARGET = RHS`
+    when RHS's only use of the source array is `SRC(IV)`, and every
+    such occurrence is wrapped -- at every level of nesting, all the way
+    out to RHS's own top level -- ONLY by calls to functions CONFIRMED
+    elemental in THIS file's own text (a `pure elemental function NAME(`
+    signature actually present, scanned fresh from the lines passed in)
+    or a small set of Fortran-intrinsic-backed casts that are themselves
+    elemental (float/int/bool/str -> real()/int()/...). A Fortran
+    elemental call (and every arithmetic/comparison/logical operator)
+    broadcasts automatically over a whole array argument with IDENTICAL
+    syntax to the scalar case, so e.g. `pnl_exact(i) = bs_straddle_value
+    (S=S(i), K=K, ...) - V0` inside `do i = 1, size(S)` collapses to
+    `pnl_exact = bs_straddle_value(S=S, K=K, ...) - V0` -- no loop, no
+    block, no per-element indexing at all (user-reported real example:
+    xdelta_gamma.py with --elemental).
+
+    Deliberately run LATE, as a whole-file text pass, rather than as a
+    codegen-time decision: which functions end up elemental is only
+    ever confirmed by mark_elemental_where_provable, a separate, later,
+    whole-text pass -- at the point the loop itself gets emitted, no
+    reliable answer exists yet (confirmed the hard way: an earlier,
+    codegen-time version of this optimization relied on a prediction,
+    self.local_elemental_funcs, that turned out to never actually be
+    populated for a program with local functions -- exactly the case
+    this rewrite exists for in the first place -- so it silently never
+    fired). Scanning the FINAL text for real `pure elemental function`
+    signatures instead means this only ever acts on the authoritative,
+    already-confirmed answer.
+
+    Drops a directly-preceding `allocate(TARGET(size(...)))` line too
+    (Fortran auto-allocates an allocatable array on assignment from a
+    conformable RHS shape) when it's still exactly where the loop-
+    rewrite pass originally put it -- a narrow, few-line lookback,
+    declining rather than guessing if anything unexpected shifted it
+    and leaving a harmless, merely redundant allocate behind.
+    """
+    elem_fn_re = re.compile(r"^\s*pure\s+elemental\s+function\s+(\w+)\s*\(", re.IGNORECASE)
+    elemental_fns = set()
+    for ln in lines:
+        m = elem_fn_re.match(ln.split("!", 1)[0])
+        if m:
+            elemental_fns.add(m.group(1).lower())
+    if not elemental_fns:
+        return lines
+
+    _SAFE_CAST_BUILTINS = {"float", "int", "bool", "str"}
+
+    def _string_mask(code):
+        mask = [False] * len(code)
+        in_single = in_double = False
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if ch == "'" and not in_double:
+                mask[i] = True
+                if in_single and i + 1 < n and code[i + 1] == "'":
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                mask[i] = True
+                if in_double and i + 1 < n and code[i + 1] == '"':
+                    mask[i + 1] = True
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                mask[i] = True
+            i += 1
+        return mask
+
+    def _enclosing_calls_all_safe(text, mask, match_start):
+        stack = []
+        i = 0
+        while i < match_start:
+            if not mask[i]:
+                if text[i] == "(":
+                    j = i - 1
+                    while j >= 0 and text[j] in " \t":
+                        j -= 1
+                    k = j
+                    while k >= 0 and (text[k].isalnum() or text[k] == "_"):
+                        k -= 1
+                    fname = text[k + 1 : j + 1]
+                    stack.append(fname.lower() if fname else None)
+                elif text[i] == ")":
+                    if stack:
+                        stack.pop()
+            i += 1
+        if not stack:
+            return False
+        for fname in stack:
+            if fname is None or (fname not in elemental_fns and fname not in _SAFE_CAST_BUILTINS):
+                return False
+        return True
+
+    def _substitute_if_vectorizable(rhs, src, iv):
+        mask = _string_mask(rhs)
+        occ_re = re.compile(rf"\b{re.escape(src)}\(\s*{re.escape(iv)}\s*\)")
+        positions = [m.start() for m in occ_re.finditer(rhs) if not mask[m.start()]]
+        if not positions:
+            return None
+        for pos in positions:
+            if not _enclosing_calls_all_safe(rhs, mask, pos):
+                return None
+        return occ_re.sub(src, rhs)
+
+    def _ends_continued(ln):
+        return ln.split("!", 1)[0].rstrip("\r\n").rstrip().endswith("&")
+
+    def _join_stmt(ls, k0):
+        parts = []
+        k = k0
+        n_ls = len(ls)
+        while True:
+            code = ls[k].split("!", 1)[0].rstrip("\r\n").strip()
+            if k > k0 and code.startswith("&"):
+                code = code[1:].strip()
+            cont = code.endswith("&")
+            if cont:
+                code = code[:-1].rstrip()
+            parts.append(code)
+            if not cont or k + 1 >= n_ls:
+                break
+            k += 1
+        return " ".join(p for p in parts if p), k
+
+    def _line_eol(ln):
+        return "\r\n" if ln.endswith("\r\n") else ("\n" if ln.endswith("\n") else "")
+
+    block_re = re.compile(r"^(\s*)block\s*$", re.IGNORECASE)
+    iv_decl_re = re.compile(r"^\s*integer\s*::\s*(\w+)\s*$", re.IGNORECASE)
+    do_re = re.compile(r"^\s*do\s+(\w+)\s*=\s*1\s*,\s*size\(\s*(\w+)\s*\)\s*$", re.IGNORECASE)
+    end_do_re = re.compile(r"^\s*end\s*do\s*$", re.IGNORECASE)
+    end_block_re = re.compile(r"^\s*end\s*block\s*$", re.IGNORECASE)
+    assign_re = re.compile(r"^\s*(\w+)\(\s*(\w+)\s*\)\s*=\s*(.*)$")
+
+    out = list(lines)
+    n = len(out)
+    i = 0
+    while i < n:
+        mb = block_re.match(out[i].split("!", 1)[0].rstrip("\r\n"))
+        if not mb or i + 4 >= n:
+            i += 1
+            continue
+        indent = mb.group(1)
+        mi = iv_decl_re.match(out[i + 1].split("!", 1)[0])
+        if not mi:
+            i += 1
+            continue
+        iv = mi.group(1)
+        mdo = do_re.match(out[i + 2].split("!", 1)[0])
+        if not mdo or mdo.group(1) != iv:
+            i += 1
+            continue
+        src = mdo.group(2)
+        stmt, last_k = _join_stmt(out, i + 3)
+        if (
+            last_k + 2 >= n
+            or not end_do_re.match(out[last_k + 1].split("!", 1)[0])
+            or not end_block_re.match(out[last_k + 2].split("!", 1)[0])
+        ):
+            i += 1
+            continue
+        ma = assign_re.match(stmt)
+        if not ma or ma.group(1).lower() == src.lower() or ma.group(2) != iv:
+            i += 1
+            continue
+        target = ma.group(1)
+        new_rhs = _substitute_if_vectorizable(ma.group(3), src, iv)
+        if new_rhs is None:
+            i += 1
+            continue
+        alloc_re = re.compile(rf"^\s*allocate\({re.escape(target)}\(size\(")
+        for bi in range(i - 1, max(-1, i - 4), -1):
+            if out[bi] is None:
+                continue
+            if alloc_re.match(out[bi].split("!", 1)[0]):
+                out[bi] = None
+                break
+            if out[bi].split("!", 1)[0].strip():
+                break
+        eol = _line_eol(out[last_k + 2])
+        out[i] = f"{indent}{target} = {new_rhs}{eol}"
+        for t in range(i + 1, last_k + 3):
+            out[t] = None
+        i = last_k + 3
+    return [ln for ln in out if ln is not None]
 
 
 def fuse_bare_copy_into_next_self_referential_assignment(lines):
@@ -3121,7 +3694,31 @@ def rewrite_listcomp_array_assign_calls_to_loop(tree):
             return True
         return False
 
+    # Collect every identifier already spelled out anywhere in the source
+    # tree, so a synthesized loop-index name can never collide with a
+    # real user variable/function/class name it lands next to once
+    # spliced back in -- short, generic names like "idx_1" are far more
+    # plausible real user names than the old line-number-qualified
+    # scheme was, so this check earns its keep here in a way it didn't
+    # before.
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
     counter = [0]
+
+    def _next_idx_name():
+        while True:
+            counter[0] += 1
+            cand = f"idx_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
 
     class _Rewriter(ast.NodeTransformer):
         def visit_Assign(self, node):
@@ -3146,8 +3743,7 @@ def rewrite_listcomp_array_assign_calls_to_loop(tree):
                 return node
             if not _needs_loop(lc.elt, gen.target.id):
                 return node
-            counter[0] += 1
-            idx_name = f"lc_idx_{node.lineno}_{counter[0]}"
+            idx_name = _next_idx_name()
             t_name = node.targets[0].id
             alloc_stmt = ast.Assign(
                 targets=[ast.Name(id=t_name, ctx=ast.Store())],
@@ -3173,6 +3769,17 @@ def rewrite_listcomp_array_assign_calls_to_loop(tree):
                 body=[assign_elem],
                 orelse=[],
             )
+            # Marks this loop as safe to fully fuse away its own idx/val
+            # loop variables at emission time (see
+            # translator.visit_For's `_synth_single_assign_loop` check):
+            # both names are entirely internal to this synthesized loop
+            # -- idx_name never existed in the user's source at all, and
+            # gen.target is a list-comprehension loop variable, which
+            # (unlike an ordinary for-loop's target) has its OWN scope in
+            # real Python and can never be read after the comprehension
+            # ends -- so neither name can possibly be referenced anywhere
+            # outside this exact loop body.
+            for_stmt._synth_single_assign_loop = True
             for new_node in (alloc_stmt, assign_elem, for_stmt):
                 ast.copy_location(new_node, node)
             ast.fix_missing_locations(alloc_stmt)
@@ -3559,12 +4166,70 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
                 return "real"
         return "real"
 
+    _compound_stmt_types = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)
+
+    def _compound_head_exprs(stmt):
+        # The sub-expressions a compound statement evaluates itself,
+        # BEFORE choosing a branch/iteration -- excludes its nested body/
+        # orelse/finalbody/handler blocks entirely, since those are each
+        # handled by their OWN separate recursive _rebuild_stmts call
+        # below. Checking the whole compound statement (including its
+        # nested blocks) for "used_here", as an earlier version of this
+        # rewrite did, meant a callback used only deep inside an `if`'s
+        # body got a snapshot inserted BOTH right before that inner
+        # statement (correct, most specific) AND, redundantly, right
+        # before the whole enclosing `if` (same value, since nothing
+        # rebinds it in between) -- two identical `global ...; closure_
+        # ... = ...` snapshots for one call site.
+        if isinstance(stmt, (ast.If, ast.While)):
+            return [stmt.test]
+        if isinstance(stmt, (ast.For, ast.AsyncFor)):
+            return [stmt.iter]
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            return [item.context_expr for item in stmt.items]
+        return []  # ast.Try has no head expression of its own.
+
+    def _stmt_store_names(stmt):
+        # Names a LEAF (non-compound) statement assigns to -- used only to
+        # invalidate a tracked "already snapshotted" closure var if this
+        # statement happens to reassign its source. Compound statements
+        # are handled separately (see below): their possible nested
+        # assignments aren't worth resolving precisely, so `fresh` is
+        # just cleared wholesale before recursing into one.
+        names = set()
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
+            targets = [stmt.target]
+        else:
+            return names
+        for t in targets:
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    names.add(n.id)
+        return names
+
     def _rebuild_stmts(stmts, hoisted_names, defs_by_name, enclosing_name):
         out = []
+        # gname -> fv for a snapshot already emitted, earlier in THIS
+        # straight-line block, that's still known up to date (nothing
+        # since has reassigned fv) -- lets a second call site right after
+        # the first, needing the SAME unchanged closure variable (e.g.
+        # f_right's and f_left's calls, both closing over piecewise_
+        # breakpoints_straddle's own "delta0"), skip re-emitting an
+        # identical, redundant `global ...; closure_... = ...` snapshot.
+        fresh = {}
         for stmt in stmts:
             if isinstance(stmt, ast.FunctionDef) and stmt.name in hoisted_names:
                 continue
-            used_here = [nm for nm in hoisted_names if _is_used_as_value(nm, [stmt])]
+            if isinstance(stmt, _compound_stmt_types):
+                used_here = [
+                    nm
+                    for nm in hoisted_names
+                    if any(_is_used_as_value(nm, [h]) for h in _compound_head_exprs(stmt))
+                ]
+            else:
+                used_here = [nm for nm in hoisted_names if _is_used_as_value(nm, [stmt])]
             if used_here:
                 targets = []
                 for nm in used_here:
@@ -3574,6 +4239,7 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
                         pair = (gname, fv)
                         if pair not in targets:
                             targets.append(pair)
+                targets = [(g, f) for g, f in targets if fresh.get(g) != f]
                 if targets:
                     g_stmt = ast.Global(names=[t[0] for t in targets])
                     ast.copy_location(g_stmt, stmt)
@@ -3585,6 +4251,17 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
                         )
                         ast.copy_location(assign, stmt)
                         out.append(assign)
+                        fresh[gname] = fv
+            if isinstance(stmt, _compound_stmt_types):
+                # A nested block could reassign anything -- not worth
+                # resolving precisely; just drop every tracked snapshot
+                # rather than risk treating a stale one as still fresh.
+                fresh.clear()
+            else:
+                reassigned = _stmt_store_names(stmt)
+                if reassigned:
+                    for gname in [g for g, f in fresh.items() if f in reassigned]:
+                        del fresh[gname]
             for field in ("body", "orelse", "finalbody"):
                 child = getattr(stmt, field, None)
                 if isinstance(child, list):
@@ -3642,6 +4319,7 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
         enclosing_name = stmt.name
         hoisted_defs = []
         init_stmts = []
+        seeded_closure_names = set()
         for name, (def_node, free) in defs_by_name.items():
             rename_map = {fv: f"closure_{enclosing_name}_{fv}" for fv in free}
 
@@ -3657,10 +4335,19 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
             hoisted_defs.append(new_def)
 
             for fv in free:
+                # Two hoisted defs from the SAME enclosing function (e.g.
+                # f_right/f_left both closing over piecewise_breakpoints_
+                # straddle's own "delta0") share one closure_..._delta0
+                # global -- seed it only once, not once per def that
+                # happens to reference it.
+                closure_name = rename_map[fv]
+                if closure_name in seeded_closure_names:
+                    continue
+                seeded_closure_names.add(closure_name)
                 kind = _guess_kind(fv, stmt)
                 init_val = ast.Constant(value=0 if kind == "int" else 0.0)
                 init_stmt = ast.Assign(
-                    targets=[ast.Name(id=rename_map[fv], ctx=ast.Store())],
+                    targets=[ast.Name(id=closure_name, ctx=ast.Store())],
                     value=init_val,
                 )
                 ast.copy_location(init_stmt, stmt)
@@ -8225,21 +8912,30 @@ def mark_recursive_procedures(lines):
 
 
 def reorder_arg_decls_before_locals(lines):
-    """Group dummy-argument declarations (those with `intent(...)`) before
-    local-variable declarations within each procedure's declaration
-    section, e.g. so `_opt` locals materialized for optional arguments
-    don't end up sandwiched between the intent(in) and intent(out) groups.
+    """Group dummy-argument declarations (those with `intent(...)`, or a
+    dummy PROCEDURE argument's `procedure(iface) :: name`) before local-
+    variable declarations within each procedure's declaration section,
+    e.g. so `_opt` locals materialized for optional arguments don't end
+    up sandwiched between the intent(in) and intent(out) groups. A
+    function's own `result(...)` variable is grouped right after the
+    dummy arguments and before ordinary locals too -- it's conceptually
+    part of the signature, not a working variable.
 
     `use` statements and named-constant (`parameter`) declarations keep
     their existing relative order ahead of everything else: an argument's
     shape expression can reference a parameter (e.g. `x(n)` with
     `integer, parameter :: n = ...`), and Fortran requires that parameter
     to be declared first, so parameters are never reordered past argument
-    or local declarations -- only args and locals are separated from each
-    other. A standalone comment/blank run is kept attached to whichever
-    declaration follows it (or, if nothing follows, stays put at the end
-    of the declaration section), so a docstring right after the signature
-    -- which precedes the first `use`/declaration entirely -- is untouched.
+    or local declarations -- only args, the result variable, and locals
+    are separated from each other. A standalone comment/blank run is kept
+    attached to whichever declaration follows it (or, if nothing follows,
+    stays put at the end of the declaration section), so a docstring
+    right after the signature -- which precedes the first `use`/
+    declaration entirely -- is untouched. A callback dummy argument's own
+    abstract interface block (`interface / function foo_cb_if(x) result
+    (r) ... end interface`) is likewise kept attached to whichever
+    declaration follows it (its own `procedure(foo_cb_if) :: f`), so the
+    two can never be separated by this reordering.
     """
     unit_start_re = re.compile(
         r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
@@ -8254,9 +8950,16 @@ def reorder_arg_decls_before_locals(lines):
     use_re = re.compile(r"^\s*use\b", re.IGNORECASE)
     param_re = re.compile(r"^\s*[^:!]*\bparameter\b", re.IGNORECASE)
     intent_re = re.compile(r"\bintent\s*\(", re.IGNORECASE)
+    proc_dummy_re = re.compile(r"^\s*procedure\s*\([^)]*\)\s*(?:,|::)", re.IGNORECASE)
+    interface_start_re = re.compile(r"^\s*(?:abstract\s+)?interface\b", re.IGNORECASE)
+    interface_end_re = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
+    result_name_re = re.compile(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", re.IGNORECASE)
 
     def _ends_continued(ln):
         return ln.rstrip("\r\n").rstrip().endswith("&")
+
+    def _is_pointer_decl(code):
+        return bool(re.search(r"\bpointer\b", code, re.IGNORECASE))
 
     out = []
     i = 0
@@ -8270,7 +8973,19 @@ def reorder_arg_decls_before_locals(lines):
         while sig_end < n and _ends_continued(lines[sig_end - 1]):
             sig_end += 1
         j = sig_end
-        while j < n and not unit_end_re.match(lines[j].split("!", 1)[0]):
+        # A callback dummy argument's own abstract interface can contain
+        # its own `end function`/`end subroutine` line (the interface's
+        # own signature's end) -- track interface nesting so THAT one is
+        # never mistaken for the enclosing procedure's own end.
+        _iface_depth = 0
+        while j < n:
+            _jcode = lines[j].split("!", 1)[0]
+            if interface_start_re.match(_jcode):
+                _iface_depth += 1
+            elif interface_end_re.match(_jcode):
+                _iface_depth = max(0, _iface_depth - 1)
+            elif _iface_depth == 0 and unit_end_re.match(_jcode):
+                break
             j += 1
         end = min(j + 1, n)
 
@@ -8283,6 +8998,17 @@ def reorder_arg_decls_before_locals(lines):
             if not code:
                 m += 1
                 continue
+            if interface_start_re.match(code):
+                # Still part of the declaration section -- walk straight
+                # past the whole block rather than treating "interface"
+                # as the first non-declaration statement and stopping.
+                m += 1
+                while m < len(body) and not interface_end_re.match(body[m].split("!", 1)[0].strip()):
+                    m += 1
+                if m < len(body):
+                    m += 1
+                decl_end = m
+                continue
             if not declish_re.match(code):
                 break
             m += 1
@@ -8290,6 +9016,10 @@ def reorder_arg_decls_before_locals(lines):
                 m += 1
             decl_end = m
         decl_lines = body[:decl_end]
+
+        sig_text = " ".join(ln.split("!", 1)[0] for ln in lines[i:sig_end])
+        result_m = result_name_re.search(sig_text)
+        result_name = result_m.group(1) if result_m else None
 
         records = []
         prefix = []
@@ -8300,6 +9030,21 @@ def reorder_arg_decls_before_locals(lines):
                 prefix.append(decl_lines[idx])
                 idx += 1
                 continue
+            if interface_start_re.match(code):
+                # Keep the whole interface block attached as part of the
+                # NEXT statement's prefix (the same mechanism a blank/
+                # comment run already uses) -- typically its own
+                # `procedure(foo_cb_if) :: f` declaration -- so the two
+                # always travel, and get classified, together.
+                prefix.append(decl_lines[idx])
+                idx += 1
+                while idx < len(decl_lines):
+                    prefix.append(decl_lines[idx])
+                    done = interface_end_re.match(decl_lines[idx].split("!", 1)[0].strip())
+                    idx += 1
+                    if done:
+                        break
+                continue
             stmt = [decl_lines[idx]]
             while _ends_continued(decl_lines[idx]) and idx + 1 < len(decl_lines):
                 idx += 1
@@ -8309,20 +9054,31 @@ def reorder_arg_decls_before_locals(lines):
             idx += 1
         trailing_prefix = prefix
 
-        use_group, param_group, arg_group, local_group = [], [], [], []
+        use_group, param_group, arg_group, result_group, local_group = [], [], [], [], []
         for rec_prefix, stmt, code in records:
+            entity_names = re.split(r"\s*::\s*", code, maxsplit=1)
+            is_result = (
+                result_name is not None
+                and len(entity_names) == 2
+                and any(
+                    e.split("(", 1)[0].strip().lower() == result_name.lower()
+                    for e in fpurity.split_top_level_commas(entity_names[1])
+                )
+            )
             if use_re.match(code):
                 bucket = use_group
             elif param_re.match(code):
                 bucket = param_group
-            elif intent_re.search(code):
+            elif is_result:
+                bucket = result_group
+            elif intent_re.search(code) or (proc_dummy_re.match(code) and not _is_pointer_decl(code)):
                 bucket = arg_group
             else:
                 bucket = local_group
             bucket.extend(rec_prefix)
             bucket.extend(stmt)
 
-        new_decl_lines = use_group + param_group + arg_group + local_group + trailing_prefix
+        new_decl_lines = use_group + param_group + arg_group + result_group + local_group + trailing_prefix
         out.extend(lines[i:sig_end])
         out.extend(new_decl_lines)
         out.extend(body[decl_end:])
@@ -8381,6 +9137,8 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
         r"^\s*(?:use\b|implicit\b|integer\b|real\b|logical\b|character\b|complex\b|type\b|class\b|procedure\b|save\b|parameter\b|external\b|intrinsic\b|common\b|equivalence\b|dimension\b)",
         re.IGNORECASE,
     )
+    interface_start_re = re.compile(r"^\s*(?:abstract\s+)?interface\b", re.IGNORECASE)
+    interface_end_re = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
     # Non-greedy `.+?` (not `[^:]+?`) so a spec containing its own colon,
     # e.g. `character(len=:), allocatable`, still matches correctly --
     # the pattern still finds the true `::` delimiter, since non-greedy
@@ -8484,6 +9242,28 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
                 records.append(("keep", [ln]))
                 idx += 1
                 continue
+            if interface_start_re.match(code_only.strip()):
+                # An abstract-interface block is a self-contained,
+                # nested declaration scope -- its own dummy-argument
+                # declarations (e.g. `real(kind=dp), intent(in) :: x`
+                # inside a callback's interface) must never be parsed as
+                # candidates here, even if their type-spec text happens
+                # to match something in the OUTER function's own decl
+                # section (they're unrelated: merging them would put a
+                # nested interface's dummy on the same line as one of
+                # this function's own locals). Keep the whole block --
+                # from "interface" through its matching "end interface"
+                # -- as one opaque, unparsed, position-preserving unit.
+                iface_lines = [ln]
+                idx += 1
+                while idx < n_decl:
+                    iln = decl_lines[idx]
+                    iface_lines.append(iln)
+                    idx += 1
+                    if interface_end_re.match(iln.rstrip("\r\n").partition("!")[0].strip()):
+                        break
+                records.append(("keep", iface_lines))
+                continue
             stmt_lines = [ln]
             while _ends_continued(ln) and idx + 1 < n_decl:
                 idx += 1
@@ -8568,7 +9348,21 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
         while sig_end < n and _ends_continued(lines[sig_end - 1]):
             sig_end += 1
         j = sig_end
-        while j < n and not unit_end_re.match(lines[j].split("!", 1)[0]):
+        # A callback dummy argument's own abstract interface can contain
+        # its own `end function`/`end subroutine` line (the interface's
+        # own signature's end) -- track interface nesting so THAT one is
+        # never mistaken for the enclosing procedure's own end, which
+        # would truncate its body (and this whole pass's view of it) at
+        # the interface block instead of the procedure's real end.
+        _iface_depth = 0
+        while j < n:
+            _jcode = lines[j].split("!", 1)[0]
+            if interface_start_re.match(_jcode):
+                _iface_depth += 1
+            elif interface_end_re.match(_jcode):
+                _iface_depth = max(0, _iface_depth - 1)
+            elif _iface_depth == 0 and unit_end_re.match(_jcode):
+                break
             j += 1
         end = min(j + 1, n)
 
@@ -8579,6 +9373,28 @@ def coalesce_nonadjacent_declarations(lines, max_len=10**9):
             code = body[m].split("!", 1)[0].strip()
             if not code:
                 m += 1
+                continue
+            if interface_start_re.match(code):
+                # A callback dummy argument's own abstract interface
+                # block (e.g. `interface / function foo_cb_if(x) result
+                # (r) ... end function foo_cb_if / end interface`,
+                # immediately followed by its own `procedure(foo_cb_if)
+                # :: f` declaration) is still part of the declaration
+                # section -- walk straight past it (never breaking the
+                # scan here) rather than treating its opening keyword as
+                # the first non-declaration statement and stopping dead,
+                # which silently left EVERY declaration after it (the
+                # procedure's own locals) untouched by coalescing.
+                # _coalesce_section separately keeps the interface
+                # block's own internal lines out of the merge groups
+                # entirely (never parses them as candidates), so nothing
+                # inside it can be mixed into an outer declaration.
+                m += 1
+                while m < len(body) and not interface_end_re.match(body[m].split("!", 1)[0].strip()):
+                    m += 1
+                if m < len(body):
+                    m += 1
+                decl_end = m
                 continue
             if not declish_re.match(code):
                 break
@@ -8820,10 +9636,25 @@ def remove_redundant_first_guarded_deallocate(lines):
         call, so it can never observe a prior allocation from an earlier
         pass through this same statement regardless of what unrelated
         code ran first.
+
+    x may also be a derived-type component (`df%values`), e.g. a freshly
+    built DataFrame's own `df%values`/`df%index` allocation -- same
+    reasoning, since the FIRST allocation of a NEWLY constructed local's
+    component is exactly as provably-unallocated as a bare local. The
+    "has x appeared in prior executable statements" check below still
+    only looks for the exact compound name (`df%values`), which alone
+    would miss a WHOLE-VARIABLE reassignment of the base (`df =
+    some_other_df`) that could have copied in an already-allocated
+    component from elsewhere -- so for a component name specifically,
+    prior use ALSO counts a bare `df = ...` (base name directly followed
+    by `=`, not `==`) assignment anywhere earlier, while deliberately NOT
+    counting a reference to a DIFFERENT component of the same base
+    (`df%columns = ...`), which can't affect df%values's own allocation
+    status.
     """
     out = list(lines)
     re_guard = re.compile(
-        r"^\s*if\s*\(\s*allocated\s*\(\s*([a-z_]\w*)\s*\)\s*\)\s*deallocate\s*\(\s*\1\s*\)\s*$",
+        r"^\s*if\s*\(\s*allocated\s*\(\s*([a-z_]\w*(?:%[a-z_]\w*)*)\s*\)\s*\)\s*deallocate\s*\(\s*\1\s*\)\s*$",
         re.IGNORECASE,
     )
     re_alloc_start = re.compile(r"^\s*allocate\(", re.IGNORECASE)
@@ -8856,7 +9687,7 @@ def remove_redundant_first_guarded_deallocate(lines):
         if close_idx < 0 or code[close_idx + 1 :].strip() != "":
             return None
         inner = code[open_idx + 1 : close_idx].strip()
-        mname = re.match(r"^([a-z_]\w*)\s*\(", inner, re.IGNORECASE)
+        mname = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*\(", inner, re.IGNORECASE)
         if not mname:
             return None
         name_close = _find_matching_rparen(inner, mname.end() - 1)
@@ -8907,6 +9738,17 @@ def remove_redundant_first_guarded_deallocate(lines):
         saw_exec_before_guard = False
         is_intent_out_alloc = False
         tok_re = re.compile(rf"\b{re.escape(var)}\b", re.IGNORECASE)
+        # For a derived-type component (`df%values`), the exact-token
+        # check above would miss a WHOLE-VARIABLE reassignment of the
+        # base (`df = some_other_df`) that could have copied in an
+        # already-allocated component from elsewhere -- so also treat a
+        # bare `df =` (not `==`) anywhere earlier as prior use. A
+        # reference to a DIFFERENT component of the same base
+        # (`df%columns = ...`) deliberately does NOT count: it can't
+        # affect df%values's own allocation status.
+        base_reassign_re = None
+        if "%" in var:
+            base_reassign_re = re.compile(rf"\b{re.escape(var.split('%', 1)[0])}\s*=(?!=)", re.IGNORECASE)
         k0 = 0
         for k in range(i - 1, -1, -1):
             ck0 = out[k].split("!", 1)[0].strip()
@@ -8945,7 +9787,7 @@ def remove_redundant_first_guarded_deallocate(lines):
                             is_intent_out_alloc = True
                 continue
             saw_exec_before_guard = True
-            if tok_re.search(stmt):
+            if tok_re.search(stmt) or (base_reassign_re and base_reassign_re.search(stmt)):
                 prior_use = True
                 break
 
@@ -8964,6 +9806,93 @@ def remove_redundant_first_guarded_deallocate(lines):
             # do not advance i; next line shifts into current slot
             continue
         i += 1
+    return out
+
+
+def combine_consecutive_single_entity_allocates(lines):
+    """Combine a run of 2+ consecutive, otherwise-untouched
+    `allocate(NAME(dims))` statements -- each allocating exactly one
+    object with a shape spec and nothing else (no stat=/source=/mold=/
+    errmsg= or other keyword arguments, which apply to the WHOLE
+    allocate statement and can't be silently merged if they'd otherwise
+    differ) -- into a single `allocate(NAME1(dims1), NAME2(dims2), ...)`
+    statement. Fortran's ALLOCATE statement already accepts any number
+    of comma-separated allocate-objects in one go, executing identically
+    to the same objects allocated one at a time in order -- this is
+    purely a textual fusion, e.g. (user-reported real example, a freshly
+    built DataFrame's own component allocations):
+
+        allocate(df%values(size(df_S), 6))
+        allocate(df%index(size(df_S)))
+
+    becomes
+
+        allocate(df%values(size(df_S), 6), df%index(size(df_S)))
+
+    Declines to merge across a blank line, a comment-only line, or a
+    trailing inline comment on either allocate statement (which would
+    otherwise be silently discarded) -- only genuinely adjacent,
+    unannotated allocate statements qualify, and a chain stops the
+    moment either condition breaks it.
+    """
+    def _find_matching_rparen(s, lparen_idx):
+        depth = 0
+        i = lparen_idx
+        while i < len(s):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    alloc_start_re = re.compile(r"^(\s*)allocate\(", re.IGNORECASE)
+
+    def _single_entity_inner(line):
+        if "!" in line:
+            return None, None
+        m0 = alloc_start_re.match(line.rstrip("\r\n"))
+        if not m0:
+            return None, None
+        code = line.rstrip("\r\n")
+        open_idx = len(m0.group(0)) - 1
+        close_idx = _find_matching_rparen(code, open_idx)
+        if close_idx < 0 or code[close_idx + 1:].strip() != "":
+            return None, None
+        inner = code[open_idx + 1 : close_idx].strip()
+        mname = re.match(r"^[a-z_]\w*(?:%[a-z_]\w*)*\s*\(", inner, re.IGNORECASE)
+        if not mname:
+            return None, None
+        name_close = _find_matching_rparen(inner, mname.end() - 1)
+        if name_close < 0 or inner[name_close + 1:].strip() != "":
+            return None, None
+        return m0.group(1), inner
+
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        indent0, inner0 = _single_entity_inner(lines[i])
+        if inner0 is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        parts = [inner0]
+        j = i + 1
+        while j < n and lines[j].strip():
+            _, inner_j = _single_entity_inner(lines[j])
+            if inner_j is None:
+                break
+            parts.append(inner_j)
+            j += 1
+        if len(parts) >= 2:
+            out.append(f"{indent0}allocate({', '.join(parts)})")
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
     return out
 
 
@@ -10071,7 +11000,7 @@ def detect_needed_helpers(tree):
     math_aliases, math_func_aliases = collect_math_aliases(tree)
     np_helper_map = {
         "arange": {"arange_int"},
-        "linspace": {"arange_int"},
+        "linspace": {"linspace"},
         "logspace": {"logspace"},
         "geomspace": {"geomspace"},
         "cumsum": {"cumsum"},
@@ -18464,6 +19393,64 @@ class translator(ast.NodeVisitor):
     def _real_decl_type(self, name, alloc=None):
         return "real(kind=sp)" if self._real_kind_for_name(name, alloc=alloc) == "real32" else "real(kind=dp)"
 
+    def _fresh_scoped_names(self, *bases):
+        """Pick short, human-readable names for one or more synthesized
+        block-local variables at once (e.g. a do-loop counter, or a
+        nested loop's outer/inner counter pair), guaranteed to avoid
+        every name already known in the CURRENT procedure scope --
+        every kind of variable/allocatable-array/named-constant this
+        translator tracks -- so a plain block-local `i` can never
+        silently collide with a same-named variable "imported" into the
+        block from the enclosing procedure via host association.
+        Case-insensitive (Fortran identifiers are; this project has its
+        own known bug class around a case-only collision reading back
+        as zero, so this deliberately doesn't repeat that mistake here).
+
+        Each `base` (e.g. "i", "j") is tried as-is first, then
+        "{base}_1", "{base}_2", ...; multiple bases passed in the same
+        call are resolved together so, e.g., a nested loop's outer and
+        inner counters never land on the same name as each other, even
+        if both would otherwise individually be free. Returns a single
+        string for one base, or a list for multiple.
+
+        The name returned here is NOT itself fed back into self.ints/
+        self.reals/etc. by this method -- a caller that wraps its own
+        `block ... end block` around the picked name (with its own
+        explicit inline declaration inside that block, as every current
+        caller does) must NOT separately call _mark_int/_mark_real/etc.
+        on it either: a `block` construct is its OWN Fortran scoping
+        unit, so the SAME picked name (e.g. plain `i`) is correctly
+        reused, collision-free, by every other block-local loop in the
+        same procedure -- sibling OR nested, since a `do i = ...`
+        loop's control variable resolves lexically to whatever `i` is
+        in scope at that exact statement, unaffected by any OTHER
+        block's own separate `i`. Registering the pick into self.ints
+        would incorrectly treat it as a persistent, procedure-wide name
+        and needlessly force every later block to fall back to `i_1`,
+        `i_2`, ... instead of each independently getting plain `i`.
+        (A caller that does NOT wrap the picked name in its own block --
+        i.e. a genuine procedure-scope loop variable with no inline
+        declaration of its own -- still needs to mark it explicitly, the
+        same as any other real local.)
+        """
+        taken = set()
+        for coll in (
+            self.ints, self.reals, self.complexes, self.logs, self.chars,
+            self.alloc_ints, self.alloc_reals, self.alloc_logs, self.alloc_chars,
+            self.alloc_complexes, self.dict_typed_vars, self.params,
+        ):
+            taken.update(str(x).lower() for x in coll)
+        picked = []
+        for base in bases:
+            cand = base
+            n = 1
+            while cand.lower() in taken:
+                cand = f"{base}_{n}"
+                n += 1
+            taken.add(cand.lower())
+            picked.append(cand)
+        return picked[0] if len(picked) == 1 else picked
+
     def _mark_int(self, name):
         if name == "_":
             return
@@ -26261,7 +27248,7 @@ class translator(ast.NodeVisitor):
             # comparisons (see _pandas_df_compare_spec's codegen).
             _l_real = self._expr_kind(node.left) == "real"
             _r_real = self._expr_kind(node.comparators[0]) == "real"
-            if _l_real or _r_real:
+            if NAN_SAFE_COMPARISONS and (_l_real or _r_real):
                 # A literal numeric constant (e.g. the `0.0` in `s2 <=
                 # 0.0`) can never be NaN, so it needs no ieee_is_nan guard
                 # of its own -- skip it entirely on that side rather than
@@ -30237,45 +31224,13 @@ class translator(ast.NodeVisitor):
                     stop_node = node.args[1]
                     num = self.expr(node.args[2])
                     num_i = num if self._expr_kind(node.args[2]) == "int" else f"int({num})"
-                    ramp = (
-                        f"real(arange_int(0, {num_i}, 1), kind=dp) / "
-                        f"real(max(1, {num_i} - 1), kind=dp)"
-                    )
-
-                    def _const_float(n):
-                        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
-                            return float(n.value)
-                        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
-                            if isinstance(n.operand, ast.Constant) and isinstance(n.operand.value, (int, float)) and not isinstance(n.operand.value, bool):
-                                sign = -1.0 if isinstance(n.op, ast.USub) else 1.0
-                                return sign * float(n.operand.value)
-                        return None
-
-                    start_val = _const_float(start_node)
-                    stop_val = _const_float(stop_node)
-                    if start_val is not None and stop_val is not None:
-                        # linspace(start, stop, num) with literal endpoints --
-                        # fold the "start + (stop - start) * ..." formula's
-                        # trivial identity terms (e.g. linspace(0.0, 1.0, n)
-                        # has start=0, coefficient=1) instead of always
-                        # emitting the general form.
-                        coeff_val = stop_val - start_val
-                        term = ramp if coeff_val == 1.0 else f"({coeff_val!r}_dp * {ramp})"
-                        if start_val == 0.0:
-                            return f"({term})"
-                        return f"({start_val!r}_dp + {term})"
-
                     a0 = self.expr(start_node)
                     a1 = self.expr(stop_node)
-                    if start_val == 0.0:
-                        # start is a literal 0 even though stop isn't
-                        # constant (e.g. linspace(0, n - 1, k)) -- drop
-                        # the "0 +" / "- 0" identity terms rather than
-                        # emitting them and relying on later constant-
-                        # folding passes, which don't fold across a
-                        # non-constant stop expression.
-                        return f"({a1} * {ramp})"
-                    return f"({a0} + ({a1} - {a0}) * {ramp})"
+                    if self._expr_kind(start_node) != "real":
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(stop_node) != "real":
+                        a1 = f"real({a1}, kind=dp)"
+                    return f"linspace({a0}, {a1}, {num_i})"
                 if node.func.attr == "logspace" and len(node.args) >= 2:
                     start = self.expr(node.args[0])
                     stop = self.expr(node.args[1])
@@ -37081,7 +38036,10 @@ class translator(ast.NodeVisitor):
                     )
                 ):
                     # tuple-target literal loop, e.g. for (i,j) in [(0,1), ...]
-                    self._mark_int(f"i_tup_{getattr(node, 'lineno', 0)}")
+                    # (the synthesized do-loop counter itself is emitted
+                    # self-contained inside its own `block`, with its own
+                    # inline declaration -- see visit_For -- so it needs
+                    # no top-of-procedure pre-declaration here)
                     iter_node = node.iter if isinstance(node.iter, (ast.List, ast.Tuple)) else self.tuple_loop_literals.get(node.iter.id)
                     if all(isinstance(t, ast.Name) for t in node.target.elts):
                         for j, tnm in enumerate(node.target.elts):
@@ -42675,19 +43633,28 @@ class translator(ast.NodeVisitor):
                 # 0.0 *before* the comparison ever runs (so the trap can
                 # never fire), then override the result to the correct
                 # constant wherever either original operand was NaN.
+                # Skippable via --no-nan-safe-compare (NAN_SAFE_COMPARISONS)
+                # for plain, idiomatic output -- the boolean-as-real
+                # merge(1.0_dp, 0.0_dp, ...) encoding itself always stays;
+                # only the extra NaN-safety wrapping around it is optional.
                 nan_result = "1.0_dp" if _cmp_spec["op"] is ast.NotEq else "0.0_dp"
                 def _nan_safe(expr_txt):
+                    if not NAN_SAFE_COMPARISONS:
+                        return expr_txt
                     return f"merge(0.0_dp, {expr_txt}, ieee_is_nan({expr_txt}))"
                 if _cmp_spec["kind"] == "df_df":
                     l_expr = self._aliased_name(_cmp_spec["left"])
                     r_expr = self._aliased_name(_cmp_spec["right"])
                     self.o.w(f"{name}%index = {l_expr}%index")
                     self.o.w(f"{name}%columns = {l_expr}%columns")
-                    self.o.w(
-                        f"{name}%values = merge({nan_result}, merge(1.0_dp, 0.0_dp, "
-                        f"{_nan_safe(f'{l_expr}%values')} {op_txt} {_nan_safe(f'{r_expr}%values')}), "
-                        f"ieee_is_nan({l_expr}%values) .or. ieee_is_nan({r_expr}%values))"
-                    )
+                    _cmp_txt = f"{_nan_safe(f'{l_expr}%values')} {op_txt} {_nan_safe(f'{r_expr}%values')}"
+                    if NAN_SAFE_COMPARISONS:
+                        self.o.w(
+                            f"{name}%values = merge({nan_result}, merge(1.0_dp, 0.0_dp, {_cmp_txt}), "
+                            f"ieee_is_nan({l_expr}%values) .or. ieee_is_nan({r_expr}%values))"
+                        )
+                    else:
+                        self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {_cmp_txt})")
                 else:
                     df_expr = self._aliased_name(_cmp_spec["df_id"])
                     scalar_txt = self._coerce_expr_kind(
@@ -42696,11 +43663,14 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{name}%index = {df_expr}%index")
                     self.o.w(f"{name}%columns = {df_expr}%columns")
                     _a, _b = (f"{df_expr}%values", scalar_txt) if _cmp_spec["df_left"] else (scalar_txt, f"{df_expr}%values")
-                    self.o.w(
-                        f"{name}%values = merge({nan_result}, merge(1.0_dp, 0.0_dp, "
-                        f"{_nan_safe(_a)} {op_txt} {_nan_safe(_b)}), "
-                        f"ieee_is_nan({df_expr}%values) .or. ieee_is_nan({scalar_txt}))"
-                    )
+                    _cmp_txt = f"{_nan_safe(_a)} {op_txt} {_nan_safe(_b)}"
+                    if NAN_SAFE_COMPARISONS:
+                        self.o.w(
+                            f"{name}%values = merge({nan_result}, merge(1.0_dp, 0.0_dp, {_cmp_txt}), "
+                            f"ieee_is_nan({df_expr}%values) .or. ieee_is_nan({scalar_txt}))"
+                        )
+                    else:
+                        self.o.w(f"{name}%values = merge(1.0_dp, 0.0_dp, {_cmp_txt})")
                 return
 
         # X = df.astype(float) -- a true no-op copy (see _pandas_df_astype_spec).
@@ -44970,10 +45940,37 @@ class translator(ast.NodeVisitor):
             while len(self.open_type_rebind_stack) > depth0:
                 self._close_one_type_rebind_block()
 
+        def _array_name_mutated_in_body(body, name):
+            # Conservative: catches a direct reassignment (`name = ...`,
+            # including via AugAssign/For/With/comprehension targets --
+            # all represented as an ast.Name in Store context) and an
+            # in-place element mutation (`name[...] = ...` or
+            # `name.attr[...] = ...`, an ast.Subscript in Store context
+            # whose base resolves back to `name`). Doesn't try to catch
+            # an in-place-mutating METHOD call (rare, and Python arrays/
+            # lists passed into this project are seldom mutated that
+            # way) -- a false negative there is the same class of risk
+            # the general codegen already accepts elsewhere, not
+            # something this narrow check needs to solve. A false
+            # POSITIVE (e.g. a nested comprehension that happens to
+            # reuse `name` as its own, genuinely separate, shadowed loop
+            # variable) only costs a missed optimization, never
+            # correctness.
+            for st in body:
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store):
+                        return True
+                    if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store):
+                        base = n.value
+                        while isinstance(base, (ast.Subscript, ast.Attribute)):
+                            base = base.value
+                        if isinstance(base, ast.Name) and base.id == name:
+                            return True
+            return False
+
         def _emit_for_over_rank1_iter(iter_node, target_name, idx_name=None, enum_start_txt=None):
             arr_expr = self.expr(iter_node)
-            iv = f"i_iter_{node.lineno}"
-            self._mark_int(iv)
+            iv = self._fresh_scoped_names("i")
             k = self._expr_kind(iter_node)
             split_iter = (
                 isinstance(iter_node, ast.Call)
@@ -44989,9 +45986,29 @@ class translator(ast.NodeVisitor):
                     comp_names_iter = list(self.dict_type_components.get(tnm_iter, {}).keys())
                     if not comp_names_iter:
                         comp_names_iter = [nm for nm, _ in self.structured_type_components.get(tnm_iter, [])]
+            # A bare `for x in ARR:`/`enumerate(ARR)` over a plain
+            # variable, never mutated anywhere in the loop body, needs
+            # no defensive copy at all -- ARR can be indexed directly,
+            # exactly as safe as any other read of it, since nothing in
+            # the loop can ever see something other than what ARR held
+            # when the loop began (user-reported: `S` is an intent(in)
+            # dummy argument here, never reassigned anywhere in the
+            # function, so materializing a whole separate `iter_tmp`
+            # copy of it is pure overhead). split_iter/tnm_iter still
+            # need their own materialization regardless (a `.split()`
+            # result and a derived-type array aren't "just" a variable).
+            elide_copy = (
+                tnm_iter is None
+                and not split_iter
+                and isinstance(iter_node, ast.Name)
+                and not _array_name_mutated_in_body(node.body, iter_node.id)
+            )
+            arr_ref = arr_expr if elide_copy else "iter_tmp"
             self.o.w("block")
             self.o.push()
-            if tnm_iter is not None:
+            if elide_copy:
+                pass
+            elif tnm_iter is not None:
                 self.o.w(f"type({tnm_iter}), allocatable :: iter_tmp(:)")
             elif k == "real":
                 self.o.w("real(kind=dp), allocatable :: iter_tmp(:)")
@@ -45004,22 +46021,61 @@ class translator(ast.NodeVisitor):
             else:
                 self.o.w("integer, allocatable :: iter_tmp(:)")
             self.o.w(f"integer :: {iv}")
-            if split_iter:
+            if elide_copy:
+                pass
+            elif split_iter:
                 self.o.w("type(strvec_t) :: iter_split_tmp")
                 self.o.w(f"iter_split_tmp = {arr_expr}")
                 self.o.w("iter_tmp = iter_split_tmp%v")
             else:
                 self.o.w(f"iter_tmp = {arr_expr}")
-            self.o.w(f"do {iv} = 1, size(iter_tmp)")
+            self.o.w(f"do {iv} = 1, size({arr_ref})")
             self.o.push()
-            if idx_name is not None and enum_start_txt is not None and idx_name != "_":
-                self._mark_int(idx_name)
-                self.o.w(f"{idx_name} = ({enum_start_txt}) + ({iv} - 1)")
-            if target_name != "_":
-                if tnm_iter is not None:
-                    self.dict_typed_vars[target_name] = tnm_iter
-                    self.dict_var_components[target_name] = list(comp_names_iter)
-                elif k == "real":
+            # Fully fuse away idx_name/target_name themselves when this
+            # loop came from the listcomp-array-assign rewrite (see
+            # rewrite_listcomp_array_assign_calls_to_loop) AND its whole
+            # body is still exactly the one `TARGET[idx_name] = ELT`
+            # statement that rewrite produces: idx_name = `(enum_start) +
+            # (iv - 1)` and target_name = `iter_tmp(iv)` are both single-
+            # use, read-only aliases with nothing left to compute except
+            # values already directly expressible in terms of `iv` --
+            # e.g. `idx_1 = 0 + (i - 1); Si = iter_tmp(i); pnl_exact(idx_1
+            # + 1) = f(Si)` collapses straight to `pnl_exact(i) =
+            # f(iter_tmp(i))` (user-reported real example, xdelta_gamma.py).
+            # Restricted to loops from that ONE rewrite pass -- never a
+            # general/hand-written `for idx, val in enumerate(arr):` --
+            # because idx_name there is genuinely synthetic (never existed
+            # in the user's source) and target_name is a list-comprehension
+            # loop variable, which (unlike an ordinary for-loop target) has
+            # its own scope in real Python and can't be read after the
+            # loop; neither guarantee holds for a loop the user wrote by
+            # hand, which might still reference either name afterward.
+            fused = False
+            if (
+                tnm_iter is None
+                and idx_name is not None and idx_name != "_" and enum_start_txt is not None
+                and target_name != "_"
+                and getattr(node, "_synth_single_assign_loop", False)
+                and len(node.body) == 1
+                and isinstance(node.body[0], ast.Assign)
+                and len(node.body[0].targets) == 1
+                and isinstance(node.body[0].targets[0], ast.Subscript)
+                and isinstance(node.body[0].targets[0].value, ast.Name)
+                and isinstance(node.body[0].targets[0].slice, ast.Name)
+                and node.body[0].targets[0].slice.id == idx_name
+            ):
+                # Still type-mark both names (needed for correct type
+                # inference/coercion while the statement below is visited
+                # normally) and still visit the statement through the
+                # NORMAL, fully-correct assignment codegen -- reusing it
+                # wholesale rather than hand-emitting the assignment
+                # ourselves means every other thing it does (RHS type
+                # coercion, NaN-safe-compare wrapping, subscript bounds
+                # handling, ...) still happens exactly as it would for
+                # any other assignment. Only afterward, text-substitute
+                # the bare idx_name/target_name tokens it emitted with
+                # their true values in terms of `iv`.
+                if k == "real":
                     self._mark_real(target_name)
                 elif k == "logical":
                     self._mark_log(target_name)
@@ -45029,8 +46085,67 @@ class translator(ast.NodeVisitor):
                     self._mark_char(target_name)
                 else:
                     self._mark_int(target_name)
-                self.o.w(f"{target_name} = iter_tmp({iv})")
-            _visit_loop_body_and_close_rebinds()
+                self._mark_int(idx_name)
+                _checkpoint = len(self.o.lines)
+                self.visit(node.body[0])
+                _val_repl = f"{arr_ref}({iv})"
+                # The subscript-target codegen just above always converts
+                # a bare Name index like idx_name into `idx_name + 1`
+                # (0-based Python -> 1-based Fortran); idx_name's own true
+                # 0-based value is `enum_start + (iv - 1)`, so the two
+                # ALWAYS combine to exactly `enum_start + iv`. Folding
+                # that shape directly, before the generic substitution
+                # below, avoids relying on the later whole-file
+                # arithmetic-simplification passes to fold a longer,
+                # already-parenthesized chain they were never designed to
+                # fully collapse (confirmed by trying the generic-only
+                # substitution first: it left behind an unsimplified
+                # `0 + i - 1 + 1` once those passes stripped ITS
+                # redundant parens without going the rest of the way).
+                # A literal "0" start (by far the common case -- plain
+                # `enumerate(x)`, never `enumerate(x, start=N)`) folds
+                # away entirely rather than leaving a no-op "0 + " for a
+                # later pass to clean up -- simplify_additive_zero_
+                # identity only ever handles a PARENTHESIZED right
+                # operand, deliberately, and a bare `iv` here isn't one.
+                _idx_plus1_repl = iv if enum_start_txt == "0" else f"({enum_start_txt}) + {iv}"
+                _idx_repl = (
+                    f"({iv} - 1)" if enum_start_txt == "0" else f"(({enum_start_txt}) + ({iv} - 1))"
+                )
+                for _li in range(_checkpoint, len(self.o.lines)):
+                    _ln = self.o.lines[_li]
+                    _ln = re.sub(rf"\b{re.escape(target_name)}\b", _val_repl, _ln)
+                    _ln = re.sub(rf"\b{re.escape(idx_name)}\b\s*\+\s*1\b", _idx_plus1_repl, _ln)
+                    _ln = re.sub(rf"\b{re.escape(idx_name)}\b", _idx_repl, _ln)
+                    self.o.lines[_li] = _ln
+                # Both names are now dead -- never emitted as a bare token
+                # anywhere in the final text -- so drop their marks too,
+                # or they'd surface as orphaned, unused top-of-procedure
+                # declarations.
+                for _coll in (self.ints, self.reals, self.complexes, self.logs, self.chars):
+                    _coll.discard(target_name)
+                    _coll.discard(idx_name)
+                fused = True
+            if not fused:
+                if idx_name is not None and enum_start_txt is not None and idx_name != "_":
+                    self._mark_int(idx_name)
+                    self.o.w(f"{idx_name} = ({enum_start_txt}) + ({iv} - 1)")
+                if target_name != "_":
+                    if tnm_iter is not None:
+                        self.dict_typed_vars[target_name] = tnm_iter
+                        self.dict_var_components[target_name] = list(comp_names_iter)
+                    elif k == "real":
+                        self._mark_real(target_name)
+                    elif k == "logical":
+                        self._mark_log(target_name)
+                    elif k == "complex":
+                        self._mark_complex(target_name)
+                    elif k == "char":
+                        self._mark_char(target_name)
+                    else:
+                        self._mark_int(target_name)
+                    self.o.w(f"{target_name} = {arr_ref}({iv})")
+                _visit_loop_body_and_close_rebinds()
             self.o.pop()
             self.o.w("end do")
             self.o.pop()
@@ -45041,7 +46156,7 @@ class translator(ast.NodeVisitor):
             meta = self.synthetic_slice_meta.get(iter_name, {})
             if not mapping:
                 raise NotImplementedError("empty synthetic slice iterable")
-            iv = f"i_iter_{node.lineno}"
+            iv = self._fresh_scoped_names("i")
             self.o.w("block")
             self.o.push()
             self.o.w(f"integer :: {iv}")
@@ -45359,10 +46474,7 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("itertools.product loop kind unsupported")
             t0 = node.target.elts[0].id
             t1 = node.target.elts[1].id
-            i0 = f"i_prod0_{node.lineno}"
-            i1 = f"i_prod1_{node.lineno}"
-            self._mark_int(i0)
-            self._mark_int(i1)
+            i0, i1 = self._fresh_scoped_names("i", "j")
             if t0 != "_":
                 if ak == "real":
                     self._mark_real(t0)
@@ -45455,8 +46567,19 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("tuple-target literal loops require homogeneous tuple/list elements")
                 row_elts.append(list(it.elts))
 
-            iv = f"i_tup_{node.lineno}"
-            self._mark_int(iv)
+            # iv itself is purely block-local (unlike tgt_elts below, which
+            # are the user's own loop-target names and must stay visible
+            # at procedure scope after the loop, same as any other real
+            # local) -- so it gets its own `block` with an inline
+            # declaration rather than relying on the top-of-procedure
+            # auto-declaration list. That list is assembled from a
+            # SEPARATE, earlier prescan pass that can't see a name only
+            # decided live here during emission; self-declaring inside a
+            # dedicated block sidesteps needing the two to agree at all.
+            iv = self._fresh_scoped_names("i")
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {iv}")
             self.o.w(f"do {iv} = 1, {len(row_elts)}")
             self.o.push()
             self.o.w(f"select case ({iv})")
@@ -45483,6 +46606,8 @@ class translator(ast.NodeVisitor):
             self.o.w("end select")
             self.o.pop()
             self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         if (
@@ -45629,7 +46754,7 @@ class translator(ast.NodeVisitor):
             meta = self.synthetic_slice_meta.get(iter_name, {})
             if not mapping:
                 raise NotImplementedError("empty synthetic slice iterable")
-            iv = f"i_iter_{node.lineno}"
+            iv = self._fresh_scoped_names("i")
             self.o.w("block")
             self.o.push()
             self.o.w(f"integer :: {iv}")
@@ -45692,8 +46817,7 @@ class translator(ast.NodeVisitor):
                 else:
                     minfo = None
                 arr_expr = f"{arr_arg.id}%keys" if minfo is not None else self.expr(arr_arg)
-                iv = f"i_sorted_{node.lineno}"
-                self._mark_int(iv)
+                iv = self._fresh_scoped_names("i")
                 if node.target.id != "_":
                     if minfo is not None:
                         self._mark_int(node.target.id)
@@ -45728,7 +46852,7 @@ class translator(ast.NodeVisitor):
                 if not all(isinstance(t, ast.Name) for t in tgt_elts):
                     raise NotImplementedError("tuple-target for loops require name targets")
                 it_expr = self.expr(node.iter)
-                iv = f"i_iter_{node.lineno}"
+                iv = self._fresh_scoped_names("i")
                 k_it = self._expr_kind(node.iter)
                 for _t in tgt_elts:
                     if _t.id == "_":
@@ -45765,16 +46889,17 @@ class translator(ast.NodeVisitor):
                 target_name = node.target.id
                 if target_name != "_":
                     self._mark_char(target_name)
+                ios_v, line_v = self._fresh_scoped_names("ios", "line")
                 self.o.w("block")
                 self.o.push()
-                self.o.w(f"integer :: ios_file_iter_{node.lineno}")
-                self.o.w(f"character(len=4096) :: line_file_iter_{node.lineno}")
+                self.o.w(f"integer :: {ios_v}")
+                self.o.w(f"character(len=4096) :: {line_v}")
                 self.o.w("do")
                 self.o.push()
-                self.o.w(f"read({node.iter.id}, '(A)', iostat=ios_file_iter_{node.lineno}) line_file_iter_{node.lineno}")
-                self.o.w(f"if (ios_file_iter_{node.lineno} /= 0) exit")
+                self.o.w(f"read({node.iter.id}, '(A)', iostat={ios_v}) {line_v}")
+                self.o.w(f"if ({ios_v} /= 0) exit")
                 if target_name != "_":
-                    self.o.w(f"{target_name} = line_file_iter_{node.lineno}")
+                    self.o.w(f"{target_name} = {line_v}")
                 _visit_loop_body_and_close_rebinds()
                 self.o.pop()
                 self.o.w("end do")
@@ -45788,7 +46913,7 @@ class translator(ast.NodeVisitor):
                     return
                 if rr == 2:
                     it_expr = self.expr(node.iter)
-                    iv = f"i_iter_{node.lineno}"
+                    iv = self._fresh_scoped_names("i")
                     if node.target.id != "_":
                         k_it = self._expr_kind(node.iter)
                         if k_it == "real":
@@ -45827,7 +46952,7 @@ class translator(ast.NodeVisitor):
                         break
                 if _looks_like_row_unpack:
                     it_expr = self.expr(node.iter)
-                    iv = f"i_iter_{node.lineno}"
+                    iv = self._fresh_scoped_names("i")
                     if _row_nm != "_":
                         k_it = self._expr_kind(node.iter)
                         if k_it == "real":
@@ -48339,7 +49464,16 @@ class translator(ast.NodeVisitor):
                         and not isinstance(a, ast.JoinedStr)
                         and self._expr_kind(a) not in {"char", "str"}
                     )
-                    if i_arg > 0 and sep_txt != "" and not (sep_txt == " " and _arg_is_numeric):
+                    needs_sep = i_arg > 0 and sep_txt != "" and not (sep_txt == " " and _arg_is_numeric)
+                    if needs_sep and is_const_str(a):
+                        # Merge the separator directly into the following
+                        # string literal instead of a separate write() --
+                        # `"a"` then a bare `" "` then `"b"` prints
+                        # identically to `"a"` then `" b"`, and folding it
+                        # in avoids an extra statement.
+                        self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(sep_txt + a.value)}")
+                        continue
+                    if needs_sep:
                         self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(sep_txt)}")
                     if is_const_str(a):
                         self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(a.value)}")
@@ -48382,7 +49516,16 @@ class translator(ast.NodeVisitor):
                     and not isinstance(a, ast.JoinedStr)
                     and self._expr_kind(a) not in {"char", "str"}
                 )
-                if i_arg > 0 and sep_txt != "" and not (sep_txt == " " and _arg_is_numeric):
+                needs_sep = i_arg > 0 and sep_txt != "" and not (sep_txt == " " and _arg_is_numeric)
+                if needs_sep and is_const_str(a):
+                    # Merge the separator directly into the following
+                    # string literal instead of emitting it as its own
+                    # print item -- `"a", " ", "b"` and `"a", " b"` print
+                    # identically, and the merged form reads far more
+                    # naturally in the generated code.
+                    parts.append(fstr(sep_txt + a.value))
+                    continue
+                if needs_sep:
                     parts.append(fstr(sep_txt))
                 if is_const_str(a):
                     parts.append(fstr(a.value))
@@ -48670,6 +49813,56 @@ class translator(ast.NodeVisitor):
 # code generation
 # -------------------------
 
+def _function_result_var_name(fn, base="func_res"):
+    """Pick the Fortran name for a function's own RESULT variable --
+    short and generic (`func_res`) rather than the old `{fn.name}_
+    result` scheme, which was unreadable for a long/compound Python
+    function name (`pnl_piecewise_quad_linear_two_sided_result`).
+
+    Reusing the exact same short name across every function in the
+    file is safe: a function's result variable only needs to be unique
+    within that ONE function's own scope, exactly like reusing a
+    block-local loop counter across sibling blocks (see
+    translator._fresh_scoped_names) -- no two functions share a scope.
+
+    What's NOT automatically safe, unlike the old scheme (which could
+    never collide with anything, being derived from the already-unique
+    function name itself): a real dummy argument or local variable
+    inside THIS function could itself be named `func_res`. Guarded by
+    a purely static, deterministic scan of `fn`'s own AST -- every
+    dummy argument name, and every name bound anywhere in its body
+    (assignment targets, for-loop targets, nested def/class names) --
+    falling back to `func_res_1`, `func_res_2`, ... on an actual
+    collision.
+
+    Deliberately static/AST-only (never consults a translator's live,
+    mutating self.ints/self.reals/etc, unlike _fresh_scoped_names):
+    this function's own name is computed independently at several
+    separate points across the pipeline (an early prescan-only pass,
+    the main signature/body emission, ...), and every one of them MUST
+    agree on the identical answer for the same `fn` -- a purely
+    syntactic property of `fn`'s AST is guaranteed to always agree,
+    while a check against mutable state could silently drift between
+    calls (a real bug hit and fixed once already this session, for a
+    synthesized loop-counter name whose prescan-time and emission-time
+    picks disagreed).
+    """
+    taken = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Name):
+            taken.add(n.id.lower())
+        elif isinstance(n, ast.arg):
+            taken.add(n.arg.lower())
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            taken.add(n.name.lower())
+    cand = base
+    i = 1
+    while cand.lower() in taken:
+        cand = f"{base}_{i}"
+        i += 1
+    return cand
+
+
 def _analyze_dict_return_spec(
     fn,
     params,
@@ -48727,7 +49920,7 @@ def _analyze_dict_return_spec(
         return None
 
     tmp_out = emit()
-    tr0 = translator(tmp_out, params={}, context="flat", list_counts={}, function_result_name=f"{fn.name}_result")
+    tr0 = translator(tmp_out, params={}, context="flat", list_counts={}, function_result_name=_function_result_var_name(fn))
     tr0.prescan(fn.body)
     comps = []
     list_elem_kind = {}
@@ -49392,7 +50585,7 @@ def _emit_local_function(
             if _rr > 0:
                 shape_donor_by_rank[_rr] = _argn
     proc_name = proc_name_override or fn.name
-    ret_name = f"{proc_name}_result"
+    ret_name = _function_result_var_name(fn)
     defaults_map = {}
     if fn.args.defaults:
         pos_names = [a.arg for a in fn.args.args]
@@ -51472,7 +52665,28 @@ def _emit_local_function(
             ret_rank = max(ret_rank, rr)
             callback_assign_targets.setdefault(cb, set()).add(tnm)
         if (not saw_direct_cb_call) and (cb in callback_passthrough_args):
-            in_rank = max(in_rank, 1)
+            # `cb` is never called directly in fn's own body -- it's just
+            # handed straight through to another local function's own
+            # callback parameter (e.g. bracket_and_solve(f, ...): return
+            # bisect_root(f, ...)). Rather than blindly guessing rank 1
+            # (originally meant for a genuinely vectorized/elementwise
+            # pass-through), prefer the rank ALREADY known for whatever
+            # concrete function actually gets passed for `cb` at fn's own
+            # call sites -- local_callback_actual_specs aggregates that
+            # from a whole-program scan (see its computation below, in
+            # this same pipeline) keyed by (fn.name, cb), and its
+            # "arg_ranks" already reflects the real actual's own
+            # parameter shape (e.g. diff's scalar "x", rank 0) --
+            # falling back to the old rank-1 guess only when no such
+            # actual-argument evidence exists at all (fn is never called
+            # anywhere with a statically-known local function for this
+            # parameter).
+            _passthrough_actual_cb = (local_callback_actual_specs or {}).get((fn.name, cb), {})
+            _passthrough_in_rank = _passthrough_actual_cb.get("arg_ranks", {}).get(0)
+            if _passthrough_in_rank is not None:
+                in_rank = max(in_rank, int(_passthrough_in_rank))
+            else:
+                in_rank = max(in_rank, 1)
         ret_kind = "real"
         if any(str(v) == "complex" for v in cb_arg_kinds.values()):
             ret_kind = "complex"
@@ -55568,7 +56782,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 params={},
                 context="flat",
                 list_counts={},
-                function_result_name=f"{fn.name}_result",
+                function_result_name=_function_result_var_name(fn),
                 local_return_specs=scalar_or_array,
                 local_return_ranks=scalar_or_array_ranks,
                 tuple_return_funcs=set(tuple_out.keys()),
@@ -57841,6 +59055,28 @@ def generate_flat(
                 local_return_specs=local_return_specs,
                 local_return_ranks=local_return_ranks,
             )
+            # Seed with every known module-level global's kind BEFORE
+            # prescanning just this one function's own body -- otherwise
+            # a callback that only READS a real module-level global
+            # (never assigns it, so prescan alone never registers it,
+            # e.g. a closure-hoisted `closure_..._target` global read
+            # inside a hoisted callback like `diff`) has that read
+            # resolve to an unknown kind, which _expr_kind then also
+            # can't resolve for any larger expression built from it --
+            # cascading into a `None` overall return-kind for the WHOLE
+            # function, discarding an otherwise-fine rank inference
+            # alongside it (see _ret_spec_kind_rank's caller).
+            for _gnm, (_gk, _gr) in _early_global_decls.items():
+                if _gk == "real":
+                    _tr.reals.add(_gnm)
+                elif _gk == "int":
+                    _tr.ints.add(_gnm)
+                elif _gk == "logical":
+                    _tr.logs.add(_gnm)
+                elif _gk == "char":
+                    _tr.chars.add(_gnm)
+                elif _gk == "complex":
+                    _tr.complexes.add(_gnm)
             _tr.prescan(_fn_node.body)
             cb_scan_cache[_key] = _tr
             return _tr
@@ -62701,6 +63937,7 @@ def transpile_file(
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_redundant_nested_arith_parens(f90_lines)
     f90_lines = simplify_narrow_redundant_arith_parens(f90_lines)
+    f90_lines = simplify_additive_zero_identity(f90_lines)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
     f90_lines = combine_parenthesized_integer_offset(f90_lines)
     f90_lines = simplify_paren_group_before_addsub(f90_lines)
@@ -62731,15 +63968,41 @@ def transpile_file(
     f90_lines = promote_immediate_array_constants(f90_lines)
     f90_lines = promote_immediate_2d_array_constants(f90_lines)
     f90_lines = coalesce_nonadjacent_declarations(f90_lines, max_len=10**9)
-    _result_names = frozenset(
-        m.group(1) for ln in f90_lines for m in re.finditer(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", ln, re.IGNORECASE)
-    )
+    # Scanned for "never merge this name" protection below -- but a
+    # callback's own abstract interface stub (e.g. `pure function
+    # v_bisect_root_f_cb_if(x) result(r)`) is JUST as likely to name its
+    # result something short and generic ("r") as any real procedure is,
+    # and that has nothing to do with an UNRELATED module-level or
+    # other-procedure variable that happens to share the same name --
+    # excluding matches found inside an `interface ... end interface`
+    # block keeps this scoped to result variables that could actually
+    # collide with a declaration coalescing might otherwise merge them
+    # into.
+    _iface_start_re = re.compile(r"^\s*(?:abstract\s+)?interface\b", re.IGNORECASE)
+    _iface_end_re = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
+    _result_names_set = set()
+    _iface_depth = 0
+    for _ln in f90_lines:
+        _code = _ln.split("!", 1)[0].strip()
+        if _iface_start_re.match(_code):
+            _iface_depth += 1
+        elif _iface_end_re.match(_code):
+            _iface_depth = max(0, _iface_depth - 1)
+        elif _iface_depth == 0:
+            for _m in re.finditer(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", _code, re.IGNORECASE):
+                _result_names_set.add(_m.group(1))
+    _result_names = frozenset(_result_names_set)
     f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9, never_merge_names=_result_names)
     f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
     f90_lines = hoist_loop_invariant_array_realloc(f90_lines)
     # Re-run: hoisting can move a guard out of its enclosing loop, which
     # makes it newly eligible (loop_depth == 0, no prior use) for removal.
     f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
+    # Runs right after: removing a guard is exactly what leaves two
+    # single-entity allocates genuinely back-to-back (e.g. a freshly
+    # built DataFrame's own df%values/df%index allocations) for this
+    # pass to then fuse into one allocate statement.
+    f90_lines = combine_consecutive_single_entity_allocates(f90_lines)
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = rebase_argsort_output_to_one_based(f90_lines)
     f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
@@ -62867,6 +64130,14 @@ def transpile_file(
     if elemental_pass:
         try:
             f90_lines = fpurity.mark_elemental_where_provable(f90_lines)
+        except Exception:
+            pass
+        # Now that elemental-ness is authoritatively confirmed in the
+        # text (never provable any earlier -- see the function's own
+        # docstring), collapse any per-element loop calling a confirmed-
+        # elemental function into a single vectorized statement.
+        try:
+            f90_lines = vectorize_rank1_elemental_call_loops(f90_lines)
         except Exception:
             pass
     # Apply final structural whitespace consistently for default and
@@ -63112,6 +64383,11 @@ def main():
         action="store_true",
         help="for old-style %%f/%%e/%%g with integer args, emit integer descriptors instead of coercing args to real",
     )
+    ap.add_argument(
+        "--no-nan-safe-compare",
+        action="store_true",
+        help="emit plain comparison operators (e.g. `x <= y`) instead of the default merge()/ieee_is_nan() NaN-safety guard -- more idiomatic/readable output, but a NaN operand can then trip -ffpe-trap=invalid at runtime instead of quietly evaluating False (True for !=) the way Python/pandas would",
+    )
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original Python run and transpiled Fortran run (implies --run)")
     ap.add_argument("--comment", action="store_true", help="emit generated procedure/argument comments")
@@ -63134,6 +64410,8 @@ def main():
         return 1
     global PERCENT_FLOAT_INT_FORMAT
     PERCENT_FLOAT_INT_FORMAT = bool(args.percent_float_int_format)
+    global NAN_SAFE_COMPARISONS
+    NAN_SAFE_COMPARISONS = not bool(args.no_nan_safe_compare)
     if any(ch in args.input_py for ch in "*?[]"):
         matches = sorted(glob.glob(args.input_py, recursive=True))
         matches = [m for m in matches if Path(m).is_file()]

@@ -110,6 +110,7 @@ public :: argsort_idx_int !@pyapi kind=function ret=integer(:) args=x:integer(:)
 public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="integer arange(start, stop, step)"
 public :: np_insert_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in),val:real(dp):intent(in) desc="numpy insert for rank-1 real array and scalar value"
 public :: np_delete_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in) desc="numpy delete for rank-1 real array and scalar index"
+public :: linspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in) desc="linspace(start, stop, num)"
 public :: logspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional,base:real(dp):intent(in):optional desc="logspace(start, stop, num=50, endpoint=True, base=10)"
 public :: geomspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional desc="geomspace(start, stop, num=50, endpoint=True)"
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
@@ -3117,6 +3118,23 @@ contains
          if (pos > 0) out(1:pos) = a(1:pos)
          if (pos < n - 1) out(pos + 1:n - 1) = a(pos + 2:n)
       end function np_delete_real_1d
+
+      pure function linspace(start, stop, num) result(x)
+         real(kind=dp), intent(in) :: start, stop
+         integer, intent(in) :: num
+         real(kind=dp), allocatable :: x(:)
+         integer :: n, i
+         n = max(0, num)
+         allocate(x(n))
+         if (n <= 0) return
+         if (n == 1) then
+            x(1) = start
+            return
+         end if
+         do i = 1, n
+            x(i) = start + (stop - start) * real(i - 1, kind=dp) / real(n - 1, kind=dp)
+         end do
+      end function linspace
 
       function logspace(start, stop, num, endpoint, base) result(x)
          real(kind=dp), intent(in) :: start, stop

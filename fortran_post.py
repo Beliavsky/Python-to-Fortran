@@ -145,6 +145,8 @@ def ensure_blank_lines_around_units_and_procedures(lines: List[str]) -> List[str
         re.IGNORECASE,
     )
     proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+    interface_start_re = re.compile(r"^\s*(?:abstract\s+)?interface\b", re.IGNORECASE)
+    interface_end_re = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
 
     def _code(ln: str) -> str:
         return fscan.strip_comment(ln).strip()
@@ -157,14 +159,32 @@ def ensure_blank_lines_around_units_and_procedures(lines: List[str]) -> List[str
             out.append("")
 
     n = len(lines)
+    interface_depth = 0
     for i, ln in enumerate(lines):
         code = _code(ln)
-        if code and (unit_start_re.match(code) or proc_start_re.match(code)):
+        # A callback's own abstract-interface body (e.g. `interface /
+        # function foo_cb_if(x) result(r) / ... / end function foo_cb_if
+        # / end interface`) is a tight, purely declarative block, not a
+        # top-level or module-contained procedure -- proc_start_re/
+        # proc_end_re would otherwise match its nested function/
+        # subroutine line too (they have no notion of "inside an
+        # interface"), padding blank lines around it that don't belong
+        # there. Track interface nesting and skip the spacing logic
+        # entirely while inside one.
+        entering_outer_interface = interface_depth == 0 and code and interface_start_re.match(code)
+        if code and interface_start_re.match(code):
+            interface_depth += 1
+        elif code and interface_end_re.match(code):
+            interface_depth = max(0, interface_depth - 1)
+
+        if entering_outer_interface or (
+            interface_depth == 0 and code and (unit_start_re.match(code) or proc_start_re.match(code))
+        ):
             _append_blank_if_needed()
 
         out.append(ln)
 
-        if not code or not (unit_end_re.match(code) or proc_end_re.match(code)):
+        if interface_depth > 0 or not code or not (unit_end_re.match(code) or proc_end_re.match(code)):
             continue
 
         # Add a blank after the end line unless the remaining input already has
@@ -450,9 +470,23 @@ def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
         module_use_lines: Dict[str, int] = {}
         module_syms: Dict[str, set[str]] = {}
         use_indent = None
+        # A hoistable-symbol match below only sets use_indent when the
+        # line ALSO qualifies as a mergeable use-only line (has parseable
+        # syms, isn't `use, intrinsic ::`) -- but a module header can
+        # easily have ONLY non-qualifying use lines (e.g. one importing
+        # operator(+) overloads, one `use, intrinsic ::`), leaving
+        # use_indent unset even though real use lines, with the real
+        # indentation convention, are right there. any_use_indent catches
+        # the indentation of ANY `use` line, qualifying or not, as a
+        # better-than-nothing fallback before resorting to matching
+        # `contains`'s own indentation (which this project's own style
+        # leaves unindented, at column 0).
+        any_use_indent = None
         insert_idx = None
         for k in range(i + 1, contains_idx):
             code_k, _ = xunused.split_code_comment(out[k].rstrip("\r\n"))
+            if any_use_indent is None and re.match(r"^\s*use\b", code_k, re.IGNORECASE):
+                any_use_indent = re.match(r"^(\s*)", code_k).group(1)
             mk = use_only_re.match(code_k.strip())
             if mk is not None and mk.group("intrinsic") is None:
                 mod_nm = mk.group("mod").lower()
@@ -464,6 +498,8 @@ def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
                         use_indent = re.match(r"^(\s*)", code_k).group(1)
             if insert_idx is None and implicit_none_re.match(code_k):
                 insert_idx = k
+        if use_indent is None:
+            use_indent = any_use_indent
         if use_indent is None:
             use_indent = re.match(r"^(\s*)", out[contains_idx]).group(1)
         if insert_idx is None:

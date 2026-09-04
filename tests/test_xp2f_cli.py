@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 import fortran_output as fout
 import fortran_post as fpost
+import fortran_purity as fpurity
 import fortran_scan as fscan
 import xp2f
 
@@ -86,6 +87,82 @@ def test_fortran_post_spaces_units_and_procedures() -> None:
     assert "end subroutine a\n\nreal(kind=dp) function b()" in text
     assert "end function b\n\nend module m" in text
     assert "end module m\n\nprogram p" in text
+
+
+def test_fortran_post_hoist_module_use_only_falls_back_to_any_use_line_indent() -> None:
+    # User-reported real bug (xdelta_gamma.py): the indentation detected
+    # for a newly-hoisted `use mod, only: sym` line only ever came from
+    # an EXISTING module-level use-only line that ALSO qualifies as
+    # mergeable (parseable syms, not `use, intrinsic ::`) -- but a
+    # module header can easily have only NON-qualifying use lines (one
+    # importing operator(+) overloads, one `use, intrinsic ::`), in
+    # which case the indentation fell all the way back to matching
+    # `contains`'s own indentation -- unindented, at column 0, in this
+    # project's own style -- producing a hoisted `use` line with NO
+    # leading whitespace at all, unlike every sibling use/implicit/
+    # declaration line around it.
+    lines = [
+        "module m",
+        "   use dataframe_str_index_mod, only: operator(+), operator(-)",
+        "   use, intrinsic :: iso_fortran_env, only: real64",
+        "   implicit none",
+        "   private",
+        "contains",
+        "pure function f(x) result(y)",
+        "   real(kind=8), intent(in) :: x",
+        "   real(kind=8) :: y",
+        "   use python_mod, only: optval",
+        "   y = optval(x, 0.0_8)",
+        "end function f",
+        "end module m",
+    ]
+
+    out = fpost.hoist_module_use_only_imports(lines)
+    joined = "\n".join(out)
+
+    assert "\n   use python_mod, only: optval\n" in joined, joined
+    assert "\nuse python_mod, only: optval\n" not in joined, joined
+
+
+def test_fortran_post_keeps_callback_interface_body_tight() -> None:
+    # User-reported real gap: ensure_blank_lines_around_units_and_
+    # procedures pads a blank line before/after every function/
+    # subroutine declaration line it sees -- but it had no notion of
+    # being INSIDE an `interface ... end interface` block, so a
+    # callback's own abstract interface (e.g. v_bisect_root's `interface
+    # / pure function v_bisect_root_f_cb_if(x) result(r) / ... / end
+    # function v_bisect_root_f_cb_if / end interface`) got the SAME
+    # padding as a real top-level procedure: a blank line right after
+    # "interface" and another right before "end interface", even though
+    # that whole block is a tight, purely declarative unit.
+    #
+    # Fixed by tracking interface nesting and skipping the spacing logic
+    # while inside one -- and, since the padding this pass DOES still
+    # want (a blank line separating the enclosing procedure's own
+    # signature from its interface block) was otherwise missing, a
+    # blank line is now inserted before "interface" itself instead.
+    lines = [
+        "pure function v_bisect_root(f, a, b) result(v_bisect_root_result)",
+        "   interface",
+        "      pure function v_bisect_root_f_cb_if(x) result(r)",
+        "         import dp",
+        "         real(kind=dp), intent(in) :: x",
+        "         real(kind=dp) :: r",
+        "      end function v_bisect_root_f_cb_if",
+        "   end interface",
+        "   procedure(v_bisect_root_f_cb_if) :: f",
+        "   real(kind=dp), intent(in) :: a, b",
+        "   real(kind=dp) :: v_bisect_root_result",
+        "   v_bisect_root_result = f(a) + f(b)",
+        "end function v_bisect_root",
+    ]
+
+    text = "\n".join(fpost.ensure_blank_lines_around_units_and_procedures(lines))
+
+    assert "\n\n   interface\n      pure function v_bisect_root_f_cb_if(x)" in text, text
+    assert "end function v_bisect_root_f_cb_if\n   end interface" in text, text
+    assert "interface\n\n" not in text, text
+    assert "\n\n   end interface" not in text, text
 
 
 @pytest.mark.parametrize("example_name", SUPPORTED_PY_COMPILE_CASES)
@@ -282,7 +359,51 @@ def test_xp2f_multiarg_print_inserts_default_space_separator(tmp_path: Path) -> 
     assert "Run: PASS" in proc.stdout
     assert "name: bob" in proc.stdout
     out_text = (tmp_path / "xprint_sep_small_p.f90").read_text(encoding="utf-8")
+    # `c` is a variable, not a string literal, so the default separator
+    # can't be folded into it at compile time and stays its own item.
     assert 'print *, "name:", " ", c' in out_text
+
+
+def test_xp2f_multiarg_print_folds_default_separator_into_next_literal(tmp_path: Path) -> None:
+    # User-reported real example, from xdelta_gamma.py: a run of
+    # label/value pairs like `print("V0 =", V0, "delta0 =", delta0,
+    # "gamma0 =", gamma0)` used to emit a bare `" "` as its own print
+    # item before each label (needed only to separate it from the
+    # previous numeric value, which Fortran's own list-directed output
+    # doesn't do for adjacent character items the way it does for
+    # numerics). Since the label right after the separator is ALWAYS a
+    # compile-time string literal here, the space can be folded directly
+    # into that literal instead -- `"V0 =", V0, " ", "delta0 =", delta0`
+    # simplifies to `"V0 =", V0, " delta0 =", delta0`, same output, one
+    # fewer print item.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xprint_fold_sep_small.py"
+    src.write_text(
+        "\n".join(
+            [
+                "V0 = 1.23",
+                "delta0 = 4.56",
+                "gamma0 = 7.89",
+                'print("V0 =", V0, "delta0 =", delta0, "gamma0 =", gamma0)',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xprint_fold_sep_small_p.f90").read_text(encoding="utf-8")
+    assert 'print *, "V0 =", V0, " delta0 =", delta0, " gamma0 =", gamma0' in out_text
 
 
 def test_xp2f_multiarg_print_supports_literal_sep(tmp_path: Path) -> None:
@@ -314,7 +435,10 @@ def test_xp2f_multiarg_print_supports_literal_sep(tmp_path: Path) -> None:
     assert "x;;y;;" in proc.stdout
     out_text = (tmp_path / "xprint_sep_literal_small_p.f90").read_text(encoding="utf-8")
     assert '"x"' in out_text
-    assert '"y"' in out_text
+    # The ";;" separator before "y" is a literal-to-literal join, so it's
+    # folded directly into the following string literal rather than
+    # emitted as its own print item (see the "name:" test below).
+    assert '";;y"' in out_text
     assert '";;"' in out_text
     assert "py_str(pi)" in out_text
 
@@ -393,6 +517,330 @@ def test_xp2f_cov_ndim_scalar_guard_keeps_matrix_target(tmp_path: Path) -> None:
     out_text = (tmp_path / "xcov_ndim_small_p.f90").read_text(encoding="utf-8")
     assert "real(kind=dp), allocatable :: global_cov(:,:)" in out_text
     assert "real(kind=dp) :: global_cov" not in out_text
+
+
+def test_xp2f_function_result_variable_uses_short_generic_name(tmp_path: Path) -> None:
+    # User-requested style change: a function's own RESULT variable is
+    # named short and generic (`func_res`) rather than the old, verbose
+    # `{fn_name}_result` scheme -- unreadable for a long/compound
+    # function name like `pnl_piecewise_quad_linear_two_sided_result`.
+    # Reusing `func_res` across every function in the file is safe: it
+    # only needs to be unique within each function's own scope.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xfunc_res_name.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def square(x):",
+                "    return x * x",
+                "",
+                "def cube(y):",
+                "    return y * y * y",
+                "",
+                "print(square(3.0))",
+                "print(cube(2.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xfunc_res_name_p.f90").read_text(encoding="utf-8")
+    assert out_text.count("result(func_res)") == 2, out_text
+    assert "_result" not in out_text
+
+
+def test_xp2f_function_result_variable_avoids_colliding_with_own_arg(tmp_path: Path) -> None:
+    # If a function's OWN dummy argument is literally named `func_res`,
+    # the synthesized result variable must fall back to `func_res_1`
+    # rather than colliding with it -- unlike the old `{fn_name}_result`
+    # scheme, `func_res` is no longer automatically unique.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xfunc_res_collision.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def double_it(func_res):",
+                "    return func_res * 2.0",
+                "",
+                "print(double_it(3.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xfunc_res_collision_p.f90").read_text(encoding="utf-8")
+    assert "result(func_res_1)" in out_text, out_text
+
+
+def test_xp2f_np_linspace_uses_dedicated_helper_function(tmp_path: Path) -> None:
+    # User-reported real example (xdelta_gamma.py): `np.linspace(60.0,
+    # 140.0, 161)` used to expand inline into a hand-derived
+    # `start + (stop - start) * real(arange_int(...), kind=dp) /
+    # real(max(1, num - 1), kind=dp)` formula -- unreadable, and an
+    # outlier among its own sibling numpy generators (logspace,
+    # geomspace, cumsum, cumprod all already get a dedicated python.f90
+    # helper function). Now calls a real `linspace(start, stop, num)`
+    # helper directly, matching that established pattern.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xlinspace_helper.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "S = np.linspace(60.0, 140.0, 161)",
+                "print(S[0])",
+                "print(S[-1])",
+                "print(len(S))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xlinspace_helper_p.f90").read_text(encoding="utf-8")
+    assert "S = linspace(60.0_dp, 140.0_dp, 161)" in out_f90, out_f90
+    assert "arange_int" not in out_f90, out_f90
+
+
+def test_xp2f_np_linspace_helper_handles_single_point_and_int_literals(tmp_path: Path) -> None:
+    # Edge cases the dedicated helper must reproduce exactly from the
+    # old inline formula's own behavior: num=1 returns just `start`
+    # (matching numpy's own linspace semantics), and integer-literal
+    # start/stop get coerced to real rather than passed as integers to
+    # a real dummy argument (a genuine type mismatch, unlike an
+    # ordinary arithmetic expression where Fortran converts implicitly).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xlinspace_edge_cases.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "a = np.linspace(0, 10, 5)",
+                "b = np.linspace(2.5, 2.5, 1)",
+                "print(a)",
+                "print(b)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xlinspace_edge_cases_p.f90").read_text(encoding="utf-8")
+    assert "linspace(real(0, kind=dp), real(10, kind=dp), 5)" in out_f90, out_f90
+    assert "linspace(2.5_dp, 2.5_dp, 1)" in out_f90, out_f90
+
+
+def test_xp2f_removes_allocated_guard_for_fresh_dataframe_component(tmp_path: Path) -> None:
+    # User-reported real example (xdelta_gamma.py): a freshly built
+    # DataFrame's own `df%values`/`df%index` allocation is preceded by
+    # a provably-always-false `if (allocated(...))` guard -- nothing
+    # earlier in the procedure could possibly have already allocated
+    # them. The guard (and now-unreachable deallocate) is dropped,
+    # leaving just the allocate.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xdf_fresh_guard.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "import numpy as np",
+                "",
+                "df = pd.DataFrame({'a': np.array([1.0, 2.0, 3.0])})",
+                "print(df)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xdf_fresh_guard_p.f90").read_text(encoding="utf-8")
+    assert "allocated(df" not in out_f90, out_f90
+    # The two now-guardless allocates end up genuinely adjacent, so a
+    # separate pass (see test_xp2f_combines_consecutive_single_entity_
+    # allocates) fuses them into one statement.
+    assert "allocate(df%values(" in out_f90, out_f90
+    assert ", df%index(" in out_f90, out_f90
+
+
+def test_xp2f_keeps_allocated_guard_when_dataframe_reassigned(tmp_path: Path) -> None:
+    # Safety case for the above: a SECOND construction of the same
+    # DataFrame variable (after a whole-variable reassignment) must
+    # keep its guard -- the base `df = ...` reassignment could have
+    # copied in an already-allocated component from elsewhere, so the
+    # "provably first allocation" argument no longer holds.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xdf_reassign_guard.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "import numpy as np",
+                "",
+                "def make_df(vals):",
+                "    return pd.DataFrame({'a': vals})",
+                "",
+                "df = make_df(np.array([1.0, 2.0, 3.0]))",
+                "df = make_df(np.array([4.0, 5.0]))",
+                "print(df)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xdf_reassign_guard_p.f90").read_text(encoding="utf-8")
+    assert out_f90.count("if (allocated(df%values)) deallocate(df%values)") == 1, out_f90
+    assert out_f90.count("if (allocated(df%index)) deallocate(df%index)") == 1, out_f90
+
+
+def test_xp2f_combines_consecutive_single_entity_allocates(tmp_path: Path) -> None:
+    # User-reported real example (xdelta_gamma.py): once the guards
+    # above are dropped, a freshly built DataFrame's `df%values`/
+    # `df%index` allocations become two genuinely adjacent, otherwise-
+    # untouched single-entity `allocate(...)` statements -- Fortran's
+    # ALLOCATE accepts any number of comma-separated allocate-objects
+    # in one statement, executing identically to allocating them one at
+    # a time, so the two fuse into
+    # `allocate(df%values(...), df%index(...))`.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xdf_combine_allocates.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import pandas as pd",
+                "import numpy as np",
+                "",
+                "df = pd.DataFrame({'a': np.array([1.0, 2.0]), 'b': np.array([3.0, 4.0])})",
+                "print(df)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xdf_combine_allocates_p.f90").read_text(encoding="utf-8")
+    assert "allocate(df%values(size(df_a), 2), df%index(size(df_a)))" in out_f90, out_f90
+
+
+def test_xp2f_does_not_combine_allocates_with_source_keyword(tmp_path: Path) -> None:
+    # Safety case: allocate statements carrying a source=/mold=/stat=
+    # keyword argument apply that option to the WHOLE statement, so
+    # they can't be blindly fused if they'd otherwise differ -- three
+    # separate np.zeros(...) allocations (each with its own source=)
+    # must stay three separate allocate statements.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xalloc_source_kw.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "a = np.zeros(3)",
+                "b = np.zeros(4)",
+                "a[0] = 1.0",
+                "b[0] = 2.0",
+                "print(a, b)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xalloc_source_kw_p.f90").read_text(encoding="utf-8")
+    assert "allocate(a(3), source=0.0_dp)" in out_f90, out_f90
+    assert "allocate(b(4), source=0.0_dp)" in out_f90, out_f90
 
 
 def test_xp2f_compiles_file_readlines_loop(tmp_path: Path) -> None:
@@ -1281,8 +1729,335 @@ def test_xp2f_falls_back_to_loop_for_listcomp_calling_local_function(tmp_path: P
         ],
     )
     out_f90 = (tmp_path / "xlistcomp_local_func_call_p.f90").read_text(encoding="utf-8")
-    assert re.search(r"\blc_idx_\d+_\d+\s*=\s*\d+\s*\+", out_f90), out_f90
-    assert re.search(r"\bf\(x=si,\s*y=2\.0_dp\)", out_f90, re.IGNORECASE), out_f90
+    # User-reported further simplification: when this rewrite's whole
+    # generated loop body is still exactly the one `TARGET[idx] = ELT`
+    # statement it produces, idx (and the enumerate value variable) are
+    # both single-use, read-only aliases for values already directly
+    # expressible via the Fortran loop counter itself -- so they're
+    # fused away entirely rather than synthesized as their own
+    # variables: `out_(i) = f(x=Sv(i), y=2.0_dp)`, no idx_N and no
+    # separate `si = ...` assignment at all. Sv itself is never
+    # mutated anywhere in this program, so on top of that fusion, the
+    # `iter_tmp` materialization step is ALSO skipped entirely (a
+    # second, independent user-reported simplification) -- Sv is
+    # indexed directly rather than through a defensive copy of it.
+    assert "idx_" not in out_f90
+    assert "iter_tmp" not in out_f90
+    assert re.search(r"\bout_\(i\) = f\(x=Sv\(i\),\s*y=2\.0_dp\)", out_f90, re.IGNORECASE), out_f90
+    # User-reported preference: the block-local do-loop counter that
+    # walks the source array should be a short, simple name ("i")
+    # rather than a Python-source-line-number-derived one
+    # ("i_iter_175") -- it's a synthesized helper that has nothing to
+    # do with the original source, so a line number embedded in it is
+    # just noise.
+    assert re.search(r"\bdo i = 1, size\(Sv\)", out_f90), out_f90
+    assert "i_iter_" not in out_f90
+
+
+def test_xp2f_block_local_loop_counter_avoids_colliding_with_outer_i(tmp_path: Path) -> None:
+    # The short "i" name picked for a block-local do-loop counter (see
+    # the test above) must never collide with a REAL variable already
+    # named "i" in the enclosing procedure -- falls back to "i_1"
+    # instead of silently shadowing it.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlistcomp_i_collision.py",
+        [
+            "import numpy as np",
+            "",
+            "def f(v):",
+            "    return v * 2.0",
+            "",
+            "i = 7",
+            "arr = np.array([1.0, 2.0, 3.0])",
+            "out = np.array([f(x) for x in arr])",
+            "print(i)",
+            "print(out)",
+        ],
+    )
+    out_f90 = (tmp_path / "xlistcomp_i_collision_p.f90").read_text(encoding="utf-8")
+    # arr is a compile-time constant (never mutated), so the source
+    # array is indexed directly rather than through a defensive
+    # `iter_tmp` copy of it (a separate, later optimization).
+    assert re.search(r"\bdo i_1 = 1, size\(arr\)", out_f90), out_f90
+
+
+def test_xp2f_listcomp_loop_fusion_handles_multiple_uses_of_loop_var(tmp_path: Path) -> None:
+    # The loop-variable value is substituted at EVERY occurrence in the
+    # element expression, not just a first/single one.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xlistcomp_fuse_multiuse.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def f(v):",
+                "    return v * 2.0",
+                "",
+                "arr = np.array([1.0, 2.0, 3.0])",
+                "out = np.array([f(v) + v for v in arr])",
+                "print(out)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xlistcomp_fuse_multiuse_p.f90").read_text(encoding="utf-8")
+    # arr is never mutated anywhere in this program, so on top of the
+    # idx/val fusion, the `iter_tmp` materialization step is ALSO
+    # skipped entirely -- arr is indexed directly.
+    assert "iter_tmp" not in out_f90
+    assert re.search(
+        r"\bout_\(i\) = f\(arr\(i\)\) \+ arr\(i\)", out_f90, re.IGNORECASE
+    ), out_f90
+
+
+def test_xp2f_hand_written_enumerate_loop_never_fuses_away_its_variables(tmp_path: Path) -> None:
+    # The single-statement-body fusion above is restricted to loops the
+    # listcomp-array-assign rewrite itself generates (marked internally
+    # via `_synth_single_assign_loop`) -- a HAND-WRITTEN `for idx, val in
+    # enumerate(arr):` loop, even one with the exact same single-
+    # statement-body shape, must keep its own idx/val variables, since
+    # unlike the rewrite's synthetic names, a user's own loop variables
+    # can legally be read again after the loop ends (as this test does).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xhandwritten_enumerate.py"
+    src.write_text(
+        "\n".join(
+            [
+                "arr = [1.0, 2.0, 3.0]",
+                "out = [0.0, 0.0, 0.0]",
+                "for idx, val in enumerate(arr):",
+                "    out[idx] = val * 2.0",
+                "print(idx)",
+                "print(out)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xhandwritten_enumerate_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"\bidx = i - 1\b", out_f90), out_f90
+    # arr is never mutated anywhere in this program either, so (a
+    # separate, independent optimization from the idx/val fusion this
+    # test is actually about) it's indexed directly rather than through
+    # a defensive `iter_tmp` copy of it.
+    assert "iter_tmp" not in out_f90
+    assert re.search(r"\bval = arr\(i\)", out_f90), out_f90
+    assert re.search(r"\bprint \*, idx\b", out_f90), out_f90
+
+
+def test_xp2f_iter_source_array_copy_kept_when_mutated_in_loop_body(tmp_path: Path) -> None:
+    # User-reported real example (xdelta_gamma.py): iterating a plain
+    # array variable never mutated anywhere in the loop needs no
+    # defensive `iter_tmp` copy -- it's indexed directly. But when the
+    # SAME array IS written to somewhere in the loop's own body (here,
+    # `arr[idx] = ...`), the copy must be kept: without it, later
+    # iterations would read back values already overwritten by earlier
+    # ones instead of the array's original contents, changing the
+    # answer -- confirmed by --run-both matching Python's own semantics
+    # exactly (Python's `enumerate(arr)` also iterates a live view, but
+    # every value here is read into `val` before `arr` is written, so
+    # a real behavior change would show up as a genuine PASS/FAIL
+    # divergence, not just cosmetic).
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xiter_src_mutated_in_body.py"
+    src.write_text(
+        "\n".join(
+            [
+                "arr = [1.0, 2.0, 3.0]",
+                "out = [0.0, 0.0, 0.0]",
+                "for idx, val in enumerate(arr):",
+                "    out[idx] = val * 2.0",
+                "    arr[idx] = val + 100.0",
+                "print(out)",
+                "print(arr)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xiter_src_mutated_in_body_p.f90").read_text(encoding="utf-8")
+    assert "iter_tmp = arr" in out_f90, out_f90
+
+
+def test_xp2f_elemental_call_loop_vectorizes_with_elemental_flag(tmp_path: Path) -> None:
+    # User-reported real example (xdelta_gamma.py --elemental): once
+    # bs_straddle_value gets promoted to `pure elemental`, the whole
+    # per-element loop this project's own listcomp-array-assign rewrite
+    # produces collapses to a single vectorized statement -- Fortran
+    # elemental calls broadcast automatically over a whole array
+    # argument, with IDENTICAL syntax to the scalar case. The `allocate`
+    # this rewrite also emits becomes unnecessary too (an allocatable
+    # array auto-allocates on assignment from a conformable RHS shape)
+    # and is dropped along with the loop.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xelem_vectorize.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def f(v):",
+                "    return v * 2.0 - 1.0",
+                "",
+                "arr = np.array([1.0, 2.0, 3.0])",
+                "out = np.array([f(v) for v in arr])",
+                "print(out)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--elemental", "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xelem_vectorize_p.f90").read_text(encoding="utf-8")
+    assert "pure elemental function f" in out_f90, out_f90
+    assert "allocate(out" not in out_f90, out_f90
+    assert "do i" not in out_f90, out_f90
+    assert re.search(r"\bout_\s*=\s*f\(arr\)", out_f90, re.IGNORECASE), out_f90
+
+
+def test_xp2f_elemental_call_loop_vectorizes_nested_all_elemental_chain(tmp_path: Path) -> None:
+    # A call whose OWN argument is itself another call is still safe to
+    # vectorize as long as EVERY level of nesting, all the way out to
+    # the loop body's top level, is a confirmed-elemental function --
+    # `combiner(helper(v), 5.0)` becomes `combiner(helper(arr), 5.0_dp)`.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xelem_nested_safe.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def helper(v):",
+                "    return v + 1.0",
+                "",
+                "def combiner(a, b):",
+                "    return a * 2.0 + b",
+                "",
+                "arr = np.array([1.0, 2.0, 3.0])",
+                "out = np.array([combiner(helper(v), 5.0) for v in arr])",
+                "print(out)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--elemental", "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xelem_nested_safe_p.f90").read_text(encoding="utf-8")
+    assert "do i" not in out_f90, out_f90
+    assert re.search(r"\bout_\s*=\s*combiner\(helper\(arr\),\s*5\.0_dp\)", out_f90, re.IGNORECASE), out_f90
+
+
+def test_xp2f_elemental_call_loop_declines_when_outer_call_not_elemental(tmp_path: Path) -> None:
+    # The mirror-image safety case: `not_elemental(helper(v), fixed)` --
+    # helper() alone looks safe (it IS elemental), but it's wrapped by
+    # not_elemental(), which takes an array argument (fixed) and so can
+    # never itself be elemental. Vectorizing would pass an array where
+    # not_elemental expects a scalar -- correctly declined, keeping the
+    # safe per-element loop. (Regression test for a bug caught and fixed
+    # before shipping: an earlier version of this check only verified
+    # the INNERMOST enclosing call, missing that the call it's nested
+    # inside also needs to be safe.)
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xelem_nested_unsafe.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def helper(v):",
+                "    return v + 1.0",
+                "",
+                "def not_elemental(a, arr2):",
+                "    return a + arr2[0]",
+                "",
+                "fixed = np.array([100.0, 200.0])",
+                "arr = np.array([1.0, 2.0, 3.0])",
+                "out = np.array([not_elemental(helper(v), fixed) for v in arr])",
+                "print(out)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--elemental", "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xelem_nested_unsafe_p.f90").read_text(encoding="utf-8")
+    assert "pure elemental function helper" in out_f90, out_f90
+    assert "pure function not_elemental" in out_f90, out_f90
+    assert "elemental function not_elemental" not in out_f90, out_f90
+    assert re.search(r"\bdo i = 1, size\(arr\)", out_f90), out_f90
 
 
 def test_fortran_rewrite_listcomp_array_assign_preserves_vectorized_form_when_possible() -> None:
@@ -4909,6 +5684,102 @@ def test_fortran_narrow_paren_simplification_never_strips_mandatory_if_where_par
     assert out[14] == "   z = -w", out
 
 
+def test_fortran_narrow_paren_simplification_strips_comparison_operand_parens() -> None:
+    # User-reported real examples, from xdelta_gamma.py's generated
+    # bisect_root: `if ((0.5_dp * (b_local - a_local)) < tol_opt) then`
+    # and `if ((fa * fm) <= 0) then` -- parens wrapping an ENTIRE operand
+    # of a relational operator (<, <=, >, >=, ==, /=), on either side.
+    # Every arithmetic operator binds tighter than every relational one
+    # in Fortran, so these outer parens are always redundant regardless
+    # of what's inside them (+, -, *, or / at the operand's own top
+    # level) -- unlike the `*`/`/`-as-RHS-of-+/-` rule above, this
+    # carries no floating-point-reordering risk at all, since nothing
+    # about the wrapped operand's own internal grouping changes.
+    lines = [
+        "         if ((0.5_dp * (b_local - a_local)) < tol_opt) then",
+        "      if ((fa * fm) <= 0) then",
+        "   if (x < (y)) then",
+        "   x = (a - b) < (c + d)",
+        # Declined: a function/array call's own argument-list parens.
+        "   if (x < sqrt(y)) then",
+        "   if (sqrt(x) < y) then",
+        # Declined: the wrapped content itself has a relational/logical
+        # operator or a top-level comma (conservative substring check,
+        # not depth-aware -- matches this function's established style).
+        "   if ((a .and. b) < c) then",
+        "   if ((merge(0.0_dp, x, y < z)) < w) then",
+        # Untouched: no parens to strip, including the MANDATORY `if (`.
+        "   if (x < y) then",
+    ]
+    out = xp2f.simplify_narrow_redundant_arith_parens(lines)
+    assert out[0] == "         if (0.5_dp * (b_local - a_local) < tol_opt) then", out
+    assert out[1] == "      if (fa * fm <= 0) then", out
+    assert out[2] == "   if (x < y) then", out
+    assert out[3] == "   x = a - b < c + d", out
+    assert out[4] == "   if (x < sqrt(y)) then", out
+    assert out[5] == "   if (sqrt(x) < y) then", out
+    assert out[6] == "   if ((a .and. b) < c) then", out
+    assert out[7] == "   if ((merge(0.0_dp, x, y < z)) < w) then", out
+    assert out[8] == "   if (x < y) then", out
+
+
+def test_fortran_narrow_paren_simplification_strips_group_before_addsub() -> None:
+    # User-reported real example, from xdelta_gamma.py:
+    # `pnl_dg = (delta0 * x) + ((0.5_dp * gamma0) * x) * x`. The FIRST
+    # group is immediately followed by `+`, so rule (5) drops its parens
+    # regardless of its own content. The SECOND group is followed by `*`
+    # (out of rule (5)'s scope, which only fires right before a genuine
+    # +/-) but is itself the RHS operand of that same `+` with `*`-only
+    # content -- pre-existing rule (2) drops ITS outer parens too, so
+    # both groups end up unwrapped here.
+    lines = [
+        "   pnl_dg = (delta0 * x) + ((0.5_dp * gamma0) * x) * x",
+        # Safe: preceded by "-", but inner has no top-level +/-, so
+        # subtracting the whole group needs no sign distribution.
+        "   y = x - (a * b) + c",
+        # UNSAFE and must be left alone: preceded by "-" with inner
+        # +/- content -- stripping would require flipping every term's
+        # sign, which plain paren removal does not do. Regression for a
+        # bug caught before shipping: `x - (a - b) + c` was being
+        # rewritten to `x - a - b + c`, silently changing the computed
+        # value (10 vs 6 for x=10,a=3,b=2,c=1).
+        "   y = x - (a - b) + c",
+        "   y = x - (a + b) + c",
+    ]
+    out = xp2f.simplify_narrow_redundant_arith_parens(lines)
+    assert out[0] == "   pnl_dg = delta0 * x + (0.5_dp * gamma0) * x * x", out
+    assert out[1] == "   y = x - a * b + c", out
+    assert out[2] == "   y = x - (a - b) + c", out
+    assert out[3] == "   y = x - (a + b) + c", out
+
+
+def test_fortran_simplify_additive_zero_identity() -> None:
+    # User-reported real example, from xdelta_gamma.py:
+    # `idx_1 = 0 + (i_iter_175 - 1)` simplifies to
+    # `idx_1 = i_iter_175 - 1`.
+    lines = [
+        "   idx_1 = 0 + (i_iter_175 - 1)",
+        # Something follows on the line: parens are kept (can't just
+        # concatenate the bare expression into the middle of the line).
+        "   x = 0 + (a - b) + 5",
+        # Declined: real zero, not a bare integer literal -- IEEE-754
+        # has 0.0 + (-0.0) = +0.0, which is NOT the same value as -0.0,
+        # so this transform must not apply to real operands.
+        "   x = 0.0_dp + (a - b)",
+        # Declined: kind-suffixed integer zero looks textually similar
+        # but isn't matched by the bare-"0" pattern.
+        "   x = 0_dp + (a - b)",
+        # Declined: not a zero literal at all.
+        "   x = 1 + (a - b)",
+    ]
+    out = xp2f.simplify_additive_zero_identity(lines)
+    assert out[0] == "   idx_1 = i_iter_175 - 1", out
+    assert out[1] == "   x = (a - b) + 5", out
+    assert out[2] == "   x = 0.0_dp + (a - b)", out
+    assert out[3] == "   x = 0_dp + (a - b)", out
+    assert out[4] == "   x = 1 + (a - b)", out
+
+
 def test_fortran_wrap_never_splits_two_character_comparison_operator() -> None:
     # Regression test: user's own full-suite run surfaced a second real
     # bug -- the long-line wrapper's break-candidate scan offered "="
@@ -5099,6 +5970,66 @@ def test_xp2f_strips_parens_around_bare_atom() -> None:
     assert out[4] == lines[4], out
 
 
+def test_fortran_reorder_arg_decls_places_result_variable_before_locals() -> None:
+    # User-requested: a function's own `result(...)` variable should be
+    # declared right after the dummy arguments and before ordinary
+    # locals -- it's conceptually part of the signature, not a working
+    # variable. reorder_arg_decls_before_locals already grouped intent(
+    # ...) dummies ahead of locals; extended to also recognize a dummy
+    # PROCEDURE argument (`procedure(iface) :: f`, no POINTER attribute
+    # -- the only way that shape is legal Fortran) as belonging with the
+    # other arguments, and to carve the result variable into its own
+    # group positioned right after them.
+    #
+    # Also covers the same interface-block-awareness gap found in
+    # coalesce_nonadjacent_declarations: the declaration-section-boundary
+    # scan didn't recognize "interface" as declaration-ish (stopping the
+    # whole pass dead at the very first line for any callback-taking
+    # procedure), and the procedure's own end was found by searching for
+    # the first "end function"/"end subroutine", which matched the
+    # callback interface's OWN nested "end function" line first. Fixed
+    # the same way, plus: the interface block is now kept bundled with
+    # whichever declaration follows it (its own `procedure(iface) :: f`)
+    # so reordering can never separate the two.
+    lines = [
+        "pure function v_bisect_root(f, a, b, tol, max_iter) result(v_bisect_root_result)",
+        "   interface",
+        "      pure function v_bisect_root_f_cb_if(x) result(r)",
+        "         import dp",
+        "         real(kind=dp), intent(in) :: x",
+        "         real(kind=dp) :: r",
+        "      end function v_bisect_root_f_cb_if",
+        "   end interface",
+        "   procedure(v_bisect_root_f_cb_if) :: f",
+        "   real(kind=dp), intent(in) :: a, b",
+        "   real(kind=dp), intent(in), optional :: tol",
+        "   integer, intent(in), optional :: max_iter",
+        "   real(kind=dp) :: tol_opt",
+        "   integer :: max_iter_opt",
+        "   real(kind=dp) :: v_bisect_root_result",
+        "   real(kind=dp) :: fa, fb, fm, m",
+        "   integer :: i_",
+        "   real(kind=dp) :: a_local, b_local",
+        "   a_local = a",
+        "end function v_bisect_root",
+    ]
+
+    out = xp2f.reorder_arg_decls_before_locals(lines)
+    joined = "\n".join(out)
+
+    # The interface block travels with its own procedure(...) :: f line,
+    # both still positioned right after the function's own signature.
+    assert "\n".join(lines[1:9]) in joined, joined
+    # The result variable now comes right after the dummy args (interface
+    # block + procedure(...) :: f + the intent(...) ones), before ANY
+    # local -- specifically before tol_opt, which appears earlier than it
+    # in the ORIGINAL, unreordered source.
+    result_idx = out.index("   real(kind=dp) :: v_bisect_root_result")
+    tol_idx = out.index("   real(kind=dp) :: tol_opt")
+    max_iter_idx = out.index("   integer, intent(in), optional :: max_iter")
+    assert max_iter_idx < result_idx < tol_idx, joined
+
+
 def test_xp2f_coalesces_adjacent_scalar_parameter_declarations() -> None:
     # Regression test: user-reported example from a real generated
     # program --
@@ -5159,6 +6090,132 @@ def test_xp2f_coalesces_adjacent_scalar_parameter_declarations() -> None:
     # one line, exactly as the user described for a main-program context
     # where SAVE isn't a consideration.
     assert "real :: x, y, z = 3.0" in joined, joined
+
+
+def test_xp2f_coalesce_nonadjacent_declarations_merges_past_callback_interface() -> None:
+    # User-reported real gap: a procedure taking a dummy PROCEDURE
+    # argument declares its callback's own abstract interface right at
+    # the top of its declaration section (e.g. v_bisect_root's
+    # `interface / pure function v_bisect_root_f_cb_if(x) result(r) /
+    # ... / end interface`) -- but the section-boundary scan didn't
+    # recognize "interface" as declaration-ish at all, so it stopped
+    # dead on the very FIRST line, treating the section as completely
+    # empty and leaving every real declaration after it (tol_opt,
+    # v_bisect_root_result, fa/fb/fm/m, a_local/b_local, ...) untouched.
+    # Worse, a SEPARATE bug in the same pass located the procedure's own
+    # end by searching for the first "end function"/"end subroutine" --
+    # which matched the callback interface's OWN nested "end function"
+    # line first, truncating the pass's view of the procedure's body
+    # entirely.
+    #
+    # Fixed by tracking interface nesting in both the end-of-procedure
+    # search and the declaration-section-boundary scan (walking straight
+    # past an entire interface block rather than stopping at it or
+    # inside it), and by keeping the interface block itself as one
+    # opaque, position-preserving unit that's never parsed as a merge
+    # candidate (so nothing inside it -- e.g. its own `real(kind=dp),
+    # intent(in) :: x` -- gets mixed into the OUTER function's locals).
+    lines = [
+        "pure function v_bisect_root(f, a, b, tol, max_iter) result(v_bisect_root_result)",
+        "   interface",
+        "      pure function v_bisect_root_f_cb_if(x) result(r)",
+        "         import dp",
+        "         real(kind=dp), intent(in) :: x",
+        "         real(kind=dp) :: r",
+        "      end function v_bisect_root_f_cb_if",
+        "   end interface",
+        "   procedure(v_bisect_root_f_cb_if) :: f",
+        "   real(kind=dp), intent(in) :: a, b",
+        "   real(kind=dp), intent(in), optional :: tol",
+        "   integer, intent(in), optional :: max_iter",
+        "   real(kind=dp) :: tol_opt",
+        "   integer :: max_iter_opt",
+        "   real(kind=dp) :: v_bisect_root_result",
+        "   real(kind=dp) :: fa, fb, fm, m",
+        "   integer :: i_",
+        "   real(kind=dp) :: a_local, b_local",
+        "   a_local = a",
+        "end function v_bisect_root",
+    ]
+
+    out = xp2f.coalesce_nonadjacent_declarations(lines, max_len=10**9)
+    joined = "\n".join(out)
+
+    # The interface block itself is completely untouched, in place.
+    assert "\n".join(lines[1:8]) in joined, joined
+    # Everything after it (dummy args aside) merges by type-spec.
+    assert "real(kind=dp) :: tol_opt, fa, fb, fm, m, a_local, b_local" in joined, joined
+    assert "integer :: max_iter_opt, i_" in joined, joined
+    # The function's own result variable stays on its own line.
+    assert "real(kind=dp) :: v_bisect_root_result" in joined, joined
+
+
+def test_xp2f_module_global_merges_despite_unrelated_callback_result_name_collision(
+    tmp_path: Path,
+) -> None:
+    # User-reported real gap (xdelta_gamma.py): a callback's own abstract
+    # interface stub always names its result "r" (hardcoded, see
+    # `result(r)` in _emit_local_function), completely unrelated to
+    # anything else in the file -- but _result_names, computed as a
+    # single FILE-WIDE scan for every `result(NAME)` occurrence, doesn't
+    # distinguish "a real procedure's own result variable" (which
+    # legitimately must never be merged with its locals) from "some
+    # unrelated callback interface's hardcoded result name" -- so it
+    # wrongly protected the module-level global variable `r` from ever
+    # being merged with its sibling globals, breaking the merge chain
+    # for a variable right after it too (nothing left to merge into).
+    # Fixed by excluding `result(...)` matches found inside an
+    # `interface ... end interface` block from _result_names.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xmodule_global_r_collision.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def bisect(f, a, b):",
+                "    for _ in range(60):",
+                "        m = (a + b) / 2.0",
+                "        if f(a) * f(m) <= 0.0:",
+                "            b = m",
+                "        else:",
+                "            a = m",
+                "    return (a + b) / 2.0",
+                "",
+                "def g(x, k, r=0.0):",
+                "    return x * k + r",
+                "",
+                "def h(x, k, r=0.0):",
+                "    return x - k - r",
+                "",
+                "k = 2.0",
+                "r = 0.5",
+                "",
+                "def _cb(x):",
+                "    return g(x, k, r=r)",
+                "",
+                "root = bisect(_cb, -10.0, 10.0)",
+                "print(root)",
+                "print(h(1.0, k, r=r))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xmodule_global_r_collision_p.f90").read_text(encoding="utf-8")
+    assert "real(kind=dp) :: k, r" in out_f90, out_f90
+    # The unrelated callback interface stub keeps its own hardcoded name.
+    assert "result(r)" in out_f90, out_f90
 
 
 def test_xp2f_coalesce_simple_declarations_merges_scalar_initializer() -> None:
@@ -7548,8 +8605,19 @@ def test_xp2f_keeps_negative_literal_comparisons_valid_in_if_chains(tmp_path: Pa
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     out_text = (tmp_path / "xif_bug_p.f90").read_text(encoding="utf-8")
+    # The MANDATORY outer `if (...)` wrapper around the whole condition
+    # must never be stripped -- this exact shape (missing it) would be
+    # invalid Fortran syntax.
     assert "if (i - j) == (-1) then" not in out_text
-    assert "if ((i - j) == (-1)) then" in out_text or "if ((i - j) == -1) then" in out_text
+    # The redundant inner parens around each comparison operand (and the
+    # negated literal) ARE safe to strip and now are (a later, separate
+    # simplification) -- so the fully-parenthesized form is no longer
+    # the only accepted shape, just still a valid one.
+    assert (
+        "if ((i - j) == (-1)) then" in out_text
+        or "if ((i - j) == -1) then" in out_text
+        or "if (i - j == -1) then" in out_text
+    )
 
 
 def test_xp2f_normalizes_removed_numpy_scalar_aliases_for_run_both(tmp_path: Path) -> None:
@@ -10127,6 +11195,430 @@ def test_xp2f_pandas_df_print_truncates_and_to_string_prints_everything(tmp_path
     assert "30.000000" in out_tostr, out_tostr
     assert "69.000000" in out_tostr, out_tostr
     assert "[70 rows" not in out_tostr, out_tostr
+
+
+def test_xp2f_no_nan_safe_compare_flag_emits_plain_comparisons(tmp_path: Path) -> None:
+    # User-requested feature: by default, a real-valued comparison (<, <=,
+    # >, >=, ==, /=) is wrapped in a merge()/ieee_is_nan() guard so a NaN
+    # operand quietly evaluates the way Python/pandas would (False, True
+    # for !=) instead of tripping -ffpe-trap=invalid -- but for a function
+    # with several such comparisons (e.g. a piecewise PnL helper with
+    # `if x <= x_L: ... if x >= x_R: ...`), that guard buries the actual
+    # branching logic under several lines of merge()/ieee_is_nan() noise
+    # per condition. --no-nan-safe-compare (NAN_SAFE_COMPARISONS) opts out:
+    # plain `if (x <= x_L) then`, idiomatic and human-readable, at the
+    # cost of NaN-safety (a NaN operand can then crash a strict-FPE
+    # build). Default (flag absent) behavior is unchanged -- checked here
+    # too, so a regression in either direction is caught.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xno_nan_safe_compare.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def f(x, x_L, x_R):",
+                "    if x <= x_L:",
+                "        return -1.0",
+                "    if x >= x_R:",
+                "        return 1.0",
+                "    return 0.0",
+                "",
+                "print(f(-2.0, -1.0, 1.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc_default = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_default.returncode == 0, proc_default.stdout + proc_default.stderr
+    assert "Build: PASS" in proc_default.stdout, proc_default.stdout + proc_default.stderr
+    assert "Run: PASS" in proc_default.stdout, proc_default.stdout + proc_default.stderr
+    out_f90_default = (tmp_path / "xno_nan_safe_compare_p.f90").read_text(encoding="utf-8")
+    assert "ieee_is_nan" in out_f90_default, out_f90_default
+    assert re.search(r"if\s*\(x\s*<=\s*x_L\)", out_f90_default) is None, out_f90_default
+
+    proc_flag = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--no-nan-safe-compare", "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_flag.returncode == 0, proc_flag.stdout + proc_flag.stderr
+    assert "Build: PASS" in proc_flag.stdout, proc_flag.stdout + proc_flag.stderr
+    assert "Run: PASS" in proc_flag.stdout, proc_flag.stdout + proc_flag.stderr
+    out_f90_flag = (tmp_path / "xno_nan_safe_compare_p.f90").read_text(encoding="utf-8")
+    assert "ieee_is_nan" not in out_f90_flag, out_f90_flag
+    assert re.search(r"if\s*\(x\s*<=\s*x_L\)", out_f90_flag), out_f90_flag
+    assert re.search(r"if\s*\(x\s*>=\s*x_R\)", out_f90_flag), out_f90_flag
+    # Same output either way -- the flag only changes HOW the comparison
+    # is emitted, never the result for non-NaN inputs.
+    assert "-1.0" in proc_default.stdout, proc_default.stdout
+    assert "-1.0" in proc_flag.stdout, proc_flag.stdout
+
+
+def test_fortran_elemental_promotion_repacks_whole_wrapped_signature() -> None:
+    # User-reported real gap: `apply_decl_edit_at_or_continuation`
+    # (fortran_purity.py, used by both --elemental's promotion and the
+    # always-on `pure` promotion) used to edit only the ONE physical line
+    # of an already-`&`-wrapped multi-line signature that matched the
+    # editor's own regex, then leave the OTHER physical lines of that
+    # same statement untouched. Inserting "elemental " lengthens that one
+    # line just enough to need re-wrapping on its own, producing a
+    # locally-valid but needlessly fragmented split (an extra, under-
+    # filled continuation line) instead of the same statement's single,
+    # cleanly repacked wrap -- e.g.
+    #   pure elemental function f(x, delta0, &
+    #      & delta_L, delta_R, &
+    #      & x_L, x_R, gamma_L, gamma_R) &
+    #      & result(f_result)
+    # where "delta_L, delta_R, x_L, x_R, gamma_L, gamma_R) &" would
+    # easily fit on ONE continuation line. Fixed by rejoining the whole
+    # statement into one flat logical line before editing, then re-
+    # wrapping that fresh from scratch.
+    lines = [
+        "pure function pnl_piecewise_quad_linear_two_sided(x, delta0, delta_L, delta_R, &",
+        "   & x_L, x_R, gamma_L, gamma_R) &",
+        "   & result(pnl_piecewise_quad_linear_two_sided_result)",
+        "   real(kind=dp), intent(in) :: x",
+        "end function pnl_piecewise_quad_linear_two_sided",
+    ]
+    changed = fpurity.apply_decl_edit_at_or_continuation(lines, 0, fpurity.add_elemental_to_declaration)
+    assert changed
+    joined = " ".join(
+        ln.strip().lstrip("&").strip() for ln in lines[:3] if "function" in ln or ln.strip().startswith("&")
+    )
+    assert "pure elemental function" in joined, lines
+    assert "delta_L, delta_R, x_L, x_R, gamma_L, gamma_R" in joined, lines
+    for ln in lines[:3]:
+        assert len(ln) <= 80, lines
+    # Exactly 3 physical lines for the signature (matching a fresh wrap
+    # of the whole edited statement), not 4 (the old, fragmented split).
+    assert lines[3].strip().startswith("real"), lines
+
+
+def test_fortran_pure_promotion_allows_provably_pure_callback_chain() -> None:
+    # User-discussed real gap: a procedure taking a dummy PROCEDURE
+    # argument (a callback, e.g. xdelta_gamma.py's v_bisect_root/f) was
+    # UNCONDITIONALLY excluded from `pure` promotion, regardless of
+    # whether the callback could be proven pure -- Fortran actually
+    # allows a pure procedure to take a procedure dummy argument, IF the
+    # dummy's own abstract interface is ALSO declared pure (12.6/
+    # C1592), which in turn requires every actual argument ever passed
+    # for it, anywhere in the file, to itself be provably pure.
+    #
+    # This covers the harder, real-world shape: bisect's OWN callback
+    # is never called with a concrete name directly -- bracket (itself
+    # taking a callback) just hands ITS OWN "f" straight through to
+    # bisect. Proving bisect's interface safe therefore depends,
+    # transitively, on bracket's OWN interface also being safe, which in
+    # turn depends on caller's actual argument (sq, an ordinary already-
+    # pure function) -- exactly xdelta_gamma.py's f_right/f_left ->
+    # v_bracket_and_solve_positive_root -> v_bisect_root chain.
+    lines = [
+        "module m",
+        "   implicit none",
+        "contains",
+        "",
+        "   function bisect(f, a, b) result(r)",
+        "      interface",
+        "         function bisect_f_cb_if(x) result(y)",
+        "            real(kind=8), intent(in) :: x",
+        "            real(kind=8) :: y",
+        "         end function bisect_f_cb_if",
+        "      end interface",
+        "      procedure(bisect_f_cb_if) :: f",
+        "      real(kind=8), intent(in) :: a, b",
+        "      real(kind=8) :: r",
+        "      r = f(a) + f(b)",
+        "   end function bisect",
+        "",
+        "   function bracket(f, a, b) result(r)",
+        "      interface",
+        "         function bracket_f_cb_if(x) result(y)",
+        "            real(kind=8), intent(in) :: x",
+        "            real(kind=8) :: y",
+        "         end function bracket_f_cb_if",
+        "      end interface",
+        "      procedure(bracket_f_cb_if) :: f",
+        "      real(kind=8), intent(in) :: a, b",
+        "      real(kind=8) :: r",
+        "      r = bisect(f, a, b)",
+        "   end function bracket",
+        "",
+        "   pure function sq(x) result(y)",
+        "      real(kind=8), intent(in) :: x",
+        "      real(kind=8) :: y",
+        "      y = x * x",
+        "   end function sq",
+        "",
+        "   function caller(a, b) result(r)",
+        "      real(kind=8), intent(in) :: a, b",
+        "      real(kind=8) :: r",
+        "      r = bracket(sq, a, b)",
+        "   end function caller",
+        "",
+        "end module m",
+    ]
+    updated = fpurity.mark_pure_where_provable(lines)
+    text = "\n".join(updated)
+    assert re.search(r"^\s*pure function bisect\(", text, re.MULTILINE), text
+    assert re.search(r"^\s*pure function bracket\(", text, re.MULTILINE), text
+    assert re.search(r"^\s*pure function bisect_f_cb_if\(", text, re.MULTILINE), text
+    assert re.search(r"^\s*pure function bracket_f_cb_if\(", text, re.MULTILINE), text
+
+
+def test_fortran_pure_promotion_declines_callback_with_unresolvable_actual() -> None:
+    # Companion negative case: when a callback's actual argument at some
+    # call site can't be resolved to a provably-pure name at all (here,
+    # an expression rather than a bare name), the analysis must decline
+    # to mark the interface (or the procedure taking it) pure -- staying
+    # exactly as conservative as before this feature existed, never
+    # guessing wrong in the unsafe direction.
+    lines = [
+        "module m",
+        "   implicit none",
+        "contains",
+        "",
+        "   function apply(f, a) result(r)",
+        "      interface",
+        "         function apply_f_cb_if(x) result(y)",
+        "            real(kind=8), intent(in) :: x",
+        "            real(kind=8) :: y",
+        "         end function apply_f_cb_if",
+        "      end interface",
+        "      procedure(apply_f_cb_if) :: f",
+        "      real(kind=8), intent(in) :: a",
+        "      real(kind=8) :: r",
+        "      r = f(a)",
+        "   end function apply",
+        "",
+        "   pure function sq(x) result(y)",
+        "      real(kind=8), intent(in) :: x",
+        "      real(kind=8) :: y",
+        "      y = x * x",
+        "   end function sq",
+        "",
+        "   function caller(a) result(r)",
+        "      real(kind=8), intent(in) :: a",
+        "      real(kind=8) :: r",
+        "      r = apply(pick(a), a)",
+        "   end function caller",
+        "",
+        "   function pick(a) result(f_out)",
+        "      real(kind=8), intent(in) :: a",
+        "      procedure(sq), pointer :: f_out",
+        "      f_out => sq",
+        "   end function pick",
+        "",
+        "end module m",
+    ]
+    updated = fpurity.mark_pure_where_provable(lines)
+    text = "\n".join(updated)
+    assert not re.search(r"^\s*pure function apply\(", text, re.MULTILINE), text
+    assert not re.search(r"^\s*pure function apply_f_cb_if\(", text, re.MULTILINE), text
+
+
+def test_xp2f_compiles_pure_callback_chain_end_to_end(tmp_path: Path) -> None:
+    # End-to-end companion to the two direct-analysis tests above,
+    # through the real xp2f.py pipeline (the hand-crafted-Fortran tests
+    # cover the harder MULTI-level pass-through case directly against
+    # mark_pure_where_provable itself): a local function taking a
+    # callback (bisect_root) reached from a nested-closure callback
+    # (diff) that's already pure should come out `pure` in the generated
+    # Fortran, and the program must still build and run to the correct
+    # answer.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xpure_callback_chain.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def bisect_root(f, a, b):",
+                "    fa = f(a)",
+                "    for i in range(60):",
+                "        mid = (a + b) / 2.0",
+                "        fm = f(mid)",
+                "        if fa * fm > 0.0:",
+                "            a = mid",
+                "            fa = fm",
+                "        else:",
+                "            b = mid",
+                "    return (a + b) / 2.0",
+                "",
+                "def find_root_near(target, lo, hi):",
+                "    def diff(x):",
+                "        return x * x - target",
+                "    return bisect_root(diff, lo, hi)",
+                "",
+                "result = find_root_near(2.0, 0.0, 10.0)",
+                "print(result)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "1.4142135" in proc.stdout, proc.stdout
+    out_f90 = (tmp_path / "xpure_callback_chain_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"^\s*pure function bisect_root\(", out_f90, re.MULTILINE), out_f90
+    assert re.search(r"^\s*pure function bisect_root_f_cb_if\(", out_f90, re.MULTILINE), out_f90
+
+
+def test_xp2f_passthrough_callback_interface_infers_scalar_not_array(tmp_path: Path) -> None:
+    # Real bug, surfaced while building the pure-callback-chain feature
+    # above: a wrapper function that hands its OWN callback parameter
+    # straight through to another local function's callback parameter,
+    # never calling it directly itself (e.g. bracket_and_solve(f, x0,
+    # x1): a = x0; b = x1; return bisect_root(f, a, b)), had its
+    # callback interface's parameter wrongly inferred as an ARRAY
+    # (`x(:)`) instead of scalar. Two compounding bugs:
+    #
+    # 1. The pass-through rank fallback (xp2f.py, callback_specs
+    #    computation) blindly guessed rank 1 whenever a callback
+    #    parameter was never called directly in the wrapper's own body,
+    #    without first checking local_callback_actual_specs -- which
+    #    already tracks, from a whole-program scan, the ACTUAL rank of
+    #    whatever concrete function gets passed for that parameter at
+    #    the wrapper's own call sites (diff, here -- a plain scalar
+    #    function). Fixed to prefer that real evidence, falling back to
+    #    the rank-1 guess only when no such evidence exists at all.
+    #
+    # 2. That real evidence never got recorded in the first place for a
+    #    callback closing over a module-level global it only READS
+    #    (never assigns) -- e.g. a closure-hoisted `closure_..._target`
+    #    global (see the closure-hoisting feature above): the scan
+    #    context built for exactly this analysis (_callback_scan_tr)
+    #    only prescans the one function's own body, which never
+    #    registers a name it never assigns, cascading into an
+    #    unresolved return-KIND for the whole function and discarding
+    #    an otherwise-fine return-RANK inference right alongside it.
+    #    Fixed by seeding that scan context with every known module-
+    #    level global's kind before prescanning.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xpassthrough_callback_rank.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def bisect_root(f, a, b):",
+                "    fa = f(a)",
+                "    for i in range(60):",
+                "        mid = (a + b) / 2.0",
+                "        fm = f(mid)",
+                "        if fa * fm > 0.0:",
+                "            a = mid",
+                "            fa = fm",
+                "        else:",
+                "            b = mid",
+                "    return (a + b) / 2.0",
+                "",
+                "def bracket_and_solve(f, x0, x1):",
+                "    a = x0",
+                "    b = x1",
+                "    return bisect_root(f, a, b)",
+                "",
+                "def find_root_near(target, lo, hi):",
+                "    def diff(x):",
+                "        return x * x - target",
+                "    return bracket_and_solve(diff, lo, hi)",
+                "",
+                "result = find_root_near(2.0, 0.0, 10.0)",
+                "print(result)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "1.4142135" in proc.stdout, proc.stdout
+    out_f90 = (tmp_path / "xpassthrough_callback_rank_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"function bracket_and_solve_f_cb_if\(x\)", out_f90), out_f90
+    assert "x(:)" not in out_f90, out_f90
+
+
+def test_xp2f_closure_hoisting_deduplicates_repeated_snapshot_and_seed(tmp_path: Path) -> None:
+    # User-reported real gap: two nested defs hoisted from the SAME
+    # enclosing function, closing over the SAME free variable (e.g.
+    # xdelta_gamma.py's f_right/f_left, both closing over piecewise_
+    # breakpoints_straddle's own "delta0"), each independently
+    # contributed their own top-level `closure_..._delta0 = 0.0_dp` seed
+    # AND their own `global closure_..._delta0; closure_..._delta0 =
+    # delta0` snapshot right before their respective call sites -- two
+    # back-to-back, byte-identical lines each, since nothing between them
+    # could have changed the shared source value. Fixed: the top-level
+    # seed is now emitted once per unique closure_... name, and a
+    # snapshot already known up to date from an earlier statement in the
+    # SAME straight-line block is skipped rather than re-emitted.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xclosure_dedup.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def bisect_root(f, a, b):",
+                "    fa = f(a)",
+                "    for i in range(60):",
+                "        mid = (a + b) / 2.0",
+                "        fm = f(mid)",
+                "        if fa * fm > 0.0:",
+                "            a = mid",
+                "            fa = fm",
+                "        else:",
+                "            b = mid",
+                "    return (a + b) / 2.0",
+                "",
+                "def two_roots(target, lo, hi):",
+                "    def f_right(x):",
+                "        return x * x - target",
+                "    def f_left(y):",
+                "        return y * y - target",
+                "    r = bisect_root(f_right, lo, hi)",
+                "    l = bisect_root(f_left, lo, hi)",
+                "    return r, l",
+                "",
+                "a, b = two_roots(4.0, 0.0, 10.0)",
+                "print(a, b)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    out_f90 = (tmp_path / "xclosure_dedup_p.f90").read_text(encoding="utf-8")
+    seed_lines = [ln for ln in out_f90.splitlines() if re.match(r"\s*closure_two_roots_target\s*=\s*0\.0_dp\s*$", ln)]
+    assert len(seed_lines) == 1, out_f90
+    snapshot_lines = [
+        ln for ln in out_f90.splitlines() if re.match(r"\s*closure_two_roots_target\s*=\s*target\s*$", ln)
+    ]
+    assert len(snapshot_lines) == 1, out_f90
 
 
 def test_xp2f_rng_normal_positional_loc_scale_applied(tmp_path: Path) -> None:
