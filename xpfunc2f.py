@@ -14,6 +14,9 @@
 # usage:
 #   python xpfunc2f.py script.py function_name
 #   python xpfunc2f.py script.py function_name --out-dir build --verify
+#   python xpfunc2f.py script.py --all           (bridge every top-level
+#     function except main(), independently; --run-both/--time-both are
+#     attempted afterward only if ALL of them bridged)
 #
 # Scope (deliberately narrow, matching xp2f.py's own "narrow first cut"
 # philosophy): the TARGET function -- the only one directly exposed to
@@ -52,6 +55,7 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import xp2f
@@ -230,7 +234,7 @@ def _split_top_level_op(expr, ops):
     return result
 
 
-def _combine_elementwise(left, right, size_of, scalar_names):
+def _combine_elementwise(left, right, size_of, scalar_names, dependency_resolver=None):
     """For two operands of a binary elementwise Fortran arithmetic op,
     return whichever operand's own length resolves as a genuine rank-1
     array size (NumPy/Fortran broadcasting: combining an array with a
@@ -241,10 +245,10 @@ def _combine_elementwise(left, right, size_of, scalar_names):
     expression is too), or None if either side is genuinely unresolvable
     and neither side had a real size (might itself hide an array).
     """
-    ls = _infer_rank1_size(left, size_of, scalar_names)
+    ls = _infer_rank1_size(left, size_of, scalar_names, dependency_resolver)
     if isinstance(ls, str):
         return ls
-    rs = _infer_rank1_size(right, size_of, scalar_names)
+    rs = _infer_rank1_size(right, size_of, scalar_names, dependency_resolver)
     if isinstance(rs, str):
         return rs
     if ls is _SCALAR and rs is _SCALAR:
@@ -252,7 +256,7 @@ def _combine_elementwise(left, right, size_of, scalar_names):
     return None
 
 
-def _infer_rank1_size(expr, size_of, scalar_names):
+def _infer_rank1_size(expr, size_of, scalar_names, dependency_resolver=None):
     """Try to symbolically classify the rank-1-or-scalar Fortran
     expression `expr`, given `size_of` (a dict mapping a lowercase
     local/dummy array NAME already known to have a safe, caller-visible
@@ -290,6 +294,9 @@ def _infer_rank1_size(expr, size_of, scalar_names):
         `_ARRAY_HELPER_ARG_LIKE_SIZE` above.
       - `NAME(single_subscript)` where NAME is a known array (in
         `size_of`) -- `_SCALAR` (an ordinary single-element access).
+      - a call to some OTHER, locally-defined dependency procedure, IF
+        `dependency_resolver` is given -- see
+        _make_local_dependency_resolver's own docstring.
     """
     expr = expr.strip()
     if not expr:
@@ -309,7 +316,7 @@ def _infer_rank1_size(expr, size_of, scalar_names):
 
     m = re.match(r"^-\s*(.+)$", expr, re.DOTALL)
     if m:
-        return _infer_rank1_size(m.group(1), size_of, scalar_names)
+        return _infer_rank1_size(m.group(1), size_of, scalar_names, dependency_resolver)
 
     if expr.startswith("(") and expr.endswith(")"):
         depth = 0
@@ -323,13 +330,13 @@ def _infer_rank1_size(expr, size_of, scalar_names):
                     whole = False
                     break
         if whole:
-            return _infer_rank1_size(expr[1:-1], size_of, scalar_names)
+            return _infer_rank1_size(expr[1:-1], size_of, scalar_names, dependency_resolver)
 
     for ops in (("+", "-"), ("*", "/"), ("**",)):
         split = _split_top_level_op(expr, ops)
         if split:
             left, _op, right = split
-            return _combine_elementwise(left, right, size_of, scalar_names)
+            return _combine_elementwise(left, right, size_of, scalar_names, dependency_resolver)
 
     m = re.match(r"^\[\s*(.*)\]\s*$", expr, re.DOTALL)
     if m:
@@ -342,7 +349,7 @@ def _infer_rank1_size(expr, size_of, scalar_names):
             return "0"
         sizes = []
         for part in parts:
-            s = _infer_rank1_size(part.strip(), size_of, scalar_names)
+            s = _infer_rank1_size(part.strip(), size_of, scalar_names, dependency_resolver)
             if s is None:
                 return None  # might itself be an unresolvable array -- bail
             sizes.append("1" if s is _SCALAR else f"({s})")
@@ -376,11 +383,19 @@ def _infer_rank1_size(expr, size_of, scalar_names):
                 return arg_parts[idx].strip() if idx < len(arg_parts) else None
             if fname in _ARRAY_HELPER_ARG_LIKE_SIZE:
                 idx = _ARRAY_HELPER_ARG_LIKE_SIZE[fname]
-                return _infer_rank1_size(arg_parts[idx], size_of, scalar_names) if idx < len(arg_parts) else None
+                return (
+                    _infer_rank1_size(arg_parts[idx], size_of, scalar_names, dependency_resolver)
+                    if idx < len(arg_parts)
+                    else None
+                )
             if fname in _ELEMENTWISE_UNARY_INTRINSICS and len(arg_parts) == 1:
-                return _infer_rank1_size(arg_parts[0], size_of, scalar_names)
+                return _infer_rank1_size(arg_parts[0], size_of, scalar_names, dependency_resolver)
             if fname in size_of:
                 return _SCALAR  # an ordinary single-element subscript of a known array
+            if dependency_resolver is not None:
+                resolved = dependency_resolver(fname, arg_parts)
+                if isinstance(resolved, str):
+                    return resolved
             return None
 
     return None
@@ -555,11 +570,39 @@ def check_f2py_compatible(lines, start, end, name):
             )
 
 
+def _find_top_level_double_colon(code):
+    """Return the index of the first `::` token at paren/bracket-depth 0
+    in `code`, or None if there isn't one -- distinguishes a genuine
+    Fortran declaration's own `TYPE, ATTRS :: names` separator from a
+    `::` that merely appears NESTED inside something else on the same
+    line, e.g. an array constructor's own type-spec (`[real(kind=dp) ::
+    1.0_dp, -ar]`). Confirmed a real bug without this distinction:
+    naively treating ANY line containing `::` as a declaration split
+    `ar_poly = [real(kind=dp) :: [1.0_dp], -ar]` (an ordinary ASSIGNMENT,
+    not a declaration at all) at its own top-level comma, producing two
+    broken, unbalanced lines ("syntax error in array constructor").
+    """
+    depth = 0
+    i = 0
+    n = len(code)
+    while i < n - 1:
+        ch = code[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth == 0 and ch == ":" and code[i + 1] == ":":
+            return i
+        i += 1
+    return None
+
+
 def _split_multi_name_decls(target_lines):
     """Normalize any declaration line listing SEVERAL names --
     `TYPE, ATTR1, ATTR2 :: name1(shape1), name2(shape2), ...` -- into one
     line PER name, each carrying the exact same type/attribute prefix. A
-    no-op for a line that already declares just one name.
+    no-op for a line that already declares just one name, OR that isn't
+    actually a declaration at all (see _find_top_level_double_colon).
 
     Several downstream per-name rewrites (see _convert_array_result)
     modify a matched declaration line AS A WHOLE, which is only safe
@@ -575,10 +618,11 @@ def _split_multi_name_decls(target_lines):
     out = []
     for ln in target_lines:
         code = _strip_comment(ln)
-        if "::" not in code:
+        idx = _find_top_level_double_colon(code)
+        if idx is None:
             out.append(ln)
             continue
-        prefix, _, names_part = code.partition("::")
+        prefix, names_part = code[:idx], code[idx + 2 :]
         names = _split_top_level(names_part)
         if len(names) <= 1:
             out.append(ln)
@@ -590,7 +634,229 @@ def _split_multi_name_decls(target_lines):
     return out
 
 
-def rewrite_target_for_f2py(lines, start, end, target_name):
+def _derive_no_alloc_array_size(proc_lines, name, arg_names, scalar_names, dependency_resolver=None):
+    """Try to derive `name`'s own caller-visible array-result size
+    expression from `proc_lines` (an already merge/split-normalized copy
+    of ONE procedure's own lines) when there's no `allocate(name(...))`
+    statement at all -- the "no allocate() fallback" set of forms
+    _infer_rank1_size recognizes (a whole-array copy/slice, an array
+    constructor, elementwise arithmetic, a recognized python.f90 helper
+    call, and -- if `dependency_resolver` is given -- a call to some
+    OTHER, locally-defined dependency procedure). Shared by
+    _convert_array_result (for the xpfunc2f.py TARGET's own array
+    result) and _make_local_dependency_resolver (recursively, for a
+    DEPENDENCY's own array result, when the target's own size expression
+    calls it) -- read-only, never mutates `proc_lines`. Returns a size
+    expression string in terms of `arg_names` (`proc_lines`'s OWN dummy
+    arguments), or None if not derivable this way.
+    """
+
+    def _find_decl(nm):
+        for i in range(1, len(proc_lines)):
+            code = _strip_comment(proc_lines[i])
+            if "::" not in code:
+                continue
+            m = re.search(rf"(?:::|,)\s*({re.escape(nm)})\b(\s*\(([^()]*)\))?", code, re.IGNORECASE)
+            if m:
+                return i, m
+        return None, None
+
+    assign_re = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
+    size_of = {}
+    for a in arg_names:
+        a_i, a_m = _find_decl(a)
+        if a_i is not None and a_m.group(3) and a_m.group(3).strip() != ":":
+            size_of[a.lower()] = a_m.group(3).strip()
+
+    # A local PARAMETER (compile-time-constant) array, declared `TYPE,
+    # parameter :: NAME(*) = [literal, ...]` -- its own size is exactly
+    # its own initializer's, resolvable the same way as any other array
+    # constructor.
+    param_re = re.compile(r"^\s*.*?\bparameter\b.*?::\s*([a-z_]\w*)\s*\(\s*\*\s*\)\s*=\s*(.+)$", re.IGNORECASE)
+    for i in range(1, len(proc_lines)):
+        pm = param_re.match(_strip_comment(proc_lines[i]))
+        if pm and pm.group(1).lower() not in size_of:
+            psize = _infer_rank1_size(pm.group(2), size_of, scalar_names, dependency_resolver)
+            if isinstance(psize, str):
+                size_of[pm.group(1).lower()] = psize
+
+    for i in range(1, len(proc_lines)):
+        lm = assign_re.match(_strip_comment(proc_lines[i]))
+        if not lm:
+            continue
+        lname = lm.group(1)
+        if lname.lower() == name.lower() or lname.lower() in size_of:
+            continue  # `name` itself resolved below; already known otherwise
+        li, lm2 = _find_decl(lname)
+        if li is None or lm2.group(3) is None or lm2.group(3).strip() != ":":
+            continue  # not a rank-1 allocatable local
+        resolved = _infer_rank1_size(lm.group(2), size_of, scalar_names, dependency_resolver)
+        if isinstance(resolved, str):
+            size_of[lname.lower()] = resolved
+
+    name_rhs = None
+    for i in range(1, len(proc_lines)):
+        am = assign_re.match(_strip_comment(proc_lines[i]))
+        if am and am.group(1).lower() == name.lower():
+            name_rhs = am.group(2)
+    if name_rhs is not None:
+        resolved = _infer_rank1_size(name_rhs, size_of, scalar_names, dependency_resolver)
+        if isinstance(resolved, str):
+            return resolved
+    return None
+
+
+def _make_local_dependency_resolver(lines, procedures, target_name):
+    """Build a `_infer_rank1_size`-compatible `dependency_resolver`:
+    given a call `fname(arg_texts...)` to some OTHER procedure defined
+    in the SAME already-transpiled module (`procedures`, from
+    parse_module) -- not the xpfunc2f.py TARGET itself, and only tried
+    after every recognized python.f90 helper/intrinsic already failed to
+    match -- try to derive THAT procedure's own array result size
+    (recursively, via the exact same set of forms _infer_rank1_size and
+    _derive_no_alloc_array_size already recognize, including a call to
+    yet ANOTHER local dependency), then substitute its own dummy
+    argument names for the ACTUAL argument text at THIS call site.
+
+    Confirmed a real, common shape: examples/xarma_nagarch_fit.py's own
+    `simulate_arma_nagarch` computes `eps = simulate_nagarch_noise(n +
+    burnin, omega, alpha, theta, beta)`, where `simulate_nagarch_noise`
+    is a plain, locally-defined function with `allocate(eps(n))` --
+    its own length is simply its own first argument, `n`. Substituting
+    the call site's own actual first argument (`n + burnin`) for that
+    gives `simulate_arma_nagarch`'s own use of `eps` a caller-visible
+    size, with NO cross-procedure ambiguity: the dependency's own
+    signature positionally maps 1:1 onto the call site's own arguments.
+
+    Conservative on purpose, matching this project's own established
+    style: only a plain FUNCTION with a rank-1 allocatable result is
+    handled (a subroutine's own multi-value-return convention is a
+    single-source-of-truth ambiguity this doesn't attempt -- WHICH
+    intent(out) dummy is "the" array result a caller-side expression
+    means isn't well-defined the way a function's own single result is);
+    a result whose size expression references anything other than the
+    dependency's OWN dummy arguments (a value computed inside ITS OWN
+    body) is rejected, the same "not knowable ahead of the call" check
+    _convert_array_result already applies to the xpfunc2f.py target
+    itself. A dependency's own resolution is cached (memoized) across
+    repeated calls, and guarded against infinite recursion for a
+    (theoretical) circular dependency chain.
+    """
+    cache: dict[str, tuple[list[str], str] | None] = {}
+
+    def _resolve(fname, arg_texts):
+        key = fname.lower()
+        if key == target_name.lower() or key not in procedures:
+            return None
+        if key not in cache:
+            cache[key] = None  # guards against infinite recursion for a circular call chain
+            cache[key] = _resolve_one(key)
+        cached = cache[key]
+        if cached is None:
+            return None
+        dep_arg_names, size_expr = cached
+        if len(arg_texts) < len(dep_arg_names):
+            return None  # fewer args than the dependency's own signature (e.g. an omitted optional)
+        substituted = size_expr
+        for dep_arg, actual_text in zip(dep_arg_names, arg_texts):
+            substituted = re.sub(
+                rf"\b{re.escape(dep_arg)}\b", f"({actual_text.strip()})", substituted, flags=re.IGNORECASE
+            )
+        return substituted
+
+    def _resolve_one(key):
+        dep_start, dep_end = procedures[key]
+        dep_lines = _split_multi_name_decls(_merge_continuations(list(lines[dep_start : dep_end + 1])))
+        dep_sig_m = SIG_RE.match(_strip_comment(dep_lines[0]))
+        if not dep_sig_m or dep_sig_m.group("kind").lower() != "function":
+            return None
+        dep_arg_names = [a for a in _split_top_level(dep_sig_m.group("args")) if a]
+        dep_result_name = key
+        if dep_sig_m.group("result"):
+            rm = RESULT_NAME_RE.search(dep_sig_m.group("result"))
+            if rm:
+                dep_result_name = rm.group(1)
+
+        dep_scalar_names = set()
+        for i in range(1, len(dep_lines)):
+            code = _strip_comment(dep_lines[i])
+            if "::" not in code:
+                continue
+            decl_part = code.split("::", 1)[1]
+            for decl in _split_top_level(decl_part):
+                dm = re.match(r"^\s*([a-z_]\w*)\s*(\([^()]*\))?\s*$", decl.strip(), re.IGNORECASE)
+                if dm and not dm.group(2):
+                    dep_scalar_names.add(dm.group(1).lower())
+
+        dep_ri, dep_rm = None, None
+        for i in range(1, len(dep_lines)):
+            code = _strip_comment(dep_lines[i])
+            if "::" not in code:
+                continue
+            rm2 = re.search(rf"(?:::|,)\s*({re.escape(dep_result_name)})\b(\s*\(([^()]*)\))?", code, re.IGNORECASE)
+            if rm2:
+                dep_ri, dep_rm = i, rm2
+                break
+        if dep_ri is None or dep_rm.group(3) is None or "," in dep_rm.group(3) or dep_rm.group(3).strip() != ":":
+            return None  # not a plain rank-1 allocatable result -- out of scope here
+
+        size_expr = None
+        alloc_stmt_re = re.compile(r"^\s*allocate\s*\(", re.IGNORECASE)
+        for i in range(1, len(dep_lines)):
+            code = _strip_comment(dep_lines[i])
+            pm = alloc_stmt_re.match(code)
+            if not pm:
+                continue
+            start = pm.end()
+            depth = 1
+            j = start
+            while j < len(code) and depth > 0:
+                if code[j] == "(":
+                    depth += 1
+                elif code[j] == ")":
+                    depth -= 1
+                j += 1
+            if depth != 0:
+                continue
+            inner = code[start : j - 1]
+            for item in _split_top_level(inner):
+                im = re.match(
+                    rf"^\s*{re.escape(dep_result_name)}\s*\((.*)\)\s*$", item.strip(), re.IGNORECASE | re.DOTALL
+                )
+                if im:
+                    size_expr = im.group(1).strip()
+                    break
+            if size_expr is not None:
+                break
+        if size_expr is None:
+            size_expr = _derive_no_alloc_array_size(
+                dep_lines, dep_result_name, dep_arg_names, dep_scalar_names, dependency_resolver=_resolve
+            )
+        if size_expr is None:
+            return None
+
+        declared = {n.lower() for n in dep_arg_names} | {dep_result_name.lower()}
+        local_names = set()
+        for i in range(1, len(dep_lines)):
+            code = _strip_comment(dep_lines[i])
+            if "::" not in code or "intent" in code.lower():
+                continue
+            decl_part = code.split("::", 1)[1]
+            for decl in _split_top_level(decl_part):
+                dm = re.match(r"^\s*([a-z_]\w*)", decl, re.IGNORECASE)
+                if dm and dm.group(1).lower() not in declared:
+                    local_names.add(dm.group(1).lower())
+        if any(re.search(rf"\b{re.escape(nm)}\b", size_expr, re.IGNORECASE) for nm in local_names):
+            return None  # depends on a value computed inside the dependency's OWN body
+        if "size(" in size_expr.lower():
+            return None
+
+        return dep_arg_names, size_expr
+
+    return _resolve
+
+
+def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
     """Rewrite the TARGET procedure's own array-shaped dummy arguments and
     (if a function) array-shaped allocatable result into f2py-bridgeable
     explicit-shape forms, in an ISOLATED copy of its own lines -- never
@@ -645,6 +911,13 @@ def rewrite_target_for_f2py(lines, start, end, target_name):
        type") -- a real f2py code-generation bug confirmed with the
        simplest possible case (`def f(x): return x ** 2 - 2.0`, no array
        anywhere). Converting to a subroutine sidesteps it entirely.
+
+    `procedures` (from parse_module, the FULL already-transpiled
+    module's own name -> (start, end) table) is optional -- when given,
+    an array result's own size expression may ALSO resolve through a
+    call to some OTHER, locally-defined dependency procedure (see
+    _make_local_dependency_resolver's own docstring), not just a
+    recognized python.f90 helper.
 
     Returns (new_lines, had_array). Raises UnsupportedFunction for a
     genuinely unsupported shape (rank >= 2, or an unrecoverable result
@@ -771,6 +1044,16 @@ def rewrite_target_for_f2py(lines, start, end, target_name):
             if dm and not dm.group(2):
                 scalar_names.add(dm.group(1).lower())
 
+    # Lets an array result's own size expression ALSO resolve through a
+    # call to some OTHER, locally-defined dependency procedure (see
+    # _make_local_dependency_resolver's own docstring) -- only built
+    # when the caller actually provided the full module's own procedure
+    # table; None otherwise (_infer_rank1_size treats that identically
+    # to "no such call recognized", the previous, more limited behavior).
+    dependency_resolver = (
+        _make_local_dependency_resolver(lines, procedures, target_name) if procedures is not None else None
+    )
+
     def _convert_array_result(ri, name, rshape, is_new_arg=True):
         """Convert the allocatable rank-1 array result/output `name`
         (declared at target_lines[ri], with assumed shape `rshape`) into
@@ -801,12 +1084,6 @@ def rewrite_target_for_f2py(lines, start, end, target_name):
             )
 
         alloc_stmt_re = re.compile(r"^\s*allocate\s*\(", re.IGNORECASE)
-        # A GENERIC single-assignment line `NAME = EXPR` -- used both to
-        # find `name`'s own (last) assignment and, for the no-allocate()
-        # fallback below, to walk every OTHER local array variable's own
-        # single assignment too (so `group(1)` must be checked against
-        # whichever name is actually wanted, unlike a name-specific regex).
-        assign_re = re.compile(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
 
         def _find_own_alloc():
             # Finds `name`'s own `NAME(SIZE_EXPR)` array-spec inside an
@@ -850,71 +1127,28 @@ def rewrite_target_for_f2py(lines, start, end, target_name):
             # allocates on assignment, so try to symbolically derive a
             # caller-visible size from `name`'s own (last) assignment,
             # walking a small, recognized set of forms (see
-            # _infer_rank1_size's own docstring): a whole-array copy from
-            # one of the procedure's own already explicit-shape array
-            # arguments (`out = choice`), a slice of a LOCAL array whose
-            # own size this same walk can resolve (`func_res = xfull
-            # (burnin + 1:size(xfull))`), a Fortran array-constructor
-            # concatenation (`ar_poly = [dp :: [1.0_dp], -ar]`), elementwise
-            # arithmetic over already-known arrays/scalars (`p(1) * x +
-            # p(2) - y`), and a call to one of a small set of recognized
-            # python.f90 builtin array-returning helpers (rnorm's
-            # `rnorm(k)`, lfilter_real's `lfilter_real(b, a, x[, zi])`). A
-            # call to some OTHER, user-defined dependency function is
-            # deliberately NOT resolved -- that would need inspecting THAT
-            # function's own body, a genuinely open-ended cross-procedure
-            # analysis out of scope here (see the module docstring).
-            size_of = {}
-            for a in arg_names:
-                a_i, a_m = _find_decl(a)
-                if a_i is not None and a_m.group(3) and a_m.group(3).strip() != ":":
-                    size_of[a.lower()] = a_m.group(3).strip()
-
-            # A local PARAMETER (compile-time-constant) array, declared
-            # `TYPE, parameter :: NAME(*) = [literal, ...]` -- its own
-            # size is exactly its own initializer's, resolvable the same
-            # way as any other array constructor.
-            param_re = re.compile(
-                r"^\s*.*?\bparameter\b.*?::\s*([a-z_]\w*)\s*\(\s*\*\s*\)\s*=\s*(.+)$", re.IGNORECASE
-            )
-            for i in range(1, len(target_lines)):
-                pm = param_re.match(_strip_comment(target_lines[i]))
-                if pm and pm.group(1).lower() not in size_of:
-                    psize = _infer_rank1_size(pm.group(2), size_of, scalar_names)
-                    if isinstance(psize, str):
-                        size_of[pm.group(1).lower()] = psize
-
-            for i in range(1, len(target_lines)):
-                lm = assign_re.match(_strip_comment(target_lines[i]))
-                if not lm:
-                    continue
-                lname = lm.group(1)
-                if lname.lower() == name.lower() or lname.lower() in size_of:
-                    continue  # `name` itself resolved below; already known otherwise
-                li, lm2 = _find_decl(lname)
-                if li is None or lm2.group(3) is None or lm2.group(3).strip() != ":":
-                    continue  # not a rank-1 allocatable local
-                resolved = _infer_rank1_size(lm.group(2), size_of, scalar_names)
-                if isinstance(resolved, str):
-                    size_of[lname.lower()] = resolved
-
-            name_rhs = None
-            for i in range(1, len(target_lines)):
-                am = assign_re.match(_strip_comment(target_lines[i]))
-                if am and am.group(1).lower() == name.lower():
-                    name_rhs = am.group(2)
-            size_expr = None
-            if name_rhs is not None:
-                resolved = _infer_rank1_size(name_rhs, size_of, scalar_names)
-                if isinstance(resolved, str):
-                    size_expr = resolved
+            # _infer_rank1_size's own docstring, and, when `procedures`
+            # was given, _make_local_dependency_resolver's own): a
+            # whole-array copy from one of the procedure's own already
+            # explicit-shape array arguments (`out = choice`), a slice of
+            # a LOCAL array whose own size this same walk can resolve
+            # (`func_res = xfull(burnin + 1:size(xfull))`), a Fortran
+            # array-constructor concatenation (`ar_poly = [dp ::
+            # [1.0_dp], -ar]`), elementwise arithmetic over already-known
+            # arrays/scalars (`p(1) * x + p(2) - y`), a call to one of a
+            # small set of recognized python.f90 builtin array-returning
+            # helpers (rnorm's `rnorm(k)`, lfilter_real's `lfilter_real(b,
+            # a, x[, zi])`), or a call to some OTHER, locally-defined
+            # dependency function whose OWN array result is itself
+            # derivable this way.
+            size_expr = _derive_no_alloc_array_size(target_lines, name, arg_names, scalar_names, dependency_resolver)
             if size_expr is None:
                 raise UnsupportedFunction(
                     f"{target_name!r}'s own array result has no `allocate(...)` "
                     f"statement, and no recognized whole-array-copy/slice/"
-                    f"constructor/elementwise-arithmetic/known-helper "
-                    f"expression, this rewrite can safely derive a caller-"
-                    f"visible size from -- can't determine one for it"
+                    f"constructor/elementwise-arithmetic/known-helper/local-"
+                    f"dependency expression, this rewrite can safely derive a "
+                    f"caller-visible size from -- can't determine one for it"
                 )
 
         # Local variables the size expression must NOT reference -- if
@@ -1166,7 +1400,22 @@ def _decl_line_for_name(target_lines, name):
 
 BLOCK_START_RE = re.compile(r"^\s*block\s*$", re.IGNORECASE)
 BLOCK_END_RE = re.compile(r"^\s*end\s*block\b", re.IGNORECASE)
-BLOCK_DECL_RE = re.compile(r"^\s*(integer|real|logical|character)\b.*::\s*([a-z_]\w*)\s*$", re.IGNORECASE)
+# The trailing `(...)` is OPTIONAL -- a block-local declared with a
+# shape (e.g. `integer, allocatable :: tmp_out_2_50(:)`, xp2f.py's own
+# temp-holder for one of several values a tuple-unpacking call site
+# returns) needs hoisting exactly like a bare scalar local does.
+# Confirmed a real bug without it: the ORIGINAL regex required the line
+# to end immediately after the bare name, so a shaped local's own decl
+# line never matched at all -- the block-decl-collecting loop below
+# stops at the first non-matching line, so it silently stopped short,
+# leaving that decl line stranded IN the body (right where the `block`
+# line used to be) rather than hoisted -- illegal Fortran once the
+# `block`/`end block` wrapper is gone ("data declaration statement
+# cannot appear after executable statements"), confirmed via examples/
+# xchoice_tuple_repro.py's own `other_call`.
+BLOCK_DECL_RE = re.compile(
+    r"^\s*(integer|real|logical|character)\b.*::\s*([a-z_]\w*)\s*(?:\([^()]*\))?\s*$", re.IGNORECASE
+)
 
 
 def unwrap_block_constructs(target_lines, existing_names):
@@ -1550,6 +1799,52 @@ def remove_from_public(trimmed_text: str, name: str) -> str:
     return trimmed_text[: m.start()] + new_line + trimmed_text[m.end() :]
 
 
+DATAFRAME_USE_RE = re.compile(
+    r"^\s*use\s+dataframe_(?:str_index|index_date|index_datetime)_mod\s*,\s*only\s*:\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def strip_unused_dataframe_use(trimmed_text: str) -> str:
+    """Drop a `use dataframe_str_index_mod`/`dataframe_index_date_mod`/
+    `dataframe_index_datetime_mod` header line if NONE of its own
+    imported PLAIN names (`DataFrame_str_index`, `nrow`, `ncol`, ...) are
+    actually referenced anywhere else in the trimmed module's own kept
+    text. xp2f.py emits this line at MODULE level whenever the SCRIPT AS
+    A WHOLE uses a pandas DataFrame ANYWHERE -- not just within the
+    target's own dependency closure -- so extracting a target that
+    doesn't touch pandas at all can leave this orphaned, needing a
+    companion module (dataframe_str_index.f90, ...) never compiled/
+    linked into this standalone f2py build. Confirmed via examples/
+    xmix.py's own `simulate_normal_mixture` (its own SCRIPT builds a
+    DataFrame elsewhere to report fit results, but the target itself
+    doesn't): gfortran failed with "Cannot open module file
+    'dataframe_str_index_mod.mod' for reading" -- a real, but
+    completely different, error than the F2PY Build failure's own
+    unhelpfully swallowed stdout suggested at first.
+
+    An `only:` entry that's an `operator(+)`-style specifier is never
+    itself checked for -- an operator overload is invoked via the bare
+    symbol (`a + b`), never by writing `operator(+)` in executable code,
+    and ordinary numeric code uses `+`/`-`/`*`/`/` constantly regardless
+    of pandas -- so only the PLAIN names (a real DataFrame type/function
+    name) are informative here. A DEPENDENCY that genuinely still needs
+    one of these names (kept, now private, but still real Fortran-to-
+    Fortran code) keeps its own `use` line intact.
+    """
+
+    def _maybe_strip(match: re.Match) -> str:
+        names = [n.strip() for n in _split_top_level(match.group(1))]
+        plain_names = [n for n in names if not re.match(r"operator\s*\(", n, re.IGNORECASE)]
+        rest = trimmed_text[match.end() :]
+        for nm in plain_names:
+            if re.search(rf"\b{re.escape(nm)}\b", rest, re.IGNORECASE):
+                return match.group(0)
+        return ""
+
+    return DATAFRAME_USE_RE.sub(_maybe_strip, trimmed_text)
+
+
 PYTHON_MOD_USE_RE = re.compile(r"^(\s*use\s+python_mod\s*,\s*only\s*:\s*)(.+)$", re.IGNORECASE | re.MULTILINE)
 
 
@@ -1629,10 +1924,27 @@ def inline_python_mod_helpers(trimmed_text: str):
     `optval(...)` call site with no generic name to resolve through at
     all.
 
+    A helper that touches python.f90's own MODULE-LEVEL state (e.g.
+    `rnorm`/`runif`, whose own concrete overloads read/write private RNG
+    -replay bookkeeping -- `rng_replay_enabled`, `rng_replay_bin_u`, ...
+    -- declared in python.f90's own specification section, never as one
+    of their own dummy arguments) is ALSO handled: every such state
+    name's own declaration is hoisted into the trimmed module's own
+    specification section too, exactly like a needed interface block --
+    this function otherwise only ever copies a PROCEDURE's own body
+    text, never anything from python.f90's own specification section, so
+    without this a state-touching helper would reference a symbol
+    nothing declares (an undetected-until-build-time "has no IMPLICIT
+    type" error, confirmed via examples/xsim_fit_nagarch.py's own
+    `simulate_nagarch`, which calls `rnorm()`). `dp` is the one
+    exception -- always separately declared by the trimmed module
+    itself already, so a reference to it needs no special handling.
+
     Returns (new_text, unresolved_names) -- unresolved_names lists any
-    requested helper this couldn't inline (not found in python.f90, or
-    itself calling something outside python_mod), left for the caller to
-    reject with a clear message rather than silently ship a broken build.
+    requested helper this couldn't inline at all (not found in
+    python.f90, as either a procedure or a generic interface), left for
+    the caller to reject with a clear message rather than silently ship
+    a broken build.
     """
     m = PYTHON_MOD_USE_RE.search(trimmed_text)
     if not m:
@@ -1644,20 +1956,13 @@ def inline_python_mod_helpers(trimmed_text: str):
     py_interfaces = _find_python_mod_interfaces(py_header)
     known = set(py_procs.keys())
 
-    # Names declared in python.f90's own SPECIFICATION section (outside
-    # `contains`) -- e.g. `rng_replay_enabled`, `rng_replay_bin_u` (the
-    # private bookkeeping `rnorm`'s own concrete overloads read/write
-    # directly, never as one of their own dummy arguments). This
-    # function only ever copies a PROCEDURE's own body text into the
-    # trimmed module, never anything from the specification section, so
-    # a helper that touches one of these can't be inlined at all -- it'd
-    # reference a symbol nothing declares, an undetected-until-build-
-    # time "has no IMPLICIT type" error, confirmed via examples/
-    # xsim_fit_nagarch.py's own `simulate_nagarch` (calls `rnorm()`,
-    # whose `rnorm0` overload touches this replay state). `dp` is the
-    # one exception -- always separately declared by the trimmed module
-    # itself already, so a reference to it is harmless.
+    # Every name declared in python.f90's own SPECIFICATION section
+    # (outside `contains`), other than `dp` (see the docstring above),
+    # mapped to its own declaration line -- so a state name any needed
+    # helper touches can have that SAME line hoisted into the trimmed
+    # module's own specification section.
     module_state_names = set()
+    module_state_decls: dict[str, str] = {}
     for ln in py_header:
         code = _strip_comment(ln)
         if "::" not in code or code.strip().lower().startswith(("use", "public", "private", "implicit")):
@@ -1665,57 +1970,50 @@ def inline_python_mod_helpers(trimmed_text: str):
         for part in _split_top_level(code.split("::", 1)[1]):
             dm = re.match(r"^\s*([a-z_]\w*)", part, re.IGNORECASE)
             if dm and dm.group(1).lower() != "dp":
-                module_state_names.add(dm.group(1).lower())
+                nm_lower = dm.group(1).lower()
+                module_state_names.add(nm_lower)
+                module_state_decls.setdefault(nm_lower, ln)
 
-    def _touches_module_state(start_names):
-        seen = set()
-        stack = list(start_names)
-        while stack:
-            nm = stack.pop()
-            if nm in seen or nm not in py_procs:
+    def _state_names_used_by(nm: str) -> set[str]:
+        """Which python.f90 module-level state names (if any) does
+        procedure `nm`'s own body reference? A state name that's ALSO
+        locally declared within this same procedure (a dummy argument,
+        its own named result, or a plain local) is shadowed -- a
+        coincidental reuse of a module-level name, not an actual
+        reference to it. Confirmed a real false-positive risk:
+        python.f90 uses `result(v)` as a common naming convention across
+        MANY otherwise-unrelated functions, and `v` also happens to be a
+        genuine module-level name -- without this exclusion,
+        optval_real's own `result(v)` falsely tripped this check.
+        """
+        start, end = py_procs[nm]
+        local_names = set()
+        for i in range(start, end + 1):
+            code = _strip_comment(py_lines[i])
+            if "::" not in code:
                 continue
-            seen.add(nm)
-            start, end = py_procs[nm]
-            # A state name that's ALSO locally declared within this same
-            # procedure (a dummy argument, its own named result, or a
-            # plain local) is shadowed -- a coincidental reuse of a
-            # module-level name, not an actual reference to it.
-            # Confirmed a real false-positive risk: python.f90 uses
-            # `result(v)` as a common naming convention across MANY
-            # otherwise-unrelated functions, and `v` also happens to be
-            # a genuine module-level name -- without this exclusion,
-            # optval_real's own `result(v)` falsely tripped this check.
-            local_names = set()
-            for i in range(start, end + 1):
-                code = _strip_comment(py_lines[i])
-                if "::" not in code:
-                    continue
-                for part in _split_top_level(code.split("::", 1)[1]):
-                    dm = re.match(r"^\s*([a-z_]\w*)", part, re.IGNORECASE)
-                    if dm:
-                        local_names.add(dm.group(1).lower())
-            # A plain RESULT_NAME_RE *search* (not requiring a full
-            # SIG_RE match) so a TYPE-PREFIXED function signature --
-            # `pure integer function optval_int(x, default) result(v)`,
-            # which SIG_RE itself doesn't match at all, since its own
-            # `prefix` group only recognizes pure/elemental/impure/
-            # recursive, never a leading type name -- still has its own
-            # `result(v)` found and excluded. Confirmed a real false
-            # positive without this: `v` is ALSO a genuine module-level
-            # name, and 3 of optval's own 4 concrete overloads use this
-            # exact type-prefixed form.
-            proc_m = PROC_START_RE.match(_strip_comment(py_lines[start]))
-            rm = RESULT_NAME_RE.search(_strip_comment(py_lines[start]))
-            if rm:
-                local_names.add(rm.group(1).lower())
-            elif proc_m and proc_m.group(1).lower() == "function":
-                local_names.add(proc_m.group(2).lower())
-            body_text = "\n".join(py_lines[start : end + 1])
-            for state_name in module_state_names - local_names:
-                if re.search(rf"\b{re.escape(state_name)}\b", body_text, re.IGNORECASE):
-                    return True
-            stack.extend(find_calls(py_lines, start, end, known, nm))
-        return False
+            for part in _split_top_level(code.split("::", 1)[1]):
+                dm = re.match(r"^\s*([a-z_]\w*)", part, re.IGNORECASE)
+                if dm:
+                    local_names.add(dm.group(1).lower())
+        # A plain RESULT_NAME_RE *search* (not requiring a full SIG_RE
+        # match) so a TYPE-PREFIXED function signature -- `pure integer
+        # function optval_int(x, default) result(v)`, which SIG_RE
+        # itself doesn't match at all, since its own `prefix` group only
+        # recognizes pure/elemental/impure/recursive, never a leading
+        # type name -- still has its own `result(v)` found and excluded.
+        proc_m = PROC_START_RE.match(_strip_comment(py_lines[start]))
+        rm = RESULT_NAME_RE.search(_strip_comment(py_lines[start]))
+        if rm:
+            local_names.add(rm.group(1).lower())
+        elif proc_m and proc_m.group(1).lower() == "function":
+            local_names.add(proc_m.group(2).lower())
+        body_text = "\n".join(py_lines[start : end + 1])
+        return {
+            state_name
+            for state_name in module_state_names - local_names
+            if re.search(rf"\b{re.escape(state_name)}\b", body_text, re.IGNORECASE)
+        }
 
     needed = set()  # concrete procedure names to inline into `contains`
     needed_interfaces = set()  # generic interface names to inline into the spec section
@@ -1724,17 +2022,10 @@ def inline_python_mod_helpers(trimmed_text: str):
     for n in requested:
         nl = n.lower()
         if nl in py_procs:
-            if _touches_module_state([nl]):
-                unresolved.append(n)
-            else:
-                frontier.append(nl)
+            frontier.append(nl)
         elif nl in py_interfaces:
-            members = [mem.lower() for mem in py_interfaces[nl][2]]
-            if _touches_module_state(members):
-                unresolved.append(n)
-            else:
-                needed_interfaces.add(nl)
-                frontier.extend(members)
+            needed_interfaces.add(nl)
+            frontier.extend(mem.lower() for mem in py_interfaces[nl][2])
         else:
             unresolved.append(n)
 
@@ -1751,6 +2042,14 @@ def inline_python_mod_helpers(trimmed_text: str):
     if not needed and not needed_interfaces:
         return trimmed_text, unresolved
 
+    # Now that the FULL transitive closure of concrete procedures is
+    # known, find every module-level state name any of them actually
+    # touches -- each such name's own declaration needs hoisting too
+    # (see this function's own docstring).
+    needed_state_names: set[str] = set()
+    for nm in needed:
+        needed_state_names |= _state_names_used_by(nm)
+
     inlined_body = []
     for nm in sorted(needed, key=lambda n: py_procs[n][0]):
         start, end = py_procs[nm]
@@ -1762,6 +2061,8 @@ def inline_python_mod_helpers(trimmed_text: str):
         start, end, _members = py_interfaces[nm]
         interface_body.extend(py_header[start : end + 1])
         interface_body.append("")
+
+    state_body = [module_state_decls[nm] for nm in sorted(needed_state_names) if nm in module_state_decls]
 
     remaining = [n for n in requested if n.lower() not in needed and n.lower() not in needed_interfaces]
     if remaining:
@@ -1775,11 +2076,11 @@ def inline_python_mod_helpers(trimmed_text: str):
         line_end = len(trimmed_text) if line_end == -1 else line_end + 1
         new_text = trimmed_text[:line_start] + trimmed_text[line_end:]
 
-    if interface_body:
+    if state_body or interface_body:
         contains_re = re.compile(r"^\s*contains\s*$", re.IGNORECASE | re.MULTILINE)
         cm = contains_re.search(new_text)
         if cm is not None:
-            insertion = "\n".join(interface_body) + "\n"
+            insertion = "\n".join(state_body + interface_body) + "\n"
             new_text = new_text[: cm.start()] + insertion + new_text[cm.start() :]
 
     end_mod_re = re.compile(r"^\s*end\s+module\b.*$", re.IGNORECASE | re.MULTILINE)
@@ -2049,120 +2350,89 @@ def generate_bridge_wrapper(mod_name, ext_name, func_name, arg_names, bridge_nam
     )
 
 
-def build_run_both_source(src: str, func_name: str, wrapper_stem: str) -> str:
-    """Return the original script's own source with just the target
-    function's `def` replaced by an import of its Fortran-backed wrapper
-    (same name) -- so everything else (its own dependency functions, any
-    other code) keeps running as ordinary Python, and only the one call
-    site the user named is rerouted to compiled Fortran.
+def build_run_both_source(src: str, targets: list[tuple[str, str]]) -> str:
+    """Return the original script's own source with EACH named top-level
+    function's own `def` replaced by an import of its own Fortran-backed
+    wrapper (same name) -- `targets` is a list of (func_name,
+    wrapper_stem) pairs: a single-element list for the ordinary one-
+    target case, or several for --all (every function in the script
+    successfully bridged) -- so everything else (any code that isn't one
+    of these defs) keeps running as ordinary Python, and only the named
+    call site(s) are rerouted to compiled Fortran.
 
     This is what --run-both/--time-both diff against the original: the
     WHOLE script's real, natural output, in situ -- a stronger check than
     --verify's isolated call on manually supplied arguments.
     """
     tree = ast.parse(src)
+    remaining = dict(targets)
     for i, node in enumerate(tree.body):
-        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+        if isinstance(node, ast.FunctionDef) and node.name in remaining:
+            wrapper_stem = remaining.pop(node.name)
             replacement = ast.ImportFrom(
-                module=wrapper_stem, names=[ast.alias(name=func_name, asname=None)], level=0
+                module=wrapper_stem, names=[ast.alias(name=node.name, asname=None)], level=0
             )
             tree.body[i] = ast.copy_location(replacement, node)
-            ast.fix_missing_locations(tree)
-            return ast.unparse(tree)
-    raise UnsupportedFunction(f"no top-level `def {func_name}(...)` found in the source script")
+    if remaining:
+        raise UnsupportedFunction(
+            f"no top-level def(s) found in the source script: {', '.join(sorted(remaining))}"
+        )
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("input_py", help="input python source containing the target function")
-    ap.add_argument(
-        "function_name",
-        nargs="?",
-        default=None,
-        help="name of the top-level function to translate (default: the first function "
-        "the script's own top-level code calls, skipping a call to 'main')",
-    )
-    ap.add_argument("--out-dir", help="directory for generated files (default: alongside input_py)")
-    ap.add_argument(
-        "--verify",
-        action="store_true",
-        help="also run the original Python function and the new wrapper on the same "
-        "arguments (given via --verify-args, a Python literal tuple) and compare results",
-    )
-    ap.add_argument(
-        "--verify-args",
-        default="()",
-        help="Python literal tuple of positional arguments to use with --verify (default: no args)",
-    )
-    ap.add_argument(
-        "--run-both",
-        action="store_true",
-        help="run the original script as-is, and again with the target function backed by "
-        "compiled Fortran, and diff normalized stdout",
-    )
-    ap.add_argument(
-        "--time-both",
-        action="store_true",
-        help="like --run-both, and also report wall-clock timing for each run",
-    )
-    args = ap.parse_args(argv)
+@dataclass
+class TargetBridgeResult:
+    """Successful outcome of bridging ONE target function -- everything
+    the caller (main()'s classic single-target path, or --all's loop)
+    needs afterward for --verify/--run-both/--time-both."""
 
-    # Absolute -- several subprocesses below (the f2py build in
-    # particular) run with cwd=out_dir, so a RELATIVE out_dir (or a path
-    # built from one, like trimmed_path) would resolve against THAT
-    # subprocess's own cwd instead of the one it meant when it was
-    # computed, e.g. plain `xpfunc2f.py script.py func` (no --out-dir,
-    # the default out_dir=py_path.parent) with a relative script.py path
-    # confirmed to break this way: f2py reported "File acf_f.f90 does
-    # not exist" because "examples\acf_f.f90" got re-resolved relative
-    # to cwd="examples".
-    py_path = Path(args.input_py).resolve()
-    out_dir = (Path(args.out_dir) if args.out_dir else py_path.parent).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = py_path.stem
-    func_name = args.function_name
+    func_name: str
+    wrapper_path: Path
+    arg_names: list[str]
 
-    timings: dict = {}
 
-    src = py_path.read_text(encoding="utf-8-sig")
-    py_tree = ast.parse(src)
-    if func_name is None:
-        try:
-            func_name = default_target_function_name(py_tree)
-        except UnsupportedFunction as e:
-            print(f"Target: FAIL ({e})")
-            return 1
-        print(f"Target: {func_name!r} (defaulted -- first function called at the top level, "
-              f"skipping 'main')")
+def _bridge_one_target(
+    func_name: str,
+    py_tree: ast.Module,
+    out_dir: Path,
+    mod_name: str,
+    header: list[str],
+    lines: list[str],
+    procedures: dict,
+    compiler_flags: list[str],
+    timings: dict,
+) -> "TargetBridgeResult | None":
+    """Extract, rewrite, and f2py-build ONE target function out of an
+    ALREADY-transpiled module -- `mod_name`/`header`/`lines`/`procedures`
+    (from parse_module) are shared, read-only inputs, never mutated
+    here, so the SAME already-transpiled module can be reused across
+    many calls (--all's own loop) without re-running xp2f.py's own
+    whole-program translation once per function.
+
+    Prints the same Extract:/F2PY Build:/Wrapper: progress lines this
+    tool has always printed, whether called once (main()'s classic
+    path) or many times (--all) -- returns a TargetBridgeResult on
+    success, or None on any failure (already reported via a printed FAIL
+    line, matching this project's own established per-stage reporting
+    style; the caller decides what a None result means for its own exit
+    code). `timings["compile"]` accumulates the f2py build time across
+    calls (so --all's own combined timing summary reports the TOTAL
+    build time across every function, not just the last one).
+    """
     try:
         target_def = find_target_def(py_tree, func_name)
     except UnsupportedFunction as e:
         print(f"Target: FAIL ({e})")
-        return 1
+        return None
     arg_names = [a.arg for a in target_def.args.args]
 
-    # Reuse xp2f.py's own, unmodified whole-program translation wholesale
-    # -- same type inference, same codegen, zero new risk to it -- then
-    # extract just the target function's transitive dependency closure
-    # out of the result.
-    full_f90_path = out_dir / f"{stem}_p.f90"
-    t0 = time.perf_counter() if args.time_both else None
-    try:
-        xp2f.transpile_file(str(py_path), [], False, no_comment=True, out_path=str(full_f90_path))
-    except (NotImplementedError, FileNotFoundError) as e:
-        print(f"Transpile: FAIL ({e})")
-        return 1
-    if args.time_both:
-        timings["transpile"] = time.perf_counter() - t0
-    print(f"Transpile: PASS ({full_f90_path})")
-
-    f90_text = full_f90_path.read_text(encoding="utf-8")
     had_array = False
     bridge_name = None
     bridge_text = None
     n_bridge_outputs = 0
+    needed = None
     try:
-        mod_name, header, lines, procedures = parse_module(f90_text)
         needed = collect_closure(func_name, procedures, lines)
         target_key = func_name.lower()
         t_start, t_end = procedures[target_key]
@@ -2193,7 +2463,7 @@ def main(argv=None) -> int:
             all_names = {tok.lower() for ln in lines for tok in re.findall(r"[A-Za-z_]\w*", ln)}
             target_lines = unwrap_block_constructs(list(lines[t_start : t_end + 1]), all_names)
         else:
-            target_lines, had_array = rewrite_target_for_f2py(lines, t_start, t_end, func_name)
+            target_lines, had_array = rewrite_target_for_f2py(lines, t_start, t_end, func_name, procedures)
 
         if bridge_name is None:
             check_f2py_compatible(target_lines, 0, len(target_lines) - 1, target_key)
@@ -2215,7 +2485,7 @@ def main(argv=None) -> int:
         # and derived types are all completely normal Fortran there).
     except UnsupportedFunction as e:
         print(f"Extract: FAIL ({e})")
-        return 1
+        return None
     print(f"Extract: PASS ({func_name} + {len(needed) - 1} dependency function(s): "
           f"{', '.join(sorted(needed - {func_name.lower()})) or '(none)'})")
     if bridge_name is not None:
@@ -2261,28 +2531,24 @@ def main(argv=None) -> int:
     # object -- confirmed empirically that both alternatives fail on this
     # toolchain (see inline_python_mod_helpers's own docstring).
     trimmed_text, unresolved_helpers = inline_python_mod_helpers(trimmed_text)
+    # xp2f.py emits a `use dataframe_..._mod, only: ...` header line
+    # whenever the SCRIPT AS A WHOLE uses a pandas DataFrame anywhere --
+    # not just within the target's own dependency closure -- so it can
+    # be left orphaned (needing a companion module never compiled/linked
+    # into this standalone f2py build) once trimmed down to a target
+    # that doesn't touch pandas at all. Dropped when nothing kept --
+    # including anything just inlined above -- actually still needs it
+    # (see strip_unused_dataframe_use's own docstring).
+    trimmed_text = strip_unused_dataframe_use(trimmed_text)
     if unresolved_helpers:
         print(f"Extract: FAIL (needs helper(s) {', '.join(unresolved_helpers)!r} this "
               f"tool can't yet bridge -- only simple python_mod helpers inlinable "
               f"directly into the trimmed module are supported, not a helper module "
               f"requiring its own separate compile/link, e.g. LAPACK-backed routines "
               f"or a pandas DataFrame companion type)")
-        return 1
+        return None
     trimmed_path = out_dir / f"{func_name}_f.f90"
     trimmed_path.write_text(trimmed_text, encoding="utf-8")
-
-    # For --time-both, use xp2f.py's own -O3 -march=native timing flags, so
-    # a --run-both/--time-both comparison against `python xp2f.py ...
-    # --time-both` is apples-to-apples rather than comparing an unoptimized
-    # f2py build against an optimized standalone one. NOT reusing xp2f.py's
-    # other default (-O0 -g -fcheck=all -fbacktrace -ffpe-trap=...) here --
-    # confirmed empirically that those debug/runtime-check flags break the
-    # link step specifically when routed through f2py's meson/ninja/lld
-    # build pipeline on this toolchain (undefined symbol: __gthr_win32_self
-    # and friends -- gfortran's own direct linker invocation, which is what
-    # xp2f.py itself uses, doesn't hit this).
-    compiler_flags = shlex.split(xp2f.default_timing_compiler_command())[1:] if args.time_both else []
-    print("Compile options:", " ".join(compiler_flags) if compiler_flags else "<none>")
 
     ext_name = f"{func_name}_fortran_ext"
     f2py_cmd = [sys.executable, "-m", "numpy.f2py", "-c", str(trimmed_path), "-m", ext_name]
@@ -2314,7 +2580,7 @@ def main(argv=None) -> int:
     )
     if gcc_lib.exists():
         f2py_cmd.extend([f"-L{gcc_lib.parent}", "-lgcc"])
-    t0 = time.perf_counter() if args.time_both else None
+    t0 = time.perf_counter()
     proc = subprocess.run(
         f2py_cmd,
         cwd=out_dir,
@@ -2322,13 +2588,12 @@ def main(argv=None) -> int:
         text=True,
         check=False,
     )
-    if args.time_both:
-        timings["compile"] = time.perf_counter() - t0
+    timings["compile"] = timings.get("compile", 0.0) + (time.perf_counter() - t0)
     if proc.returncode != 0:
         print("F2PY Build: FAIL")
         print(proc.stdout[-4000:])
         print(proc.stderr[-4000:])
-        return 1
+        return None
     print("F2PY Build: PASS")
 
     wrapper_path = out_dir / f"{func_name}_f.py"
@@ -2342,6 +2607,309 @@ def main(argv=None) -> int:
             generate_wrapper(mod_name, ext_name, func_name, arg_names), encoding="utf-8"
         )
     print(f"Wrapper: {wrapper_path}")
+    return TargetBridgeResult(func_name=func_name, wrapper_path=wrapper_path, arg_names=arg_names)
+
+
+def _run_both_and_report(
+    py_path: Path, run_both_src: str, out_dir: Path, run_both_filename: str, time_both: bool, timings: dict
+) -> bool:
+    """Write `run_both_src` to `out_dir/run_both_filename`, run the
+    ORIGINAL script and the patched one (same environment, PYTHONPATH
+    extended so the patched script's own wrapper imports resolve), and
+    diff normalized stdout -- shared by main()'s classic single-target
+    --run-both/--time-both and --all's own combined version (every
+    successfully-bridged function's def replaced at once); the two
+    differ only in how `run_both_src` itself was built.
+
+    Returns True if both runs succeeded and matched, False otherwise
+    (already reported via printed Run (...):/Run-both: lines).
+    """
+    run_both_path = out_dir / run_both_filename
+    run_both_path.write_text(run_both_src, encoding="utf-8")
+
+    # The patched script needs both the wrapper module(s) and their
+    # compiled f2py extension(s) importable; all were just written into
+    # out_dir.
+    run_env = os.environ.copy()
+    existing_pp = run_env.get("PYTHONPATH", "")
+    run_env["PYTHONPATH"] = str(out_dir) + (os.pathsep + existing_pp if existing_pp else "")
+
+    t0 = time.perf_counter() if time_both else None
+    py_rc, py_out, py_err, _ = xp2f.run_capture([sys.executable, str(py_path)], env=run_env)
+    if time_both:
+        timings["python_run"] = time.perf_counter() - t0
+    print(f"Run (python): {'PASS' if py_rc == 0 else f'FAIL (exit {py_rc})'}")
+    if py_out.strip():
+        print(py_out.rstrip())
+    if py_rc != 0:
+        if py_err.strip():
+            print(py_err.rstrip())
+        return False
+
+    t0 = time.perf_counter() if time_both else None
+    fb_rc, fb_out, fb_err, _ = xp2f.run_capture([sys.executable, str(run_both_path)], env=run_env)
+    if time_both:
+        timings["fortran_run"] = time.perf_counter() - t0
+    print(f"Run (fortran-backed): {'PASS' if fb_rc == 0 else f'FAIL (exit {fb_rc})'}")
+    if fb_out.strip():
+        print(fb_out.rstrip())
+    if fb_rc != 0:
+        if fb_err.strip():
+            print(fb_err.rstrip())
+        return False
+
+    def _norm(text: str) -> list[str]:
+        return text.replace("\r\n", "\n").rstrip("\n").splitlines()
+
+    py_lines = _norm(py_out)
+    fb_lines = _norm(fb_out)
+    run_both_match = py_lines == fb_lines
+    print(f"Run-both: {'MATCH' if run_both_match else 'DIFF'}")
+    if not run_both_match:
+        for dl in difflib.unified_diff(py_lines, fb_lines, fromfile="python", tofile="fortran-backed", lineterm=""):
+            print(dl)
+    return run_both_match
+
+
+def _print_timing_summary(timings: dict) -> None:
+    """Same stage set and layout as xp2f.py's own timing summary
+    ("python run" / "transpile" / "compile" / "fortran run" / "total")
+    so the two tools' reported speedups read side by side -- shared by
+    main()'s classic single-target --time-both and --all's own combined
+    version, where "compile" is the SUM of every function's own f2py
+    build time (accumulated by _bridge_one_target across each call).
+    """
+    timings["total"] = (
+        timings.get("transpile", 0.0) + timings.get("compile", 0.0) + timings.get("fortran_run", 0.0)
+    )
+    base = timings.get("python_run", 0.0)
+
+    def _ratio(v: float) -> str:
+        return f"{(v / base):.6f}" if base > 0.0 else "n/a"
+
+    rows = []
+    if "python_run" in timings:
+        rows.append(("python run", timings["python_run"]))
+    rows.append(("transpile", timings.get("transpile", 0.0)))
+    rows.append(("compile", timings.get("compile", 0.0)))
+    if "fortran_run" in timings:
+        rows.append(("fortran run", timings["fortran_run"]))
+    rows.append(("total", timings["total"]))
+
+    print("")
+    print("Timing summary (seconds):")
+    stage_w = max(len("stage"), max(len(name) for name, _ in rows))
+    sec_vals = [f"{val:.6f}" for _name, val in rows]
+    sec_w = max(len("seconds"), max(len(s) for s in sec_vals))
+    show_ratio = "python_run" in timings
+    if show_ratio:
+        ratio_hdr = "ratio(vs python run)"
+        ratio_vals = [_ratio(val) for _name, val in rows]
+        ratio_w = max(len(ratio_hdr), max(len(r) for r in ratio_vals))
+        print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    {ratio_hdr:>{ratio_w}}")
+        for name, val in rows:
+            rtxt = _ratio(val)
+            print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}    {rtxt:>{ratio_w}}")
+    else:
+        print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}")
+        for name, val in rows:
+            print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}")
+
+
+def _run_all_targets(
+    args, py_path: Path, py_tree: ast.Module, src: str, out_dir: Path, mod_name: str, header: list[str],
+    lines: list[str], procedures: dict, compiler_flags: list[str], timings: dict,
+) -> int:
+    """--all: bridge EVERY top-level function in the script (except one
+    named `main`, typically just an entry-point wrapper rather than a
+    good bridge target itself) as an INDEPENDENT target, sharing the one
+    already-transpiled module across all of them. Reports pass/fail per
+    function and continues past a failure rather than aborting the
+    whole run -- the point of --all is maximizing how many functions end
+    up bridged, not requiring all-or-nothing.
+
+    --run-both/--time-both are only attempted afterward if EVERY
+    function was successfully bridged -- patching them all in at once
+    raises real per-function interaction questions (a bridged function
+    calling one that's still plain Python, or vice versa) that only
+    disappear cleanly when there's no plain-Python function left at all.
+    """
+    all_func_names = [
+        node.name for node in py_tree.body if isinstance(node, ast.FunctionDef) and node.name != "main"
+    ]
+    if not all_func_names:
+        print("Target: FAIL (no top-level function found in the source script, other than "
+              "'main' if present)")
+        return 1
+
+    results: dict[str, TargetBridgeResult | None] = {}
+    for i, func_name in enumerate(all_func_names, start=1):
+        print(f"\n[{i}/{len(all_func_names)}] {func_name}")
+        results[func_name] = _bridge_one_target(
+            func_name, py_tree, out_dir, mod_name, header, lines, procedures, compiler_flags, timings
+        )
+
+    n_ok = sum(1 for r in results.values() if r is not None)
+    print(f"\nAll-functions summary: {n_ok} of {len(all_func_names)} bridged")
+    for func_name, r in results.items():
+        print(f"  {'PASS' if r is not None else 'FAIL'}  {func_name}")
+
+    if not (args.run_both or args.time_both):
+        return 0 if n_ok > 0 else 1
+
+    if n_ok != len(all_func_names):
+        print(f"\nRun-both: SKIPPED (not all {len(all_func_names)} functions bridged: {n_ok} "
+              f"succeeded -- --run-both/--time-both need EVERY function backed by Fortran to "
+              f"patch the whole script at once)")
+        return 1
+
+    run_both_src = build_run_both_source(src, [(name, r.wrapper_path.stem) for name, r in results.items()])
+    ok = _run_both_and_report(
+        py_path, run_both_src, out_dir, f"{py_path.stem}_all_run_both.py", args.time_both, timings
+    )
+    if args.time_both:
+        _print_timing_summary(timings)
+    return 0 if ok else 1
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("input_py", help="input python source containing the target function")
+    ap.add_argument(
+        "function_name",
+        nargs="?",
+        default=None,
+        help="name of the top-level function to translate (default: the first function "
+        "the script's own top-level code calls, skipping a call to 'main'); mutually "
+        "exclusive with --all",
+    )
+    ap.add_argument("--out-dir", help="directory for generated files (default: alongside input_py)")
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="translate EVERY top-level function in the script (except one named 'main'), "
+        "each independently, reporting pass/fail per function -- mutually exclusive with "
+        "function_name/--verify. --run-both/--time-both are attempted afterward (patching "
+        "every successfully-bridged function in at once) only if ALL of them bridged",
+    )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="also run the original Python function and the new wrapper on the same "
+        "arguments (given via --verify-args, a Python literal tuple) and compare results",
+    )
+    ap.add_argument(
+        "--verify-args",
+        default="()",
+        help="Python literal tuple of positional arguments to use with --verify (default: no args)",
+    )
+    ap.add_argument(
+        "--run-both",
+        action="store_true",
+        help="run the original script as-is, and again with the target function backed by "
+        "compiled Fortran, and diff normalized stdout",
+    )
+    ap.add_argument(
+        "--time-both",
+        action="store_true",
+        help="like --run-both, and also report wall-clock timing for each run",
+    )
+    args = ap.parse_args(argv)
+
+    if args.all and args.function_name:
+        ap.error("function_name and --all are mutually exclusive")
+    if args.all and args.verify:
+        ap.error("--verify and --all are mutually exclusive (--verify needs one function's own arguments)")
+
+    # Absolute -- several subprocesses below (the f2py build in
+    # particular) run with cwd=out_dir, so a RELATIVE out_dir (or a path
+    # built from one, like trimmed_path) would resolve against THAT
+    # subprocess's own cwd instead of the one it meant when it was
+    # computed, e.g. plain `xpfunc2f.py script.py func` (no --out-dir,
+    # the default out_dir=py_path.parent) with a relative script.py path
+    # confirmed to break this way: f2py reported "File acf_f.f90 does
+    # not exist" because "examples\acf_f.f90" got re-resolved relative
+    # to cwd="examples".
+    py_path = Path(args.input_py).resolve()
+    out_dir = (Path(args.out_dir) if args.out_dir else py_path.parent).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = py_path.stem
+
+    timings: dict = {}
+
+    src = py_path.read_text(encoding="utf-8-sig")
+    py_tree = ast.parse(src)
+
+    # Reuse xp2f.py's own, unmodified whole-program translation wholesale
+    # -- same type inference, same codegen, zero new risk to it -- then
+    # extract just the target function's transitive dependency closure
+    # out of the result. Done ONCE regardless of how many functions end
+    # up bridged (--all's own loop reuses this same parsed module for
+    # every one of them) -- re-running xp2f.py's own whole-program static
+    # analysis once per function would be pure waste, since the
+    # transpiled output doesn't depend on which function is targeted.
+    full_f90_path = out_dir / f"{stem}_p.f90"
+    t0 = time.perf_counter() if args.time_both else None
+    try:
+        xp2f.transpile_file(str(py_path), [], False, no_comment=True, out_path=str(full_f90_path))
+    except (NotImplementedError, FileNotFoundError) as e:
+        print(f"Transpile: FAIL ({e})")
+        return 1
+    if args.time_both:
+        timings["transpile"] = time.perf_counter() - t0
+    print(f"Transpile: PASS ({full_f90_path})")
+
+    f90_text = full_f90_path.read_text(encoding="utf-8")
+    try:
+        mod_name, header, lines, procedures = parse_module(f90_text)
+    except UnsupportedFunction as e:
+        # Regression test for a real bug: parse_module used to run INSIDE
+        # the per-target try/except (this project's own established
+        # style for a clean "Extract: FAIL (...)" report), but hoisting
+        # the transpile-once step out of the per-target logic (so --all
+        # can share it across every function) moved this call to run
+        # BEFORE any try/except existed at all, so a script whose own
+        # transpiled output has no `module ... contains ... end module`
+        # block (e.g. xp2f.py's own --flat-style output) crashed with an
+        # unhandled traceback instead of the same clean message every
+        # other unsupported-shape case gets. Confirmed via examples/
+        # xalias_repro.py.
+        print(f"Extract: FAIL ({e})")
+        return 1
+
+    # For --time-both, use xp2f.py's own -O3 -march=native timing flags, so
+    # a --run-both/--time-both comparison against `python xp2f.py ...
+    # --time-both` is apples-to-apples rather than comparing an unoptimized
+    # f2py build against an optimized standalone one. NOT reusing xp2f.py's
+    # other default (-O0 -g -fcheck=all -fbacktrace -ffpe-trap=...) here --
+    # confirmed empirically that those debug/runtime-check flags break the
+    # link step specifically when routed through f2py's meson/ninja/lld
+    # build pipeline on this toolchain (undefined symbol: __gthr_win32_self
+    # and friends -- gfortran's own direct linker invocation, which is what
+    # xp2f.py itself uses, doesn't hit this).
+    compiler_flags = shlex.split(xp2f.default_timing_compiler_command())[1:] if args.time_both else []
+    print("Compile options:", " ".join(compiler_flags) if compiler_flags else "<none>")
+
+    if args.all:
+        return _run_all_targets(
+            args, py_path, py_tree, src, out_dir, mod_name, header, lines, procedures, compiler_flags, timings
+        )
+
+    func_name = args.function_name
+    if func_name is None:
+        try:
+            func_name = default_target_function_name(py_tree)
+        except UnsupportedFunction as e:
+            print(f"Target: FAIL ({e})")
+            return 1
+        print(f"Target: {func_name!r} (defaulted -- first function called at the top level, "
+              f"skipping 'main')")
+
+    result = _bridge_one_target(
+        func_name, py_tree, out_dir, mod_name, header, lines, procedures, compiler_flags, timings
+    )
+    if result is None:
+        return 1
 
     if args.verify:
         verify_args = ast.literal_eval(args.verify_args)
@@ -2351,7 +2919,7 @@ def main(argv=None) -> int:
         exec(compile(py_tree, str(py_path), "exec"), ns)
         py_result = ns[func_name](*verify_args)
         sys.path.insert(0, str(out_dir))
-        wrapper_mod = __import__(wrapper_path.stem)
+        wrapper_mod = __import__(result.wrapper_path.stem)
         f_result = getattr(wrapper_mod, func_name)(*verify_args)
         match = _results_match(py_result, f_result)
         print(f"Verify: {'MATCH' if match else 'MISMATCH'} (python={py_result!r} fortran={f_result!r})")
@@ -2359,93 +2927,15 @@ def main(argv=None) -> int:
             return 1
 
     if args.run_both or args.time_both:
-        run_both_src = build_run_both_source(src, func_name, wrapper_path.stem)
-        run_both_path = out_dir / f"{func_name}_run_both.py"
-        run_both_path.write_text(run_both_src, encoding="utf-8")
-
-        # The patched script needs both the wrapper module and its compiled
-        # f2py extension importable; both were just written into out_dir.
-        run_env = os.environ.copy()
-        existing_pp = run_env.get("PYTHONPATH", "")
-        run_env["PYTHONPATH"] = str(out_dir) + (os.pathsep + existing_pp if existing_pp else "")
-
-        t0 = time.perf_counter() if args.time_both else None
-        py_rc, py_out, py_err, _ = xp2f.run_capture([sys.executable, str(py_path)], env=run_env)
-        if args.time_both:
-            timings["python_run"] = time.perf_counter() - t0
-        print(f"Run (python): {'PASS' if py_rc == 0 else f'FAIL (exit {py_rc})'}")
-        if py_out.strip():
-            print(py_out.rstrip())
-        if py_rc != 0:
-            if py_err.strip():
-                print(py_err.rstrip())
-            return 1
-
-        t0 = time.perf_counter() if args.time_both else None
-        fb_rc, fb_out, fb_err, _ = xp2f.run_capture([sys.executable, str(run_both_path)], env=run_env)
-        if args.time_both:
-            timings["fortran_run"] = time.perf_counter() - t0
-        print(f"Run (fortran-backed): {'PASS' if fb_rc == 0 else f'FAIL (exit {fb_rc})'}")
-        if fb_out.strip():
-            print(fb_out.rstrip())
-        if fb_rc != 0:
-            if fb_err.strip():
-                print(fb_err.rstrip())
-            return 1
-
-        def _norm(text: str) -> list[str]:
-            return text.replace("\r\n", "\n").rstrip("\n").splitlines()
-
-        py_lines = _norm(py_out)
-        fb_lines = _norm(fb_out)
-        run_both_match = py_lines == fb_lines
-        print(f"Run-both: {'MATCH' if run_both_match else 'DIFF'}")
-        if not run_both_match:
-            for dl in difflib.unified_diff(py_lines, fb_lines, fromfile="python", tofile="fortran-backed", lineterm=""):
-                print(dl)
-
-        if not run_both_match:
+        run_both_src = build_run_both_source(src, [(func_name, result.wrapper_path.stem)])
+        ok = _run_both_and_report(
+            py_path, run_both_src, out_dir, f"{func_name}_run_both.py", args.time_both, timings
+        )
+        if not ok:
             return 1
 
     if args.time_both:
-        # Same stage set and layout as xp2f.py's own timing summary
-        # ("python run" / "transpile" / "compile" / "fortran run" /
-        # "total") so the two tools' reported speedups read side by side.
-        timings["total"] = (
-            timings.get("transpile", 0.0) + timings.get("compile", 0.0) + timings.get("fortran_run", 0.0)
-        )
-        base = timings.get("python_run", 0.0)
-
-        def _ratio(v: float) -> str:
-            return f"{(v / base):.6f}" if base > 0.0 else "n/a"
-
-        rows = []
-        if "python_run" in timings:
-            rows.append(("python run", timings["python_run"]))
-        rows.append(("transpile", timings.get("transpile", 0.0)))
-        rows.append(("compile", timings.get("compile", 0.0)))
-        if "fortran_run" in timings:
-            rows.append(("fortran run", timings["fortran_run"]))
-        rows.append(("total", timings["total"]))
-
-        print("")
-        print("Timing summary (seconds):")
-        stage_w = max(len("stage"), max(len(name) for name, _ in rows))
-        sec_vals = [f"{val:.6f}" for _name, val in rows]
-        sec_w = max(len("seconds"), max(len(s) for s in sec_vals))
-        show_ratio = "python_run" in timings
-        if show_ratio:
-            ratio_hdr = "ratio(vs python run)"
-            ratio_vals = [_ratio(val) for _name, val in rows]
-            ratio_w = max(len(ratio_hdr), max(len(r) for r in ratio_vals))
-            print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    {ratio_hdr:>{ratio_w}}")
-            for name, val in rows:
-                rtxt = _ratio(val)
-                print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}    {rtxt:>{ratio_w}}")
-        else:
-            print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}")
-            for name, val in rows:
-                print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}")
+        _print_timing_summary(timings)
 
     return 0
 

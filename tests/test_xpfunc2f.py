@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,10 @@ XASA183_INFERRED_PATH = REPO_ROOT / "examples" / "xasa183_inferred.py"
 XBS_VEC_PATH = REPO_ROOT / "examples" / "xbs_vec.py"
 XOPTIONS_PDE_PATH = REPO_ROOT / "examples" / "xoptions_pde.py"
 XSIM_FIT_NAGARCH_T_PATH = REPO_ROOT / "examples" / "xsim_fit_nagarch_t.py"
+XALIAS_REPRO_PATH = REPO_ROOT / "examples" / "xalias_repro.py"
+XARMA_AIC_FIT_PATH = REPO_ROOT / "examples" / "xarma_aic_fit.py"
+XMIX_PATH = REPO_ROOT / "examples" / "xmix.py"
+XARMA_NAGARCH_FIT_PATH = REPO_ROOT / "examples" / "xarma_nagarch_fit.py"
 
 
 def _run_xpfunc2f(args, cwd) -> subprocess.CompletedProcess:
@@ -560,6 +565,60 @@ def test_split_multi_name_decls() -> None:
     # A single-name line is left completely untouched.
     assert xpfunc2f._split_multi_name_decls(["integer, intent(in) :: n"]) == ["integer, intent(in) :: n"]
 
+    # Regression test for a second, separate bug this same normalization
+    # introduced: an ordinary ASSIGNMENT statement whose RHS is a Fortran
+    # array constructor with an explicit type-spec (`[real(kind=dp) ::
+    # part1, part2]`) also CONTAINS a `::` token -- but nested inside the
+    # brackets, not a genuine declaration separator at all. Naively
+    # splitting at the first `::` anywhere treated this as a two-name
+    # declaration and split it at the constructor's own top-level comma,
+    # producing two broken, unbalanced lines (confirmed via examples/
+    # xarma_aic_fit.py's own `simulate_arma`: "syntax error in array
+    # constructor"). Must be left completely untouched.
+    assign_line = "   ar_poly = [real(kind=dp) :: [1.0_dp], -ar]"
+    assert xpfunc2f._split_multi_name_decls([assign_line]) == [assign_line]
+
+
+def test_find_top_level_double_colon() -> None:
+    assert xpfunc2f._find_top_level_double_colon("integer, intent(in) :: n") is not None
+    assert xpfunc2f._find_top_level_double_colon("ar_poly = [real(kind=dp) :: [1.0_dp], -ar]") is None
+
+
+def test_strip_unused_dataframe_use() -> None:
+    # Regression test: xp2f.py emits a `use dataframe_str_index_mod,
+    # only: ...` header line whenever the SCRIPT AS A WHOLE uses a
+    # pandas DataFrame anywhere -- not just within the target's own
+    # dependency closure -- so it can be left orphaned once trimmed down
+    # to a target that doesn't touch pandas at all, needing a companion
+    # module never compiled/linked into this standalone f2py build
+    # (confirmed via examples/xmix.py's own `simulate_normal_mixture`:
+    # gfortran "Cannot open module file 'dataframe_str_index_mod.mod'").
+    unused = "\n".join(
+        [
+            "module m",
+            "   use dataframe_str_index_mod, only: DataFrame_str_index, nrow, ncol, "
+            "operator(+), operator(-), operator(*), operator(/), abs_str",
+            "   implicit none",
+            "contains",
+            "   pure function f(x) result(y)",
+            "      real(kind=8), intent(in) :: x",
+            "      real(kind=8) :: y",
+            "      y = x + 1.0d0",
+            "   end function f",
+            "end module m",
+            "",
+        ]
+    )
+    new_text = xpfunc2f.strip_unused_dataframe_use(unused)
+    assert "use dataframe_str_index_mod" not in new_text
+    assert "pure function f(x) result(y)" in new_text  # everything else untouched
+
+    # A dependency that genuinely still uses one of the imported PLAIN
+    # names (nrow) keeps its own `use` line intact.
+    still_used = unused.replace("y = x + 1.0d0", "y = x + real(nrow(x), kind=8)")
+    new_text2 = xpfunc2f.strip_unused_dataframe_use(still_used)
+    assert "use dataframe_str_index_mod" in new_text2
+
 
 def test_rewrite_target_for_f2py_handles_multiline_signature_and_shared_allocate() -> None:
     # Regression test combining two real bugs found together (examples/
@@ -592,21 +651,74 @@ def test_rewrite_target_for_f2py_handles_multiline_signature_and_shared_allocate
     assert not any("allocate(" in ln for ln in new_lines)
 
 
-def test_inline_python_mod_helpers_rejects_rng_replay_state_helper() -> None:
+def test_rewrite_target_for_f2py_resolves_size_through_local_dependency() -> None:
+    # Regression test for the array_result_size_not_derivable blocker:
+    # examples/xarma_nagarch_fit.py's own `simulate_arma_nagarch` derives
+    # its own array result's size from `eps`, which comes from a call to
+    # `simulate_nagarch_noise` -- a plain, LOCALLY-DEFINED function (not
+    # a python.f90 builtin) with its own `allocate(eps(n))`, i.e. its
+    # own length is simply its own first argument, `n`. Previously
+    # rejected outright ("no ... known-helper expression"); now resolved
+    # by passing `procedures` (parse_module's own name -> (start, end)
+    # table) so a call to some OTHER locally-defined procedure can be
+    # recursively derived too, then its own dummy names substituted for
+    # the call site's own actual argument text (`n` -> `n + burnin`).
+    lines = [
+        "function simulate_nagarch_noise(n, omega) result(eps)",
+        "   integer, intent(in) :: n",
+        "   real(kind=dp), intent(in) :: omega",
+        "   real(kind=dp), allocatable :: eps(:)",
+        "   allocate(eps(n))",
+        "   eps = omega",
+        "end function simulate_nagarch_noise",
+        "",
+        "function simulate_arma_nagarch(n, burnin, omega) result(func_res)",
+        "   integer, intent(in) :: n, burnin",
+        "   real(kind=dp), intent(in) :: omega",
+        "   real(kind=dp), allocatable :: func_res(:)",
+        "   real(kind=dp), allocatable :: eps(:)",
+        "   eps = simulate_nagarch_noise(n + burnin, omega)",
+        "   func_res = eps",
+        "end function simulate_arma_nagarch",
+    ]
+    procedures = {
+        "simulate_nagarch_noise": (0, 6),
+        "simulate_arma_nagarch": (8, 15),
+    }
+    start, end = procedures["simulate_arma_nagarch"]
+
+    # Without `procedures`, still correctly rejected (previous, more
+    # limited behavior -- unchanged for any existing caller that doesn't
+    # pass it).
+    with pytest.raises(xpfunc2f.UnsupportedFunction):
+        xpfunc2f.rewrite_target_for_f2py(lines, start, end, "simulate_arma_nagarch")
+
+    new_lines, had_array = xpfunc2f.rewrite_target_for_f2py(
+        lines, start, end, "simulate_arma_nagarch", procedures
+    )
+    assert had_array is True
+    assert "   real(kind=dp), intent(out) :: func_res((n + burnin))" in new_lines
+
+
+def test_inline_python_mod_helpers_hoists_rng_replay_state() -> None:
     # Regression test: python.f90's own `rnorm` (a generic interface,
     # like `optval`) dispatches to `rnorm0`/`rnorm1`/etc., which read/
     # write private RNG-replay bookkeeping (`rng_replay_enabled`,
     # `rng_replay_bin_u`, ...) declared in python.f90's own
-    # specification section -- never copied over by this function,
-    # which only ever copies a PROCEDURE's own body text. Silently
-    # inlining it anyway (an unintended side effect of generalizing the
-    # `optval` fix to ANY generic interface) produced a build failure
-    # ("has no IMPLICIT type") instead of a clean rejection; `rnorm`
-    # must come back unresolved, same as before that generalization.
-    # `optval` itself must NOT be a false-positive casualty of this
-    # guard -- 3 of its 4 concrete overloads use `result(v)`, and `v` is
-    # ALSO a genuine module-level name, so the check must recognize a
-    # locally-shadowed name (an overload's OWN result variable) as safe.
+    # specification section, never as one of their own dummy arguments.
+    # This function only ever copies a PROCEDURE's own body text, so
+    # inlining `rnorm` without ALSO hoisting these state declarations
+    # into the trimmed module's own specification section produced a
+    # build failure ("has no IMPLICIT type") -- confirmed via examples/
+    # xsim_fit_nagarch.py's own `simulate_nagarch`. Fixed by hoisting
+    # every module-level state name any inlined helper's own transitive
+    # closure touches, the same way a needed `interface` block already
+    # is.
+    #
+    # `optval` exercises the OTHER side of this: it must NOT falsely
+    # trigger hoisting the module-level `v` declaration (a real,
+    # unrelated global) -- 3 of its 4 concrete overloads use `result(v)`
+    # as their OWN local name, which shadows the module-level one.
     text = xpfunc2f.PYTHON_MOD_PATH.read_text(encoding="utf-8", errors="ignore")
     assert "rng_replay_enabled" in text
 
@@ -619,17 +731,23 @@ def test_inline_python_mod_helpers_rejects_rng_replay_state_helper() -> None:
             "   pure function f(x) result(y)",
             "      real(kind=8), intent(in), optional :: x",
             "      real(kind=8) :: y",
-            "      y = optval(x, 0.0d0)",
+            "      y = optval(x, 0.0d0) + rnorm()",
             "   end function f",
             "end module m",
             "",
         ]
     )
     new_text, unresolved = xpfunc2f.inline_python_mod_helpers(trimmed)
-    assert unresolved == ["rnorm"]
-    assert "use python_mod, only: rnorm" in new_text
+    assert unresolved == []
+    assert "use python_mod" not in new_text
     assert "interface optval" in new_text
-    assert "rng_replay" not in new_text.lower()
+    assert "interface rnorm" in new_text
+    assert "rng_replay_enabled" in new_text
+    assert "rng_replay_bin_u" in new_text
+    # The module-level `v` declaration is NOT spuriously hoisted --
+    # optval's own overloads' `result(v)` shadows it, so it's correctly
+    # recognized as unrelated.
+    assert not re.search(r"^\s*character\(len=:\), allocatable :: v\(:\)\s*$", new_text, re.MULTILINE)
 
 
 def test_inline_python_mod_helpers_finds_type_prefixed_functions() -> None:
@@ -748,6 +866,46 @@ def test_xpfunc2f_bridges_data_dependent_three_output_partition(tmp_path: Path) 
     assert "bridged via a generated 'partition_by_bounds_bridge'" in proc.stdout
     assert "F2PY Build: PASS" in proc.stdout
     assert "Verify: MATCH" in proc.stdout, proc.stdout
+
+
+def test_unwrap_block_constructs_hoists_array_shaped_local() -> None:
+    # Direct unit test for BLOCK_DECL_RE's own bug: a block-local
+    # declared WITH a shape (`integer, allocatable :: tmp_out_2_50(:)`)
+    # must be recognized and hoisted just like a bare scalar local
+    # (`integer :: tmp_out_1_50`) -- the original regex only matched a
+    # decl line ending immediately after the bare name, so the block-
+    # decl-collecting loop stopped at the first (scalar) local and left
+    # the array-shaped one stranded in the body once `block`/`end block`
+    # were stripped.
+    lines = [
+        "subroutine other_call()",
+        "   integer, parameter :: n = 3",
+        "   integer :: n2",
+        "   integer, allocatable :: choice(:)",
+        "   n2 = -1",
+        "   block",
+        "      integer :: tmp_out_1_50",
+        "      integer, allocatable :: tmp_out_2_50(:)",
+        "      call backbin_rc(n, n2, choice, tmp_out_1_50, tmp_out_2_50)",
+        "      n2 = tmp_out_1_50",
+        "      choice = tmp_out_2_50",
+        "   end block",
+        "   print *, choice(1)",
+        "end subroutine other_call",
+    ]
+    existing_names = {tok.lower() for ln in lines for tok in re.findall(r"[A-Za-z_]\w*", ln)}
+    new_lines = xpfunc2f.unwrap_block_constructs(lines, existing_names)
+    assert not any("block" in ln.lower() for ln in new_lines)
+    # Both locals hoisted -- appearing in the DECLARATION section, before
+    # the first executable statement (`n2 = -1`).
+    exec_i = new_lines.index("   n2 = -1")
+    decl_lines = new_lines[:exec_i]
+    assert any("tmp_out_1_50" in ln for ln in decl_lines)
+    assert any("allocatable" in ln and "tmp_out_2_50" in ln for ln in decl_lines)
+    # Nothing resembling either temp's own declaration is left stranded
+    # in the body (after the first executable statement).
+    body_lines = new_lines[exec_i:]
+    assert not any("::" in ln and "tmp_out_2_50" in ln for ln in body_lines)
 
 
 def test_merge_continuations_joins_wrapped_declaration() -> None:
@@ -1023,3 +1181,230 @@ def test_default_target_function_name_unit() -> None:
         "def unused(x):\n    return x\ndef main():\n    return real(2)\ndef real(y):\n    return y\nmain()\n"
     )
     assert xpfunc2f.default_target_function_name(tree_main_wraps) == "real"
+
+
+def test_build_run_both_source_patches_several_functions_at_once() -> None:
+    # Regression test for --all's own combined run-both: EVERY named
+    # target's own def is replaced by an import of its own wrapper in
+    # ONE pass (not just one, the classic single-target case) -- other
+    # top-level code (a helper NOT itself a target, and the script's own
+    # driver statements) is left completely untouched.
+    src = "\n".join(
+        [
+            "def helper(x):",
+            "    return x + 1",
+            "def a(x):",
+            "    return x * 2",
+            "def b(y):",
+            "    return y - 1",
+            "print(a(1), b(2), helper(3))",
+            "",
+        ]
+    )
+    new_src = xpfunc2f.build_run_both_source(src, [("a", "a_f"), ("b", "b_f")])
+    assert "from a_f import a" in new_src
+    assert "from b_f import b" in new_src
+    assert "def helper(x):" in new_src
+    assert "def a(" not in new_src
+    assert "def b(" not in new_src
+    assert "print(a(1), b(2), helper(3))" in new_src
+
+
+def test_build_run_both_source_rejects_missing_target() -> None:
+    src = "def a(x):\n    return x\n"
+    with pytest.raises(xpfunc2f.UnsupportedFunction):
+        xpfunc2f.build_run_both_source(src, [("a", "a_f"), ("missing", "missing_f")])
+
+
+def test_xpfunc2f_all_bridges_every_function(tmp_path: Path) -> None:
+    # End-to-end: --all on xprime_func.py (is_prime + count_primes, no
+    # main()) bridges BOTH functions independently, sharing one
+    # transpile pass, and reports a per-function summary.
+    proc = _run_xpfunc2f([str(XPRIME_FUNC_PATH), "--all", "--out-dir", str(tmp_path)], tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.count("Transpile: PASS") == 1, proc.stdout  # shared, not once per function
+    assert "[1/2] is_prime" in proc.stdout, proc.stdout
+    assert "[2/2] count_primes" in proc.stdout, proc.stdout
+    assert "All-functions summary: 2 of 2 bridged" in proc.stdout, proc.stdout
+    assert "PASS  is_prime" in proc.stdout, proc.stdout
+    assert "PASS  count_primes" in proc.stdout, proc.stdout
+    assert (tmp_path / "is_prime_f.py").exists()
+    assert (tmp_path / "count_primes_f.py").exists()
+
+
+def test_xpfunc2f_all_run_both_when_every_function_bridges(tmp_path: Path) -> None:
+    # End-to-end: --all --run-both patches BOTH functions in at once
+    # (count_primes' own Fortran calls is_prime via its own PRIVATE
+    # embedded copy internally, entirely bypassing is_prime's own
+    # separately-bridged wrapper -- no cross-extension linking needed)
+    # and runs the whole script once, matching the original exactly.
+    proc = _run_xpfunc2f([str(XPRIME_FUNC_PATH), "--all", "--out-dir", str(tmp_path), "--run-both"], tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "All-functions summary: 2 of 2 bridged" in proc.stdout, proc.stdout
+    assert "Run-both: MATCH" in proc.stdout, proc.stdout
+    run_both_src = (tmp_path / "xprime_func_all_run_both.py").read_text(encoding="utf-8")
+    assert "from is_prime_f import is_prime" in run_both_src
+    assert "from count_primes_f import count_primes" in run_both_src
+
+
+def test_xpfunc2f_all_skips_run_both_on_partial_failure(tmp_path: Path) -> None:
+    # End-to-end: one function bridges fine, the other has a rank-2
+    # array argument -- genuinely out of scope ("only rank-1 arrays are
+    # bridged for now"), so only 1 of 2 functions bridges. --run-both
+    # must be SKIPPED rather than attempted with a partially-bridged
+    # script, and the run must be reported as failed overall since the
+    # explicitly-requested --run-both didn't happen.
+    src = tmp_path / "xsynth_partial.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def good_func(x):",
+                "    return x + 1.0",
+                "",
+                "def bad_func(m):",
+                "    return m[0, 0] + m[1, 1]",
+                "",
+                "a = np.array([[1.0, 2.0], [3.0, 4.0]])",
+                "print(good_func(2.0))",
+                "print(bad_func(a))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = _run_xpfunc2f([str(src), "--all", "--out-dir", str(tmp_path), "--run-both"], tmp_path)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "All-functions summary: 1 of 2 bridged" in proc.stdout, proc.stdout
+    assert "PASS  good_func" in proc.stdout, proc.stdout
+    assert "FAIL  bad_func" in proc.stdout, proc.stdout
+    assert "Run-both: SKIPPED" in proc.stdout, proc.stdout
+
+
+def test_xpfunc2f_all_bridges_tuple_unpack_temp_with_array_shape(tmp_path: Path) -> None:
+    # Regression test for a real bug found running --all over examples/
+    # xchoice_tuple_repro.py: `other_call`'s own body has a `block ...
+    # end block` construct (xp2f.py's own scoping idiom for a tuple-
+    # unpacking call site's temp holders) whose SECOND local is
+    # array-shaped (`integer, allocatable :: tmp_out_2_50(:)`) --
+    # BLOCK_DECL_RE originally required a block-local's own decl line to
+    # end immediately after the bare name, so it never matched a shaped
+    # local at all. The block-decl-collecting loop stops at the first
+    # non-matching line, so it silently stopped after just the FIRST
+    # (scalar) local, leaving the array-shaped one stranded in the body
+    # once the `block`/`end block` wrapper was stripped -- a declaration
+    # after an executable statement, illegal Fortran ("data declaration
+    # statement ... cannot appear after executable statements").
+    proc = _run_xpfunc2f([str(XCHOICE_TUPLE_REPRO_PATH), "other_call", "--out-dir", str(tmp_path)], tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "F2PY Build: PASS" in proc.stdout, proc.stdout
+    out_f90 = (tmp_path / "other_call_f.f90").read_text(encoding="utf-8")
+    assert "block" not in out_f90.lower()
+    assert "allocatable :: tmp_out_2_50" in out_f90, out_f90
+
+
+def test_xpfunc2f_all_rejects_function_name_and_verify(tmp_path: Path) -> None:
+    # --all is mutually exclusive with an explicit function_name (which
+    # function would it even apply to?) and with --verify (which needs
+    # one function's own arguments, not a script-wide run).
+    proc = _run_xpfunc2f([str(XPRIME_FUNC_PATH), "count_primes", "--all"], tmp_path)
+    assert proc.returncode != 0
+    assert "mutually exclusive" in (proc.stdout + proc.stderr)
+
+    proc = _run_xpfunc2f([str(XPRIME_FUNC_PATH), "--all", "--verify"], tmp_path)
+    assert proc.returncode != 0
+    assert "mutually exclusive" in (proc.stdout + proc.stderr)
+
+
+def test_xpfunc2f_reports_unparseable_module_cleanly(tmp_path: Path) -> None:
+    # Regression test for a real bug the --all refactor introduced:
+    # parse_module used to run INSIDE the per-target try/except (this
+    # project's own established style for a clean "Extract: FAIL (...)"
+    # report), but hoisting the transpile-once step out of the per-
+    # target logic (so --all can share it across every function) moved
+    # this call to run BEFORE any try/except existed at all -- a script
+    # whose own transpiled output has no `module ... contains ... end
+    # module` block (examples/xalias_repro.py's own, xp2f.py's own
+    # --flat-style output here) crashed with an unhandled traceback
+    # instead of the same clean message every other unsupported-shape
+    # case gets.
+    proc = _run_xpfunc2f([str(XALIAS_REPRO_PATH), "--out-dir", str(tmp_path)], tmp_path)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Traceback" not in proc.stderr, proc.stdout + proc.stderr
+    assert "Extract: FAIL" in proc.stdout, proc.stdout
+
+
+def test_xpfunc2f_bridges_rnorm_using_function(tmp_path: Path) -> None:
+    # End-to-end: examples/xarma_aic_fit.py's own `simulate_arma` calls
+    # `rnorm(n + burnin)` -- previously rejected outright ("needs
+    # helper(s) 'rnorm'"), now successfully inlined (its own RNG-replay
+    # state hoisted into the trimmed module's specification section).
+    # Not checked with --run-both/--verify: rnorm draws genuine random
+    # numbers here (no replay file set up), so Python's own and
+    # Fortran's own draws are expected to differ -- only the build
+    # itself, and that the resulting extension actually runs, matter.
+    proc = _run_xpfunc2f([str(XARMA_AIC_FIT_PATH), "simulate_arma", "--out-dir", str(tmp_path)], tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "F2PY Build: PASS" in proc.stdout, proc.stdout
+    sys.path.insert(0, str(tmp_path))
+    wrapper_mod = __import__("simulate_arma_f")
+    np = __import__("numpy")
+    result = wrapper_mod.simulate_arma(50, np.array([0.5]), np.array([0.2]), 10)
+    assert result.shape == (50,)
+    assert np.isfinite(result).all()
+
+
+def test_xpfunc2f_bridges_function_needing_optval_and_rnorm(tmp_path: Path) -> None:
+    # End-to-end: examples/xmix.py's own `simulate_normal_mixture` needs
+    # BOTH `rnorm` and `optval` inlined together, AND exercises
+    # strip_unused_dataframe_use -- the script's own driver code builds
+    # a pandas DataFrame elsewhere to report fit results (unrelated to
+    # this target), so xp2f.py emits a module-wide `use
+    # dataframe_str_index_mod, only: ...` header line that would
+    # otherwise be left orphaned (needing a companion module never
+    # linked into this standalone f2py build) once trimmed down to just
+    # this target.
+    proc = _run_xpfunc2f(
+        [str(XMIX_PATH), "simulate_normal_mixture", "--out-dir", str(tmp_path)], tmp_path
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "F2PY Build: PASS" in proc.stdout, proc.stdout
+    out_f90 = (tmp_path / "simulate_normal_mixture_f.f90").read_text(encoding="utf-8")
+    assert "dataframe_str_index_mod" not in out_f90, out_f90
+    sys.path.insert(0, str(tmp_path))
+    wrapper_mod = __import__("simulate_normal_mixture_f")
+    np = __import__("numpy")
+    x, component = wrapper_mod.simulate_normal_mixture(
+        200, np.array([0.5, 0.5]), np.array([-1.0, 1.0]), np.array([0.5, 0.5]), 1
+    )
+    assert x.shape == (200,)
+    assert component.shape == (200,)
+    assert np.isfinite(x).all()
+    assert set(component.tolist()) <= {0, 1}
+
+
+def test_xpfunc2f_bridges_size_derived_through_local_dependency(tmp_path: Path) -> None:
+    # End-to-end: examples/xarma_nagarch_fit.py's own
+    # `simulate_arma_nagarch` derives its own array result's size
+    # through a call to `simulate_nagarch_noise`, a plain, locally-
+    # defined dependency function (previously rejected outright: "no
+    # ... known-helper expression"). Not checked with --run-both/
+    # --verify: rnorm draws genuine random numbers here (no replay file
+    # set up), so Python's own and Fortran's own draws are expected to
+    # differ -- only the build itself, and that the resulting extension
+    # actually runs, matter.
+    proc = _run_xpfunc2f(
+        [str(XARMA_NAGARCH_FIT_PATH), "simulate_arma_nagarch", "--out-dir", str(tmp_path)], tmp_path
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Extract: PASS (simulate_arma_nagarch + 1 dependency function(s): simulate_nagarch_noise)" in proc.stdout, (
+        proc.stdout
+    )
+    assert "F2PY Build: PASS" in proc.stdout, proc.stdout
+    sys.path.insert(0, str(tmp_path))
+    np = __import__("numpy")
+    wrapper_mod = __import__("simulate_arma_nagarch_f")
+    result = wrapper_mod.simulate_arma_nagarch(50, np.array([0.5]), np.array([0.2]), 10, 0.01, 0.05, 0.1, 0.85)
+    assert result.shape == (50,)
+    assert np.isfinite(result).all()
