@@ -1,0 +1,61 @@
+# examples/*.py files with at least one top-level function definition
+# AND top-level code that calls or references one of them (a direct
+# NAME(...) call, or NAME passed by reference as a callback argument to
+# another top-level call -- e.g. fsolve(equations, x0)) -- suitable
+# targets for xpfunc2f.py. xpfunc2f_batch.py's own @list format: one
+# path per line, '#' for comments, blank lines ignored -- NO trailing
+# inline comments (the reader doesn't strip them, only a leading '#').
+
+examples/xalias_repro.py
+examples/xamerican_options.py
+examples/xar_acf.py
+examples/xarma_aic.py
+examples/xarma_aic_fit.py
+examples/xarma_nagarch_fit.py
+examples/xasa183_inferred.py
+examples/xbfgs.py
+examples/xbrentq.py
+examples/xbs.py
+examples/xbs_monte_carlo.py
+examples/xbs_vec.py
+examples/xcallback_passthrough_order_repro.py
+examples/xcallback_two_arg_repro.py
+examples/xchoice_tuple_repro.py
+examples/xcurve_fit.py
+examples/xequicorr_bands.py
+examples/xequicorr_turnover.py
+examples/xfilter_bounds.py
+examples/xfit_hv.py
+examples/xfit_hv_no_dates.py
+examples/xfit_nagarch_ccc.py
+examples/xfit_nagarch_dcc.py
+examples/xfit_nagarch_t_func.py
+examples/xfsolve.py
+examples/xfsolve_list_return.py
+examples/xgcd.py
+examples/xglobal_repro3.py
+examples/xglobal_repro4.py
+examples/xkd_inferred.py
+examples/xknapsack_inferred.py
+examples/xlbfgsb.py
+examples/xleast_squares.py
+examples/xma_persist.py
+examples/xminimize_scalar.py
+examples/xmix.py
+examples/xmix_full.py
+examples/xmix_ic.py
+examples/xmix_mv.py
+examples/xnested.py
+examples/xoptions_pde.py
+examples/xpartition_bounds.py
+examples/xprime.py
+examples/xr8sm_inferred.py
+examples/xreturn_stats.py
+examples/xreturn_stats_simple.py
+examples/xreturns_mv_t.py
+examples/xreturns_t.py
+examples/xrosetta.py
+examples/xsim_fit_nagarch.py
+examples/xsim_fit_nagarch_t.py
+examples/xtoms178_inferred.py
+examples/xxbs.py

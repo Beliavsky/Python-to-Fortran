@@ -66,6 +66,12 @@ Run Python and translated Fortran and compare normalized output:
 python xp2f.py path\to\program.py --run-diff
 ```
 
+Also declare a procedure `elemental` (and vectorize a per-element loop that calls it) where provably safe:
+
+```console
+python xp2f.py path\to\program.py --elemental
+```
+
 Run a batch file list:
 
 ```console
@@ -151,10 +157,15 @@ Important caveats:
 ## Repository Contents
 
 - `xp2f.py`: main transpiler and command-line interface.
+- `xpfunc2f.py`: translates ONE function (and its dependency closure) from a Python script to Fortran, compiles it with `numpy.f2py`, and generates a thin Python wrapper -- same name, same call signature -- backed by the compiled Fortran, for use inside an otherwise-unchanged Python program.
+- `fortran_scan.py`: shared Fortran source-scanning/rewriting utilities used by `xp2f.py`.
+- `fortran_post.py`: shared post-processing rewrites (cleanup, simplification, formatting) applied to generated Fortran.
+- `fortran_purity.py`: determines `pure`/`elemental` eligibility of generated procedures by examining the emitted Fortran text.
 - `python.f90`: Fortran helper runtime used by translated programs.
 - `dataframe_str_index.f90`, `dataframe_index_date.f90`, `dataframe_index_datetime.f90`: pandas `DataFrame` companion types (string-indexed, date-indexed, datetime-indexed), auto-included when a translated program uses pandas.
 - `lapack_d.f90`: bundled double-precision LAPACK helpers used by some translations.
 - `xp2f_batch.py`: batch runner for many Python files.
+- `xpfunc2f_batch.py`: batch runner for `xpfunc2f.py` over many Python files, reporting outcomes by stage (`Target`/`Transpile`/`Extract`/`F2PY Build`/`Run`) and a blocker breakdown for `Extract: FAIL` reasons.
 - `xcompare_xp2f_batch_results.py`: compares batch result snapshots.
 - `xsummarize_xp2f_progress.py`: summarizes progress from `burkardt_python_results*.txt` files.
 - `tests/`: focused tests for the Python-to-Fortran tooling.
