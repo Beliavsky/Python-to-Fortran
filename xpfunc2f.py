@@ -531,6 +531,19 @@ def check_f2py_compatible(lines, start, end, name):
     so this conservatively scans the WHOLE procedure body text instead --
     a false "unsupported" from matching something in an unrelated context
     only costs an unnecessary rejection, never a wrong bridge).
+
+    Skips content inside a nested `interface ... end interface` block (a
+    callback dummy argument's own abstract interface, e.g. `procedure(f_cb_if)
+    :: f`) -- that interface's own dummy arguments (e.g. `x(:)`) are a
+    DIFFERENT declaration than the target's own outer one of the same name,
+    and f2py's own callback-marshalling handles it directly; only the
+    target's own outer signature is what a thin f2py wrapper must bridge.
+    Confirmed a real bug without this: the callback interface's own nested
+    `real(kind=dp), intent(in) :: x(:)` line (left correctly untouched, since
+    it's the callback's OWN abstract signature, not the target's) was
+    mistaken for an unrewritten array-shaped dummy of the TARGET itself,
+    rejecting the whole bridge even after rewrite_target_for_f2py correctly
+    rewrote the target's own outer `x(:)`.
     """
     sig_line = _strip_comment(lines[start])
     # A FUNCTION's own result variable is array-shaped exactly when its own
@@ -545,8 +558,17 @@ def check_f2py_compatible(lines, start, end, name):
         m_result = re.search(r"\bresult\s*\(\s*([a-z_]\w*)\s*\)", sig_line, re.IGNORECASE)
         result_name = (m_result.group(1) if m_result else m_func.group(1)).lower()
 
+    in_interface = False
     for i in range(start, end + 1):
         code = _strip_comment(lines[i])
+        if INTERFACE_START_RE.match(code):
+            in_interface = True
+            continue
+        if INTERFACE_END_RE.match(code):
+            in_interface = False
+            continue
+        if in_interface:
+            continue
         if DERIVED_TYPE_RE.match(code.strip()):
             raise UnsupportedFunction(
                 f"{name!r} uses a derived type (line: {code.strip()!r}) -- not "
@@ -952,8 +974,27 @@ def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
             result_name = rm.group(1)
 
     def _find_decl(name):
+        # Skip content inside a nested `interface ... end interface` block
+        # (a callback dummy argument's own abstract interface, e.g.
+        # `procedure(f_cb_if) :: f`) -- that interface's own dummy arguments
+        # (e.g. `x(:)`) are a DIFFERENT declaration than the TARGET's own
+        # outer one of the same name, and must never be mistaken for it.
+        # Confirmed a real bug without this: the callback interface's own
+        # nested `x(:)` (appearing first, textually, since the interface
+        # block precedes the target's own declaration section) was rewritten
+        # instead of the target's own outer `x(:)`, leaving the latter
+        # unrewritten and rejected later by check_f2py_compatible.
+        in_interface = False
         for i in range(1, len(target_lines)):
             code = _strip_comment(target_lines[i])
+            if INTERFACE_START_RE.match(code):
+                in_interface = True
+                continue
+            if INTERFACE_END_RE.match(code):
+                in_interface = False
+                continue
+            if in_interface:
+                continue
             if "::" not in code:
                 continue
             m = re.search(
