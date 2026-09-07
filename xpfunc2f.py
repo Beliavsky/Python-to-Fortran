@@ -2769,18 +2769,37 @@ def _run_all_targets(
     whole run -- the point of --all is maximizing how many functions end
     up bridged, not requiring all-or-nothing.
 
+    --except (args.except_funcs) additionally skips whatever function
+    name(s) it lists -- e.g. a data-loading function with no good Fortran
+    equivalent (pandas I/O, network calls, ...) that would otherwise just
+    fail and clutter the summary, or one the user simply doesn't want
+    translated. Checked against the script's own top-level function names
+    up front (BEFORE excluding 'main') so a typo'd or nonexistent name is
+    caught with a clear error instead of silently matching nothing.
+
     --run-both/--time-both are only attempted afterward if EVERY
-    function was successfully bridged -- patching them all in at once
-    raises real per-function interaction questions (a bridged function
-    calling one that's still plain Python, or vice versa) that only
-    disappear cleanly when there's no plain-Python function left at all.
+    (non-excepted) function was successfully bridged -- patching them all
+    in at once raises real per-function interaction questions (a bridged
+    function calling one that's still plain Python, or vice versa) that
+    only disappear cleanly when there's no plain-Python function left at
+    all -- an intentionally excepted function stays plain Python forever,
+    so it's fine for it to remain un-bridged; only an actual FAILURE among
+    the rest still blocks --run-both/--time-both.
     """
+    top_level_names = {node.name for node in py_tree.body if isinstance(node, ast.FunctionDef)}
+    except_names = set(args.except_funcs or [])
+    unknown = except_names - top_level_names
+    if unknown:
+        print(f"Target: FAIL (--except name(s) not found as a top-level function in the "
+              f"script: {', '.join(sorted(unknown))})")
+        return 1
     all_func_names = [
-        node.name for node in py_tree.body if isinstance(node, ast.FunctionDef) and node.name != "main"
+        node.name for node in py_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name != "main" and node.name not in except_names
     ]
     if not all_func_names:
         print("Target: FAIL (no top-level function found in the source script, other than "
-              "'main' if present)")
+              "'main' and any --except name(s), if present)")
         return 1
 
     results: dict[str, TargetBridgeResult | None] = {}
@@ -2822,7 +2841,7 @@ def main(argv=None) -> int:
         default=None,
         help="name of the top-level function to translate (default: the first function "
         "the script's own top-level code calls, skipping a call to 'main'); mutually "
-        "exclusive with --all",
+        "exclusive with --all/--except",
     )
     ap.add_argument("--out-dir", help="directory for generated files (default: alongside input_py)")
     ap.add_argument(
@@ -2832,6 +2851,17 @@ def main(argv=None) -> int:
         "each independently, reporting pass/fail per function -- mutually exclusive with "
         "function_name/--verify. --run-both/--time-both are attempted afterward (patching "
         "every successfully-bridged function in at once) only if ALL of them bridged",
+    )
+    ap.add_argument(
+        "--except",
+        dest="except_funcs",
+        nargs="+",
+        metavar="FUNC",
+        default=None,
+        help="like --all, but also skip these top-level function name(s) -- e.g. a "
+        "data-loading function with no good Fortran equivalent (pandas I/O, network "
+        "calls, ...). Implies --all; mutually exclusive with function_name/--verify. "
+        "'main' is always skipped regardless, whether or not it's named here too",
     )
     ap.add_argument(
         "--verify",
@@ -2857,10 +2887,15 @@ def main(argv=None) -> int:
     )
     args = ap.parse_args(argv)
 
+    # --except implies --all's own semantics (translate every top-level
+    # function, minus some names) -- always paired together from here on,
+    # so every other --all check/branch below also covers --except for free.
+    if args.except_funcs:
+        args.all = True
     if args.all and args.function_name:
-        ap.error("function_name and --all are mutually exclusive")
+        ap.error("function_name and --all/--except are mutually exclusive")
     if args.all and args.verify:
-        ap.error("--verify and --all are mutually exclusive (--verify needs one function's own arguments)")
+        ap.error("--verify and --all/--except are mutually exclusive (--verify needs one function's own arguments)")
 
     # Absolute -- several subprocesses below (the f2py build in
     # particular) run with cwd=out_dir, so a RELATIVE out_dir (or a path
