@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import ast
 import difflib
+import math
 import os
 import re
 import shlex
@@ -2145,6 +2146,353 @@ def write_f2cmap_file(path: Path) -> None:
     path.write_text("dict(real=dict(dp='double'))\n", encoding="utf-8")
 
 
+# Every LAPACK routine name this project's own python.f90 helpers call
+# (confirmed via `grep -oE '\bcall\s+d[a-z]{4,6}\s*\(' python.f90` --
+# dpotrf for a Cholesky factorization, the rest for the other
+# numpy.linalg-backed helpers: dgeev/dgeqrf/dgesv/dgesvd/dgetrf/dgetri/
+# dorgqr/dsyev). A trimmed module referencing any of these (after
+# inline_python_mod_helpers has already inlined whichever helper calls
+# it) needs lapack_d.f90 -- this project's own vendored, whole-file
+# LAPACK reference implementation, already used by xp2f.py's own
+# whole-program `--compile` path the same way -- linked in too.
+LAPACK_ROUTINE_RE = re.compile(
+    r"\b(dgeev|dgeqrf|dgesv|dgesvd|dgetrf|dgetri|dorgqr|dpotrf|dsyev)\s*\(", re.IGNORECASE
+)
+
+
+def _ensure_lapack_archive():
+    """Return (lib_dir, lib_stem) for a `-L{lib_dir} -l{lib_stem}` link
+    flag pair that resolves every LAPACK_ROUTINE_RE symbol, or None if
+    lapack_d isn't available at all (no source to build it from).
+
+    f2py's own `-c` build mode can't just be handed lapack_d.f90
+    directly as an extra source file the way plain gfortran can: EVERY
+    file f2py is given gets crackfortran-parsed as something to WRAP for
+    Python (confirmed empirically -- a bare `.o` object file passed the
+    same way is silently just added to that same file list and produces
+    no link input at all, no error either, since crackfortran can't read
+    binary content as Fortran source and just finds nothing there). The
+    fix is the same mechanism this project's own `-lgcc` link flag
+    already uses successfully: wrap the already-compiled object in a
+    plain static archive (`ar rcs liblapack_d.a lapack_d.o`) and pass it
+    as an ordinary `-L`/`-l` linker flag instead -- f2py passes those
+    straight through to the final link command untouched.
+
+    Cached (as `liblapack_d.a`, alongside this project's own vendored
+    lapack_d.o/lapack_d.f90) so the ~110K-line lapack_d.f90 is compiled
+    or re-archived at most once, not on every xpfunc2f.py invocation
+    that happens to need it.
+    """
+    cache_dir = Path(__file__).resolve().parent / ".xpfunc2f_lapack_cache"
+    archive_path = cache_dir / "liblapack_d.a"
+    if archive_path.exists():
+        return cache_dir, "lapack_d"
+
+    here = Path(__file__).resolve().parent
+    obj_path = here / "lapack_d.o"
+    if not obj_path.exists():
+        # No pre-built object -- compile lapack_d.f90 fresh, ONCE, into
+        # the cache dir itself (never the repo root -- this is a
+        # generated artifact, not something to leave lying around next
+        # to the vendored source).
+        src_path = here / "lapack_d.f90"
+        if not src_path.exists():
+            return None
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = cache_dir / "lapack_d.o"
+        proc = subprocess.run(
+            ["gfortran", "-O2", "-c", str(src_path), "-o", str(obj_path)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0 or not obj_path.exists():
+            return None
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(["ar", "rcs", str(archive_path), str(obj_path)], capture_output=True, text=True)
+    if proc.returncode != 0 or not archive_path.exists():
+        return None
+    return cache_dir, "lapack_d"
+
+
+PROGRAM_START_RE = re.compile(r"^\s*program\s+([a-z_]\w*)\s*$", re.IGNORECASE)
+PROGRAM_END_RE = re.compile(r"^\s*end\s+program\b", re.IGNORECASE)
+_LITERAL_TOKEN_RE = re.compile(
+    r"""^(?:
+        [+-]?(?:\d+\.?\d*|\.\d+)(?:[eEdD][+-]?\d+)?(?:_[a-z]\w*)?  # numeric, optional _dp-style kind suffix
+        |\.(?:true|false)\.                                        # logical
+        |'[^']*'                                                    # char literal, single-quoted
+        |"[^"]*"                                                    # char literal, double-quoted
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _find_program_block(lines):
+    """(start, end) inclusive line-index span of the `program ... end
+    program` block xp2f.py's own whole-program translation emits after
+    the module (the script's own top-level entry point) -- or (None,
+    None) if there isn't one (e.g. a module-only/--flat-style
+    translation).
+    """
+    start = end = None
+    for i, ln in enumerate(lines):
+        code = _strip_comment(ln)
+        if start is None:
+            if PROGRAM_START_RE.match(code):
+                start = i
+            continue
+        if PROGRAM_END_RE.match(code):
+            end = i
+            break
+    return start, end
+
+
+_TYPE_DECL_PREFIX_RE = re.compile(
+    r"^\s*(integer|real|logical|complex|character|double\s+precision|type|class)\b", re.IGNORECASE
+)
+
+
+def _split_multi_name_var_decls(header):
+    """Like _split_multi_name_decls, but scoped to ONLY a genuine TYPE
+    declaration line (one whose own prefix starts with a real Fortran
+    type keyword) -- never a `use ..., only: a, b, c` header line, which
+    ALSO has a top-level `::` (right after `intrinsic`) and top-level
+    commas of its own, but means something completely different: naively
+    running the general splitter over the WHOLE header corrupted it,
+    confirmed a real bug via examples/xma_persist.py's own `use,
+    intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan,
+    ieee_is_nan` -- split into several bogus, syntactically-broken `use`
+    lines (one of them literally `use, intrinsic :: only: ieee_value`),
+    a silent corruption that built and failed ONLY once f2py itself
+    tried to compile the result (well past Extract/every earlier check).
+    """
+    out = []
+    for ln in header:
+        code = _strip_comment(ln)
+        idx = _find_top_level_double_colon(code)
+        if idx is None or not _TYPE_DECL_PREFIX_RE.match(code[:idx]):
+            out.append(ln)
+            continue
+        prefix, names_part = code[:idx], code[idx + 2 :]
+        names = _split_top_level(names_part)
+        if len(names) <= 1:
+            out.append(ln)
+            continue
+        trailing = ln[len(code) :]
+        for nm in names:
+            out.append(f"{prefix}:: {nm.strip()}")
+        out[-1] += trailing
+    return out
+
+
+def _module_level_var_decls(header):
+    """Yield (line_idx, prefix, name, shape_or_None) for each plain
+    module-level VARIABLE declared in `header` that does NOT already
+    carry its own inline initializer -- skips `parameter`s (already a
+    compile-time constant, nothing to hoist) and any declaration that
+    already has one (e.g. `= 0.0_dp`). A candidate set for
+    hoist_global_initializers below.
+    """
+    for i, ln in enumerate(header):
+        code = _strip_comment(ln)
+        idx = _find_top_level_double_colon(code)
+        if idx is None:
+            continue
+        prefix = code[:idx]
+        if re.search(r"\bparameter\b", prefix, re.IGNORECASE):
+            continue
+        # A genuine TYPE declaration only -- `public ::`/`private ::` (an
+        # ACCESS specification, not a declaration) shares the same `::`
+        # syntax and would otherwise be misread as declaring a scalar
+        # variable named after each name it lists (confirmed a real bug:
+        # `public :: dp, f, r`'s own `dp` was mistaken for an
+        # uninitialized module-level variable needing to be hoisted).
+        if not re.match(
+            r"^\s*(integer|real|logical|complex|character|double\s+precision|type|class)\b",
+            prefix,
+            re.IGNORECASE,
+        ):
+            continue
+        for decl in _split_top_level(code[idx + 2 :]):
+            decl = decl.strip()
+            if "=" in decl:
+                continue
+            m = re.match(r"^([a-z_]\w*)\s*(?:\(([^()]*)\))?\s*$", decl, re.IGNORECASE)
+            if m:
+                yield i, prefix, m.group(1), m.group(2)
+
+
+def _hoistable_literal_value(rhs: str):
+    """If `rhs` (an assignment's own right-hand side text) is either a
+    single literal token, or an array-constructor `[literal, literal,
+    ...]` (an optional leading `TYPE ::` type-spec accepted, xp2f.py's
+    own idiom for a typed constructor) of ONLY literal elements, return
+    (value_text_to_emit, element_count_or_None) -- element_count is None
+    for a scalar. Returns None for anything else (a name reference, a
+    function call, an operator between two operands, ...) -- deliberately
+    conservative, same "only when provably safe" spirit as
+    _derive_no_alloc_array_size.
+    """
+    rhs = rhs.strip()
+    m = re.match(r"^\[\s*(?:[a-z]\w*(?:\([^()]*\))?\s*::\s*)?(.*)\]$", rhs, re.IGNORECASE | re.DOTALL)
+    if m:
+        elems = [e.strip() for e in _split_top_level(m.group(1)) if e.strip()]
+        if elems and all(_LITERAL_TOKEN_RE.match(e) for e in elems):
+            return rhs, len(elems)
+        return None
+    if _LITERAL_TOKEN_RE.match(rhs):
+        return rhs, None
+    return None
+
+
+def _name_declared_locally(body_lines, name):
+    """True if `name` is declared as its OWN dummy argument or local
+    variable somewhere in `body_lines[1:]` (its own signature line,
+    body_lines[0], is skipped -- every dummy argument's name necessarily
+    appears there regardless of shadowing, so it says nothing either
+    way). Ordinary Fortran scoping: a local/dummy of this name SHADOWS a
+    module-level global of the same name completely within this one
+    procedure -- any bare reference to `name` inside it means the LOCAL
+    one, never the global.
+    """
+    decl_re = re.compile(rf"::\s*{re.escape(name)}\s*(\([^()]*\))?\s*$", re.IGNORECASE)
+    return any(decl_re.search(_strip_comment(ln)) for ln in body_lines[1:])
+
+
+def hoist_global_initializers(header, lines, needed_bodies):
+    """Return a NEW header (list of lines) with each module-level global
+    genuinely REFERENCED by `needed_bodies` (a list of per-procedure
+    line-lists -- the target's own already-rewritten body, plus every
+    dependency's own raw body) given an inline initializer, hoisted from
+    the script's own top-level `program` block -- when it's safely
+    derivable. Never mutates `header` itself.
+
+    Each procedure's own body is checked SEPARATELY (not flattened into
+    one blob) so a same-named LOCAL variable or dummy argument in ONE of
+    them -- which, by ordinary Fortran scoping, SHADOWS the module-level
+    global entirely within that procedure (see _name_declared_locally)
+    -- is correctly excluded from counting as a genuine reference.
+    Confirmed a real bug without this: examples/xsim_fit_nagarch_t.py's
+    own module-level `r` was never actually referenced by ITS OWN name
+    anywhere, but a COMPLETELY UNRELATED dummy argument also happening
+    to be named `r(:)`, in a totally different (dependency) procedure,
+    was mistaken for a genuine use of the module-level global -- wrongly
+    rejecting a bridge that built and ran correctly before this hoisting
+    step existed at all (caught by the project's own regression suite).
+
+    xp2f.py's own whole-program translation puts a Python module-level
+    assignment's own Fortran equivalent in the `program` block (the
+    script's own top-level entry point), never in the module's own
+    declaration section -- ordinary Fortran has no equivalent of
+    Python's "module-level code runs at import time" for a plain
+    variable declaration. Bridging a single function standalone never
+    runs that `program` block at all, so a referenced global left merely
+    DECLARED (never assigned) is read as garbage -- confirmed
+    empirically via examples/xglobal_repro3.py's own module-level `r =
+    np.array([1.0, 2.0, 3.0])`, referenced by the bridged function via
+    `np.sum(r)`: an unallocated `sum(r)` crashes the Fortran-backed run
+    with an access violation (0xC0000005), well past every earlier check
+    (Extract/F2PY Build both report PASS -- this only surfaces once the
+    compiled extension actually RUNS).
+
+    Only ever hoists a PROVABLY SAFE initializer: a single top-level
+    assignment (the program block's own BASE indentation -- the first
+    executable statement's own, taken as the "not nested in any do/if/
+    ... block" level) to a literal value/array-constructor, with no
+    OTHER assignment to the same name anywhere in the program block (a
+    later reassignment would make "hoist the first one" silently wrong).
+    Raises UnsupportedFunction for anything else (multiple assignments,
+    a computed/runtime-dependent value, no program block at all, ...) --
+    a clean Extract-time rejection instead of a silent runtime crash.
+    """
+    prog_start, prog_end = _find_program_block(lines)
+    # Merged to ONE logical line per statement first -- xp2f.py's own
+    # line-wrapping means even a plain `use ..., only: a, b, c` can
+    # `&`-continue across several physical lines, and a raw per-PHYSICAL-
+    # line scan used to badly misjudge the block's own base indentation
+    # from a continuation line's own (different) leading whitespace,
+    # confirmed via examples/xma_persist.py's own multi-line `use`
+    # statement: its own base_indent came out as the CONTINUATION line's
+    # indent, so the real first statement (`pairwise_corr = 0.3_dp`, at
+    # the TRUE base indent) never matched, and a genuinely safe, single,
+    # unambiguous `t_cost_one_way = 0.001_dp` assignment was wrongly
+    # reported as "found 0" -- a regression this hoisting step itself
+    # introduced (a bridge that built and ran fine before it existed).
+    prog_lines = _merge_continuations(lines[prog_start : prog_end + 1]) if prog_start is not None else []
+    base_indent = None
+    if prog_lines:
+        for j in range(1, len(prog_lines)):
+            code = _strip_comment(prog_lines[j])
+            stripped = code.strip()
+            if not stripped or stripped.lower() == "implicit none" or stripped.lower().startswith("use "):
+                continue
+            base_indent = len(prog_lines[j]) - len(prog_lines[j].lstrip())
+            break
+
+    # Split to ONE name per declaration line FIRST -- a shared line
+    # (`real(kind=dp) :: pairwise_corr, t_cost_one_way`) rewritten IN
+    # PLACE for just one of its names would otherwise clobber the WHOLE
+    # line, silently dropping every sibling name sharing it. Confirmed a
+    # real bug via this exact case (examples/xma_persist.py's own
+    # `pairwise_corr`/`t_cost_one_way`, declared together): rewriting
+    # `t_cost_one_way`'s own hoisted initializer overwrote `pairwise_corr`
+    # right off the line entirely, gfortran rejecting the now-orphaned
+    # `public :: ..., pairwise_corr, ...` with "has no IMPLICIT type".
+    new_header = _split_multi_name_var_decls(_merge_continuations(list(header)))
+    for i, prefix, name, shape in list(_module_level_var_decls(new_header)):
+        referenced = False
+        for body_lines in needed_bodies:
+            if _name_declared_locally(body_lines, name):
+                continue  # shadowed by a local/dummy of the same name in THIS procedure
+            if any(
+                re.search(rf"\b{re.escape(name)}\b", _strip_comment(ln), re.IGNORECASE)
+                for ln in body_lines[1:]
+            ):
+                referenced = True
+                break
+        if not referenced:
+            continue  # not referenced by the target/its dependency closure at all
+        if prog_start is None:
+            raise UnsupportedFunction(
+                f"references module-level global {name!r}, which has no inline "
+                f"initializer and there's no top-level program block to derive "
+                f"one from -- can't safely bridge standalone"
+            )
+        assign_re = re.compile(rf"^(\s*){re.escape(name)}\s*=\s*(.+?)\s*$", re.IGNORECASE)
+        matches = []
+        for j in range(1, len(prog_lines) - 1):
+            m = assign_re.match(_strip_comment(prog_lines[j]))
+            if m and (base_indent is None or len(m.group(1)) == base_indent):
+                matches.append(m.group(2))
+        if len(matches) != 1:
+            raise UnsupportedFunction(
+                f"references module-level global {name!r}, whose own top-level "
+                f"initializer isn't a single, unambiguous assignment in the "
+                f"program body (found {len(matches)}) -- can't safely hoist"
+            )
+        hoistable = _hoistable_literal_value(matches[0])
+        if hoistable is None:
+            raise UnsupportedFunction(
+                f"references module-level global {name!r}, whose own top-level "
+                f"initializer ({matches[0]!r}) isn't a literal value/array "
+                f"constructor -- can't safely hoist a runtime-computed value into "
+                f"the bridged module's own declaration"
+            )
+        value_text, count = hoistable
+        new_prefix = re.sub(r",?\s*allocatable\s*", "", prefix, flags=re.IGNORECASE).rstrip()
+        if count is not None:
+            if shape is None:
+                raise UnsupportedFunction(
+                    f"module-level global {name!r} is assigned an array literal "
+                    f"but declared as a scalar -- unexpected shape mismatch"
+                )
+            new_header[i] = f"{new_prefix} :: {name}({count}) = {value_text}"
+        else:
+            new_header[i] = f"{new_prefix} :: {name} = {value_text}"
+    return new_header
+
+
 def build_trimmed_module(mod_name, header, lines, procedures, needed, override_lines=None):
     override_lines = override_lines or {}
     dropped = {nm for nm in procedures if nm not in needed}
@@ -2331,7 +2679,84 @@ def _results_match(a, b) -> bool:
     return a == b
 
 
-def generate_wrapper(mod_name, ext_name, func_name, arg_names) -> str:
+def _unused_scalar_target_args(target_lines, arg_names):
+    """Which of `arg_names` (the target's own ORIGINAL Python argument
+    names, order-preserved) are (a) declared as a plain SCALAR dummy (no
+    array shape -- kept narrowly scoped to the observed case; an array
+    argument's marshalling is already more involved and untested here)
+    and (b) referenced NOWHERE in `target_lines` except their own
+    declaration line -- i.e. genuinely unused by the procedure's own
+    Fortran body.
+
+    xp2f.py's own whole-program translation sometimes keeps such a dummy
+    purely for Python-signature compatibility with the original
+    function, even though its actual value plays no role internally --
+    confirmed via examples/xmix.py's own `simulate_normal_mixture(n,
+    weights, means, sds, rng)`: `rng` (a numpy Generator object in
+    Python) becomes a bare `integer, intent(in) :: rng` in Fortran,
+    never referenced in the body at all (the actual random draws go
+    through a completely different mechanism, RNG-replay or a direct
+    Fortran RNG call, neither of which touches this dummy). Forwarding
+    the real Generator OBJECT to it unconditionally is never going to
+    work (f2py reports "can't be converted to int" -- confirmed
+    empirically, an outright runtime TypeError past every earlier
+    Extract/F2PY Build check) -- but since it's unused, the fix isn't a
+    conversion at all: mark it `optional` (see _mark_args_optional) and
+    have the wrapper simply not pass it through (see generate_wrapper's
+    own `omit_args`), which is exactly equivalent to what the Fortran
+    body already does with it (nothing).
+    """
+    unused = set()
+    for name in arg_names:
+        name_re = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+        decl_re = re.compile(rf"::\s*{re.escape(name)}\s*(\([^()]*\))?\s*$", re.IGNORECASE)
+        is_scalar_decl = False
+        used_elsewhere = False
+        # target_lines[0] is the procedure's own signature line -- every
+        # dummy argument's name necessarily appears there (in the
+        # parameter list itself), so it must be skipped here or EVERY
+        # argument would always look "used" and this would never fire.
+        for ln in target_lines[1:]:
+            code = _strip_comment(ln)
+            if not name_re.search(code):
+                continue
+            dm = decl_re.search(code)
+            if dm:
+                if dm.group(1) is None:
+                    is_scalar_decl = True
+                continue  # its own declaration line; not a use
+            used_elsewhere = True
+        if is_scalar_decl and not used_elsewhere:
+            unused.add(name.lower())
+    return unused
+
+
+def _mark_args_optional(target_lines, names):
+    """Return a NEW target_lines with `, optional` added to each named
+    dummy's own `intent(...)` attribute list -- lets f2py's compiled
+    extension accept a call that OMITS it entirely (see
+    _unused_scalar_target_args/generate_wrapper's own `omit_args`),
+    instead of requiring some value the wrapper has no safe way to
+    provide.
+    """
+    names_l = {n.lower() for n in names}
+    out = []
+    for ln in target_lines:
+        code = _strip_comment(ln)
+        m = re.search(r"::\s*([a-z_]\w*)\s*$", code, re.IGNORECASE)
+        if (
+            m
+            and m.group(1).lower() in names_l
+            and not re.search(r"\boptional\b", code, re.IGNORECASE)
+        ):
+            ln = re.sub(r"(intent\s*\([^)]*\))", r"\1, optional", ln, count=1, flags=re.IGNORECASE)
+        out.append(ln)
+    return out
+
+
+def generate_wrapper(mod_name, ext_name, func_name, arg_names, omit_args=frozenset(), vectorize_scalars=False) -> str:
+    if not arg_names:
+        vectorize_scalars = False  # nothing to broadcast over; avoid a bare "(,)" tuple literal
     args_sig = ", ".join(arg_names)
     # f2py always lowercases a Fortran dummy's own name for its generated
     # Python-facing keyword (Fortran identifiers are case-insensitive, so
@@ -2344,15 +2769,70 @@ def generate_wrapper(mod_name, ext_name, func_name, arg_names) -> str:
     # required argument 's'". The wrapper's OWN Python-facing signature
     # (`args_sig` above) still uses the original case, unaffected --
     # this is a drop-in replacement, so it must accept calls the same
-    # way the original Python function did.
-    call_args = ", ".join(f"{a.lower()}={a}" for a in arg_names)
-    return (
+    # way the original Python function did. `omit_args` (see
+    # _unused_scalar_target_args) are left OUT of this call entirely --
+    # marked `optional` on the Fortran side, genuinely unused by its own
+    # body, and often impossible to marshal anyway (e.g. a numpy
+    # Generator object has no valid conversion to whatever placeholder
+    # scalar type the dummy was given).
+    call_args = ", ".join(f"{a.lower()}={a}" for a in arg_names if a.lower() not in omit_args)
+    # The SAME lowercasing applies to the compiled extension's own MODULE
+    # and PROCEDURE attribute names, not just its dummy-argument keywords
+    # -- confirmed empirically via examples/xgcd.py's own `Gcd`: the
+    # compiled extension exposes it as `gcd` (f2py's own `--lower` pass),
+    # so referencing `{ext_name}.{mod_name}.{func_name}` with the
+    # ORIGINAL-case `Gcd` raised "'fortran' object has no attribute
+    # 'Gcd'. Did you mean: 'gcd'?" at CALL time -- past every earlier
+    # check (Extract/F2PY Build all reported PASS), only surfacing when
+    # the wrapper actually ran. `func_name` in the DEF line/docstring
+    # above stays the original case, unaffected -- only this attribute-
+    # access chain into the compiled extension needs lowering.
+    mod_attr = mod_name.lower()
+    func_attr = func_name.lower()
+    header_comment = (
         f"# Generated by xpfunc2f.py -- a thin wrapper around the f2py-compiled\n"
         f"# Fortran translation of `{func_name}`. Same name, same call signature\n"
         f"# as the original Python function; drop-in replacement at call sites.\n"
-        f"import {ext_name}\n\n\n"
-        f"def {func_name}({args_sig}):\n"
-        f"    return {ext_name}.{mod_name}.{func_name}({call_args})\n"
+    )
+    if not vectorize_scalars:
+        return (
+            header_comment
+            + f"import {ext_name}\n\n\n"
+            + f"def {func_name}({args_sig}):\n"
+            + f"    return {ext_name}.{mod_attr}.{func_attr}({call_args})\n"
+        )
+    # A PURELY SCALAR target (no array-shaped argument/result at all --
+    # rewrite_target_for_f2py never touched it) is NOT actually a safe
+    # drop-in replacement as-is: the ORIGINAL Python function, built from
+    # ordinary numpy expressions, transparently broadcasts over an
+    # array-valued argument (numpy's own elementwise semantics) -- but
+    # f2py's compiled scalar dummy does NOT raise a clear error for an
+    # array argument, it silently (mis-)reads just one value out of it.
+    # Confirmed a real, dangerous silent-wrong-result bug via
+    # examples/xcurve_fit.py's own `model(x, a, b, c)`, passed to real
+    # scipy `curve_fit` (still running as ordinary Python in --run-both,
+    # only `model` itself replaced) -- curve_fit's own convention calls
+    # it with the WHOLE `xdata` array at once, and the compiled scalar
+    # `model` silently returned `a*exp(-b*0)+c` (as if x were 0.0)
+    # regardless of which actual x values were passed, letting the
+    # optimizer converge on a completely wrong, constant-model fit with
+    # no error at all. Falls back to elementwise dispatch (matching
+    # ordinary numpy broadcasting) whenever ANY argument passed is
+    # itself array-like -- kept as a FALLBACK, not the only path, so an
+    # ordinary plain-scalar call (this tool's originally-intended usage)
+    # still goes straight to the compiled extension with no per-call
+    # `np.vectorize` overhead.
+    impl_name = f"_{func_name}_scalar_impl"
+    return (
+        header_comment
+        + f"import {ext_name}\n"
+        + f"import numpy as np\n\n\n"
+        + f"def {impl_name}({args_sig}):\n"
+        + f"    return {ext_name}.{mod_attr}.{func_attr}({call_args})\n\n\n"
+        + f"def {func_name}({args_sig}):\n"
+        + f"    if any(hasattr(_v, '__len__') for _v in ({args_sig},)):\n"
+        + f"        return np.vectorize({impl_name})({args_sig})\n"
+        + f"    return {impl_name}({args_sig})\n"
     )
 
 
@@ -2368,8 +2848,12 @@ def generate_bridge_wrapper(mod_name, ext_name, func_name, arg_names, bridge_nam
     """
     args_sig = ", ".join(arg_names)
     # See generate_wrapper's own comment: f2py always lowercases a
-    # Fortran dummy's own name for its generated Python-facing keyword.
+    # Fortran dummy's own name for its generated Python-facing keyword,
+    # and equally its own MODULE/PROCEDURE attribute names -- lower both
+    # here too, same reasoning (examples/xgcd.py's own `Gcd`/`gcd`).
     call_args = ", ".join(f"{a.lower()}={a}" for a in arg_names)
+    mod_attr = mod_name.lower()
+    bridge_attr = bridge_name.lower()
     raw_names = []
     for i in range(n_outputs):
         raw_names.append(f"_out{i}")
@@ -2386,7 +2870,7 @@ def generate_bridge_wrapper(mod_name, ext_name, func_name, arg_names, bridge_nam
         f"# call sites.\n"
         f"import {ext_name}\n\n\n"
         f"def {func_name}({args_sig}):\n"
-        f"    {unpack} = {ext_name}.{mod_name}.{bridge_name}({call_args})\n"
+        f"    {unpack} = {ext_name}.{mod_attr}.{bridge_attr}({call_args})\n"
         f"    return {trims}\n"
     )
 
@@ -2506,8 +2990,20 @@ def _bridge_one_target(
         else:
             target_lines, had_array = rewrite_target_for_f2py(lines, t_start, t_end, func_name, procedures)
 
+        omit_args = set()
         if bridge_name is None:
             check_f2py_compatible(target_lines, 0, len(target_lines) - 1, target_key)
+            # A scalar dummy the Fortran body never actually references
+            # (see _unused_scalar_target_args's own docstring, e.g.
+            # examples/xmix.py's own `rng`) is marked `optional` and left
+            # OUT of the wrapper's own call entirely -- there's often no
+            # valid conversion from what Python actually passes (e.g. a
+            # numpy Generator object) to whatever placeholder scalar type
+            # it was given, and since it's unused, nothing is lost by not
+            # passing it at all.
+            omit_args = _unused_scalar_target_args(target_lines, arg_names)
+            if omit_args:
+                target_lines = _mark_args_optional(target_lines, omit_args)
         # else: the target is kept completely UNCHANGED (still
         # allocatable) -- it's never itself exposed to f2py, only called
         # internally by the bridge, so its own shape doesn't need to pass
@@ -2524,6 +3020,19 @@ def _bridge_one_target(
         # internal Fortran-to-Fortran call needs no f2py-facing rewrite
         # at all -- assumed-shape array arguments, allocatable results,
         # and derived types are all completely normal Fortran there).
+
+        # A module-level global referenced by the target or any of its
+        # dependencies would otherwise be left merely DECLARED, never
+        # ASSIGNED -- its own initializer lives in the script's top-level
+        # `program` block, which a standalone f2py bridge never runs.
+        # See hoist_global_initializers's own docstring. Kept as
+        # SEPARATE per-procedure line-lists (not flattened into one
+        # blob) so a same-named local/dummy in one of them can be told
+        # apart from a genuine reference to the module-level global.
+        needed_bodies = [target_lines] + [
+            lines[procedures[nm][0] : procedures[nm][1] + 1] for nm in needed if nm != target_key
+        ]
+        header = hoist_global_initializers(header, lines, needed_bodies)
     except UnsupportedFunction as e:
         print(f"Extract: FAIL ({e})")
         return None
@@ -2621,6 +3130,18 @@ def _bridge_one_target(
     )
     if gcc_lib.exists():
         f2py_cmd.extend([f"-L{gcc_lib.parent}", "-lgcc"])
+    # A trimmed module calling a LAPACK routine (e.g. `dpotrf`, reached
+    # through an inlined python_mod helper like `random_mvn_samples` --
+    # xp2f.py's own translation of `rng.multivariate_normal(...)`) needs
+    # this project's own vendored lapack_d linked in too, the same way
+    # xp2f.py's own whole-program `--compile` path already does -- see
+    # _ensure_lapack_archive's own docstring for why it's an archived
+    # `.o`, not lapack_d.f90 itself, that gets passed here.
+    if LAPACK_ROUTINE_RE.search(trimmed_text):
+        lapack_lib = _ensure_lapack_archive()
+        if lapack_lib is not None:
+            lapack_dir, lapack_stem = lapack_lib
+            f2py_cmd.extend([f"-L{lapack_dir}", f"-l{lapack_stem}"])
     t0 = time.perf_counter()
     proc = subprocess.run(
         f2py_cmd,
@@ -2644,11 +3165,142 @@ def _bridge_one_target(
             encoding="utf-8",
         )
     else:
+        # A target that ended up with NO array argument/result at all --
+        # `had_array` never went True, and it wasn't already a subroutine
+        # to begin with (`is_function` covers the "originally a scalar
+        # function" case; a scalar-only SUBROUTINE input is exceedingly
+        # rare but the same risk applies either way) -- is exactly the
+        # case where an external caller (unlike this project's own
+        # generated Fortran, which only ever calls it scalar-wise) might
+        # pass an array anyway, e.g. scipy's `curve_fit` calling its own
+        # `model` callback with the WHOLE xdata array at once. See
+        # generate_wrapper's own `vectorize_scalars` docstring.
         wrapper_path.write_text(
-            generate_wrapper(mod_name, ext_name, func_name, arg_names), encoding="utf-8"
+            generate_wrapper(mod_name, ext_name, func_name, arg_names, omit_args, vectorize_scalars=not had_array),
+            encoding="utf-8",
         )
     print(f"Wrapper: {wrapper_path}")
     return TargetBridgeResult(func_name=func_name, wrapper_path=wrapper_path, arg_names=arg_names)
+
+
+_NUM_CORE_RE_TEXT = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?|(?:inf|nan)"
+_SIGNED_NUM_RE_TEXT = rf"[+-]?(?:{_NUM_CORE_RE_TEXT})"
+_KV_PREFIX_RE = re.compile(r"^([A-Za-z_][\w.]*=)(.*)$")
+_COMPLEX_PAREN_RE = re.compile(
+    rf"\(\s*({_SIGNED_NUM_RE_TEXT})\s*,\s*({_SIGNED_NUM_RE_TEXT})\s*\)", re.IGNORECASE
+)
+_COMPLEX_SUFFIX_RE = re.compile(
+    rf"\(?\s*({_SIGNED_NUM_RE_TEXT})\s*([+-])\s*({_NUM_CORE_RE_TEXT})j\s*\)?", re.IGNORECASE
+)
+_IMAG_ONLY_RE = re.compile(rf"({_SIGNED_NUM_RE_TEXT})j", re.IGNORECASE)
+
+
+def _parse_tok_num(tok):
+    """Parse `tok` as a real or complex number (Fortran `D`/`d` exponent
+    marker accepted alongside `E`/`e`; a bracketed `(re, im)` pair or a
+    trailing `Xj` imaginary suffix both accepted) -- or None if it isn't
+    one at all. A scaled-down copy of xp2f.py's own --run-diff/--numeric-
+    diff token parser (that one lives as a closure nested inside its own
+    main(), not reusable as-is) -- kept independent rather than sharing
+    code across the two tools' very different CLI/argument surfaces.
+    """
+    t = tok.strip().strip("[],").strip()
+    if not t:
+        return None
+    m = _COMPLEX_PAREN_RE.fullmatch(t)
+    if m:
+        return complex(
+            float(m.group(1).replace("d", "e").replace("D", "E")),
+            float(m.group(2).replace("d", "e").replace("D", "E")),
+        )
+    m = _COMPLEX_SUFFIX_RE.fullmatch(t)
+    if m:
+        re_part = float(m.group(1).replace("d", "e").replace("D", "E"))
+        im_part = float(m.group(3).replace("d", "e").replace("D", "E"))
+        if m.group(2) == "-":
+            im_part = -im_part
+        return complex(re_part, im_part)
+    m = _IMAG_ONLY_RE.fullmatch(t)
+    if m:
+        return complex(0.0, float(m.group(1).replace("d", "e").replace("D", "E")))
+    try:
+        return complex(float(t.replace("d", "e").replace("D", "E")), 0.0)
+    except ValueError:
+        return None
+
+
+def _tok_close(a: str, b: str, tol: float) -> bool:
+    """True if tokens `a`/`b` (already whitespace/comma-split) are either
+    textually identical, or both numeric and within relative tolerance
+    `tol` of each other -- lets a pure precision/formatting difference
+    (Python's compact `repr` vs. Fortran's full-precision list-directed
+    output, e.g. `12.0` vs `12.000000000000000`) match without masking a
+    GENUINE value difference.
+    """
+    if a == b:
+        return True
+    # A "label=value" token (e.g. "omega=0.1" vs "omega=0.10000000001")
+    # stays fused as one token by the caller's own whitespace/comma
+    # split -- peel off a matching "label=" prefix (identical on both
+    # sides only; a differing/missing label is a real mismatch) so just
+    # the trailing value gets the numeric-tolerant comparison below.
+    a_m = _KV_PREFIX_RE.match(a)
+    b_m = _KV_PREFIX_RE.match(b)
+    a_prefix = a_m.group(1) if a_m else ""
+    b_prefix = b_m.group(1) if b_m else ""
+    if a_prefix or b_prefix:
+        if a_prefix != b_prefix:
+            return False
+        a, b = a_m.group(2), b_m.group(2)
+        if a == b:
+            return True
+    av, bv = _parse_tok_num(a), _parse_tok_num(b)
+    if av is None or bv is None:
+        return False
+    for ax, bx in ((av.real, bv.real), (av.imag, bv.imag)):
+        if math.isnan(ax) or math.isnan(bx):
+            if math.isnan(ax) and math.isnan(bx):
+                continue
+            return False
+        if math.isinf(ax) or math.isinf(bx):
+            if ax == bx:
+                continue
+            return False
+        if abs(ax - bx) > tol * max(1.0, abs(ax), abs(bx)):
+            return False
+    return True
+
+
+def _lines_close(a_lines: list[str], b_lines: list[str], tol: float) -> bool:
+    """True if `a_lines`/`b_lines` are equal as whitespace/comma-split
+    token streams under `_tok_close`'s own numeric-tolerant comparison --
+    line boundaries themselves don't matter (only token order), so a
+    trivial line-wrapping difference can't cause a spurious mismatch
+    either. Requires the same TOTAL token count -- a genuinely different
+    number of values printed is always a real difference, never absorbed
+    here.
+    """
+
+    def _tokenize(lines):
+        toks = []
+        for ln in lines:
+            for raw in ln.replace("[", " ").replace("]", " ").replace(",", " ").split():
+                toks.append(raw)
+        return toks
+
+    a_tok, b_tok = _tokenize(a_lines), _tokenize(b_lines)
+    if len(a_tok) != len(b_tok):
+        return False
+    return all(_tok_close(at, bt, tol) for at, bt in zip(a_tok, b_tok))
+
+
+# Relative tolerance for the numeric-tolerant --run-both/--time-both
+# fallback comparison -- tight enough to only absorb a pure precision/
+# formatting difference (e.g. Python's `12.0` vs Fortran's
+# `12.000000000000000`), never a genuine value divergence (an unconverged
+# optimizer result, a diverged RNG stream, ...). Matches xp2f.py's own
+# --run-diff default display tolerance (1.0e-12).
+RUN_BOTH_NUMERIC_TOL = 1.0e-12
 
 
 def _run_both_and_report(
@@ -2705,11 +3357,29 @@ def _run_both_and_report(
     py_lines = _norm(py_out)
     fb_lines = _norm(fb_out)
     run_both_match = py_lines == fb_lines
-    print(f"Run-both: {'MATCH' if run_both_match else 'DIFF'}")
+    numeric_tolerant = False
     if not run_both_match:
+        # A byte-for-byte mismatch is often just a PRECISION/FORMATTING
+        # difference, not a real one -- Python's own compact float repr
+        # vs. Fortran's full-precision list-directed `print *` output
+        # (confirmed via examples/xnested.py's own `nested_polynomial`:
+        # "12.0" vs "12.000000000000000", the exact same value). Falls
+        # back to a numeric-tolerant comparison (_lines_close) before
+        # reporting a genuine DIFF -- tight tolerance (see
+        # RUN_BOTH_NUMERIC_TOL), so an actually-wrong result (e.g. an
+        # unconverged optimizer returning its initial guess instead of a
+        # fitted value) still correctly reports DIFF.
+        numeric_tolerant = _lines_close(py_lines, fb_lines, RUN_BOTH_NUMERIC_TOL)
+    if run_both_match:
+        print("Run-both: MATCH")
+    elif numeric_tolerant:
+        print("Run-both: MATCH (numeric-tolerant -- byte-for-byte text differs, but every "
+              f"value agrees within relative tolerance {RUN_BOTH_NUMERIC_TOL:g})")
+    else:
+        print("Run-both: DIFF")
         for dl in difflib.unified_diff(py_lines, fb_lines, fromfile="python", tofile="fortran-backed", lineterm=""):
             print(dl)
-    return run_both_match
+    return run_both_match or numeric_tolerant
 
 
 def _print_timing_summary(timings: dict) -> None:
