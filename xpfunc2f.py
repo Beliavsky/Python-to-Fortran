@@ -1597,7 +1597,17 @@ def _merge_continuations(phys_lines):
     several array outputs -- AND a single declaration shared by several
     of those same outputs). Blank/comment-only/non-continued lines are
     preserved as their own, unchanged entries -- this is a pure re-
-    grouping, never a text edit.
+    grouping, never a text edit (the merged line's own INDENTATION is
+    preserved too, taken from the first physical line -- confirmed a
+    real cosmetic bug without this: the first part's own leading
+    whitespace was unconditionally stripped and never restored, so a
+    continued statement's merged line always came out at column 0 in
+    the final generated .f90 file, regardless of its actual nesting --
+    e.g. examples/xxbs.py's own `black_scholes`, whose `func_res = ...`
+    assignment is `&`-continued in xp2f.py's own original translation,
+    came out unindented relative to its own enclosing `if ... then` /
+    `end if` once merged, even though nothing about its Fortran meaning
+    changed).
     """
     out = []
     i = 0
@@ -1608,6 +1618,7 @@ def _merge_continuations(phys_lines):
             out.append(phys_lines[i])
             i += 1
             continue
+        indent = phys_lines[i][: len(phys_lines[i]) - len(phys_lines[i].lstrip())]
         parts = [code[:-1].rstrip().lstrip()]
         i += 1
         while i < n:
@@ -1620,7 +1631,7 @@ def _merge_continuations(phys_lines):
             i += 1
             if not cont:
                 break
-        out.append(" ".join(parts))
+        out.append(indent + " ".join(parts))
     return out
 
 
@@ -1933,6 +1944,22 @@ def _find_python_mod_interfaces(header_lines):
     return out
 
 
+def _dedent_lines(lines):
+    """Strip the common leading whitespace shared by every NON-BLANK
+    line in `lines` -- a plain re-grouping, never a text edit to any
+    line's OWN relative indentation (nested content stays exactly as
+    indented relative to its own enclosing construct). A no-op if the
+    minimum indent is already 0, or if `lines` is entirely blank.
+    """
+    non_blank = [ln for ln in lines if ln.strip()]
+    if not non_blank:
+        return lines
+    min_indent = min(len(ln) - len(ln.lstrip()) for ln in non_blank)
+    if min_indent == 0:
+        return lines
+    return [ln[min_indent:] if ln[:min_indent].strip() == "" else ln.lstrip() for ln in lines]
+
+
 def inline_python_mod_helpers(trimmed_text: str):
     """Rewrite a `use python_mod, only: NAME1, NAME2, ...` line in the
     trimmed module by INLINING each simple NAME's own Fortran source
@@ -2092,10 +2119,26 @@ def inline_python_mod_helpers(trimmed_text: str):
     for nm in needed:
         needed_state_names |= _state_names_used_by(nm)
 
-    inlined_body = []
+    # A blank line BEFORE the first inlined procedure too, not just
+    # between each pair of them -- confirmed a real cosmetic bug without
+    # it: the trimmed module's own target procedure's `end
+    # subroutine`/`end function` line ran directly into the first
+    # inlined helper's own signature line with no separator at all.
+    inlined_body = [""]
     for nm in sorted(needed, key=lambda n: py_procs[n][0]):
         start, end = py_procs[nm]
-        inlined_body.extend(py_lines[start : end + 1])
+        # python.f90's own procedures are indented relative to SOME
+        # outer nesting of its own file layout (its helpers commonly sit
+        # at a 6-space base indent) -- dedented here to a flush-left
+        # signature/end line, matching the trimmed module's own
+        # convention for a procedure directly inside `contains` (e.g.
+        # its own TARGET procedure's `subroutine NAME(...)`/`end
+        # subroutine NAME` lines never carry python.f90's leftover base
+        # indent). Relative indentation WITHIN the procedure (its own
+        # body's nesting under `if`/`do`/...) is preserved exactly --
+        # only the common leading whitespace shared by every line is
+        # removed.
+        inlined_body.extend(_dedent_lines(py_lines[start : end + 1]))
         inlined_body.append("")
 
     interface_body = []
@@ -2213,6 +2256,1019 @@ def _ensure_lapack_archive():
     if proc.returncode != 0 or not archive_path.exists():
         return None
     return cache_dir, "lapack_d"
+
+
+# ---------------------------------------------------------------------------
+# ctypes/bind(c) backend (--backend ctypes) -- an alternative to f2py that
+# sidesteps several f2py-specific quirks (the scalar-function subroutine-
+# conversion glue-wrapper bug, --lower case mangling, the .f2py_f2cmap dp-
+# resolution dance, f2py's -c mode silently dropping a raw .o link input,
+# f2py's own silent array-to-scalar mismarshalling) by using plain
+# iso_c_binding interoperability and a direct `gfortran -shared` compile
+# instead of f2py's own crackfortran/meson pipeline. PHASE 1 ONLY: plain
+# scalar real/integer/logical arguments and result -- no arrays, no
+# strings, no callbacks yet (rejected with UnsupportedFunction, same
+# fail-clean philosophy as check_f2py_compatible). See the approved plan
+# at the time this was written for the full phased design.
+# ---------------------------------------------------------------------------
+
+
+def _c_interoperable_decl(base_type: str) -> str:
+    """Map a Fortran base type spec, as `_base_type_of_decl` returns it
+    (e.g. `real(kind=dp)`, `integer`, `logical`), to its iso_c_binding
+    equivalent for a bind(c) dummy/result declaration. `character` needs
+    genuinely different handling (an explicit-length buffer, not a
+    simple type-name swap) -- not covered here, a later ctypes-backend
+    phase.
+    """
+    bt = base_type.strip().lower()
+    if bt.startswith("real"):
+        return "real(c_double)"
+    if bt.startswith("integer"):
+        return "integer(c_int)"
+    if bt.startswith("logical"):
+        return "logical(c_bool)"
+    raise UnsupportedFunction(f"ctypes backend: no iso_c_binding mapping yet for base type {base_type!r}")
+
+
+CALLBACK_DECL_RE = re.compile(
+    r"^\s*procedure\s*\(\s*([a-z_]\w*)\s*\)\s*(?:,[^:]*)?::\s*([a-z_]\w*)\s*$", re.IGNORECASE
+)
+
+
+def _find_callback_arg(target_lines):
+    """Return (cb_arg_name, iface_name) for the target's own callback
+    dummy argument -- a `procedure(IFACE) :: name` declaration (xp2f.py's
+    own shape for a Python function passed as an argument, e.g.
+    examples/xcallback_two_arg_repro.py's own `evaluate(f, x, n)`) -- or
+    (None, None) if there isn't one.
+    """
+    for ln in target_lines[1:]:
+        m = CALLBACK_DECL_RE.match(_strip_comment(ln))
+        if m:
+            return m.group(2), m.group(1)
+    return None, None
+
+
+def _rewrite_callback_interface_for_ctypes(target_lines, cb_arg_name, iface_name):
+    """Return (new_target_lines, cb_result_c_type, cb_arg_specs) with the
+    named callback interface (a `function`/`subroutine IFACE_NAME(...)
+    ... end` block nested inside `interface ... end interface`, xp2f.py's
+    own shape for a Python callback argument's OWN signature) rewritten
+    for C interoperability: marked `bind(c)`, and its own assumed-shape
+    array dummy(s) converted to explicit-shape + a new synth-size dummy
+    -- bind(c) forbids assumed-shape on the callback's own interface
+    just as much as on the outer target's.
+
+    This is NOT optional cosmetics: a Python-supplied `ctypes.CFUNCTYPE`
+    is only callable correctly through a Fortran PROCEDURE POINTER when
+    the interface used to type that pointer is ALSO interoperable --
+    otherwise Fortran generates its own native (descriptor-based, for an
+    assumed-shape array) calling convention at every call site of the
+    callback, which is incompatible with the plain-pointer C-ABI
+    `CFUNCTYPE` actually provides, corrupting the call. Since the
+    callback's own interface, once rewritten, must stay IDENTICAL
+    wherever the SAME callback argument is used (the target's own copy,
+    and any DEPENDENCY's own copy it forwards the callback to), this
+    same rewrite must be applied to every one of them consistently --
+    the caller is responsible for finding and rewriting each copy.
+
+    If the target's own body calls the callback DIRECTLY (e.g.
+    examples/xcallback_two_arg_repro.py's own `evaluate`, `value = f(x,
+    n)` -- unlike examples/xcallback_passthrough_order_repro.py's own
+    `driver`, which only ever forwards it along to `evaluate`), that
+    call site is rewritten too, appending the new size argument(s).
+
+    `cb_arg_specs` is an ordered list of (c_type, is_array) describing
+    the callback's OWN (rewritten) dummy arguments, for building the
+    matching `ctypes.CFUNCTYPE` signature. `iface_lines` is the
+    rewritten interface block's own full text (from `interface` through
+    `end interface`) -- the SHIM needs its own copy of it (a sibling
+    procedure can't see another procedure's own locally-scoped interface
+    at all), and if the SAME callback is forwarded to a dependency, that
+    dependency's own copy of the interface needs the identical rewrite
+    too (the caller's own responsibility, not this function's). PHASE 4
+    scope only: every callback argument must be a plain scalar real/
+    integer/logical or a plain assumed-shape rank-1 array (`x(:)`, never
+    `x(:,:)`); the result must be a plain scalar. Raises
+    UnsupportedFunction otherwise.
+    """
+    out = list(target_lines)
+    iface_start = proc_start = proc_end = None
+    depth = 0
+    for i, ln in enumerate(out):
+        code = _strip_comment(ln)
+        if INTERFACE_START_RE.match(code):
+            if depth == 0:
+                iface_start = i
+            depth += 1
+            continue
+        if INTERFACE_END_RE.match(code):
+            depth -= 1
+            continue
+        if depth >= 1 and iface_start is not None and proc_start is None:
+            m = PROC_START_RE.match(code)
+            if m and m.group(2).lower() == iface_name.lower():
+                proc_start = i
+                continue
+        if depth >= 1 and proc_start is not None and proc_end is None:
+            m2 = PROC_END_RE.match(code)
+            if m2 and m2.group(2).lower() == iface_name.lower():
+                proc_end = i
+                break
+    if proc_start is None or proc_end is None:
+        raise UnsupportedFunction(f"ctypes backend: callback interface {iface_name!r} not found")
+
+    sig_m = SIG_RE.match(_strip_comment(out[proc_start]))
+    if not sig_m:
+        raise UnsupportedFunction(f"ctypes backend: callback interface {iface_name!r}'s own signature didn't parse")
+    cb_args = [a for a in _split_top_level(sig_m.group("args")) if a]
+    cb_result_name = iface_name
+    if sig_m.group("result"):
+        rm = RESULT_NAME_RE.search(sig_m.group("result"))
+        if rm:
+            cb_result_name = rm.group(1)
+
+    def _cb_decl_for(name):
+        for j in range(proc_start + 1, proc_end):
+            code = _strip_comment(out[j])
+            m = re.search(rf"::\s*({re.escape(name)})\s*(\([^()]*\))?\s*$", code, re.IGNORECASE)
+            if m and m.group(1).lower() == name.lower():
+                return j, code, m.group(2)
+        return None, None, None
+
+    existing_names = {tok.lower() for ln in out for tok in re.findall(r"[A-Za-z_]\w*", ln)}
+    synth_counter = [0]
+
+    def _next_synth():
+        while True:
+            synth_counter[0] += 1
+            cand = f"cb_n{synth_counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    cb_arg_specs = []
+    new_args = []
+    size_insertions = []
+    extra_call_sources = []  # python-side source array names, for the call-site rewrite below
+    for name in cb_args:
+        j, decl, shape = _cb_decl_for(name)
+        if decl is None:
+            raise UnsupportedFunction(f"ctypes backend: callback argument {name!r} has no declaration")
+        if re.search(r"\bcharacter\b", decl, re.IGNORECASE):
+            raise UnsupportedFunction("ctypes backend: a character callback argument isn't yet supported")
+        c_type = _c_interoperable_decl(_base_type_of_decl(decl))
+        if shape is None:
+            # A scalar dummy in a bind(c) interface is passed BY
+            # REFERENCE unless explicitly marked VALUE -- Fortran's own
+            # native convention for an interoperable procedure, NOT a
+            # detail ctypes' own CFUNCTYPE/trampoline can just infer.
+            # Confirmed a real, silent-garbage bug without this: the
+            # trampoline received a raw ADDRESS reinterpreted as a
+            # plain int (a huge, nonsensical value) instead of the
+            # actual argument, since the CFUNCTYPE side assumes
+            # ordinary by-value C ints for a plain `ctypes.c_int`
+            # argtype.
+            if not re.search(r"\bvalue\b", decl, re.IGNORECASE):
+                out[j] = re.sub(r"(::)", r", value \1", out[j], count=1, flags=re.IGNORECASE)
+            new_args.append(name)
+            cb_arg_specs.append((c_type, False))
+            continue
+        shape_txt = shape.strip("()").strip()
+        if shape_txt != ":":
+            raise UnsupportedFunction(
+                f"ctypes backend: callback argument {name!r}'s own shape {shape_txt!r} isn't plain "
+                f"assumed-shape -- not yet supported"
+            )
+        synth = _next_synth()
+        out[j] = re.sub(
+            rf"\b{re.escape(name)}\s*\(\s*:\s*\)", f"{name}({synth})", out[j], count=1, flags=re.IGNORECASE
+        )
+        # The new synth-size dummy ALSO needs VALUE, same reasoning as
+        # above -- it's a plain scalar the ctypes side passes by value.
+        size_insertions.append(f"         integer, intent(in), value :: {synth}")
+        new_args.append(name)
+        new_args.append(synth)
+        cb_arg_specs.append((c_type, True))
+        extra_call_sources.append(name)
+
+    rj, rdecl, rshape = _cb_decl_for(cb_result_name)
+    if rdecl is None or rshape is not None:
+        raise UnsupportedFunction("ctypes backend: a callback result must be a plain scalar")
+    cb_result_c_type = _c_interoperable_decl(_base_type_of_decl(rdecl))
+
+    prefix_m = re.match(
+        r"^(\s*(?:pure\s+|elemental\s+|impure\s+|recursive\s+)*)(function|subroutine)\s+[a-z_]\w*\s*\(",
+        _strip_comment(out[proc_start]),
+        re.IGNORECASE,
+    )
+    result_clause = f" result({cb_result_name})" if sig_m.group("result") else ""
+    out[proc_start] = (
+        f"{prefix_m.group(1)}{prefix_m.group(2)} {iface_name}({', '.join(new_args)}) bind(c){result_clause}"
+    )
+    # An IMPORT statement (e.g. `import dp`) must be the FIRST thing in
+    # its own scoping unit's specification part -- inserting the new
+    # synth-size declaration immediately after the header line broke
+    # this ("IMPORT statement ... cannot follow data declaration
+    # statement") whenever the interface body had one, which xp2f.py's
+    # own codegen always does for a callback referencing `dp`. Insert
+    # after any leading IMPORT line(s) instead.
+    insert_at = proc_start + 1
+    while insert_at <= proc_end and re.match(r"^\s*import\b", _strip_comment(out[insert_at]), re.IGNORECASE):
+        insert_at += 1
+    for ins in reversed(size_insertions):
+        out.insert(insert_at, ins)
+        proc_end += 1
+
+    # The interface block's own closing line -- everything from
+    # iface_start through here is what the SHIM needs its own copy of
+    # (see this function's own docstring: a sibling procedure can't see
+    # another procedure's own LOCALLY-scoped interface at all).
+    iface_end = None
+    for i in range(proc_end + 1, len(out)):
+        if INTERFACE_END_RE.match(_strip_comment(out[i])):
+            iface_end = i
+            break
+    if iface_end is None:
+        raise UnsupportedFunction(f"ctypes backend: no closing 'end interface' found for {iface_name!r}")
+
+    if extra_call_sources:
+        call_re = re.compile(rf"\b{re.escape(cb_arg_name)}\s*\(([^()]*)\)")
+        for i in range(iface_end + 1, len(out)):
+            code = _strip_comment(out[i])
+            m = call_re.search(code)
+            if not m:
+                continue
+            call_arg_texts = [a.strip() for a in _split_top_level(m.group(1))]
+            new_call = (
+                f"{cb_arg_name}("
+                + ", ".join(call_arg_texts + [f"size({src})" for src in extra_call_sources])
+                + ")"
+            )
+            out[i] = out[i][: m.start()] + new_call + out[i][m.end() :]
+            break  # exactly one direct call site expected -- see this function's own docstring
+
+    iface_lines = out[iface_start : iface_end + 1]
+    return out, cb_result_c_type, cb_arg_specs, iface_lines
+
+
+def _inner_call_arg(name: str, c_type: str) -> str:
+    """The expression to pass for `name` (an INPUT dummy of the shim's
+    own bind(c) declaration) when calling the inner, already-f2py-
+    rewritten target -- plain passthrough for real/integer, but a
+    `logical(c_bool)` value/array needs converting to the inner target's
+    own default `logical` kind first: the two kinds have DIFFERENT
+    storage sizes (1 byte vs 4), so passing one directly where the other
+    is expected is a real kind mismatch, not just a style choice --
+    confirmed via examples/xchoice_tuple_repro.py's own `reject`
+    argument ("Error: Type mismatch in argument 'reject' ... LOGICAL(1)
+    to LOGICAL(4)"). Fortran's own `LOGICAL(x)` conversion intrinsic is
+    ELEMENTAL, so this same wrap is valid for a logical ARRAY argument
+    too, not just a scalar.
+    """
+    if c_type == "logical(c_bool)":
+        return f"logical({name})"
+    return name
+
+
+def _array_result_size_expr_to_python(shape, size_source, arg_names_l, decls):
+    """Translate a Fortran array-result size expression -- built ONLY
+    from the target's own arguments, a synth-size dummy, integer
+    literals, and +/-/parens arithmetic (rewrite_target_for_f2py's own
+    size derivation -- see _derive_no_alloc_array_size/_infer_rank1_size
+    -- never produces anything else) -- into an equivalent Python
+    expression string for the ctypes wrapper's own pre-allocation.
+    Fortran's `+`/`-`/parens/integer-literal syntax is ALREADY valid
+    Python verbatim, and an ordinary scalar argument's own Fortran name
+    IS its Python name too -- the only substitution ever needed is a
+    synth-size dummy name (never itself Python-facing) -> `len(<its own
+    source array's Python name>)`.
+
+    Returns None if the expression references anything else (an unknown
+    name -- some other local Fortran variable that leaked through,
+    never actually seen in practice) -- the caller then raises
+    UnsupportedFunction, same fail-clean philosophy as everywhere else
+    in this backend, rather than emitting a Python expression that could
+    raise `NameError` or silently compute the wrong thing.
+    """
+    result = shape
+    for nm in set(re.findall(r"[a-z_]\w*", shape, re.IGNORECASE)):
+        nm_l = nm.lower()
+        if nm_l in size_source:
+            result = re.sub(rf"\b{re.escape(nm)}\b", f"len({size_source[nm_l]})", result, flags=re.IGNORECASE)
+        elif nm_l in arg_names_l and decls.get(nm_l, (None, None, None))[1] is None:
+            pass  # already a valid Python name (a plain scalar argument) -- no substitution needed
+        else:
+            return None
+    return result
+
+
+def _strip_matching_outer_parens(s: str) -> str:
+    """Strip exactly the OUTERMOST matching paren pair wrapping the
+    whole (already-trimmed) string `s`, if there is one -- unlike a
+    plain `.strip("()")`, which removes EVERY leading/trailing paren
+    character regardless of nesting, corrupting a shape expression with
+    nested parens of its own (e.g. `(((n + burnin)) - (burnin + 1) +
+    1)`: `.strip("()")` over-strips to `n + burnin)) - (burnin + 1) +
+    1`, silently mismatched parens). A no-op if `s` isn't wrapped in one
+    single pair spanning its entire length.
+    """
+    s = s.strip()
+    if not (s.startswith("(") and s.endswith(")")):
+        return s
+    depth = 0
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return s[1:-1].strip() if i == len(s) - 1 else s
+    return s
+
+
+def build_ctypes_shim(
+    target_lines,
+    arg_names,
+    omit_args,
+    orig_is_function,
+    func_name,
+    cb_arg_name=None,
+    cb_iface_name=None,
+    cb_result_c_type=None,
+    cb_arg_specs_inner=None,
+    cb_iface_lines=None,
+):
+    """Build a thin `bind(c)` shim procedure that calls `target_lines`
+    (already rewritten by rewrite_target_for_f2py -- explicit-shape,
+    scalar-function-converted-to-subroutine, exactly as the f2py backend
+    already produces it) unchanged, restoring genuine Fortran FUNCTION
+    semantics at the ctypes-visible boundary when `orig_is_function` is
+    True AND the target's own result turns out scalar (never an array --
+    see below): rewrite_target_for_f2py's own scalar-function-to-subroutine
+    conversion exists ONLY to dodge a real f2py code-generation bug (its
+    own generated glue wrapper for a module FUNCTION references `dp`
+    without importing it) that has no bind(c)/ctypes equivalent at all --
+    ctypes' own `restype` handles a genuine function result directly. The
+    shim itself decides its own calling convention independent of what
+    the INNER target's own post-rewrite shape happens to be; it never
+    needs modifying `target_lines` itself, so this carries zero risk to
+    the already-tested f2py rewrite it's built on top of.
+
+    Phase 4 adds a callback argument -- `cb_arg_name`/`cb_iface_name`/
+    `cb_result_c_type`/`cb_arg_specs_inner`/`cb_iface_lines` are the
+    products of _rewrite_callback_interface_for_ctypes, already run by
+    the CALLER (never here) on `target_lines` BEFORE it's handed to
+    build_trimmed_module -- unlike every other rewrite this function
+    itself performs, that one MUST happen before this function runs, not
+    inside it: build_trimmed_module is what actually writes the target's
+    own body into the trimmed module, so the rewritten (interoperable)
+    interface has to already be baked into the `target_lines` the caller
+    passes in, or the body written to disk still has the OLD interface,
+    mismatched against what this function's own shim expects (see
+    _rewrite_callback_interface_for_ctypes's own docstring for exactly
+    this bug, confirmed via examples/xcallback_two_arg_repro.py's own
+    `evaluate`). Left as optional/`None` parameters (rather than
+    detecting the callback here too) specifically so this function can
+    never accidentally re-run that rewrite a second time on an
+    already-rewritten interface, which would raise (its own explicit-
+    shape dummy no longer looks assumed-shape) rather than silently
+    misbehave.
+
+    Phase 2 adds rank-1 array arguments/results -- already explicit-shape
+    (`x(n_1)` + a synthesized `integer, intent(in) :: n_1` dummy) thanks
+    to rewrite_target_for_f2py's own array rewrite, which is bind(c)-legal
+    AS-IS modulo the iso_c_binding type mapping (no `type(c_ptr)`/
+    `c_f_pointer` indirection needed -- an explicit-shape array of
+    interoperable type is directly legal in a bind(c) interface). A
+    synth-size dummy (an appended, scalar, integer dummy referenced as
+    SOME array's own shape text) is NEVER exposed in the shim's own
+    Python-facing signature at all -- ctypes computes it automatically
+    from that array's own `len()` (see generate_ctypes_wrapper) the same
+    way a caller never has to think about it in the original Python
+    function either. An array RESULT's own size is resolved the same
+    way, when it's simply one of these known synth-size names (the
+    common case, confirmed via examples/xfsolve.py's own `equations` and
+    examples/xchoice_tuple_repro.py's own `backbin_rc` -- both size their
+    own array output directly off an existing synth-size dummy, never a
+    more complex expression). Still not yet supported: `character`
+    arguments/results (a later phase), and any size expression that
+    ISN'T simply a known synth-size name (raises UnsupportedFunction --
+    the data-dependent-length "bridge" convention and a genuinely
+    computed size expression are deferred pending a real example, since
+    none exists in the corpus yet to verify a design against).
+
+    Returns (shim_text, c_arg_specs, is_shim_function, shim_symbol,
+    result_c_type) -- `result_c_type` is the iso_c_binding type string for
+    the shim's own SCALAR function result when `is_shim_function` is
+    True, else None (a subroutine-shaped shim returns nothing in C terms;
+    ctypes' own `restype` must be set to `None`, not skipped, or it
+    defaults to `c_int` and misinterprets whatever garbage happens to be
+    in that register). `c_arg_specs` is an ordered list of
+    (python_arg_name, c_type_str, kind, meta) for every dummy the shim's
+    own Python-facing signature EXPOSES (an `omit_args` name, and any
+    synth-size dummy, are both dropped entirely -- see above). `kind` is
+    one of:
+    - `"value"`: an ordinary by-VALUE scalar input.
+    - `"out_ref"`: a scalar `intent(out)` dummy (no VALUE attribute, so
+      passed by ADDRESS) -- ctypes needs `POINTER(c_type)` and
+      `ctypes.byref(...)`.
+    - `"array_in"`: a rank-1 array argument, passed as a plain pointer --
+      `meta` is the array's own synth-size dummy name (or a literal
+      shape string), used to compute how much of the caller's own numpy
+      array to read.
+    - `"array_out"`: a rank-1 array result, passed as a pointer to a
+      buffer the WRAPPER must pre-allocate before calling -- `meta` is
+      the Python expression (already translated) for how many elements
+      to allocate.
+    - `"size_of"`: NOT user-facing -- a synth-size dummy tied to some
+      array argument (`meta` names it); its own value is computed
+      automatically as `len(<that array>)`.
+    - `"string_in"`: a scalar character INPUT argument, passed as a raw
+      byte buffer (`c_type` is the literal string `"character"`, not an
+      iso_c_binding type name -- handled specially, never looked up in
+      `_CTYPES_TYPE_NAMES`). Always immediately followed by one
+      `"strlen_of"` entry.
+    - `"strlen_of"`: NOT user-facing -- the companion byte-length dummy
+      for the `"string_in"` entry immediately before it (`meta` names
+      that string argument); computed automatically as
+      `len(<that argument's own encoded bytes>)`.
+    - `"callback"`: a user-supplied Python callable (`c_type` is the
+      literal string `"callback"`, never looked up in
+      `_CTYPES_TYPE_NAMES`), passed as a raw `ctypes.CFUNCTYPE` instance.
+      `meta` is `(iface_name, cb_result_c_type, cb_arg_specs)` -- see
+      _rewrite_callback_interface_for_ctypes's own docstring for
+      `cb_arg_specs`' own shape -- used to build the matching CFUNCTYPE
+      signature and a small trampoline converting a raw array pointer
+      argument back into a numpy array before calling the user's own
+      function.
+    `generate_ctypes_wrapper` uses this to build the matching ctypes
+    `argtypes`/`restype` and marshaling code.
+    """
+    sig_m = SIG_RE.match(_strip_comment(target_lines[0]))
+    if not sig_m:
+        raise UnsupportedFunction("ctypes backend: target's own post-rewrite signature line didn't parse")
+    post_args = [a for a in _split_top_level(sig_m.group("args")) if a]
+    arg_names_l = {a.lower() for a in arg_names}
+    # Any post-rewrite dummy NOT among the target's own ORIGINAL Python
+    # arguments is one rewrite_target_for_f2py itself appended -- the
+    # scalar function's own converted result, an array result's own
+    # dummy, or a synthesized array-size dummy.
+    appended = {a.lower() for a in post_args if a.lower() not in arg_names_l}
+
+    def _decl_for(name):
+        # Skip content inside a nested `interface ... end interface`
+        # block -- a callback argument's own abstract interface -- same
+        # reasoning as rewrite_target_for_f2py's OWN _find_decl: that
+        # interface's own dummy arguments (e.g. `x(:)`) are a DIFFERENT
+        # declaration than the target's own outer one of the same name,
+        # and must never be mistaken for it.
+        in_interface = False
+        for ln in target_lines[1:]:
+            code = _strip_comment(ln)
+            if INTERFACE_START_RE.match(code):
+                in_interface = True
+                continue
+            if INTERFACE_END_RE.match(code):
+                in_interface = False
+                continue
+            if in_interface:
+                continue
+            idx = code.rfind("::")
+            if idx == -1:
+                continue
+            tail = code[idx + 2 :].strip()
+            nm = re.match(rf"^{re.escape(name)}\b", tail, re.IGNORECASE)
+            if not nm:
+                continue
+            rest = tail[nm.end() :].strip()
+            if not rest:
+                return code, None  # plain scalar, no shape at all
+            if not rest.startswith("("):
+                continue  # some other suffix (e.g. a DIFFERENT name sharing this prefix) -- not a match
+            # A derived array-result size expression can nest parens
+            # arbitrarily (e.g. rewrite_target_for_f2py's own closed-form
+            # range length, `func_res(((n + burnin)) - (burnin + 1) +
+            # 1)`) -- a plain non-nesting `\([^()]*\)` regex silently
+            # fails to match the WHOLE shape at all here, confirmed a
+            # real bug via examples/xarma_aic_fit.py's own
+            # `simulate_arma`: "no declaration found for 'func_res'"
+            # (the line existed, the regex just couldn't see it). Track
+            # paren depth by hand instead.
+            depth = 0
+            end = None
+            for i, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end is None:
+                continue  # unbalanced -- not a match
+            return code, rest[: end + 1]
+        return None, None
+
+    decls = {}  # name.lower() -> (decl_line, shape_or_None, is_char)
+    for name in post_args:
+        decl, shape = _decl_for(name)
+        if decl is None:
+            raise UnsupportedFunction(f"ctypes backend: no declaration found for {name!r}")
+        is_char = bool(re.search(r"\bcharacter\b", decl, re.IGNORECASE))
+        decls[name.lower()] = (decl, _strip_matching_outer_parens(shape) if shape else None, is_char)
+
+    # A synth-size dummy: appended, scalar (no shape of its own), and
+    # referenced as some OTHER dummy's own shape text -- its VALUE is
+    # computed automatically by the wrapper from that array's own
+    # length, never exposed as a distinct Python-facing parameter.
+    # Prefer an ARRAY_IN source over an array_out one (an output's own
+    # size is derived from an input the caller already provided, never
+    # the reverse) when more than one array happens to share the same
+    # synth-size name.
+    size_source: dict[str, str] = {}
+    for name in post_args:
+        _decl, shape, _is_char = decls[name.lower()]
+        if shape and re.match(r"^[a-z_]\w*$", shape, re.IGNORECASE) and shape.lower() in appended:
+            if shape.lower() not in size_source or name.lower() not in appended:
+                size_source[shape.lower()] = name
+    size_dummy_names = set(size_source.keys())
+
+    c_arg_specs = []
+    shim_call_args = []
+    shim_decls = []
+    shim_dummy_names = []  # the shim's OWN Fortran argument list, in order
+    shim_body_extra = []  # executable statements needed BEFORE the inner call (e.g. string reconstruction)
+    shim_body_after = []  # executable statements needed AFTER the inner call (e.g. logical result conversion)
+    result_c_type = None
+    result_name = None
+
+    for name in post_args:
+        name_l = name.lower()
+        if name_l in size_dummy_names:
+            # Never exposed as a distinct PYTHON-facing parameter -- see
+            # size_source above -- but still a real dummy in the SHIM's
+            # own Fortran signature (bind(c) explicit-shape arrays always
+            # need an explicit int length passed alongside) and thus a
+            # real slot in the ACTUAL ctypes call `generate_ctypes_wrapper`
+            # has to build. "size_of" tells it to compute this argument's
+            # own value automatically, as `len(<source array's own
+            # Python name>)`, instead of asking the caller for it.
+            c_type = _c_interoperable_decl(_base_type_of_decl(decls[name_l][0]))
+            shim_decls.append(f"   {c_type}, value :: {name}")
+            shim_call_args.append(f"{name}={name}")
+            shim_dummy_names.append(name)
+            c_arg_specs.append((name, c_type, "size_of", size_source[name_l]))
+            continue
+        decl, shape, is_char = decls[name_l]
+        is_array = shape is not None
+        is_appended = name_l in appended
+        if cb_arg_name is not None and name_l == cb_arg_name.lower():
+            # The callback dummy itself -- `procedure(IFACE) :: f`
+            # becomes `type(c_funptr), value :: f` in the shim (the raw
+            # C function pointer ctypes actually hands over), converted
+            # to a genuine Fortran PROCEDURE POINTER via
+            # `c_f_procpointer` before being passed, unchanged, to the
+            # inner (untouched) target -- which still expects
+            # `procedure(IFACE) :: f` exactly as xp2f.py emitted it, now
+            # satisfied because IFACE's own interface was ALREADY
+            # rewritten to be interoperable (see
+            # _rewrite_callback_interface_for_ctypes's own docstring for
+            # why that rewrite, not just this pointer conversion, is
+            # what actually makes the call safe).
+            ptr_name = f"{name}_ptr"
+            shim_decls.append(f"   type(c_funptr), value :: {name}")
+            shim_decls.append(f"   procedure({cb_iface_name}), pointer :: {ptr_name}")
+            shim_body_extra.append(f"   call c_f_procpointer({name}, {ptr_name})")
+            shim_call_args.append(f"{name}={ptr_name}")
+            shim_dummy_names.append(name)
+            c_arg_specs.append((name, "callback", "callback", (cb_iface_name, cb_result_c_type, cb_arg_specs_inner)))
+            continue
+        if is_char:
+            # A plain SCALAR character INPUT argument (e.g.
+            # examples/xxbs.py's own `black_scholes(..., option="call")`)
+            # -- xp2f.py always emits this as `character(len=*),
+            # intent(in)` (assumed-length), illegal in a bind(c)
+            # interface as-is. Not yet supported: a character ARRAY, or
+            # a character RESULT (`character(len=:), allocatable` --
+            # xp2f.py's own return convention for a `str`) -- deferred,
+            # same reasoning as the array-result "bridge" case: no
+            # corpus example currently needs either, so nothing to
+            # verify a length-bound design against.
+            if is_array or is_appended:
+                raise UnsupportedFunction(
+                    f"ctypes backend: {name!r} is a character array/result -- not yet supported"
+                )
+            len_name = f"{name}_len"
+            str_name = f"{name}_str"
+            shim_decls.append(f"   character(kind=c_char), intent(in) :: {name}({len_name})")
+            shim_decls.append(f"   integer(c_int), value :: {len_name}")
+            shim_decls.append(f"   character(len={len_name}) :: {str_name}")
+            shim_decls.append(f"   integer :: {name}_i")
+            shim_body_extra.append(
+                f"   do {name}_i = 1, {len_name}\n"
+                f"      {str_name}({name}_i:{name}_i) = {name}({name}_i)\n"
+                f"   end do"
+            )
+            shim_call_args.append(f"{name}={str_name}")
+            shim_dummy_names.append(name)
+            shim_dummy_names.append(len_name)
+            # TWO c_arg_specs entries, matching the TWO actual Fortran
+            # dummy slots in order -- "strlen_of" (like "size_of" for an
+            # array) is never user-facing; its own value is computed
+            # automatically as `len(<source string arg's own encoded
+            # bytes>)`, never asked of the caller directly.
+            c_arg_specs.append((name, "character", "string_in", None))
+            c_arg_specs.append((len_name, "integer(c_int)", "strlen_of", name))
+            continue
+        c_type = _c_interoperable_decl(_base_type_of_decl(decl))
+        if is_array:
+            if is_appended:
+                # Array RESULT/output. Its own shape is a Fortran
+                # expression built (by rewrite_target_for_f2py's own
+                # size derivation -- see _derive_no_alloc_array_size/
+                # _infer_rank1_size) from ONLY: the target's own
+                # arguments, a synth-size dummy, integer literals, and
+                # +/-/parens arithmetic -- e.g. examples/xar_acf.py's own
+                # `(nacf + 1) - (1)` (`nacf` a plain scalar argument) or
+                # examples/xarma_aic_fit.py's own `((n + burnin)) -
+                # (burnin + 1) + 1` (`n`/`burnin` both plain scalar
+                # arguments). Fortran's own `+`/`-`/parens/integer-
+                # literal syntax is ALREADY valid Python verbatim, and an
+                # ordinary scalar argument's own Fortran name IS its
+                # Python name too -- the ONLY substitution ever needed is
+                # a synth-size dummy (never itself Python-facing) ->
+                # `len(<its own source array's Python name>)`. See
+                # _array_result_size_expr_to_python's own docstring.
+                alloc_expr = _array_result_size_expr_to_python(shape, size_source, arg_names_l, decls)
+                if alloc_expr is None:
+                    raise UnsupportedFunction(
+                        f"ctypes backend: {name!r}'s own array-result size expression {shape!r} "
+                        f"references something other than a known synth-size dummy, an integer "
+                        f"literal, or a plain scalar argument -- not yet supported"
+                    )
+                shim_decls.append(f"   {c_type}, intent(out) :: {name}({shape})")
+                shim_call_args.append(f"{name}={name}")
+                shim_dummy_names.append(name)
+                c_arg_specs.append((name, c_type, "array_out", alloc_expr))
+            else:
+                # Array argument -- intent(in) OR intent(inout) (mirror
+                # the INNER target's own declared intent exactly; a bare
+                # `intent(in)` guess broke examples/xchoice_tuple_repro.py's
+                # own `choice`, an inout array, with a real gfortran
+                # error: "Dummy argument 'choice' with INTENT(IN) in
+                # variable definition context"). Both marshal identically
+                # on the ctypes side either way: a numpy array's own
+                # buffer is already mutable in place, so passing its
+                # pointer once naturally reflects an in-place mutation
+                # back to the caller with no special handling needed.
+                intent_kw = "inout" if re.search(r"intent\s*\(\s*inout\s*\)", decl, re.IGNORECASE) else "in"
+                shim_decls.append(f"   {c_type}, intent({intent_kw}) :: {name}({shape})")
+                shim_call_args.append(f"{name}={_inner_call_arg(name, c_type)}")
+                shim_dummy_names.append(name)
+                c_arg_specs.append((name, c_type, "array_in", shape))
+            continue
+        if is_appended:
+            result_c_type, result_name = c_type, name
+            if orig_is_function:
+                # We already know (the `if is_array` branch above didn't
+                # fire) that THIS appended name is scalar -- regardless
+                # of whether some OTHER argument happens to be an array.
+                if c_type == "logical(c_bool)":
+                    # Same by-value real-vs-c_bool kind mismatch as
+                    # _inner_call_arg fixes for an INPUT -- but this is
+                    # the OUTPUT direction (writing the inner target's
+                    # own default-`logical` result INTO the shim's own
+                    # `logical(c_bool)` one), so a plain conversion-
+                    # wrapped expression won't do; the inner call needs a
+                    # genuine local variable of the INNER target's own
+                    # kind to write through, converted afterward.
+                    # Confirmed a real bug via examples/xprime.py's own
+                    # `is_prime` (a logical-returning function): "Type
+                    # mismatch in argument 'func_res' ... LOGICAL(1) to
+                    # LOGICAL(4)".
+                    tmp_name = f"{name}_tmp"
+                    shim_decls.append(f"   logical :: {tmp_name}")
+                    shim_call_args.append(f"{name}={tmp_name}")
+                    shim_body_after.append(f"   xpc_{name} = logical({tmp_name}, kind=c_bool)")
+                else:
+                    shim_call_args.append(f"{name}=xpc_{name}")
+                # No dummy declaration at all -- this becomes the SHIM's
+                # own function result variable instead, declared in the
+                # `result(...)` clause built below.
+                continue
+            shim_decls.append(f"   {c_type}, intent(out) :: {name}")
+            shim_call_args.append(f"{name}={name}")
+            shim_dummy_names.append(name)
+            c_arg_specs.append((name, c_type, "out_ref", None))
+            continue
+        if name_l in omit_args:
+            # Genuinely unused by the target's own body (see
+            # _unused_scalar_target_args) -- the inner target already
+            # accepts a call omitting it (already marked `optional` by
+            # _mark_args_optional), so the shim just never declares it.
+            # KEYWORD calls throughout (see the SAME reasoning right
+            # above `inner_call`'s own construction) are exactly what
+            # makes simply omitting this one safe -- a POSITIONAL call
+            # would silently shift every LATER argument into the wrong
+            # slot instead (confirmed a real bug via
+            # examples/xequicorr_turnover.py's own `rng`, followed by
+            # its own array result `turnover`: "Type mismatch in
+            # argument 'rng' ... passed REAL(8) to INTEGER(4)").
+            continue
+        shim_decls.append(f"   {c_type}, value :: {name}")
+        shim_call_args.append(f"{name}={_inner_call_arg(name, c_type)}")
+        shim_dummy_names.append(name)
+        c_arg_specs.append((name, c_type, "value", None))
+
+    shim_symbol = f"xpc_{func_name}"
+    inner_call = f"call {func_name}(" + ", ".join(shim_call_args) + ")"
+    # A sibling procedure can't see another procedure's own locally-
+    # scoped interface at all -- the shim needs its own copy of the
+    # (already-rewritten, interoperable) callback interface too.
+    iface_block = list(cb_iface_lines) if cb_iface_lines else []
+    body = (
+        ["   use, intrinsic :: iso_c_binding"] + iface_block + shim_decls + [""] + shim_body_extra
+        + [f"   {inner_call}"] + shim_body_after
+    )
+    arglist = ", ".join(shim_dummy_names)
+
+    if orig_is_function and result_name is not None:
+        header = f"function {shim_symbol}({arglist}) bind(c, name=\"{shim_symbol}\") result(xpc_{result_name})"
+        body.insert(1, f"   {result_c_type} :: xpc_{result_name}")
+        text = "\n".join([header] + body + [f"end function {shim_symbol}"])
+        return text, c_arg_specs, True, shim_symbol, result_c_type
+
+    header = f"subroutine {shim_symbol}({arglist}) bind(c, name=\"{shim_symbol}\")"
+    text = "\n".join([header] + body + [f"end subroutine {shim_symbol}"])
+    return text, c_arg_specs, False, shim_symbol, None
+
+
+def build_ctypes_extension(trimmed_path: Path, out_dir: Path, compiler_flags: list[str], needs_lapack: bool):
+    """Compile `trimmed_path` (the trimmed module, with a ctypes shim
+    already appended via append_procedure_to_module) into a shared
+    library via a PLAIN `gfortran -shared` invocation -- no meson, no
+    crackfortran, no f2cmap, none of f2py's own pipeline. Confirmed
+    empirically: a `bind(c, name=...)` symbol is exported and callable
+    via `ctypes.CDLL(...)` with NO extra export flags needed on this
+    toolchain (a minimal proof-of-concept built and called cleanly
+    without `-Wl,--export-all-symbols` or any DLLEXPORT attribute).
+
+    Returns the compiled library's own Path, or None on a build failure
+    (already printed, matching this project's own established per-stage
+    reporting style).
+    """
+    dll_path = out_dir / f"{trimmed_path.stem}_ctypes_ext.dll"
+    cmd = ["gfortran", "-shared", "-fPIC", "-O2"]
+    if compiler_flags:
+        cmd.extend(compiler_flags)
+    cmd.extend(["-o", str(dll_path), str(trimmed_path)])
+    if needs_lapack:
+        lapack_lib = _ensure_lapack_archive()
+        if lapack_lib is not None:
+            lapack_dir, lapack_stem = lapack_lib
+            cmd.extend([f"-L{lapack_dir}", f"-l{lapack_stem}"])
+    proc = subprocess.run(cmd, cwd=out_dir, capture_output=True, text=True)
+    if proc.returncode != 0 or not dll_path.exists():
+        print("Ctypes Build: FAIL")
+        print(proc.stdout[-4000:])
+        print(proc.stderr[-4000:])
+        return None
+    return dll_path
+
+
+_CTYPES_TYPE_NAMES = {
+    "real(c_double)": "ctypes.c_double",
+    "integer(c_int)": "ctypes.c_int",
+    "logical(c_bool)": "ctypes.c_bool",
+}
+_CTYPES_NP_DTYPE = {
+    "real(c_double)": "np.float64",
+    "integer(c_int)": "np.intc",
+    "logical(c_bool)": "np.bool_",
+}
+
+
+def generate_ctypes_wrapper(
+    dll_path: Path,
+    func_name: str,
+    shim_symbol: str,
+    c_arg_specs,
+    is_shim_function: bool,
+    result_c_type,
+    arg_names,
+    omit_args,
+) -> str:
+    """Like generate_wrapper, but for the ctypes backend: loads the
+    compiled shared library via `ctypes.CDLL`, sets `argtypes`/`restype`
+    on the bind(c) shim symbol, and writes a thin Python function with
+    the SAME name/signature as the original -- same filename convention
+    (`{func_name}_f.py`) as the f2py backend's own wrapper, so --run-both/
+    --all/--except/build_run_both_source need no changes at all to work
+    with either backend.
+
+    `arg_names`/`omit_args` (the target's own ORIGINAL Python argument
+    names, in order, and which of them build_ctypes_shim's own
+    `_unused_scalar_target_args` check found genuinely unused) are needed
+    because an omitted name is dropped from `c_arg_specs` ENTIRELY --
+    without them, this function would have no way to know the outer,
+    Python-facing signature is still supposed to ACCEPT (just silently
+    ignore) that argument too, matching both the original Python
+    function's own signature and generate_wrapper's own f2py-backend
+    contract. Confirmed a real bug without this: `simulate_turnover`'s
+    own ctypes wrapper only accepted 4 arguments where the original
+    (and the f2py-backend wrapper) both accept 5, breaking any caller
+    that still passes the unused `rng` positionally (`TypeError:
+    simulate_turnover() takes 4 positional arguments but 5 were given`).
+
+    `c_arg_specs` (see build_ctypes_shim's own docstring) is the shim's
+    OWN complete, ordered Fortran argument list -- `argtypes` and the
+    actual ctypes call are built by iterating it directly, one clause per
+    `mode`:
+    - `"value"`: an ordinary user-supplied scalar, passed by value.
+    - `"size_of"`: NOT user-facing at all -- its own value is computed
+      automatically as `len(<source array>)` (`meta` names which one).
+    - `"out_ref"`: passed by ADDRESS (`ctypes.byref(...)`) to a fresh
+      local ctypes instance, whose own `.value` is read back afterward
+      and returned.
+    - `"array_in"`: a user-supplied array-like, converted to a
+      C-contiguous numpy array of the matching dtype (accepts a plain
+      Python list too, not just an existing ndarray) and passed as a raw
+      pointer via `.ctypes.data_as(...)`.
+    - `"array_out"`: a fresh numpy buffer the wrapper itself pre-allocates
+      (sized by `meta`, an already-Python-valid size expression) and
+      passes as a pointer, returned once the call fills it in.
+    - `"string_in"`: a user-supplied `str`, encoded to utf-8 bytes and
+      passed as a plain `c_char_p`. Always immediately followed by a
+      `"strlen_of"` entry, NOT user-facing, whose own value is the byte
+      length of that same encoded string.
+    """
+    # `is_scalar_only`'s own fast path calls `_shim(args_sig)` DIRECTLY,
+    # passing every name in `args_sig` straight through positionally --
+    # only safe when args_sig exactly matches the shim's own real
+    # argument list, which isn't true when an omitted name is mixed in
+    # (it must still appear in the OUTER Python-facing signature below,
+    # but never reaches the shim at all).
+    is_scalar_only = (
+        is_shim_function and not omit_args and all(mode == "value" for _, _, mode, _ in c_arg_specs)
+    )
+    input_specs = [s for s in c_arg_specs if s[2] in ("value", "array_in", "string_in", "callback")]
+    # A purely scalar target still needs numpy for its own vectorize
+    # fallback below (an external caller, unlike this project's own
+    # generated Fortran, might pass an array anyway -- see its own
+    # comment), not just when an array mode is already present.
+    needs_numpy = is_scalar_only or any(
+        mode in ("array_in", "array_out", "callback") for _, _, mode, _ in c_arg_specs
+    )
+    # The FULL original argument list, in ORIGINAL order, including any
+    # omitted name -- see this function's own docstring for why (the
+    # outer, Python-facing signature must still ACCEPT it, even though
+    # it's never forwarded to the shim at all).
+    args_sig = ", ".join(arg_names)
+
+    # A callback argument needs its own MODULE-LEVEL ctypes.CFUNCTYPE
+    # (its argtypes/restype describe the callback's OWN, already-
+    # rewritten-for-interop signature -- see
+    # _rewrite_callback_interface_for_ctypes's own docstring for
+    # `cb_arg_specs`' shape) -- built once here, referenced both in
+    # `_shim.argtypes` and when wrapping the user's own callable before
+    # each call.
+    functype_decls = []
+    functype_var = {}
+    for n, t, mode, meta in c_arg_specs:
+        if mode != "callback":
+            continue
+        _iface_name, cb_result_c_type, cb_arg_specs_inner = meta
+        cb_argtypes = []
+        for cb_c_type, cb_is_array in cb_arg_specs_inner:
+            cb_ct = _CTYPES_TYPE_NAMES[cb_c_type]
+            if cb_is_array:
+                cb_argtypes.append(f"ctypes.POINTER({cb_ct})")
+                cb_argtypes.append("ctypes.c_int")
+            else:
+                cb_argtypes.append(cb_ct)
+        var = f"_{n}_functype"
+        functype_var[n] = var
+        functype_decls.append(
+            f"{var} = ctypes.CFUNCTYPE({_CTYPES_TYPE_NAMES[cb_result_c_type]}, {', '.join(cb_argtypes)})\n"
+        )
+
+    def _argtype_for(n, t, mode):
+        if mode == "string_in":
+            return "ctypes.c_char_p"
+        if mode == "callback":
+            return functype_var[n]
+        if mode in ("value", "size_of", "strlen_of"):
+            return _CTYPES_TYPE_NAMES[t]
+        return f"ctypes.POINTER({_CTYPES_TYPE_NAMES[t]})"
+
+    argtypes_src = ", ".join(_argtype_for(n, t, mode) for n, t, mode, _ in c_arg_specs)
+    # ctypes defaults an unset `restype` to `c_int`, silently misreading
+    # whatever happens to be in that register -- a void (subroutine-
+    # shaped) shim needs `restype = None` explicitly, not just omitted.
+    restype_src = _CTYPES_TYPE_NAMES[result_c_type] if is_shim_function else "None"
+
+    header = (
+        "# Generated by xpfunc2f.py -- a thin ctypes wrapper around the compiled\n"
+        f"# bind(c) translation of `{func_name}`. Same name, same call signature\n"
+        "# as the original Python function; drop-in replacement at call sites.\n"
+        "import ctypes\n"
+        "import os\n" + ("import numpy as np\n" if needs_numpy else "") + "\n"
+        f"_dll = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), {dll_path.name!r}))\n"
+        + "".join(functype_decls)
+        + f"_shim = _dll.{shim_symbol}\n"
+        f"_shim.argtypes = [{argtypes_src}]\n"
+        f"_shim.restype = {restype_src}\n\n\n"
+    )
+
+    if is_scalar_only:
+        # A target with NO array argument/result at all is exactly the
+        # case where an external caller -- unlike this project's own
+        # generated Fortran, which only ever calls it scalar-wise --
+        # might pass an array anyway, e.g. scipy's `curve_fit` calling
+        # its own `model` callback with the WHOLE xdata array at once.
+        # f2py's OWN vectorize_scalars fallback (generate_wrapper) exists
+        # for the exact same reason; ctypes has no automatic marshaling
+        # at all for a scalar dummy given an array, so without this it
+        # would just raise a plain ctypes ArgumentError instead of
+        # working -- falls back to elementwise dispatch (matching
+        # ordinary numpy broadcasting) whenever any argument passed is
+        # itself array-like, while an ordinary scalar call still goes
+        # straight to the compiled extension with no per-call overhead.
+        if not args_sig:
+            return header + f"def {func_name}():\n    return _shim()\n"
+        return header + (
+            f"def {func_name}({args_sig}):\n"
+            f"    if any(hasattr(_v, '__len__') for _v in ({args_sig},)):\n"
+            f"        return np.vectorize(_shim)({args_sig})\n"
+            f"    return _shim({args_sig})\n"
+        )
+
+    body = [f"def {func_name}({args_sig}):\n"]
+    call_parts = []
+    out_names = []
+    for n, t, mode, meta in c_arg_specs:
+        ct = _CTYPES_TYPE_NAMES.get(t)
+        if mode == "value":
+            call_parts.append(n)
+        elif mode == "size_of":
+            call_parts.append(f"len({meta})")
+        elif mode == "string_in":
+            body.append(f"    _{n}_bytes = str({n}).encode('utf-8')\n")
+            call_parts.append(f"_{n}_bytes")
+        elif mode == "strlen_of":
+            call_parts.append(f"len(_{meta}_bytes)")
+        elif mode == "array_in":
+            body.append(f"    _{n}_arr = np.ascontiguousarray({n}, dtype={_CTYPES_NP_DTYPE[t]})\n")
+            body.append(f"    _{n}_p = _{n}_arr.ctypes.data_as(ctypes.POINTER({ct}))\n")
+            call_parts.append(f"_{n}_p")
+        elif mode == "out_ref":
+            body.append(f"    _{n} = {ct}()\n")
+            call_parts.append(f"ctypes.byref(_{n})")
+            out_names.append(f"_{n}.value")
+        elif mode == "array_out":
+            body.append(f"    _{n}_arr = np.empty({meta}, dtype={_CTYPES_NP_DTYPE[t]})\n")
+            body.append(f"    _{n}_p = _{n}_arr.ctypes.data_as(ctypes.POINTER({ct}))\n")
+            call_parts.append(f"_{n}_p")
+            out_names.append(f"_{n}_arr")
+        elif mode == "callback":
+            # A small trampoline matching the callback's OWN rewritten,
+            # interoperable signature exactly -- one parameter per
+            # `cb_arg_specs_inner` entry (a POINTER+length PAIR for an
+            # array, a plain scalar otherwise), converting a raw array
+            # pointer back into a numpy array (`np.ctypeslib.as_array`)
+            # before calling the user's OWN Python callable with
+            # arguments matching what it originally expected.
+            _iface_name, _cb_result_c_type, cb_arg_specs_inner = meta
+            params = []
+            call_inner_args = []
+            trampoline_body = []
+            for idx, (cb_c_type, cb_is_array) in enumerate(cb_arg_specs_inner):
+                if cb_is_array:
+                    p_ptr, p_n = f"_p{idx}", f"_n{idx}"
+                    params.append(p_ptr)
+                    params.append(p_n)
+                    arr_var = f"_arr{idx}"
+                    trampoline_body.append(f"        {arr_var} = np.ctypeslib.as_array({p_ptr}, shape=({p_n},))\n")
+                    call_inner_args.append(arr_var)
+                else:
+                    p = f"_p{idx}"
+                    params.append(p)
+                    call_inner_args.append(p)
+            trampoline_name = f"_{n}_trampoline"
+            body.append(f"    def {trampoline_name}({', '.join(params)}):\n")
+            body.extend(trampoline_body)
+            body.append(f"        return {n}({', '.join(call_inner_args)})\n")
+            call_parts.append(f"{functype_var[n]}({trampoline_name})")
+
+    if is_shim_function:
+        body.append(f"    return _shim({', '.join(call_parts)})\n")
+        return header + "".join(body)
+
+    body.append(f"    _shim({', '.join(call_parts)})\n")
+    body.append("    return " + (out_names[0] if len(out_names) == 1 else ", ".join(out_names)) + "\n")
+    return header + "".join(body)
 
 
 PROGRAM_START_RE = re.compile(r"^\s*program\s+([a-z_]\w*)\s*$", re.IGNORECASE)
@@ -2927,6 +3983,7 @@ def _bridge_one_target(
     procedures: dict,
     compiler_flags: list[str],
     timings: dict,
+    backend: str = "f2py",
 ) -> "TargetBridgeResult | None":
     """Extract, rewrite, and f2py-build ONE target function out of an
     ALREADY-transpiled module -- `mod_name`/`header`/`lines`/`procedures`
@@ -2961,6 +4018,13 @@ def _bridge_one_target(
         needed = collect_closure(func_name, procedures, lines)
         target_key = func_name.lower()
         t_start, t_end = procedures[target_key]
+        # Captured BEFORE any rewrite touches lines[t_start] -- the
+        # ctypes backend needs to know whether the ORIGINAL target was a
+        # function (restoring genuine function-call semantics at its own
+        # bind(c) shim boundary is the whole point of not just reusing
+        # rewrite_target_for_f2py's own scalar-function-to-subroutine
+        # conversion as the final word -- see build_ctypes_shim).
+        orig_sig_m = SIG_RE.match(_strip_comment(lines[t_start]))
 
         # Try the "provably bounded, data-dependent-length accumulator"
         # bridge FIRST (a distinct codegen shape from rewrite_target_
@@ -3033,6 +4097,40 @@ def _bridge_one_target(
             lines[procedures[nm][0] : procedures[nm][1] + 1] for nm in needed if nm != target_key
         ]
         header = hoist_global_initializers(header, lines, needed_bodies)
+
+        # ctypes backend only: a callback argument's own interface must
+        # be rewritten for C interoperability BEFORE build_trimmed_module
+        # runs, not after -- that's what actually writes each
+        # procedure's own body into the trimmed module, so the rewrite
+        # has to already be baked into what gets passed as override_lines
+        # (see build_ctypes_shim's own docstring for the bug this avoids).
+        # Every DEPENDENCY that ALSO declares a copy of the same callback
+        # (e.g. examples/xcallback_passthrough_order_repro.py's own
+        # `driver`, which forwards its own callback dummy to `evaluate`)
+        # needs the identical treatment for the whole call chain to stay
+        # interoperable -- see _rewrite_callback_interface_for_ctypes's
+        # own docstring.
+        override_lines = {target_key: target_lines}
+        cb_shim_info = (None, None, None, None, None)
+        if backend == "ctypes":
+            cb_arg_name, cb_iface_name = _find_callback_arg(target_lines)
+            if cb_arg_name is not None:
+                target_lines, cb_result_c_type, cb_arg_specs_inner, cb_iface_lines = (
+                    _rewrite_callback_interface_for_ctypes(target_lines, cb_arg_name, cb_iface_name)
+                )
+                override_lines[target_key] = target_lines
+                cb_shim_info = (cb_arg_name, cb_iface_name, cb_result_c_type, cb_arg_specs_inner, cb_iface_lines)
+                for nm in needed:
+                    if nm == target_key:
+                        continue
+                    dep_start, dep_end = procedures[nm]
+                    dep_lines = list(lines[dep_start : dep_end + 1])
+                    dep_cb_arg_name, dep_cb_iface_name = _find_callback_arg(dep_lines)
+                    if dep_cb_arg_name is not None:
+                        dep_lines, _rct, _cas, _cil = _rewrite_callback_interface_for_ctypes(
+                            dep_lines, dep_cb_arg_name, dep_cb_iface_name
+                        )
+                        override_lines[nm] = dep_lines
     except UnsupportedFunction as e:
         print(f"Extract: FAIL ({e})")
         return None
@@ -3047,7 +4145,7 @@ def _bridge_one_target(
               f"rewritten to an f2py-bridgeable explicit-shape form")
 
     trimmed_text = build_trimmed_module(
-        mod_name, header, lines, procedures, needed, override_lines={target_key: target_lines}
+        mod_name, header, lines, procedures, needed, override_lines=override_lines
     )
     # Every DEPENDENCY (any OTHER name in `needed`) is stripped from the
     # trimmed module's own `public ::` list -- kept PRIVATE, same as any
@@ -3098,6 +4196,60 @@ def _bridge_one_target(
               f"or a pandas DataFrame companion type)")
         return None
     trimmed_path = out_dir / f"{func_name}_f.f90"
+
+    if backend == "ctypes":
+        # Phase 1 of the ctypes/bind(c) backend -- see build_ctypes_shim's
+        # own docstring. Not yet supported: the data-dependent-length
+        # bridge path (bridge_name is not None) or anything array-shaped/
+        # character (build_ctypes_shim itself rejects those).
+        if bridge_name is not None:
+            print("Extract: FAIL (ctypes backend: data-dependent-length array-result "
+                  "bridge not yet supported)")
+            return None
+        # Whether the ORIGINAL target was a function at all -- regardless
+        # of whether any ARGUMENT is array-shaped (that's independent:
+        # e.g. examples/xbfgs.py's own `objective(x)` takes an array but
+        # still returns a plain scalar, and a bind(c) function taking an
+        # array-pointer argument and returning a scalar is completely
+        # ordinary C-ABI shape -- build_ctypes_shim itself decides,
+        # per-name, whether the specific appended "result" turns into a
+        # genuine function result or an array out-param).
+        orig_is_function = orig_sig_m is not None and orig_sig_m.group("kind").lower() == "function"
+        cb_arg_name, cb_iface_name, cb_result_c_type, cb_arg_specs_inner, cb_iface_lines = cb_shim_info
+        try:
+            shim_text, c_arg_specs, is_shim_function, shim_symbol, result_c_type = build_ctypes_shim(
+                target_lines, arg_names, omit_args, orig_is_function, func_name,
+                cb_arg_name, cb_iface_name, cb_result_c_type, cb_arg_specs_inner, cb_iface_lines,
+            )
+        except UnsupportedFunction as e:
+            print(f"Extract: FAIL ({e})")
+            return None
+        # append_procedure_to_module also adds the shim to the module's
+        # own `public ::` list -- harmless (a plain gfortran -shared
+        # compile never consults it; a bind(c) symbol is always exported
+        # by its own external name regardless), reused here just to avoid
+        # a second, near-identical "insert before end module" helper.
+        trimmed_text = append_procedure_to_module(trimmed_text, shim_text, shim_symbol)
+        trimmed_path.write_text(trimmed_text, encoding="utf-8")
+        t0 = time.perf_counter()
+        dll_path = build_ctypes_extension(
+            trimmed_path, out_dir, compiler_flags, needs_lapack=LAPACK_ROUTINE_RE.search(trimmed_text) is not None
+        )
+        timings["compile"] = timings.get("compile", 0.0) + (time.perf_counter() - t0)
+        if dll_path is None:
+            return None
+        print("Ctypes Build: PASS")
+        wrapper_path = out_dir / f"{func_name}_f.py"
+        wrapper_path.write_text(
+            generate_ctypes_wrapper(
+                dll_path, func_name, shim_symbol, c_arg_specs, is_shim_function, result_c_type,
+                arg_names, omit_args,
+            ),
+            encoding="utf-8",
+        )
+        print(f"Wrapper: {wrapper_path}")
+        return TargetBridgeResult(func_name=func_name, wrapper_path=wrapper_path, arg_names=arg_names)
+
     trimmed_path.write_text(trimmed_text, encoding="utf-8")
 
     ext_name = f"{func_name}_fortran_ext"
@@ -3476,7 +4628,8 @@ def _run_all_targets(
     for i, func_name in enumerate(all_func_names, start=1):
         print(f"\n[{i}/{len(all_func_names)}] {func_name}")
         results[func_name] = _bridge_one_target(
-            func_name, py_tree, out_dir, mod_name, header, lines, procedures, compiler_flags, timings
+            func_name, py_tree, out_dir, mod_name, header, lines, procedures, compiler_flags, timings,
+            backend=args.backend,
         )
 
     n_ok = sum(1 for r in results.values() if r is not None)
@@ -3514,6 +4667,16 @@ def main(argv=None) -> int:
         "exclusive with --all/--except",
     )
     ap.add_argument("--out-dir", help="directory for generated files (default: alongside input_py)")
+    ap.add_argument(
+        "--backend",
+        choices=["f2py", "ctypes"],
+        default="f2py",
+        help="bridging backend (default: f2py). 'ctypes' compiles a bind(c) shim via a plain "
+        "gfortran -shared build instead of f2py's own crackfortran/meson pipeline -- currently "
+        "PHASE 1 ONLY: a purely scalar real/integer/logical target (no arrays, no strings, no "
+        "callbacks yet), restoring genuine Fortran function-call semantics at the ctypes "
+        "boundary even when the target's own body was converted to a subroutine internally.",
+    )
     ap.add_argument(
         "--all",
         action="store_true",
@@ -3652,7 +4815,8 @@ def main(argv=None) -> int:
               f"skipping 'main')")
 
     result = _bridge_one_target(
-        func_name, py_tree, out_dir, mod_name, header, lines, procedures, compiler_flags, timings
+        func_name, py_tree, out_dir, mod_name, header, lines, procedures, compiler_flags, timings,
+        backend=args.backend,
     )
     if result is None:
         return 1

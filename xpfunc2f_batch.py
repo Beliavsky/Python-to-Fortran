@@ -210,6 +210,14 @@ def main() -> int:
         "a large corpus, at the cost of not checking the bridged function's own output "
         "still matches Python's. Mutually exclusive with --time-both.",
     )
+    ap.add_argument(
+        "--backend",
+        choices=["f2py", "ctypes"],
+        default="f2py",
+        help="Forward --backend to xpfunc2f.py (default: f2py). 'ctypes' bridges via a "
+        "bind(c) shim + plain gfortran -shared build instead of f2py's own crackfortran/"
+        "meson pipeline.",
+    )
     ap.add_argument("--maxfail", type=int, default=0, help="Stop after this many failures (0 = no limit).")
     ap.add_argument("--skip", type=int, default=0, help="Skip this many matched files before applying --limit.")
     ap.add_argument("--limit", type=int, default=0, help="Process at most this many matched files (0 = no limit).")
@@ -356,6 +364,8 @@ def main() -> int:
         out_dir = work_root / f"{i:04d}_{pyf.stem}"
         out_dir.mkdir(parents=True, exist_ok=True)
         cmd = [sys.executable, str(XPFUNC2F_PATH), str(source_abs), "--out-dir", str(out_dir)]
+        if args.backend != "f2py":
+            cmd.extend(["--backend", args.backend])
         if not args.compile:
             cmd.append("--time-both" if args.time_both else "--run-both")
 
