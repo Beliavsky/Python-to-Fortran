@@ -2887,6 +2887,81 @@ def const_comment(name, tree):
     return "constant from python source"
 
 
+def inline_percent_format_constant_vars(tree):
+    """Rewrite `NAME % ARGS` to `"LITERAL" % ARGS` wherever NAME is a
+    module-level `NAME = "literal string"` assignment appearing (per
+    count_assignments -- the same module-scope-only, exactly-once check
+    find_parameters already uses for numeric constant promotion) exactly
+    once anywhere at module level.
+
+    User-reported real failure: `fmt_s = "%10s"` then
+    `print(fmt_s % "lag", fmt_s % "sample", fmt_s % "true")` -- a MULTI-
+    argument print, where each `%` expression is just one of several
+    print() arguments. The two already-correct Python-%-style-format
+    code paths (the general BinOp Mod lowering, and print()'s single-
+    argument fast path) both only recognize the left operand of `%` as
+    string formatting when it's a literal `ast.Constant` string -- an
+    opaque Name, even one statically known to hold a string, falls
+    through both straight to the *arithmetic* Mod codegen, emitting
+    invalid Fortran (`modulo(fmt_s, "lag")`, a character argument passed
+    to an intrinsic that requires INTEGER/REAL). This project doesn't
+    track compile-time constant VALUES during codegen at all (only a
+    later, purely textual post-pass promotes a single-assignment scalar
+    to a Fortran `parameter` -- cosmetic only, decided long after codegen
+    has already run) -- so recognizing this shape has to happen here, as
+    an early rewrite feeding the literal to the two already-correct
+    sites, rather than by teaching either of them to resolve a Name's
+    value.
+
+    Deliberately scoped to module-level occurrences only (both for the
+    single assignment AND for the `%` usages rewritten): a function could
+    read the same-named module global, or could shadow it with its own
+    unrelated local -- telling those apart would need real scope
+    analysis this narrow pass doesn't do, so it conservatively leaves
+    every in-function occurrence alone rather than risk rewriting a
+    shadowed local's own `%` use.
+    """
+    counts = count_assignments(tree)
+    str_constants: dict = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and is_const_str(node.value)
+            and counts.get(node.targets[0].id, 0) == 1
+        ):
+            str_constants[node.targets[0].id] = node.value.value
+    if not str_constants:
+        return tree
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            return node
+
+        def visit_ClassDef(self, node):
+            return node
+
+        def visit_BinOp(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.op, ast.Mod)
+                and isinstance(node.left, ast.Name)
+                and node.left.id in str_constants
+            ):
+                lit = ast.Constant(value=str_constants[node.left.id])
+                ast.copy_location(lit, node.left)
+                node.left = lit
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
 def _line_starts(src_text):
     starts = [0]
     for i, ch in enumerate(src_text):
@@ -3631,13 +3706,16 @@ def rewrite_integer_quotient_seed_divisions(tree):
 
 def rewrite_listcomp_array_assign_calls_to_loop(tree):
     """Rewrite `TARGET = np.array([ELT for VAR in ITERABLE])` (or
-    np.asarray(...)) into an equivalent explicit loop, ONLY when ELT
-    contains a call that this project's own inline elementwise ListComp
-    lowering (the ast.Call handling inside expr()'s ast.ListComp branch)
-    can't possibly support. That lowering only ever accepts a handful of
-    narrow call shapes: str/int/float/bool applied directly to the bare
-    loop variable, max/min without keywords, or a bare 0-arg strip/
-    lstrip/rstrip method -- so ANY OTHER call (in particular, calling an
+    np.asarray(...)) into an equivalent explicit loop, and likewise for
+    `return np.array([ELT for VAR in ITERABLE])` (a synthesized result
+    variable takes TARGET's place, and the loop is followed by `return`
+    of it) -- ONLY when ELT contains a call that this project's own
+    inline elementwise ListComp lowering (the ast.Call handling inside
+    expr()'s ast.ListComp branch) can't possibly support. That lowering
+    only ever accepts a handful of narrow call shapes: str/int/float/bool
+    applied directly to the bare loop variable, max/min without
+    keywords, or a bare 0-arg strip/lstrip/rstrip method -- so ANY OTHER
+    call (in particular, calling an
     arbitrary user-defined function -- even a single bare `f(v)`, with
     or without keyword arguments) is rewritten here, before it ever
     reaches that lowering, into:
@@ -3720,67 +3798,108 @@ def rewrite_listcomp_array_assign_calls_to_loop(tree):
                 existing_names.add(cand)
                 return cand
 
+    tmp_counter = [0]
+
+    def _next_tmp_name():
+        while True:
+            tmp_counter[0] += 1
+            cand = f"lc_res_{tmp_counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    def _unsupported_array_listcomp(call_node):
+        """Return (loop_var_name, ListComp) if `call_node` is
+        `np.array([ELT for VAR in ITERABLE])`/`np.asarray(...)` in the
+        single-generator, unfiltered, call-containing shape this rewrite
+        targets, else None -- shared by visit_Assign and visit_Return so
+        both stay in lockstep.
+        """
+        if not (
+            isinstance(call_node, ast.Call)
+            and isinstance(call_node.func, ast.Attribute)
+            and call_node.func.attr in {"array", "asarray"}
+            and isinstance(call_node.func.value, ast.Name)
+            and call_node.func.value.id in {"np", "numpy"}
+            and len(call_node.args) >= 1
+            and isinstance(call_node.args[0], ast.ListComp)
+        ):
+            return None
+        lc = call_node.args[0]
+        if len(lc.generators) != 1 or lc.generators[0].ifs:
+            return None
+        gen = lc.generators[0]
+        if not isinstance(gen.target, ast.Name):
+            return None
+        if not _needs_loop(lc.elt, gen.target.id):
+            return None
+        return lc
+
+    def _build_loop(lc, t_name):
+        idx_name = _next_idx_name()
+        gen = lc.generators[0]
+        alloc_stmt = ast.Assign(
+            targets=[ast.Name(id=t_name, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="empty", ctx=ast.Load()),
+                args=[ast.Call(func=ast.Name(id="len", ctx=ast.Load()), args=[gen.iter], keywords=[])],
+                keywords=[],
+            ),
+        )
+        assign_elem = ast.Assign(
+            targets=[
+                ast.Subscript(
+                    value=ast.Name(id=t_name, ctx=ast.Load()),
+                    slice=ast.Name(id=idx_name, ctx=ast.Load()),
+                    ctx=ast.Store(),
+                )
+            ],
+            value=lc.elt,
+        )
+        for_stmt = ast.For(
+            target=ast.Tuple(elts=[ast.Name(id=idx_name, ctx=ast.Store()), gen.target], ctx=ast.Store()),
+            iter=ast.Call(func=ast.Name(id="enumerate", ctx=ast.Load()), args=[gen.iter], keywords=[]),
+            body=[assign_elem],
+            orelse=[],
+        )
+        # Marks this loop as safe to fully fuse away its own idx/val loop
+        # variables at emission time (see translator.visit_For's
+        # `_synth_single_assign_loop` check): both names are entirely
+        # internal to this synthesized loop -- idx_name never existed in
+        # the user's source at all, and gen.target is a list-comprehension
+        # loop variable, which (unlike an ordinary for-loop's target) has
+        # its OWN scope in real Python and can never be read after the
+        # comprehension ends -- so neither name can possibly be referenced
+        # anywhere outside this exact loop body.
+        for_stmt._synth_single_assign_loop = True
+        return alloc_stmt, for_stmt
+
     class _Rewriter(ast.NodeTransformer):
+        def visit_Return(self, node):
+            self.generic_visit(node)
+            lc = _unsupported_array_listcomp(node.value)
+            if lc is None:
+                return node
+            t_name = _next_tmp_name()
+            alloc_stmt, for_stmt = _build_loop(lc, t_name)
+            ret_stmt = ast.Return(value=ast.Name(id=t_name, ctx=ast.Load()))
+            for new_node in (alloc_stmt, for_stmt, ret_stmt):
+                ast.copy_location(new_node, node)
+            ast.fix_missing_locations(alloc_stmt)
+            ast.fix_missing_locations(for_stmt)
+            ast.fix_missing_locations(ret_stmt)
+            return [alloc_stmt, for_stmt, ret_stmt]
+
         def visit_Assign(self, node):
             self.generic_visit(node)
-            if not (
-                len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr in {"array", "asarray"}
-                and isinstance(node.value.func.value, ast.Name)
-                and node.value.func.value.id in {"np", "numpy"}
-                and len(node.value.args) >= 1
-                and isinstance(node.value.args[0], ast.ListComp)
-            ):
+            if not (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
                 return node
-            lc = node.value.args[0]
-            if len(lc.generators) != 1 or lc.generators[0].ifs:
+            lc = _unsupported_array_listcomp(node.value)
+            if lc is None:
                 return node
-            gen = lc.generators[0]
-            if not isinstance(gen.target, ast.Name):
-                return node
-            if not _needs_loop(lc.elt, gen.target.id):
-                return node
-            idx_name = _next_idx_name()
             t_name = node.targets[0].id
-            alloc_stmt = ast.Assign(
-                targets=[ast.Name(id=t_name, ctx=ast.Store())],
-                value=ast.Call(
-                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="empty", ctx=ast.Load()),
-                    args=[ast.Call(func=ast.Name(id="len", ctx=ast.Load()), args=[gen.iter], keywords=[])],
-                    keywords=[],
-                ),
-            )
-            assign_elem = ast.Assign(
-                targets=[
-                    ast.Subscript(
-                        value=ast.Name(id=t_name, ctx=ast.Load()),
-                        slice=ast.Name(id=idx_name, ctx=ast.Load()),
-                        ctx=ast.Store(),
-                    )
-                ],
-                value=lc.elt,
-            )
-            for_stmt = ast.For(
-                target=ast.Tuple(elts=[ast.Name(id=idx_name, ctx=ast.Store()), gen.target], ctx=ast.Store()),
-                iter=ast.Call(func=ast.Name(id="enumerate", ctx=ast.Load()), args=[gen.iter], keywords=[]),
-                body=[assign_elem],
-                orelse=[],
-            )
-            # Marks this loop as safe to fully fuse away its own idx/val
-            # loop variables at emission time (see
-            # translator.visit_For's `_synth_single_assign_loop` check):
-            # both names are entirely internal to this synthesized loop
-            # -- idx_name never existed in the user's source at all, and
-            # gen.target is a list-comprehension loop variable, which
-            # (unlike an ordinary for-loop's target) has its OWN scope in
-            # real Python and can never be read after the comprehension
-            # ends -- so neither name can possibly be referenced anywhere
-            # outside this exact loop body.
-            for_stmt._synth_single_assign_loop = True
-            for new_node in (alloc_stmt, assign_elem, for_stmt):
+            alloc_stmt, for_stmt = _build_loop(lc, t_name)
+            for new_node in (alloc_stmt, for_stmt):
                 ast.copy_location(new_node, node)
             ast.fix_missing_locations(alloc_stmt)
             ast.fix_missing_locations(for_stmt)
@@ -4042,7 +4161,44 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
         | {"np", "math", "random"}
     )
 
-    def _free_vars(fn_node):
+    def _enclosing_local_names(enclosing_fn):
+        names = {
+            a.arg
+            for a in list(enclosing_fn.args.posonlyargs)
+            + list(enclosing_fn.args.args)
+            + list(enclosing_fn.args.kwonlyargs)
+        }
+
+        class _V(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):
+                # Nested function bodies have their own local namespace.
+                names.add(node.name)
+
+            def visit_AsyncFunctionDef(self, node):
+                names.add(node.name)
+
+            def visit_ClassDef(self, node):
+                names.add(node.name)
+
+            def visit_Lambda(self, node):
+                return
+
+            def visit_ExceptHandler(self, node):
+                if node.name:
+                    names.add(node.name)
+                self.generic_visit(node)
+
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Store):
+                    names.add(node.id)
+
+        v = _V()
+        for stmt in enclosing_fn.body:
+            v.visit(stmt)
+        return names
+
+    def _free_vars(fn_node, enclosing_fn):
+        enclosing_locals = _enclosing_local_names(enclosing_fn)
         param_names = {
             a.arg
             for a in list(fn_node.args.posonlyargs)
@@ -4108,7 +4264,12 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
                 if isinstance(node.ctx, ast.Store):
                     bound.add(node.id)
                 elif isinstance(node.ctx, ast.Load):
-                    if node.id in excluded_names:
+                    # A local in the enclosing function shadows an identically
+                    # named module variable.  It therefore remains a genuine
+                    # closure value and must be snapshotted (for example a
+                    # ``fixed_dof`` formal when the driver also has a module-
+                    # level variable named ``fixed_dof``).
+                    if node.id in excluded_names and node.id not in enclosing_locals:
                         return
                     if node.id not in bound and node.id not in seen:
                         seen.add(node.id)
@@ -4306,7 +4467,7 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
         defs_by_name = {}
         ok_all = True
         for def_node in to_hoist:
-            free = _free_vars(def_node)
+            free = _free_vars(def_node, stmt)
             if free is None:
                 ok_all = False
                 break
@@ -4350,6 +4511,12 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
                     targets=[ast.Name(id=closure_name, ctx=ast.Store())],
                     value=init_val,
                 )
+                # Mark this synthetic seed so generate_flat can suppress it
+                # once whole-program inference proves that the captured value
+                # is an array.  The seed is useful for scalar closure globals,
+                # but assigning it to an allocatable array would be a rank
+                # mismatch before the real snapshot.
+                init_stmt._xp2f_closure_seed = True
                 ast.copy_location(init_stmt, stmt)
                 init_stmts.append(init_stmt)
 
@@ -12317,6 +12484,29 @@ def detect_needed_helpers(tree):
                 if re.search(r"%(?:[-+#0 ]*\d*(?:\.\d+)?)?[gG]", fmt_text):
                     needed.add("py_format_g_real")
                     needed.add("py_str_int")
+                # Old-style "%...spec..." % args formatting (the BinOp Mod
+                # codegen's own inline lowering, see expr()'s ast.Mod
+                # handling) wraps EVERY substituted argument in py_str(...)
+                # for any recognized conversion char -- not just %g/%G --
+                # so py_str must be pulled in from python_mod whenever any
+                # of them appears, matching that codegen's own conv_chars
+                # set exactly. Missing this (previously only checked %g)
+                # produced a "no IMPLICIT type" build failure for the far
+                # more common %d/%s/%f cases, whenever the %-expression
+                # was one of several print() arguments (its OWN py_str
+                # need isn't otherwise visible from the outer print() call
+                # shape the way a print(..., sep=...) call's is).
+                if re.search(r"%(?:[-+#0 ]*\d*(?:\.\d+)?)?[diouxXeEfFgGcrs]", fmt_text):
+                    needed.add("py_str")
+                # A WIDTH-bearing %s/%c/%r (e.g. "%10s") is expanded (see
+                # _fortran_write_for_percent_format's "desc_rjust" items)
+                # via this project's own str_rjust helper -- pads to
+                # max(width, actual length), matching Python's own %Ns
+                # (which pads a SHORTER value but never truncates a
+                # LONGER one, unlike a fixed-width Fortran `aW` edit
+                # descriptor used directly).
+                if re.search(r"%[-+#0 ]*\d+[crs]", fmt_text):
+                    needed.add("str_rjust")
             self.generic_visit(node)
 
         def visit_JoinedStr(self, node):
@@ -13637,29 +13827,58 @@ def validate_no_duplicate_top_level_defs(tree):
 _CARRIED_MODULE_IMPORTS = {"math", "cmath"}
 
 
+def safe_import_prefix(name):
+    """Sanitize a local import alias into the prefix inline_local_from_imports
+    uses when it renames a plain `import mod_name` (attribute-access)
+    module's inlined function to `f"{prefix}_{true_name}"`, to avoid
+    collisions between two sibling modules that happen to define a
+    same-named function. Promoted to module level (like
+    resolve_sibling_module_path above) so xpfunc2f.py's own
+    find_target_def/_bridge_one_target can independently recompute the
+    exact renamed identifier for a target reached via `import mod_name`,
+    without duplicating -- and risking drifting out of sync with -- this
+    formula."""
+    return re.sub(r"\W+", "_", name).strip("_") or "mod"
+
+
+def resolve_sibling_module_path(mod_name, py_path):
+    """Resolve a dotted import name (`import mod_name` / `from mod_name
+    import ...`) to a sibling .py file living next to py_path, or a
+    sibling package's __init__.py -- the same, and only, resolution
+    inline_local_from_imports itself uses to decide whether an import is
+    "a local module we can inline" at all. Returns None for anything
+    else (a real installed/third-party package, a name with no such
+    file). Promoted out of inline_local_from_imports's own body (rather
+    than kept as a private closure there) so other callers -- notably
+    xpfunc2f.py's own find_target_def/build_run_both_source, which need
+    to locate a target function's TRUE, pre-rename definition even when
+    inline_local_from_imports itself renamed it in the merged tree (the
+    `import mod_name` attribute-access case, see module_attr_renames
+    below) -- can resolve a sibling module the identical way without
+    duplicating this logic and risking it drifting out of sync."""
+    parts = [p for p in (mod_name or "").split(".") if p]
+    if not parts:
+        return None
+    base_dir = Path(py_path).resolve().parent
+    path = base_dir.joinpath(*parts)
+    py_file = path.with_suffix(".py")
+    if py_file.exists():
+        return py_file
+    init_file = path / "__init__.py"
+    if init_file.exists():
+        return init_file
+    return None
+
+
 def inline_local_from_imports(tree, py_path):
     """Inline simple sibling-module functions/constants imported by name or module."""
-    base_dir = Path(py_path).resolve().parent
     new_body = []
     changed = False
     module_cache = {}
     module_attr_renames = {}
 
-    def _module_path(mod_name):
-        parts = [p for p in (mod_name or "").split(".") if p]
-        if not parts:
-            return None
-        path = base_dir.joinpath(*parts)
-        py_file = path.with_suffix(".py")
-        if py_file.exists():
-            return py_file
-        init_file = path / "__init__.py"
-        if init_file.exists():
-            return init_file
-        return None
-
     def _load_exports(mod_name):
-        path = _module_path(mod_name)
+        path = resolve_sibling_module_path(mod_name, py_path)
         if path is None:
             return None
         key = str(path.resolve())
@@ -13711,9 +13930,6 @@ def inline_local_from_imports(tree, py_path):
         module_cache[key] = exports
         return exports
 
-    def _safe_import_prefix(name):
-        return re.sub(r"\W+", "_", name).strip("_") or "mod"
-
     def _referenced_module_names(fn_node, funcs, assigns):
         # Other same-module function/constant names fn_node's body
         # references -- either as a bare (unqualified) function call to
@@ -13761,7 +13977,7 @@ def inline_local_from_imports(tree, py_path):
                     continue
                 _carry_extra_imports(exports)
                 alias_name = al.asname or al.name.split(".", 1)[0]
-                prefix = _safe_import_prefix(alias_name)
+                prefix = safe_import_prefix(alias_name)
                 for nm, fn_src in exports["funcs"].items():
                     local_name = f"{prefix}_{nm}"
                     module_attr_renames[(alias_name, nm)] = local_name
@@ -13797,6 +14013,35 @@ def inline_local_from_imports(tree, py_path):
             added_src_names = set()
             for al in st.names:
                 if al.name == "*":
+                    # `from module import *` -- unlike a named alias,
+                    # there's no asname to rename under, so every
+                    # exported name is inlined under its own true name
+                    # (matching real Python's own star-import semantics:
+                    # every top-level name the module defines, minus a
+                    # leading-underscore "private" convention; this
+                    # project has no notion of a module's own `__all__`
+                    # to consult, so that finer real-Python override
+                    # isn't honored). Reuses the exact same per-name
+                    # inlining as an explicit `from module import name`
+                    # -- deliberately not a separate code path, so a
+                    # star import stays exactly as capable as spelling
+                    # every name out by hand.
+                    for src_name in exports["funcs"]:
+                        if src_name.startswith("_") or src_name in added_src_names:
+                            continue
+                        fn = copy.deepcopy(exports["funcs"][src_name])
+                        imported.append(fn)
+                        added_src_names.add(src_name)
+                    for src_name in exports["assigns"]:
+                        if src_name.startswith("_") or src_name in added_src_names:
+                            continue
+                        imported.append(
+                            ast.Assign(
+                                targets=[ast.Name(id=src_name, ctx=ast.Store())],
+                                value=copy.deepcopy(exports["assigns"][src_name]),
+                            )
+                        )
+                        added_src_names.add(src_name)
                     continue
                 local_name = al.asname or al.name
                 if al.name in exports["funcs"]:
@@ -49159,7 +49404,21 @@ class translator(ast.NodeVisitor):
                 return f"integer, allocatable :: {out_name}({','.join(':' for _ in range(rr))})"
             return f"integer :: {out_name}"
 
-        def _fortran_write_for_percent_format(fmt_text, rhs_node, advance_no):
+        def _percent_format_parts(fmt_text, rhs_node):
+            """Parse a Python old-style `"FMT" % ARGS` format string into
+            (fmt_parts, write_args): Fortran edit descriptors (width/
+            precision-aware -- 'i10', 'f10.4', 'a', ...) and the matching
+            argument expressions, ready to join into one `write(unit,
+            '(...)') args...` statement. Shared by the single-argument
+            print(fmt % args) fast path (_fortran_write_for_percent_format
+            below) and the multi-argument print loop's own per-argument
+            handling of a %-format argument alongside other print() args
+            -- both need the exact same width/precision-faithful
+            expansion, not the separate, naive py_str(...)-wrapping the
+            generic BinOp Mod expression lowering falls back to when a
+            %-format expression isn't the direct, sole argument of a
+            print() call.
+            """
             conv_chars = set("diouxXeEfFgGcrs")
             def _parse_width_prec(spec_text):
                 # Return (width, prec) as strings when present in %-specifier
@@ -49237,7 +49496,24 @@ class translator(ast.NodeVisitor):
                         else:
                             items.append(("desc", "g0", an, int_scalar))
                 elif cl in {"c", "r", "s"}:
-                    items.append(("desc", "a", an, False))
+                    # A width DOES matter for %s -- Python's default
+                    # (non-"-"-flagged) %Ns right-justifies to a MINIMUM
+                    # field width, never truncating a longer value. A
+                    # fixed-width Fortran `aW` edit descriptor is NOT
+                    # equivalent: for output, when the value is longer
+                    # than W, Fortran silently TRUNCATES to the leftmost W
+                    # characters instead of just leaving it unpadded --
+                    # confirmed by a real, pre-existing test regressing
+                    # ("theoretical" -> "theoretica" under %10s). Routed
+                    # through this project's own str_rjust helper instead
+                    # (pads to max(width, actual length), so it can only
+                    # ever pad, never truncate) with a bare, width-less
+                    # `a` descriptor around its already-correctly-sized
+                    # result.
+                    if width is not None:
+                        items.append(("desc_rjust", int(width), an))
+                    else:
+                        items.append(("desc", "a", an, False))
                 else:
                     raise NotImplementedError(f"unsupported old-style print format code '%{code}'")
                 i = j + 1
@@ -49283,6 +49559,21 @@ class translator(ast.NodeVisitor):
                         expr_txt = f"py_format_g_real({expr_txt})"
                     write_args.append(expr_txt)
                     prev_desc = True
+                elif ent[0] == "desc_rjust":
+                    if prev_desc:
+                        fmt_parts.append("1x")
+                    fmt_parts.append("a")
+                    width_n, arg_node = ent[1], ent[2]
+                    expr_txt = self.expr(arg_node)
+                    # Mirror the plain-"a"-descriptor branch below: a
+                    # logical value isn't itself character-typed, so it
+                    # needs the same True/False text conversion before
+                    # str_rjust (which requires a character argument) can
+                    # see it.
+                    if self._rank_expr(arg_node) == 0 and self._expr_kind(arg_node) == "logical":
+                        expr_txt = f"trim(merge('True ', 'False', {expr_txt}))"
+                    write_args.append(f"str_rjust({expr_txt}, {width_n})")
+                    prev_desc = True
                 else:
                     if prev_desc:
                         fmt_parts.append("1x")
@@ -49305,6 +49596,10 @@ class translator(ast.NodeVisitor):
                     prev_desc = True
             if not fmt_parts:
                 fmt_parts = ["' '"]
+            return fmt_parts, write_args
+
+        def _fortran_write_for_percent_format(fmt_text, rhs_node, advance_no):
+            fmt_parts, write_args = _percent_format_parts(fmt_text, rhs_node)
             ffmt = "(" + ",".join(fmt_parts) + ")"
             adv = ", advance='no'" if advance_no else ""
             if write_args:
@@ -49445,6 +49740,9 @@ class translator(ast.NodeVisitor):
                         else:
                             self.o.w(f"write({unit_txt},*) {self.expr(a)}")
                 return
+            def _is_percent_format_arg(a):
+                return isinstance(a, ast.BinOp) and isinstance(a.op, ast.Mod) and is_const_str(a.left)
+
             # Fortran list-directed output concatenates adjacent elements of
             # a character array with no separator, so a rank-1 char-array
             # argument needs an explicit per-element write loop rather than
@@ -49456,7 +49754,17 @@ class translator(ast.NodeVisitor):
                 and self._rank_expr(a) == 1
                 for a in call.args
             )
-            if has_char_array:
+            # Fortran list-directed output has no per-item format control,
+            # so a %-format argument (which needs its OWN width/precision
+            # edit descriptors -- e.g. "%10s"/"%10.4f" -- to match Python's
+            # padding) can't be folded into the single combined `print *,
+            # ...` statement the plain branch below emits either; it needs
+            # its own dedicated, descriptor-aware write() just like a char
+            # array argument does, so it shares that same per-argument
+            # write-loop rather than falling through to the generic
+            # branch's naive py_str(...) (width/precision-blind) handling.
+            has_percent_format = any(_is_percent_format_arg(a) for a in call.args)
+            if has_char_array or has_percent_format:
                 _tmp_counter = 0
                 for i_arg, a in enumerate(call.args):
                     _arg_is_numeric = (
@@ -49479,6 +49787,13 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(a.value)}")
                     elif isinstance(a, ast.JoinedStr):
                         raise NotImplementedError("f-string in multi-argument print not supported")
+                    elif _is_percent_format_arg(a):
+                        fmt_parts, write_args = _percent_format_parts(a.left.value, a.right)
+                        ffmt = "(" + ",".join(fmt_parts) + ")"
+                        if write_args:
+                            self.o.w(f"write({unit_txt},{fstr(ffmt)}, advance='no') " + ", ".join(write_args))
+                        else:
+                            self.o.w(f"write({unit_txt},{fstr(ffmt)}, advance='no')")
                     elif self._expr_kind(a) == "char" and self._rank_expr(a) == 1:
                         arr_txt = self.expr(a)
                         _tmp_counter += 1
@@ -56400,6 +56715,17 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 isinstance(_n, ast.Assign)
                 and len(_n.targets) == 1
                 and isinstance(_n.targets[0], (ast.Tuple, ast.List))
+                and isinstance(_n.value, ast.Name)
+                and _n.value.id == arg_nm
+            ):
+                # Sequence-unpacking a formal (``a, b = params``) proves
+                # that it is an array-like rank-1 input even when the formal
+                # is otherwise only forwarded through thin wrapper calls.
+                rr = max(rr, 1)
+            if (
+                isinstance(_n, ast.Assign)
+                and len(_n.targets) == 1
+                and isinstance(_n.targets[0], (ast.Tuple, ast.List))
                 and isinstance(_n.value, ast.Attribute)
                 and isinstance(_n.value.value, ast.Name)
                 and _n.value.value.id == arg_nm
@@ -57451,6 +57777,14 @@ def generate_flat(
                 rr = max(rr, 2 if row_like else 1)
         for st in fn.body:
             for n in ast.walk(st):
+                if (
+                    isinstance(n, ast.Assign)
+                    and len(n.targets) == 1
+                    and isinstance(n.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == nm
+                ):
+                    rr = max(rr, 1)
                 if (
                     isinstance(n, ast.Assign)
                     and len(n.targets) == 1
@@ -58962,6 +59296,7 @@ def generate_flat(
                     _ranks[_idx] = 0
 
     _force_rng_param_kinds()
+    _early_global_decls = {}
     if local_funcs:
         _early_global_decls = collect_top_level_shared_decls(tree, local_funcs=local_funcs, params=params)
         _early_global_decls.update(collect_module_global_decls(local_funcs))
@@ -58986,9 +59321,19 @@ def generate_flat(
                 _target = _st.targets[0].id
                 if _target not in _global_names:
                     continue
+                _i = _idx[_st.value.id]
+                _source_kinds = local_func_arg_kinds.get(_fn.name, [])
+                _source_ranks = local_func_arg_ranks.get(_fn.name, [])
+                _source_kind = _source_kinds[_i] if _i < len(_source_kinds) else None
+                _source_rank = int(_source_ranks[_i]) if _i < len(_source_ranks) else 0
+                if _source_kind in {"real", "complex", "logical", "char", "int"}:
+                    _old_kind, _old_rank = _early_global_decls.get(_target, (None, 0))
+                    _early_global_decls[_target] = (
+                        _promote_kind_hint(_old_kind, _source_kind),
+                        max(int(_old_rank), _source_rank),
+                    )
                 _gk, _gr = _early_global_decls.get(_target, (None, 0))
                 if _gk in {"real", "complex", "logical", "char", "int"}:
-                    _i = _idx[_st.value.id]
                     if _i < len(local_func_arg_kinds.get(_fn.name, [])):
                         local_func_arg_kinds[_fn.name][_i] = _promote_kind_hint(
                             local_func_arg_kinds[_fn.name][_i], _gk
@@ -61837,6 +62182,14 @@ def generate_flat(
 
     module_text = ""
     module_global_decls = collect_module_global_decls(local_funcs)
+    for _gnm, (_gk, _gr) in _early_global_decls.items():
+        if _gnm not in module_global_decls:
+            continue
+        _oldk, _oldr = module_global_decls[_gnm]
+        module_global_decls[_gnm] = (
+            _promote_kind_hint(_oldk, _gk),
+            max(int(_oldr), int(_gr)),
+        )
     module_global_inits = collect_module_global_initializers(local_funcs)
     if use_proc_module:
         for _gnm, (_gk, _gr) in collect_top_level_shared_decls(
@@ -61854,6 +62207,22 @@ def generate_flat(
             else:
                 _mk = _oldk
             module_global_decls[_gnm] = (_mk, max(int(_oldr), int(_gr)))
+    # Closure hoisting creates a scalar top-level seed solely to establish a
+    # module variable for each captured value.  Once inference proves a
+    # capture is an array, its real snapshot assignment inside the enclosing
+    # procedure both allocates and initializes it; emitting the scalar seed in
+    # the program would instead be an invalid rank-mismatched assignment.
+    tree.body = [
+        _st
+        for _st in tree.body
+        if not (
+            bool(getattr(_st, "_xp2f_closure_seed", False))
+            and isinstance(_st, ast.Assign)
+            and len(_st.targets) == 1
+            and isinstance(_st.targets[0], ast.Name)
+            and int(module_global_decls.get(_st.targets[0].id, (None, 0))[1]) > 0
+        )
+    ]
     if use_proc_module:
         om = emit()
         om.w(f"module {proc_mod_name}")
@@ -63307,6 +63676,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
@@ -63617,6 +63987,7 @@ def transpile_file(
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
@@ -64187,6 +64558,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     validate_imports_supported(tree, py_path)

@@ -1,0 +1,1 @@
+TARGET_SUM_SQ = 4.0

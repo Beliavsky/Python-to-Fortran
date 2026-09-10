@@ -2089,6 +2089,195 @@ def test_fortran_rewrite_listcomp_array_assign_rewrites_unsupported_call() -> No
     assert "enumerate" in dumped, dumped
 
 
+def test_xp2f_runs_return_of_unsupported_call_listcomp_array(tmp_path: Path) -> None:
+    # User-reported real failure: `return np.array([np.dot(x[k:], x[:-k])
+    # / denom for k in range(1, nacf + 1)])` (an autocorrelation function)
+    # failed with the same misleading "ListComp currently supports only
+    # single-generator form" message -- this ONE IS single-generator; the
+    # real cause is the SAME one rewrite_listcomp_array_assign_calls_to_
+    # loop already handles for a plain assignment (an ELT the inline
+    # elementwise lowering can't support, here np.dot with two slice
+    # arguments), except this occurrence is the value of a `return`
+    # statement rather than an assignment's RHS, which the rewrite didn't
+    # cover yet. Fixed by adding a visit_Return alongside visit_Assign,
+    # sharing the same detection/loop-building helpers: a synthesized
+    # result variable (`lc_res_N`, avoiding collision with real names)
+    # takes the assignment target's place, followed by `return` of it.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xlistcomp_return_unsupported_call.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def acf(x, nacf):",
+                "    x = np.asarray(x, dtype=float)",
+                "    x = x - x.mean()",
+                "    denom = np.dot(x, x)",
+                "    return np.array([",
+                "        np.dot(x[k:], x[:-k]) / denom",
+                "        for k in range(1, nacf + 1)",
+                "    ])",
+                "",
+                "x = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 1.0, 2.0])",
+                "rho = acf(x, 4)",
+                "print(rho)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_f90 = (tmp_path / "xlistcomp_return_unsupported_call_p.f90").read_text(encoding="utf-8")
+    assert "result(lc_res_1)" in out_f90, out_f90
+
+
+def test_fortran_rewrite_listcomp_array_return_rewrites_unsupported_call() -> None:
+    # Direct unit test mirroring test_fortran_rewrite_listcomp_array_
+    # assign_rewrites_unsupported_call, but for a `return` statement.
+    src = "def g(S):\n    return np.array([f(s) for s in S])\n"
+    tree = ast.parse(src)
+    new_tree = xp2f.rewrite_listcomp_array_assign_calls_to_loop(tree)
+    dumped = ast.dump(new_tree)
+    assert "ListComp" not in dumped, dumped
+    assert "For(" in dumped, dumped
+    assert "enumerate" in dumped, dumped
+    assert "Return(" in dumped, dumped
+
+
+def test_xp2f_percent_format_constant_var_in_multi_arg_print(tmp_path: Path) -> None:
+    # User-reported real failure: `fmt_s = "%10s"` then a MULTI-argument
+    # print, each argument formatting a piece with it --
+    # `print(fmt_s % "lag", fmt_s % "sample", fmt_s % "true")` -- produced
+    # invalid Fortran (`modulo(fmt_s, "lag")`): the two already-correct
+    # Python-%-style-format code paths (the general BinOp Mod lowering,
+    # and print()'s single-argument fast path) both only recognize the
+    # LEFT operand of `%` as string formatting when it's a literal
+    # ast.Constant string -- an opaque Name, even one statically known
+    # (via a single top-level assignment) to hold a string, fell straight
+    # through to the *arithmetic* modulo() codegen instead, which
+    # requires INTEGER/REAL operands.
+    #
+    # Fixed with a new early tree rewrite, inline_percent_format_
+    # constant_vars: a module-level `NAME = "literal string"` assigned
+    # exactly once anywhere at module level has every `NAME % ARGS`
+    # rewritten to `"literal string" % ARGS`, so the two already-correct
+    # sites see the literal they already know how to handle.
+    #
+    # A SEPARATE bug surfaced once this one was fixed: detect_needed_
+    # helpers' own %-format scan only added "py_str" (needed by the
+    # substitution codegen for EVERY conversion char, not just %g/%G)
+    # when the format string matched a %g/%G specifier specifically --
+    # any other spec (here %s) left `use python_mod, only: ...` missing
+    # py_str entirely, a "no IMPLICIT type" build failure. Fixed by
+    # broadening that check to the full conv_chars set the codegen
+    # itself recognizes.
+    #
+    # A THIRD, width/precision-fidelity gap surfaced once THAT was
+    # fixed: this shape (a %-format expression as one of several print()
+    # arguments) fell to the generic BinOp Mod lowering's naive py_str(
+    # value) wrapping, which ignores width/precision entirely ("%10s" %
+    # "lag" produced unpadded "lag", not Python's "       lag") --
+    # _fortran_write_for_percent_format (used only for the single-
+    # argument `print(fmt % args)` fast path) already builds proper,
+    # width/precision-aware Fortran edit descriptors, just never wired
+    # up for a %-format argument sharing a print() call with others.
+    # Fixed by extracting its descriptor-building loop into a reusable
+    # _percent_format_parts helper and giving a %-format argument its
+    # own dedicated, descriptor-aware write() in the multi-argument
+    # print loop (mirroring how a char-array argument already gets its
+    # own dedicated write() there), instead of falling through to the
+    # generic, width-blind expression lowering.
+    #
+    # A related, narrower gap in that SAME shared descriptor builder was
+    # caught (via a pre-existing test regressing) and fixed alongside
+    # it: the %s/%c/%r conversion branch never used its own parsed width
+    # at all (always a bare Fortran `a` descriptor, no padding). A first
+    # attempt used a fixed-width `aW` descriptor directly -- WRONG,
+    # since Fortran's `aW` output editing TRUNCATES a value longer than
+    # W to its leftmost W characters, whereas Python's %Ns only ever
+    # pads a SHORTER value and never truncates a longer one (confirmed
+    # by test_xp2f_simplifies_format_string_space_literals_end_to_end's
+    # own "%10s" % "theoretical" regressing to "theoretica"). Fixed
+    # properly by routing through this project's own str_rjust helper
+    # (pads to max(width, actual length) -- can only ever pad) with a
+    # bare, width-less `a` descriptor around its already-correctly-sized
+    # result, instead of a fixed-width descriptor on the raw value.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xpercent_format_const_var.py"
+    src.write_text(
+        "\n".join(
+            [
+                "fmt_s = '%10s'",
+                "print(fmt_s % 'lag', fmt_s % 'sample', fmt_s % 'true')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out_f90 = (tmp_path / "xpercent_format_const_var_p.f90").read_text(encoding="utf-8")
+    assert "modulo(fmt_s" not in out_f90, out_f90
+    assert re.search(r"\buse python_mod, only:[^\n]*\bstr_rjust\b", out_f90), out_f90
+    assert 'str_rjust("lag", 10)' in out_f90, out_f90
+
+
+def test_xp2f_multi_arg_print_percent_format_mixed_numeric_width_precision(tmp_path: Path) -> None:
+    # Companion regression test for the same width/precision-fidelity
+    # fix, exercising the mixed int/float-with-width-and-precision case
+    # from the ORIGINAL user-reported script (examples/xar_acf.py):
+    # `print("%10d" % (i + 1), "%10.4f" % x, "%10.4f" % y)` -- three
+    # %-format arguments in one print() call, none of them the print()
+    # call's sole argument.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xpercent_format_mixed_numeric.py",
+        [
+            "for i in range(3):",
+            "    print('%10d' % (i + 1), '%10.4f' % (i * 1.5), '%10.4f' % (i * 2.5))",
+        ],
+    )
+
+
+def test_fortran_inline_percent_format_constant_vars_rewrites_name_operand() -> None:
+    # Direct unit test of inline_percent_format_constant_vars: a
+    # module-level, single-assignment string constant used as the LEFT
+    # operand of `%` is replaced by its literal value.
+    src = "fmt_s = '%10s'\nout = fmt_s % 'lag'\n"
+    tree = ast.parse(src)
+    new_tree = xp2f.inline_percent_format_constant_vars(tree)
+    dumped = ast.dump(new_tree)
+    assert "Constant(value='%10s')" in dumped, dumped
+    # Reassigned anywhere -> no longer safe to inline (left untouched).
+    src2 = "fmt_s = '%10s'\nfmt_s = '%5d'\nout = fmt_s % 'lag'\n"
+    tree2 = ast.parse(src2)
+    new_tree2 = xp2f.inline_percent_format_constant_vars(tree2)
+    dumped2 = ast.dump(new_tree2)
+    assert "BinOp(left=Name(id='fmt_s'" in dumped2, dumped2
+
+
 def test_xp2f_runs_masked_assignment_into_numpy_empty_array(tmp_path: Path) -> None:
     src = tmp_path / "xmasked_empty_assign.py"
     src.write_text(
@@ -2858,6 +3047,78 @@ def test_xp2f_compiles_nested_function_used_as_callback(tmp_path: Path) -> None:
             "print(result)",
         ],
     )
+
+
+def test_xp2f_compiles_minimize_callback_capturing_array_and_shadowed_scalar(
+    tmp_path: Path,
+) -> None:
+    # A fit function naturally closes its one-argument scipy callback over
+    # both the observations and fit options.  Exercise three linked pieces:
+    # array-valued closure globals retain their rank, an enclosing formal
+    # shadows an identically named module variable, and a thin objective
+    # wrapper inherits the rank-1 signature of the likelihood's parameter
+    # vector.
+    for helper_name in ("python.f90", "lbfgsb.f90", "lbfgsb_bridge.f90"):
+        shutil.copy2(REPO_ROOT / helper_name, tmp_path / helper_name)
+    src = tmp_path / "xminimize_nested_array_closure.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "from scipy.optimize import minimize",
+                "",
+                "def loss(params, values, fixed):",
+                "    mu, = params",
+                "    return np.sum((values - mu) ** 2) + fixed",
+                "",
+                "fixed = 100.0",
+                "",
+                "def fit(values, fixed=0.0):",
+                "    def objective(params):",
+                "        return loss(params, values, fixed)",
+                "    x0 = np.array([0.0])",
+                "    result = minimize(",
+                "        objective, x0, method='L-BFGS-B', bounds=[(-10.0, 10.0)]",
+                "    )",
+                "    return result.x",
+                "",
+                "values = np.array([1.0, 2.0, 3.0])",
+                "print(fit(values, 0.0)[0])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(XP2F_PATH),
+            str(src),
+            str(tmp_path / "python.f90"),
+            str(tmp_path / "lbfgsb.f90"),
+            str(tmp_path / "lbfgsb_bridge.f90"),
+            "--compile",
+            "--run",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "Run: PASS" in proc.stdout, proc.stdout + proc.stderr
+    out_f90 = (tmp_path / "xminimize_nested_array_closure_p.f90").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(
+        r"real\(kind=dp\), allocatable :: closure_fit_values\(:\)", out_f90
+    ), out_f90
+    assert re.search(r"real\(kind=dp\) :: closure_fit_fixed\b", out_f90), out_f90
+    assert re.search(r"function objective\(params\)", out_f90), out_f90
+    assert re.search(r"intent\(in\) :: params\(:\)", out_f90), out_f90
 
 
 def test_fortran_rewrite_nested_callback_functions_hoists_and_threads_closure() -> None:
@@ -5881,6 +6142,14 @@ def test_xp2f_simplifies_format_string_space_literals_end_to_end(tmp_path: Path)
     # fields -- confirms the simplification fires through the full
     # pipeline and preserves output exactly (run-diff MATCH), plus a
     # direct check that the emitted format string was actually folded.
+    #
+    # Also caught a real regression from a LATER, unrelated fix: an
+    # initial attempt at honoring %s's width used a fixed-width Fortran
+    # `aW` edit descriptor directly, which -- unlike Python's own %Ns --
+    # TRUNCATES a value longer than W ("theoretical" % "%10s" silently
+    # became "theoretica"). This test's own run-diff MATCH is what
+    # caught it; see the str_rjust-based fix in
+    # test_xp2f_percent_format_constant_var_in_multi_arg_print.
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     _run_xp2f_compile_diff(
         tmp_path,

@@ -12,8 +12,7 @@ module dataframe_str_index_mod
    implicit none
    private
 
-   integer, parameter :: nlen_label_str = 64
-   integer, parameter :: nlen_columns_str = 64
+   integer, parameter :: nlen_label_str = 64, nlen_columns_str = 64
 
    type, public :: DataFrame_str_index
       character(len=nlen_label_str), allocatable :: index(:)
