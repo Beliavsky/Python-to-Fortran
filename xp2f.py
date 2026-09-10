@@ -7845,7 +7845,7 @@ def propagate_call_arg_intent_to_caller_dummy(lines):
             entities = [e.strip() for e in _split_top_level_commas_simple(rhs) if e.strip()]
             if len(entities) != 1:
                 continue
-            if re.split(r"[(\s]", entities[0], 1)[0].lower() == dummy.lower():
+            if re.split(r"[(\s]", entities[0], maxsplit=1)[0].lower() == dummy.lower():
                 return k
         return -1
 
@@ -31074,7 +31074,15 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"sin", "cos", "tan"}
                 and len(node.args) >= 1
             ):
-                return f"{node.func.attr}({self.expr(node.args[0])})"
+                a0 = self.expr(node.args[0])
+                # Fortran's sin/cos/tan reject an INTEGER argument (numpy
+                # silently promotes); cast, same as every other real-only
+                # intrinsic handler here. Without this, e.g. `np.cos(i)`
+                # for an integer loop index emitted `cos(i)` and failed
+                # to compile.
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"{node.func.attr}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
