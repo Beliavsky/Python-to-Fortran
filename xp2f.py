@@ -48118,6 +48118,15 @@ class translator(ast.NodeVisitor):
             self._emit_print_call(c)
             return
 
+        if (
+            isinstance(c.func, ast.Name)
+            and c.func.id in getattr(self, "callback_subroutine_params", set())
+        ):
+            # Bare statement call of an explicit pyccel `'()(...)' ` subroutine
+            # callback dummy (e.g. `dydt(t[i], y[i,:], y[i+1,:])`).
+            self.o.w(f"call {c.func.id}(" + ", ".join(self.expr(a) for a in c.args) + ")")
+            return
+
         if isinstance(c.func, ast.Name) and c.func.id in self.local_void_funcs:
             args_nodes = self._build_local_call_actual_nodes(c.func.id, c)
             ranks = self.local_func_arg_ranks.get(c.func.id, [])
@@ -50850,6 +50859,7 @@ def _emit_local_function(
     local_func_arg_names=None,
     local_func_defaults=None,
     local_func_callback_params=None,
+    local_func_callback_sig=None,
     local_void_funcs=None,
     local_generic_overloads=None,
     local_overload_dispatch=None,
@@ -53220,6 +53230,14 @@ def _emit_local_function(
         if info["scalarize_vector_call"]:
             tr._mark_int("i_cb")
     tr.callback_specs = dict(callback_specs)
+    # Params carrying an explicit pyccel `'()(...)' ` SUBROUTINE-callback
+    # annotation -- visit_Expr emits `call <p>(...)` (not a value call) for
+    # a bare statement call of one of these. Reset per function.
+    tr.callback_subroutine_params = {
+        _p
+        for _p, _s in (local_func_callback_sig or {}).get(fn.name, {}).items()
+        if isinstance(_s, dict) and _s.get("kind") == "subroutine"
+    }
 
     # Propagate inferred callback return shape/kind to assigned locals.
     callback_complex_targets = set()
@@ -54748,6 +54766,42 @@ def _emit_local_function(
     prefer_real_unknown_args = (ret_spec_hint in {"real", "alloc_real"}) and (force_arg_kinds is None)
     for arg in args:
         arg_emit = arg_emit_map.get(arg, arg)
+        _cb_sub_sig = (local_func_callback_sig or {}).get(fn.name, {}).get(arg)
+        if isinstance(_cb_sub_sig, dict) and _cb_sub_sig.get("kind") == "subroutine":
+            # Explicit pyccel `'()(argtypes...)' ` SUBROUTINE callback: emit
+            # its interface and `procedure(iface) :: arg` from the annotation
+            # directly (the usage-inferred callback_specs path just below is
+            # function-only). Array arguments default to intent(inout) -- a
+            # callback that writes an output array is exactly why these ODE
+            # integrators (euler/rk4/midpoint) take one.
+            iface_name = f"{proc_name}_{arg}_cb_if"
+            _cb_ftype = {
+                "real": "real(kind=dp)", "int": "integer",
+                "logical": "logical", "complex": "complex(kind=dp)",
+            }
+            _cb_names = [f"cb_a{_i + 1}" for _i in range(len(_cb_sub_sig["args"]))]
+            o.w("interface")
+            o.push()
+            o.w(f"subroutine {iface_name}(" + ", ".join(_cb_names) + ")")
+            o.push()
+            o.w("import dp")
+            for _nm, (_bk, _rk, _it) in zip(_cb_names, _cb_sub_sig["args"]):
+                _ft = _cb_ftype.get(_bk, "real(kind=dp)")
+                if _rk > 0:
+                    _dims = ",".join(":" for _ in range(_rk))
+                    o.w(f"{_ft}, intent({_it}) :: {_nm}({_dims})")
+                else:
+                    o.w(f"{_ft}, intent({_it}) :: {_nm}")
+            o.pop()
+            o.w(f"end subroutine {iface_name}")
+            o.pop()
+            o.w("end interface")
+            _decl = f"procedure({iface_name})"
+            if arg in optional_args:
+                _decl += ", optional"
+            _decl += f" :: {arg_emit}"
+            o.w(_decl + (f" ! {argument_comment(arg, 'in')}" if not no_comment else ""))
+            continue
         if arg in callback_specs:
             cb = callback_specs[arg]
             cb_in_rank = max(0, int(cb.get("in_rank", 0)))
@@ -54910,6 +54964,17 @@ def _emit_local_function(
             ):
                 local_func_arg_kinds[fn.name][idx] = "logical"
         arr_rank = 0 if is_elemental_fn or arg in forced_scalar_args_for_emit else _arg_array_rank(arg)
+        # `_arg_array_rank` is body-usage-only; honor an explicit
+        # `float[:]` / `float[:,:]` annotation too, so a parameter that
+        # the body never actually indexes (e.g. euler_mod.py's
+        # `humps_deriv(x, y, out)` where `y` is unused) still gets its
+        # annotated rank -- otherwise it emits as a scalar and a
+        # procedure-pointer interface it must match rejects it.
+        if not (is_elemental_fn or arg in forced_scalar_args_for_emit):
+            _ann_l = ann_map.get(arg, "")
+            _am = re.search(r"\[\s*:(?:\s*,\s*:)*\s*\]", _ann_l)
+            if _am:
+                arr_rank = max(arr_rank, _am.group(0).count(":"))
         _local_rank_hint = 0
         if not is_elemental_fn:
             for _st in fn.body:
@@ -57810,6 +57875,108 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
     return scalar_or_array, scalar_or_array_ranks, tuple_out, tuple_out_ranks
 
 
+_PYCCEL_PROC_ANN_RE = re.compile(r"^\(([^()]*)\)\s*\(\s*(.*)\)$")
+
+
+def _parse_pyccel_proc_annotation(ann_str):
+    """Parse pyccel's function-pointer annotation, e.g.
+    `'()(float, float[:], float[:])'` or `'(float)(Final[float[:]])'`,
+    into `{"kind": "subroutine"|"function", "args": [(base, rank, intent), ...],
+    "ret": (base, rank) | None}` -- or None if the string isn't that shape.
+
+    `()` (empty return) -> a subroutine callback; a non-empty return ->
+    a function callback. Each argument's `Final[...]` wrapper (pyccel's
+    read-only marker) maps to `intent(in)`; a bare array argument defaults
+    to `intent(inout)` (a callback that writes through an output array,
+    the whole reason these ODE-integrator benchmarks pass one), a bare
+    scalar to `intent(in)`.
+    """
+    if ann_str is None:
+        return None
+    s = ann_str.strip().strip("'\"").strip()
+    m = _PYCCEL_PROC_ANN_RE.match(s)
+    if not m:
+        return None
+    ret_txt = m.group(1).strip()
+    args_txt = m.group(2).strip()
+
+    def _base_rank(tok):
+        t = tok.strip()
+        forced_in = False
+        fm = re.match(r"^Final\s*\[\s*(.*?)\s*\]$", t, re.IGNORECASE)
+        if fm:
+            t = fm.group(1).strip()
+            forced_in = True
+        rank = 0
+        bm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(\[[^\]]*\])?$", t)
+        if not bm:
+            return None
+        base_word = bm.group(1).lower()
+        if bm.group(2):
+            rank = bm.group(2).count(":") or 1
+        base = {
+            "float": "real", "double": "real", "real": "real",
+            "int": "int", "integer": "int",
+            "bool": "logical", "complex": "complex",
+        }.get(base_word)
+        if base is None:
+            return None
+        return (base, rank, forced_in)
+
+    arg_specs = []
+    if args_txt:
+        depth = 0
+        cur = []
+        toks = []
+        for ch in args_txt:
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            if ch == "," and depth == 0:
+                toks.append("".join(cur))
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            toks.append("".join(cur))
+        raw = []
+        for tk in toks:
+            br = _base_rank(tk)
+            if br is None:
+                return None
+            raw.append(br)
+        # A bare `float[:]` argument carries no intent in this annotation
+        # style. Convention for the ODE-integrator callbacks these describe
+        # -- dydt(t, y, out) -- is: scalars are inputs, and only the LAST
+        # array argument is the output; earlier arrays are read-only. A
+        # `Final[...]` wrapper forces `in` regardless of position.
+        _last_arr = max((i for i, (_b, _r, _f) in enumerate(raw) if _r > 0), default=-1)
+        for i, (b, r, forced_in) in enumerate(raw):
+            if r == 0:
+                intent = "in"
+            elif forced_in:
+                intent = "in"
+            elif i == _last_arr:
+                intent = "inout"
+            else:
+                intent = "in"
+            arg_specs.append((b, r, intent))
+
+    ret = None
+    if ret_txt:
+        br = _base_rank(ret_txt)
+        if br is None:
+            return None
+        ret = (br[0], br[1])
+
+    return {
+        "kind": "function" if ret is not None else "subroutine",
+        "args": arg_specs,
+        "ret": ret,
+    }
+
+
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None
@@ -58640,9 +58807,25 @@ def generate_flat(
             return True
         return False
     local_func_callback_params = {}
+    local_func_callback_sig = {}
     local_func_rng_params = {}
     for fn in (local_funcs or []):
         fn_arg_names = [a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))]
+        # Pyccel-style function-pointer annotations, e.g.
+        # `dydt: '()(float, float[:], float[:])'` -- an explicit callback
+        # signature, far more reliable than inferring one from usage, and
+        # (unlike the usage-inferred callback_specs) able to describe a
+        # SUBROUTINE callback with multiple array in/out arguments.
+        for _a in (list(fn.args.args) + list(fn.args.kwonlyargs)):
+            if _a.annotation is None:
+                continue
+            try:
+                _ann_txt = ast.unparse(_a.annotation)
+            except Exception:
+                continue
+            _sig = _parse_pyccel_proc_annotation(_ann_txt)
+            if _sig is not None:
+                local_func_callback_sig.setdefault(fn.name, {})[_a.arg] = _sig
         cb_args = set()
         rng_args = set()
         for st in fn.body:
@@ -62673,6 +62856,7 @@ def generate_flat(
                         local_func_arg_names=local_func_arg_names,
                         local_func_defaults=local_func_defaults,
                         local_func_callback_params=local_func_callback_params,
+                        local_func_callback_sig=local_func_callback_sig,
                         local_void_funcs=local_void_funcs,
                         local_generic_overloads=local_generic_overloads,
                         local_overload_dispatch=local_overload_dispatch,
@@ -62721,6 +62905,7 @@ def generate_flat(
                     local_func_arg_names=local_func_arg_names,
                     local_func_defaults=local_func_defaults,
                     local_func_callback_params=local_func_callback_params,
+                    local_func_callback_sig=local_func_callback_sig,
                     local_void_funcs=local_void_funcs,
                     local_generic_overloads=local_generic_overloads,
                     local_overload_dispatch=local_overload_dispatch,
@@ -63181,6 +63366,7 @@ def generate_flat(
                 local_func_arg_names=local_func_arg_names,
                 local_func_defaults=local_func_defaults,
                 local_func_callback_params=local_func_callback_params,
+                local_func_callback_sig=local_func_callback_sig,
                 local_void_funcs=local_void_funcs,
                 local_generic_overloads=local_generic_overloads,
                 toplevel_shared_specs=_toplevel_shared_specs,
