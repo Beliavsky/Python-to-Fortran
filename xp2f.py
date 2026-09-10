@@ -7759,6 +7759,151 @@ def _name_used_as_call_arg(lines, name, start, end):
     return False
 
 
+def propagate_call_arg_intent_to_caller_dummy(lines):
+    """Promote a procedure's own `intent(in)` dummy to `intent(inout)` when
+    it is handed, as a bare actual argument, into a `call`/function-call
+    slot whose callee dummy this same file confirms is `intent(out)` or
+    `intent(inout)`.
+
+    xp2f.py's per-function intent inference is local: it marks a dummy
+    that the function's own body assigns (whole-name augmented assignment,
+    or subscripted/sliced assignment), but not one mutated ONLY by being
+    passed to another procedure that writes through it. E.g. md_mod.py's
+    `initialize(pos)` has a body that is just
+    `seed = r8mat_uniform_ab(pos, ...)`, and `r8mat_uniform_ab`'s own
+    first dummy `r` is correctly inferred `intent(inout)` -- but `pos`
+    stayed `intent(in)`, so gfortran rejects binding it to that inout
+    slot. This whole-file post-pass closes the gap, iterating to a
+    fixpoint since one promotion can expose the next.
+
+    Deliberately conservative:
+    - only a CONFIRMED out/inout callee slot triggers a promotion --
+      callee defined in this file, its dummy at that position resolvable,
+      its intent written explicitly (an unresolved callee, e.g. a
+      python_mod helper, is left alone, matching _callee_dummy_intent_is_in);
+    - only a bare-name actual argument counts (`foo(x)` or `foo(x(:))`),
+      never `x` inside a larger expression or a single element `x(i)` --
+      Fortran can't bind those to an out/inout dummy anyway;
+    - only a dummy whose declaration is a single-entity `intent(in)` line
+      (always true here: split_declarations_to_single_names runs first).
+    """
+    proc_hdr_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(subroutine|function)\s+([A-Za-z_]\w*)\s*\(",
+        flags=re.IGNORECASE,
+    )
+    proc_end_re = re.compile(r"^\s*end\s+(subroutine|function)\b", flags=re.IGNORECASE)
+    intent_in_re = re.compile(r"intent\s*\(\s*in\s*\)", flags=re.IGNORECASE)
+    intent_out_inout_re = re.compile(r"intent\s*\(\s*(?:out|in\s*out)\s*\)", flags=re.IGNORECASE)
+    bare_arg_re = re.compile(r"^([A-Za-z_]\w*)\s*(?:\(\s*:(?:\s*,\s*:)*\s*\))?$")
+    call_tok_re = re.compile(r"(?<![A-Za-z0-9_%])([A-Za-z_]\w*)\s*\(")
+
+    out = list(lines)
+    n = len(out)
+
+    # 1. Index every procedure defined in this file: name -> (start, end, [dummy names]).
+    procs = {}
+    i = 0
+    while i < n:
+        m = proc_hdr_re.match(out[i].split("!", 1)[0])
+        if not m:
+            i += 1
+            continue
+        hdr, hdr_end = _joined_call_stmt(out, i)
+        mh = proc_hdr_re.match(hdr)
+        open_idx = mh.end() - 1
+        close_idx = _find_matching_rparen_simple(hdr, open_idx)
+        dummies = []
+        if close_idx > open_idx:
+            dummies = [
+                d.strip().lower()
+                for d in _split_top_level_commas_simple(hdr[open_idx + 1 : close_idx])
+                if d.strip()
+            ]
+        end_idx = n
+        for k in range(hdr_end + 1, n):
+            if proc_end_re.match(out[k].split("!", 1)[0]):
+                end_idx = k
+                break
+        # Store the header's LAST physical line (not its first): a
+        # multi-line `&`-continued signature would otherwise put the body
+        # scan's start inside the still-open dummy list.
+        procs[mh.group(2).lower()] = (hdr_end, end_idx, dummies)
+        i = end_idx + 1
+
+    if not procs:
+        return out
+
+    def _solo_dummy_decl_idx(start, end, dummy):
+        """Index of a `TYPE, intent(...) :: <dummy>[(shape)]` line declaring
+        exactly `dummy` and nothing else, or -1."""
+        for k in range(start + 1, end):
+            code_k = out[k].split("!", 1)[0]
+            if "::" not in code_k or "intent" not in code_k.lower():
+                continue
+            lhs, _, rhs = code_k.partition("::")
+            entities = [e.strip() for e in _split_top_level_commas_simple(rhs) if e.strip()]
+            if len(entities) != 1:
+                continue
+            if re.split(r"[(\s]", entities[0], 1)[0].lower() == dummy.lower():
+                return k
+        return -1
+
+    def _callee_slot_is_out_or_inout(callee, arg_index):
+        info = procs.get(callee.lower())
+        if info is None:
+            return False
+        c_start, c_end, c_dummies = info
+        if not (0 <= arg_index < len(c_dummies)):
+            return False
+        d_idx = _solo_dummy_decl_idx(c_start, c_end, c_dummies[arg_index])
+        if d_idx < 0:
+            return False
+        lhs = out[d_idx].split("!", 1)[0].partition("::")[0]
+        return bool(intent_out_inout_re.search(lhs))
+
+    changed = True
+    guard = 0
+    while changed and guard < 50:
+        changed = False
+        guard += 1
+        for pname, (p_start, p_end, p_dummies) in procs.items():
+            for d in p_dummies:
+                d_idx = _solo_dummy_decl_idx(p_start, p_end, d)
+                if d_idx < 0:
+                    continue
+                lhs = out[d_idx].split("!", 1)[0].partition("::")[0]
+                if not intent_in_re.search(lhs) or intent_out_inout_re.search(lhs):
+                    continue
+                promote = False
+                k = p_start + 1
+                while k < p_end and not promote:
+                    if not out[k].split("!", 1)[0].strip():
+                        k += 1
+                        continue
+                    stmt, k_end = _joined_call_stmt(out, k)
+                    for cm in call_tok_re.finditer(stmt):
+                        callee = cm.group(1)
+                        if callee.lower() not in procs or callee.lower() == pname:
+                            continue
+                        oi = cm.end() - 1
+                        ci = _find_matching_rparen_simple(stmt, oi)
+                        if ci < 0:
+                            continue
+                        for ai, a in enumerate(_split_top_level_commas_simple(stmt[oi + 1 : ci])):
+                            ma = bare_arg_re.match(a.strip())
+                            if ma and ma.group(1).lower() == d.lower() and _callee_slot_is_out_or_inout(callee, ai):
+                                promote = True
+                                break
+                        if promote:
+                            break
+                    k = k_end + 1
+                if promote:
+                    out[d_idx] = intent_in_re.sub("intent(inout)", out[d_idx], count=1)
+                    changed = True
+    return out
+
+
 def promote_immediate_scalar_constants(lines):
     """Promote immediate scalar `decl` + `name = const` to `parameter`.
 
@@ -54443,7 +54588,10 @@ def _emit_local_function(
                     if isinstance(n.target, ast.Name) and n.target.id == nm:
                         # Scalar rebinding via +=/-= is local in Python; array
                         # dummies can be caller-visible and need INOUT.
-                        if _arg_array_rank(nm) > 0:
+                        # `_arg_array_rank` only sees body usage, so also
+                        # accept a `float[:]`-style annotation for a param
+                        # whose only appearance is this bare `nm += ...`.
+                        if _arg_array_rank(nm) > 0 or "[:" in ann_map.get(nm, ""):
                             return True
         return False
 
@@ -54460,7 +54608,25 @@ def _emit_local_function(
                                     return True
                 if isinstance(n, ast.AugAssign):
                     if isinstance(n.target, ast.Name) and n.target.id == nm:
-                        return True
+                        # `nm += ...` on a SCALAR parameter is a local rebind
+                        # in Python (numbers are immutable) -- shadow it and
+                        # keep intent(in). But on an ARRAY parameter it's an
+                        # in-place `__iadd__`, visible to the caller, so it
+                        # must NOT be treated as a rebind here: leaving it out
+                        # lets _arg_is_assigned's own AugAssign check (which
+                        # already handles this exact array case) mark it
+                        # intent(inout), and stops the `_local` shadow at the
+                        # emit site from being created. Previously every `nm
+                        # += ...` counted as a rebind, so an array param only
+                        # ever `+=`'d was silently routed to an unused
+                        # `_local` copy and the update was dropped (e.g.
+                        # md_mod.py's update()). `_arg_array_rank` only sees
+                        # body usage (subscripts, loops), so also consult the
+                        # `float[:]`-style annotation for a param whose only
+                        # appearance is the bare `nm += ...` itself.
+                        _ann = ann_map.get(nm, "")
+                        if _arg_array_rank(nm) <= 0 and "[:" not in _ann:
+                            return True
         return False
 
     def _arg_needs_allocatable_rebind(nm):
@@ -64334,6 +64500,12 @@ def transpile_file(
     # coalesce_nonadjacent_declarations below regroups whatever the promote
     # passes didn't touch.
     f90_lines = split_declarations_to_single_names(f90_lines)
+    # Runs on single-entity decls (above) and before the shadow-copy /
+    # constant-promotion passes: an `intent(in)` dummy only mutated by
+    # being passed into another local procedure's out/inout slot needs
+    # promoting to `intent(inout)` before anything reasons about it as
+    # read-only (e.g. md_mod.py's initialize(pos) -> r8mat_uniform_ab).
+    f90_lines = propagate_call_arg_intent_to_caller_dummy(f90_lines)
     f90_lines = eliminate_redundant_readonly_param_shadow_copies(f90_lines)
     f90_lines = promote_immediate_scalar_constants(f90_lines)
     f90_lines = promote_immediate_array_constants(f90_lines)
