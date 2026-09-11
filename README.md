@@ -72,6 +72,15 @@ Also declare a procedure `elemental` (and vectorize a per-element loop that call
 python xp2f.py path\to\program.py --elemental
 ```
 
+A handful of further opt-in flags close specific performance and correctness gaps identified by comparing translations against [Pyccel](PYCCEL_COMPARISON.md) on the same source programs; each is a self-contained post-pass over the generated Fortran and defaults off, so ordinary output is unaffected:
+
+```console
+python xp2f.py path\to\program.py --optimize-loops   # swap a column-major-unfriendly nested loop's own order, where provably safe
+python xp2f.py path\to\program.py --value-args        # declare read-only scalar dummy arguments VALUE instead of intent(in)
+python xp2f.py path\to\program.py --int-kind int64     # declare integers with an explicit kind (int32 or int64) instead of the compiler default
+python xp2f.py path\to\program.py --perf-hints          # print (never modify) a diagnostic for strided array-access patterns neither flag above can safely fix
+```
+
 Run a batch file list:
 
 ```console
@@ -161,6 +170,10 @@ Important caveats:
 - `fortran_scan.py`: shared Fortran source-scanning/rewriting utilities used by `xp2f.py`.
 - `fortran_post.py`: shared post-processing rewrites (cleanup, simplification, formatting) applied to generated Fortran.
 - `fortran_purity.py`: determines `pure`/`elemental` eligibility of generated procedures by examining the emitted Fortran text.
+- `fortran_loop_reorder.py`: `--optimize-loops` post-pass; swaps a nested loop pair's own outer/inner order to match Fortran's column-major array storage, where provably safe.
+- `fortran_int_kind.py`: `--int-kind` post-pass; rewrites bare `integer` declarations (and related literals/casts) to an explicit `int32`/`int64` kind, excluding external LAPACK/bridge call boundaries that require the compiler's own default kind.
+- `fortran_perf_hints.py`: `--perf-hints` diagnostic; reports (never rewrites) strided-array-access patterns that neither `--optimize-loops` nor `--int-kind` can safely fix.
+- `pyccel_wrap.py`: standalone wrapper giving [Pyccel](PYCCEL_COMPARISON.md) an `xp2f.py`-style `--compile`/`--run`/`--run-both`/`--numeric-diff` command-line interface, for comparing the two tools' translations of the same Python source.
 - `python.f90`: Fortran helper runtime used by translated programs.
 - `dataframe_str_index.f90`, `dataframe_index_date.f90`, `dataframe_index_datetime.f90`: pandas `DataFrame` companion types (string-indexed, date-indexed, datetime-indexed), auto-included when a translated program uses pandas.
 - `lapack_d.f90`: bundled double-precision LAPACK helpers used by some translations.
