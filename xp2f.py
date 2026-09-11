@@ -36,6 +36,7 @@ import shutil
 from datetime import datetime
 from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import fortran_output as fout
+import fortran_loop_reorder as floop
 import fortran_post as fpost
 import fortran_purity as fpurity
 from fortran_scan import (
@@ -4303,6 +4304,79 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
             v.visit(s)
         return found[0]
 
+    def _is_called_directly_as_statement(name, stmts):
+        """True if `name(...)` appears as its own standalone statement
+        (`ast.Expr(value=Call(func=Name(id=name)))`) anywhere in `stmts`,
+        recursing into compound statements the same way _find_hoistable's
+        own _scan does. This is the VOID/subroutine-call-as-statement
+        shape _is_used_as_value deliberately excludes (see its own
+        `visit_Call`) -- a direct call used WITHIN a larger expression
+        (`return helper(x)`, `y = helper(x)`) is a different, already-
+        working path (a trivial single-expression nested def's body gets
+        inlined straight at the call site by a separate optimization,
+        left untouched here), but the standalone-statement shape has no
+        such fallback at all when the callee is a nested def -- see
+        _def_has_no_return_value's own docstring for why this pairs with
+        that check rather than firing on its own.
+        """
+        found = [False]
+
+        def _scan(ss):
+            for s in ss:
+                if (
+                    isinstance(s, ast.Expr)
+                    and isinstance(s.value, ast.Call)
+                    and isinstance(s.value.func, ast.Name)
+                    and s.value.func.id == name
+                ):
+                    found[0] = True
+                for field in ("body", "orelse", "finalbody"):
+                    child = getattr(s, field, None)
+                    if isinstance(child, list):
+                        _scan(child)
+                if isinstance(s, ast.Try):
+                    for h in s.handlers:
+                        _scan(h.body)
+
+        _scan(stmts)
+        return found[0]
+
+    def _def_has_no_return_value(def_node):
+        """True if `def_node`'s own body never returns a value (only a
+        bare `return`, or no return at all) -- ignoring any further-
+        nested def's own returns, which are irrelevant to this one's own
+        control flow. Gates the direct-call hoist path (see
+        _is_called_directly_as_statement) to genuinely void/subroutine-
+        shaped nested defs -- e.g. cfd_python_test.py's own build_up_b/
+        pressure_poisson, both nested inside and closing over
+        cavity_flow_2d's own parameters, called directly as bare
+        statements purely for their side effects on a mutable array
+        argument, with no existing fallback at all (unlike a nested def
+        with a genuine return value called directly, already handled by
+        a separate trivial-inline optimization this must not disturb).
+        """
+        found = [False]
+
+        def _scan(stmts):
+            for s in stmts:
+                if found[0]:
+                    return
+                if isinstance(s, ast.Return) and s.value is not None:
+                    found[0] = True
+                    return
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                for field in ("body", "orelse", "finalbody"):
+                    child = getattr(s, field, None)
+                    if isinstance(child, list):
+                        _scan(child)
+                if isinstance(s, ast.Try):
+                    for h in s.handlers:
+                        _scan(h.body)
+
+        _scan(def_node.body)
+        return not found[0]
+
     def _guess_kind(name, enclosing_fn):
         args = list(enclosing_fn.args.args)
         defaults = list(enclosing_fn.args.defaults)
@@ -4390,7 +4464,15 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
                     if any(_is_used_as_value(nm, [h]) for h in _compound_head_exprs(stmt))
                 ]
             else:
-                used_here = [nm for nm in hoisted_names if _is_used_as_value(nm, [stmt])]
+                used_here = [
+                    nm
+                    for nm in hoisted_names
+                    if _is_used_as_value(nm, [stmt])
+                    or (
+                        _def_has_no_return_value(defs_by_name[nm][0])
+                        and _is_called_directly_as_statement(nm, [stmt])
+                    )
+                ]
             if used_here:
                 targets = []
                 for nm in used_here:
@@ -4439,7 +4521,10 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
         def _scan(stmts):
             for stmt in stmts:
                 if isinstance(stmt, ast.FunctionDef):
-                    if _is_used_as_value(stmt.name, fn.body):
+                    if _is_used_as_value(stmt.name, fn.body) or (
+                        _def_has_no_return_value(stmt)
+                        and _is_called_directly_as_statement(stmt.name, fn.body)
+                    ):
                         found.append(stmt)
                     continue
                 for field in ("body", "orelse", "finalbody"):
@@ -4529,6 +4614,165 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
     tree.body = new_body
     ast.fix_missing_locations(tree)
     return tree
+
+
+def rewrite_class_methods_to_toplevel(tree):
+    """Hoist every method (other than `__init__`) of a plain/dataclass-
+    shaped class -- the same shapes `collect_dataclass_info` (xp2f.py)
+    already recognizes as a Fortran derived type -- to a top-level
+    procedure with `self` as its own first argument, annotated with the
+    class's own bare name. The EXISTING user-class-parameter machinery
+    (`dict_arg_types`/`user_class_types`, consulted wherever a bare-name
+    annotation is checked against `user_class_types`) already knows how
+    to declare and dereference a `type(ClassName_t)` dummy from that
+    annotation, so `self` needs nothing new once hoisted -- `self.field`
+    inside the hoisted body resolves exactly like any other struct
+    parameter's own attribute access already does.
+
+    xp2f.py never had any translation path for a class's own methods at
+    all: `obj.method(args)` failed outright ("unsupported call") since a
+    ClassDef's own nested defs were simply never emitted anywhere (only
+    `__init__` is consulted, for field extraction) -- confirmed via a
+    minimal repro before writing this.
+
+    Two shapes, matching pyccel-benchmarks' own splines.py (the
+    motivating file) exactly:
+    - A `@property`-decorated method whose ENTIRE body is the single
+      statement `return self.FIELD` is NOT hoisted to a procedure at
+      all -- it's pyccel's own `@inline` signaling exactly this intent
+      for `Spline.degree`. Every `X.propname` read anywhere in the
+      resulting tree is rewritten to `X.FIELD` directly instead.
+    - Every other method becomes `f"{ClassName}_{method_name}"`
+      (leading underscore in the original name preserved, e.g.
+      `Spline__basis_funcs`), body copied unchanged (its own `self.foo`/
+      `self.bar(...)` references still work once rewritten below).
+
+    Every `X.method(...)` call -- `self.method(...)` inside another
+    hoisted method, or `obj.method(...)` from outside, e.g. a driver
+    script -- is rewritten to `NEW_PROC_NAME(X, args...)` in the same
+    pass, over the WHOLE resulting tree (hoisted defs included, since
+    one hoisted method's body may itself call another).
+
+    Deliberately narrow, matching this session's established "decline
+    rather than guess" pattern -- NOT attempted, left completely alone:
+    inheritance; more than one class defining the same method or
+    property name (both the property and the method rewrite are keyed
+    by bare name across ALL classes in the file, not per-class, so a
+    same-named clash would misresolve -- acceptable given the "no
+    multiple interacting classes" scope this shares with
+    collect_dataclass_info's own single-class-at-a-time design); a
+    property whose body isn't the exact single-statement getter shape
+    above (silently dropped instead -- any real use then surfaces as a
+    clean "unsupported call"/undefined-name failure, never a silent
+    miscompile); `@property` setters; classmethods/staticmethods; magic
+    methods other than `__init__`; a method with zero parameters at all
+    (no `self` to annotate -- skipped, same fail-clean stance).
+    """
+    property_field_flat = {}
+    method_to_proc = {}
+    changed = False
+
+    new_body = []
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            new_body.append(stmt)
+            continue
+        cname = stmt.name
+
+        def _is_property_decorated(member):
+            return any(
+                (isinstance(d, ast.Name) and d.id == "property")
+                or (isinstance(d, ast.Attribute) and d.attr == "property")
+                for d in member.decorator_list
+            )
+
+        # First pass over this class's own members: collect every
+        # trivial-getter property up front, so a method hoisted below
+        # that references one defined LATER in the same class body
+        # (Python doesn't care about method definition order within a
+        # class) still sees it.
+        local_property_fields = {}
+        for member in stmt.body:
+            if (
+                isinstance(member, ast.FunctionDef)
+                and member.name != "__init__"
+                and _is_property_decorated(member)
+                and len(member.body) == 1
+                and isinstance(member.body[0], ast.Return)
+                and isinstance(member.body[0].value, ast.Attribute)
+                and isinstance(member.body[0].value.value, ast.Name)
+                and member.body[0].value.value.id == "self"
+            ):
+                local_property_fields[member.name] = member.body[0].value.attr
+        property_field_flat.update(local_property_fields)
+
+        kept_body = []
+        class_hoisted = []
+        for member in stmt.body:
+            if not isinstance(member, ast.FunctionDef) or member.name == "__init__":
+                kept_body.append(member)
+                continue
+            if member.name in local_property_fields or _is_property_decorated(member):
+                # Either inlined via property_field_flat above, or an
+                # unsupported property shape dropped outright -- either
+                # way it's never emitted as a procedure.
+                changed = True
+                continue
+            if not member.args.args:
+                # No `self` (or any other) parameter to annotate --
+                # leave this one alone entirely (fails clean later, same
+                # as before this pass existed, rather than guess).
+                kept_body.append(member)
+                continue
+            new_name = f"{cname}_{member.name}"
+            new_fn = copy.deepcopy(member)
+            new_fn.name = new_name
+            new_fn.decorator_list = []
+            new_fn.args.args[0].annotation = ast.Name(id=cname, ctx=ast.Load())
+            ast.copy_location(new_fn, member)
+            ast.fix_missing_locations(new_fn)
+            class_hoisted.append(new_fn)
+            method_to_proc[member.name] = new_name
+            changed = True
+        stmt.body = kept_body if kept_body else [ast.Pass()]
+        new_body.append(stmt)
+        new_body.extend(class_hoisted)
+
+    if not changed:
+        return tree
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            if isinstance(node.ctx, ast.Load) and node.attr in property_field_flat:
+                return ast.copy_location(
+                    ast.Attribute(value=node.value, attr=property_field_flat[node.attr], ctx=ast.Load()),
+                    node,
+                )
+            return node
+
+        def visit_Call(self, node):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.ctx, ast.Load)
+                and node.func.attr in method_to_proc
+            ):
+                new_obj = self.visit(node.func.value)
+                new_args = [self.visit(a) for a in node.args]
+                new_kw = [ast.keyword(arg=kw.arg, value=self.visit(kw.value)) for kw in node.keywords]
+                new_call = ast.Call(
+                    func=ast.Name(id=method_to_proc[node.func.attr], ctx=ast.Load()),
+                    args=[new_obj] + new_args,
+                    keywords=new_kw,
+                )
+                return ast.copy_location(new_call, node)
+            self.generic_visit(node)
+            return node
+
+    out = ast.Module(body=new_body, type_ignores=getattr(tree, "type_ignores", []))
+    out = _Rewriter().visit(out)
+    ast.fix_missing_locations(out)
+    return out
 
 
 def rewrite_pandas_read_csv_set_index(tree):
@@ -14039,10 +14283,20 @@ def inline_local_from_imports(tree, py_path):
             return None
         funcs = {}
         assigns = {}
+        classes = {}
         extra_imports = []
         for st in mod_tree.body:
             if isinstance(st, ast.FunctionDef):
                 funcs[st.name] = st
+            elif isinstance(st, ast.ClassDef):
+                # A class defined in the sibling module (e.g. pyccel-
+                # benchmarks' own splines.py `class Spline`) needs to be
+                # inlined just like a function -- collect_dataclass_info
+                # and rewrite_class_methods_to_toplevel both only ever
+                # scan the FINAL merged tree, so a class left un-inlined
+                # here is invisible to either and its own constructor
+                # call fails outright ("unsupported call: Spline(...)").
+                classes[st.name] = st
             elif isinstance(st, ast.Assign):
                 for tgt in st.targets:
                     if isinstance(tgt, ast.Name):
@@ -14075,7 +14329,7 @@ def inline_local_from_imports(tree, py_path):
                 # picks it up the same way it would if the import had been
                 # written directly in the main script.
                 extra_imports.append(copy.deepcopy(st))
-        exports = {"funcs": funcs, "assigns": assigns, "extra_imports": extra_imports}
+        exports = {"funcs": funcs, "assigns": assigns, "classes": classes, "extra_imports": extra_imports}
         module_cache[key] = exports
         return exports
 
@@ -14156,6 +14410,12 @@ def inline_local_from_imports(tree, py_path):
                             value=copy.deepcopy(val_src),
                         )
                     )
+                for nm, cls_src in exports["classes"].items():
+                    local_name = f"{prefix}_{nm}"
+                    module_attr_renames[(alias_name, nm)] = local_name
+                    cls = copy.deepcopy(cls_src)
+                    cls.name = local_name
+                    imported.append(cls)
             if keep_aliases:
                 kept = copy.copy(st)
                 kept.names = keep_aliases
@@ -14205,6 +14465,11 @@ def inline_local_from_imports(tree, py_path):
                             )
                         )
                         added_src_names.add(src_name)
+                    for src_name in exports["classes"]:
+                        if src_name.startswith("_") or src_name in added_src_names:
+                            continue
+                        imported.append(copy.deepcopy(exports["classes"][src_name]))
+                        added_src_names.add(src_name)
                     continue
                 local_name = al.asname or al.name
                 if al.name in exports["funcs"]:
@@ -14219,6 +14484,11 @@ def inline_local_from_imports(tree, py_path):
                             value=copy.deepcopy(exports["assigns"][al.name]),
                         )
                     )
+                    added_src_names.add(al.name)
+                elif al.name in exports["classes"]:
+                    cls = copy.deepcopy(exports["classes"][al.name])
+                    cls.name = local_name
+                    imported.append(cls)
                     added_src_names.add(al.name)
 
             # Transitively pull in any other same-module function/constant
@@ -14380,17 +14650,28 @@ def collect_dataclass_info(tree):
         return False
 
     def _field_kind(ann):
+        """Returns (kind, rank) for a recognized field annotation, else
+        None. `rank` is 0 for a scalar. Beyond the original bare-scalar
+        forms, also accepts a pyccel-style array annotation -- either a
+        bare subscript (`float[:]`) or, matching e.g. `Spline.__init__`'s
+        own `knots: 'float[:]'`, the same syntax wrapped as a string
+        literal (`ast.unparse` of a string constant re-quotes it, hence
+        the one layer of quote-stripping below before handing off to the
+        shared `_parse_base_type_and_rank`)."""
         txt = ""
         if ann is not None and hasattr(ast, "unparse"):
             txt = ast.unparse(ann).lower()
         if txt in {"float", "np.float64", "real"}:
-            return "real"
+            return ("real", 0)
         if txt in {"int", "np.int64", "integer"}:
-            return "int"
+            return ("int", 0)
         if txt in {"bool", "logical"}:
-            return "logical"
+            return ("logical", 0)
         if txt in {"str", "character"}:
-            return "char"
+            return ("char", 0)
+        br = _parse_base_type_and_rank(txt.strip("'\""))
+        if br is not None:
+            return (br[0], br[1])
         return None
 
     def _is_namedtuple_base(b):
@@ -14423,7 +14704,7 @@ def collect_dataclass_info(tree):
                     if k is None:
                         ok = False
                         break
-                    fields.append((st.target.id, k))
+                    fields.append((st.target.id, k[0], k[1]))
                     continue
                 # Keep subset strict for predictable lowering.
                 ok = False
@@ -14461,7 +14742,7 @@ def collect_dataclass_info(tree):
                     and isinstance(st.value, ast.Name)
                     and st.value.id in pmap
                 ):
-                    fields.append((st.targets[0].attr, pmap[st.value.id]))
+                    fields.append((st.targets[0].attr, pmap[st.value.id][0], pmap[st.value.id][1]))
                     continue
                 if isinstance(st, ast.Pass):
                     continue
@@ -20449,6 +20730,19 @@ class translator(ast.NodeVisitor):
                 if _idx_kind == "DataFrame_str_index":
                     return "char"
                 return None
+            if isinstance(node.value, ast.Name):
+                # A user-class/struct field read (self.field / obj.field):
+                # resolve the field's own kind from the struct's component
+                # list, the same source of truth the declaration emitter
+                # itself uses. Needed so a local variable assigned from a
+                # struct field (`low = self.n`) infers the field's real
+                # kind instead of silently falling back to real.
+                _nm = self._aliased_name(node.value.id)
+                _tnm = self.dict_typed_vars.get(_nm)
+                if _tnm is not None:
+                    for _fnm, _fkind, _frank in self.structured_type_components.get(_tnm, []):
+                        if _fnm == node.attr and _frank == 0:
+                            return _fkind
             return None
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.Not):
@@ -20554,7 +20848,7 @@ class translator(ast.NodeVisitor):
             ):
                 anm = self._aliased_name(node.value.id)
                 tnm = self.structured_array_types.get(anm, "")
-                for fnm, fkind in self.structured_type_components.get(tnm, []):
+                for fnm, fkind, _frank in self.structured_type_components.get(tnm, []):
                     if fnm == node.slice.value:
                         return fkind
             if (
@@ -25197,6 +25491,17 @@ class translator(ast.NodeVisitor):
             _idx_kind2 = self.pandas_df_vars.get(self._pandas_df_root_id(node.value))
             if _idx_kind2 == "DataFrame_str_index":
                 return 1
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            # A user-class/struct field read (self.field / obj.field) --
+            # see the matching kind-resolution branch in _expr_kind just
+            # above; needed so an array-typed field (e.g. `self.knots`)
+            # reports its actual rank instead of the scalar default.
+            _nm2 = self._aliased_name(node.value.id)
+            _tnm2 = self.dict_typed_vars.get(_nm2)
+            if _tnm2 is not None:
+                for _fnm2, _fkind2, _frank2 in self.structured_type_components.get(_tnm2, []):
+                    if _fnm2 == node.attr:
+                        return _frank2
         if isinstance(node, ast.Call):
             np_attr = self._numpy_call_attr(node.func)
             if np_attr in {"all", "any", "prod", "count_nonzero", "sum", "min", "max"} and len(node.args) >= 1:
@@ -29998,7 +30303,7 @@ class translator(ast.NodeVisitor):
                     tnm = self.user_class_types[node.func.id]
                     args_nodes = list(node.args)
                     parts = []
-                    comps = [nm for nm, _ in self.structured_type_components.get(tnm, [])]
+                    comps = [nm for nm, _, _ in self.structured_type_components.get(tnm, [])]
                     for i, a in enumerate(args_nodes):
                         ae = strip_redundant_outer_parens_expr(self.expr(a))
                         if i < len(comps):
@@ -35035,7 +35340,7 @@ class translator(ast.NodeVisitor):
                     if ann_txt in self.user_class_types:
                         tnm = self.user_class_types[ann_txt]
                         self.dict_typed_vars[tname] = tnm
-                        self.dict_var_components[tname] = [nm for nm, _ in self.structured_type_components.get(tnm, [])]
+                        self.dict_var_components[tname] = [nm for nm, _, _ in self.structured_type_components.get(tnm, [])]
                         self.ints.discard(tname)
                         self.reals.discard(tname)
                         self.logs.discard(tname)
@@ -35128,7 +35433,7 @@ class translator(ast.NodeVisitor):
                     tname = node.targets[0].id
                     tnm = self.user_class_types[node.value.func.id]
                     self.dict_typed_vars[tname] = tnm
-                    self.dict_var_components[tname] = [nm for nm, _ in self.structured_type_components.get(tnm, [])]
+                    self.dict_var_components[tname] = [nm for nm, _, _ in self.structured_type_components.get(tnm, [])]
                     self.ints.discard(tname)
                     self.reals.discard(tname)
                     self.logs.discard(tname)
@@ -39764,7 +40069,7 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("structured np.array rows must be tuples/lists")
                 if len(row.elts) != len(fields):
                     raise NotImplementedError("structured np.array row width does not match dtype")
-                for j, (fname, _fkind) in enumerate(fields):
+                for j, (fname, _fkind, _frank) in enumerate(fields):
                     self.o.w(f"{t.id}({i})%{fname} = {self.expr(row.elts[j])}")
             return
 
@@ -46401,7 +46706,7 @@ class translator(ast.NodeVisitor):
                     tnm_iter = self.structured_array_types[anm_iter]
                     comp_names_iter = list(self.dict_type_components.get(tnm_iter, {}).keys())
                     if not comp_names_iter:
-                        comp_names_iter = [nm for nm, _ in self.structured_type_components.get(tnm_iter, [])]
+                        comp_names_iter = [nm for nm, _, _ in self.structured_type_components.get(tnm_iter, [])]
             # A bare `for x in ARR:`/`enumerate(ARR)` over a plain
             # variable, never mutated anywhere in the loop body, needs
             # no defensive copy at all -- ARR can be indexed directly,
@@ -50218,10 +50523,19 @@ class translator(ast.NodeVisitor):
                         float_code = code if code in {"e", "f", "g"} else None
                         if float_code is not None:
                             expr_txt = f"real({expr_txt}, kind=dp)"
+                            # Fortran's plain `E` descriptor normalizes to
+                            # `0.ddddEsxx` (leading digit always 0), so
+                            # `E0.N` shows only N significant digits --
+                            # Python's `.Ne` gives d.ddd...E form, N+1 sig
+                            # figs. `ES` normalizes to that same d.ddd...
+                            # form Python/C use, so `ES0.N` matches it
+                            # exactly instead of silently rendering one
+                            # fewer significant digit.
+                            _desc = "es" if float_code == "e" else float_code
                             if width is not None and prec is not None:
-                                fcode = f"{float_code}{width}.{prec}"
+                                fcode = f"{_desc}{width}.{prec}"
                             elif prec is not None:
-                                fcode = f"{float_code}0.{prec}"
+                                fcode = f"{_desc}0.{prec}"
                             else:
                                 fcode = "g0"
                         else:
@@ -50248,10 +50562,14 @@ class translator(ast.NodeVisitor):
                             fcode = "l1"
                     else:
                         real_code = code if code in {"e", "f", "g"} else None
+                        # See the matching int-kind branch above: `ES`
+                        # (not plain `E`) is needed to match Python's own
+                        # `.Ne` significant-digit count.
+                        _desc = "es" if real_code == "e" else real_code
                         if real_code is not None and width is not None and prec is not None:
-                            fcode = f"{real_code}{width}.{prec}"
+                            fcode = f"{_desc}{width}.{prec}"
                         elif real_code is not None and prec is not None:
-                            fcode = f"{real_code}0.{prec}"
+                            fcode = f"{_desc}0.{prec}"
                         else:
                             fcode = "g0"
 
@@ -50901,6 +51219,7 @@ def _emit_local_function(
     toplevel_shared_specs=None,
     toplevel_str_list_values=None,
     tuple_df_return_positions=None,
+    structured_type_components=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -51253,6 +51572,7 @@ def _emit_local_function(
         local_proc_name_aliases=local_proc_name_aliases,
         shape_donor_by_rank=shape_donor_by_rank,
         current_function_name=fn.name,
+        structured_type_components=structured_type_components,
     )
     if force_list_args:
         for _nm in force_list_args:
@@ -51435,7 +51755,7 @@ def _emit_local_function(
         if tnm in (dict_type_components or {}):
             tr.dict_var_components[anm] = list((dict_type_components or {}).get(tnm, {}).keys())
         else:
-            tr.dict_var_components[anm] = [nm for nm, _ in tr.structured_type_components.get(tnm, [])]
+            tr.dict_var_components[anm] = [nm for nm, _, _ in tr.structured_type_components.get(tnm, [])]
         tr.ints.discard(anm)
         tr.reals.discard(anm)
         tr.alloc_ints.discard(anm)
@@ -57896,6 +58216,44 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
 _PYCCEL_PROC_ANN_RE = re.compile(r"^\(([^()]*)\)\s*\(\s*(.*)\)$")
 
 
+def _parse_base_type_and_rank(tok):
+    """Parse one pyccel-style type token -- `float`, `int[:]`,
+    `Final[float[:,:]]`, a bare `str`, etc. -- into `(base_kind, rank,
+    forced_in) | None`. `base_kind` is one of "real"/"int"/"logical"/
+    "complex"/"char"; `rank` is the array rank (0 for a scalar, from
+    counting `:` inside a trailing `[...]`); `forced_in` is True when
+    the token was wrapped in `Final[...]` (pyccel's read-only marker).
+    Returns None when `tok` isn't recognized at all.
+
+    Shared by `_parse_pyccel_proc_annotation` (a callback dummy's own
+    argument list) and `_field_kind` (a class field's `__init__`
+    parameter annotation, xp2f.py's own dataclass-lowering path) so the
+    two don't drift out of sync on what counts as a valid type token.
+    """
+    t = tok.strip()
+    forced_in = False
+    fm = re.match(r"^Final\s*\[\s*(.*?)\s*\]$", t, re.IGNORECASE)
+    if fm:
+        t = fm.group(1).strip()
+        forced_in = True
+    rank = 0
+    bm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(\[[^\]]*\])?$", t)
+    if not bm:
+        return None
+    base_word = bm.group(1).lower()
+    if bm.group(2):
+        rank = bm.group(2).count(":") or 1
+    base = {
+        "float": "real", "double": "real", "real": "real",
+        "int": "int", "integer": "int",
+        "bool": "logical", "complex": "complex",
+        "str": "char", "character": "char",
+    }.get(base_word)
+    if base is None:
+        return None
+    return (base, rank, forced_in)
+
+
 def _parse_pyccel_proc_annotation(ann_str):
     """Parse pyccel's function-pointer annotation, e.g.
     `'()(float, float[:], float[:])'` or `'(float)(Final[float[:]])'`,
@@ -57918,28 +58276,7 @@ def _parse_pyccel_proc_annotation(ann_str):
     ret_txt = m.group(1).strip()
     args_txt = m.group(2).strip()
 
-    def _base_rank(tok):
-        t = tok.strip()
-        forced_in = False
-        fm = re.match(r"^Final\s*\[\s*(.*?)\s*\]$", t, re.IGNORECASE)
-        if fm:
-            t = fm.group(1).strip()
-            forced_in = True
-        rank = 0
-        bm = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(\[[^\]]*\])?$", t)
-        if not bm:
-            return None
-        base_word = bm.group(1).lower()
-        if bm.group(2):
-            rank = bm.group(2).count(":") or 1
-        base = {
-            "float": "real", "double": "real", "real": "real",
-            "int": "int", "integer": "int",
-            "bool": "logical", "complex": "complex",
-        }.get(base_word)
-        if base is None:
-            return None
-        return (base, rank, forced_in)
+    _base_rank = _parse_base_type_and_rank
 
     arg_specs = []
     if args_txt:
@@ -58001,6 +58338,30 @@ def generate_flat(
 ):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map, extra_def_nodes=local_funcs)
     char_list_final_sizes = compute_list_final_sizes(tree)
+
+    def _seed_struct_param_types(tr_scan, fn_scan):
+        # A parameter (including a hoisted method's own `self`) annotated
+        # with a bare user-class name is a struct-typed variable, same as
+        # one populated via dict_arg_types at final-emission time (see
+        # `for anm, tnm in (dict_arg_types or {}).items(): tr.dict_typed_vars[anm] = tnm`
+        # below). The disposable translator instances used for these early
+        # kind-inference prescans are built fresh per call and never see
+        # that population, so without this, `_expr_kind` can't resolve
+        # `Attribute(Name(param), field)` at all (it isn't a dict/
+        # struct-typed Name yet) and a local like `low = self.n` silently
+        # falls back to the generic real-number default -- wrong whenever
+        # the field is actually int/logical/char.
+        for _a in getattr(getattr(fn_scan, "args", None), "args", []):
+            if (
+                _a.annotation is not None
+                and hasattr(ast, "unparse")
+                and ast.unparse(_a.annotation) in dict(user_class_types or {})
+            ):
+                _tnm = dict(user_class_types or {})[ast.unparse(_a.annotation)]
+                tr_scan.dict_typed_vars[_a.arg] = _tnm
+                tr_scan.dict_var_components[_a.arg] = [
+                    nm for nm, _, _ in (structured_type_components or {}).get(_tnm, [])
+                ]
     def _tuple_subscript_base_rank(elts):
         # Base-array rank consumed by a tuple subscript.
         # `None`/`np.newaxis` inserts an axis and does not consume one.
@@ -58368,7 +58729,11 @@ def generate_flat(
             return _infer_arg_kind_result_cache[cache_key]
         tr_local = _infer_arg_kind_tr_cache.get(id(fn))
         if tr_local is None:
-            tr_local = translator(emit(), params={}, context="flat", list_counts={})
+            tr_local = translator(
+                emit(), params={}, context="flat", list_counts={},
+                user_class_types=user_class_types, structured_type_components=structured_type_components,
+            )
+            _seed_struct_param_types(tr_local, fn)
             tr_local.prescan(fn.body)
             _infer_arg_kind_tr_cache[id(fn)] = tr_local
 
@@ -58970,6 +59335,8 @@ def generate_flat(
             # site (e.g. `other_fn(y)`), overriding that function's own,
             # correct body-based rank guess.
             local_return_ranks=_prov_scalar_ranks,
+            user_class_types=user_class_types,
+            structured_type_components=structured_type_components,
         )
         tr_seed.local_df_return_info.update(_scan_local_df_return_info(local_funcs))
         tr_seed.tuple_df_return_positions.update(_all_tuple_df_return_positions(local_funcs))
@@ -59339,11 +59706,14 @@ def generate_flat(
                 # fix, for a variable assigned from a local-function call
                 # inside ANOTHER local function's own body.
                 local_return_ranks=_prov_scalar_ranks,
+                user_class_types=user_class_types,
+                structured_type_components=structured_type_components,
             )
             if _local_ret_df_info_scan:
                 tr_local_scan.local_df_return_info.update(_local_ret_df_info_scan)
             if _local_ret_tuple_df_info_scan:
                 tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan)
+            _seed_struct_param_types(tr_local_scan, _fn_scan)
             tr_local_scan.prescan(_fn_scan.body)
             _record_call_hints(_fn_scan, tr_local_scan, _fn_scan)
             _record_piecewise_call_hints(_fn_scan, tr_local_scan)
@@ -59774,6 +60144,8 @@ def generate_flat(
                 tuple_return_out_ranks=tuple_return_out_ranks,
                 local_return_specs=local_return_specs,
                 local_return_ranks=local_return_ranks,
+                user_class_types=user_class_types,
+                structured_type_components=structured_type_components,
             )
             # Seed with every known module-level global's kind BEFORE
             # prescanning just this one function's own body -- otherwise
@@ -59797,6 +60169,7 @@ def generate_flat(
                     _tr.chars.add(_gnm)
                 elif _gk == "complex":
                     _tr.complexes.add(_gnm)
+            _seed_struct_param_types(_tr, _fn_node)
             _tr.prescan(_fn_node.body)
             cb_scan_cache[_key] = _tr
             return _tr
@@ -61309,6 +61682,8 @@ def generate_flat(
             tuple_return_out_kinds=_prov_tuple_out,
             tuple_return_out_ranks=_prov_tuple_out_ranks,
             local_return_specs=_prov_scalar_specs,
+            user_class_types=user_class_types,
+            structured_type_components=structured_type_components,
         )
         _rr_h = local_func_arg_ranks.get(fn.name, [])
         _rk_h = local_func_arg_kinds.get(fn.name, [])
@@ -61338,6 +61713,7 @@ def generate_flat(
                     _tr_fn._mark_complex(_a.arg)
                 elif _rk == "char":
                     _tr_fn._mark_char(_a.arg)
+        _seed_struct_param_types(_tr_fn, fn)
         _tr_fn.prescan(fn.body)
         base_kinds = list(tuple_return_out_kinds.get(fn.name, []))
         base_ranks = list(tuple_return_out_ranks.get(fn.name, []))
@@ -61479,11 +61855,14 @@ def generate_flat(
                 # See the matching fix on tr_seed near this function's
                 # construction, above.
                 local_return_ranks=_prov_scalar_ranks,
+                user_class_types=user_class_types,
+                structured_type_components=structured_type_components,
             )
             if _local_ret_df_info_scan2:
                 _tr_local_scan.local_df_return_info.update(_local_ret_df_info_scan2)
             if _local_ret_tuple_df_info_scan2:
                 _tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan2)
+            _seed_struct_param_types(_tr_local_scan, _fn_scan)
             _tr_local_scan.prescan(_fn_scan.body)
             _record(_fn_scan, _tr_local_scan, _fn_scan)
         return pair_lists, triad_lists, joint_calls
@@ -62409,8 +62788,22 @@ def generate_flat(
             type_names.append(tname)
             target_o.w(f"type :: {tname}")
             target_o.push()
-            for fname, fkind in fields:
-                if fkind == "real":
+            for fname, fkind, frank in fields:
+                if frank > 0:
+                    # An array-typed field (e.g. Spline's own `knots`/
+                    # `coeffs`, both `'float[:]'`) -- allocatable, same
+                    # convention the sibling dict_return_specs loop just
+                    # above already uses for its own array components.
+                    dims = ",".join(":" for _ in range(frank))
+                    if fkind == "real":
+                        target_o.w(f"real(kind=dp), allocatable :: {fname}({dims})")
+                    elif fkind == "logical":
+                        target_o.w(f"logical, allocatable :: {fname}({dims})")
+                    elif fkind == "char":
+                        target_o.w(f"character(len=:), allocatable :: {fname}({dims})")
+                    else:
+                        target_o.w(f"integer, allocatable :: {fname}({dims})")
+                elif fkind == "real":
                     target_o.w(f"real(kind=dp) :: {fname}")
                 elif fkind == "logical":
                     target_o.w(f"logical :: {fname}")
@@ -62880,6 +63273,7 @@ def generate_flat(
                         local_overload_dispatch=local_overload_dispatch,
                         local_overload_tuple_profiles=local_overload_tuple_profiles,
                         user_class_types=user_class_types,
+                        structured_type_components=structured_type_components,
                         local_func_dict_arg_types=local_func_dict_arg_types,
                         proc_name_override=pname,
                         force_arg_kinds=forced_kinds,
@@ -62929,6 +63323,7 @@ def generate_flat(
                     local_overload_dispatch=local_overload_dispatch,
                     local_overload_tuple_profiles=local_overload_tuple_profiles,
                     user_class_types=user_class_types,
+                    structured_type_components=structured_type_components,
                     local_func_dict_arg_types=local_func_dict_arg_types,
                     elemental_funcs=elemental_targets,
                     force_non_elemental_funcs=passed_as_actual,
@@ -62999,6 +63394,19 @@ def generate_flat(
             _spec = dict_return_specs.get(_fn_name)
             if isinstance(_spec, dict) and _spec.get("type_name"):
                 proc_main_needed.add(_spec["type_name"])
+        # A user-class constructor call directly in the top-level program
+        # body (e.g. `v = Vec(...)`) needs its own derived type declared
+        # there too -- confirmed via a real build failure ("derived type
+        # ... being used before it is defined") when the type's own
+        # `type :: X_t ... end type` lives in the module but the program
+        # unit's own `use MODULE, only: ...` list never named it.
+        for _n in ast.walk(_main_tree):
+            if (
+                isinstance(_n, ast.Call)
+                and isinstance(_n.func, ast.Name)
+                and _n.func.id in (user_class_types or {})
+            ):
+                proc_main_needed.add((user_class_types or {})[_n.func.id])
         # Main code generated in proc-module mode may still declare local
         # real/complex variables with kind=dp even when source lacks literals.
         proc_main_needed.add("dp")
@@ -63390,6 +63798,7 @@ def generate_flat(
                 toplevel_shared_specs=_toplevel_shared_specs,
                 local_overload_dispatch=local_overload_dispatch,
                 user_class_types=user_class_types,
+                structured_type_components=structured_type_components,
                 local_func_dict_arg_types=local_func_dict_arg_types,
                 elemental_funcs=elemental_targets,
                 force_non_elemental_funcs=passed_as_actual,
@@ -64057,6 +64466,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = rewrite_class_methods_to_toplevel(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
     params = find_parameters(tree)
     list_counts = build_list_count_map(tree)
@@ -64355,6 +64765,7 @@ def transpile_file(
     src_override=None,
     elemental_pass=False,
     max_use_only=None,
+    optimize_loops=False,
 ):
     if src_override is not None:
         src = normalize_numpy_removed_aliases(src_override)
@@ -64368,9 +64779,19 @@ def transpile_file(
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = rewrite_class_methods_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
     tree = inline_local_from_imports(tree, py_path)
+    # Re-run: a sibling-module function inlined just above may itself have
+    # its own hoistable nested def(s) -- the first call, above, only ever
+    # saw the driver script's OWN top-level functions (empty, typically,
+    # for a driver that's just `from module import target`), since the
+    # sibling module's own source is independently re-parsed inside
+    # inline_local_from_imports with no rewrite passes applied to it.
+    # Idempotent on anything already flat, so safe to call again.
+    tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = rewrite_class_methods_to_toplevel(tree)
     tree = normalize_scipy_submodule_attribute_calls(tree)
     tree = normalize_scipy_signal_submodule_access(tree)
     translator.global_synthetic_slices = {}
@@ -64848,6 +65269,8 @@ def transpile_file(
     # is already declared integer), so it belongs in the default path
     # too, not just full postprocessing.
     f90_lines = simplify_redundant_int_casts(f90_lines)
+    if optimize_loops:
+        f90_lines = floop.reorder_column_major_loop_nests(f90_lines)
     if list_directed_io:
         f90_lines = rewrite_to_list_directed_io(f90_lines)
     f90_lines = remove_allocatable_shadow_decls(f90_lines)
@@ -64945,6 +65368,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = rewrite_class_methods_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
 
     top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
@@ -65096,6 +65520,7 @@ def main():
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
     ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
     ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
+    ap.add_argument("--optimize-loops", action="store_true", help="swap the nesting order of immediately-nested do loops that fill a 2D array in (outer,inner) subscript order, when provably safe -- see fortran_loop_reorder.py")
     ap.add_argument("--elemental", action="store_true", help="also declare a PURE procedure ELEMENTAL where the emitted Fortran proves it's safe (scalar dummies/result, no procedure dummy, never passed as a callback)")
     ap.add_argument("--max-use-only", type=int, default=None, metavar="N", help="collapse a `use MOD, only: a, b, ...` statement with more than N names into a bare `use MOD ! imports K entities` -- only for a module this same run also generated, and only when doing so can't collide with anything else visible in that use statement's own enclosing module/program")
     ap.add_argument("--list-directed-io", action="store_true", help="rewrite formatted write/print to list-directed output")
@@ -65549,6 +65974,7 @@ def main():
             src_override=transpile_src_text,
             elemental_pass=args.elemental,
             max_use_only=args.max_use_only,
+            optimize_loops=args.optimize_loops,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:
