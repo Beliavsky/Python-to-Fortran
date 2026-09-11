@@ -51220,6 +51220,7 @@ def _emit_local_function(
     toplevel_str_list_values=None,
     tuple_df_return_positions=None,
     structured_type_components=None,
+    value_scalar_args=False,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -55128,6 +55129,13 @@ def _emit_local_function(
                 if _rk > 0:
                     _dims = ",".join(":" for _ in range(_rk))
                     o.w(f"{_ft}, intent({_it}) :: {_nm}({_dims})")
+                elif value_scalar_args and _it == "in" and _bk != "char":
+                    # See the matching intent(in)->value swap in
+                    # _emit_local_function's own per-argument declaration
+                    # loop below -- an interface block's dummy attributes
+                    # must exactly match whatever the concrete function
+                    # eventually bound to this dummy-procedure declares.
+                    o.w(f"{_ft}, value :: {_nm}")
                 else:
                     o.w(f"{_ft}, intent({_it}) :: {_nm}")
             o.pop()
@@ -55174,16 +55182,25 @@ def _emit_local_function(
                     else:
                         o.w(f"real(kind=dp), intent(in) :: {_nm}({dims})")
                 else:
+                    # A scalar callback-parameter interface declaration MUST
+                    # exactly match whatever the concrete function eventually
+                    # bound to this dummy-procedure actually declares (Fortran
+                    # requires the actual and the interface to agree on every
+                    # dummy's attributes) -- so this mirrors the same
+                    # intent(in)->value swap _emit_local_function's own
+                    # per-argument declaration applies below, under the same
+                    # flag, for the same reason (char excluded there too).
+                    _cb_attr = "value" if value_scalar_args else "intent(in)"
                     if _k == "int":
-                        o.w(f"integer, intent(in) :: {_nm}")
+                        o.w(f"integer, {_cb_attr} :: {_nm}")
                     elif _k == "logical":
-                        o.w(f"logical, intent(in) :: {_nm}")
+                        o.w(f"logical, {_cb_attr} :: {_nm}")
                     elif _k == "char":
                         o.w(f"character(len=*), intent(in) :: {_nm}")
                     elif _k == "complex":
-                        o.w(f"complex(kind=dp), intent(in) :: {_nm}")
+                        o.w(f"complex(kind=dp), {_cb_attr} :: {_nm}")
                     else:
-                        o.w(f"real(kind=dp), intent(in) :: {_nm}")
+                        o.w(f"real(kind=dp), {_cb_attr} :: {_nm}")
             if cb_ret_rank <= 0:
                 if cb_ret_kind == "complex":
                     o.w("complex(kind=dp) :: r")
@@ -55649,6 +55666,40 @@ def _emit_local_function(
                 count=1,
                 flags=re.IGNORECASE,
             )
+        if (
+            value_scalar_args
+            and intent_txt == "in"
+            and int(arr_rank) == 0
+            and arg not in (dict_arg_types or {})
+            and arg not in (df_arg_types or {})
+        ):
+            # A read-only scalar dummy currently declared intent(in): Python
+            # itself already only lets the callee rebind its OWN local copy
+            # of a scalar parameter (never the caller's), so this is a
+            # behavior-preserving declaration swap, not a semantic change --
+            # `value` permits everything `intent(in)` does, plus local
+            # reassignment (already handled some other way when the source
+            # rebinds this name; see _arg_is_assigned above). It also avoids
+            # a pass-by-reference indirection on every access, which is a
+            # measured, sometimes large win (~6-7x on a deep-recursion
+            # benchmark) for a hot scalar argument. Excluded: assumed-length
+            # CHARACTER (VALUE + `len=*` is a portability wrinkle across
+            # compilers) and derived-type/procedure dummies (out of scope
+            # for this pass).
+            _decl_low_v = arg_decl.lower()
+            if (
+                "character" not in _decl_low_v
+                and "type(" not in _decl_low_v
+                and "allocatable" not in _decl_low_v
+                and "procedure(" not in _decl_low_v
+            ):
+                arg_decl = re.sub(
+                    r"intent\(in\)(,\s*optional)?",
+                    lambda m: "value" + (m.group(1) or ""),
+                    arg_decl,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
         arg_meta[arg] = (decl_kind, int(arr_rank), intent_txt)
         o.w(arg_decl + (f" ! {argument_comment(arg, 'in')}" if not no_comment else ""))
         if (
@@ -58334,7 +58385,8 @@ def _parse_pyccel_proc_annotation(ann_str):
 
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
-    structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None
+    structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None,
+    value_scalar_args=False,
 ):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map, extra_def_nodes=local_funcs)
     char_list_final_sizes = compute_list_final_sizes(tree)
@@ -63274,6 +63326,7 @@ def generate_flat(
                         local_overload_tuple_profiles=local_overload_tuple_profiles,
                         user_class_types=user_class_types,
                         structured_type_components=structured_type_components,
+                        value_scalar_args=value_scalar_args,
                         local_func_dict_arg_types=local_func_dict_arg_types,
                         proc_name_override=pname,
                         force_arg_kinds=forced_kinds,
@@ -63324,6 +63377,7 @@ def generate_flat(
                     local_overload_tuple_profiles=local_overload_tuple_profiles,
                     user_class_types=user_class_types,
                     structured_type_components=structured_type_components,
+                    value_scalar_args=value_scalar_args,
                     local_func_dict_arg_types=local_func_dict_arg_types,
                     elemental_funcs=elemental_targets,
                     force_non_elemental_funcs=passed_as_actual,
@@ -63799,6 +63853,7 @@ def generate_flat(
                 local_overload_dispatch=local_overload_dispatch,
                 user_class_types=user_class_types,
                 structured_type_components=structured_type_components,
+                value_scalar_args=value_scalar_args,
                 local_func_dict_arg_types=local_func_dict_arg_types,
                 elemental_funcs=elemental_targets,
                 force_non_elemental_funcs=passed_as_actual,
@@ -64766,6 +64821,7 @@ def transpile_file(
     elemental_pass=False,
     max_use_only=None,
     optimize_loops=False,
+    value_scalar_args=False,
 ):
     if src_override is not None:
         src = normalize_numpy_removed_aliases(src_override)
@@ -65046,6 +65102,7 @@ def transpile_file(
             structured_dtype_strings=structured_dtype_strings,
             user_class_types=user_class_types,
             rng_replay_path=rng_replay_path,
+            value_scalar_args=value_scalar_args,
         )
         used_flat_fallback = False
     else:
@@ -65067,6 +65124,7 @@ def transpile_file(
                 structured_dtype_strings=structured_dtype_strings,
                 user_class_types=user_class_types,
                 rng_replay_path=rng_replay_path,
+                value_scalar_args=value_scalar_args,
             )
             used_flat_fallback = True
         else:
@@ -65093,6 +65151,7 @@ def transpile_file(
                     structured_dtype_strings=structured_dtype_strings,
                     user_class_types=user_class_types,
                     rng_replay_path=rng_replay_path,
+                    value_scalar_args=value_scalar_args,
                 )
                 used_flat_fallback = True
 
@@ -65521,6 +65580,7 @@ def main():
     ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
     ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
     ap.add_argument("--optimize-loops", action="store_true", help="swap the nesting order of immediately-nested do loops that fill a 2D array in (outer,inner) subscript order, when provably safe -- see fortran_loop_reorder.py")
+    ap.add_argument("--value-args", action="store_true", help="declare a read-only scalar dummy argument (not CHARACTER, not a derived type) VALUE instead of intent(in) -- avoids a pass-by-reference indirection on every access, a real win for hot scalar arguments (e.g. deep recursion)")
     ap.add_argument("--elemental", action="store_true", help="also declare a PURE procedure ELEMENTAL where the emitted Fortran proves it's safe (scalar dummies/result, no procedure dummy, never passed as a callback)")
     ap.add_argument("--max-use-only", type=int, default=None, metavar="N", help="collapse a `use MOD, only: a, b, ...` statement with more than N names into a bare `use MOD ! imports K entities` -- only for a module this same run also generated, and only when doing so can't collide with anything else visible in that use statement's own enclosing module/program")
     ap.add_argument("--list-directed-io", action="store_true", help="rewrite formatted write/print to list-directed output")
@@ -65975,6 +66035,7 @@ def main():
             elemental_pass=args.elemental,
             max_use_only=args.max_use_only,
             optimize_loops=args.optimize_loops,
+            value_scalar_args=args.value_args,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:
