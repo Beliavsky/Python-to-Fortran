@@ -37,10 +37,14 @@ procedure under an explicit interface to match its dummy's kind EXACTLY
 `integer(kind=ikind)`, the same way an unsuffixed real literal would fail
 against a `real(kind=dp)` parameter.
 
-Tailored to xp2f.py's own emission style, mirroring fortran_loop_reorder.py:
-a declaration that spans more than one physical line via `&` continuation
-is left untouched rather than mishandled (a known, narrow limitation, not
-a correctness issue -- just a missed upgrade for that one declaration).
+Tailored to xp2f.py's own emission style, but unlike fortran_loop_reorder.py
+(which declines a `do`-loop nest whose header spans more than one physical
+line -- swapping two header lines in place has nowhere to put a longer
+one), a statement that spans more than one physical line via `&`
+continuation is still handled here: it's flattened to its already-joined
+logical text, rewritten as a single line, and re-wrapped afterward with
+this codebase's own existing `fortran_post.wrap_long_lines` if that made
+it too long -- rather than skipped.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence, Set, Tuple
 
+import fortran_post as fpost
 import fortran_scan as fscan
 
 # External boundary procedures: static, unmodified Fortran -- the vendored
@@ -483,23 +488,30 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
     # scan above.
     excluded = excluded | {"dp", "sp", "ikind"}
 
+    def stmt_last_line(k: int) -> int:
+        """1-based index of the LAST physical line of statement k,
+        following its own `&` continuations from its own start line --
+        NOT derived from the next statement's own start line, which a
+        blank or comment-only line in between (extremely common right
+        after a declaration block in xp2f.py's own output) would wrongly
+        widen, making a genuinely single-physical-line statement look
+        multi-line."""
+        idx = stmts[k][0] - 1
+        while idx < len(lines):
+            code = _split_code_comment(lines[idx])[0].rstrip()
+            if not code.endswith("&"):
+                break
+            idx += 1
+        return idx + 1
+
     def stmt_span(k: int) -> Tuple[int, int]:
+        # A "generous" span (through the line before the NEXT statement,
+        # rather than stmt_last_line's precise end) for boundary-line
+        # marking below -- including a trailing blank/comment line is
+        # harmless there, since those lines have no literals to protect.
         start = stmts[k][0]
         end = stmts[k + 1][0] - 1 if k + 1 < len(stmts) else len(lines)
         return start, end
-
-    def stmt_is_single_line(k: int) -> bool:
-        # NOT simply "does this statement's own start line equal the next
-        # statement's start line minus one" -- a blank or comment-only
-        # line between this statement and the next (extremely common
-        # right after a declaration block in xp2f.py's own output) would
-        # wrongly widen that gap and make a genuinely single-physical-line
-        # statement look multi-line. A statement is only continued onto a
-        # further physical line if its own first line actually ends with
-        # a trailing `&` (after stripping any comment).
-        start = stmts[k][0]
-        code = _split_code_comment(lines[start - 1])[0].rstrip()
-        return not code.endswith("&")
 
     # Every physical line belonging to a boundary-call statement is left
     # out of integer-literal suffixing -- a literal actual argument to one
@@ -513,32 +525,55 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
             start, end = stmt_span(k)
             boundary_lines.update(range(start, end + 1))
 
-    literal_suffixed = list(lines)
-    for i in range(len(literal_suffixed)):
-        if (i + 1) in boundary_lines:
-            continue
-        raw = literal_suffixed[i]
-        body, eol = _line_eol(raw)
-        code, comment = _split_code_comment(body)
-        code = _widen_bare_int_casts_in_code(code)
-        code = _suffix_bare_int_literals_in_code(code)
-        literal_suffixed[i] = f"{code}{comment}{eol}"
-
-    # Splice each declaration statement's rewrite (which may split one
-    # physical line into two) back into the line list positionally.
+    # One unified pass over STATEMENTS (not raw physical lines): a
+    # statement spanning more than one physical line via `&` continuation
+    # is flattened to its already-joined logical text (from `stmts`) and
+    # rewritten as a single (possibly long) line, rather than skipped --
+    # `fpost.wrap_long_lines` below re-wraps anything that ends up over
+    # gfortran's free-form line-length limit, the same wrapper xp2f.py's
+    # own pipeline already uses for exactly this purpose.
     out: List[str] = []
     consumed_through = 0
     for k, (lineno, text) in enumerate(stmts):
-        idx = lineno - 1
-        if idx < consumed_through:
+        start_idx = lineno - 1
+        if start_idx < consumed_through:
             continue
-        out.extend(literal_suffixed[consumed_through:idx])
-        if _DECL_RE.match(text) and stmt_is_single_line(k):
-            out.extend(_rewrite_decl_line(literal_suffixed[idx], excluded))
+        out.extend(lines[consumed_through:start_idx])
+        end_idx = stmt_last_line(k) - 1
+
+        if lineno in boundary_lines:
+            out.extend(lines[start_idx : end_idx + 1])
+            consumed_through = end_idx + 1
+            continue
+
+        first_code = _split_code_comment(_line_eol(lines[start_idx])[0])[0]
+        indent_m = re.match(r"^(\s*)", first_code)
+        indent = indent_m.group(1) if indent_m else ""
+        last_body, eol = _line_eol(lines[end_idx])
+        _, comment = _split_code_comment(last_body)
+
+        code_line = _widen_bare_int_casts_in_code(f"{indent}{text}")
+        code_line = _suffix_bare_int_literals_in_code(code_line)
+        full_line = f"{code_line}{comment}{eol}"
+
+        if _DECL_RE.match(code_line):
+            out.extend(_rewrite_decl_line(full_line, excluded))
         else:
-            out.append(literal_suffixed[idx])
-        consumed_through = idx + 1
-    out.extend(literal_suffixed[consumed_through:])
+            out.append(full_line)
+        consumed_through = end_idx + 1
+    out.extend(lines[consumed_through:])
+    # fpost.wrap_long_lines only puts the ORIGINAL line's own trailing
+    # newline (if any) on the LAST of the segments it splits a long line
+    # into -- correct for xp2f.py's own f90_lines convention (no line
+    # carries its own newline; the caller joins the whole list with "\n"
+    # at the very end), but this tool's standalone CLI convention (like
+    # `lines`, read via splitlines(keepends=True)) is that EVERY element
+    # carries its own newline. Normalize to whichever convention `lines`
+    # itself actually used, so a newly-inserted internal segment doesn't
+    # end up silently concatenated onto the next line with no separator.
+    out = fpost.wrap_long_lines(out, max_len=80)
+    if lines and lines[0].endswith(("\n", "\r\n")):
+        out = [ln if ln.endswith(("\n", "\r\n")) else ln + "\n" for ln in out]
 
     # Second pass: insert the ikind parameter (+ iso_fortran_env import)
     # once per module/program unit.
