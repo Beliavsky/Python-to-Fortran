@@ -13963,13 +13963,17 @@ def validate_no_duplicate_top_level_defs(tree):
 # Modules whose own top-level import statement, inside a sibling module
 # being inlined by inline_local_from_imports below, needs to be carried
 # over into the merged tree -- because a downstream alias-collector
-# (collect_math_aliases here; collect_time_aliases/collect_sys_aliases/
-# collect_scipy_special_aliases/collect_statistics_aliases have the same
-# "only ever ast.walk()s the final tree" shape and would have the same
-# gap for their own modules, but only math/cmath has actually been hit
-# and verified in practice so far) needs to see it to recognize calls
-# like `math.sqrt(...)` inside an inlined function body.
-_CARRIED_MODULE_IMPORTS = {"math", "cmath"}
+# (collect_math_aliases, collect_numpy_func_aliases, collect_numpy_const_
+# aliases here; collect_time_aliases/collect_sys_aliases/collect_scipy_
+# special_aliases/collect_statistics_aliases have the same "only ever
+# ast.walk()s the final tree" shape and would have the same gap for
+# their own modules, but only these have actually been hit in practice)
+# needs to see it to recognize calls like `math.sqrt(...)` -- or a
+# `from numpy import zeros` name like `zeros(...)` -- inside an inlined
+# function body. (`from numpy import zeros` in md_mod.py, inlined into a
+# driver that imports `md`, otherwise hit "unsupported call: zeros(...)"
+# because collect_numpy_func_aliases never saw the import.)
+_CARRIED_MODULE_IMPORTS = {"math", "cmath", "numpy"}
 
 
 def safe_import_prefix(name):
@@ -14093,21 +14097,35 @@ def inline_local_from_imports(tree, py_path):
                 refs.add(n.func.id)
             elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in assigns:
                 refs.add(n.id)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in funcs:
+                # A same-module function referenced by bare name but never
+                # directly CALLED here -- passed as a callback actual
+                # (`euler(humps_deriv, ...)`), stored in a variable, etc.
+                # Still has to be inlined, or its `call`/reference site is
+                # left dangling. (A direct call is the ast.Call branch
+                # above; this is everything else.)
+                refs.add(n.id)
         return refs
 
-    carried_import_modules = set()
+    carried_import_keys = set()
 
     def _carry_extra_imports(exports):
         nonlocal changed
         for imp_st in exports.get("extra_imports", ()):
-            names = (
-                {(al.name or "").strip() for al in imp_st.names}
-                if isinstance(imp_st, ast.Import)
-                else {(imp_st.module or "").strip()}
-            )
-            if names & carried_import_modules:
+            # Dedup key: for `import X [as Y]` the source module `X`; for
+            # `from X import a, b` one key per imported name (`X::a`) --
+            # several `from numpy import zeros` / `from numpy import pi`
+            # statements in one sibling module must ALL survive, not just
+            # the first (keying on the bare module name would drop the
+            # rest and lose `pi`, `sqrt`, ... -- see md_mod.py).
+            if isinstance(imp_st, ast.Import):
+                keys = {(al.name or "").strip() for al in imp_st.names}
+            else:
+                mod = (imp_st.module or "").strip()
+                keys = {f"{mod}::{(al.name or '').strip()}" for al in imp_st.names}
+            if keys <= carried_import_keys:
                 continue
-            carried_import_modules.update(names)
+            carried_import_keys.update(keys)
             new_body.append(copy.deepcopy(imp_st))
             changed = True
 
