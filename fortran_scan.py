@@ -1268,8 +1268,32 @@ def _fold_simple_integer_arithmetic(stmt: str) -> str:
             p -= 1
         if p > 0 and s[p - 1] in "+-":
             return m.group(0)
-        a = int(m.group(1))
         op = m.group(2)
+        if op in "+-":
+            # A literal flanking a +/- fold that is ITSELF the operand of
+            # an adjacent, higher-precedence * or / lying just OUTSIDE the
+            # match can't be folded together with the +/- term:
+            # `nx / 4 + 1` is `(nx / 4) + 1`, not `nx / (4 + 1)` -- folding
+            # the trailing "4 + 1" into "5" (unaware the "4" is really a
+            # divisor) silently turns `nx / 4 + 1` into `nx / 5`, changing
+            # which value gets divided (confirmed via examples/pyccel_
+            # bench/poisson_2d_mod.py's own `b[ny // 4, nx // 4]`, whose
+            # Fortran translation, `b(ny / 4 + 1, nx / 4 + 1)` after the
+            # 0-based-to-1-based `+ 1` is added, was folding to `b(ny / 5,
+            # nx / 5)` here and placing the source term at the wrong grid
+            # cell). Same danger symmetrically on the right: `1 + 4 * nx`
+            # would fold "1 + 4" into "5" while the "4" is actually `*`'s
+            # left operand. A neighboring +/- outside the match (the guard
+            # just above) is a different, already-handled hazard -- this
+            # is specifically about a higher-precedence operator.
+            if p > 0 and s[p - 1] in "*/":
+                return m.group(0)
+            q = m.end()
+            while q < len(s) and s[q].isspace():
+                q += 1
+            if q < len(s) and s[q] in "*/":
+                return m.group(0)
+        a = int(m.group(1))
         b = int(m.group(3))
         if op == "+":
             return str(a + b)
