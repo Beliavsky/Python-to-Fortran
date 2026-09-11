@@ -37,6 +37,7 @@ from datetime import datetime
 from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import fortran_output as fout
 import fortran_int_kind as fikind
+import fortran_perf_hints as fphints
 import fortran_loop_reorder as floop
 import fortran_post as fpost
 import fortran_purity as fpurity
@@ -64824,6 +64825,7 @@ def transpile_file(
     optimize_loops=False,
     value_scalar_args=False,
     int_kind=None,
+    perf_hints=False,
 ):
     if src_override is not None:
         src = normalize_numpy_removed_aliases(src_override)
@@ -65334,6 +65336,17 @@ def transpile_file(
         f90_lines = floop.reorder_column_major_loop_nests(f90_lines)
     if int_kind:
         f90_lines = fikind.add_integer_kind(f90_lines, int_kind)
+    if perf_hints:
+        # Purely advisory: never mutates f90_lines. Scanned AFTER
+        # --optimize-loops so a nested-loop-pair case it already fixed
+        # doesn't show up here as a stale finding -- only genuinely
+        # unfixable-by-loop-reordering shapes (a row slice, or a single
+        # non-nested loop's own strided index) are left to report.
+        _hint_text = fphints.format_hints(
+            fphints.scan_strided_access_hints(f90_lines), stem + "_p.f90"
+        )
+        if _hint_text:
+            print(_hint_text, file=sys.stderr)
     if list_directed_io:
         f90_lines = rewrite_to_list_directed_io(f90_lines)
     f90_lines = remove_allocatable_shadow_decls(f90_lines)
@@ -65586,6 +65599,7 @@ def main():
     ap.add_argument("--optimize-loops", action="store_true", help="swap the nesting order of immediately-nested do loops that fill a 2D array in (outer,inner) subscript order, when provably safe -- see fortran_loop_reorder.py")
     ap.add_argument("--value-args", action="store_true", help="declare a read-only scalar dummy argument (not CHARACTER, not a derived type) VALUE instead of intent(in) -- avoids a pass-by-reference indirection on every access, a real win for hot scalar arguments (e.g. deep recursion)")
     ap.add_argument("--int-kind", choices=["int32", "int64"], default=None, help="declare integers with an explicit kind (integer, parameter :: ikind = int32|int64; integer(kind=ikind) everywhere) instead of the compiler's bare default integer -- avoids silent overflow on large values, matching pyccel's own default. Excludes a fixed set of external LAPACK/scipy.optimize-bridge boundary calls, which require plain default-kind INTEGER arguments -- see fortran_int_kind.py")
+    ap.add_argument("--perf-hints", action="store_true", help="print (to stderr; never modifies the generated Fortran) a warning for each row-slice or loop-strided array access found AFTER --optimize-loops has already run -- a pattern pyccel's translation typically avoids by transposing array storage, that this project's own tools can't safely fix (would mean reshaping an array's own declared layout) -- see fortran_perf_hints.py")
     ap.add_argument("--elemental", action="store_true", help="also declare a PURE procedure ELEMENTAL where the emitted Fortran proves it's safe (scalar dummies/result, no procedure dummy, never passed as a callback)")
     ap.add_argument("--max-use-only", type=int, default=None, metavar="N", help="collapse a `use MOD, only: a, b, ...` statement with more than N names into a bare `use MOD ! imports K entities` -- only for a module this same run also generated, and only when doing so can't collide with anything else visible in that use statement's own enclosing module/program")
     ap.add_argument("--list-directed-io", action="store_true", help="rewrite formatted write/print to list-directed output")
@@ -66042,6 +66056,7 @@ def main():
             optimize_loops=args.optimize_loops,
             value_scalar_args=args.value_args,
             int_kind=args.int_kind,
+            perf_hints=args.perf_hints,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:
