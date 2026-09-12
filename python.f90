@@ -380,6 +380,9 @@ public :: expm1 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) de
 
 public :: math_remainder !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) desc="Python 3 math.remainder(x, y): IEEE 754 remainder, x - round(x/y)*y with ties to even"
 
+public :: expm1_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.expm1 for complex input: exp(x) - 1, precise for small abs(real(x))"
+public :: log1p_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.log1p for complex input: log(1 + x)"
+
 interface cumsum
    module procedure cumsum_real, cumsum_int
 end interface cumsum
@@ -8084,5 +8087,28 @@ contains
          end if
          r = x - real(n, kind=dp) * y
       end function math_remainder
+
+      elemental function expm1_complex(x) result(y)
+         ! np.expm1/cmath-style expm1 on a complex argument. Uses the
+         ! standard complex identity exp(a+bi) - 1 = (exp(a)*cos(b) - 1)
+         ! + i*exp(a)*sin(b), with exp(a)*cos(b) - 1 rewritten via the
+         ! real expm1 (above) plus a half-angle term to avoid the same
+         ! cancellation the real case avoids. Adapted from pyccel's own
+         ! pyc_expm1_c64
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         complex(kind=dp), intent(in) :: x
+         complex(kind=dp) :: y
+         real(kind=dp) :: half_sin, re, im
+         re = real(x, kind=dp)
+         im = aimag(x)
+         half_sin = sin(im * 0.5_dp)
+         y = cmplx(expm1(re) * cos(im) - 2.0_dp * half_sin * half_sin, exp(re) * sin(im), kind=dp)
+      end function expm1_complex
+
+      elemental function log1p_complex(x) result(y)
+         complex(kind=dp), intent(in) :: x
+         complex(kind=dp) :: y
+         y = log(cmplx(1.0_dp, 0.0_dp, kind=dp) + x)
+      end function log1p_complex
 
 end module python_mod

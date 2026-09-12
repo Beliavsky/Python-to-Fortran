@@ -4618,6 +4618,65 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
     return tree
 
 
+def rewrite_bare_numpy_imports_to_attribute_calls(tree):
+    """Rewrite `from numpy import X; X(...)` to `X(...)` shaped as
+    `np.X(...)` (a synthetic `np.` attribute access), so every one of
+    the ~300 existing `node.func.attr == "X"` / numpy-attribute-gated
+    dispatch sites throughout this file -- kind inference, rank
+    inference, codegen -- sees the bare-imported form automatically,
+    with no per-function change needed on their part.
+
+    Without this, `np.X(...)` and a bare `from numpy import X; X(...)`
+    are two entirely different code paths: only a small, manually
+    maintained allowlist (NUMPY_DIRECT_IMPORT_SUPPORTED) and a
+    separate, narrower `self.numpy_func_aliases`/`_is_numpy_call`
+    mechanism cover the bare form, and historically only a handful of
+    call sites were ever updated to consult it (float32/float64/
+    int8..int64/complex64/complex128/csingle/cdouble) -- every other
+    numpy function (where, full with a positional dtype, cross, ...)
+    silently only worked via `np.X(...)`, never via the bare-imported
+    form, unless and until someone happened to test that specific
+    function's own bare-import case and patched its own handful of
+    call sites by hand.
+
+    Matches the existing alias-collection convention (collect_math_
+    aliases/collect_numpy_func_aliases): a whole-program `ast.walk`,
+    with no attempt to track whether the import is function ('from
+    numpy import X' at module scope) or in fact more narrowly scoped,
+    and no attempt to detect the (rare, and already just as
+    unhandled by every other alias mechanism in this file) case where
+    the imported name is later reassigned to something else entirely.
+    Deliberately unconditional -- not gated by any supported-name
+    allowlist -- since a name numpy doesn't actually support (or this
+    project doesn't) simply reaches the same "unsupported call"
+    reporting np.X(...) already gets today, just with an accurate
+    np.-qualified name in the message instead of a bare one.
+    """
+    numpy_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "numpy":
+            for al in node.names:
+                if al.name != "*":
+                    numpy_names.add(al.asname or al.name)
+    if not numpy_names:
+        return tree
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Name) and node.func.id in numpy_names:
+                np_name = ast.Name(id="np", ctx=ast.Load())
+                ast.copy_location(np_name, node.func)
+                new_func = ast.Attribute(value=np_name, attr=node.func.id, ctx=ast.Load())
+                ast.copy_location(new_func, node.func)
+                node.func = new_func
+            return node
+
+    tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_class_methods_to_toplevel(tree):
     """Hoist every method (other than `__init__`) of a plain/dataclass-
     shaped class -- the same shapes `collect_dataclass_info` (xp2f.py)
@@ -12089,8 +12148,10 @@ def detect_needed_helpers(tree):
                     needed.add("lcm_int_scalar")
                 elif mf == "expm1":
                     needed.add("expm1")
+                    needed.add("expm1_complex")
                 elif mf == "log1p":
                     needed.add("log1p")
+                    needed.add("log1p_complex")
                 elif mf == "remainder":
                     needed.add("math_remainder")
                 elif mf == "cmath:isfinite":
@@ -12156,8 +12217,10 @@ def detect_needed_helpers(tree):
                     needed.add("lcm_int_scalar")
                 elif node.func.attr == "expm1":
                     needed.add("expm1")
+                    needed.add("expm1_complex")
                 elif node.func.attr == "log1p":
                     needed.add("log1p")
+                    needed.add("log1p_complex")
                 elif node.func.attr == "remainder":
                     needed.add("math_remainder")
             if (
@@ -12166,6 +12229,7 @@ def detect_needed_helpers(tree):
                 and node.func.attr in {"expm1", "log1p"}
             ):
                 needed.add(node.func.attr)
+                needed.add(node.func.attr + "_complex")
             if isinstance(node.func, ast.Name) and node.func.id == "set":
                 needed.add("unique_char")
                 needed.add("unique_int")
@@ -15161,6 +15225,41 @@ def runtime_helper_templates():
          y = c_log1p(x)
       end function log1p"""
 
+    expm1_complex_pub = (
+        "public :: expm1_complex !@pyapi kind=function ret=complex(dp) "
+        "args=x:complex(dp):intent(in) "
+        "desc=\"np.expm1 for complex input: exp(x) - 1, precise for small abs(real(x))\""
+    )
+
+    expm1_complex_blk = """      elemental function expm1_complex(x) result(y)
+         ! np.expm1/cmath-style expm1 on a complex argument. Uses the
+         ! standard complex identity exp(a+bi) - 1 = (exp(a)*cos(b) - 1)
+         ! + i*exp(a)*sin(b), with exp(a)*cos(b) - 1 rewritten via the
+         ! real expm1 (above) plus a half-angle term to avoid the same
+         ! cancellation the real case avoids. Adapted from pyccel's own
+         ! pyc_expm1_c64
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         complex(kind=dp), intent(in) :: x
+         complex(kind=dp) :: y
+         real(kind=dp) :: half_sin, re, im
+         re = real(x, kind=dp)
+         im = aimag(x)
+         half_sin = sin(im * 0.5_dp)
+         y = cmplx(expm1(re) * cos(im) - 2.0_dp * half_sin * half_sin, exp(re) * sin(im), kind=dp)
+      end function expm1_complex"""
+
+    log1p_complex_pub = (
+        "public :: log1p_complex !@pyapi kind=function ret=complex(dp) "
+        "args=x:complex(dp):intent(in) "
+        "desc=\"np.log1p for complex input: log(1 + x)\""
+    )
+
+    log1p_complex_blk = """      elemental function log1p_complex(x) result(y)
+         complex(kind=dp), intent(in) :: x
+         complex(kind=dp) :: y
+         y = log(cmplx(1.0_dp, 0.0_dp, kind=dp) + x)
+      end function log1p_complex"""
+
     math_remainder_pub = (
         "public :: math_remainder !@pyapi kind=function ret=real(dp) "
         "args=x:real(dp):intent(in),y:real(dp):intent(in) "
@@ -16224,6 +16323,8 @@ def runtime_helper_templates():
         "csign_complex": (csign_complex_pub, csign_complex_blk),
         "expm1": (expm1_pub, expm1_blk),
         "log1p": (log1p_pub, log1p_blk),
+        "expm1_complex": (expm1_complex_pub, expm1_complex_blk),
+        "log1p_complex": (log1p_complex_pub, log1p_complex_blk),
         "math_remainder": (math_remainder_pub, math_remainder_blk),
         "print_int_list": (pil_pub, pil_blk),
         "print_char_list": (pcl_pub, pcl_blk),
@@ -16285,6 +16386,7 @@ def ensure_runtime_helpers(runtime_path, needed_helpers):
         "nanstd": ["nanvar", "nanmean"],
         "nanvar": ["nanmean"],
         "py_round_int": ["py_round_ndigits"],
+        "expm1_complex": ["expm1"],
     }
 
     expanded = []
@@ -20666,6 +20768,27 @@ class translator(ast.NodeVisitor):
 
     def _np_dtype_text(self, call_node):
         dtype_txt = ""
+        # numpy accepts dtype as a plain positional argument too (e.g.
+        # np.full(3, val, np.int32), no dtype= keyword at all) -- the
+        # positional index differs by function: full/full_like's dtype
+        # is their 3rd argument (fill_value comes before it), zeros/
+        # ones/empty/zeros_like/ones_like's is their 2nd. Checked first;
+        # an explicit dtype= keyword below overrides it (a real call
+        # only ever supplies one or the other).
+        attr = self._numpy_call_attr(getattr(call_node, "func", None))
+        pos_idx = None
+        if attr in {"full", "full_like"} and len(call_node.args) >= 3:
+            pos_idx = 2
+        elif attr in {"zeros", "ones", "empty", "zeros_like", "ones_like"} and len(call_node.args) >= 2:
+            pos_idx = 1
+        if pos_idx is not None:
+            dnode = call_node.args[pos_idx]
+            if isinstance(dnode, ast.Constant) and isinstance(dnode.value, str):
+                dtype_txt = dnode.value.lower()
+            elif isinstance(dnode, ast.Name):
+                dtype_txt = dnode.id.lower()
+            elif isinstance(dnode, ast.Attribute) and isinstance(dnode.value, ast.Name):
+                dtype_txt = dnode.attr.lower()
         for kw in getattr(call_node, "keywords", []):
             if kw.arg == "dtype":
                 if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
@@ -21352,6 +21475,19 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"expm1", "log1p"}
+                and len(node.args) >= 1
+                and self._expr_kind(node.args[0]) == "complex"
+            ):
+                # Unlike logaddexp/logaddexp2/sinc (real-only in numpy),
+                # expm1/log1p accept and preserve a complex input -- a
+                # variable assigned np.expm1(complex_array) was
+                # previously always declared real, silently discarding
+                # the imaginary part entirely.
+                return "complex"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -26224,7 +26360,7 @@ class translator(ast.NodeVisitor):
                     return max(2, self._rank_expr(node.args[0]))
                 if node.func.attr == "atleast_3d" and len(node.args) >= 1:
                     return max(3, self._rank_expr(node.args[0]))
-                if node.func.attr in {"log1p", "nan_to_num", "float32", "float64", "int8", "int16", "int32", "int64"} and len(node.args) >= 1:
+                if node.func.attr in {"expm1", "log1p", "nan_to_num", "float32", "float64", "int8", "int16", "int32", "int64"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"pad", "roll", "flip", "flipud", "copy", "empty_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -30190,6 +30326,8 @@ class translator(ast.NodeVisitor):
                             if self._expr_kind(a0) in {"int", "logical"}:
                                 return f"int({a0_expr})"
                             return f"int({mfn}({a0_expr}))"
+                        if mfn in {"expm1", "log1p"} and self._expr_kind(a0) == "complex":
+                            return f"{mfn}_complex({a0_expr})"
                         if mfn not in {"erf", "erfc"} and self._expr_kind(a0) in {"int", "logical"}:
                             a0_expr = f"real({a0_expr}, kind=dp)"
                         return f"{mfn}({a0_expr})"
@@ -31843,7 +31981,10 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
-                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                _k0log1p = self._expr_kind(node.args[0])
+                if _k0log1p == "complex":
+                    return f"log1p_complex({a0})"
+                if _k0log1p in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 return f"log1p({a0})"
             if (
@@ -33740,6 +33881,8 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
+                if k0 == "complex":
+                    return f"{node.func.attr}_complex({a0})"
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 if node.func.attr == "expm1":
@@ -34873,7 +35016,10 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
-                if node.func.attr in {"expm1", "log1p"} and self._expr_kind(node.args[0]) in {"int", "logical"}:
+                _k0 = self._expr_kind(node.args[0])
+                if node.func.attr in {"expm1", "log1p"} and _k0 == "complex":
+                    return f"{node.func.attr}_complex({a0})"
+                if node.func.attr in {"expm1", "log1p"} and _k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 if node.func.attr == "expm1":
                     return f"expm1({a0})"
@@ -65176,6 +65322,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
+    tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
     params = find_parameters(tree)
     list_counts = build_list_count_map(tree)
@@ -65504,6 +65651,7 @@ def transpile_file(
     # Idempotent on anything already flat, so safe to call again.
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
+    tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     tree = normalize_scipy_submodule_attribute_calls(tree)
     tree = normalize_scipy_signal_submodule_access(tree)
     translator.global_synthetic_slices = {}
@@ -66097,6 +66245,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
+    tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     validate_imports_supported(tree, py_path)
 
     top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
