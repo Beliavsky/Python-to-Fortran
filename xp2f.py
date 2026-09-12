@@ -6681,8 +6681,16 @@ def merge_allocate_then_scalar_fill_to_source(lines):
     entity_re = re.compile(r"^([A-Za-z_]\w*)\s*(?:\(.*\))?$")
     decl_stmt_re = re.compile(r"^(\s*)(.+?)\s*::\s*(.+)$", re.IGNORECASE)
     base_type_re = re.compile(r"^(integer|real|logical|character|complex)\b", flags=re.IGNORECASE)
-    real_literal_re = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:_dp)?$", flags=re.IGNORECASE)
-    real_typed_re = re.compile(r"_dp\b", flags=re.IGNORECASE)
+    # This project's own two real kind aliases (integer, parameter :: dp =
+    # real64 / sp = real32) -- captured so a real(kind=sp) declaration
+    # can't be merged with a _dp-suffixed literal (or vice versa): source=
+    # requires an EXACT kind match, unlike a plain assignment, which
+    # converts silently. Real declarations spelled some other way (a bare
+    # unkinded `real`, or a literal iso_fortran_env name) fall through to
+    # base_type "real" below and are never matched -- abstain rather than
+    # risk merging into the wrong precision.
+    real_kind_re = re.compile(r"^real\s*\(\s*(?:kind\s*=\s*)?(sp|dp)\s*\)", flags=re.IGNORECASE)
+    real_literal_re = re.compile(r"^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:_(dp|sp))?$", flags=re.IGNORECASE)
     int_literal_re = re.compile(r"^[+-]?\d+$")
     logical_literal_re = re.compile(r"^\.(?:true|false)\.$", flags=re.IGNORECASE)
 
@@ -6718,6 +6726,12 @@ def merge_allocate_then_scalar_fill_to_source(lines):
                 mbt = base_type_re.match(spec)
                 if mbt:
                     base_type = mbt.group(1).lower()
+                    if base_type == "real":
+                        mrk = real_kind_re.match(spec)
+                        # An unkinded/unrecognized real spelling stays
+                        # "real" (never matched below -- abstain rather
+                        # than guess which precision a bare literal means).
+                        base_type = f"real_{mrk.group(1).lower()}" if mrk else "real"
                     for ent in _split_top_level_commas(md.group(3)):
                         ment = re.match(r"^([A-Za-z_]\w*)", ent.strip())
                         if ment:
@@ -6728,8 +6742,17 @@ def merge_allocate_then_scalar_fill_to_source(lines):
     def _rhs_matches_type(base_type, rhs):
         if base_type == "integer":
             return bool(int_literal_re.match(rhs))
-        if base_type == "real":
-            return bool(real_literal_re.match(rhs)) and bool(real_typed_re.search(rhs))
+        if base_type in ("real_dp", "real_sp"):
+            m = real_literal_re.match(rhs)
+            if not m:
+                return False
+            # source= requires an EXACT kind match (unlike a plain
+            # assignment, which converts silently) -- a _dp literal may
+            # only merge into a real(kind=dp) declaration, and likewise
+            # for _sp/real(kind=sp); an unsuffixed literal never merges,
+            # matching this function's own prior (dp-only) strictness.
+            suffix = (m.group(1) or "").lower()
+            return suffix == ("dp" if base_type == "real_dp" else "sp")
         if base_type == "logical":
             return bool(logical_literal_re.match(rhs))
         # character/complex/derived types: too easy to get subtly wrong
@@ -14091,7 +14114,7 @@ NUMPY_DIRECT_IMPORT_SUPPORTED = {
     "all", "any", "array", "asarray", "bitwise_and", "bitwise_or", "bitwise_xor",
     "count_nonzero", "dot", "empty", "floor_divide", "imag", "max", "min", "mod",
     "ones", "prod", "real", "reshape", "shape", "size", "sum", "zeros",
-    "float32", "float64", "complex64", "complex128", "csingle", "cdouble",
+    "float32", "float64", "double", "complex64", "complex128", "csingle", "cdouble",
     "int8", "int16", "int32", "int64",
 }
 
@@ -20191,7 +20214,7 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.UnaryOp):
             return self._expr_real_kind_tag(node.operand)
         if isinstance(node, ast.Call):
-            if self._is_numpy_call(node.func, {"float32", "float64"}) and len(node.args) >= 1:
+            if self._is_numpy_call(node.func, {"float32", "float64", "double"}) and len(node.args) >= 1:
                 return "real32" if self._numpy_call_attr(node.func) == "float32" else "real64"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype" and len(node.args) >= 1:
                 a0 = node.args[0]
@@ -21242,7 +21265,7 @@ class translator(ast.NodeVisitor):
                 "chr", "py_str", "py_ctime", "str_zfill", "str_ljust", "str_rjust", "to_lower", "to_upper", "str_strip", "str_lstrip", "str_rstrip", "str_replace", "str_join"
             }:
                 return "char"
-            if self._is_numpy_call(node.func, {"float32", "float64"}) and len(node.args) >= 1:
+            if self._is_numpy_call(node.func, {"float32", "float64", "double"}) and len(node.args) >= 1:
                 return "real"
             if self._is_numpy_call(node.func, {"int8", "int16", "int32", "int64"}) and len(node.args) >= 1:
                 return "int"
@@ -25699,7 +25722,7 @@ class translator(ast.NodeVisitor):
             np_attr = self._numpy_call_attr(node.func)
             if (
                 np_attr in {
-                    "float32", "float64", "int8", "int16", "int32", "int64",
+                    "float32", "float64", "double", "int8", "int16", "int32", "int64",
                     "complex64", "complex128", "csingle", "cdouble",
                 }
                 and len(node.args) >= 1
@@ -30230,10 +30253,15 @@ class translator(ast.NodeVisitor):
                 # zero-argument call like the constant form rather than treating
                 # it as an unsupported function call.
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
-            if self._is_numpy_call(node.func, {"float32", "float64"}) and len(node.args) == 1:
+            if self._is_numpy_call(node.func, {"float32", "float64", "double"}) and len(node.args) == 1:
+                # numpy.double is documented as a plain alias of float64.
                 _attr = self._numpy_call_attr(node.func)
                 _kind = "sp" if _attr == "float32" else "dp"
-                return f"real({self.expr(node.args[0])}, kind={_kind})"
+                _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "logical":
+                    # REAL() doesn't accept a LOGICAL argument directly.
+                    _a0 = f"merge(1, 0, {_a0})"
+                return f"real({_a0}, kind={_kind})"
             if self._is_numpy_call(node.func, {"int8", "int16", "int32", "int64"}) and len(node.args) == 1:
                 # A truncating cast to a fixed-width integer kind. Fortran's
                 # own INT(x, kind=...) already matches numpy's own runtime
@@ -30983,7 +31011,11 @@ class translator(ast.NodeVisitor):
                     return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
                 return reduced
             if self._is_numpy_call(node.func, {"complex64", "complex128", "csingle", "cdouble"}) and len(node.args) >= 1:
-                return f"cmplx({self.expr(node.args[0])}, kind=dp)"
+                _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "logical":
+                    # CMPLX() doesn't accept a LOGICAL argument directly.
+                    _a0 = f"merge(1, 0, {_a0})"
+                return f"cmplx({_a0}, kind=dp)"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
