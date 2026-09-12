@@ -375,6 +375,9 @@ public :: py_round_int !@pyapi kind=function ret=integer args=x:real(dp):intent(
 public :: csign_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.sign() for complex input: x / abs(x), 0 at the origin"
 public :: floor_div_int !@pyapi kind=function ret=integer args=x:integer:intent(in),y:integer:intent(in) desc="Python-style integer floor division (x // y, floors toward negative infinity)"
 
+public :: log1p !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="log(1 + x), full precision for small abs(x) via the C library's own log1p()"
+public :: expm1 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="exp(x) - 1, full precision for small abs(x) via the C library's own expm1()"
+
 interface cumsum
    module procedure cumsum_real, cumsum_int
 end interface cumsum
@@ -8022,5 +8025,43 @@ contains
          integer, intent(in) :: x, y
          q = x / y - merge(1, 0, mod(x, y) /= 0 .and. ((x < 0) .neqv. (y < 0)))
       end function floor_div_int
+
+      elemental function log1p(x) result(y)
+         ! A literal log(1.0_dp + x) suffers the same catastrophic
+         ! cancellation as the naive expm1 formula above, for the same
+         ! reason (forming 1 + x first discards x's own low-order bits
+         ! once x is small). The C library's own log1p() avoids this.
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: y
+         interface
+            pure function c_log1p(x) bind(c, name="log1p") result(r)
+               import :: dp
+               real(kind=dp), intent(in), value :: x
+               real(kind=dp) :: r
+            end function c_log1p
+         end interface
+         y = c_log1p(x)
+      end function log1p
+
+      elemental function expm1(x) result(y)
+         ! A literal exp(x) - 1.0_dp loses most significant digits to
+         ! catastrophic cancellation once x is small (confirmed against
+         ! Python's own math.expm1: at x = 1e-12 the naive formula is
+         ! off by a relative error of ~9e-5, and by ~11% at x = 1e-15).
+         ! The C library's own expm1() (the same routine Python's
+         ! math.expm1/numpy.expm1 are themselves backed by) avoids this.
+         ! Adapted from pyccel's own c_expm1 binding
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: y
+         interface
+            pure function c_expm1(x) bind(c, name="expm1") result(r)
+               import :: dp
+               real(kind=dp), intent(in), value :: x
+               real(kind=dp) :: r
+            end function c_expm1
+         end interface
+         y = c_expm1(x)
+      end function expm1
 
 end module python_mod

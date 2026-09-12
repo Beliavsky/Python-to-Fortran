@@ -12057,6 +12057,10 @@ def detect_needed_helpers(tree):
                 elif mf == "lcm":
                     needed.add("lcm_int")
                     needed.add("lcm_int_scalar")
+                elif mf == "expm1":
+                    needed.add("expm1")
+                elif mf == "log1p":
+                    needed.add("log1p")
                 elif mf == "cmath:isfinite":
                     needed.add("complex_isfinite")
                 elif mf == "cmath:isinf":
@@ -12118,6 +12122,16 @@ def detect_needed_helpers(tree):
                 elif node.func.attr == "lcm":
                     needed.add("lcm_int")
                     needed.add("lcm_int_scalar")
+                elif node.func.attr == "expm1":
+                    needed.add("expm1")
+                elif node.func.attr == "log1p":
+                    needed.add("log1p")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"expm1", "log1p"}
+            ):
+                needed.add(node.func.attr)
             if isinstance(node.func, ast.Name) and node.func.id == "set":
                 needed.add("unique_char")
                 needed.add("unique_int")
@@ -14077,6 +14091,8 @@ NUMPY_DIRECT_IMPORT_SUPPORTED = {
     "all", "any", "array", "asarray", "bitwise_and", "bitwise_or", "bitwise_xor",
     "count_nonzero", "dot", "empty", "floor_divide", "imag", "max", "min", "mod",
     "ones", "prod", "real", "reshape", "shape", "size", "sum", "zeros",
+    "float32", "float64", "complex64", "complex128", "csingle", "cdouble",
+    "int8", "int16", "int32", "int64",
 }
 
 
@@ -15056,6 +15072,56 @@ def runtime_helper_templates():
             s = x / m
          end if
       end function csign_complex"""
+
+    expm1_pub = (
+        "public :: expm1 !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp):intent(in) "
+        "desc=\"exp(x) - 1, full precision for small abs(x) via the C library's own expm1()\""
+    )
+
+    expm1_blk = """      elemental function expm1(x) result(y)
+         ! A literal exp(x) - 1.0_dp loses most significant digits to
+         ! catastrophic cancellation once x is small (confirmed against
+         ! Python's own math.expm1: at x = 1e-12 the naive formula is
+         ! off by a relative error of ~9e-5, and by ~11% at x = 1e-15).
+         ! The C library's own expm1() (the same routine Python's
+         ! math.expm1/numpy.expm1 are themselves backed by) avoids this.
+         ! Adapted from pyccel's own c_expm1 binding
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: y
+         interface
+            pure function c_expm1(x) bind(c, name="expm1") result(r)
+               import :: dp
+               real(kind=dp), intent(in), value :: x
+               real(kind=dp) :: r
+            end function c_expm1
+         end interface
+         y = c_expm1(x)
+      end function expm1"""
+
+    log1p_pub = (
+        "public :: log1p !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp):intent(in) "
+        "desc=\"log(1 + x), full precision for small abs(x) via the C library's own log1p()\""
+    )
+
+    log1p_blk = """      elemental function log1p(x) result(y)
+         ! A literal log(1.0_dp + x) suffers the same catastrophic
+         ! cancellation as the naive expm1 formula above, for the same
+         ! reason (forming 1 + x first discards x's own low-order bits
+         ! once x is small). The C library's own log1p() avoids this.
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: y
+         interface
+            pure function c_log1p(x) bind(c, name="log1p") result(r)
+               import :: dp
+               real(kind=dp), intent(in), value :: x
+               real(kind=dp) :: r
+            end function c_log1p
+         end interface
+         y = c_log1p(x)
+      end function log1p"""
 
     pil_pub = (
         "public :: print_int_list  !@pyapi kind=subroutine "
@@ -16093,6 +16159,8 @@ def runtime_helper_templates():
         "py_round_ndigits": (py_round_ndigits_pub, py_round_ndigits_blk),
         "py_round_int": (py_round_int_pub, py_round_int_blk),
         "csign_complex": (csign_complex_pub, csign_complex_blk),
+        "expm1": (expm1_pub, expm1_blk),
+        "log1p": (log1p_pub, log1p_blk),
         "print_int_list": (pil_pub, pil_blk),
         "print_char_list": (pcl_pub, pcl_blk),
         "print_real_list": (prl_pub, prl_blk),
@@ -20123,13 +20191,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.UnaryOp):
             return self._expr_real_kind_tag(node.operand)
         if isinstance(node, ast.Call):
-            if (
-                isinstance(node.func, ast.Attribute)
-                and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"float32", "float64"}
-                and len(node.args) >= 1
-            ):
-                return "real32" if node.func.attr == "float32" else "real64"
+            if self._is_numpy_call(node.func, {"float32", "float64"}) and len(node.args) >= 1:
+                return "real32" if self._numpy_call_attr(node.func) == "float32" else "real64"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype" and len(node.args) >= 1:
                 a0 = node.args[0]
                 if isinstance(a0, ast.Name):
@@ -21179,13 +21242,10 @@ class translator(ast.NodeVisitor):
                 "chr", "py_str", "py_ctime", "str_zfill", "str_ljust", "str_rjust", "to_lower", "to_upper", "str_strip", "str_lstrip", "str_rstrip", "str_replace", "str_join"
             }:
                 return "char"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"float32", "float64"}
-                and len(node.args) >= 1
-            ):
+            if self._is_numpy_call(node.func, {"float32", "float64"}) and len(node.args) >= 1:
                 return "real"
+            if self._is_numpy_call(node.func, {"int8", "int16", "int32", "int64"}) and len(node.args) >= 1:
+                return "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -21636,13 +21696,7 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return "int"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr in {"complex64", "complex128", "csingle", "cdouble"}
-                and len(node.args) >= 1
-            ):
+            if self._is_numpy_call(node.func, {"complex64", "complex128", "csingle", "cdouble"}) and len(node.args) >= 1:
                 return "complex"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -25643,6 +25697,17 @@ class translator(ast.NodeVisitor):
                         return _frank2
         if isinstance(node, ast.Call):
             np_attr = self._numpy_call_attr(node.func)
+            if (
+                np_attr in {
+                    "float32", "float64", "int8", "int16", "int32", "int64",
+                    "complex64", "complex128", "csingle", "cdouble",
+                }
+                and len(node.args) >= 1
+            ):
+                # A dtype-cast constructor is shape-preserving: same rank as
+                # its own argument, whether called as np.X(...) or via a
+                # bare `from numpy import X` import.
+                return self._rank_expr(node.args[0])
             if np_attr in {"all", "any", "prod", "count_nonzero", "sum", "min", "max"} and len(node.args) >= 1:
                 r0 = self._rank_expr(node.args[0])
                 axis_node = None
@@ -26062,7 +26127,7 @@ class translator(ast.NodeVisitor):
                     return max(2, self._rank_expr(node.args[0]))
                 if node.func.attr == "atleast_3d" and len(node.args) >= 1:
                     return max(3, self._rank_expr(node.args[0]))
-                if node.func.attr in {"log1p", "nan_to_num"} and len(node.args) >= 1:
+                if node.func.attr in {"log1p", "nan_to_num", "float32", "float64", "int8", "int16", "int32", "int64"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"pad", "roll", "flip", "flipud", "copy", "empty_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -30056,9 +30121,13 @@ class translator(ast.NodeVisitor):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
                 if len(node.args) == 1:
-                    if k0 in {"int", "logical"}:
+                    if k0 == "int":
                         # round() on an int returns that same int unchanged.
                         return a0
+                    if k0 == "logical":
+                        # round(bool) returns 0/1 as an int in Python, not
+                        # the bool itself.
+                        return f"merge(1, 0, {a0})"
                     return f"py_round_int({a0})"
                 def _const_int_ndigits(n):
                     # A negative literal parses as UnaryOp(USub, Constant),
@@ -30077,7 +30146,13 @@ class translator(ast.NodeVisitor):
 
                 nd = _const_int_ndigits(node.args[1]) if len(node.args) == 2 else None
                 if nd is not None:
-                    a0r = a0 if k0 == "real" else f"real({a0}, kind=dp)"
+                    if k0 == "real":
+                        a0r = a0
+                    elif k0 == "logical":
+                        # REAL() doesn't accept a LOGICAL argument directly.
+                        a0r = f"real(merge(1, 0, {a0}), kind=dp)"
+                    else:
+                        a0r = f"real({a0}, kind=dp)"
                     rounded = f"py_round_ndigits({a0r}, {nd})"
                     if k0 in {"int", "logical"}:
                         # round(some_int, ndigits) still returns an int in
@@ -30155,15 +30230,22 @@ class translator(ast.NodeVisitor):
                 # zero-argument call like the constant form rather than treating
                 # it as an unsupported function call.
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr in {"float32", "float64"}
-                and len(node.args) == 1
-            ):
-                _kind = "sp" if node.func.attr == "float32" else "dp"
+            if self._is_numpy_call(node.func, {"float32", "float64"}) and len(node.args) == 1:
+                _attr = self._numpy_call_attr(node.func)
+                _kind = "sp" if _attr == "float32" else "dp"
                 return f"real({self.expr(node.args[0])}, kind={_kind})"
+            if self._is_numpy_call(node.func, {"int8", "int16", "int32", "int64"}) and len(node.args) == 1:
+                # A truncating cast to a fixed-width integer kind. Fortran's
+                # own INT(x, kind=...) already matches numpy's own runtime
+                # narrowing behavior exactly, including two's-complement
+                # wraparound on an out-of-range value (confirmed directly:
+                # int(300_int32, kind=int8) and np.int8(np.int64(300)) both
+                # give 44; int(-130, kind=int8) and np.int8(np.int64(-130))
+                # both give 126) -- no custom helper needed.
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "logical":
+                    a0 = f"merge(1, 0, {a0})"
+                return f"int({a0}, kind={self._numpy_call_attr(node.func)})"
             if isinstance(node.func, ast.Name) and node.func.id == "complex":
                 if len(node.args) == 2:
                     return f"cmplx(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp), kind=dp)"
@@ -30900,13 +30982,7 @@ class translator(ast.NodeVisitor):
                 if keepdims:
                     return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
                 return reduced
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr in {"complex64", "complex128", "csingle", "cdouble"}
-                and len(node.args) >= 1
-            ):
+            if self._is_numpy_call(node.func, {"complex64", "complex128", "csingle", "cdouble"}) and len(node.args) >= 1:
                 return f"cmplx({self.expr(node.args[0])}, kind=dp)"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -31590,7 +31666,10 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "log1p"
                 and len(node.args) >= 1
             ):
-                return f"log(1.0_dp + {self.expr(node.args[0])})"
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"log1p({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -33488,8 +33567,8 @@ class translator(ast.NodeVisitor):
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 if node.func.attr == "expm1":
-                    return f"(exp({a0}) - 1.0_dp)"
-                return f"log(1.0_dp + ({a0}))"
+                    return f"expm1({a0})"
+                return f"log1p({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -34483,10 +34562,12 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
+                if node.func.attr in {"expm1", "log1p"} and self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
                 if node.func.attr == "expm1":
-                    return f"(exp({a0}) - 1.0_dp)"
+                    return f"expm1({a0})"
                 if node.func.attr == "log1p":
-                    return f"log(1.0_dp + ({a0}))"
+                    return f"log1p({a0})"
                 return f"sinc_scalar({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -63304,7 +63385,7 @@ def generate_flat(
         if _tree_uses_scipy_minimize_powell(_proc_use_scan_tree):
             om.w("use powell_bridge_mod, only: powell_user_fn, powell_minimize")
         om.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan, ieee_positive_inf, ieee_negative_inf")
-        om.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
+        om.w("use, intrinsic :: iso_fortran_env, only: real32, real64, int8, int16, int32, int64")
         om.w("implicit none")
         om.w("private")
         om.w("integer, parameter :: sp = real32")
@@ -63761,7 +63842,7 @@ def generate_flat(
     # per program/module unit when its own body has no ieee symbols.
     o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan, ieee_positive_inf, ieee_negative_inf")
     if not use_proc_module:
-        o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
+        o.w("use, intrinsic :: iso_fortran_env, only: real32, real64, int8, int16, int32, int64")
     o.w("implicit none")
     if not use_proc_module:
         o.w("integer, parameter :: sp = real32")
@@ -64169,7 +64250,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
         if syms:
             o.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
     o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan, ieee_positive_inf, ieee_negative_inf")
-    o.w("use, intrinsic :: iso_fortran_env, only: real32, real64")
+    o.w("use, intrinsic :: iso_fortran_env, only: real32, real64, int8, int16, int32, int64")
     o.w("implicit none")
     o.w("integer, parameter :: sp = real32")
     o.w("integer, parameter :: dp = real64")
