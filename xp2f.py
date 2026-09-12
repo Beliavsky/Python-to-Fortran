@@ -12230,6 +12230,25 @@ def detect_needed_helpers(tree):
             ):
                 needed.add(node.func.attr)
                 needed.add(node.func.attr + "_complex")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"amax", "amin", "max", "min"}
+            ):
+                # Conservative: kind isn't known at this syntactic pre-pass,
+                # so request both complex-reduction helpers whenever any of
+                # these appear on a numpy-qualified call.
+                needed.add("complex_amax")
+                needed.add("complex_amin")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"max", "min"}
+                and len(node.args) == 0
+            ):
+                # arr.max()/arr.min() method-call form -- same conservative
+                # over-request as above (kind isn't known here).
+                needed.add("complex_amax")
+                needed.add("complex_amin")
             if isinstance(node.func, ast.Name) and node.func.id == "set":
                 needed.add("unique_char")
                 needed.add("unique_int")
@@ -15260,6 +15279,54 @@ def runtime_helper_templates():
          y = log(cmplx(1.0_dp, 0.0_dp, kind=dp) + x)
       end function log1p_complex"""
 
+    complex_amax_pub = (
+        "public :: complex_amax !@pyapi kind=function ret=complex(dp) "
+        "args=arr:complex(dp)(:):intent(in) "
+        "desc=\"np.amax/np.max on a complex array: numpy orders complex values "
+        "lexicographically (real part first, then imaginary part as a tiebreak), "
+        "which MAXVAL can't do since it rejects complex operands entirely\""
+    )
+
+    complex_amax_blk = """      function complex_amax(arr) result(m)
+         ! Adapted from pyccel's own amax_4/amax_8
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         complex(kind=dp), intent(in) :: arr(:)
+         complex(kind=dp) :: m
+         complex(kind=dp) :: a
+         integer :: i
+         m = arr(1)
+         do i = 2, size(arr)
+            a = arr(i)
+            if (real(a, kind=dp) > real(m, kind=dp) .or. &
+                (real(a, kind=dp) == real(m, kind=dp) .and. aimag(a) > aimag(m))) then
+               m = a
+            end if
+         end do
+      end function complex_amax"""
+
+    complex_amin_pub = (
+        "public :: complex_amin !@pyapi kind=function ret=complex(dp) "
+        "args=arr:complex(dp)(:):intent(in) "
+        "desc=\"np.amin/np.min on a complex array: numpy orders complex values "
+        "lexicographically (real part first, then imaginary part as a tiebreak), "
+        "which MINVAL can't do since it rejects complex operands entirely\""
+    )
+
+    complex_amin_blk = """      function complex_amin(arr) result(m)
+         complex(kind=dp), intent(in) :: arr(:)
+         complex(kind=dp) :: m
+         complex(kind=dp) :: a
+         integer :: i
+         m = arr(1)
+         do i = 2, size(arr)
+            a = arr(i)
+            if (real(a, kind=dp) < real(m, kind=dp) .or. &
+                (real(a, kind=dp) == real(m, kind=dp) .and. aimag(a) < aimag(m))) then
+               m = a
+            end if
+         end do
+      end function complex_amin"""
+
     math_remainder_pub = (
         "public :: math_remainder !@pyapi kind=function ret=real(dp) "
         "args=x:real(dp):intent(in),y:real(dp):intent(in) "
@@ -16325,6 +16392,8 @@ def runtime_helper_templates():
         "log1p": (log1p_pub, log1p_blk),
         "expm1_complex": (expm1_complex_pub, expm1_complex_blk),
         "log1p_complex": (log1p_complex_pub, log1p_complex_blk),
+        "complex_amax": (complex_amax_pub, complex_amax_blk),
+        "complex_amin": (complex_amin_pub, complex_amin_blk),
         "math_remainder": (math_remainder_pub, math_remainder_blk),
         "print_int_list": (pil_pub, pil_blk),
         "print_char_list": (pcl_pub, pcl_blk),
@@ -19870,15 +19939,29 @@ class translator(ast.NodeVisitor):
 
     def _norm_expr(self, node):
         a0 = self.expr(node.args[0])
-        if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
+        if self._rank_expr(node.args[0]) == 0:
+            # A scalar is norm'd as a 1-element vector: norm(x) == abs(x)
+            # (real numpy only accepts a bare, no-ord/no-axis call for a
+            # scalar at all -- an explicit ord/axis raises ValueError --
+            # so ord/axis aren't considered here). Unconditionally
+            # coerces int/logical to real, since Python's norm() always
+            # returns a float even for an int input (norm(4) == 4.0).
+            k0 = self._expr_kind(node.args[0])
+            if k0 in {"int", "logical"}:
+                a0 = f"real({a0}, kind=dp)"
+            return f"abs({a0})"
+        if self._expr_kind(node.args[0]) in {"int", "logical"}:
             a0 = f"real({a0}, kind=dp)"
         ord_node = node.args[1] if len(node.args) >= 2 else None
         axis_node = None
+        keepdims = False
         for kw in node.keywords:
             if kw.arg == "ord":
                 ord_node = kw.value
             elif kw.arg == "axis":
                 axis_node = kw.value
+            elif kw.arg == "keepdims":
+                keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
         ord_is_fro = bool(is_const_str(ord_node) and str(ord_node.value).lower() in {"fro", "f"})
         ord_is_two = bool(
             isinstance(ord_node, ast.Constant)
@@ -19889,6 +19972,12 @@ class translator(ast.NodeVisitor):
             isinstance(ord_node, ast.Constant)
             and isinstance(ord_node.value, (int, float))
             and abs(float(ord_node.value) - 1.0) <= 0.0
+        )
+        ord_is_zero = bool(
+            isinstance(ord_node, ast.Constant)
+            and isinstance(ord_node.value, (int, float))
+            and not isinstance(ord_node.value, bool)
+            and abs(float(ord_node.value)) <= 0.0
         )
         ord_is_posinf = bool(
             isinstance(ord_node, ast.Attribute)
@@ -19904,24 +19993,57 @@ class translator(ast.NodeVisitor):
             and is_numpy_name_node(ord_node.operand.value)
             and ord_node.operand.attr == "inf"
         )
+        # abs(a0)**2 (not (a0)**2) is what actually matches norm's own
+        # definition for a COMPLEX a0 -- (a0)**2 for a complex value is
+        # itself complex (e.g. (1+2j)**2 == -3+4j), not |a0|**2, so the
+        # old formula both computed the wrong magnitude and left the
+        # whole sqrt(sum(...)) expression complex-typed instead of real.
+        # abs() of a real value squares identically to the value itself,
+        # so this is exactly equivalent to the old formula for real input
+        # and only changes (fixes) the complex case.
+        sq_term = f"abs({a0})**2"
         if axis_node is not None:
             dim_expr = f"({self.expr(axis_node)} + 1)"
             if ord_node is None or ord_is_fro or ord_is_two:
-                return f"sqrt(sum(({a0})**2, dim={dim_expr}))"
-            if ord_is_posinf:
-                return f"maxval(abs({a0}), dim={dim_expr})"
-            if ord_is_neginf:
-                return f"minval(abs({a0}), dim={dim_expr})"
-            if ord_is_one:
-                return f"sum(abs({a0}), dim={dim_expr})"
-            return f"sum(abs({a0}), dim={dim_expr})"
+                reduced = f"sqrt(sum({sq_term}, dim={dim_expr}))"
+            elif ord_is_posinf:
+                reduced = f"maxval(abs({a0}), dim={dim_expr})"
+            elif ord_is_neginf:
+                reduced = f"minval(abs({a0}), dim={dim_expr})"
+            elif ord_is_one:
+                reduced = f"sum(abs({a0}), dim={dim_expr})"
+            elif ord_is_zero:
+                reduced = f"real(count({a0} /= 0, dim={dim_expr}), kind=dp)"
+            else:
+                _ord_txt = self.expr(ord_node)
+                if self._expr_kind(ord_node) in {"int", "logical"}:
+                    _ord_txt = f"real({_ord_txt}, kind=dp)"
+                # General (Minkowski) p-norm: (sum(|x|**p))**(1/p) -- the
+                # only correct formula for an arbitrary ord (previously
+                # every ord not equal to 1/2/0/+-inf/"fro" silently fell
+                # through to the ord=1 formula regardless of its actual
+                # value).
+                reduced = f"(sum(abs({a0})**({_ord_txt}), dim={dim_expr}))**(1.0_dp/({_ord_txt}))"
+            if keepdims:
+                # keepdims=True keeps the reduced axis as a size-1
+                # dimension rather than dropping it -- matches the
+                # _rank_expr side's own keepdims handling above.
+                return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+            return reduced
         if ord_node is None or ord_is_fro or ord_is_two:
-            return f"sqrt(sum(({a0})**2))"
+            return f"sqrt(sum({sq_term}))"
         if ord_is_posinf:
             return f"maxval(abs({a0}))"
         if ord_is_neginf:
             return f"minval(abs({a0}))"
-        return f"sum(abs({a0}))"
+        if ord_is_one:
+            return f"sum(abs({a0}))"
+        if ord_is_zero:
+            return f"real(count({a0} /= 0), kind=dp)"
+        _ord_txt = self.expr(ord_node)
+        if self._expr_kind(ord_node) in {"int", "logical"}:
+            _ord_txt = f"real({_ord_txt}, kind=dp)"
+        return f"(sum(abs({a0})**({_ord_txt})))**(1.0_dp/({_ord_txt}))"
 
     def _coerce_local_actual_rank(self, callee, idx, arg_node, arg_expr, all_arg_nodes=None):
         if callee in self.local_generic_overloads:
@@ -20779,7 +20901,7 @@ class translator(ast.NodeVisitor):
         pos_idx = None
         if attr in {"full", "full_like"} and len(call_node.args) >= 3:
             pos_idx = 2
-        elif attr in {"zeros", "ones", "empty", "zeros_like", "ones_like"} and len(call_node.args) >= 2:
+        elif attr in {"zeros", "ones", "empty", "zeros_like", "ones_like", "empty_like"} and len(call_node.args) >= 2:
             pos_idx = 1
         if pos_idx is not None:
             dnode = call_node.args[pos_idx]
@@ -21630,7 +21752,27 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"copy", "empty_like", "flipud"}
+                and node.func.attr == "empty_like"
+                and len(node.args) >= 1
+            ):
+                # Unlike copy/flipud (which never take a dtype=), empty_like
+                # accepts one -- previously always ignored here, falling
+                # back to the input array's own kind even when a
+                # different dtype was explicitly requested.
+                dtype_txt = self._np_dtype_text(node)
+                if "complex" in dtype_txt:
+                    return "complex"
+                if "bool" in dtype_txt:
+                    return "logical"
+                if "int" in dtype_txt:
+                    return "int"
+                if "float" in dtype_txt:
+                    return "real"
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"copy", "flipud"}
                 and len(node.args) >= 1
             ):
                 return self._expr_kind(node.args[0])
@@ -22246,12 +22388,18 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"zeros_like", "ones_like"}
+                and node.func.attr in {"zeros_like", "ones_like", "full_like"}
                 and len(node.args) >= 1
             ):
                 dtype_txt = self._np_dtype_text(node)
                 if "complex" in dtype_txt:
                     return "complex"
+                if "bool" in dtype_txt:
+                    return "logical"
+                if "int" in dtype_txt:
+                    return "int"
+                if "float" in dtype_txt:
+                    return "real"
                 return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -22521,8 +22669,39 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"eye", "identity", "linspace"}
+                and node.func.attr == "linspace"
             ):
+                # linspace accepts an explicit dtype= (e.g. dtype=np.int32
+                # truncates each generated value to an int) -- previously
+                # ignored entirely, always declaring the result real.
+                dtype_txt = self._np_dtype_text(node)
+                if "int" in dtype_txt:
+                    return "int"
+                if "complex" in dtype_txt:
+                    return "complex"
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"eye", "identity"}
+            ):
+                # eye/identity accept a dtype= too -- previously ignored,
+                # always declaring the result real. Only "int" is
+                # handled: the underlying eye()/identity() helper always
+                # produces a real array regardless of the requested
+                # dtype, and Fortran's own implicit real->int conversion
+                # on assignment happens to make that work correctly for
+                # an int target (every element is an exact 0.0/1.0) --
+                # but there's no equivalent implicit real->logical
+                # conversion, so claiming "logical" here without also
+                # teaching the codegen call site to wrap the result in an
+                # explicit (eye(...) /= 0) would trade a silently-wrong
+                # value for a compile-time crash instead. Left as a
+                # documented gap rather than fixed.
+                dtype_txt = self._np_dtype_text(node)
+                if "int" in dtype_txt:
+                    return "int"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -22574,6 +22753,13 @@ class translator(ast.NodeVisitor):
                 and node.func.value.id == "np"
                 and node.func.attr in {"logspace", "geomspace"}
             ):
+                # Same dtype= gap as linspace above -- previously ignored,
+                # always declaring the result real.
+                dtype_txt = self._np_dtype_text(node)
+                if "int" in dtype_txt:
+                    return "int"
+                if "complex" in dtype_txt:
+                    return "complex"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -25980,13 +26166,22 @@ class translator(ast.NodeVisitor):
                 or self._is_linalg_call(node.func, {"norm"})
             ) and len(node.args) >= 1:
                 axis_node = None
+                keepdims = False
                 if len(node.args) >= 3:
                     axis_node = node.args[2]
                 for kw in node.keywords:
                     if kw.arg == "axis":
                         axis_node = kw.value
-                        break
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is not None:
+                    if keepdims:
+                        # keepdims=True keeps the reduced axis as a
+                        # size-1 dimension rather than dropping it -- the
+                        # result stays at the input's own rank, not
+                        # input_rank - 1 (which is only correct without
+                        # keepdims).
+                        return self._rank_expr(node.args[0])
                     return max(0, self._rank_expr(node.args[0]) - 1)
                 return 0
             if isinstance(node.func, ast.Attribute) and node.func.attr == "split":
@@ -30114,6 +30309,9 @@ class translator(ast.NodeVisitor):
                         return f"var_1d({base_expr})"
                     return f"var_1d({base_expr}, {self.expr(ddof_node)})"
                 if attr == "min":
+                    if self._expr_kind(node.func.value) == "complex":
+                        # MINVAL doesn't accept complex operands.
+                        return f"complex_amin({base_expr})"
                     axis_node = None
                     keepdims = False
                     for kw in getattr(node, "keywords", []):
@@ -30129,6 +30327,9 @@ class translator(ast.NodeVisitor):
                         return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
                     return reduced
                 if attr == "max":
+                    if self._expr_kind(node.func.value) == "complex":
+                        # MAXVAL doesn't accept complex operands.
+                        return f"complex_amax({base_expr})"
                     axis_node = None
                     keepdims = False
                     for kw in getattr(node, "keywords", []):
@@ -31219,6 +31420,9 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex":
+                    # MAXVAL doesn't accept complex operands.
+                    return f"complex_amax({a0})"
                 axis_node = None
                 keepdims = False
                 for kw in node.keywords:
@@ -32319,6 +32523,12 @@ class translator(ast.NodeVisitor):
             if np_attr in {"sum", "min", "max"} and len(node.args) >= 1:
                 a0 = self.expr(node.args[0])
                 op = {"sum": "sum", "min": "minval", "max": "maxval"}[np_attr]
+                is_complex_minmax = np_attr in {"min", "max"} and self._expr_kind(node.args[0]) == "complex"
+                if is_complex_minmax:
+                    # MAXVAL/MINVAL don't accept complex operands -- numpy
+                    # orders complex values lexicographically (real part
+                    # first, then imaginary as a tiebreak).
+                    op = "complex_amax" if np_attr == "max" else "complex_amin"
                 axis_node = None
                 keepdims = False
                 if len(node.args) >= 2:
@@ -32330,6 +32540,14 @@ class translator(ast.NodeVisitor):
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is None:
                     return f"{op}({a0})"
+                if is_complex_minmax:
+                    # complex_amax/complex_amin only take a rank-1 array;
+                    # axis-wise reduction on a complex array isn't supported.
+                    dim_expr = f"({self.expr(axis_node)} + 1)"
+                    reduced = f"{op}({a0})"
+                    if keepdims:
+                        return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                    return reduced
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 reduced = f"{op}({a0}, dim={dim_expr})"
                 if keepdims:
@@ -32508,15 +32726,42 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "full_like" and len(node.args) >= 2:
                     a0 = self.expr(node.args[0])
                     fill = self.expr(node.args[1])
+                    dtype_txt = self._np_dtype_text(node)
+                    fill_is_logical = "bool" in dtype_txt or (
+                        not dtype_txt and self._expr_kind(node.args[1]) == "logical"
+                    )
+                    if fill_is_logical:
+                        # `fill + 0*a0` (the general numeric broadcast
+                        # trick below) is invalid Fortran for a LOGICAL
+                        # fill value -- +/* aren't defined on LOGICAL at
+                        # all. MERGE broadcasts scalar TSOURCE/FSOURCE
+                        # arguments across an array-shaped MASK, so an
+                        # always-true, a0-shaped mask (built by comparing
+                        # a0 to itself with whatever equality operator
+                        # matches ITS OWN kind, independent of the fill
+                        # value's kind) gives exactly the right shape.
+                        a0_kind = self._expr_kind(node.args[0])
+                        eq_op = ".eqv." if a0_kind == "logical" else "=="
+                        return f"merge({fill}, {fill}, ({a0} {eq_op} {a0}))"
                     return f"({fill} + 0*{a0})"
                 if node.func.attr == "clip":
                     a0 = self.expr(node.args[0])
+                    a0_kind = self._expr_kind(node.args[0])
                     lo = "(-huge(1.0_dp))"
                     hi = "huge(1.0_dp)"
+                    # MAX/MIN require every argument to share one exact
+                    # type -- an int-literal bound (e.g. np.clip(a, 0, 10)
+                    # on a real array a) previously passed straight
+                    # through unconverted, a type mismatch against a0's
+                    # own (real) kind.
                     if len(node.args) >= 2 and not is_none(node.args[1]):
                         lo = self.expr(node.args[1])
+                        if a0_kind == "real" and self._expr_kind(node.args[1]) in {"int", "logical"}:
+                            lo = f"real({lo}, kind=dp)"
                     if len(node.args) >= 3 and not is_none(node.args[2]):
                         hi = self.expr(node.args[2])
+                        if a0_kind == "real" and self._expr_kind(node.args[2]) in {"int", "logical"}:
+                            hi = f"real({hi}, kind=dp)"
                     return f"min(max({a0}, {lo}), {hi})"
                 if node.func.attr == "linspace" and len(node.args) >= 3:
                     start_node = node.args[0]
@@ -32531,28 +32776,45 @@ class translator(ast.NodeVisitor):
                         a1 = f"real({a1}, kind=dp)"
                     return f"linspace({a0}, {a1}, {num_i})"
                 if node.func.attr == "logspace" and len(node.args) >= 2:
-                    start = self.expr(node.args[0])
-                    stop = self.expr(node.args[1])
+                    start_node = node.args[0]
+                    stop_node = node.args[1]
+                    start = self.expr(start_node)
+                    stop = self.expr(stop_node)
+                    if self._expr_kind(start_node) != "real":
+                        start = f"real({start}, kind=dp)"
+                    if self._expr_kind(stop_node) != "real":
+                        stop = f"real({stop}, kind=dp)"
                     num = "50"
                     endpoint = ".true."
                     base = "10.0_dp"
+                    base_node = None
                     if len(node.args) >= 3:
                         num = self.expr(node.args[2])
                     if len(node.args) >= 4:
                         endpoint = self.expr(node.args[3])
                     if len(node.args) >= 5:
-                        base = self.expr(node.args[4])
+                        base_node = node.args[4]
                     for kw in node.keywords:
                         if kw.arg == "num":
                             num = self.expr(kw.value)
                         elif kw.arg == "endpoint":
                             endpoint = self.expr(kw.value)
                         elif kw.arg == "base":
-                            base = self.expr(kw.value)
+                            base_node = kw.value
+                    if base_node is not None:
+                        base = self.expr(base_node)
+                        if self._expr_kind(base_node) != "real":
+                            base = f"real({base}, kind=dp)"
                     return f"logspace({start}, {stop}, int({num}), {endpoint}, {base})"
                 if node.func.attr == "geomspace" and len(node.args) >= 2:
-                    start = self.expr(node.args[0])
-                    stop = self.expr(node.args[1])
+                    start_node = node.args[0]
+                    stop_node = node.args[1]
+                    start = self.expr(start_node)
+                    stop = self.expr(stop_node)
+                    if self._expr_kind(start_node) != "real":
+                        start = f"real({start}, kind=dp)"
+                    if self._expr_kind(stop_node) != "real":
+                        stop = f"real({stop}, kind=dp)"
                     num = "50"
                     endpoint = ".true."
                     if len(node.args) >= 3:
@@ -34889,6 +35151,11 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex":
+                    # MAXVAL/MINVAL don't accept complex operands at all
+                    # -- numpy orders complex values lexicographically
+                    # (real part first, then imaginary as a tiebreak).
+                    return f"{'complex_amax' if node.func.attr == 'amax' else 'complex_amin'}({a0})"
                 fn = "maxval" if node.func.attr == "amax" else "minval"
                 return f"{fn}({a0})"
             if (
@@ -36633,8 +36900,26 @@ class translator(ast.NodeVisitor):
                 ):
                     outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
                     if len(outs) >= 2:
-                        self._mark_alloc_int(outs[0], rank=1)
-                        self._mark_alloc_int(outs[1], rank=1)
+                        # np.divmod broadcasts like any other numpy ufunc: a
+                        # scalar-input call (e.g. divmod(17, 5)) returns a
+                        # scalar (q, r) pair, not an array -- only an
+                        # array-shaped input actually returns arrays.
+                        # Unconditionally marking both outputs as rank-1
+                        # arrays here previously overrode the correct
+                        # scalar classification the OTHER (scalar-only)
+                        # np.divmod prescan handler elsewhere in this
+                        # function had already made, crashing at runtime
+                        # ("Assignment of scalar to unallocated array").
+                        _dm_rank = max(
+                            self._rank_expr(node.value.args[0]) if len(node.value.args) >= 1 else 0,
+                            self._rank_expr(node.value.args[1]) if len(node.value.args) >= 2 else 0,
+                        )
+                        if _dm_rank >= 1:
+                            self._mark_alloc_int(outs[0], rank=_dm_rank)
+                            self._mark_alloc_int(outs[1], rank=_dm_rank)
+                        else:
+                            self._mark_int(outs[0])
+                            self._mark_int(outs[1])
                         continue
                 if (
                     len(node.targets) == 1

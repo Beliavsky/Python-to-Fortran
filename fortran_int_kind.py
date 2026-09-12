@@ -113,6 +113,31 @@ def _scan_external_boundary_calls() -> frozenset:
                     if nm_m and nm_m.group(1).lower() in arg_names:
                         names.add(unit["name"].lower())
                         break
+        # A call site never spells out argsort_int/argsort_real (the
+        # concrete procedures just found above) -- it calls the GENERIC
+        # interface name (`call argsort(...)`, resolved to whichever
+        # concrete procedure matches at compile time), which is a
+        # different name entirely and was invisible to the scan above
+        # (an `interface NAME ... end interface` block is neither a
+        # `subroutine` nor a `function` unit). If any of an interface's
+        # own module procedures already has a bare-integer dummy (i.e.
+        # is already in `names`), the interface's own name is just as
+        # much an external boundary call as they are.
+        for m_if in re.finditer(
+            r"^\s*interface\s+([A-Za-z_]\w*)\s*$(.*?)^\s*end\s+interface\b",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        ):
+            iface_name = m_if.group(1).lower()
+            body = m_if.group(2)
+            concrete = set()
+            for m_mp in re.finditer(r"^\s*module\s+procedure\s+(.+)$", body, flags=re.IGNORECASE | re.MULTILINE):
+                for nm in m_mp.group(1).split(","):
+                    nm = nm.strip().lower()
+                    if nm:
+                        concrete.add(nm)
+            if concrete & names:
+                names.add(iface_name)
         del src_lines
 
     _boundary_calls_cache = frozenset(names)

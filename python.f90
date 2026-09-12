@@ -383,6 +383,9 @@ public :: math_remainder !@pyapi kind=function ret=real(dp) args=x:real(dp):inte
 public :: expm1_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.expm1 for complex input: exp(x) - 1, precise for small abs(real(x))"
 public :: log1p_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.log1p for complex input: log(1 + x)"
 
+public :: complex_amin !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) desc="np.amin/np.min on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MINVAL can't do since it rejects complex operands entirely"
+public :: complex_amax !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) desc="np.amax/np.max on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MAXVAL can't do since it rejects complex operands entirely"
+
 interface cumsum
    module procedure cumsum_real, cumsum_int
 end interface cumsum
@@ -8110,5 +8113,37 @@ contains
          complex(kind=dp) :: y
          y = log(cmplx(1.0_dp, 0.0_dp, kind=dp) + x)
       end function log1p_complex
+
+      function complex_amin(arr) result(m)
+         complex(kind=dp), intent(in) :: arr(:)
+         complex(kind=dp) :: m
+         complex(kind=dp) :: a
+         integer :: i
+         m = arr(1)
+         do i = 2, size(arr)
+            a = arr(i)
+            if (real(a, kind=dp) < real(m, kind=dp) .or. &
+                (real(a, kind=dp) == real(m, kind=dp) .and. aimag(a) < aimag(m))) then
+               m = a
+            end if
+         end do
+      end function complex_amin
+
+      function complex_amax(arr) result(m)
+         ! Adapted from pyccel's own amax_4/amax_8
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         complex(kind=dp), intent(in) :: arr(:)
+         complex(kind=dp) :: m
+         complex(kind=dp) :: a
+         integer :: i
+         m = arr(1)
+         do i = 2, size(arr)
+            a = arr(i)
+            if (real(a, kind=dp) > real(m, kind=dp) .or. &
+                (real(a, kind=dp) == real(m, kind=dp) .and. aimag(a) > aimag(m))) then
+               m = a
+            end if
+         end do
+      end function complex_amax
 
 end module python_mod
