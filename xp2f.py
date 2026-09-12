@@ -10564,6 +10564,25 @@ def combine_parenthesized_integer_offset(lines):
     pat = re.compile(r"(?<![\w])\(([^()]+?)\s*([+\-])\s*(\d+)\)\s*([+\-])\s*(\d+)(?!\.\d|_)")
 
     def _repl(m):
+        # Guard first: `(A) op2 lit2 -> (A op2 lit2)` is only a valid fold
+        # when the parenthesized group is itself a standalone additive term
+        # in its surrounding context -- i.e. nothing outside multiplies/
+        # divides it, or subtracts it as a unit (which would need every
+        # term inside it to flip sign, not just have lit2 folded in as-is).
+        # `2 * (x + 6) - 3` is NOT `2 * (x + 6 - 3)` (found via a pyccel-
+        # test-suite class repro: `2 * (p.x + 6) - 2` silently miscomputed);
+        # nor is `n - (x + 6) - 3` the same as `n - (x + 6 - 3)` (the
+        # trailing -3 would need to become +3 once distributed through
+        # that leading minus). Preceded by `+`, `(`, `,`, `=`, or nothing
+        # (start of expression) is safe -- the group is a plain additive
+        # term there, so combining the trailing op2/lit2 into it holds.
+        s = m.string
+        p0 = m.start() - 1
+        while p0 >= 0 and s[p0].isspace():
+            p0 -= 1
+        prev_ch0 = s[p0] if p0 >= 0 else ""
+        if prev_ch0 in "*/-":
+            return m.group(0)
         inner, op1, lit1, op2, lit2 = m.groups()
         v1 = int(lit1) if op1 == "+" else -int(lit1)
         v2 = int(lit2) if op2 == "+" else -int(lit2)
@@ -10580,7 +10599,6 @@ def combine_parenthesized_integer_offset(lines):
         # the entire content of an enclosing paren pair), the wrapping
         # parens are redundant -- e.g. `slice1(..., (n + 2) - 1, ...)` ->
         # `slice1(..., n + 1, ...)`.
-        s = m.string
         p = m.start() - 1
         while p >= 0 and s[p].isspace():
             p -= 1
@@ -14823,6 +14841,45 @@ def collect_dataclass_info(tree):
             return _is_dataclass_decorator(d.func)
         return False
 
+    def _literal_field_default(v):
+        """A field initialized directly from a literal, e.g. `self._x = 10`
+        or `self._default = 0` -- rather than passed straight through from
+        an __init__ parameter -- is common (pyccel's own ArrProperties/
+        pep526.py test classes both use it) but wasn't recognized at all
+        before: collect_dataclass_info's plain-class scan only accepted a
+        bare `self.field = param_name` RHS, so any class with even one
+        such literal-initialized field was silently rejected as
+        "not struct-shaped" (`ok = False`), meaning every method on it
+        failed later with an unrelated-looking "unsupported call" once
+        code tried to construct an instance. Returns (kind, rank=0,
+        Fortran literal text) for a bool/int/float literal (optionally
+        negated), else None. String literals are deliberately not
+        supported here -- a `character(len=:), allocatable` component's
+        own default-initializer rules are more involved and no test
+        needs it yet."""
+        node = v
+        neg = False
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            neg = isinstance(node.op, ast.USub)
+            node = node.operand
+        if not isinstance(node, ast.Constant):
+            return None
+        val = node.value
+        if isinstance(val, bool):
+            if neg:
+                # `-True`/`-False` -- Python itself promotes this to an
+                # int (bool is an int subclass), not a logical negation;
+                # not a realistic literal-default shape either way.
+                return None
+            return ("logical", 0, ".true." if val else ".false.")
+        if isinstance(val, int):
+            n = -val if neg else val
+            return ("int", 0, str(n))
+        if isinstance(val, float):
+            n = -val if neg else val
+            return ("real", 0, f"{n!r}_dp")
+        return None
+
     def _field_kind(ann):
         """Returns (kind, rank) for a recognized field annotation, else
         None. `rank` is 0 for a scalar. Beyond the original bare-scalar
@@ -14878,7 +14935,7 @@ def collect_dataclass_info(tree):
                     if k is None:
                         ok = False
                         break
-                    fields.append((st.target.id, k[0], k[1]))
+                    fields.append((st.target.id, k[0], k[1], None))
                     continue
                 # Keep subset strict for predictable lowering.
                 ok = False
@@ -14913,11 +14970,21 @@ def collect_dataclass_info(tree):
                     and isinstance(st.targets[0], ast.Attribute)
                     and isinstance(st.targets[0].value, ast.Name)
                     and st.targets[0].value.id == "self"
-                    and isinstance(st.value, ast.Name)
-                    and st.value.id in pmap
                 ):
-                    fields.append((st.targets[0].attr, pmap[st.value.id][0], pmap[st.value.id][1]))
-                    continue
+                    if isinstance(st.value, ast.Name) and st.value.id in pmap:
+                        fields.append((st.targets[0].attr, pmap[st.value.id][0], pmap[st.value.id][1], None))
+                        continue
+                    lit = _literal_field_default(st.value)
+                    if lit is not None:
+                        # Not constructor-configurable at all in the
+                        # original Python (the value never depends on any
+                        # __init__ parameter) -- carried as the derived
+                        # type component's own default initializer instead
+                        # (see _emit_type_defs), and never appears in the
+                        # constructor-call argument list (see the
+                        # user_class_types Call-lowering in expr()).
+                        fields.append((st.targets[0].attr, lit[0], lit[1], lit[2]))
+                        continue
                 if isinstance(st, ast.Pass):
                     continue
                 ok = False
@@ -14929,6 +14996,32 @@ def collect_dataclass_info(tree):
         type_components[tname] = fields
 
     return class_to_type, type_components
+
+
+def user_class_ann_text(ann):
+    """Normalize a parameter/return annotation node to the bare class-name
+    text `user_class_types` is keyed by. Handles the two shapes actually
+    seen in pyccel's own test suite that a plain `ast.unparse(ann)` lookup
+    misses: a forward-ref STRING annotation (`a: "ArrProperties"` --
+    ast.unparse of a string Constant re-quotes it, so the naive lookup
+    compares `'ArrProperties'` against the bare `ArrProperties` key and
+    never matches -- confirmed via a repro built from pyccel's own
+    class_constness.py, where this silently dropped `a`'s struct-typed
+    parameter registration for any function other than a hoisted method's
+    own `self`, which is synthesized as a bare Name separately and so
+    never hit this path), and pyccel's own `Final[...]` read-only-self
+    convention (`self: "Final[ArrProperties]"`) wrapping the class name.
+    Returns None if `ann` is absent or ast.unparse isn't available."""
+    if ann is None or not hasattr(ast, "unparse"):
+        return None
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+        txt = ann.value.strip()
+    else:
+        txt = ast.unparse(ann).strip()
+    m = re.match(r"^Final\[(.*)\]$", txt)
+    if m:
+        txt = m.group(1).strip()
+    return txt
 
 
 def detect_scalar_outputs(tree, params):
@@ -21251,7 +21344,7 @@ class translator(ast.NodeVisitor):
                 _nm = self._aliased_name(node.value.id)
                 _tnm = self.dict_typed_vars.get(_nm)
                 if _tnm is not None:
-                    for _fnm, _fkind, _frank in self.structured_type_components.get(_tnm, []):
+                    for _fnm, _fkind, _frank, _fdefault in self.structured_type_components.get(_tnm, []):
                         if _fnm == node.attr and _frank == 0:
                             return _fkind
             return None
@@ -21359,7 +21452,7 @@ class translator(ast.NodeVisitor):
             ):
                 anm = self._aliased_name(node.value.id)
                 tnm = self.structured_array_types.get(anm, "")
-                for fnm, fkind, _frank in self.structured_type_components.get(tnm, []):
+                for fnm, fkind, _frank, _fdefault in self.structured_type_components.get(tnm, []):
                     if fnm == node.slice.value:
                         return fkind
             if (
@@ -26092,7 +26185,7 @@ class translator(ast.NodeVisitor):
             _nm2 = self._aliased_name(node.value.id)
             _tnm2 = self.dict_typed_vars.get(_nm2)
             if _tnm2 is not None:
-                for _fnm2, _fkind2, _frank2 in self.structured_type_components.get(_tnm2, []):
+                for _fnm2, _fkind2, _frank2, _fdefault2 in self.structured_type_components.get(_tnm2, []):
                     if _fnm2 == node.attr:
                         return _frank2
         if isinstance(node, ast.Call):
@@ -31073,7 +31166,17 @@ class translator(ast.NodeVisitor):
                     tnm = self.user_class_types[node.func.id]
                     args_nodes = list(node.args)
                     parts = []
-                    comps = [nm for nm, _, _ in self.structured_type_components.get(tnm, [])]
+                    # Only fields with no default initializer are actually
+                    # constructor parameters -- a literal-defaulted field
+                    # (`self._default = 0`, never derived from an __init__
+                    # argument) is invisible to the Python constructor call
+                    # too, so it must never consume one of args_nodes'
+                    # positions; it's left for the derived type's own
+                    # default (see _emit_type_defs) to supply.
+                    comps = [
+                        nm for nm, _, _, fdefault in self.structured_type_components.get(tnm, [])
+                        if fdefault is None
+                    ]
                     for i, a in enumerate(args_nodes):
                         ae = strip_redundant_outer_parens_expr(self.expr(a))
                         if i < len(comps):
@@ -36346,10 +36449,11 @@ class translator(ast.NodeVisitor):
                     tname = node.target.id
                     ann_txt = ast.unparse(node.annotation) if hasattr(ast, "unparse") else ""
                     low_ann = ann_txt.lower()
-                    if ann_txt in self.user_class_types:
-                        tnm = self.user_class_types[ann_txt]
+                    _class_ann_txt = user_class_ann_text(node.annotation)
+                    if _class_ann_txt is not None and _class_ann_txt in self.user_class_types:
+                        tnm = self.user_class_types[_class_ann_txt]
                         self.dict_typed_vars[tname] = tnm
-                        self.dict_var_components[tname] = [nm for nm, _, _ in self.structured_type_components.get(tnm, [])]
+                        self.dict_var_components[tname] = [nm for nm, _, _, _ in self.structured_type_components.get(tnm, [])]
                         self.ints.discard(tname)
                         self.reals.discard(tname)
                         self.logs.discard(tname)
@@ -36442,7 +36546,7 @@ class translator(ast.NodeVisitor):
                     tname = node.targets[0].id
                     tnm = self.user_class_types[node.value.func.id]
                     self.dict_typed_vars[tname] = tnm
-                    self.dict_var_components[tname] = [nm for nm, _, _ in self.structured_type_components.get(tnm, [])]
+                    self.dict_var_components[tname] = [nm for nm, _, _, _ in self.structured_type_components.get(tnm, [])]
                     self.ints.discard(tname)
                     self.reals.discard(tname)
                     self.logs.discard(tname)
@@ -40192,6 +40296,22 @@ class translator(ast.NodeVisitor):
                 self.o.pop()
                 self.o.w("end block")
                 continue
+            if isinstance(t, ast.Name):
+                # `del name` -- unbind a whole variable (as opposed to a
+                # single list/array element, handled above). For an
+                # allocatable array/list, actually free its storage
+                # (mirrors CPython's own list.__del__ freeing the
+                # underlying buffer); for a scalar or derived-type
+                # (class-instance) variable there's nothing meaningful to
+                # free -- Fortran's own scoping already reclaims the
+                # storage once the enclosing procedure returns, so this is
+                # a no-op. Any user-defined __del__ side effect is not
+                # modeled (matches this project's existing "decline rather
+                # than guess" stance on magic methods).
+                if self._rank_expr(t) >= 1:
+                    name_expr = self.expr(t)
+                    self.o.w(f"if (allocated({name_expr})) deallocate({name_expr})")
+                continue
             raise NotImplementedError("unsupported delete target")
 
     def visit_Assign(self, node):
@@ -40258,6 +40378,36 @@ class translator(ast.NodeVisitor):
                 "DataFrame_index_date frame (no time-of-day component to "
                 "begin with); this frame is DataFrame_index_datetime"
             )
+        if (
+            isinstance(t, ast.Attribute)
+            and isinstance(t.value, ast.Name)
+            and t.value.id in self.dict_typed_vars
+        ):
+            # obj.field = expr / self.field = expr -- a user-class (derived
+            # type) instance's own field assignment. Reads already resolve
+            # to `obj%field` (see expr()'s dict_typed_vars branch), but
+            # there was previously no matching write path at all -- every
+            # class method or driver script that ever mutated an instance
+            # attribute (rather than just reading one at construction time)
+            # hit "unsupported assign".
+            lhs_expr = f"{self.expr(t.value)}%{t.attr}"
+            tnm = self.dict_typed_vars[t.value.id]
+            field_kind = None
+            for fnm, fkind, _frank, _fdefault in self.structured_type_components.get(tnm, []):
+                if fnm == t.attr:
+                    field_kind = fkind
+                    break
+            rhs_txt = self.expr(v)
+            if (
+                field_kind == "logical"
+                and isinstance(v, ast.Constant)
+                and isinstance(v.value, int)
+                and not isinstance(v.value, bool)
+                and int(v.value) in {0, 1}
+            ):
+                rhs_txt = ".true." if int(v.value) == 1 else ".false."
+            self.o.w(f"{lhs_expr} = {rhs_txt}")
+            return
         if (
             isinstance(t, ast.Name)
             and t.id in self.pandas_df_vars
@@ -41096,7 +41246,7 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("structured np.array rows must be tuples/lists")
                 if len(row.elts) != len(fields):
                     raise NotImplementedError("structured np.array row width does not match dtype")
-                for j, (fname, _fkind, _frank) in enumerate(fields):
+                for j, (fname, _fkind, _frank, _fdefault) in enumerate(fields):
                     self.o.w(f"{t.id}({i})%{fname} = {self.expr(row.elts[j])}")
             return
 
@@ -47791,7 +47941,7 @@ class translator(ast.NodeVisitor):
                     tnm_iter = self.structured_array_types[anm_iter]
                     comp_names_iter = list(self.dict_type_components.get(tnm_iter, {}).keys())
                     if not comp_names_iter:
-                        comp_names_iter = [nm for nm, _, _ in self.structured_type_components.get(tnm_iter, [])]
+                        comp_names_iter = [nm for nm, _, _, _ in self.structured_type_components.get(tnm_iter, [])]
             # A bare `for x in ARR:`/`enumerate(ARR)` over a plain
             # variable, never mutated anywhere in the loop body, needs
             # no defensive copy at all -- ARR can be indexed directly,
@@ -52841,7 +52991,7 @@ def _emit_local_function(
         if tnm in (dict_type_components or {}):
             tr.dict_var_components[anm] = list((dict_type_components or {}).get(tnm, {}).keys())
         else:
-            tr.dict_var_components[anm] = [nm for nm, _, _ in tr.structured_type_components.get(tnm, [])]
+            tr.dict_var_components[anm] = [nm for nm, _, _, _ in tr.structured_type_components.get(tnm, [])]
         tr.ints.discard(anm)
         tr.reals.discard(anm)
         tr.alloc_ints.discard(anm)
@@ -57680,8 +57830,8 @@ def _emit_local_function(
             }
         ):
             ret_decl = "complex(kind=dp)"
-        elif fn.returns is not None and hasattr(ast, "unparse") and (ast.unparse(fn.returns) in dict(user_class_types or {})):
-            ret_decl = f"type({dict(user_class_types or {})[ast.unparse(fn.returns)]})"
+        elif user_class_ann_text(fn.returns) in dict(user_class_types or {}):
+            ret_decl = f"type({dict(user_class_types or {})[user_class_ann_text(fn.returns)]})"
         elif ret_spec in {"real", "complex", "logical", "char"}:
             if ret_spec == "real":
                 ret_decl = "real(kind=dp)"
@@ -58358,7 +58508,7 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
     return result
 
 
-def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None):
+def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None, user_class_types=None, structured_type_components=None):
     tuple_out = {}
     tuple_out_ranks = {}
     scalar_or_array = {}
@@ -58827,6 +58977,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 tuple_return_funcs=set(tuple_out.keys()),
                 tuple_return_out_kinds=tuple_out,
                 tuple_return_out_ranks=tuple_out_ranks,
+                user_class_types=user_class_types or {},
+                structured_type_components=structured_type_components or {},
             )
             if _local_ret_df_info:
                 tr.local_df_return_info.update(_local_ret_df_info)
@@ -58855,8 +59007,30 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             }
             for _dfnm in _df_param_names:
                 tr.pandas_df_vars[_dfnm] = "DataFrame_str_index"
+            # Same gap, same fix, for a user-class-typed parameter (e.g.
+            # `def f(a: "ArrProperties"):` then `a.some_field` in the
+            # body) -- found via a pyccel-test-suite repro derived from
+            # class_constness.py's own ArrProperties/f: without this,
+            # `tr.prescan` below hits "unsupported attribute expr:
+            # a._n_pts" (the property `a.n_points` having already been
+            # inlined to `a._n_pts` by rewrite_class_methods_to_toplevel)
+            # even though the SAME parameter resolves fine once the real,
+            # later codegen pass runs (which does get dict_arg_types --
+            # see `_emit_local_function`'s own identical seeding). This
+            # early pass builds its own disposable translator per fn and
+            # never saw it.
+            _class_param_types = {}
+            for a in fn_args_all:
+                _ann_txt = user_class_ann_text(a.annotation)
+                if _ann_txt is not None and _ann_txt in (user_class_types or {}):
+                    _class_param_types[a.arg] = (user_class_types or {})[_ann_txt]
+            for _cpnm, _cptnm in _class_param_types.items():
+                tr.dict_typed_vars[_cpnm] = _cptnm
+                tr.dict_var_components[_cpnm] = [
+                    nm for nm, _, _, _ in (structured_type_components or {}).get(_cptnm, [])
+                ]
             for i, a in enumerate(fn_args_all):
-                if a.arg in _df_param_names:
+                if a.arg in _df_param_names or a.arg in _class_param_types:
                     continue
                 rr = rr_h[i] if i < len(rr_h) else 0
                 rk = rk_h[i] if i < len(rk_h) else None
@@ -58893,7 +59067,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         tr._mark_char(a.arg)
             tr.prescan(fn.body)
             for a in fn_args_all:
-                if a.arg in _df_param_names:
+                if a.arg in _df_param_names or a.arg in _class_param_types:
                     continue
                 _lk, _lr = _infer_local_name_spec(fn, a.arg, tr)
                 if int(_lr) > 0:
@@ -59489,15 +59663,12 @@ def generate_flat(
         # falls back to the generic real-number default -- wrong whenever
         # the field is actually int/logical/char.
         for _a in getattr(getattr(fn_scan, "args", None), "args", []):
-            if (
-                _a.annotation is not None
-                and hasattr(ast, "unparse")
-                and ast.unparse(_a.annotation) in dict(user_class_types or {})
-            ):
-                _tnm = dict(user_class_types or {})[ast.unparse(_a.annotation)]
+            _ann_txt2 = user_class_ann_text(_a.annotation)
+            if _ann_txt2 is not None and _ann_txt2 in dict(user_class_types or {}):
+                _tnm = dict(user_class_types or {})[_ann_txt2]
                 tr_scan.dict_typed_vars[_a.arg] = _tnm
                 tr_scan.dict_var_components[_a.arg] = [
-                    nm for nm, _, _ in (structured_type_components or {}).get(_tnm, [])
+                    nm for nm, _, _, _ in (structured_type_components or {}).get(_tnm, [])
                 ]
     def _tuple_subscript_base_rank(elts):
         # Base-array rank consumed by a tuple subscript.
@@ -60448,6 +60619,8 @@ def generate_flat(
         params,
         arg_rank_hints={},
         arg_kind_hints={},
+        user_class_types=user_class_types,
+        structured_type_components=structured_type_components,
     )
     if local_funcs:
         tr_seed = translator(
@@ -60881,6 +61054,8 @@ def generate_flat(
         params,
         arg_rank_hints=call_rank_hints,
         arg_kind_hints=call_kind_hints,
+        user_class_types=user_class_types,
+        structured_type_components=structured_type_components,
     )
     _apply_c8_container_return_hints(local_return_specs)
     base_func_arg_ranks = {}
@@ -62584,6 +62759,8 @@ def generate_flat(
             params,
             arg_rank_hints=local_func_arg_ranks,
             arg_kind_hints=local_func_arg_kinds,
+            user_class_types=user_class_types,
+            structured_type_components=structured_type_components,
         )
         for _cb_actual in callback_scalar_actual_names:
             if _cb_actual in local_return_ranks:
@@ -63752,11 +63929,11 @@ def generate_flat(
             # Skip elemental auto-marking for user-defined class/dataclass typed signatures.
             has_user_type = False
             for a in fn.args.args:
-                if a.annotation is not None and hasattr(ast, "unparse") and ast.unparse(a.annotation) in dict(user_class_types or {}):
+                if user_class_ann_text(a.annotation) in dict(user_class_types or {}):
                     has_user_type = True
                     break
-            if (not has_user_type) and fn.returns is not None and hasattr(ast, "unparse"):
-                has_user_type = ast.unparse(fn.returns) in dict(user_class_types or {})
+            if not has_user_type:
+                has_user_type = user_class_ann_text(fn.returns) in dict(user_class_types or {})
             if has_user_type:
                 continue
             if not function_is_pure(fn, known_pure_calls=pure_local_calls):
@@ -63925,7 +64102,7 @@ def generate_flat(
             type_names.append(tname)
             target_o.w(f"type :: {tname}")
             target_o.push()
-            for fname, fkind, frank in fields:
+            for fname, fkind, frank, fdefault in fields:
                 if frank > 0:
                     # An array-typed field (e.g. Spline's own `knots`/
                     # `coeffs`, both `'float[:]'`) -- allocatable, same
@@ -63940,14 +64117,23 @@ def generate_flat(
                         target_o.w(f"character(len=:), allocatable :: {fname}({dims})")
                     else:
                         target_o.w(f"integer, allocatable :: {fname}({dims})")
-                elif fkind == "real":
-                    target_o.w(f"real(kind=dp) :: {fname}")
+                    continue
+                # A scalar field never actually tied to any __init__
+                # parameter (e.g. `self._default = 0`) -- always this one
+                # fixed value, never constructor-supplied (see
+                # collect_dataclass_info's _literal_field_default and the
+                # matching Call-lowering skip in expr()'s
+                # user_class_types branch) -- carried as the component's
+                # own Fortran default initializer instead.
+                suffix = f" = {fdefault}" if fdefault is not None else ""
+                if fkind == "real":
+                    target_o.w(f"real(kind=dp) :: {fname}{suffix}")
                 elif fkind == "logical":
-                    target_o.w(f"logical :: {fname}")
+                    target_o.w(f"logical :: {fname}{suffix}")
                 elif fkind == "char":
                     target_o.w(f"character(len=:), allocatable :: {fname}")
                 else:
-                    target_o.w(f"integer :: {fname}")
+                    target_o.w(f"integer :: {fname}{suffix}")
             target_o.pop()
             target_o.w(f"end type {tname}")
         return type_names
@@ -63956,12 +64142,9 @@ def generate_flat(
         out = {}
         for a in fn.args.args:
             anm = a.arg
-            if (
-                a.annotation is not None
-                and hasattr(ast, "unparse")
-                and ast.unparse(a.annotation) in dict(user_class_types or {})
-            ):
-                out[anm] = dict(user_class_types or {})[ast.unparse(a.annotation)]
+            _ann_txt = user_class_ann_text(a.annotation)
+            if _ann_txt is not None and _ann_txt in dict(user_class_types or {}):
+                out[anm] = dict(user_class_types or {})[_ann_txt]
                 continue
             keys = set()
             for st in ast.walk(fn):
@@ -64303,6 +64486,8 @@ def generate_flat(
                                 params,
                                 arg_rank_hints={fn.name: _rank_hints},
                                 arg_kind_hints={fn.name: _kind_hints},
+                                user_class_types=user_class_types,
+                                structured_type_components=structured_type_components,
                             )
                             if fn.name in tuple_return_funcs:
                                 _ret_src_names = list(local_tuple_return_src_names.get(fn.name, []))
