@@ -369,6 +369,12 @@ public :: ewm_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):i
 public :: ewm_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) desc="exponentially weighted sample standard deviation (adjust=True, bias=False, pandas' defaults)"
 public :: shift_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),periods:integer:intent(in):optional,fill_value:real(dp):intent(in):optional desc="pandas-style Series.shift(periods, fill_value) for a plain 1D real vector"
 
+public :: py_round_ndigits !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),ndigits:integer:intent(in) desc="Python 3 round(x, ndigits): ties round to even (banker's rounding)"
+public :: floor_div_real !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) desc="Python-style real floor division (x // y, floor of the quotient, result stays real)"
+public :: py_round_int !@pyapi kind=function ret=integer args=x:real(dp):intent(in) desc="Python 3 round(x) with no ndigits: banker's rounding to the nearest integer"
+public :: csign_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.sign() for complex input: x / abs(x), 0 at the origin"
+public :: floor_div_int !@pyapi kind=function ret=integer args=x:integer:intent(in),y:integer:intent(in) desc="Python-style integer floor division (x // y, floors toward negative infinity)"
+
 interface cumsum
    module procedure cumsum_real, cumsum_int
 end interface cumsum
@@ -7949,5 +7955,72 @@ contains
             if (k < n) y(1:n - k) = x(k + 1:n)
          end if
       end function shift_1d
+
+      elemental function py_round_ndigits(x, ndigits) result(rnd)
+         ! Python 3's round() rounds ties to even ("banker's rounding");
+         ! Fortran's NINT/ANINT round ties away from zero instead (e.g.
+         ! round(2.5) == 2 and round(-2.5) == -2 in Python, but
+         ! NINT(2.5) == 3 and NINT(-2.5) == -3). Adapted from pyccel's
+         ! pyc_bankers_round_float
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         real(kind=dp), intent(in) :: x
+         integer, intent(in) :: ndigits
+         real(kind=dp) :: rnd
+         real(kind=dp) :: scaled, diff
+         integer(kind=int64) :: n
+         scaled = x * 10.0_dp**ndigits
+         n = nint(scaled, kind=int64)
+         diff = scaled - real(n, kind=dp)
+         if (ndigits <= 0 .and. (diff == 0.5_dp .or. diff == -0.5_dp)) then
+            n = nint(scaled * 0.5_dp, kind=int64) * 2_int64
+         end if
+         rnd = real(n, kind=dp) * 10.0_dp**(-ndigits)
+      end function py_round_ndigits
+
+      elemental function floor_div_real(x, y) result(q)
+         ! Python's // on floats is floor(x / y), returned as a float --
+         ! not the same operation as ordinary real division, which is
+         ! what plain Fortran "/" gives.
+         real(kind=dp), intent(in) :: x, y
+         real(kind=dp) :: q
+         q = real(floor(x / y, kind=int64), kind=dp)
+      end function floor_div_real
+
+      elemental integer function py_round_int(x) result(r)
+         ! round(x) with no ndigits argument returns an int in Python
+         ! (round(x, n) returns a float even for n == 0); this wrapper
+         ! keeps that same banker's-rounding rule via py_round_ndigits.
+         real(kind=dp), intent(in) :: x
+         r = nint(py_round_ndigits(x, 0))
+      end function py_round_int
+
+      elemental function csign_complex(x) result(s)
+         ! Fortran's SIGN intrinsic doesn't accept complex operands at
+         ! all, so a literal `sign(1.0_dp, x)` translation of np.sign on
+         ! a complex-typed value isn't valid Fortran. Adapted from
+         ! pyccel's csign/sign_c64
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         complex(kind=dp), intent(in) :: x
+         complex(kind=dp) :: s
+         real(kind=dp) :: m
+         m = abs(x)
+         if (m == 0.0_dp) then
+            s = (0.0_dp, 0.0_dp)
+         else
+            s = x / m
+         end if
+      end function csign_complex
+
+      elemental integer function floor_div_int(x, y) result(q)
+         ! Python // floors toward negative infinity; Fortran's own
+         ! integer "/" truncates toward zero instead, giving the wrong
+         ! answer whenever x and y have opposite signs and don't divide
+         ! evenly (e.g. -7 // 2 == -4 in Python, but -7 / 2 == -3 via
+         ! plain Fortran truncation). Formula adapted from pyccel's
+         ! pyc_floor_div_i32/pyc_floor_div_i64
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         integer, intent(in) :: x, y
+         q = x / y - merge(1, 0, mod(x, y) /= 0 .and. ((x < 0) .neqv. (y < 0)))
+      end function floor_div_int
 
 end module python_mod

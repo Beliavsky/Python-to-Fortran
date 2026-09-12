@@ -11903,6 +11903,23 @@ def detect_needed_helpers(tree):
                 and node.func.attr == "gauss"
             ):
                 needed.add("rnorm")
+            if isinstance(node.func, ast.Name) and node.func.id == "round":
+                # round(x) -> py_round_int; round(x, ndigits) -> py_round_ndigits.
+                # Pull in both regardless of which call shape appears --
+                # cheaper and simpler than threading arg-count detection
+                # through this purely-syntactic pass.
+                needed.add("py_round_int")
+                needed.add("py_round_ndigits")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "sign"
+            ):
+                # Only needed when the operand is complex-typed (see
+                # csign_complex's own codegen call site), but kind isn't
+                # known at this syntactic stage -- conservative like the
+                # FloorDiv case above.
+                needed.add("csign_complex")
 
             def _is_scipy_special_attr_call(fn):
                 if not isinstance(fn, ast.Attribute):
@@ -12857,6 +12874,15 @@ def detect_needed_helpers(tree):
             self.generic_visit(node)
 
         def visit_BinOp(self, node):
+            if isinstance(node.op, ast.FloorDiv):
+                # Conservative: kind (int vs real) isn't known at this
+                # purely-syntactic detection stage, so request both --
+                # matching the existing convention elsewhere in this scan
+                # (e.g. np.zeros pulls in all dtype variants regardless of
+                # which one is actually used). An unused template just
+                # sits idle in python_mod; see floor_div_int/floor_div_real.
+                needed.add("floor_div_int")
+                needed.add("floor_div_real")
             if isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)):
                 needed.add("unique_int")
                 needed.add("unique_char")
@@ -12906,6 +12932,15 @@ def detect_needed_helpers(tree):
             for part in node.values:
                 if isinstance(part, ast.FormattedValue) and part.format_spec is not None:
                     needed.add("str_format_real_fixed")
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node):
+            # x //= y -- an AugAssign's own .op is never visited by
+            # visit_BinOp (it isn't a BinOp node), so floor-division
+            # augmented assignment needs its own detection here.
+            if isinstance(node.op, ast.FloorDiv):
+                needed.add("floor_div_int")
+                needed.add("floor_div_real")
             self.generic_visit(node)
 
     scan().visit(tree)
@@ -14926,6 +14961,102 @@ def runtime_helper_templates():
          mod_pow_int = int(res)
       end function mod_pow_int"""
 
+    floor_div_int_pub = (
+        "public :: floor_div_int !@pyapi kind=function ret=integer "
+        "args=x:integer:intent(in),y:integer:intent(in) "
+        "desc=\"Python-style integer floor division (x // y, floors toward negative infinity)\""
+    )
+
+    floor_div_int_blk = """      elemental integer function floor_div_int(x, y) result(q)
+         ! Python // floors toward negative infinity; Fortran's own
+         ! integer "/" truncates toward zero instead, giving the wrong
+         ! answer whenever x and y have opposite signs and don't divide
+         ! evenly (e.g. -7 // 2 == -4 in Python, but -7 / 2 == -3 via
+         ! plain Fortran truncation). Formula adapted from pyccel's
+         ! pyc_floor_div_i32/pyc_floor_div_i64
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         integer, intent(in) :: x, y
+         q = x / y - merge(1, 0, mod(x, y) /= 0 .and. ((x < 0) .neqv. (y < 0)))
+      end function floor_div_int"""
+
+    floor_div_real_pub = (
+        "public :: floor_div_real !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp):intent(in),y:real(dp):intent(in) "
+        "desc=\"Python-style real floor division (x // y, floor of the quotient, result stays real)\""
+    )
+
+    floor_div_real_blk = """      elemental function floor_div_real(x, y) result(q)
+         ! Python's // on floats is floor(x / y), returned as a float --
+         ! not the same operation as ordinary real division, which is
+         ! what plain Fortran "/" gives.
+         real(kind=dp), intent(in) :: x, y
+         real(kind=dp) :: q
+         q = real(floor(x / y, kind=int64), kind=dp)
+      end function floor_div_real"""
+
+    py_round_ndigits_pub = (
+        "public :: py_round_ndigits !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp):intent(in),ndigits:integer:intent(in) "
+        "desc=\"Python 3 round(x, ndigits): ties round to even (banker's rounding)\""
+    )
+
+    py_round_ndigits_blk = """      elemental function py_round_ndigits(x, ndigits) result(rnd)
+         ! Python 3's round() rounds ties to even ("banker's rounding");
+         ! Fortran's NINT/ANINT round ties away from zero instead (e.g.
+         ! round(2.5) == 2 and round(-2.5) == -2 in Python, but
+         ! NINT(2.5) == 3 and NINT(-2.5) == -3). Adapted from pyccel's
+         ! pyc_bankers_round_float
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         real(kind=dp), intent(in) :: x
+         integer, intent(in) :: ndigits
+         real(kind=dp) :: rnd
+         real(kind=dp) :: scaled, diff
+         integer(kind=int64) :: n
+         scaled = x * 10.0_dp**ndigits
+         n = nint(scaled, kind=int64)
+         diff = scaled - real(n, kind=dp)
+         if (ndigits <= 0 .and. (diff == 0.5_dp .or. diff == -0.5_dp)) then
+            n = nint(scaled * 0.5_dp, kind=int64) * 2_int64
+         end if
+         rnd = real(n, kind=dp) * 10.0_dp**(-ndigits)
+      end function py_round_ndigits"""
+
+    py_round_int_pub = (
+        "public :: py_round_int !@pyapi kind=function ret=integer "
+        "args=x:real(dp):intent(in) "
+        "desc=\"Python 3 round(x) with no ndigits: banker's rounding to the nearest integer\""
+    )
+
+    py_round_int_blk = """      elemental integer function py_round_int(x) result(r)
+         ! round(x) with no ndigits argument returns an int in Python
+         ! (round(x, n) returns a float even for n == 0); this wrapper
+         ! keeps that same banker's-rounding rule via py_round_ndigits.
+         real(kind=dp), intent(in) :: x
+         r = nint(py_round_ndigits(x, 0))
+      end function py_round_int"""
+
+    csign_complex_pub = (
+        "public :: csign_complex !@pyapi kind=function ret=complex(dp) "
+        "args=x:complex(dp):intent(in) desc=\"np.sign() for complex input: x / abs(x), 0 at the origin\""
+    )
+
+    csign_complex_blk = """      elemental function csign_complex(x) result(s)
+         ! Fortran's SIGN intrinsic doesn't accept complex operands at
+         ! all, so a literal `sign(1.0_dp, x)` translation of np.sign on
+         ! a complex-typed value isn't valid Fortran. Adapted from
+         ! pyccel's csign/sign_c64
+         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         complex(kind=dp), intent(in) :: x
+         complex(kind=dp) :: s
+         real(kind=dp) :: m
+         m = abs(x)
+         if (m == 0.0_dp) then
+            s = (0.0_dp, 0.0_dp)
+         else
+            s = x / m
+         end if
+      end function csign_complex"""
+
     pil_pub = (
         "public :: print_int_list  !@pyapi kind=subroutine "
         "args=a:integer(:):intent(in),n:integer:intent(in) "
@@ -15957,6 +16088,11 @@ def runtime_helper_templates():
     return {
         "isqrt_int": (isqrt_pub, isqrt_blk),
         "mod_pow_int": (mod_pow_pub, mod_pow_blk),
+        "floor_div_int": (floor_div_int_pub, floor_div_int_blk),
+        "floor_div_real": (floor_div_real_pub, floor_div_real_blk),
+        "py_round_ndigits": (py_round_ndigits_pub, py_round_ndigits_blk),
+        "py_round_int": (py_round_int_pub, py_round_int_blk),
+        "csign_complex": (csign_complex_pub, csign_complex_blk),
         "print_int_list": (pil_pub, pil_blk),
         "print_char_list": (pcl_pub, pcl_blk),
         "print_real_list": (prl_pub, prl_blk),
@@ -16016,6 +16152,7 @@ def ensure_runtime_helpers(runtime_path, needed_helpers):
         "statistics_quantiles_real": ["sort_real_vec"],
         "nanstd": ["nanvar", "nanmean"],
         "nanvar": ["nanmean"],
+        "py_round_int": ["py_round_ndigits"],
     }
 
     expanded = []
@@ -27702,6 +27839,17 @@ class translator(ast.NodeVisitor):
                 elif rk0 == "real" and lk0 in {"int", "logical"}:
                     a = f"real({a}, kind=dp)"
                 return f"modulo({a}, {b})"
+            if op is ast.FloorDiv:
+                # Python // floors toward negative infinity (and, for
+                # real operands, keeps a float result) -- plain Fortran
+                # "/" does neither (see floor_div_int/floor_div_real).
+                if lk0 == "real" or rk0 == "real":
+                    if lk0 in {"int", "logical"}:
+                        a = f"real({a}, kind=dp)"
+                    if rk0 in {"int", "logical"}:
+                        b = f"real({b}, kind=dp)"
+                    return f"floor_div_real({a}, {b})"
+                return f"floor_div_int({a}, {b})"
             if op is ast.LShift:
                 return f"ishft({a}, int({b}))"
             if op is ast.RShift:
@@ -29901,16 +30049,43 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "chr" and len(node.args) == 1:
                 return f"achar(int({self.expr(node.args[0])}))"
             if isinstance(node.func, ast.Name) and node.func.id == "round":
+                # Python 3's round() rounds ties to even ("banker's
+                # rounding"); a plain nint()/NINT rounds ties away from
+                # zero instead (round(2.5) == 2 in Python, NINT(2.5) ==
+                # 3) -- see py_round_int/py_round_ndigits in python.f90.
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
                 if len(node.args) == 1:
-                    return f"nint({self.expr(node.args[0])})"
-                if (
-                    len(node.args) == 2
-                    and isinstance(node.args[1], ast.Constant)
-                    and isinstance(node.args[1].value, int)
-                    and int(node.args[1].value) == 0
-                ):
-                    return f"nint({self.expr(node.args[0])})"
-                raise NotImplementedError("round() currently supports one argument (or ndigits=0)")
+                    if k0 in {"int", "logical"}:
+                        # round() on an int returns that same int unchanged.
+                        return a0
+                    return f"py_round_int({a0})"
+                def _const_int_ndigits(n):
+                    # A negative literal parses as UnaryOp(USub, Constant),
+                    # not a bare Constant -- handle both shapes.
+                    if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool):
+                        return int(n.value)
+                    if (
+                        isinstance(n, ast.UnaryOp)
+                        and isinstance(n.op, ast.USub)
+                        and isinstance(n.operand, ast.Constant)
+                        and isinstance(n.operand.value, int)
+                        and not isinstance(n.operand.value, bool)
+                    ):
+                        return -int(n.operand.value)
+                    return None
+
+                nd = _const_int_ndigits(node.args[1]) if len(node.args) == 2 else None
+                if nd is not None:
+                    a0r = a0 if k0 == "real" else f"real({a0}, kind=dp)"
+                    rounded = f"py_round_ndigits({a0r}, {nd})"
+                    if k0 in {"int", "logical"}:
+                        # round(some_int, ndigits) still returns an int in
+                        # Python (unchanged for ndigits >= 0; rounded to a
+                        # power-of-ten multiple for ndigits < 0).
+                        return f"int({rounded})"
+                    return rounded
+                raise NotImplementedError("round() currently supports a constant-integer ndigits argument")
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id not in self.local_func_arg_names
@@ -31905,6 +32080,11 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"abs", "fabs"}:
                     return f"abs({a0})"
                 if node.func.attr == "sign":
+                    if k0 == "complex":
+                        # Fortran's SIGN intrinsic doesn't accept complex
+                        # operands at all -- np.sign(complex) means x /
+                        # abs(x) (0 at the origin); see csign_complex.
+                        return f"csign_complex({a0})"
                     return f"sign(1.0_dp, {a0})"
                 if node.func.attr in {"fix", "trunc"}:
                     return f"aint({a0})"
@@ -46154,7 +46334,14 @@ class translator(ast.NodeVisitor):
             elif isinstance(node.op, ast.Div):
                 upd = f"{base} / {rhs}"
             elif isinstance(node.op, ast.FloorDiv):
-                upd = f"{base} / {rhs}"
+                bk = self._expr_kind(node.target.value)
+                rk = self._expr_kind(node.value)
+                if bk == "real" or rk == "real":
+                    lhs_e = base if bk == "real" else f"real({base}, kind=dp)"
+                    rhs_e = rhs if rk == "real" else f"real({rhs}, kind=dp)"
+                    upd = f"floor_div_real({lhs_e}, {rhs_e})"
+                else:
+                    upd = f"floor_div_int({base}, {rhs})"
             elif isinstance(node.op, ast.Mod):
                 bk = self._expr_kind(node.target.value)
                 rk = self._expr_kind(node.value)
@@ -46205,9 +46392,17 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{lhs} = {lhs} / {rhs}")
             return
         if isinstance(node.op, ast.FloorDiv):
-            # Python // is floor division; Fortran integer "/" truncates toward zero.
-            # For current supported integer workflows this is the closest direct mapping.
-            self.o.w(f"{lhs} = {lhs} / {rhs}")
+            # Python // floors toward negative infinity (and, for real
+            # operands, keeps a float result) -- plain Fortran "/" does
+            # neither; see floor_div_int/floor_div_real in python.f90.
+            lk = self._expr_kind(node.target)
+            rk = self._expr_kind(node.value)
+            if lk == "real" or rk == "real":
+                lhs_e = lhs if lk == "real" else f"real({lhs}, kind=dp)"
+                rhs_e = rhs if rk == "real" else f"real({rhs}, kind=dp)"
+                self.o.w(f"{lhs} = floor_div_real({lhs_e}, {rhs_e})")
+            else:
+                self.o.w(f"{lhs} = floor_div_int({lhs}, {rhs})")
             return
         if isinstance(node.op, ast.Mod):
             lk = self._expr_kind(node.target)
