@@ -6130,13 +6130,20 @@ def simplify_generated_parentheses(lines):
 
     def _peel_print_arg_parens(expr):
         cur = expr.strip()
-        while cur.startswith("(") and cur.endswith(")"):
+        # NOTE: the loop guard here must verify the leading "(" and
+        # trailing ")" are an actual MATCHING pair (_is_wrapped_by_outer_
+        # parens), not just check the first/last characters in isolation.
+        # A prior bug used the naive character check, which also fires on
+        # a string like "(.not. A(x)) .and. (.not. B(x))" -- true
+        # first/last characters, but NOT a matching wrap (the leading "("
+        # actually closes right after "A(x)") -- and then blindly sliced
+        # off one character from each end regardless, corrupting the
+        # expression (e.g. cmath.isfinite/isinf/isnan and any other
+        # print argument shaped like "(X) <non-arith op> (Y)").
+        while _is_wrapped_by_outer_parens(cur):
             inner = cur[1:-1].strip()
             if not inner or _has_top_level_comma(inner) or _has_top_level_arith_op(inner):
                 break
-            if strip_redundant_outer_parens_expr(cur) == cur:
-                cur = inner
-                continue
             nxt = strip_redundant_outer_parens_expr(cur)
             if nxt == cur:
                 break
@@ -12084,6 +12091,8 @@ def detect_needed_helpers(tree):
                     needed.add("expm1")
                 elif mf == "log1p":
                     needed.add("log1p")
+                elif mf == "remainder":
+                    needed.add("math_remainder")
                 elif mf == "cmath:isfinite":
                     needed.add("complex_isfinite")
                 elif mf == "cmath:isinf":
@@ -12149,6 +12158,8 @@ def detect_needed_helpers(tree):
                     needed.add("expm1")
                 elif node.func.attr == "log1p":
                     needed.add("log1p")
+                elif node.func.attr == "remainder":
+                    needed.add("math_remainder")
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -14107,6 +14118,10 @@ MATH_DIRECT_IMPORT_SUPPORTED = {
     "exp", "log", "atan2", "expm1", "log1p",
     "floor", "ceil", "trunc", "prod", "isclose",
     "comb", "perm", "factorial", "gcd", "lcm", "isqrt",
+    "fabs", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "log2", "log10", "gamma", "lgamma",
+    "isfinite", "isinf", "isnan",
+    "copysign", "hypot", "ldexp", "remainder",
 }
 
 
@@ -15146,6 +15161,31 @@ def runtime_helper_templates():
          y = c_log1p(x)
       end function log1p"""
 
+    math_remainder_pub = (
+        "public :: math_remainder !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp):intent(in),y:real(dp):intent(in) "
+        "desc=\"Python 3 math.remainder(x, y): IEEE 754 remainder, x - round(x/y)*y with ties to even\""
+    )
+
+    math_remainder_blk = """      elemental function math_remainder(x, y) result(r)
+         ! math.remainder is the IEEE 754 remainder (x - n*y where n =
+         ! round(x/y), ties to even) -- distinct from x % y (floors) and
+         ! Fortran's own MOD (truncates). Built on the same round-half-
+         ! to-even rule as py_round_ndigits, to avoid depending on the
+         ! ieee_arithmetic module's own IEEE_REM (which needs its own
+         ! per-unit `use` plumbing this project doesn't otherwise carry).
+         real(kind=dp), intent(in) :: x, y
+         real(kind=dp) :: r
+         real(kind=dp) :: q
+         integer(kind=int64) :: n
+         q = x / y
+         n = nint(q, kind=int64)
+         if (abs(q - real(n, kind=dp)) == 0.5_dp) then
+            n = nint(q * 0.5_dp, kind=int64) * 2_int64
+         end if
+         r = x - real(n, kind=dp) * y
+      end function math_remainder"""
+
     pil_pub = (
         "public :: print_int_list  !@pyapi kind=subroutine "
         "args=a:integer(:):intent(in),n:integer:intent(in) "
@@ -16184,6 +16224,7 @@ def runtime_helper_templates():
         "csign_complex": (csign_complex_pub, csign_complex_blk),
         "expm1": (expm1_pub, expm1_blk),
         "log1p": (log1p_pub, log1p_blk),
+        "math_remainder": (math_remainder_pub, math_remainder_blk),
         "print_int_list": (pil_pub, pil_blk),
         "print_char_list": (pcl_pub, pcl_blk),
         "print_real_list": (prl_pub, prl_blk),
@@ -22554,6 +22595,14 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.value.id in self.math_aliases and node.func.attr in {"erf", "erfc"}:
                     return "real"
+                if node.func.value.id in self.math_aliases and node.func.attr in {
+                    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
+                    "log2", "log10", "gamma", "lgamma",
+                    "copysign", "hypot", "ldexp", "remainder",
+                }:
+                    return "real"
+                if node.func.value.id in self.math_aliases and node.func.attr in {"isfinite", "isinf", "isnan"}:
+                    return "logical"
                 if node.func.value.id in self.math_aliases and node.func.attr == "isclose":
                     return "logical"
                 if node.func.value.id in self.math_aliases and node.func.attr == "prod" and len(node.args) >= 1:
@@ -22607,7 +22656,13 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if mf in {"floor", "ceil", "trunc", "comb", "perm", "factorial", "gcd", "lcm", "isqrt"}:
                     return "int"
-                if mf == "isclose":
+                if mf in {
+                    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
+                    "log2", "log10", "gamma", "lgamma",
+                    "copysign", "hypot", "ldexp", "remainder",
+                }:
+                    return "real"
+                if mf in {"isfinite", "isinf", "isnan", "isclose"}:
                     return "logical"
                 if mf == "prod" and len(node.args) >= 1:
                     k0 = self._expr_kind(node.args[0])
@@ -25719,6 +25774,25 @@ class translator(ast.NodeVisitor):
                     if _fnm2 == node.attr:
                         return _frank2
         if isinstance(node, ast.Call):
+            if (
+                len(node.args) == 1
+                and (
+                    (
+                        isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "cmath"
+                        and node.func.attr == "polar"
+                    )
+                    or (
+                        isinstance(node.func, ast.Name)
+                        and self.math_func_aliases.get(node.func.id) == "cmath:polar"
+                    )
+                )
+            ):
+                # cmath.polar(z) is a 2-tuple (r, theta) -- lowered to a
+                # rank-1, size-2 real array literal in expr() (see the
+                # tuple-unpack assignment branch above for the same call).
+                return 1
             np_attr = self._numpy_call_attr(node.func)
             if (
                 np_attr in {
@@ -30026,7 +30100,23 @@ class translator(ast.NodeVisitor):
                 return ".true." if ok else ".false."
             if isinstance(node.func, ast.Name) and node.func.id in self.math_func_aliases:
                 mfn = self.math_func_aliases[node.func.id]
-                if isinstance(mfn, str) and mfn.startswith("cmath:") and len(node.args) == 1:
+                if (
+                    isinstance(mfn, str)
+                    and mfn.startswith("cmath:")
+                    and len(node.args) == 1
+                    and mfn.split(":", 1)[1] in {
+                        "sqrt", "exp", "sin", "cos", "tan", "asin", "acos", "atan",
+                        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+                    }
+                ):
+                    # Only the names that genuinely share their Fortran
+                    # intrinsic's spelling belong in this early-return
+                    # shortcut -- isfinite/isinf/isnan/phase/polar/rect/
+                    # log/log10/isclose have no same-named Fortran
+                    # intrinsic and must fall through to the fuller
+                    # dispatch below instead (previously this block
+                    # intercepted them too, emitting a bare, undefined
+                    # call like isfinite(z) that failed to compile).
                     base = mfn.split(":", 1)[1]
                     a0 = node.args[0]
                     a0_expr = self.expr(a0)
@@ -30092,7 +30182,7 @@ class translator(ast.NodeVisitor):
                             elif kw.arg == "abs_tol":
                                 abs_tol = _cmath_real_arg(kw.value)
                         return f"(abs(({a0}) - ({b0})) <= max(({abs_tol}), ({rel_tol}) * max(abs({a0}), abs({b0}))))"
-                if mfn in {"sqrt", "erf", "erfc", "atan", "asin", "acos", "tan", "sin", "cos", "exp", "log", "atan2", "expm1", "log1p", "floor", "ceil", "trunc"}:
+                if mfn in {"sqrt", "erf", "erfc", "atan", "asin", "acos", "tan", "sin", "cos", "exp", "log", "atan2", "expm1", "log1p", "floor", "ceil", "trunc", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "log10", "gamma"}:
                     if len(node.args) == 1:
                         a0 = node.args[0]
                         a0_expr = self.expr(a0)
@@ -30111,6 +30201,60 @@ class translator(ast.NodeVisitor):
                         if self._expr_kind(node.args[1]) in {"int", "logical"}:
                             a1 = f"real({a1}, kind=dp)"
                         return f"atan2({a0}, {a1})"
+                if mfn == "fabs" and len(node.args) == 1:
+                    a0 = self.expr(node.args[0])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    return f"abs({a0})"
+                if mfn == "log2" and len(node.args) == 1:
+                    a0 = self.expr(node.args[0])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    return f"(log({a0}) / log(2.0_dp))"
+                if mfn == "lgamma" and len(node.args) == 1:
+                    a0 = self.expr(node.args[0])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    return f"log_gamma({a0})"
+                if mfn in {"isfinite", "isinf", "isnan"} and len(node.args) == 1:
+                    a0 = self.expr(node.args[0])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if mfn == "isfinite":
+                        return f"ieee_is_finite({a0})"
+                    if mfn == "isinf":
+                        return f"((.not. ieee_is_finite({a0})) .and. (.not. ieee_is_nan({a0})))"
+                    return f"ieee_is_nan({a0})"
+                if mfn == "copysign" and len(node.args) == 2:
+                    a0 = self.expr(node.args[0])
+                    b0 = self.expr(node.args[1])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                        b0 = f"real({b0}, kind=dp)"
+                    return f"sign(abs({a0}), {b0})"
+                if mfn == "hypot" and len(node.args) == 2:
+                    a0 = self.expr(node.args[0])
+                    b0 = self.expr(node.args[1])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                        b0 = f"real({b0}, kind=dp)"
+                    return f"hypot({a0}, {b0})"
+                if mfn == "ldexp" and len(node.args) == 2:
+                    a0 = self.expr(node.args[0])
+                    b0 = self.expr(node.args[1])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    return f"scale({a0}, int({b0}))"
+                if mfn == "remainder" and len(node.args) == 2:
+                    a0 = self.expr(node.args[0])
+                    b0 = self.expr(node.args[1])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                        b0 = f"real({b0}, kind=dp)"
+                    return f"math_remainder({a0}, {b0})"
                 if mfn in {"comb", "perm", "factorial", "gcd", "lcm", "isqrt"}:
                     if mfn == "isqrt" and len(node.args) == 1:
                         return f"isqrt_int({self.expr(node.args[0])})"
@@ -33605,6 +33749,141 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id in self.math_aliases
+                and node.func.attr in {"sinh", "cosh", "tanh", "asinh", "acosh", "atanh"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"{node.func.attr}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "fabs"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"abs({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "log10"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"log10({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "log2"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"(log({a0}) / log(2.0_dp))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "gamma"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"gamma({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "lgamma"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"log_gamma({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr in {"isfinite", "isinf", "isnan"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if node.func.attr == "isfinite":
+                    return f"ieee_is_finite({a0})"
+                if node.func.attr == "isinf":
+                    return f"((.not. ieee_is_finite({a0})) .and. (.not. ieee_is_nan({a0})))"
+                return f"ieee_is_nan({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "copysign"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                    b0 = f"real({b0}, kind=dp)"
+                return f"sign(abs({a0}), {b0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "hypot"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                    b0 = f"real({b0}, kind=dp)"
+                return f"hypot({a0}, {b0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "ldexp"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"scale({a0}, int({b0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "remainder"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                    b0 = f"real({b0}, kind=dp)"
+                return f"math_remainder({a0}, {b0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
                 and node.func.attr in {"floor", "ceil", "trunc"}
                 and len(node.args) == 1
             ):
@@ -35148,6 +35427,28 @@ class translator(ast.NodeVisitor):
                         for _e in _lhs_elts:
                             if isinstance(_e, ast.Name):
                                 self._mark_int(_e.id)
+                elif (
+                    isinstance(_m, ast.Assign)
+                    and len(_m.targets) == 1
+                    and isinstance(_m.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(_m.value, ast.Call)
+                    and (
+                        (
+                            isinstance(_m.value.func, ast.Attribute)
+                            and isinstance(_m.value.func.value, ast.Name)
+                            and _m.value.func.value.id == "cmath"
+                            and _m.value.func.attr == "polar"
+                        )
+                        or (
+                            isinstance(_m.value.func, ast.Name)
+                            and self.math_func_aliases.get(_m.value.func.id) == "cmath:polar"
+                        )
+                    )
+                ):
+                    # r, theta = cmath.polar(z) -- both outputs are real.
+                    for _e in _m.targets[0].elts:
+                        if isinstance(_e, ast.Name):
+                            self._mark_real(_e.id)
                 elif (
                     isinstance(_m, ast.Assign)
                     and len(_m.targets) == 1
@@ -41226,6 +41527,49 @@ class translator(ast.NodeVisitor):
             b0 = self.expr(v.args[1])
             self.o.w(f"{qn} = {a0} / {b0}")
             self.o.w(f"{rn} = mod({a0}, {b0})")
+            return
+        # tuple unpacking from cmath.polar(z) / bare polar(z) (from cmath
+        # import polar) -- both call shapes lower to the same [r, theta]
+        # array-literal expression in expr(), but that array is only ever
+        # correctly usable when consumed inline (e.g. as a print() arg);
+        # assigning polar(z) to a name (r, t = ... or rt = ...) needs its
+        # own explicit two-statement form here, same as np.divmod above.
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and isinstance(v, ast.Call)
+            and len(t.elts) >= 2
+            and len(v.args) == 1
+            and (
+                (
+                    isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id == "cmath"
+                    and v.func.attr == "polar"
+                )
+                or (
+                    isinstance(v.func, ast.Name)
+                    and self.math_func_aliases.get(v.func.id) == "cmath:polar"
+                )
+            )
+        ):
+            if not isinstance(t.elts[0], ast.Name) or not isinstance(t.elts[1], ast.Name):
+                raise NotImplementedError("tuple assignment targets must be names")
+            rn = t.elts[0].id
+            tn = t.elts[1].id
+            for _pn in (rn, tn):
+                self.reals.add(_pn)
+                self.ints.discard(_pn)
+                self.logs.discard(_pn)
+                self.complexes.discard(_pn)
+                self.chars.discard(_pn)
+                self.alloc_ints.discard(_pn)
+                self.alloc_reals.discard(_pn)
+            z0 = self.expr(v.args[0])
+            zk = self._expr_kind(v.args[0])
+            if zk != "complex":
+                z0 = f"cmplx({z0}, kind=dp)"
+            self.o.w(f"{rn} = abs({z0})")
+            self.o.w(f"{tn} = atan2(aimag({z0}), real({z0}, kind=dp))")
             return
         # tuple unpacking from np.quantile(x, [q0, q1, ...])
         if (

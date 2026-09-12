@@ -378,6 +378,8 @@ public :: floor_div_int !@pyapi kind=function ret=integer args=x:integer:intent(
 public :: log1p !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="log(1 + x), full precision for small abs(x) via the C library's own log1p()"
 public :: expm1 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="exp(x) - 1, full precision for small abs(x) via the C library's own expm1()"
 
+public :: math_remainder !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) desc="Python 3 math.remainder(x, y): IEEE 754 remainder, x - round(x/y)*y with ties to even"
+
 interface cumsum
    module procedure cumsum_real, cumsum_int
 end interface cumsum
@@ -8063,5 +8065,24 @@ contains
          end interface
          y = c_expm1(x)
       end function expm1
+
+      elemental function math_remainder(x, y) result(r)
+         ! math.remainder is the IEEE 754 remainder (x - n*y where n =
+         ! round(x/y), ties to even) -- distinct from x % y (floors) and
+         ! Fortran's own MOD (truncates). Built on the same round-half-
+         ! to-even rule as py_round_ndigits, to avoid depending on the
+         ! ieee_arithmetic module's own IEEE_REM (which needs its own
+         ! per-unit `use` plumbing this project doesn't otherwise carry).
+         real(kind=dp), intent(in) :: x, y
+         real(kind=dp) :: r
+         real(kind=dp) :: q
+         integer(kind=int64) :: n
+         q = x / y
+         n = nint(q, kind=int64)
+         if (abs(q - real(n, kind=dp)) == 0.5_dp) then
+            n = nint(q * 0.5_dp, kind=int64) * 2_int64
+         end if
+         r = x - real(n, kind=dp) * y
+      end function math_remainder
 
 end module python_mod
