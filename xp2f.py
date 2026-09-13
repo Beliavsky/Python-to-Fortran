@@ -4677,6 +4677,183 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     return tree
 
 
+def hoist_class_constructors_with_side_effects(tree):
+    """A class whose __init__ does more than assign each field exactly
+    once -- e.g. pyccel's own classes_1.py Line: `self.a = a; self.a.x =
+    99.0` mutates a NESTED field after construction -- can't be built by
+    collect_dataclass_info's own single-expression-per-field template
+    mechanism (every other class shape in this project reduces to that:
+    a plain passthrough, a literal default, a computed np.ones/zeros/
+    empty call, even the two-statement allocate-then-fill idiom). Such a
+    class needs its own EXTRA __init__ statements actually executed, in
+    order, against a real struct value.
+
+    Hoists __init__ into a genuine constructor FUNCTION for exactly
+    those classes (collect_dataclass_info already tells us which ones,
+    via class_ctor_extra -- computed there since it already does all the
+    shape analysis this needs, but that function only ever collects
+    metadata, never mutates the tree, hence this separate pass):
+
+        def ClassName_new(<__init__'s own params, minus self>):
+            self = ClassName(<same params, forwarded positionally>)
+            <the extra statements, verbatim>
+            return self
+
+    The inner `self = ClassName(...)` deliberately keeps the ORIGINAL
+    bare constructor-call form -- it's what actually triggers the
+    existing structure-constructor Call-lowering in expr() (unchanged,
+    still building the simple fields exactly as before) -- while every
+    OTHER call site of `ClassName(...)` anywhere else in the tree is
+    rewritten to call `ClassName_new(...)` instead, so a driver script's
+    own `line = Line(p1)` gets the extra statements applied automatically.
+    Assigning a plain (non-annotated) Name from a user-class constructor
+    call already registers that Name as struct-typed for the real
+    codegen pass (the same mechanism an ordinary `p = Point(...)`
+    anywhere else in a script already relies on), so `self`'s own
+    fields resolve normally -- including a nested chain, now that
+    _struct_type_of resolves those -- for every extra statement that
+    follows.
+    """
+    _class_to_type, _type_components, class_ctor_extra = collect_dataclass_info(tree)
+    if not class_ctor_extra:
+        return tree
+    # Idempotence: this pass is wired into all 3-4 tree-prep chains (the
+    # default pipeline runs its own chain TWICE), and re-running it on a
+    # tree that already has a given class's own hoisted `ClassName_new`
+    # must be a no-op for that class -- otherwise the blanket call-site
+    # rewrite below, run a second time, also matches the literal
+    # `ClassName(...)` call INSIDE that already-hoisted function's own
+    # body (the one deliberately kept in the bare constructor-call form
+    # so it triggers the structure-constructor Call-lowering), turning it
+    # into a self-recursive `ClassName_new(...)` call instead -- confirmed
+    # via a real "self" struct-type-registration regression traced with a
+    # debug build.
+    _existing_top_level_names = {
+        n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    class_ctor_extra = {
+        cnm: v for cnm, v in class_ctor_extra.items()
+        if f"{cnm}_new" not in _existing_top_level_names
+    }
+    if not class_ctor_extra:
+        return tree
+
+    class _CallRewriter(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in class_ctor_extra
+            ):
+                return ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id=f"{node.func.id}_new", ctx=ast.Load()),
+                        args=node.args,
+                        keywords=node.keywords,
+                    ),
+                    node,
+                )
+            return node
+
+    new_tree = _CallRewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+
+    new_body = []
+    for stmt in new_tree.body:
+        new_body.append(stmt)
+        if isinstance(stmt, ast.ClassDef) and stmt.name in class_ctor_extra:
+            ctor_params, leftover_stmts = class_ctor_extra[stmt.name]
+            new_fn_args = ast.arguments(
+                posonlyargs=[], args=list(ctor_params), vararg=None,
+                kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[],
+            )
+            self_assign = ast.Assign(
+                targets=[ast.Name(id="self", ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Name(id=stmt.name, ctx=ast.Load()),
+                    args=[ast.Name(id=a.arg, ctx=ast.Load()) for a in ctor_params],
+                    keywords=[],
+                ),
+            )
+            new_fn = ast.FunctionDef(
+                name=f"{stmt.name}_new",
+                args=new_fn_args,
+                body=[self_assign] + list(leftover_stmts) + [ast.Return(value=ast.Name(id="self", ctx=ast.Load()))],
+                decorator_list=[],
+                returns=None,
+            )
+            ast.copy_location(new_fn, stmt)
+            new_body.append(new_fn)
+
+    out = ast.Module(body=new_body, type_ignores=getattr(tree, "type_ignores", []))
+    ast.fix_missing_locations(out)
+    return out
+
+
+def rewrite_case_colliding_class_fields(tree):
+    """Fortran identifiers are case-insensitive, so a Python class with
+    two fields differing only in case -- e.g. pyccel's own
+    `classes_2.py::Point`, which has both `self.x` and `self.X` -- lowers
+    to a derived type with two components that collide (`Component 'x'
+    already declared`), a compile failure with no earlier warning at all.
+    Detect any such case-insensitive collision within a single class's
+    own `__init__` (the same field-defining shape `collect_dataclass_info`
+    itself recognizes) and rename every subsequent colliding field to a
+    fresh, case-insensitively-unique name, rewriting every `Attribute`
+    access to it (matching `rewrite_class_methods_to_toplevel`'s own
+    property-inlining rewrite immediately below: renames are applied by
+    bare attribute-name text, across the whole tree, not scoped to one
+    class's own instances -- the safe, already-established convention
+    here, since no static type information is available at this AST-only
+    stage to scope it more tightly)."""
+    rename_map = {}
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        init_fn = next((s for s in node.body if isinstance(s, ast.FunctionDef) and s.name == "__init__"), None)
+        if init_fn is None:
+            continue
+        seen_lower = {}
+        for st in ast.walk(init_fn):
+            tgt = None
+            if isinstance(st, ast.Assign) and len(st.targets) == 1:
+                tgt = st.targets[0]
+            elif isinstance(st, ast.AnnAssign):
+                tgt = st.target
+            if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id == "self"):
+                continue
+            low = tgt.attr.lower()
+            if low not in seen_lower:
+                seen_lower[low] = tgt.attr
+                continue
+            if tgt.attr == seen_lower[low] or tgt.attr in rename_map:
+                continue
+            # A later field whose name collides case-insensitively with
+            # an earlier one in this same class -- pick a fresh name that
+            # doesn't case-insensitively clash with anything already seen
+            # (in this class) or already chosen (in any class so far).
+            taken_lower = set(seen_lower.keys()) | {v.lower() for v in rename_map.values()}
+            candidate = f"{tgt.attr}_cc"
+            n = 2
+            while candidate.lower() in taken_lower:
+                candidate = f"{tgt.attr}_cc{n}"
+                n += 1
+            rename_map[tgt.attr] = candidate
+    if not rename_map:
+        return tree
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            if node.attr in rename_map:
+                node.attr = rename_map[node.attr]
+            return node
+
+    out = _Rewriter().visit(tree)
+    ast.fix_missing_locations(out)
+    return out
+
+
 def rewrite_class_methods_to_toplevel(tree):
     """Hoist every method (other than `__init__`) of a plain/dataclass-
     shaped class -- the same shapes `collect_dataclass_info` (xp2f.py)
@@ -11655,6 +11832,32 @@ def _svd_call_wants_economy(node):
     return False
 
 
+def template_derived_needed_helpers(structured_type_components):
+    """A struct field's own "template" expression (see
+    collect_dataclass_info's _computed_array_field_template and its
+    allocate-then-whole-slice-fill idiom) can SYNTHESIZE a fresh Call
+    node -- e.g. a `np.full(...)` standing in for two ORIGINAL source
+    statements, `self.z = np.empty(k); self.z[:] = 7.0` -- that never
+    appears literally anywhere in the actual source tree
+    detect_needed_helpers walks, since the synthesized Call only exists
+    inside this template. Wrap every template found across every known
+    struct type as its own scannable statement and run the SAME
+    detection over that, so a helper it alone needs (`arange_int`, for
+    `np.full`'s own broadcast-shape codegen) isn't silently dropped
+    wherever `needed`/its per-module refinements get computed."""
+    template_nodes = [
+        tmpl[1]
+        for fields in (structured_type_components or {}).values()
+        for _fnm, _fkind, _frank, _fdefault, tmpl in fields
+        if tmpl is not None
+    ]
+    if not template_nodes:
+        return set()
+    scan_tree = ast.Module(body=[ast.Expr(value=n) for n in template_nodes], type_ignores=[])
+    ast.fix_missing_locations(scan_tree)
+    return detect_needed_helpers(scan_tree)
+
+
 def detect_needed_helpers(tree):
     needed = set()
     linalg_aliases = collect_linalg_aliases(tree)
@@ -14826,6 +15029,7 @@ def collect_dataclass_info(tree):
     """Collect simple @dataclass and plain class records as Fortran derived types."""
     class_to_type = {}
     type_components = {}
+    class_ctor_extra = {}
 
     def _is_dataclass_decorator(d):
         if isinstance(d, ast.Name) and d.id == "dataclass":
@@ -14880,6 +15084,38 @@ def collect_dataclass_info(tree):
             return ("real", 0, f"{n!r}_dp")
         return None
 
+    def _computed_array_field_template(v):
+        """A field whose value is COMPUTED from __init__'s own parameters
+        rather than passed straight through unchanged -- e.g. pyccel's own
+        `array_attribute.py::A.__init__`: `self.x = np.ones(n)` (an
+        allocatable real array field, its shape depending on the
+        parameter `n`, not a single argument's own raw value). Neither
+        the pmap passthrough nor the literal-default case above covers
+        this: it's not `self.field = param_name` (the whole call is the
+        RHS, not a bare Name), and it's not a fixed literal either (its
+        VALUE actually depends on the constructor argument). Recognized
+        narrowly -- `np.ones`/`np.zeros`/`np.empty` with exactly one
+        positional argument and no dtype= override (real is the default
+        for all three) -- and returns (kind="real", rank=1, the deep-
+        copied Call node itself) so the constructor-call Call-lowering in
+        expr() can later substitute __init__'s own parameter Names for
+        the actual call's argument expressions and render the result via
+        self.expr(), rather than trying (and failing) to map this field
+        onto a plain positional/keyword structure-constructor argument or
+        a static default initializer -- neither of which can express "the
+        array's length is the constructor's own argument value."."""
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in {"np", "numpy"}
+            and v.func.attr in {"ones", "zeros", "empty"}
+            and len(v.args) == 1
+            and not v.keywords
+        ):
+            return ("real", 1, copy.deepcopy(v))
+        return None
+
     def _field_kind(ann):
         """Returns (kind, rank) for a recognized field annotation, else
         None. `rank` is 0 for a scalar. Beyond the original bare-scalar
@@ -14888,7 +15124,20 @@ def collect_dataclass_info(tree):
         own `knots: 'float[:]'`, the same syntax wrapped as a string
         literal (`ast.unparse` of a string constant re-quotes it, hence
         the one layer of quote-stripping below before handing off to the
-        shared `_parse_base_type_and_rank`)."""
+        shared `_parse_base_type_and_rank`). ALSO accepts a bare class
+        name (e.g. `l: "Point"`, pyccel's own classes_1.py::Line) when
+        that class was ALREADY recognized as struct-shaped earlier in
+        this same source-order pass over `tree.body` (a forward
+        reference to a class defined LATER in the file isn't attempted
+        -- classes are processed strictly in the order they appear) --
+        kind is then the special marker `"struct:<TypeName>_t"`, which
+        every consumer of a field's own kind (the derived-type
+        declaration emitter, the struct-field assignment/read paths in
+        the real translator) recognizes and handles as a nested
+        component rather than a primitive scalar/array."""
+        _cls_txt = user_class_ann_text(ann)
+        if _cls_txt is not None and _cls_txt in class_to_type:
+            return (f"struct:{class_to_type[_cls_txt]}", 0)
         txt = ""
         if ann is not None and hasattr(ast, "unparse"):
             txt = ast.unparse(ann).lower()
@@ -14935,11 +15184,25 @@ def collect_dataclass_info(tree):
                     if k is None:
                         ok = False
                         break
-                    fields.append((st.target.id, k[0], k[1], None))
+                    fields.append((st.target.id, k[0], k[1], None, None))
                     continue
                 # Keep subset strict for predictable lowering.
                 ok = False
                 break
+            if ok and fields:
+                # A @dataclass/NamedTuple's own implicit __init__ takes
+                # exactly these fields as its parameters, in this same
+                # declared order -- give each field that same "constructor
+                # parameter" template the plain-class branch below builds
+                # explicitly, so the constructor-call Call-lowering in
+                # expr() (which looks for it on ANY field to recover the
+                # class's own constructor parameter order) has one to find
+                # here too.
+                _dc_param_names = tuple(f[0] for f in fields)
+                fields = [
+                    (fname, fkind, frank, fdefault, (_dc_param_names, ast.Name(id=fname, ctx=ast.Load())))
+                    for fname, fkind, frank, fdefault, _old_tmpl in fields
+                ]
         else:
             # Plain class subset:
             # class C:
@@ -14961,7 +15224,35 @@ def collect_dataclass_info(tree):
                 pmap[a.arg] = k
             if not ok:
                 continue
-            for st in init_fn.body:
+            def _is_full_slice(sl):
+                return isinstance(sl, ast.Slice) and sl.lower is None and sl.upper is None and sl.step is None
+
+            def _full_slice_fill_value(st, field_attr):
+                """`self.FIELD[:] = fill_expr` immediately after
+                `self.FIELD = np.empty/zeros/ones(shape)` -- pyccel's own
+                array_attribute.py-adjacent idiom (allocate the shape,
+                then fill it in a second statement) -- returns
+                `fill_expr` if `st` is exactly that shape for this same
+                field, else None."""
+                if not (
+                    isinstance(st, ast.Assign)
+                    and len(st.targets) == 1
+                    and isinstance(st.targets[0], ast.Subscript)
+                    and isinstance(st.targets[0].value, ast.Attribute)
+                    and isinstance(st.targets[0].value.value, ast.Name)
+                    and st.targets[0].value.value.id == "self"
+                    and st.targets[0].value.attr == field_attr
+                    and _is_full_slice(st.targets[0].slice)
+                ):
+                    return None
+                return st.value
+
+            body_stmts = list(init_fn.body)
+            leftover_stmts = []
+            si = 0
+            while si < len(body_stmts):
+                st = body_stmts[si]
+                si += 1
                 if isinstance(st, ast.Expr) and isinstance(getattr(st, "value", None), ast.Constant) and isinstance(st.value.value, str):
                     continue
                 if (
@@ -14972,7 +15263,10 @@ def collect_dataclass_info(tree):
                     and st.targets[0].value.id == "self"
                 ):
                     if isinstance(st.value, ast.Name) and st.value.id in pmap:
-                        fields.append((st.targets[0].attr, pmap[st.value.id][0], pmap[st.value.id][1], None))
+                        fields.append((
+                            st.targets[0].attr, pmap[st.value.id][0], pmap[st.value.id][1], None,
+                            (tuple(pmap.keys()), ast.Name(id=st.value.id, ctx=ast.Load())),
+                        ))
                         continue
                     lit = _literal_field_default(st.value)
                     if lit is not None:
@@ -14983,19 +15277,119 @@ def collect_dataclass_info(tree):
                         # (see _emit_type_defs), and never appears in the
                         # constructor-call argument list (see the
                         # user_class_types Call-lowering in expr()).
-                        fields.append((st.targets[0].attr, lit[0], lit[1], lit[2]))
+                        fields.append((st.targets[0].attr, lit[0], lit[1], lit[2], None))
+                        continue
+                    if (
+                        isinstance(st.value, ast.Call)
+                        and isinstance(st.value.func, ast.Attribute)
+                        and isinstance(st.value.func.value, ast.Name)
+                        and st.value.func.value.id in {"np", "numpy"}
+                        and st.value.func.attr in {"ones", "zeros", "empty"}
+                        and len(st.value.args) == 1
+                        and not st.value.keywords
+                        and si < len(body_stmts)
+                    ):
+                        # `self.field = np.empty(k)` immediately followed
+                        # by a whole-array fill: the intermediate
+                        # allocator doesn't matter (its own contents are
+                        # about to be overwritten completely either way),
+                        # so this is exactly `self.field = np.full(k,
+                        # fill_expr)` -- same idiom
+                        # merge_allocate_then_scalar_fill_to_source
+                        # already recognizes at the generated-FORTRAN-TEXT
+                        # level (`allocate(x(n)); x = fill` ->
+                        # `allocate(x(n), source=fill)`), just caught here
+                        # at the Python-source/field-template level
+                        # instead.
+                        fill_expr = _full_slice_fill_value(body_stmts[si], st.targets[0].attr)
+                        if fill_expr is not None:
+                            si += 1
+                            full_call = ast.Call(
+                                func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="full", ctx=ast.Load()),
+                                args=[copy.deepcopy(st.value.args[0]), copy.deepcopy(fill_expr)],
+                                keywords=[],
+                            )
+                            fields.append((
+                                st.targets[0].attr, "real", 1, None,
+                                (tuple(pmap.keys()), full_call),
+                            ))
+                            continue
+                    computed = _computed_array_field_template(st.value)
+                    if computed is not None:
+                        ckind, crank, ctemplate = computed
+                        fields.append((st.targets[0].attr, ckind, crank, None, (tuple(pmap.keys()), ctemplate)))
                         continue
                 if isinstance(st, ast.Pass):
                     continue
-                ok = False
-                break
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Global, ast.Nonlocal, ast.Import, ast.ImportFrom)) or (
+                    isinstance(st, ast.Return) and st.value is not None
+                ):
+                    # Genuinely incompatible with hoisting __init__ into a
+                    # constructor procedure below.
+                    ok = False
+                    break
+                if (
+                    isinstance(st, ast.Assign)
+                    and len(st.targets) == 1
+                    and isinstance(st.targets[0], ast.Attribute)
+                    and isinstance(st.targets[0].value, ast.Name)
+                    and st.targets[0].value.id == "self"
+                    and st.targets[0].attr not in {f[0] for f in fields}
+                ):
+                    # A NEW field, defined by something other than the
+                    # simple shapes already tried above (e.g. `self._x =
+                    # self.l.get_x()`, a method call on a nested field --
+                    # pyccel's own classes_1.py Line) -- unlike mutating
+                    # an EXISTING field (kind/rank already known from its
+                    # own defining statement), this field's own kind/rank
+                    # can't be determined at this static, pre-codegen
+                    # stage at all (no type-inference pass has run yet),
+                    # so there is nothing to put in the derived type's
+                    # own declaration for it. Declined rather than
+                    # guessed -- matches this function's existing stance
+                    # everywhere else it can't pin down a field's type.
+                    ok = False
+                    break
+                # Everything else -- mutating an ALREADY-known field via a
+                # non-simple expression, a nested-field mutation (`self.a.x
+                # = ...`), a plain method call, If/For/While, ... -- is
+                # deferred as a "leftover" constructor statement instead of
+                # rejecting the whole class outright.
+                leftover_stmts.append(copy.deepcopy(st))
+            # A stateless plain class -- __init__ takes only `self` and
+            # does nothing but `pass` (e.g. pyccel's own classes_2.py
+            # Point, whose only job is hosting addition()/subtraction()
+            # methods) -- has no fields at all, unlike the @dataclass/
+            # NamedTuple branch above, where zero declared fields is
+            # never a real, intentional shape worth supporting. `fields`
+            # empty is fine here; only a genuinely unsupported statement
+            # shape (ok = False) should reject the class.
+            if not ok:
+                continue
+            tname = f"{node.name}_t"
+            class_to_type[node.name] = tname
+            type_components[tname] = fields
+            if leftover_stmts:
+                # __init__ does more than assign each field once -- e.g.
+                # pyccel's own classes_1.py Line: `self.a = a; self.a.x =
+                # 99.0` mutates a NESTED field after construction, which
+                # no single per-field expression template (the mechanism
+                # every other class shape in this function reduces to)
+                # can express: it needs __init__'s own EXTRA statements
+                # actually executed, in order, against a real struct
+                # value. Recorded here for hoist_class_constructors_
+                # with_side_effects to turn into a real constructor
+                # procedure; collect_dataclass_info itself only collects
+                # metadata, never mutates the tree.
+                class_ctor_extra[node.name] = (copy.deepcopy(init_fn.args.args[1:]), leftover_stmts)
+            continue
         if not ok or not fields:
             continue
         tname = f"{node.name}_t"
         class_to_type[node.name] = tname
         type_components[tname] = fields
 
-    return class_to_type, type_components
+    return class_to_type, type_components, class_ctor_extra
 
 
 def user_class_ann_text(ann):
@@ -15022,6 +15416,23 @@ def user_class_ann_text(ann):
     if m:
         txt = m.group(1).strip()
     return txt
+
+
+def _all_returns_same_struct_type(fn, dict_typed_vars):
+    """If `fn` has no explicit user-class return annotation but every one
+    of its `return EXPR` statements hands back a bare Name already known
+    (via `dict_typed_vars`, e.g. a struct-typed parameter) to be the SAME
+    struct type, return that type's name; else None. Covers a function
+    like pyccel's own `choose_A(a1, a2, b)` -- `if b: return a1 else:
+    return a2` -- which has no `-> T` annotation at all, only inferable
+    from its own return statements."""
+    ret_vals = [r.value for r in ast.walk(fn) if isinstance(r, ast.Return) and r.value is not None]
+    if not ret_vals or not all(isinstance(v, ast.Name) and v.id in dict_typed_vars for v in ret_vals):
+        return None
+    tnms = {dict_typed_vars[v.id] for v in ret_vals}
+    if len(tnms) != 1:
+        return None
+    return next(iter(tnms))
 
 
 def detect_scalar_outputs(tree, params):
@@ -21037,6 +21448,30 @@ class translator(ast.NodeVisitor):
             return self._rank_expr(uc) == 0
         return False
 
+    def _struct_type_of(self, node):
+        """The derived-type name (e.g. "Point_t") `node` evaluates to, if
+        it's a struct/class-typed expression, else None. Handles an
+        arbitrarily deep chain of nested-struct field access (`self.l`,
+        `line.a`, `self.l.inner.other`, ...) -- one class holding another
+        as one of its own fields, e.g. pyccel's own classes_1.py Line
+        holding a Point -- not just a single dict_typed_vars Name, which
+        is as far as the read/write struct-field paths that consult this
+        used to reach (a nested chain more than one level deep was
+        "unsupported attribute expr"/"unsupported assign" before this)."""
+        if isinstance(node, ast.Name):
+            return self.dict_typed_vars.get(self._aliased_name(node.id))
+        if isinstance(node, ast.Attribute):
+            base_tnm = self._struct_type_of(node.value)
+            if base_tnm is None:
+                return None
+            for fnm, fkind, _frank, _fdefault, _ftmpl in self.structured_type_components.get(base_tnm, []):
+                if fnm == node.attr:
+                    if isinstance(fkind, str) and fkind.startswith("struct:"):
+                        return fkind[len("struct:"):]
+                    return None
+            return None
+        return None
+
     def _expr_kind(self, node):
         if (
             isinstance(node, ast.Subscript)
@@ -21344,8 +21779,8 @@ class translator(ast.NodeVisitor):
                 _nm = self._aliased_name(node.value.id)
                 _tnm = self.dict_typed_vars.get(_nm)
                 if _tnm is not None:
-                    for _fnm, _fkind, _frank, _fdefault in self.structured_type_components.get(_tnm, []):
-                        if _fnm == node.attr and _frank == 0:
+                    for _fnm, _fkind, _frank, _fdefault, _ftmpl in self.structured_type_components.get(_tnm, []):
+                        if _fnm == node.attr:
                             return _fkind
             return None
         if isinstance(node, ast.UnaryOp):
@@ -21452,7 +21887,7 @@ class translator(ast.NodeVisitor):
             ):
                 anm = self._aliased_name(node.value.id)
                 tnm = self.structured_array_types.get(anm, "")
-                for fnm, fkind, _frank, _fdefault in self.structured_type_components.get(tnm, []):
+                for fnm, fkind, _frank, _fdefault, _ftmpl in self.structured_type_components.get(tnm, []):
                     if fnm == node.slice.value:
                         return fkind
             if (
@@ -26185,7 +26620,7 @@ class translator(ast.NodeVisitor):
             _nm2 = self._aliased_name(node.value.id)
             _tnm2 = self.dict_typed_vars.get(_nm2)
             if _tnm2 is not None:
-                for _fnm2, _fkind2, _frank2, _fdefault2 in self.structured_type_components.get(_tnm2, []):
+                for _fnm2, _fkind2, _frank2, _fdefault2, _ftmpl2 in self.structured_type_components.get(_tnm2, []):
                     if _fnm2 == node.attr:
                         return _frank2
         if isinstance(node, ast.Call):
@@ -28586,12 +29021,23 @@ class translator(ast.NodeVisitor):
                     # plain (non-allocatable) and have no such test.
                     return name in self.chars
                 if is_none(a):
+                    # A genuinely optional Fortran dummy argument (present()-
+                    # tracked) takes priority over the dict/struct "first
+                    # component allocated?" sentinel test below, even when
+                    # the name is ALSO dict-typed (a struct-typed optional
+                    # parameter, e.g. `def f(a: "A" = None)`, is both) --
+                    # present() is correct regardless of the struct's own
+                    # field shape, whereas _dict_none_test assumes an
+                    # allocatable first field, which isn't true in general
+                    # (a scalar-only-fields class has no such component at
+                    # all, and ALLOCATED() on a plain scalar is a compile
+                    # error).
+                    if isinstance(b, ast.Name) and b.id in self.optional_dummy_args:
+                        return "(.not. present(" + b.id + "))" if op is ast.Is else "present(" + b.id + ")"
                     if isinstance(b, ast.Name) and b.id in self.dict_typed_vars:
                         t = _dict_none_test(b.id)
                         if t is not None:
                             return t if op is ast.Is else f"(.not. {t})"
-                    if isinstance(b, ast.Name) and b.id in self.optional_dummy_args:
-                        return "(.not. present(" + b.id + "))" if op is ast.Is else "present(" + b.id + ")"
                     if isinstance(b, ast.Name) and b.id in self.callable_aliases:
                         return ".false." if op is ast.Is else ".true."
                     if isinstance(b, ast.Name) and (
@@ -28603,12 +29049,12 @@ class translator(ast.NodeVisitor):
                     left = self.expr(b)
                     return f"({left} == -1)" if op is ast.Is else f"({left} /= -1)"
                 if is_none(b):
+                    if isinstance(a, ast.Name) and a.id in self.optional_dummy_args:
+                        return "(.not. present(" + a.id + "))" if op is ast.Is else "present(" + a.id + ")"
                     if isinstance(a, ast.Name) and a.id in self.dict_typed_vars:
                         t = _dict_none_test(a.id)
                         if t is not None:
                             return t if op is ast.Is else f"(.not. {t})"
-                    if isinstance(a, ast.Name) and a.id in self.optional_dummy_args:
-                        return "(.not. present(" + a.id + "))" if op is ast.Is else "present(" + a.id + ")"
                     if isinstance(a, ast.Name) and a.id in self.callable_aliases:
                         return ".false." if op is ast.Is else ".true."
                     if isinstance(a, ast.Name) and (
@@ -31164,28 +31610,60 @@ class translator(ast.NodeVisitor):
                         return self.expr(repl)
                 if node.func.id in self.user_class_types:
                     tnm = self.user_class_types[node.func.id]
+                    fields_list = self.structured_type_components.get(tnm, [])
                     args_nodes = list(node.args)
+                    # Every non-literal-defaulted field carries the SAME
+                    # "template" -- (this class's own constructor
+                    # parameter names in order, an expression over those
+                    # parameter names giving the field's own value) --
+                    # whether it's a plain passthrough (`self.data = x` ->
+                    # template is just `Name("x")`), a @dataclass's own
+                    # implicit field-as-parameter, or something genuinely
+                    # COMPUTED from the parameters (`self.x = np.ones(n)`,
+                    # pyccel's own array_attribute.py -- the field's own
+                    # shape depends on the constructor's argument value,
+                    # which neither a positional/keyword passthrough NOR a
+                    # static default initializer can express). Recover the
+                    # parameter-name order from whichever field has one.
+                    ctor_param_names = ()
+                    for _fnm, _fkind, _frank, _fdefault, _ftmpl in fields_list:
+                        if _ftmpl is not None:
+                            ctor_param_names = _ftmpl[0]
+                            break
+                    subst = {}
+                    for i, pname in enumerate(ctor_param_names):
+                        if i < len(args_nodes):
+                            subst[pname] = args_nodes[i]
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg is not None and kw.arg in ctor_param_names:
+                            subst[kw.arg] = kw.value
+
+                    class _CtorParamSubst(ast.NodeTransformer):
+                        def visit_Name(self, n):
+                            if isinstance(n.ctx, ast.Load) and n.id in subst:
+                                return copy.deepcopy(subst[n.id])
+                            return n
+
                     parts = []
-                    # Only fields with no default initializer are actually
-                    # constructor parameters -- a literal-defaulted field
-                    # (`self._default = 0`, never derived from an __init__
-                    # argument) is invisible to the Python constructor call
-                    # too, so it must never consume one of args_nodes'
-                    # positions; it's left for the derived type's own
-                    # default (see _emit_type_defs) to supply.
-                    comps = [
-                        nm for nm, _, _, fdefault in self.structured_type_components.get(tnm, [])
-                        if fdefault is None
-                    ]
-                    for i, a in enumerate(args_nodes):
-                        ae = strip_redundant_outer_parens_expr(self.expr(a))
-                        if i < len(comps):
-                            parts.append(f"{comps[i]}={ae}")
-                        else:
-                            parts.append(ae)
+                    for fnm, _fkind, _frank, fdefault, ftmpl in fields_list:
+                        if fdefault is not None:
+                            # Never derived from any __init__ argument at
+                            # all -- invisible to the Python constructor
+                            # call too; left for the derived type's own
+                            # default initializer (see _emit_type_defs).
+                            continue
+                        if ftmpl is None:
+                            continue
+                        _, template_node = ftmpl
+                        substituted = _CtorParamSubst().visit(copy.deepcopy(template_node))
+                        ast.fix_missing_locations(substituted)
+                        ae = strip_redundant_outer_parens_expr(self.expr(substituted))
+                        parts.append(f"{fnm}={ae}")
                     for kw in getattr(node, "keywords", []):
                         if kw.arg is None:
                             raise NotImplementedError("**kwargs not supported")
+                        if kw.arg in ctor_param_names:
+                            continue
                         parts.append(f"{kw.arg}={strip_redundant_outer_parens_expr(self.expr(kw.value))}")
                     return f"{tnm}(" + ", ".join(parts) + ")"
                 if node.func.id in self.local_void_funcs:
@@ -35680,10 +36158,7 @@ class translator(ast.NodeVisitor):
                 if node.value.func.attr == "iinfo":
                     # NumPy: np.iinfo(np.int32).max
                     return "huge(1)"
-            if (
-                isinstance(node.value, ast.Name)
-                and node.value.id in self.dict_typed_vars
-            ):
+            if self._struct_type_of(node.value) is not None:
                 return f"{self.expr(node.value)}%{node.attr}"
             if node.attr == "columns" and self._is_pandas_df_ref_node(node.value):
                 _df_expr2, _cols2 = self._pandas_df_ref(node.value, node)
@@ -36453,7 +36928,7 @@ class translator(ast.NodeVisitor):
                     if _class_ann_txt is not None and _class_ann_txt in self.user_class_types:
                         tnm = self.user_class_types[_class_ann_txt]
                         self.dict_typed_vars[tname] = tnm
-                        self.dict_var_components[tname] = [nm for nm, _, _, _ in self.structured_type_components.get(tnm, [])]
+                        self.dict_var_components[tname] = [nm for nm, _, _, _, _ in self.structured_type_components.get(tnm, [])]
                         self.ints.discard(tname)
                         self.reals.discard(tname)
                         self.logs.discard(tname)
@@ -36546,7 +37021,7 @@ class translator(ast.NodeVisitor):
                     tname = node.targets[0].id
                     tnm = self.user_class_types[node.value.func.id]
                     self.dict_typed_vars[tname] = tnm
-                    self.dict_var_components[tname] = [nm for nm, _, _, _ in self.structured_type_components.get(tnm, [])]
+                    self.dict_var_components[tname] = [nm for nm, _, _, _, _ in self.structured_type_components.get(tnm, [])]
                     self.ints.discard(tname)
                     self.reals.discard(tname)
                     self.logs.discard(tname)
@@ -40380,20 +40855,23 @@ class translator(ast.NodeVisitor):
             )
         if (
             isinstance(t, ast.Attribute)
-            and isinstance(t.value, ast.Name)
-            and t.value.id in self.dict_typed_vars
+            and self._struct_type_of(t.value) is not None
         ):
             # obj.field = expr / self.field = expr -- a user-class (derived
-            # type) instance's own field assignment. Reads already resolve
-            # to `obj%field` (see expr()'s dict_typed_vars branch), but
-            # there was previously no matching write path at all -- every
-            # class method or driver script that ever mutated an instance
-            # attribute (rather than just reading one at construction time)
-            # hit "unsupported assign".
+            # type) instance's own field assignment (`_struct_type_of`
+            # resolves an arbitrarily deep nested-struct chain, e.g.
+            # `self.l.field = expr` for pyccel's own classes_1.py Line
+            # holding a Point, not just a bare Name). Reads already
+            # resolve to `obj%field` (see expr()'s matching
+            # _struct_type_of branch), but there was previously no
+            # matching write path at all -- every class method or driver
+            # script that ever mutated an instance attribute (rather than
+            # just reading one at construction time) hit "unsupported
+            # assign".
             lhs_expr = f"{self.expr(t.value)}%{t.attr}"
-            tnm = self.dict_typed_vars[t.value.id]
+            tnm = self._struct_type_of(t.value)
             field_kind = None
-            for fnm, fkind, _frank, _fdefault in self.structured_type_components.get(tnm, []):
+            for fnm, fkind, _frank, _fdefault, _ftmpl in self.structured_type_components.get(tnm, []):
                 if fnm == t.attr:
                     field_kind = fkind
                     break
@@ -41246,7 +41724,7 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("structured np.array rows must be tuples/lists")
                 if len(row.elts) != len(fields):
                     raise NotImplementedError("structured np.array row width does not match dtype")
-                for j, (fname, _fkind, _frank, _fdefault) in enumerate(fields):
+                for j, (fname, _fkind, _frank, _fdefault, _ftmpl) in enumerate(fields):
                     self.o.w(f"{t.id}({i})%{fname} = {self.expr(row.elts[j])}")
             return
 
@@ -47941,7 +48419,7 @@ class translator(ast.NodeVisitor):
                     tnm_iter = self.structured_array_types[anm_iter]
                     comp_names_iter = list(self.dict_type_components.get(tnm_iter, {}).keys())
                     if not comp_names_iter:
-                        comp_names_iter = [nm for nm, _, _, _ in self.structured_type_components.get(tnm_iter, [])]
+                        comp_names_iter = [nm for nm, _, _, _, _ in self.structured_type_components.get(tnm_iter, [])]
             # A bare `for x in ARR:`/`enumerate(ARR)` over a plain
             # variable, never mutated anywhere in the loop body, needs
             # no defensive copy at all -- ARR can be indexed directly,
@@ -52991,7 +53469,7 @@ def _emit_local_function(
         if tnm in (dict_type_components or {}):
             tr.dict_var_components[anm] = list((dict_type_components or {}).get(tnm, {}).keys())
         else:
-            tr.dict_var_components[anm] = [nm for nm, _, _, _ in tr.structured_type_components.get(tnm, [])]
+            tr.dict_var_components[anm] = [nm for nm, _, _, _, _ in tr.structured_type_components.get(tnm, [])]
         tr.ints.discard(anm)
         tr.reals.discard(anm)
         tr.alloc_ints.discard(anm)
@@ -57027,6 +57505,24 @@ def _emit_local_function(
         decl_kind, arr_rank, intent_txt = meta
         if decl_kind is None:
             continue
+        if decl_kind.lower().startswith("type("):
+            # A struct/class-typed None-default parameter (e.g. pyccel's
+            # own `def get_x_from_A(a: "A" = None)`) needs no local alias/
+            # materialization at all -- unlike a scalar/array default,
+            # there's no sensible "default struct value" to fabricate.
+            # Left un-aliased, `arg` resolves to the raw dummy directly,
+            # which is already declared `optional` (see the `, optional`
+            # suffix applied below to every name in optional_args
+            # regardless of kind) and whose presence the body checks via
+            # `is not None` -> `present()` (see expr()'s Compare handling,
+            # which now checks optional_dummy_args before the dict/struct
+            # "first field allocated?" sentinel test for exactly this
+            # reason). Before this, decl_kind == "type(...)" fell through
+            # to the generic scalar branch below, which doesn't recognize
+            # "type(...)" as any of logical/complex/real/character and so
+            # silently mismarked it as a plain integer default (`optval(a,
+            # 0)` -- no matching generic overload, a compile error).
+            continue
         lk = decl_kind.lower()
         alias = f"{arg}_opt"
         if int(arr_rank) > 0:
@@ -57832,6 +58328,17 @@ def _emit_local_function(
             ret_decl = "complex(kind=dp)"
         elif user_class_ann_text(fn.returns) in dict(user_class_types or {}):
             ret_decl = f"type({dict(user_class_types or {})[user_class_ann_text(fn.returns)]})"
+        elif _all_returns_same_struct_type(fn, tr.dict_typed_vars) is not None:
+            # No explicit `-> T` return annotation, but every `return`
+            # statement hands back a bare struct-typed variable/parameter
+            # (all the same class) -- e.g. pyccel's own `choose_A(a1, a2,
+            # b)`, which just returns whichever of its two A-typed
+            # parameters `b` picks, with no annotation at all. Without
+            # this, the result variable fell through to the generic
+            # real/int default (int, since neither ret_spec nor any
+            # earlier branch matched), and the body's own `func_res = a1`
+            # (a TYPE(a_t)) failed to compile against it.
+            ret_decl = f"type({_all_returns_same_struct_type(fn, tr.dict_typed_vars)})"
         elif ret_spec in {"real", "complex", "logical", "char"}:
             if ret_spec == "real":
                 ret_decl = "real(kind=dp)"
@@ -59027,7 +59534,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             for _cpnm, _cptnm in _class_param_types.items():
                 tr.dict_typed_vars[_cpnm] = _cptnm
                 tr.dict_var_components[_cpnm] = [
-                    nm for nm, _, _, _ in (structured_type_components or {}).get(_cptnm, [])
+                    nm for nm, _, _, _, _ in (structured_type_components or {}).get(_cptnm, [])
                 ]
             for i, a in enumerate(fn_args_all):
                 if a.arg in _df_param_names or a.arg in _class_param_types:
@@ -59668,7 +60175,7 @@ def generate_flat(
                 _tnm = dict(user_class_types or {})[_ann_txt2]
                 tr_scan.dict_typed_vars[_a.arg] = _tnm
                 tr_scan.dict_var_components[_a.arg] = [
-                    nm for nm, _, _, _ in (structured_type_components or {}).get(_tnm, [])
+                    nm for nm, _, _, _, _ in (structured_type_components or {}).get(_tnm, [])
                 ]
     def _tuple_subscript_base_rank(elts):
         # Base-array rank consumed by a tuple subscript.
@@ -62825,6 +63332,58 @@ def generate_flat(
         if tnm not in dict_type_components:
             dict_type_components[tnm] = {cname: (ckind, crank) for cname, ckind, _, crank in spec["components"]}
 
+    # A local function returning a user-class INSTANCE (not the dict-
+    # emulation feature above) -- e.g. `ClassName_new`, hoisted by
+    # hoist_class_constructors_with_side_effects for a class whose
+    # __init__ does more than assign each field once (pyccel's own
+    # classes_1.py Line) -- needs the SAME "assigning this function's
+    # result registers the target as struct-typed" treatment a plain
+    # `x = ClassName(...)` constructor call already gets, or a caller's
+    # own `line = ClassName_new(...)` local never resolves as
+    # struct-typed at all (confirmed via a real "unsupported attribute
+    # expr" failure on `line.a.x` otherwise). Reuses dict_return_types/
+    # dict_type_components -- the same registration path (see the
+    # `v.func.id in self.dict_return_types` check below) -- rather than
+    # a new mechanism, so nothing about the read/write codegen needs to
+    # change; only feeding it here.
+    for fn in (local_funcs or []):
+        if fn.name in dict_return_types:
+            continue
+        ret_class_types = set()
+        ret_ok = True
+        for st in ast.walk(fn):
+            if not (isinstance(st, ast.Return) and st.value is not None):
+                continue
+            rv = st.value
+            found_tnm = None
+            if isinstance(rv, ast.Call) and isinstance(rv.func, ast.Name) and rv.func.id in (user_class_types or {}):
+                found_tnm = (user_class_types or {})[rv.func.id]
+            elif isinstance(rv, ast.Name):
+                for st2 in ast.walk(fn):
+                    if (
+                        isinstance(st2, ast.Assign)
+                        and len(st2.targets) == 1
+                        and isinstance(st2.targets[0], ast.Name)
+                        and st2.targets[0].id == rv.id
+                        and isinstance(st2.value, ast.Call)
+                        and isinstance(st2.value.func, ast.Name)
+                        and st2.value.func.id in (user_class_types or {})
+                    ):
+                        found_tnm = (user_class_types or {})[st2.value.func.id]
+                        break
+            if found_tnm is None:
+                ret_ok = False
+                break
+            ret_class_types.add(found_tnm)
+        if ret_ok and len(ret_class_types) == 1:
+            tnm = next(iter(ret_class_types))
+            dict_return_types[fn.name] = tnm
+            if tnm not in dict_type_components:
+                dict_type_components[tnm] = {
+                    fnm: (fkind, frank)
+                    for fnm, fkind, frank, _fdefault, _ftmpl in (structured_type_components or {}).get(tnm, [])
+                }
+
     tuple_return_funcs = set()
     local_tuple_return_out_names = {}
     local_tuple_return_src_names = {}
@@ -64055,8 +64614,27 @@ def generate_flat(
             n for n in tree.body
             if isinstance(n, (ast.Import, ast.ImportFrom)) or _is_rng_ctor_assign(n)
         ]
+        # A user class's own `__init__` is never itself hoisted into
+        # `local_funcs` (ClassDef is deliberately excluded from that
+        # `isinstance(s, ast.FunctionDef)` filter -- __init__ becomes a
+        # structure-constructor call, not a standalone procedure) -- but
+        # since a constructor call's own field values can now be COMPUTED
+        # expressions substituted straight from __init__'s own body (see
+        # collect_dataclass_info's _computed_array_field_template, e.g.
+        # `self.x = np.ones(n)`), a runtime helper referenced only inside
+        # an __init__ (`ones_real` here) needs to be visible to this scan
+        # too, or it's silently dropped from this module's own `use
+        # python_mod, only: ...` list -- confirmed via a real build
+        # failure ("ones_real" with no IMPLICIT type) derived from
+        # pyccel's own array_attribute.py.
+        for _cls in tree.body:
+            if isinstance(_cls, ast.ClassDef):
+                for _member in _cls.body:
+                    if isinstance(_member, ast.FunctionDef) and _member.name == "__init__":
+                        _proc_tree_top_level.append(_member)
         proc_tree = ast.Module(body=_proc_tree_top_level + list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
+        proc_needed |= template_derived_needed_helpers(structured_type_components)
         for mod, syms in helper_uses.items():
             keep = sorted([s for s in syms if s in proc_needed])
             if keep:
@@ -64095,14 +64673,55 @@ def generate_flat(
                     target_o.w(f"integer :: {cname}")
             target_o.pop()
             target_o.w(f"end type {tname}")
-        for tname, fields in sorted((structured_type_components or {}).items()):
+        # A struct type referencing ANOTHER struct type as one of its own
+        # fields (e.g. pyccel's own classes_1.py Line, holding a Point)
+        # must have that OTHER type's own `type :: ... end type` already
+        # emitted earlier in the same module -- plain alphabetical order
+        # ("Line_t" before "Point_t") can get this backwards (confirmed
+        # via a real build failure: "Derived type ... has not been
+        # previously defined"). Emit in dependency order instead: a
+        # type's own nested struct fields first, depth-first, alphabetical
+        # among types with no ordering constraint between them (keeps
+        # output stable/deterministic).
+        def _struct_type_deps(tname):
+            return sorted({
+                fkind[len("struct:"):]
+                for _fname, fkind, _frank, _fdefault, _ftmpl in (structured_type_components or {}).get(tname, [])
+                if isinstance(fkind, str) and fkind.startswith("struct:")
+            })
+
+        _struct_order = []
+        _struct_visiting = set()
+
+        def _visit_struct_type(tname):
+            if tname in _struct_order or tname not in (structured_type_components or {}):
+                return
+            if tname in _struct_visiting:
+                return  # a dependency cycle -- fall back to emitting as-is rather than infinite-recurse
+            _struct_visiting.add(tname)
+            for dep in _struct_type_deps(tname):
+                _visit_struct_type(dep)
+            _struct_visiting.discard(tname)
+            _struct_order.append(tname)
+
+        for tname in sorted((structured_type_components or {}).keys()):
+            _visit_struct_type(tname)
+
+        for tname in _struct_order:
+            fields = (structured_type_components or {})[tname]
             if tname in emitted:
                 continue
             emitted.add(tname)
             type_names.append(tname)
             target_o.w(f"type :: {tname}")
             target_o.push()
-            for fname, fkind, frank, fdefault in fields:
+            for fname, fkind, frank, fdefault, _ftmpl in fields:
+                if isinstance(fkind, str) and fkind.startswith("struct:"):
+                    # A field whose own type is ANOTHER user class (e.g.
+                    # pyccel's own classes_1.py Line, holding a Point) --
+                    # see _field_kind's own class-name recognition.
+                    target_o.w(f"type({fkind[len('struct:'):]}) :: {fname}")
+                    continue
                 if frank > 0:
                     # An array-typed field (e.g. Spline's own `knots`/
                     # `coeffs`, both `'float[:]'`) -- allocatable, same
@@ -64738,6 +65357,7 @@ def generate_flat(
             proc_main_needed.add(fn_alias_map.get("main", "main"))
         proc_main_syms = sorted([_s for _s in proc_public_syms if _s in proc_main_needed])
         main_needed = detect_needed_helpers(_main_tree)
+        main_needed |= template_derived_needed_helpers(structured_type_components)
         if rng_replay_path:
             main_needed.update({"rng_replay_init", "rng_replay_close"})
         helper_uses_main = {}
@@ -65791,6 +66411,8 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = hoist_class_constructors_with_side_effects(tree)
+    tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
@@ -66108,6 +66730,8 @@ def transpile_file(
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = hoist_class_constructors_with_side_effects(tree)
+    tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
@@ -66120,6 +66744,8 @@ def transpile_file(
     # inline_local_from_imports with no rewrite passes applied to it.
     # Idempotent on anything already flat, so safe to call again.
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = hoist_class_constructors_with_side_effects(tree)
+    tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     tree = normalize_scipy_submodule_attribute_calls(tree)
@@ -66309,7 +66935,7 @@ def transpile_file(
     translator.global_numpy_func_aliases = collect_numpy_func_aliases(tree)
     translator.global_numpy_const_aliases = collect_numpy_const_aliases(tree)
     structured_type_components, structured_array_types, structured_dtype_strings = collect_structured_dtype_info(effective_tree)
-    user_class_types, user_type_components = collect_dataclass_info(tree)
+    user_class_types, user_type_components, _class_ctor_extra = collect_dataclass_info(tree)
     for tnm, fields in user_type_components.items():
         if tnm not in structured_type_components:
             structured_type_components[tnm] = fields
@@ -66317,6 +66943,7 @@ def transpile_file(
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
     needed = detect_needed_helpers(helper_scan_tree)
+    needed |= template_derived_needed_helpers(structured_type_components)
     if _tree_uses_shell_exec(helper_scan_tree):
         needed.add("exec_cmd_status")
     if rng_replay_path and _tree_uses_replayable_rng(helper_scan_tree):
@@ -66714,6 +67341,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
+    tree = hoist_class_constructors_with_side_effects(tree)
+    tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     validate_imports_supported(tree, py_path)

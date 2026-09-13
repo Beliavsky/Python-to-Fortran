@@ -13085,3 +13085,482 @@ def test_xp2f_pandas_read_csv_set_index_on_non_date_column_still_unsupported(tmp
     assert proc.returncode != 0
     assert "unsupported call" in proc.stdout, proc.stdout + proc.stderr
     assert "set_index" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_class_struct_field_assignment(tmp_path: Path) -> None:
+    # Regression test: obj.field = expr / self.field = expr (inside a
+    # hoisted method) was previously completely unsupported ("unsupported
+    # assign") -- reads of a struct field already worked, but there was no
+    # matching write path at all. Covers both an external field assignment
+    # and a method mutating its own field via self.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_field_assign.py",
+        [
+            "class Point:",
+            "    def __init__(self, x: float, y: float):",
+            "        self.x = x",
+            "        self.y = y",
+            "",
+            "    def translate(self, a: float, b: float):",
+            "        self.x = self.x + a",
+            "        self.y = self.y + b",
+            "",
+            "",
+            "def main():",
+            "    p = Point(1.0, 2.0)",
+            "    p.x = 5.0",
+            "    p.translate(1.0, 2.0)",
+            "    print(p.x, p.y)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_del_instance(tmp_path: Path) -> None:
+    # Regression test: `del obj` on a class instance (or any scalar/
+    # derived-type variable) crashed with "unsupported delete target";
+    # now a no-op for scalars/derived types (Fortran's own scoping
+    # already reclaims that storage).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_del.py",
+        [
+            "class Point:",
+            "    def __init__(self, x: float, y: float):",
+            "        self.x = x",
+            "        self.y = y",
+            "",
+            "    def __del__(self):",
+            "        pass",
+            "",
+            "",
+            "def main():",
+            "    p = Point(1.0, 2.0)",
+            "    print(p.x, p.y)",
+            "    del p",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_arithmetic_fold_precedence_with_leading_multiply(tmp_path: Path) -> None:
+    # Regression test: combine_parenthesized_integer_offset's `(A) op2
+    # lit2 -> (A op2 lit2)` fold was applied even when the parenthesized
+    # group was itself multiplied/divided by something outside it, or
+    # subtracted as a unit -- so `2 * (x + 6) - 2` was silently
+    # miscomputed as `2 * (x + 4)` (found via a class repro, but
+    # reproduces with no class involved at all). Also covers the
+    # symmetric preceded-by-minus case: `n - (x + 6) - 3`.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xparen_fold_precedence.py",
+        [
+            "def main():",
+            "    x = 0.0",
+            "    a = 2 * (x + 6) - 2",
+            "    print(a)",
+            "    y = 5.0",
+            "    b = 10 - (y + 3) - 2",
+            "    print(b)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_literal_default_field(tmp_path: Path) -> None:
+    # Regression test: collect_dataclass_info's plain-class field scan
+    # only accepted `self.field = param_name` (a bare passthrough of an
+    # __init__ parameter); a field initialized from a literal instead
+    # (`self._default = 0`, not derived from any parameter) silently
+    # rejected the whole class as "not struct-shaped". Now such a field
+    # becomes the derived type's own default initializer.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_literal_default_field.py",
+        [
+            "class ArrProperties:",
+            "    def __init__(self, n: int):",
+            "        self._n_pts = n",
+            "        self._default = 0",
+            "",
+            "    def get_n_pts(self):",
+            "        return self._n_pts",
+            "",
+            "    def get_default(self):",
+            "        return self._default",
+            "",
+            "",
+            "def main():",
+            "    a = ArrProperties(4)",
+            "    print(a.get_n_pts())",
+            "    print(a.get_default())",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_typed_param_forward_ref_string_annotation(tmp_path: Path) -> None:
+    # Regression test: a user-class annotation written as a forward-ref
+    # string (`a: "ArrProperties"`) wasn't recognized as a struct type at
+    # several sites -- only a bare unquoted annotation matched
+    # ast.unparse(ann) directly. Covers a non-self, class-typed parameter
+    # on an ordinary function.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_forward_ref_param.py",
+        [
+            "class Point:",
+            "    def __init__(self, x: float, y: float):",
+            "        self.x = x",
+            "        self.y = y",
+            "",
+            "",
+            "def get_x(p: \"Point\"):",
+            "    return p.x",
+            "",
+            "",
+            "def main():",
+            "    pt = Point(3.0, 4.0)",
+            "    print(get_x(pt))",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_return_type_inference_no_annotation(tmp_path: Path) -> None:
+    # Regression test: a function with no explicit '-> T' return
+    # annotation, whose every 'return EXPR' hands back a bare struct-typed
+    # variable/parameter (all the same class), had its result variable
+    # fall through to the generic int default -- so the body's own
+    # struct-typed assignment into it failed to compile.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_return_inference.py",
+        [
+            "class A:",
+            "    def __init__(self, a: int):",
+            "        self._a = a",
+            "",
+            "    def get_a(self):",
+            "        return self._a",
+            "",
+            "",
+            "def choose_A(a1: \"A\", a2: \"A\", b: bool):",
+            "    if b:",
+            "        return a1",
+            "    else:",
+            "        return a2",
+            "",
+            "",
+            "def main():",
+            "    x = A(5)",
+            "    y = A(9)",
+            "    z = choose_A(x, y, True)",
+            "    print(z.get_a())",
+            "    z2 = choose_A(x, y, False)",
+            "    print(z2.get_a())",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_case_colliding_fields(tmp_path: Path) -> None:
+    # Regression test: Fortran identifiers are case-insensitive, so a
+    # class with two fields differing only in case (self.x/self.X)
+    # lowered to a derived type with two colliding components
+    # ("Component x already declared"). Now the later field is renamed to
+    # a fresh, case-insensitively-unique name and every access to it is
+    # rewritten consistently.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_case_collision.py",
+        [
+            "class Point:",
+            "    def __init__(self, x: float, y: float):",
+            "        self.x = x",
+            "        self.X = y",
+            "",
+            "    def set_coordinates(self, x: float, y: float):",
+            "        self.x = x",
+            "        self.X = y",
+            "",
+            "    def get_coordinates(self):",
+            "        return self.x, self.X",
+            "",
+            "",
+            "def main():",
+            "    p = Point(1.0, 2.0)",
+            "    p.set_coordinates(3.0, 4.0)",
+            "    a, b = p.get_coordinates()",
+            "    print(a, b)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_optional_none_struct_param(tmp_path: Path) -> None:
+    # Regression test: Optional[A] = None struct-typed parameters tried
+    # to route through optval(), which has no derived-type overload --
+    # decl_kind == 'type(...)' was never excluded from that scalar/array-
+    # default machinery, silently mismarking the field as a plain integer
+    # default. Now such a parameter is left as a genuinely optional
+    # Fortran dummy (type(A_t), optional), with 'a is not None' correctly
+    # compiling to present(a).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_optional_none_param.py",
+        [
+            "class A:",
+            "    def __init__(self, x: int):",
+            "        self.data = x",
+            "",
+            "",
+            "def get_x_from_A(a: \"A\" = None):",
+            "    if a is not None:",
+            "        return a.data",
+            "    else:",
+            "        return 5",
+            "",
+            "",
+            "def main():",
+            "    a = A(4)",
+            "    print(get_x_from_A(a))",
+            "    print(get_x_from_A())",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_computed_array_field(tmp_path: Path) -> None:
+    # Regression test: `self.field = np.ones(n)` in __init__ -- an array
+    # field whose VALUE, not just its presence, is computed from a
+    # constructor argument -- was previously impossible to represent
+    # (neither a positional passthrough nor a static default initializer
+    # can express it) and silently rejected the whole class.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_computed_array_field.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "class A:",
+            "    def __init__(self, n: int):",
+            "        self.x = np.ones(n)",
+            "",
+            "    def get_x(self):",
+            "        return self.x",
+            "",
+            "",
+            "def main():",
+            "    a = A(4)",
+            "    print(a.get_x())",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_allocate_then_fill_field(tmp_path: Path) -> None:
+    # Regression test: a field built across TWO __init__ statements -- an
+    # allocating call immediately followed by a whole-slice fill
+    # (`self.z = np.empty(k); self.z[:] = 7.0`) -- collapsed into an
+    # equivalent single `np.full(k, 7.0)` template, the same 'allocate +
+    # fill' idiom merge_allocate_then_scalar_fill_to_source already
+    # recognizes at the generated-Fortran-text level, caught here at the
+    # Python-source level instead.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_alloc_then_fill_field.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "class C:",
+            "    def __init__(self, k: int):",
+            "        self.z = np.empty(k)",
+            "        self.z[:] = 7.0",
+            "",
+            "    def get_z(self):",
+            "        return self.z",
+            "",
+            "",
+            "def main():",
+            "    c = C(3)",
+            "    print(c.get_z())",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_stateless_empty_init(tmp_path: Path) -> None:
+    # Regression test: a class with an empty __init__ (just `pass`, no
+    # fields at all -- e.g. a class whose only job is hosting other
+    # methods) was rejected outright by a stray 'fields must be
+    # non-empty' check meant only for the @dataclass/NamedTuple branch.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_stateless.py",
+        [
+            "class Point:",
+            "    def __init__(self):",
+            "        pass",
+            "",
+            "    def addition(self, a: float, b: float):",
+            "        return a + b",
+            "",
+            "",
+            "def main():",
+            "    p = Point()",
+            "    print(p.addition(1.0, 2.0))",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_nested_composition(tmp_path: Path) -> None:
+    # Regression test: a class whose own field is ANOTHER user class was
+    # entirely unsupported -- _field_kind() only recognized primitive/
+    # array annotations, never a bare class name. Also covers reading a
+    # nested chain more than one level deep (line.a.x) and a derived-type
+    # emission-order fix (a struct type referencing another must be
+    # emitted after it, not just alphabetically).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_nested_composition.py",
+        [
+            "class Point:",
+            "    def __init__(self, x: float, y: float):",
+            "        self.x = x",
+            "        self.y = y",
+            "",
+            "    def get_x(self):",
+            "        return self.x",
+            "",
+            "",
+            "class Line:",
+            "    def __init__(self, a: \"Point\", b: \"Point\"):",
+            "        self.a = a",
+            "        self.b = b",
+            "",
+            "    def length_x(self):",
+            "        return self.b.get_x() - self.a.get_x()",
+            "",
+            "",
+            "def main():",
+            "    p1 = Point(1.0, 2.0)",
+            "    p2 = Point(4.0, 6.0)",
+            "    line = Line(p1, p2)",
+            "    print(line.length_x())",
+            "    print(line.a.x)",
+            "    print(line.b.y)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_nested_field_mutation_in_constructor(tmp_path: Path) -> None:
+    # Regression test: a class whose __init__ does more than assign each
+    # field exactly once -- mutating a NESTED field afterward
+    # (`self.a = a; self.a.x = 99.0`) -- couldn't be built by the single-
+    # expression-per-field template mechanism; __init__ is now hoisted
+    # into a real constructor function for exactly this case.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_nested_field_mutation.py",
+        [
+            "class Point:",
+            "    def __init__(self, x: float, y: float):",
+            "        self.x = x",
+            "        self.y = y",
+            "",
+            "",
+            "class Line:",
+            "    def __init__(self, a: \"Point\"):",
+            "        self.a = a",
+            "        self.a.x = 99.0",
+            "",
+            "",
+            "def main():",
+            "    p1 = Point(1.0, 2.0)",
+            "    line = Line(p1)",
+            "    print(line.a.x, line.a.y)",
+            "",
+            "",
+            "main()",
+        ],
+    )
+
+
+def test_xp2f_class_new_field_from_nested_method_call_still_declined(tmp_path: Path) -> None:
+    # Companion to the nested-field-mutation test above: a class __init__
+    # that tries to DEFINE a new field from a method call on a nested
+    # field (`self._x = self.l.get_x()`) must stay a cleanly declined,
+    # unsupported case rather than being silently mishandled -- its own
+    # type can't be determined at this static, pre-codegen stage.
+    src = tmp_path / "xclass_new_field_from_method_call.py"
+    src.write_text(
+        "\n".join(
+            [
+                "class Point:",
+                "    def __init__(self, x: float):",
+                "        self.x = x",
+                "",
+                "    def get_x(self):",
+                "        return self.x",
+                "",
+                "",
+                "class Line:",
+                "    def __init__(self, a: \"Point\"):",
+                "        self.a = a",
+                "        self._x = self.a.get_x()",
+                "",
+                "    def get_x(self):",
+                "        return self._x",
+                "",
+                "",
+                "def main():",
+                "    p = Point(1.0)",
+                "    line = Line(p)",
+                "    print(line.get_x())",
+                "",
+                "",
+                "main()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "unsupported" in proc.stdout, proc.stdout + proc.stderr
