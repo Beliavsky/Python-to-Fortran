@@ -473,6 +473,22 @@ def simplify_narrow_redundant_arith_parens(lines):
                 minus_sign_flip_risk = prev_ch == "-" and re.search(r"[+\-,]", inner)
                 if inner and not minus_sign_flip_risk:
                     removals5.append((open_idx, close_idx))
+                    # Skip past this whole matched span instead of just
+                    # past its own opening paren: a NESTED "(" inside it
+                    # (e.g. the "(-2)" inside "(1 - 2 + (-2) - 4)") can
+                    # ALSO independently qualify as its own rule-5
+                    # candidate (nothing above requires the found +/-
+                    # immediately before "(" to be genuinely binary, the
+                    # way the earlier rule (2) scan does) -- collecting
+                    # BOTH a pair and one nested inside it corrupts the
+                    # text, since the single left-to-right stitching
+                    # pass below assumes every removal is disjoint, not
+                    # nested (confirmed via a real repro: `(1 - 2 + (-2)
+                    # - 4) - 5` -- from pyccel's own tests/pyccel/scripts/
+                    # expressions.py's `f8` -- came out with an entire
+                    # digit run duplicated and parens left unbalanced).
+                    qi = close_idx + 1
+                    continue
             qi = open_idx + 1
 
         if removals5:
@@ -2857,8 +2873,24 @@ def const_int_expr_to_fortran(node, allowed_names=None):
             return f"({left} * {right})"
         if isinstance(node.op, ast.Pow):
             return f"({left} ** {right})"
-        if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+        if isinstance(node.op, ast.FloorDiv):
             return f"({left} / {right})"
+        if isinstance(node.op, ast.Div):
+            # Python's `/` is ALWAYS true division -- `100 / 10 / 10 / 2`
+            # is `0.5`, a float, even though every operand here is a
+            # plain int literal -- never a valid "integer constant
+            # expression" at all, unlike `//` (floor division), which
+            # DOES stay an int for two int operands and is the only one
+            # of the two Fortran's bare integer "/" actually matches.
+            # Treating them the same silently declared the result an
+            # `integer, parameter` and truncated it via Fortran's integer
+            # "/" (found via pyccel's own tests/pyccel/scripts/
+            # expressions.py: `f1 = 100 / 10 / 10 / 2` printed as the
+            # integer 0 instead of 0.5). Returning None here makes this
+            # expression simply not a recognized constant-int expression,
+            # falling back to the normal (already-correct) real-valued
+            # codegen path instead.
+            return None
         if isinstance(node.op, ast.Mod):
             return f"mod({left}, {right})"
         return None
@@ -22933,7 +22965,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"zeros", "ones", "empty", "full"}
+                and node.func.attr in {"zeros", "ones", "empty"}
             ):
                 dtype_txt = self._np_dtype_text(node)
                 if "bool" in dtype_txt:
@@ -23238,6 +23270,29 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "full"
                 and len(node.args) >= 2
             ):
+                # `np.full` was previously grouped in with zeros/ones/
+                # empty just above -- unlike those, `full`'s own result
+                # kind depends on its FILL VALUE (the 2nd positional
+                # arg), not just an explicit dtype= -- so that grouped
+                # check's own "no dtype given -> real" fallback silently
+                # overrode this branch for every `np.full(shape, fill)`
+                # call with no dtype= at all (this branch was dead code
+                # until `full` was excluded from that group above). An
+                # explicit dtype= still wins when given, matching the
+                # dedicated codegen's own _np_dtype_text-based handling
+                # elsewhere. Found via pyccel's own tests/pyccel/scripts/
+                # complex_numbers.py: `np.full((5, 5), (1 + 2j))` was
+                # declared real, silently dropping the imaginary part on
+                # assignment.
+                dtype_txt = self._np_dtype_text(node)
+                if "bool" in dtype_txt:
+                    return "logical"
+                if "int" in dtype_txt:
+                    return "int"
+                if "complex" in dtype_txt:
+                    return "complex"
+                if "float" in dtype_txt:
+                    return "real"
                 return self._expr_kind(node.args[1])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -31292,10 +31347,28 @@ class translator(ast.NodeVisitor):
                 # int(300_int32, kind=int8) and np.int8(np.int64(300)) both
                 # give 44; int(-130, kind=int8) and np.int8(np.int64(-130))
                 # both give 126) -- no custom helper needed.
-                a0 = self.expr(node.args[0])
-                if self._expr_kind(node.args[0]) == "logical":
-                    a0 = f"merge(1, 0, {a0})"
-                return f"int({a0}, kind={self._numpy_call_attr(node.func)})"
+                _target_kind = self._numpy_call_attr(node.func)
+                if (
+                    isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, int)
+                    and not isinstance(node.args[0].value, bool)
+                ):
+                    # A bare integer LITERAL's own token is parsed at its
+                    # default kind (int32) unless explicitly suffixed --
+                    # regardless of the int(..., kind=...) wrapper around
+                    # it -- so a literal that doesn't fit int32 (e.g.
+                    # int64(2147483648), from pyccel's own tests/pyccel/
+                    # scripts/print_integers.py) failed to compile at all
+                    # ("Integer too big for its kind") even though the
+                    # CAST itself was to a wide-enough kind. Suffix the
+                    # literal with the target kind directly so it's
+                    # parsed at that width from the start.
+                    a0 = f"{node.args[0].value}_{_target_kind}"
+                else:
+                    a0 = self.expr(node.args[0])
+                    if self._expr_kind(node.args[0]) == "logical":
+                        a0 = f"merge(1, 0, {a0})"
+                return f"int({a0}, kind={_target_kind})"
             if isinstance(node.func, ast.Name) and node.func.id == "complex":
                 if len(node.args) == 2:
                     return f"cmplx(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp), kind=dp)"
@@ -39490,6 +39563,15 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_real(t.id, rank=rank_hint)
                         elif kfill == "logical":
                             self._mark_alloc_log(t.id, rank=rank_hint)
+                        elif kfill == "complex":
+                            # Missing entirely -- fell to the int default
+                            # below, silently dropping the imaginary part
+                            # on assignment (Fortran allows an implicit
+                            # complex->real/int narrowing conversion, no
+                            # compile error at all). Found via pyccel's
+                            # own tests/pyccel/scripts/complex_numbers.py:
+                            # `np.full((5, 5), (1 + 2j))`.
+                            self._mark_alloc_complex(t.id, rank=rank_hint)
                         else:
                             self._mark_alloc_int(t.id, rank=rank_hint)
 
@@ -66785,6 +66867,70 @@ def transpile_file(
     used_main_unwrap = False
     effective_tree = tree
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
+
+    # Top-level executable code can appear BOTH before/around an
+    # `if __name__ == "__main__":` guard AND inside it (e.g. pyccel's own
+    # tests/pyccel/scripts/expressions.py: module-level variable
+    # assignments, then a guard containing only print statements) --
+    # `exec_nodes` above already excludes the guard node itself, so this
+    # is NOT the "no direct top-level executable code" case the block
+    # below handles; effective_tree was about to stay the raw, unmodified
+    # `tree`, and the later per-statement emission loop unconditionally
+    # skips any `is_main_guard_if` node outright (`continue`, no
+    # unwrapping) -- silently discarding the guard's ENTIRE body, with no
+    # error at all (confirmed via a real repro: a single module-level
+    # assignment before the guard was enough to make every statement
+    # inside it vanish from the compiled program with zero print output).
+    # Splice the guard's own effective body in at its exact position
+    # instead, exactly as Python's own top-to-bottom execution would.
+    _top_level_main_guard = next((s for s in tree.body if is_main_guard_if(s)), None)
+    if exec_nodes and _top_level_main_guard is not None:
+        _called_main_only = False
+        if len(_top_level_main_guard.body) == 1:
+            _b0 = _top_level_main_guard.body[0]
+            if (
+                isinstance(_b0, ast.Expr)
+                and isinstance(_b0.value, ast.Call)
+                and isinstance(_b0.value.func, ast.Name)
+                and _b0.value.func.id == "main"
+                and len(_b0.value.args) == 0
+            ):
+                _called_main_only = True
+        # For the "calls main()" shape, splice in just the bare `main()`
+        # call itself (unwrapped from the `If`), leaving `main` as a
+        # completely untouched, separately-emitted local function --
+        # NOT its inlined body. generate_flat already has its own
+        # established, correct handling for a bare call to a known local
+        # function named `main` appearing directly in the exec body (the
+        # same mechanism the "no other top-level code" branch below
+        # relies on for a guard-only file). Deliberately NOT reusing
+        # that branch's own "inline main_def.body and exclude main from
+        # local_funcs" approach here: doing so once caused a genuine
+        # regression -- with `main` no longer in local_funcs,
+        # use_proc_module (and the module-global/shared-declaration
+        # machinery gated on it) could go false, silently losing the
+        # declaration for a module-level global `main`'s own (post-
+        # inlining-of-ITS-OWN-callees) body still referenced, e.g.
+        # `RNG_SEED = None` fed into `main()` through an inlined
+        # `simulate(seed)` -- confirmed via a real "Symbol has no
+        # IMPLICIT type" compile failure.
+        _guard_replacement = (
+            [_top_level_main_guard.body[0]] if _called_main_only else list(_top_level_main_guard.body)
+        )
+        _new_top = []
+        for _s in tree.body:
+            if _s is _top_level_main_guard:
+                _new_top.extend(_guard_replacement)
+            else:
+                _new_top.append(_s)
+        effective_tree = ast.Module(body=_new_top, type_ignores=getattr(tree, "type_ignores", []))
+        used_main_unwrap = True
+        exec_nodes = [
+            s
+            for s in effective_tree.body
+            if not isinstance(s, (ast.ImportFrom, ast.Import, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and not is_main_guard_if(s)
+        ]
 
     # If there is no direct top-level executable code but there is a canonical
     # main guard that calls main(), transpile the main() body as program body.

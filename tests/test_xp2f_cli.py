@@ -13564,3 +13564,126 @@ def test_xp2f_class_new_field_from_nested_method_call_still_declined(tmp_path: P
     )
     assert proc.returncode != 0
     assert "unsupported" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_main_guard_with_preceding_module_level_code(tmp_path: Path) -> None:
+    # Regression test: a module-level statement before an
+    # `if __name__ == "__main__":` guard previously caused the guard's
+    # ENTIRE body to be silently discarded during codegen -- Build and
+    # Run both reported success on a program with zero print statements
+    # executed, no error or warning at all. Root cause: the guard-
+    # unwrapping logic only fired when there was NO other top-level
+    # executable code; otherwise the raw guard node was left for the
+    # per-statement emission loop to unconditionally skip.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xmain_guard_with_module_level_code.py",
+        [
+            "a1 = 2 / 2",
+            "a2 = 2 + 3",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(a1)",
+            "    print(a2)",
+            "    print(a1 + a2)",
+        ],
+    )
+
+
+def test_xp2f_main_guard_calls_main_with_preceding_module_level_code(tmp_path: Path) -> None:
+    # Companion to the test above, covering the OTHER guard shape this
+    # same fix handles: module-level code before the guard, and the
+    # guard itself only calling a separately-defined main().
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xmain_guard_calls_main_with_module_level_code.py",
+        [
+            "SCALE = 3",
+            "",
+            "def main():",
+            "    x = 2 * SCALE",
+            "    print(x)",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    main()",
+        ],
+    )
+
+
+def test_xp2f_arith_paren_fold_nested_negative_literal(tmp_path: Path) -> None:
+    # Regression test: simplify_narrow_redundant_arith_parens' rule 5
+    # (drop parens wrapping an entire expression followed by a genuine
+    # binary +/-) could select two NESTED (not disjoint) removal spans
+    # in the same pass -- e.g. `1 - 2 + -2 - 4 - 5`, where the inner
+    # `(-2)` also independently qualified for the same rule -- and the
+    # single left-to-right stitching pass that applies all chosen
+    # removals assumes they're disjoint, corrupting the text (an
+    # unbalanced-parens compile failure) whenever they're nested.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xparen_fold_nested_negative.py",
+        [
+            "if __name__ == \"__main__\":",
+            "    f8 = 1 - 2 + -2 - 4 - 5",
+            "    print(f8)",
+        ],
+    )
+
+
+def test_xp2f_true_division_of_int_literals_not_folded_as_integer(tmp_path: Path) -> None:
+    # Regression test: find_parameters' const_int_expr_to_fortran
+    # conflated Python's `/` (ALWAYS true division -- 100/10/10/2 is
+    # 0.5, a float, even though every operand is a plain int literal)
+    # with `//` (floor division) -- folding a chain of bare `/`
+    # literals the same way silently declared the result an `integer,
+    # parameter` and truncated it via Fortran's own integer division,
+    # producing 0 instead of 0.5.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtrue_division_int_literals.py",
+        [
+            "if __name__ == \"__main__\":",
+            "    f1 = 100 / 10 / 10 / 2",
+            "    print(f1)",
+        ],
+    )
+
+
+def test_xp2f_np_full_complex_fill_no_dtype(tmp_path: Path) -> None:
+    # Regression test: np.full(shape, fill) with a complex fill value
+    # and no explicit dtype= was declared real, silently dropping the
+    # imaginary part on assignment -- an overly broad "zeros/ones/empty/
+    # full" grouping in _expr_kind's own dtype-only check shadowed a
+    # separate, correct fill-value-kind check for `full` specifically.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_full_complex_fill.py",
+        [
+            "if __name__ == \"__main__\":",
+            "    from numpy import full",
+            "",
+            "    x = full((5, 5), (1 + 2j))",
+            "    r = x.sum()",
+            "    print(r.real, r.imag)",
+        ],
+    )
+
+
+def test_xp2f_np_int64_large_literal_cast(tmp_path: Path) -> None:
+    # Regression test: np.int64(large_literal) (e.g. 2147483648) failed
+    # to compile ("Integer too big for its kind") even though the
+    # cast's own target kind was wide enough -- the literal's own token
+    # is parsed at the default 32-bit kind unless explicitly suffixed,
+    # regardless of the int(..., kind=...) wrapper around it.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_int64_large_literal.py",
+        [
+            "from numpy import int64",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(int64(2147483648))",
+            "    print(int64(9223372036854775807))",
+        ],
+    )
