@@ -66,6 +66,46 @@ PERCENT_FLOAT_INT_FORMAT = False
 # wouldn't have raised at all).
 NAN_SAFE_COMPARISONS = True
 
+# Fortran keywords/intrinsics a generated identifier must never collide
+# with. Shared between translator.reserved_names (drives _aliased_name,
+# which renames a COLLIDING NAME REFERENCE -- e.g. a call site `do()` ->
+# `xdo()`) and generate_flat's own fn_alias_map (drives the matching
+# FUNCTION/SUBROUTINE DEFINITION's own header and its module `use ...
+# only:`/`public ::` listings) -- these two mechanisms used to consult
+# two independently hand-maintained copies of "what's forbidden", and
+# fn_alias_map's copy never included Fortran keywords at all (only
+# already-used-elsewhere symbols), so a Python function literally named
+# `do` (a genuine Fortran keyword -- pyccel's own tests/pyccel/scripts/
+# GENERATED_NAME_COLLISION.py) got its CALL SITES renamed to `xdo()` but
+# its own `function do(...)` definition, and the `use ..., only: do`
+# import that should have named it, were left as the literal, un-
+# renamed (and in the `use` list's case, simply dropped) `do` -- a
+# gfortran "has no IMPLICIT type" for the never-defined `xdo`.
+FORTRAN_RESERVED_IDENTIFIERS = {
+    "dp", "eye", "epsilon",
+    "abs", "acos", "aimag", "all", "allocated", "any", "asin", "atan", "atan2",
+    "associate", "block",
+    "ceiling", "char", "cmplx", "conjg", "cos", "cosh", "count", "dble", "dim",
+    "complex", "contains", "cycle",
+    "data", "dimension", "do", "dot_product", "double", "elemental", "else",
+    "elseif", "end", "entry", "equivalence", "exit", "exp", "external",
+    "floor", "format", "function",
+    "go", "goto", "if", "implicit", "in", "index", "integer", "interface", "intrinsic",
+    "int", "len", "len_trim", "log", "log10", "logical",
+    "lbound", "matmul", "max", "maxval", "merge", "min", "minval", "mod", "module",
+    "modulo",
+    "namelist", "none", "nint", "open", "optional",
+    "pack", "parameter", "pointer", "present", "print", "private", "procedure",
+    "product", "program", "public", "pure",
+    "rank", "read", "real", "recursive", "repeat", "reshape", "return", "rewind",
+    "save", "scan", "select", "sequence", "shape", "sign", "sin", "size", "spread", "sqrt",
+    "stop", "subroutine", "sum",
+    "tan", "tanh", "then", "tiny", "transfer", "transpose", "trim",
+    "type",
+    "ubound", "use",
+    "where", "write",
+}
+
 _ROUND_FLOAT_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])([+-]?(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?)"
 )
@@ -2663,6 +2703,31 @@ def _compiler_parts_with_debug_flags(compiler_parts):
     return parts
 
 
+def _split_generated_fortran_lines(text):
+    """Like `text.splitlines()`, but a line boundary ONLY at '\\n' --
+    never str.splitlines()'s wider set of Unicode line/paragraph
+    separators (\\x0b, \\x0c, \\x1c-\\x1e, \\x85, \\u2028, \\u2029).
+
+    The already-generated Fortran source text this is applied to can
+    contain one of those bytes embedded raw inside a string literal --
+    an ordinary `print("\\f")` or `print("\\x0b")`, say (pyccel's own
+    tests/pyccel/scripts/print_strings.py exercises exactly this) --
+    left there by codegen on purpose, as literal string content. Feeding
+    that text through plain `.splitlines()` silently drops the byte and
+    inserts a bogus extra newline in its place, corrupting the string
+    (an outright "Unterminated character constant" compile error when
+    the spurious break lands between the opening and closing quote).
+    Internally-generated text is only ever joined back together with
+    plain '\\n' (see the `"\\n".join(...)` at the end of this same
+    pipeline), so '\\n' is the only boundary that's actually meaningful
+    here.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "" and text.endswith("\n"):
+        lines.pop()
+    return lines
+
+
 def fstr(s):
     # use double quotes when possible; fallback to single quotes; escape embedded quotes by doubling
     # if the source string contains newlines, emit a Fortran concatenation with new_line('a')
@@ -3739,6 +3804,358 @@ def rewrite_integer_quotient_seed_divisions(tree):
     return new_tree
 
 
+def rewrite_tuple_call_subscript_to_temp(tree):
+    """A tuple-returning function is implemented as a Fortran SUBROUTINE
+    with multiple output arguments (there's no single Fortran return
+    value to hand a tuple back as) -- `a, b = f()` already works, calling
+    the subroutine and binding its outputs directly. But `f()[i]`, used
+    directly in a larger expression without first assigning the call's
+    result to a name (e.g. pyccel's own tests/pyccel/scripts/functions.py:
+    `print(multi_level_tuple_return()[2])`), has no such call site to
+    hang the subroutine call off of -- it isn't a Python-level tuple-
+    unpack at all -- and previously fell through to plain-array-
+    subscript codegen, `f()(3)`, which gfortran rejects outright
+    ("Unexpected use of subroutine name").
+
+    Hoists any `CALL(...)[CONST_INDEX]` found anywhere inside a
+    statement -- where CALL is a bare-Name call to a function whose
+    every `return` is a fixed-arity tuple/list literal -- into a
+    preceding tuple-unpack assignment to fresh temporaries, then
+    replaces the subscript expression in place with a reference to the
+    one temporary holding that index. Deliberately narrow: only a
+    constant integer index (the call's own arity must be known
+    statically to build the unpacking assignment), and only recurses
+    into the statement-list-bearing node kinds a real program actually
+    uses one of these in (Module/FunctionDef/If/For/While bodies).
+    """
+    # `return [a, b]` (a list literal) is ambiguous the same way it is for
+    # generate_flat's own canonical tuple_return_funcs collector (see its
+    # matching comment): Python code uses a list literal return both for
+    # a multi-value tuple-unpack (`a, b = f()`) and as a single sequence/
+    # array result (`y = f(); y[0]`). Without the same disambiguation
+    # here, a function like `def stats(x): return [np.mean(x), np.std(x)]`
+    # -- called ONLY as `stats(x)[0]`, never unpacked -- got hijacked into
+    # a bogus multi-output tuple-unpack (`_tuple_tmp_1_0, _tuple_tmp_1_1 =
+    # stats(x)`) instead of being left alone for the pre-existing, correct
+    # array-valued-function codegen path (`stats` compiles to a plain
+    # rank-1-real-returning FUNCTION here, not a multi-output SUBROUTINE,
+    # precisely because generate_flat's own collector saw no matching-
+    # arity unpack site and inferred it as array-valued) -- an
+    # "unsupported assign" once the bogus unpack hit codegen with no
+    # subroutine to call. `return a, b` (a genuine tuple) has no such
+    # ambiguity and keeps the existing lenient rule.
+    observed_unpack_arities = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], (ast.Tuple, ast.List))
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+        ):
+            observed_unpack_arities.setdefault(node.value.func.id, set()).add(len(node.targets[0].elts))
+
+    tuple_return_arity = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        arity = None
+        ok = True
+        all_list_literals = True
+        for st in ast.walk(node):
+            if isinstance(st, ast.Return) and st.value is not None:
+                if isinstance(st.value, (ast.Tuple, ast.List)):
+                    a = len(st.value.elts)
+                    if not isinstance(st.value, ast.List):
+                        all_list_literals = False
+                else:
+                    ok = False
+                    break
+                if arity is None:
+                    arity = a
+                elif arity != a:
+                    ok = False
+                    break
+        if not ok or arity is None or arity <= 0:
+            continue
+        if all_list_literals and arity not in observed_unpack_arities.get(node.name, set()):
+            continue
+        tuple_return_arity[node.name] = arity
+
+    if not tuple_return_arity:
+        return tree
+
+    counter = [0]
+    changed = [False]
+
+    class _Finder(ast.NodeTransformer):
+        def __init__(self):
+            self.hoisted = []
+
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in tuple_return_arity
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and not isinstance(node.slice.value, bool)
+            ):
+                arity = tuple_return_arity[node.value.func.id]
+                idx = node.slice.value
+                if idx < 0:
+                    idx += arity
+                if not (0 <= idx < arity):
+                    return node
+                counter[0] += 1
+                tmp_names = [f"_tuple_tmp_{counter[0]}_{i}" for i in range(arity)]
+                assign = ast.Assign(
+                    targets=[ast.Tuple(elts=[ast.Name(id=n, ctx=ast.Store()) for n in tmp_names], ctx=ast.Store())],
+                    value=node.value,
+                )
+                ast.copy_location(assign, node)
+                ast.fix_missing_locations(assign)
+                self.hoisted.append(assign)
+                changed[0] = True
+                return ast.copy_location(ast.Name(id=tmp_names[idx], ctx=ast.Load()), node)
+            return node
+
+    def _process_body(body):
+        new_body = []
+        for stmt in body:
+            stmt = _BodyRewriter().visit(stmt)
+            finder = _Finder()
+            stmt = finder.visit(stmt)
+            new_body.extend(finder.hoisted)
+            new_body.append(stmt)
+        return new_body
+
+    class _BodyRewriter(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            return node
+
+        def visit_If(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            node.orelse = _process_body(node.orelse)
+            return node
+
+        def visit_For(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            node.orelse = _process_body(node.orelse)
+            return node
+
+        def visit_While(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            node.orelse = _process_body(node.orelse)
+            return node
+
+    out = ast.Module(body=_process_body(tree.body), type_ignores=getattr(tree, "type_ignores", []))
+    if not changed[0]:
+        return tree
+    ast.fix_missing_locations(out)
+    return out
+
+
+def rewrite_niladic_tuple_return_calls_to_literal(tree):
+    """A zero-argument function whose entire body is a single `return
+    (literal, tuple, ...)` (or list) statement -- e.g. pyccel's own
+    tests/pyccel/scripts/array_tuple_shape.py: `def g(): return (2, 3)`,
+    used as `np.zeros(g())` -- has no Fortran call-site of its own that
+    a np.zeros/np.ones/np.full shape argument's existing "shape is a
+    Tuple literal, or a Name bound to one" resolution logic recognizes;
+    that logic is scattered across ~30 call sites in the emitter, so
+    rather than teaching each one about a THIRD shape shape (a call to a
+    niladic accessor), inline the call at the AST level -- pure constant
+    propagation, since the function is niladic with no side effects and
+    always returns the same literal.
+
+    Deliberately narrow: only replaces bare `Name()` calls (no args, no
+    keywords) to a function whose body is exactly one `return` of a
+    Tuple/List literal of int constants; leaves the function definition
+    itself untouched (a later unreachable-function prune, if any, can
+    still remove it), and leaves alone any reference to the function
+    that isn't itself being called (e.g. passed as a callback).
+    """
+    literal_return = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        a = node.args
+        if a.args or a.vararg or a.kwonlyargs or a.kwarg or a.defaults or a.kw_defaults:
+            continue
+        if len(node.body) != 1 or not isinstance(node.body[0], ast.Return):
+            continue
+        val = node.body[0].value
+        if not isinstance(val, (ast.Tuple, ast.List)):
+            continue
+        if not all(is_const_number_value(e, e.value) if isinstance(e, ast.Constant) else False for e in val.elts):
+            continue
+        if not all(isinstance(e.value, int) and not isinstance(e.value, bool) for e in val.elts):
+            continue
+        literal_return[node.name] = val
+
+    if not literal_return:
+        return tree
+
+    changed = [False]
+
+    class _Inliner(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in literal_return
+                and not node.args
+                and not node.keywords
+            ):
+                changed[0] = True
+                return ast.copy_location(copy.deepcopy(literal_return[node.func.id]), node)
+            return node
+
+    out = _Inliner().visit(tree)
+    if not changed[0]:
+        return tree
+    ast.fix_missing_locations(out)
+    return out
+
+
+def rewrite_tuple_literal_shape_name_to_literal(tree):
+    """A Name bound (exactly once, anywhere in the tree) to a Tuple/List
+    literal of int constants -- e.g. `c_shape = (1, 2)` -- used as the
+    shape argument of an np.zeros/ones/empty/full call (e.g. pyccel's own
+    tests/pyccel/scripts/array_tuple_shape.py: `c = np.zeros(c_shape)`)
+    hits the exact same "shape resolution is a Name, not a literal"
+    problem rewrite_niladic_tuple_return_calls_to_literal exists for --
+    the array constructor's own rank/dims codegen only correctly handles
+    a literal Tuple/List shape (or, degenerately, a scalar), not a Name
+    that merely happens to be bound to one; left alone, it falls through
+    to treating the Name as a single bogus dimension spec (e.g. the
+    invalid `allocate(c(c_shape), source=0.0_dp)`).
+
+    Substitutes a deep copy of the literal at just the shape-argument
+    position of such a call, leaving the original assignment and every
+    OTHER use of the name (e.g. a plain `print(c_shape)`) untouched.
+    Conservative in the same spirit as rewrite_niladic_tuple_return_
+    calls_to_literal: only applies when the name is assigned exactly
+    once anywhere in the whole tree, so there is no risk of picking up
+    the wrong binding.
+    """
+    store_counts = {}
+    literal_of = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            store_counts[node.id] = store_counts.get(node.id, 0) + 1
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, (ast.Tuple, ast.List))
+            and node.value.elts
+            and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, int) and not isinstance(e.value, bool)
+                for e in node.value.elts
+            )
+        ):
+            literal_of[node.targets[0].id] = node.value
+
+    candidates = {nm: lit for nm, lit in literal_of.items() if store_counts.get(nm, 0) == 1}
+    if not candidates:
+        return tree
+
+    changed = [False]
+
+    class _ShapeNameInliner(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"np", "numpy"}
+                and node.func.attr in {"zeros", "ones", "empty", "full"}
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in candidates
+            ):
+                changed[0] = True
+                node.args[0] = ast.copy_location(copy.deepcopy(candidates[node.args[0].id]), node.args[0])
+            return node
+
+    out = _ShapeNameInliner().visit(tree)
+    if not changed[0]:
+        return tree
+    ast.fix_missing_locations(out)
+    return out
+
+
+def rewrite_math_const_from_import_to_attribute(tree):
+    """`from math import nan` (or `pi`/`e`/`tau`/`inf`/`Inf`, and the same
+    from `cmath`), then using the bare name `nan` directly -- e.g.
+    pyccel's own tests/pyccel/scripts/print_nan.py -- has no codegen of
+    its own: `math.pi`/`math.nan`/etc, as an Attribute, is already fully
+    supported (see _expr_kind and expr()'s own math/cmath constant
+    branches), but a bare Name left over from a `from ... import ...`
+    is not recognized as anything in particular and falls through to
+    "no IMPLICIT type". Rewrite each such bare Name reference back into
+    the already-supported `math.NAME` (or `cmath.NAME`) Attribute form.
+
+    Conservative: only touches a name that is never itself a Store
+    target anywhere in the tree (so an unrelated local variable that
+    happens to share the constant's name is left alone, unrewritten --
+    and, since nothing else recognizes a bare `nan`/`pi`/... either,
+    that shadowing case still surfaces as the same pre-existing
+    "unsupported" error it always did, not a new corruption).
+    """
+    const_names = {"pi", "e", "tau", "nan", "inf", "Inf"}
+    imported_from = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in {"math", "cmath"}:
+            for alias in node.names:
+                if alias.asname is not None:
+                    continue
+                if alias.name in const_names:
+                    imported_from[alias.name] = node.module
+
+    if not imported_from:
+        return tree
+
+    store_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in imported_from:
+            store_names.add(node.id)
+    candidates = {nm: mod for nm, mod in imported_from.items() if nm not in store_names}
+    if not candidates:
+        return tree
+
+    changed = [False]
+
+    class _ConstInliner(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and node.id in candidates:
+                changed[0] = True
+                return ast.copy_location(
+                    ast.Attribute(
+                        value=ast.Name(id=candidates[node.id], ctx=ast.Load()),
+                        attr=node.id,
+                        ctx=ast.Load(),
+                    ),
+                    node,
+                )
+            return node
+
+    out = _ConstInliner().visit(tree)
+    if not changed[0]:
+        return tree
+    ast.fix_missing_locations(out)
+    return out
+
+
 def rewrite_listcomp_array_assign_calls_to_loop(tree):
     """Rewrite `TARGET = np.array([ELT for VAR in ITERABLE])` (or
     np.asarray(...)) into an equivalent explicit loop, and likewise for
@@ -4684,12 +5101,19 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     reporting np.X(...) already gets today, just with an accurate
     np.-qualified name in the message instead of a bare one.
     """
-    numpy_names = set()
+    numpy_names = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "numpy":
             for al in node.names:
                 if al.name != "*":
-                    numpy_names.add(al.asname or al.name)
+                    # Map the LOCAL name (the alias, if any) to the
+                    # ORIGINAL numpy name -- `from numpy import sum as
+                    # np_sum; np_sum(w2D)` (pyccel's own tests/pyccel/
+                    # scripts/hope_benchmarks/point_spread_func.py) must
+                    # become `np.sum(w2D)`, not the bogus `np.np_sum(w2D)`
+                    # every one of this file's ~300 `node.func.attr ==
+                    # "sum"`-gated dispatch sites has never heard of.
+                    numpy_names[al.asname or al.name] = al.name
     if not numpy_names:
         return tree
 
@@ -4699,7 +5123,7 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
             if isinstance(node.func, ast.Name) and node.func.id in numpy_names:
                 np_name = ast.Name(id="np", ctx=ast.Load())
                 ast.copy_location(np_name, node.func)
-                new_func = ast.Attribute(value=np_name, attr=node.func.id, ctx=ast.Load())
+                new_func = ast.Attribute(value=np_name, attr=numpy_names[node.func.id], ctx=ast.Load())
                 ast.copy_location(new_func, node.func)
                 node.func = new_func
             return node
@@ -5589,7 +6013,7 @@ def compute_local_functions_purity(local_funcs, known_pure_calls=None):
 
 def remove_redundant_tail_returns(src_text):
     """Remove redundant RETURNs near procedure tails."""
-    lines = src_text.splitlines()
+    lines = _split_generated_fortran_lines(src_text)
 
     def _is_blank(i):
         return lines[i].strip() == ""
@@ -5711,7 +6135,7 @@ def simplify_size_dim_for_rank1_arrays(src_text):
     )
     decl_re = re.compile(r"::\s*([^!]*)")
 
-    lines = src_text.splitlines()
+    lines = _split_generated_fortran_lines(src_text)
     out = list(lines)
     i = 0
     n = len(lines)
@@ -5795,7 +6219,7 @@ def rename_conflicting_identifiers(src_text):
     )
     name_tok_re = re.compile(r"\b([A-Za-z_]\w*)\b")
     rename_map = {}
-    lines = src_text.splitlines()
+    lines = _split_generated_fortran_lines(src_text)
     declared = set()
     unit_start_re = re.compile(
         r"^\s*(?:pure\s+|elemental\s+|impure\s+|recursive\s+|module\s+)*"
@@ -7280,7 +7704,7 @@ def normalize_split_relational_operators(lines):
     text = re.sub(r"<\s*&\s*\n\s*&\s*=", "<=", text)
     text = re.sub(r">\s*&\s*\n\s*&\s*=", ">=", text)
     text = re.sub(r"=\s*&\s*\n\s*&\s*=", "==", text)
-    return text.splitlines()
+    return _split_generated_fortran_lines(text)
 
 
 def enforce_space_before_inline_comments(lines):
@@ -15288,6 +15712,28 @@ def collect_dataclass_info(tree):
                 if isinstance(st, ast.Expr) and isinstance(getattr(st, "value", None), ast.Constant) and isinstance(st.value.value, str):
                     continue
                 if (
+                    isinstance(st, ast.AnnAssign)
+                    and st.value is not None
+                    and isinstance(st.target, ast.Attribute)
+                    and isinstance(st.target.value, ast.Name)
+                    and st.target.value.id == "self"
+                ):
+                    # `self.z: float = 10.0` -- an annotated attribute
+                    # assignment (pyccel's own tests/pyccel/scripts/
+                    # classes/class_variables.py) is semantically the
+                    # same field-defining shape as the plain `self.z =
+                    # 10.0` every check below already recognizes; without
+                    # this, it matched NONE of them (they all check
+                    # isinstance(st, ast.Assign), never ast.AnnAssign),
+                    # so `z` never became a declared struct field at all,
+                    # yet the constructor still executed it as a
+                    # "leftover" statement against the already-built
+                    # struct -- gfortran: "'z' is not a member of the
+                    # ... structure". Normalize to the equivalent Assign
+                    # once here and let every existing shape-check below
+                    # handle it unchanged.
+                    st = ast.copy_location(ast.Assign(targets=[st.target], value=st.value), st)
+                if (
                     isinstance(st, ast.Assign)
                     and len(st.targets) == 1
                     and isinstance(st.targets[0], ast.Attribute)
@@ -19947,6 +20393,19 @@ class translator(ast.NodeVisitor):
         # tuple_return_out_kinds itself has no DataFrame case.
         self.tuple_df_return_positions = dict(tuple_df_return_positions or {})
         self.dict_return_types = dict(dict_return_types or {})
+        # `b = a` where `a` is already a class-typed (dict_typed_vars)
+        # Name aliases the SAME underlying object in Python (pyccel's own
+        # tests/pyccel/scripts/classes/class_pointer.py: mutating through
+        # `b` must be visible through `a` too) -- plain Fortran derived-
+        # type assignment copies by value, so without this a class
+        # instance silently loses Python's own reference semantics.
+        # class_pointer_alias_of[alias_name] = source_name marks such an
+        # alias (declared `pointer` instead of a plain value, and
+        # assigned via `=>` instead of `=`); class_pointer_targets is
+        # every name that's ever aliased this way (declared `target` so
+        # a pointer can legally point at it).
+        self.class_pointer_alias_of = {}
+        self.class_pointer_targets = set()
         self.dict_typed_vars = {}
         self.pandas_df_vars = {}
         self.pandas_df_index_label = {}
@@ -20114,30 +20573,7 @@ class translator(ast.NodeVisitor):
         self.type_rebind_targets = set()
         self.open_type_rebind_stack = []
         self.open_type_rebind_meta = []
-        self.reserved_names = {
-            "dp", "eye", "epsilon",
-            "abs", "acos", "aimag", "all", "allocated", "any", "asin", "atan", "atan2",
-            "associate", "block",
-            "ceiling", "char", "cmplx", "conjg", "cos", "cosh", "count", "dble", "dim",
-            "complex", "contains", "cycle",
-            "data", "dimension", "do", "dot_product", "double", "elemental", "else",
-            "elseif", "end", "entry", "equivalence", "exit", "exp", "external",
-            "floor", "format", "function",
-            "go", "goto", "if", "implicit", "in", "index", "integer", "interface", "intrinsic",
-            "int", "len", "len_trim", "log", "log10", "logical",
-            "lbound", "matmul", "max", "maxval", "merge", "min", "minval", "mod", "module",
-            "modulo",
-            "namelist", "none", "nint", "open", "optional",
-            "pack", "parameter", "pointer", "present", "print", "private", "procedure",
-            "product", "program", "public", "pure",
-            "rank", "read", "real", "recursive", "repeat", "reshape", "return", "rewind",
-            "save", "scan", "select", "sequence", "shape", "sign", "sin", "size", "spread", "sqrt",
-            "stop", "subroutine", "sum",
-            "tan", "tanh", "then", "tiny", "transfer", "transpose", "trim",
-            "type",
-            "ubound", "use",
-            "where", "write",
-        }
+        self.reserved_names = set(FORTRAN_RESERVED_IDENTIFIERS)
         self.name_aliases = {}
         self.fortran_name_owner = {}
         self.synthetic_alias_names = set()
@@ -29120,7 +29556,17 @@ class translator(ast.NodeVisitor):
                         return f"(.not. allocated({left}))" if op is ast.Is else f"allocated({left})"
                     left = self.expr(a)
                     return f"({left} == -1)" if op is ast.Is else f"({left} /= -1)"
-                raise NotImplementedError("is/is not supported only with None")
+                if self._expr_kind(a) == "logical" and self._expr_kind(b) == "logical":
+                    # Python bool is a singleton type (True/False are each
+                    # unique objects), so `is`/`is not` against a bool
+                    # value -- a literal (`a is False`) or another bool
+                    # variable (`a is b`) -- is equivalent to `==`/`!=`,
+                    # which already has correct logical-kind (.eqv./.neqv.)
+                    # codegen below. Fall through to it rather than
+                    # duplicating it here.
+                    op = ast.Eq if op is ast.Is else ast.NotEq
+                else:
+                    raise NotImplementedError("is/is not supported only with None")
             if op is ast.In or op is ast.NotIn:
                 lhs_node = node.left
                 rhs_node = node.comparators[0]
@@ -33353,7 +33799,45 @@ class translator(ast.NodeVisitor):
                         # operands at all -- np.sign(complex) means x /
                         # abs(x) (0 at the origin); see csign_complex.
                         return f"csign_complex({a0})"
-                    return f"sign(1.0_dp, {a0})"
+                    # Two distinct bugs here previously: (1) np.sign of an
+                    # int/logical argument reused the real-valued
+                    # `sign(1.0_dp, a0)` template with a0 left un-promoted
+                    # (this branch is excluded from the int->real
+                    # promotion above), pairing a real 1.0_dp with an
+                    # integer a0 -- a gfortran "'b' argument of 'sign'
+                    # intrinsic must be the same type and kind as 'a'"
+                    # (pyccel's own tests/pyccel/scripts/numpy/
+                    # numpy_sign.py: np.sign(0), np.sign(np.int32(42)),
+                    # ...). (2) even with matching types, Fortran's
+                    # SIGN(A, B) treats a zero B as positive-signed, so
+                    # np.sign(0) / np.sign(0.0) came out 1 / 1.0 instead
+                    # of matching numpy's own 0 / 0.0 -- merge in the
+                    # zero case explicitly. np.sign also preserves its
+                    # argument's own int-vs-real kind (numpy sign(int) is
+                    # an int, not a float), so int/logical and real need
+                    # their own separately-kinded zero/one/minus-one
+                    # literals, not a single shared real-valued template.
+                    if k0 in {"int", "logical"}:
+                        a0i = f"merge(1, 0, {a0})" if k0 == "logical" else a0
+                        # SIGN(A, B) requires A and B to share the exact
+                        # same kind, not just the same type -- a bare `1`/
+                        # `0` literal (default kind) mismatches a
+                        # non-default-kind argument (np.sign(np.int8(...))
+                        # etc.). kind(a0i) is a compile-time constant, so
+                        # int(1, kind=kind(a0i)) always matches whatever
+                        # kind a0i actually has.
+                        one_i = f"int(1, kind=kind({a0i}))"
+                        zero_i = f"int(0, kind=kind({a0i}))"
+                        return f"merge({zero_i}, sign({one_i}, {a0i}), {a0i} == {zero_i})"
+                    # Same kind-matching requirement as the int/logical
+                    # case just above: a bare 1.0_dp/0.0_dp (double
+                    # precision) mismatches a single-precision argument
+                    # (np.sign(np.float32(...))). real(1.0, kind=kind(a0))
+                    # widens the exactly-representable literals 1.0/0.0
+                    # to a0's own kind with no precision loss.
+                    one_r = f"real(1.0, kind=kind({a0}))"
+                    zero_r = f"real(0.0, kind=kind({a0}))"
+                    return f"merge({zero_r}, sign({one_r}, {a0}), {a0} == {zero_r})"
                 if node.func.attr in {"fix", "trunc"}:
                     return f"aint({a0})"
                 if node.func.attr == "rint":
@@ -34679,6 +35163,37 @@ class translator(ast.NodeVisitor):
                             a1 = _spread_to_cond_shape(a1)
                         if int(self._rank_expr(node.args[2])) == 0:
                             a2 = _spread_to_cond_shape(a2)
+                    # Fortran's MERGE intrinsic requires tsource/fsource to
+                    # share the exact same type AND kind -- unlike np.where,
+                    # which happily broadcasts/promotes mixed int/real/
+                    # complex branches. A branch built from a genuine `/`
+                    # (always-real in Python) alongside one that stays
+                    # integer (e.g. `*`) is a real, observed case
+                    # (array_binary_operation.py's arr/2 vs arr*2), so
+                    # reconcile the two branches' kinds before handing them
+                    # to merge(), the same promote-narrower-to-wider policy
+                    # used elsewhere in this codebase (int -> real -> complex).
+                    k1 = self._expr_kind(node.args[1])
+                    k2 = self._expr_kind(node.args[2])
+                    if k1 != k2 and k1 not in {"char", "logical"} and k2 not in {"char", "logical"}:
+                        if "complex" in (k1, k2):
+                            if k1 != "complex":
+                                a1 = (
+                                    f"cmplx({a1}, 0.0_dp, kind=dp)"
+                                    if k1 == "real"
+                                    else f"cmplx(real({a1}, kind=dp), 0.0_dp, kind=dp)"
+                                )
+                            if k2 != "complex":
+                                a2 = (
+                                    f"cmplx({a2}, 0.0_dp, kind=dp)"
+                                    if k2 == "real"
+                                    else f"cmplx(real({a2}, kind=dp), 0.0_dp, kind=dp)"
+                                )
+                        elif "real" in (k1, k2):
+                            if k1 == "int":
+                                a1 = f"real({a1}, kind=dp)"
+                            if k2 == "int":
+                                a2 = f"real({a2}, kind=dp)"
                     return f"merge({a1}, {a2}, {cond})"
                 if len(node.args) == 1:
                     cond = self.expr(node.args[0])
@@ -37095,6 +37610,38 @@ class translator(ast.NodeVisitor):
                     tnm = self.user_class_types[node.value.func.id]
                     self.dict_typed_vars[tname] = tnm
                     self.dict_var_components[tname] = [nm for nm, _, _, _, _ in self.structured_type_components.get(tnm, [])]
+                    self.ints.discard(tname)
+                    self.reals.discard(tname)
+                    self.logs.discard(tname)
+                    self.alloc_ints.discard(tname)
+                    self.alloc_reals.discard(tname)
+                    self.alloc_logs.discard(tname)
+                    self.alloc_chars.discard(tname)
+                    self.alloc_complexes.discard(tname)
+                    self.alloc_int_rank.pop(tname, None)
+                    self.alloc_real_rank.pop(tname, None)
+                    self.alloc_log_rank.pop(tname, None)
+                    self.alloc_char_rank.pop(tname, None)
+                    self.alloc_complex_rank.pop(tname, None)
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in self.dict_typed_vars
+                    and node.targets[0].id != node.value.id
+                ):
+                    # `b = a` where `a` is already a class instance --
+                    # aliasing, not a fresh construction. `b` becomes a
+                    # POINTER to `a` (declared `target`) so mutating
+                    # through either name is visible through the other,
+                    # matching Python's own reference semantics.
+                    tname = node.targets[0].id
+                    src = node.value.id
+                    tnm = self.dict_typed_vars[src]
+                    self.dict_typed_vars[tname] = tnm
+                    self.dict_var_components[tname] = list(self.dict_var_components.get(src, []))
+                    self.class_pointer_alias_of[tname] = src
+                    self.class_pointer_targets.add(src)
                     self.ints.discard(tname)
                     self.reals.discard(tname)
                     self.logs.discard(tname)
@@ -40031,7 +40578,8 @@ class translator(ast.NodeVisitor):
                     and len(v.args) == 3
                 ):
                     k1 = self._expr_kind(v.args[1])
-                    if k1 == "real":
+                    k2 = self._expr_kind(v.args[2])
+                    if k1 == "real" or k2 == "real":
                         self._mark_alloc_real(t.id)
                     elif k1 == "logical":
                         self._mark_alloc_log(t.id)
@@ -40871,6 +41419,42 @@ class translator(ast.NodeVisitor):
                 continue
             raise NotImplementedError("unsupported delete target")
 
+    def visit_Assert(self, node):
+        # translator subclasses ast.NodeVisitor: a statement type with no
+        # visit_X method here is silently no-op'd by generic_visit rather
+        # than erroring -- ast.Assert had no handler at all, so `assert
+        # False` (or any assert whose condition is false at runtime)
+        # transpiled to a program that builds and runs successfully,
+        # silently skipping the check with zero output difference and
+        # exit code 0 (pyccel's own tests/pyccel/scripts/asserts/
+        # invalid_assert1.py: Python exits 1 with AssertionError, the
+        # transpiled binary exited 0 having done nothing at all -- and
+        # any variable ONLY referenced by the dropped assert then looked
+        # unused and got pruned too).
+        self._emit_comments_for(node)
+        t = self.expr(node.test)
+        k = self._expr_kind(node.test)
+        r = max(0, int(self._rank_expr(node.test)))
+        # Same Python-truthiness reduction visit_If's own _if_test_expr
+        # uses (logical as-is; char kind is non-empty; numeric is
+        # nonzero; an array condition is "all elements truthy").
+        if k == "logical":
+            truthy = f"all({t})" if r > 0 else t
+        elif k == "char":
+            truthy = f"all(len_trim({t}) > 0)" if r > 0 else f"(len_trim({t}) > 0)"
+        else:
+            truthy = f"all(({t}) /= 0)" if r > 0 else f"(({t}) /= 0)"
+        if node.msg is not None and is_const_str(node.msg):
+            msg_txt = f"AssertionError: {node.msg.value}"
+        else:
+            msg_txt = "AssertionError"
+        # ERROR STOP (not plain STOP): STOP with a character message
+        # exits 0 on this platform/compiler, which wouldn't reproduce
+        # Python's own nonzero exit code on a failed assert; ERROR STOP
+        # is standard-guaranteed to signal an error condition and exits
+        # nonzero under gfortran.
+        self.o.w(f"if (.not. ({truthy})) error stop {fstr(msg_txt)}")
+
     def visit_Assign(self, node):
         self._emit_comments_for(node)
         if len(node.targets) != 1:
@@ -40888,6 +41472,18 @@ class translator(ast.NodeVisitor):
             return
         t = node.targets[0]
         v = node.value
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Name)
+            and t.id in self.class_pointer_alias_of
+            and self.class_pointer_alias_of[t.id] == v.id
+        ):
+            # `b = a`, `a` a class instance -- pointer assignment (`=>`),
+            # not a value copy, so mutating through either name is
+            # visible through the other (see class_pointer_alias_of's
+            # matching prescan branch/declaration for why).
+            self.o.w(f"{t.id} => {v.id}")
+            return
         if isinstance(t, ast.Name) and isinstance(v, ast.Name) and v.id in self.pandas_series_vars:
             # ser2 = ser (bare Name-to-Name, ser a pd.Series(...)-derived
             # variable) -- same pure-alias resolution as the DataFrame
@@ -47257,6 +47853,30 @@ class translator(ast.NodeVisitor):
                     a1 = _spread_to_cond_shape(a1)
                 if int(self._rank_expr(v.args[2])) == 0:
                     a2 = _spread_to_cond_shape(a2)
+            # See the matching np.where lowering in expr() for why this
+            # reconciliation is needed: MERGE requires tsource/fsource to
+            # share the exact same type and kind.
+            k1 = self._expr_kind(v.args[1])
+            k2 = self._expr_kind(v.args[2])
+            if k1 != k2 and k1 not in {"char", "logical"} and k2 not in {"char", "logical"}:
+                if "complex" in (k1, k2):
+                    if k1 != "complex":
+                        a1 = (
+                            f"cmplx({a1}, 0.0_dp, kind=dp)"
+                            if k1 == "real"
+                            else f"cmplx(real({a1}, kind=dp), 0.0_dp, kind=dp)"
+                        )
+                    if k2 != "complex":
+                        a2 = (
+                            f"cmplx({a2}, 0.0_dp, kind=dp)"
+                            if k2 == "real"
+                            else f"cmplx(real({a2}, kind=dp), 0.0_dp, kind=dp)"
+                        )
+                elif "real" in (k1, k2):
+                    if k1 == "int":
+                        a1 = f"real({a1}, kind=dp)"
+                    if k2 == "int":
+                        a2 = f"real({a2}, kind=dp)"
             self.o.w(f"{name} = merge({a1}, {a2}, {cond})")
             return
 
@@ -51651,6 +52271,42 @@ class translator(ast.NodeVisitor):
         self.o.w("end do")
 
     def _emit_print_call(self, call):
+        """Wraps _emit_print_call_impl to actually emit a non-empty,
+        non-default `end=` value's own text.
+
+        _emit_print_call_impl only ever derives an `advance_no` boolean
+        from `end=` (True to suppress Fortran's own automatic newline,
+        False to keep it) -- it never appends the custom end text
+        itself anywhere, across ANY of its many content-type branches
+        (plain string literal, multi-arg, numeric, tuple, ...). That's
+        invisible for `end=""` (nothing to add, matches advance_no=True
+        with no extra text) and for the default `end="\\n"` (advance_no
+        stays False, Fortran's own automatic newline already matches
+        it), but pyccel's own tests/pyccel/scripts/print_sp_and_end.py
+        shows the real gap: `print("...", end=". ")` silently dropped
+        the ". " entirely, printing "..." with a plain newline instead
+        -- e.g. two prints meant to share one physical line ended up on
+        separate ones.
+
+        Rather than threading end_txt through every one of that
+        function's ~30 write-emitting branches, emit it here instead,
+        once, as a single trailing write -- correct as long as the impl
+        already used advance='no' for anything other than the default
+        "\\n" (see the advance_no fix at this same function's `end`/
+        `sep` keyword scan).
+        """
+        self._emit_print_call_impl(call)
+        end_txt = None
+        unit_txt = "*"
+        for kw in getattr(call, "keywords", []):
+            if kw.arg == "end" and is_const_str(kw.value):
+                end_txt = kw.value.value
+            elif kw.arg == "file":
+                unit_txt = self.expr(kw.value)
+        if end_txt not in (None, "", "\n"):
+            self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(end_txt)}")
+
+    def _emit_print_call_impl(self, call):
         unit_txt = "*"
         def _tuple_print_decl(out_name, kind_hint, rank_hint):
             rr = max(0, int(rank_hint or 0))
@@ -51902,7 +52558,11 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("print(sep=...) currently supports only string literals")
             elif kw.arg == "file":
                 unit_txt = self.expr(kw.value)
-        advance_no = (end_txt == "")
+        # Any explicit end= other than the default "\n" needs Fortran's
+        # own automatic record-terminator suppressed -- not just end=""
+        # -- since _emit_print_call (the wrapper) appends the actual
+        # end text itself as a separate trailing write afterward.
+        advance_no = end_txt is not None and end_txt != "\n"
 
         if (
             len(call.args) == 1
@@ -65122,6 +65782,16 @@ def generate_flat(
         used_proc_names.update(type_names)
         used_proc_names.update(module_global_decls.keys())
         used_proc_names.add("dp")
+        # A local function's own name must dodge Fortran keywords/
+        # intrinsics too, not just other already-used symbols -- e.g. a
+        # Python function named `do` (a genuine Fortran keyword) --
+        # matching the SAME forbidden set translator._aliased_name
+        # already consults (via reserved_names) to rename any COLLIDING
+        # CALL SITE; without this, the call site got renamed (to `xdo`)
+        # while this function's own definition and `use ... only:`
+        # listing kept the literal, un-renamed, never-actually-defined
+        # name.
+        used_proc_names.update(FORTRAN_RESERVED_IDENTIFIERS)
         fn_alias_map = {}
         for fn in local_funcs:
             _nm = fn.name
@@ -65693,7 +66363,12 @@ def generate_flat(
     if chars:
         o.w("character(len=:), allocatable :: " + ", ".join(chars))
     for vname, tname in dict_type_vars:
-        o.w(f"type({tname}) :: {vname}")
+        if vname in tr.class_pointer_alias_of:
+            o.w(f"type({tname}), pointer :: {vname} => null()")
+        elif vname in tr.class_pointer_targets:
+            o.w(f"type({tname}), target :: {vname}")
+        else:
+            o.w(f"type({tname}) :: {vname}")
     for vname, tname in sorted(tr.pandas_df_vars.items()):
         o.w(f"type({tname}) :: {vname}")
     for vname in sorted(tr.pandas_date_vars):
@@ -66204,7 +66879,7 @@ def resolve_helper_uses(helper_paths, needed_helpers):
 
 def _modules_defined_in_source(src_text):
     mods = set()
-    for ln in src_text.splitlines():
+    for ln in _split_generated_fortran_lines(src_text):
         m = re.match(r"^\s*module\s+([a-z_]\w*)\b", ln, flags=re.IGNORECASE)
         if m and not re.match(r"^\s*module\s+procedure\b", ln, flags=re.IGNORECASE):
             mods.add(m.group(1).lower())
@@ -66213,7 +66888,7 @@ def _modules_defined_in_source(src_text):
 
 def _modules_used_in_source(src_text):
     mods = set()
-    for ln in src_text.splitlines():
+    for ln in _split_generated_fortran_lines(src_text):
         # skip intrinsic use statements: use, intrinsic :: iso_fortran_env, only: ...
         if re.match(r"^\s*use\s*,\s*intrinsic\s*::", ln, flags=re.IGNORECASE):
             continue
@@ -66490,6 +67165,10 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = rewrite_tuple_call_subscript_to_temp(tree)
+    tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
+    tree = rewrite_math_const_from_import_to_attribute(tree)
+    tree = rewrite_tuple_literal_shape_name_to_literal(tree)
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
@@ -66809,6 +67488,10 @@ def transpile_file(
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = rewrite_tuple_call_subscript_to_temp(tree)
+    tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
+    tree = rewrite_math_const_from_import_to_attribute(tree)
+    tree = rewrite_tuple_literal_shape_name_to_literal(tree)
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
@@ -67207,7 +67890,7 @@ def transpile_file(
     f90 = rename_conflicting_identifiers(f90)
     # General Fortran cleanup: fold simple integer arithmetic and remove
     # conservative redundant parentheses in generated statements.
-    f90_lines = f90.splitlines()
+    f90_lines = _split_generated_fortran_lines(f90)
     # Always apply a minimal set of semantics-preserving cleanups so default
     # output is readable even without full --postprocess rewrites.
     f90_lines = simplify_generated_parentheses(f90_lines)
@@ -67484,6 +68167,10 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
+    tree = rewrite_tuple_call_subscript_to_temp(tree)
+    tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
+    tree = rewrite_math_const_from_import_to_attribute(tree)
+    tree = rewrite_tuple_literal_shape_name_to_literal(tree)
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
