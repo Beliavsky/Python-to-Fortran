@@ -4479,6 +4479,127 @@ def rewrite_listcomp_zip_target_to_index(tree):
     return new_tree
 
 
+def rewrite_for_enumerate_bare_target_to_tuple(tree):
+    """Rewrite `for v in enumerate(z, [start]): ... v[0] ... v[1] ...`
+    (a bare-Name loop target for an enumerate() iterator, subscripted
+    inside the body instead of unpacked at the `for` itself) into `for
+    (fresh_i, fresh_x) in enumerate(z, [start]): ...`, substituting every
+    `v[0]`/`v[1]` reference in the loop body (and orelse) with the fresh
+    index/element names -- e.g. pyccel's own loops.py:
+    `enumerate_on_1d_array_with_tuple`: `for v in enumerate(z): res +=
+    v[0] * v[1]`.
+
+    This project's existing enumerate()-in-a-for-loop lowering only ever
+    recognizes an already-unpacked 2-tuple target (`for i, x in
+    enumerate(z)`) -- a bare Name target was rejected outright
+    ("enumerate target must be a 2-item tuple/list"), even though
+    `v[0]`/`v[1]` access the exact same two values a literal Python
+    tuple `v = (i, x)` would expose, just indexed instead of unpacked.
+
+    Deliberately narrow: only rewrites when the loop body's only
+    references to the target name are `v[0]`/`v[1]` subscripts with a
+    literal 0/1 index (a bare `v` used as a whole value -- passed to
+    another function, printed directly, ... -- is left completely
+    untouched, falling through to the existing decline unchanged).
+    """
+    counter = [0]
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
+    def _next_name(base):
+        while True:
+            counter[0] += 1
+            cand = f"{base}_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    def _is_enumerate_call(node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "enumerate"
+            and len(node.args) == 1
+            and (not node.keywords or (len(node.keywords) == 1 and node.keywords[0].arg == "start"))
+        )
+
+    class _TargetSubscriptSubst(ast.NodeTransformer):
+        def __init__(self, target_name, idx_name, val_name):
+            self.target_name = target_name
+            self.idx_name = idx_name
+            self.val_name = val_name
+            self.bare_uses_remain = False
+
+        def visit_Subscript(self, node):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == self.target_name
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value in (0, 1)
+            ):
+                # Matches the v[0]/v[1] shape this rewrite targets --
+                # replace outright WITHOUT recursing into node.value
+                # first (it's exactly the bare `Name(id=target_name)`
+                # visit_Name below would otherwise flag as an
+                # unsubstitutable whole-value use of the target).
+                repl_name = self.idx_name if node.slice.value == 0 else self.val_name
+                return ast.copy_location(ast.Name(id=repl_name, ctx=node.ctx), node)
+            self.generic_visit(node)
+            return node
+
+        def visit_Name(self, node):
+            if node.id == self.target_name:
+                self.bare_uses_remain = True
+            return node
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_For(self, node):
+            self.generic_visit(node)
+            if not (isinstance(node.target, ast.Name) and _is_enumerate_call(node.iter)):
+                return node
+            target_name = node.target.id
+            idx_name = _next_name(f"{target_name}_idx")
+            val_name = _next_name(f"{target_name}_val")
+            subst = _TargetSubscriptSubst(target_name, idx_name, val_name)
+            node.body = [subst.visit(st) for st in node.body]
+            node.orelse = [subst.visit(st) for st in node.orelse]
+            if subst.bare_uses_remain:
+                # A bare (non-subscript) reference to the target name
+                # survives somewhere -- not this rewrite's shape to
+                # handle; leave the ORIGINAL node untouched (bail out
+                # without committing the partial substitution already
+                # applied to a deep-copied body would be needed to truly
+                # roll back, but since substitution only ever replaces a
+                # `v[0]`/`v[1]` Subscript -- never anything a bare-`v`
+                # use also depends on -- leaving both forms in the body
+                # is safe: the existing lowering will still reject the
+                # unresolved bare `v` reference with its own clear
+                # "enumerate target must be a 2-item tuple/list" or
+                # "unsupported" decline).
+                return node
+            node.target = ast.copy_location(
+                ast.Tuple(
+                    elts=[
+                        ast.Name(id=idx_name, ctx=ast.Store()),
+                        ast.Name(id=val_name, ctx=ast.Store()),
+                    ],
+                    ctx=ast.Store(),
+                ),
+                node.target,
+            )
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
 def rewrite_pop_call_expr_to_temp(tree):
     """Hoist a `list_var.pop(...)` call that appears anywhere OTHER than
     the two directly-supported statement shapes -- a plain `x =
@@ -14234,6 +14355,7 @@ def detect_needed_helpers(tree):
                 needed.add("diag")
             if is_print_like:
                 needed.add("print_matrix")
+                needed.add("print_array_3d")
                 if len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "primes":
                     needed.add("print_int_list")
                 if len(node.args) == 1 and isinstance(node.args[0], ast.JoinedStr):
@@ -18511,6 +18633,20 @@ def _simple_function_as_lambda(fn_node):
         and isinstance(body[0].value, ast.Constant)
         and isinstance(body[0].value.value, str)
     ):
+        body = body[1:]
+    # A leading `import X` / `from X import Y` (e.g. pyccel's own
+    # test_epyccel_return_arrays.py: `def single_return(): from numpy
+    # import array; return array([1, 2, 3, 4])`) has no runtime effect
+    # on the return value -- it's purely a name-binding statement, and
+    # rewrite_bare_numpy_imports_to_attribute_calls has ALREADY rewritten
+    # any bare-imported-name call in the return expression to its np.X(...)
+    # form regardless of whether this import statement itself survives.
+    # Strip any number of these before the single-return-statement check
+    # below, exactly like the leading-docstring case just above -- their
+    # mere presence otherwise disqualified an every-other-way-trivial
+    # single-return nested function from being convertible to a lambda at
+    # all, so its own call sites fell through to "unsupported call".
+    while body and isinstance(body[0], (ast.Import, ast.ImportFrom)):
         body = body[1:]
     if len(body) != 1 or not isinstance(body[0], ast.Return) or body[0].value is None:
         return None
@@ -24688,6 +24824,16 @@ class translator(ast.NodeVisitor):
             ):
                 return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Attribute) and node.func.attr == "reshape":
+                if is_numpy_name_node(node.func.value) and len(node.args) >= 1:
+                    # np.reshape(x, shape) -- the array being reshaped is
+                    # node.args[0], not node.func.value (which is just
+                    # the `np`/`numpy` module name itself here, unlike
+                    # the x.reshape(shape) METHOD-call shape this branch
+                    # was written for). Without this, np.reshape(...)'s
+                    # own element kind was derived from "np" itself
+                    # (unknown), silently defaulting elsewhere to real
+                    # even when reshaping an integer array.
+                    return self._expr_kind(node.args[0])
                 return self._expr_kind(node.func.value)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -25307,9 +25453,34 @@ class translator(ast.NodeVisitor):
         scalar index still gets -- see maybe_negative_int_vars's own
         comment for why a runtime-negative index needs this at all
         (previously a hard out-of-bounds crash, not a decline).
+
+        A compile-time-constant negative index (a literal `-k`, e.g.
+        `y[-1, ...]`) is resolved directly to `dim_size_expr - (k - 1)`
+        (mirroring the sibling 2D-tuple-subscript codegen's own local
+        `_idx1_expr` closure, which already got this right) rather than
+        falling through to the generic `(v + 1)` formula below -- for
+        k=1 that gives `(-1 + 1) == 0`, an out-of-bounds Fortran index
+        (below the lower bound of 1) instead of the correct
+        `dim_size_expr` (Python's own last-element tail indexing).
         """
         if isinstance(a, ast.Name) and a.id in self.maybe_negative_int_vars:
             return f"(modulo({self.expr(a)}, {dim_size_expr}) + 1)"
+        _k = None
+        if isinstance(a, ast.Constant) and isinstance(a.value, int) and not isinstance(a.value, bool) and a.value < 0:
+            _k = -int(a.value)
+        elif (
+            isinstance(a, ast.UnaryOp)
+            and isinstance(a.op, ast.USub)
+            and isinstance(a.operand, ast.Constant)
+            and isinstance(a.operand.value, int)
+            and not isinstance(a.operand.value, bool)
+            and a.operand.value >= 1
+        ):
+            _k = int(a.operand.value)
+        if _k is not None:
+            if _k == 1:
+                return dim_size_expr
+            return f"({dim_size_expr} - {_k - 1})"
         return f"({self.expr(a)} + 1)"
 
     def _const_int_value(self, node):
@@ -28225,7 +28396,19 @@ class translator(ast.NodeVisitor):
                 ):
                     return True
                 if isinstance(src, ast.Name):
-                    return True
+                    # A bare Name only counts as an RNG-instance receiver
+                    # (e.g. `rng = np.random.default_rng(); rng.power(...)`)
+                    # when it's actually a tracked RNG variable -- NOT the
+                    # numpy module alias itself. Without this guard, plain
+                    # `np.power(a, b)` (an ordinary elementwise ufunc, node
+                    # .func.value == Name('np')) was misidentified as
+                    # `np.random.power(a, size)` and its second argument
+                    # `b` misinterpreted as a `size=` tuple, producing a
+                    # bogus rank (e.g. len(b.elts) instead of the real
+                    # broadcast rank -- found via pyccel-suite mining:
+                    # print(np.power([2,3,4],[3,2,1])) got misdetected as
+                    # rank 3 and crashed print_array_3d dispatch).
+                    return src.id in self.rng_vars and src.id not in {"np", "numpy"}
                 return False
 
             if (
@@ -31168,10 +31351,21 @@ class translator(ast.NodeVisitor):
                     return f"{base}({d0}, {d1}, {d2})"
 
                 if all(not isinstance(a, ast.Slice) and not is_none(a) for a in (a0, a1, a2)):
+                    # Route every scalar index through the same
+                    # negative-safe _idx_or_slice_expr/_scalar_idx1_expr
+                    # helper the sibling "any dim is a slice" branch just
+                    # above already uses -- this all-scalar branch
+                    # previously did a naive `({expr} + 1)` per index
+                    # unconditionally, which for a literal negative index
+                    # (e.g. `y[0, -1, 0]`, pyccel's own
+                    # test_epyccel_transpose.py) computed `(-1 + 1) == 0`,
+                    # an out-of-bounds Fortran index (0, below the lower
+                    # bound of 1) instead of the correct `size(y, 2)`
+                    # (Python's own last-element tail indexing).
                     return (
-                        f"{base}(({self.expr(a0)} + 1), "
-                        f"({self.expr(a1)} + 1), "
-                        f"({self.expr(a2)} + 1))"
+                        f"{base}({_idx_or_slice_expr(a0, 1)}, "
+                        f"{_idx_or_slice_expr(a1, 2)}, "
+                        f"{_idx_or_slice_expr(a2, 3)})"
                     )
                 raise NotImplementedError("unsupported 3D tuple subscripts")
             # Logical mask indexing (NumPy): a[mask] -> pack(a, mask)
@@ -31809,7 +32003,20 @@ class translator(ast.NodeVisitor):
                 if callee in {"np.transpose", "np.permute_dims"}:
                     a0 = self.expr(node.args[0]) if len(node.args) >= 1 else ""
                     if len(node.args) == 1:
-                        return f"transpose({a0})"
+                        # See the identical rank-3 fix (and its
+                        # reasoning) at the direct np.transpose(x)/
+                        # .T/.transpose() codegen sites.
+                        _r0 = self._rank_expr(node.args[0])
+                        if _r0 <= 1:
+                            return a0
+                        if _r0 == 2:
+                            return f"transpose({a0})"
+                        if _r0 == 3:
+                            return (
+                                f"reshape({a0}, [size({a0},3), size({a0},2), size({a0},1)], "
+                                f"order=[3,2,1])"
+                            )
+                        raise NotImplementedError(f"{callee} currently supports rank up to 3")
                     axes = node.args[1]
                     if not isinstance(axes, (ast.Tuple, ast.List)):
                         raise NotImplementedError(f"{callee} axes must be tuple/list")
@@ -33807,11 +34014,21 @@ class translator(ast.NodeVisitor):
                 if not dim_nodes:
                     raise NotImplementedError("np.reshape requires shape arguments")
                 dims = ", ".join(self._reshape_dims_exprs(a0, dim_nodes))
-                if order_txt == "F":
+                if order_txt == "F" or len(dim_nodes) < 2:
                     return f"reshape({a0}, [{dims}])"
-                if len(dim_nodes) == 2:
-                    return f"reshape({a0}, [{dims}], order=[2, 1])"
-                return f"reshape({a0}, [{dims}])"
+                # NumPy's own reshape() defaults to row-major ('C') fill
+                # order -- the LAST axis varies fastest -- but Fortran's
+                # RESHAPE with no `order=` argument fills its own native
+                # column-major way (FIRST axis fastest) instead, silently
+                # producing a completely different (if same-shaped)
+                # array. Reversing the axis priority via `order=[N, N-1,
+                # ..., 1]` reproduces row-major fill using Fortran's own
+                # intrinsic (verified empirically: reshape(src, [2,5],
+                # order=[2,1]) correctly fills row-by-row) -- previously
+                # only ever applied for the rank-2 case, silently wrong
+                # for rank 3+.
+                order_list = ", ".join(str(_i) for _i in range(len(dim_nodes), 0, -1))
+                return f"reshape({a0}, [{dims}], order=[{order_list}])"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -33975,7 +34192,28 @@ class translator(ast.NodeVisitor):
                     return f"eye(int({self.expr(node.args[0])}), int({self.expr(node.args[0])}))"
                 a0 = self.expr(node.args[0])
                 if len(node.args) == 1:
-                    return f"transpose({a0})"
+                    # Fortran's TRANSPOSE intrinsic strictly requires a
+                    # rank-2 matrix -- np.transpose(x) with NO explicit
+                    # axes reverses ALL axes instead, which for rank 3
+                    # needs RESHAPE's own `order=` argument to permute
+                    # dimensions (verified: reshape(x, [size(x,3),
+                    # size(x,2), size(x,1)], order=[3,2,1]) gives
+                    # y(k,j,i) = x(i,j,k), exactly numpy's own default-
+                    # axes transpose semantics) -- mirroring the
+                    # identical rank-3 case the sibling `.T`/
+                    # `.transpose()` codegen already has (or, after this
+                    # same fix, now also has).
+                    _r0 = self._rank_expr(node.args[0])
+                    if _r0 <= 1:
+                        return a0
+                    if _r0 == 2:
+                        return f"transpose({a0})"
+                    if _r0 == 3:
+                        return (
+                            f"reshape({a0}, [size({a0},3), size({a0},2), size({a0},1)], "
+                            f"order=[3,2,1])"
+                        )
+                    raise NotImplementedError("np.transpose currently supports rank up to 3")
                 axes = node.args[1]
                 if not isinstance(axes, (ast.Tuple, ast.List)):
                     raise NotImplementedError("np.transpose axes must be tuple/list")
@@ -35215,12 +35453,30 @@ class translator(ast.NodeVisitor):
             ):
                 arr = self.expr(node.func.value)
                 if node.func.attr == "reshape":
+                    _order_txt = None
+                    for _kw in getattr(node, "keywords", []):
+                        if _kw.arg == "order" and isinstance(_kw.value, ast.Constant):
+                            _order_txt = str(_kw.value.value).upper()
+                            break
+                    def _reshape_call(_dim_nodes):
+                        _dims = ", ".join(self._reshape_dims_exprs(arr, _dim_nodes))
+                        if _order_txt == "F" or len(_dim_nodes) < 2:
+                            return f"reshape({arr}, [{_dims}])"
+                        # See the identical np.reshape(...) fix (and its
+                        # verified reasoning) just above: NumPy's own
+                        # .reshape() method also defaults to row-major
+                        # ('C') fill order, which Fortran's own RESHAPE
+                        # only reproduces via a reversed `order=`
+                        # argument -- previously never applied here at
+                        # all (any rank), so `x.reshape(2, 5)` silently
+                        # filled the result in Fortran's native column-
+                        # major order instead.
+                        _order_list = ", ".join(str(_i) for _i in range(len(_dim_nodes), 0, -1))
+                        return f"reshape({arr}, [{_dims}], order=[{_order_list}])"
                     if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
-                        dims = ", ".join(self._reshape_dims_exprs(arr, list(node.args[0].elts)))
-                        return f"reshape({arr}, [{dims}])"
+                        return _reshape_call(list(node.args[0].elts))
                     if len(node.args) >= 1:
-                        dims = ", ".join(self._reshape_dims_exprs(arr, list(node.args)))
-                        return f"reshape({arr}, [{dims}])"
+                        return _reshape_call(list(node.args))
                     raise NotImplementedError("reshape requires shape arguments")
                 if node.func.attr == "astype" and self._pandas_df_astype_spec(node) is not None:
                     # df.astype(float) as a nested sub-expression (e.g.
@@ -37694,10 +37950,29 @@ class translator(ast.NodeVisitor):
                 return "[" + ", ".join(dims) + "]"
             if node.attr == "T":
                 vtxt = self.expr(node.value)
-                if self._rank_expr(node.value) <= 1:
+                _t_rank = self._rank_expr(node.value)
+                if _t_rank <= 1:
                     # NumPy: vector.T is a no-op.
                     return vtxt
-                return f"transpose({vtxt})"
+                if _t_rank == 2:
+                    return f"transpose({vtxt})"
+                if _t_rank == 3:
+                    # Fortran's TRANSPOSE intrinsic strictly requires a
+                    # rank-2 matrix -- numpy's own .T (no explicit axes)
+                    # reverses ALL axes instead, which for rank 3 needs
+                    # RESHAPE's own `order=` argument to permute
+                    # dimensions (verified: reshape(x, [size(x,3),
+                    # size(x,2), size(x,1)], order=[3,2,1]) gives
+                    # y(k,j,i) = x(i,j,k), exactly numpy's own `.T`/
+                    # `np.transpose(x)` default-axes semantics) --
+                    # mirroring the identical rank-3 case the sibling
+                    # `.transpose()` METHOD-call codegen already has.
+                    return (
+                        f"reshape({vtxt}, "
+                        f"[size({vtxt},3), size({vtxt},2), size({vtxt},1)], "
+                        f"order=[3,2,1])"
+                    )
+                raise NotImplementedError(".T currently supports rank up to 3")
             if node.attr == "flat":
                 vtxt = self.expr(node.value)
                 return f"reshape({vtxt}, [size({vtxt})])"
@@ -38059,8 +38334,7 @@ class translator(ast.NodeVisitor):
                     and isinstance(_m.targets[0], (ast.Tuple, ast.List))
                     and isinstance(_m.value, ast.Call)
                     and isinstance(_m.value.func, ast.Attribute)
-                    and isinstance(_m.value.func.value, ast.Name)
-                    and _m.value.func.value.id == "np"
+                    and is_numpy_name_node(_m.value.func.value)
                 ):
                     _lhs_elts = list(_m.targets[0].elts)
                     _attr = _m.value.func.attr
@@ -53797,6 +54071,9 @@ class translator(ast.NodeVisitor):
             if self._rank_expr(a0) == 2 and self._expr_kind(a0) in {"real", "int", "alloc_real", "alloc_int"}:
                 self.o.w(f"call print_matrix({self.expr(a0)})")
                 return
+            if self._rank_expr(a0) == 3 and self._expr_kind(a0) in {"real", "int", "alloc_real", "alloc_int"}:
+                self.o.w(f"call print_array_3d({self.expr(a0)})")
+                return
         if len(call.args) != 1:
             if (
                 len(call.args) == 2
@@ -53805,6 +54082,14 @@ class translator(ast.NodeVisitor):
                 and self._expr_kind(call.args[1]) in {"real", "int", "alloc_real", "alloc_int"}
             ):
                 self.o.w(f"call print_matrix({fstr(call.args[0].value)}, {self.expr(call.args[1])})")
+                return
+            if (
+                len(call.args) == 2
+                and is_const_str(call.args[0])
+                and self._rank_expr(call.args[1]) == 3
+                and self._expr_kind(call.args[1]) in {"real", "int", "alloc_real", "alloc_int"}
+            ):
+                self.o.w(f"call print_array_3d({fstr(call.args[0].value)}, {self.expr(call.args[1])})")
                 return
             # Conservative multi-argument handling.
             # If list outputs are mixed with other args, emit in parts.
@@ -66357,12 +66642,28 @@ def generate_flat(
                     ):
                         return True
             return False
+        _final_pos_args = list(fn.args.args) + list(fn.args.kwonlyargs)
         for i, arg_nm in enumerate(local_func_arg_names.get(fn.name, [])):
             if i >= len(local_func_arg_kinds[fn.name]):
                 break
+            # _semantic_int_context's own FloorDiv/Mod check matches an
+            # arg used as EITHER operand of `//`/`%` unconditionally,
+            # regardless of the annotated type of either operand --
+            # Python's `//`/`%` stay real-valued when either operand is a
+            # float (17 // 2.5 == 6.0, a float, not truncated to int).
+            # Without this guard, an explicitly `float`-annotated
+            # parameter used in a floor-division/modulo expression (e.g.
+            # pyccel's own test_epyccel_division.py: `def fdiv_i_r(x:
+            # int, y: "float"): return x // y`) had its own authoritative
+            # annotation silently overridden back to "int" here --
+            # producing a wrong INTEGER dummy-argument declaration (and,
+            # downstream, floor_div_int/floor_div_real dispatch on the
+            # wrong operand kind entirely).
+            _explicit_ann_kind = _ann_kind(_final_pos_args[i].annotation) if i < len(_final_pos_args) else None
             if (
                 _semantic_int_context(arg_nm)
                 and _default_kind_by_arg.get(arg_nm) != "real"
+                and _explicit_ann_kind != "real"
                 and local_func_arg_kinds[fn.name][i] in {None, "real"}
             ):
                 local_func_arg_kinds[fn.name][i] = "int"
@@ -68373,6 +68674,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = ast.parse(src_text, filename=source_name)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -68713,6 +69015,7 @@ def transpile_file(
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -69397,6 +69700,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)

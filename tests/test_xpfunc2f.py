@@ -420,7 +420,9 @@ def test_inline_python_mod_helpers_resolves_generic_interface() -> None:
     assert "optval" not in procs
     interfaces = xpfunc2f._find_python_mod_interfaces(header)
     assert "optval" in interfaces
-    assert set(interfaces["optval"][2]) == {"optval_int", "optval_real", "optval_logical", "optval_char"}
+    assert set(interfaces["optval"][2]) == {
+        "optval_int", "optval_real", "optval_logical", "optval_char", "optval_complex",
+    }
 
     trimmed = "\n".join(
         [

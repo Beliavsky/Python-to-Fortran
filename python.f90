@@ -309,6 +309,7 @@ public :: loadtxt_logical_2d !@pyapi kind=function ret=logical(:,:) args=path:ch
 public :: loadtxt_logical_1d !@pyapi kind=function ret=logical(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected logical column as vector (nonzero=>true)"
 public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in),delimiter:character:intent(in):optional,fmt:character:intent(in):optional desc="write real matrix text file with basic delimiter/fmt options"
 public :: print_matrix !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),label:character:intent(in):optional desc="print 2D real matrix with aligned columns"
+public :: print_array_3d !@pyapi kind=subroutine args=a:real(dp)(:,:,:):intent(in),label:character:intent(in):optional desc="print 3D real array with numpy-style nested brackets"
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
 public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
 public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional desc="m-th derivative coefficients for descending-order polynomial"
@@ -495,6 +496,7 @@ interface optval
    module procedure optval_real
    module procedure optval_logical
    module procedure optval_char
+   module procedure optval_complex
 end interface optval
 
 interface convolve
@@ -508,6 +510,13 @@ interface print_matrix
    module procedure print_matrix_int_2d
    module procedure print_matrix_label_int_2d
 end interface print_matrix
+
+interface print_array_3d
+   module procedure print_array_3d_real
+   module procedure print_array_3d_label_real
+   module procedure print_array_3d_int
+   module procedure print_array_3d_label_int
+end interface print_array_3d
 
 interface index1
    module procedure index1_real
@@ -870,8 +879,7 @@ contains
 
       subroutine print_matrix_real_2d(a)
          real(kind=dp), intent(in) :: a(:,:)
-         integer :: i, j, pad
-         integer, allocatable :: w(:)
+         integer :: i, j, pad, w
          character(len=64) :: buf
 
          if (size(a,1) <= 0 .or. size(a,2) <= 0) then
@@ -879,12 +887,11 @@ contains
             return
          end if
 
-         allocate(w(size(a,2)))
          w = 1
          do j = 1, size(a,2)
             do i = 1, size(a,1)
                write(buf, "(g0)") a(i, j)
-               w(j) = max(w(j), len_trim(adjustl(buf)))
+               w = max(w, len_trim(adjustl(buf)))
             end do
          end do
 
@@ -900,7 +907,7 @@ contains
                if (j > 1) write(*, "(a)", advance="no") " "
                write(buf, "(g0)") a(i, j)
                buf = adjustl(buf)
-               pad = w(j) - len_trim(buf)
+               pad = w - len_trim(buf)
                if (pad > 0) write(*, "(a)", advance="no") repeat(" ", pad)
                write(*, "(a)", advance="no") trim(buf)
             end do
@@ -914,8 +921,7 @@ contains
 
       subroutine print_matrix_int_2d(a)
          integer, intent(in) :: a(:,:)
-         integer :: i, j, pad
-         integer, allocatable :: w(:)
+         integer :: i, j, pad, w
          character(len=64) :: buf
 
          if (size(a,1) <= 0 .or. size(a,2) <= 0) then
@@ -923,12 +929,11 @@ contains
             return
          end if
 
-         allocate(w(size(a,2)))
          w = 1
          do j = 1, size(a,2)
             do i = 1, size(a,1)
                write(buf, "(i0)") a(i, j)
-               w(j) = max(w(j), len_trim(adjustl(buf)))
+               w = max(w, len_trim(adjustl(buf)))
             end do
          end do
 
@@ -944,7 +949,7 @@ contains
                if (j > 1) write(*, "(a)", advance="no") " "
                write(buf, "(i0)") a(i, j)
                buf = adjustl(buf)
-               pad = w(j) - len_trim(buf)
+               pad = w - len_trim(buf)
                if (pad > 0) write(*, "(a)", advance="no") repeat(" ", pad)
                write(*, "(a)", advance="no") trim(buf)
             end do
@@ -955,6 +960,118 @@ contains
             end if
          end do
       end subroutine print_matrix_int_2d
+
+      subroutine print_array_3d_real(a)
+         real(kind=dp), intent(in) :: a(:,:,:)
+         integer :: i, j, k, pad, w
+         character(len=64) :: buf
+
+         if (size(a,1) <= 0 .or. size(a,2) <= 0 .or. size(a,3) <= 0) then
+            write(*, "(a)") "[]"
+            return
+         end if
+
+         w = 1
+         do k = 1, size(a,3)
+            do j = 1, size(a,2)
+               do i = 1, size(a,1)
+                  write(buf, "(g0)") a(i, j, k)
+                  w = max(w, len_trim(adjustl(buf)))
+               end do
+            end do
+         end do
+
+         do i = 1, size(a,1)
+            do j = 1, size(a,2)
+               if (i == 1 .and. j == 1) then
+                  write(*, "(a)", advance="no") "[[["
+               else if (j == 1) then
+                  write(*, "(a)", advance="no") " [["
+               else
+                  write(*, "(a)", advance="no") "  ["
+               end if
+               do k = 1, size(a,3)
+                  if (k > 1) write(*, "(a)", advance="no") " "
+                  write(buf, "(g0)") a(i, j, k)
+                  buf = adjustl(buf)
+                  pad = w - len_trim(buf)
+                  if (pad > 0) write(*, "(a)", advance="no") repeat(" ", pad)
+                  write(*, "(a)", advance="no") trim(buf)
+               end do
+               if (i == size(a,1) .and. j == size(a,2)) then
+                  write(*, "(a)") "]]]"
+               else if (j == size(a,2)) then
+                  write(*, "(a)") "]]"
+               else
+                  write(*, "(a)") "]"
+               end if
+            end do
+            if (i < size(a,1)) write(*, "(a)") ""
+         end do
+      end subroutine print_array_3d_real
+
+      subroutine print_array_3d_int(a)
+         integer, intent(in) :: a(:,:,:)
+         integer :: i, j, k, pad, w
+         character(len=64) :: buf
+
+         if (size(a,1) <= 0 .or. size(a,2) <= 0 .or. size(a,3) <= 0) then
+            write(*, "(a)") "[]"
+            return
+         end if
+
+         w = 1
+         do k = 1, size(a,3)
+            do j = 1, size(a,2)
+               do i = 1, size(a,1)
+                  write(buf, "(i0)") a(i, j, k)
+                  w = max(w, len_trim(adjustl(buf)))
+               end do
+            end do
+         end do
+
+         do i = 1, size(a,1)
+            do j = 1, size(a,2)
+               if (i == 1 .and. j == 1) then
+                  write(*, "(a)", advance="no") "[[["
+               else if (j == 1) then
+                  write(*, "(a)", advance="no") " [["
+               else
+                  write(*, "(a)", advance="no") "  ["
+               end if
+               do k = 1, size(a,3)
+                  if (k > 1) write(*, "(a)", advance="no") " "
+                  write(buf, "(i0)") a(i, j, k)
+                  buf = adjustl(buf)
+                  pad = w - len_trim(buf)
+                  if (pad > 0) write(*, "(a)", advance="no") repeat(" ", pad)
+                  write(*, "(a)", advance="no") trim(buf)
+               end do
+               if (i == size(a,1) .and. j == size(a,2)) then
+                  write(*, "(a)") "]]]"
+               else if (j == size(a,2)) then
+                  write(*, "(a)") "]]"
+               else
+                  write(*, "(a)") "]"
+               end if
+            end do
+            if (i < size(a,1)) write(*, "(a)") ""
+         end do
+      end subroutine print_array_3d_int
+
+      subroutine print_array_3d_label_real(label, a)
+         character(len=*), intent(in) :: label
+         real(kind=dp), intent(in) :: a(:,:,:)
+         write(*, "(a)") trim(label)
+         call print_array_3d_real(a)
+      end subroutine print_array_3d_label_real
+
+      subroutine print_array_3d_label_int(label, a)
+         character(len=*), intent(in) :: label
+         integer, intent(in) :: a(:,:,:)
+         write(*, "(a)") trim(label)
+         call print_array_3d_int(a)
+      end subroutine print_array_3d_label_int
 
       pure real(kind=dp) function index1_real(x, i)
          real(kind=dp), intent(in) :: x(:)
@@ -1559,6 +1676,16 @@ contains
             v = default
          end if
       end function optval_real
+
+      pure complex(kind=dp) function optval_complex(x, default) result(v)
+         complex(kind=dp), intent(in), optional :: x
+         complex(kind=dp), intent(in) :: default
+         if (present(x)) then
+            v = x
+         else
+            v = default
+         end if
+      end function optval_complex
 
       pure logical function optval_logical(x, default) result(v)
          logical, intent(in), optional :: x

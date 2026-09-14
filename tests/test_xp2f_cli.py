@@ -2423,14 +2423,18 @@ def test_xp2f_runs_direct_numpy_reshape_import_with_order(tmp_path: Path) -> Non
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xreshape_direct_import_p.f90").read_text(encoding="utf-8")
-    # `a` and `b` are both rank-2 real literals (via reshape) that are
-    # never reassigned, so xp2f's constant-promotion pass turns each into
-    # a named PARAMETER with an explicit shape and the reshape() baked
-    # directly into the declaration, rather than a separate allocatable +
-    # assignment.
+    # `a` and `b` are both rank-2 INTEGER literals (via reshape of a
+    # plain int list -- numpy's own reshape([1,...,6], (2,3)) gives an
+    # int64 array, not real) that are never reassigned, so xp2f's
+    # constant-promotion pass turns each into a named PARAMETER with an
+    # explicit shape and the reshape() baked directly into the
+    # declaration, rather than a separate allocatable + assignment.
+    # `a` (no explicit order=, numpy's own row-major default) gets an
+    # explicit order=[2, 1] (Fortran's RESHAPE fills its own native
+    # column-major way otherwise); `b` (explicit order='F') doesn't.
     joined = _join_fortran_continuations(out_text)
-    assert "real(kind=dp), parameter :: a(2,3) = reshape([1, 2, 3, 4, 5, 6], [2, 3], order=[2, 1])" in joined
-    assert "real(kind=dp), parameter :: b(2,3) = reshape([1, 2, 3, 4, 5, 6], [2, 3])" in joined
+    assert "integer, parameter :: a(2,3) = reshape([1, 2, 3, 4, 5, 6], [2, 3], order=[2, 1])" in joined
+    assert "integer, parameter :: b(2,3) = reshape([1, 2, 3, 4, 5, 6], [2, 3])" in joined
     assert "a(1, :)" in out_text
     assert "a((1), :)" not in out_text
 
@@ -15045,3 +15049,511 @@ def test_xp2f_tuple_return_of_in_expressions_rank(tmp_path: Path) -> None:
             "    print(r2)",
         ],
     )
+
+
+def test_xp2f_nested_single_return_function_with_leading_import(tmp_path: Path) -> None:
+    # Regression test: a trivial nested `def` with exactly one statement
+    # (`return EXPR`) is converted to a lambda substitution
+    # (_simple_function_as_lambda) so a bare call to it anywhere else in
+    # the enclosing function is resolved -- but a leading `import X` /
+    # `from X import Y` statement before that single return (e.g.
+    # pyccel's own test_epyccel_return_arrays.py: `def single_return():
+    # from numpy import array; return array([1, 2, 3, 4])`) made
+    # len(body) != 1, disqualifying the conversion even though the
+    # import has no runtime effect on the return value -- so `b =
+    # single_return() + 1` fell through to "unsupported call:
+    # single_return()". Now stripped first, exactly like the
+    # already-handled leading-docstring case.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnested_single_return_leading_import.py",
+        [
+            "def return_arrays_in_expression():",
+            "    def single_return():",
+            "        from numpy import array",
+            "        return array([1, 2, 3, 4])",
+            "",
+            "    b = single_return() + 1",
+            "    return b",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    r = return_arrays_in_expression()",
+            "    print(r[0])",
+            "    print(r[1])",
+            "    print(r[2])",
+            "    print(r[3])",
+        ],
+    )
+
+
+def test_xp2f_optional_complex_default_arg(tmp_path: Path) -> None:
+    # Regression test: a complex-typed Optional argument
+    # (`x: "complex" = None`) lowers its "value if present, else
+    # default" pattern to the `optval` generic (python.f90) -- but the
+    # generic interface only had int/real/logical/char specific
+    # procedures, no complex one at all ("There is no specific function
+    # for the generic 'optval'"). Added optval_complex alongside the
+    # existing optval_real, matching the same present(x)-then-default
+    # shape -- pyccel's own test_epyccel_default_args.py: `def f5(x:
+    # "complex" = 1j): y = x - 1; return y`.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xoptional_complex_default.py",
+        [
+            "def f5c(x: \"complex\" = 1j):",
+            "    y = x - 1",
+            "    return y",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(f5c(2.9 + 3j))",
+            "    print(f5c())",
+        ],
+    )
+
+
+def test_xp2f_floor_division_real_annotated_arg_not_forced_int(tmp_path: Path) -> None:
+    # Regression test: `_semantic_int_context` (used to decide whether a
+    # local function parameter should be forced to "int") matched a
+    # parameter used as EITHER operand of `//`/`%` unconditionally --
+    # but Python's `//`/`%` stay real-valued when either operand is a
+    # float (17 // 2.5 == 6.0, a float, not truncated to an int).
+    # Without checking the parameter's own EXPLICIT annotation first,
+    # this silently overrode an authoritative `float`-annotated
+    # parameter's kind back to "int" -- pyccel's own
+    # test_epyccel_division.py: `def fdiv_i_r(x: int, y: "float"):
+    # return x // y`. The wrong INTEGER dummy-argument declaration then
+    # also made the FloorDiv codegen itself dispatch to floor_div_int
+    # instead of floor_div_real, silently truncating the divisor to an
+    # integer before dividing (17 // 2.5 computed as 17 // 2 == 8,
+    # instead of the correct floor(17 / 2.5) == 6.0).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xfloordiv_real_annotated_arg.py",
+        [
+            "def fdiv_i_r(x: int, y: \"float\"):",
+            "    return x // y",
+            "",
+            "",
+            "def fdiv_r_r(x: \"float\", y: \"float\"):",
+            "    return x // y",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(fdiv_i_r(17, 2.5))",
+            "    print(fdiv_i_r(-17, 2.5))",
+            "    print(fdiv_r_r(19.5, 2.5))",
+            "    print(fdiv_r_r(-19.5, -2.5))",
+        ],
+    )
+
+
+def test_xp2f_for_loop_enumerate_bare_target_subscripted(tmp_path: Path) -> None:
+    # Regression test: `for v in enumerate(z): ... v[0] ... v[1] ...`
+    # (a bare-Name loop target, subscripted inside the body instead of
+    # unpacked at the `for` itself) was rejected outright ("enumerate
+    # target must be a 2-item tuple/list") -- pyccel's own loops.py:
+    # `enumerate_on_1d_array_with_tuple`. This project's existing
+    # enumerate()-in-a-for-loop lowering only ever recognized an
+    # already-unpacked 2-tuple target (`for i, x in enumerate(z)`), even
+    # though `v[0]`/`v[1]` access the exact same two values. New AST
+    # rewrite desugars into fresh index/value names, substituting every
+    # `v[0]`/`v[1]` subscript in the loop body.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xfor_enumerate_bare_target.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def enumerate_on_1d_array_with_tuple(z: \"int[:]\"):",
+            "    res = 0",
+            "    for v in enumerate(z):",
+            "        res += v[0] * v[1]",
+            "",
+            "    return res",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    z = np.arange(7)",
+            "    print(enumerate_on_1d_array_with_tuple(z))",
+        ],
+    )
+
+
+def test_xp2f_transpose_rank3_and_negative_index(tmp_path: Path) -> None:
+    # Regression test for two bugs found together via pyccel's own
+    # test_epyccel_transpose.py:
+    # 1. Fortran's TRANSPOSE intrinsic strictly requires a rank-2
+    #    matrix, but np.transpose(x)/x.T (no explicit axes -- reverses
+    #    ALL axes) unconditionally emitted `transpose(x)` regardless of
+    #    rank, crashing to build for a rank-3 array. Fixed at every
+    #    codegen site (`.T` property, `.transpose()` method already had
+    #    it, `np.transpose(x)` direct call, and the `t = np.transpose;
+    #    t(x)` callable-alias form) via RESHAPE's own `order=` argument
+    #    (verified: reshape(x, [size(x,3), size(x,2), size(x,1)],
+    #    order=[3,2,1]) gives y(k,j,i) = x(i,j,k), exactly numpy's own
+    #    default-axes transpose semantics).
+    # 2. A 3D tuple subscript with ALL THREE indices scalar (no slice)
+    #    used a naive `(expr + 1)` conversion per index, unconditionally
+    #    -- for a literal negative index (`y[0, -1, 0]`) this computed
+    #    `(-1 + 1) == 0`, an out-of-bounds Fortran index, instead of the
+    #    correct `size(y, 2)` (Python's own last-element tail indexing).
+    #    Fixed by teaching the shared _scalar_idx1_expr helper to
+    #    resolve a literal negative constant directly, matching the
+    #    sibling 2D-tuple-subscript codegen's own local `_idx1_expr`
+    #    closure, which already got this right.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtranspose_rank3_negindex.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def f2_shape(x: \"int[:,:,:]\"):",
+            "    from numpy import transpose",
+            "",
+            "    y = transpose(x)",
+            "    n, m, p = y.shape",
+            "    return n, m, p, y[0, -1, 0], y[0, 0, -1], y[-1, -1, 0]",
+            "",
+            "",
+            "def f2_prop(x: \"int[:,:,:]\"):",
+            "    y = x.T",
+            "    n, m, p = y.shape",
+            "    return n, m, p, y[0, -1, 0], y[0, 0, -1], y[-1, -1, 0]",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    x2 = np.array(",
+            "        [[[0, 1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12, 13], [14, 15, 16, 17, 18, 19, 20]],",
+            "         [[21, 22, 23, 24, 25, 26, 27], [28, 29, 30, 31, 32, 33, 34], [35, 36, 37, 38, 39, 40, 41]]],",
+            "        dtype=int,",
+            "    )",
+            "    a2, b2, c2, d2, e2, f2v = f2_shape(x2)",
+            "    print(a2); print(b2); print(c2); print(d2); print(e2); print(f2v)",
+            "    a4, b4, c4, d4, e4, f4v = f2_prop(x2)",
+            "    print(a4); print(b4); print(c4); print(d4); print(e4); print(f4v)",
+        ],
+    )
+
+
+def test_xp2f_reshape_row_major_order_and_int_kind(tmp_path: Path) -> None:
+    # Regression test for two bugs found together while investigating
+    # the transpose fix above:
+    # 1. NumPy's own reshape() defaults to row-major ('C') fill order
+    #    (the LAST axis varies fastest), but Fortran's RESHAPE with no
+    #    `order=` argument fills its own native column-major way (FIRST
+    #    axis fastest) instead -- silently producing a completely
+    #    different (same-shaped) array with no error at all. Fixed for
+    #    both `x.reshape(shape)` (method call, previously never handled
+    #    order at all) and `np.reshape(x, shape)` (function call,
+    #    previously only correct for the rank-2 case) via RESHAPE's own
+    #    reversed `order=[N, N-1, ..., 1]` argument (verified
+    #    empirically for both rank 2 and rank 3), for any rank -- an
+    #    explicit `order='F'` is still honored unchanged.
+    # 2. np.reshape(x, shape)'s own element kind was derived from
+    #    `node.func.value` (the `np`/`numpy` module name itself, always
+    #    unknown) instead of `node.args[0]` (the array actually being
+    #    reshaped) -- np.reshape(np.arange(10, dtype=int), (2, 5))
+    #    silently declared its result `real` instead of `integer`.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xreshape_row_major_order.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def method_2d():",
+            "    x = np.arange(10, dtype=int).reshape(2, 5)",
+            "    return x",
+            "",
+            "",
+            "def func_2d():",
+            "    x = np.reshape(np.arange(10, dtype=int), (2, 5))",
+            "    return x",
+            "",
+            "",
+            "def method_forder():",
+            "    x = np.arange(10, dtype=int).reshape(2, 5, order='F')",
+            "    return x",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(method_2d())",
+            "    print(func_2d())",
+            "    print(method_forder())",
+        ],
+    )
+
+def _run_both_output_blocks(proc_stdout: str) -> tuple[str, str]:
+    """Split ``--run-both`` combined stdout into (python_block, fortran_block).
+
+    The python block is everything printed by the script's own run, between
+    the "Run (python): PASS" marker and the "wrote ..." marker; the fortran
+    block is everything printed after the "Run: PASS" marker to the end of
+    output. Both are returned with a trailing newline stripped so exact-text
+    comparisons aren't thrown off by a final blank line.
+    """
+    py_start = proc_stdout.index("Run (python): PASS") + len("Run (python): PASS")
+    py_end = proc_stdout.index("\nwrote ")
+    python_block = proc_stdout[py_start:py_end].strip("\n")
+    f_start = proc_stdout.index("Run: PASS") + len("Run: PASS")
+    fortran_block = proc_stdout[f_start:].strip("\n")
+    return python_block, fortran_block
+
+
+def test_xp2f_prints_3d_int_array_numpy_style(tmp_path: Path) -> None:
+    src = tmp_path / "x3d_print_int.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def make():",
+                "    return np.array([[[1, -222], [3, 4]], [[5, 6], [-7, 8]]], dtype=int)",
+                "",
+                "x = make()",
+                "print(x)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    python_block, fortran_block = _run_both_output_blocks(proc.stdout)
+    # numpy's own rank-3 print format: bracket nesting keyed on
+    # (outer-slice-index, row-index), one GLOBAL width across the whole
+    # array (not per-column/per-slice), and a blank line between
+    # consecutive outer slices. Assert the Fortran output matches
+    # Python/numpy's own output byte-for-byte.
+    assert fortran_block == python_block
+    assert python_block == (
+        "[[[   1 -222]\n"
+        "  [   3    4]]\n"
+        "\n"
+        " [[   5    6]\n"
+        "  [  -7    8]]]"
+    )
+
+
+def test_xp2f_prints_3d_int_array_asymmetric_shapes(tmp_path: Path) -> None:
+    src = tmp_path / "x3d_print_asym.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def make_row1():",
+                "    return np.arange(6).reshape(3, 1, 2)",
+                "",
+                "def make_col1():",
+                "    return np.arange(6).reshape(3, 2, 1)",
+                "",
+                "def make_single():",
+                "    return np.arange(1).reshape(1, 1, 1)",
+                "",
+                "print(make_row1())",
+                "print(make_col1())",
+                "print(make_single())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    python_block, fortran_block = _run_both_output_blocks(proc.stdout)
+    assert fortran_block == python_block
+    assert python_block == (
+        "[[[0 1]]\n"
+        "\n"
+        " [[2 3]]\n"
+        "\n"
+        " [[4 5]]]\n"
+        "[[[0]\n"
+        "  [1]]\n"
+        "\n"
+        " [[2]\n"
+        "  [3]]\n"
+        "\n"
+        " [[4]\n"
+        "  [5]]]\n"
+        "[[[0]]]"
+    )
+
+
+def test_xp2f_prints_2d_int_array_uses_global_width(tmp_path: Path) -> None:
+    src = tmp_path / "x2d_print_width.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "def make():",
+                "    return np.array([[1, -222], [3, 4]])",
+                "",
+                "print(make())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    python_block, fortran_block = _run_both_output_blocks(proc.stdout)
+    # numpy pads every column to ONE global width across the whole 2D
+    # matrix (here, width 4 from "-222"), not a per-column width.
+    assert fortran_block == python_block
+    assert python_block == "[[   1 -222]\n [   3    4]]"
+
+def test_xp2f_bare_numpy_shape_tuple_unpack_declares_locals(tmp_path: Path) -> None:
+    # Real bug found mining pyccel's own test suite
+    # (tests/pyccel/scripts/import_syntax/import_mod.py): the local-function
+    # declaration prescan's special case for `a, b = np.shape(x)`-style
+    # tuple-unpacking only recognized the RHS when the numpy module alias
+    # was spelled exactly "np" (a hardcoded `_m.value.func.value.id ==
+    # "np"` check), unlike the actual codegen for this same pattern (in
+    # visit_Assign), which correctly used the general is_numpy_name_node()
+    # helper (accepting both "np" and a bare "numpy" import). A script
+    # using `import numpy` (no "as np" alias) and calling
+    # `numpy.shape(x)` inside a local function got its unpacked targets
+    # silently skipped by the prescan, so no `integer ::` declaration was
+    # emitted for them -- and if the function happened to live in the same
+    # module as an unrelated module-level constant of the same name (e.g.
+    # a top-level `n = 3` promoted to a Fortran PARAMETER), the identifier
+    # resolved via host association to that immutable PARAMETER instead,
+    # crashing the build with "Named constant ... in variable definition
+    # context". Also failed (independently of any name collision) with a
+    # plain "has no IMPLICIT type" error whenever no such collision existed
+    # (confirmed via a variant using unique names n1/m1/n2/m2).
+    src = tmp_path / "xbare_numpy_shape_unpack.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy",
+                "",
+                "",
+                "def matmat(a: \"float[:,:]\", b: \"float[:,:]\", c: \"float[:,:]\"):",
+                "    n, m = numpy.shape(a)",
+                "    m, p = numpy.shape(b)",
+                "    for i in range(0, n):",
+                "        for j in range(0, p):",
+                "            for k in range(0, m):",
+                "                c[i, j] = c[i, j] + a[i, k] * b[k, j]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    n = 3",
+                "    m = 4",
+                "    p = 3",
+                "    a = numpy.zeros((n, m), \"double\")",
+                "    b = numpy.zeros((m, p), \"double\")",
+                "    c = numpy.zeros((n, p), \"double\")",
+                "    a[0, 0] = 1.0",
+                "    a[0, 1] = 2.0",
+                "    b[0, 0] = 1.0",
+                "    b[1, 0] = 1.0",
+                "    matmat(a, b, c)",
+                "    print(c[0, 0])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xbare_numpy_shape_unpack_p.f90").read_text(encoding="utf-8")
+    assert "integer :: " in out_text
+    # `n`/`m`/`p` (function-local, from numpy.shape() unpacking) must be
+    # declared as ordinary local integers inside matmat's own subroutine,
+    # not left to fall through to the unrelated module-level PARAMETER of
+    # the same name.
+    assert re.search(r"subroutine matmat\(.*?end subroutine matmat", out_text, re.S)
+    matmat_body = re.search(r"subroutine matmat\(.*?end subroutine matmat", out_text, re.S).group(0)
+    assert re.search(r"integer\s*::.*\bn\b", matmat_body)
+    assert re.search(r"integer\s*::.*\bm\b", matmat_body)
+    assert re.search(r"integer\s*::.*\bp\b", matmat_body)
+
+def test_xp2f_np_power_array_args_not_misdetected_as_rng_distribution(tmp_path: Path) -> None:
+    # Regression test: _rank_expr's `_is_rng_rank_source` helper treated
+    # ANY bare Name receiver as an RNG-instance source (e.g. `rng.power(a,
+    # size)` where `rng = np.random.default_rng()`), with no check that
+    # the name was actually a tracked RNG variable -- so plain
+    # `np.power(a, b)` (an ordinary elementwise ufunc, receiver is just
+    # the module alias Name('np')) was misidentified as
+    # `np.random.power(a, size)`, and its second array argument got
+    # misinterpreted as a `size=` tuple, producing a bogus rank (the
+    # array literal's own length) instead of the real broadcast rank.
+    # This silently produced a wrong array rank for any code path
+    # consulting _rank_expr, and crashed outright once print()'s
+    # rank-3 dispatch (print_array_3d) started trusting it (found via
+    # examples/xnp_math_funcs.py: print(np.power([2,3,4],[3,2,1]))).
+    src = tmp_path / "xnp_power_rank.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "print(np.power([2.0, 3.0, 4.0], [3.0, 2.0, 1.0]))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+    out_text = (tmp_path / "xnp_power_rank_p.f90").read_text(encoding="utf-8")
+    assert "call print_array_3d" not in out_text
