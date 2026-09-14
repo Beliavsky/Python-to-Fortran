@@ -13687,3 +13687,1361 @@ def test_xp2f_np_int64_large_literal_cast(tmp_path: Path) -> None:
             "    print(int64(9223372036854775807))",
         ],
     )
+
+
+def test_xp2f_np_where_mixed_int_real_branches(tmp_path: Path) -> None:
+    # Regression test: np.where(cond, a, b) lowers to Fortran's MERGE
+    # intrinsic, which requires its tsource/fsource arguments to share the
+    # exact same type AND kind -- unlike np.where itself, which happily
+    # promotes mixed int/real branches. `arr / 2` (Python's `/` is always
+    # true division, so this branch is always real) alongside `arr * 2`
+    # (which stays integer) previously reached MERGE unreconciled, a
+    # gfortran compile error ("'fsource' argument of 'merge' intrinsic...
+    # must be the same type and kind as 'tsource'").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_where_mixed_int_real.py",
+        [
+            "import numpy as np",
+            "",
+            "if __name__ == \"__main__\":",
+            "    arr = np.array([1, 2, 3, 4, 5, 6])",
+            "    arr1 = np.where(arr < 5, arr / 2, arr * 2)",
+            "    print(arr1)",
+        ],
+    )
+
+
+def test_xp2f_bool_is_and_is_not_against_bool_value(tmp_path: Path) -> None:
+    # Regression test: `is`/`is not` against a bool value -- a literal
+    # (`a is False`, `a is not True`) or another bool variable (`a is b`)
+    # -- was rejected outright ("is/is not supported only with None"),
+    # even though Python's bool is a singleton type, making `is`/`is not`
+    # against a bool value equivalent to `==`/`!=` (already correctly
+    # lowered to Fortran's .eqv./.neqv. for logical operands).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xbool_is_not_bool_value.py",
+        [
+            "def is_false(a: \"bool\"):",
+            "    c = False",
+            "    if a is False:",
+            "        c = True",
+            "    return c",
+            "",
+            "",
+            "def compare_is(a: \"bool\", b: \"bool\"):",
+            "    c = False",
+            "    if a is b:",
+            "        c = True",
+            "    return c",
+            "",
+            "",
+            "def not_true(a: \"bool\"):",
+            "    c = False",
+            "    if a is not True:",
+            "        c = True",
+            "    return c",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(is_false(False))",
+            "    print(compare_is(True, False))",
+            "    print(not_true(True))",
+        ],
+    )
+
+
+def test_xp2f_np_zeros_shape_from_niladic_function_call(tmp_path: Path) -> None:
+    # Regression test: np.zeros(g()) where g() is a zero-argument
+    # function whose entire body is `return (2, 3)` was rejected
+    # outright ("unsupported call: g()") -- the array-constructor shape
+    # argument's own resolution only recognized a literal Tuple/List (or
+    # a Name bound to one), not a call to a niladic literal-tuple-
+    # returning accessor.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_zeros_shape_niladic_call.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def g():",
+            "    return (2, 3)",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    a = np.zeros(g())",
+            "    print(a.shape[0], a.shape[1])",
+        ],
+    )
+
+
+def test_xp2f_np_zeros_shape_from_tuple_literal_name(tmp_path: Path) -> None:
+    # Regression test: np.zeros(shape) where `shape` is a plain Name
+    # bound (exactly once) to a Tuple literal of int constants (e.g.
+    # `c_shape = (1, 2)`) previously reached the array constructor's
+    # shape-argument codegen unresolved, generating an invalid
+    # `allocate(c(c_shape), source=0.0_dp)` -- using the whole array name
+    # as a single bogus dimension spec instead of unpacking its elements
+    # -- a gfortran "Bad array specification in ALLOCATE statement".
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_zeros_shape_tuple_literal_name.py",
+        [
+            "import numpy as np",
+            "",
+            "if __name__ == \"__main__\":",
+            "    c_shape = (1, 2)",
+            "    c = np.zeros(c_shape)",
+            "    print(c.shape[0], c.shape[1])",
+        ],
+    )
+
+
+def test_xp2f_math_nan_bare_name_from_import(tmp_path: Path) -> None:
+    # Regression test: `from math import nan` then using the bare name
+    # `nan` directly (pyccel's own tests/pyccel/scripts/print_nan.py) was
+    # rejected ("Symbol 'nan' has no IMPLICIT type") -- `math.nan` as an
+    # Attribute is already fully supported, but a bare Name left over
+    # from a `from ... import ...` wasn't recognized as anything.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xmath_nan_bare_name.py",
+        [
+            "from math import nan",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(nan)",
+        ],
+    )
+
+
+def test_xp2f_print_string_with_form_feed_char(tmp_path: Path) -> None:
+    # Regression test: a raw control character embedded in a Python
+    # string literal (e.g. `print(\"\\f\")`, pyccel's own tests/pyccel/
+    # scripts/print_strings.py) got silently corrupted by an internal
+    # post-processing pass that split the whole generated Fortran source
+    # text via `str.splitlines()` -- which treats \\x0b/\\x0c/\\x1c-\\x1e/
+    # \\x85/\\u2028/\\u2029 as line boundaries too, not just '\\n' -- so
+    # the character was dropped and a bogus newline inserted in its
+    # place, landing mid string-literal ("Unterminated character
+    # constant").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xprint_form_feed.py",
+        [
+            "if __name__ == \"__main__\":",
+            "    print(\"\\f\")",
+            "    print(\"before\\fafter\")",
+        ],
+    )
+
+
+def test_xp2f_print_end_with_nonempty_custom_text(tmp_path: Path) -> None:
+    # Regression test: print(..., end=". ") (a non-empty, non-default
+    # `end=`) silently dropped the end text entirely and fell back to a
+    # plain newline-terminated write -- pyccel's own tests/pyccel/
+    # scripts/print_sp_and_end.py chains several prints with a custom
+    # `end=` expecting them to share one physical line.
+    # _emit_print_call only ever used `end=` to decide whether to
+    # suppress Fortran's own automatic newline (true only for the exact
+    # empty-string case) -- the custom text itself was never emitted by
+    # any of the function's many content-type branches.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xprint_end_custom_text.py",
+        [
+            "if __name__ == \"__main__\":",
+            "    print(\"The first sentence\", end=\". \")",
+            "    print(\"The second sentence\", end=\". \")",
+            "    print(\"Mercury\", \"Venus\", \"Earth\", sep=\", \", end=\", \")",
+            "    print(\"Jupiter\", \"Saturn\", sep=\", \")",
+        ],
+    )
+
+
+def test_xp2f_numpy_from_import_with_asname(tmp_path: Path) -> None:
+    # Regression test: `from numpy import sum as np_sum` then calling
+    # `np_sum(arr)` (pyccel's own tests/pyccel/scripts/hope_benchmarks/
+    # point_spread_func.py) was rewritten to the bogus `np.np_sum(arr)`
+    # -- rewrite_bare_numpy_imports_to_attribute_calls mapped the LOCAL
+    # (aliased) name back onto itself as the synthetic `np.` attribute,
+    # instead of the ORIGINAL numpy name, so none of this file's own
+    # `node.func.attr == "sum"`-gated dispatch sites ever recognized it
+    # ("unsupported call: np.np_sum(...)").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnumpy_from_import_asname.py",
+        [
+            "from numpy import sum as np_sum",
+            "from numpy import zeros",
+            "",
+            "if __name__ == \"__main__\":",
+            "    arr = zeros(3)",
+            "    arr[0] = 1.0",
+            "    arr[1] = 2.0",
+            "    arr[2] = 3.0",
+            "    print(np_sum(arr))",
+        ],
+    )
+
+
+def test_xp2f_function_named_fortran_keyword(tmp_path: Path) -> None:
+    # Regression test: a Python function literally named `do` (a
+    # genuine Fortran keyword -- pyccel's own tests/pyccel/scripts/
+    # GENERATED_NAME_COLLISION.py) had its CALL SITES renamed to `xdo()`
+    # by the translator's own reserved-keyword alias mechanism, but the
+    # function's own definition header and its module `use ..., only:`
+    # listing were built by a SEPARATE, independent alias mechanism
+    # (fn_alias_map) that only knew about collisions with other already
+    # -used symbols, not Fortran keywords -- leaving the definition and
+    # `use` list with the literal, un-renamed `do`, so the renamed call
+    # site (`xdo()`) referenced a symbol that was never actually
+    # imported or defined ("has no IMPLICIT type").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xfn_named_do.py",
+        [
+            "def f():",
+            "    do_0001 = 5",
+            "    return g() + do() + do_0001",
+            "",
+            "",
+            "def g():",
+            "    return 2",
+            "",
+            "",
+            "def do():",
+            "    return 4",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    a = f()",
+            "    print(a)",
+        ],
+    )
+
+
+def test_xp2f_list_returning_function_subscripted_not_unpacked(tmp_path: Path) -> None:
+    # Regression test: rewrite_tuple_call_subscript_to_temp's own
+    # tuple_return_arity collection treated a function whose every
+    # return is a List literal (as well as a Tuple literal) of fixed
+    # arity as a multi-output-subroutine candidate -- but a List literal
+    # return is genuinely ambiguous (Python uses it both for multi-value
+    # tuple-unpack returns AND as a single sequence/array result), and
+    # generate_flat's own canonical tuple_return_funcs collector already
+    # resolves that ambiguity by only treating an all-list-literal
+    # function as multi-output when some call site actually UNPACKS it
+    # at matching arity -- not when every call site only ever subscripts
+    # it. Without the same disambiguation here, `stats(x)[0]` (never
+    # unpacked anywhere) got hijacked into a bogus tuple-unpack
+    # assignment (`_tuple_tmp_1_0, _tuple_tmp_1_1 = stats(x)`) instead of
+    # being left alone for the correct array-valued-function codegen --
+    # "unsupported assign" once that bogus unpack reached codegen with
+    # no matching subroutine to call.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlist_return_subscript_only.py",
+        [
+            "import numpy as np",
+            "",
+            "def stats(x):",
+            "    return [np.mean(x), np.std(x)]",
+            "",
+            "if __name__ == \"__main__\":",
+            "    x = np.array([1.0, 2.0, 3.0, 4.0])",
+            "    print(stats(x)[0])",
+        ],
+    )
+
+
+def test_xp2f_assert_false_aborts_with_nonzero_exit_code(tmp_path: Path) -> None:
+    # Regression test: translator subclasses ast.NodeVisitor, so a
+    # statement type with no visit_X method (ast.Assert had none at all)
+    # is silently no-op'd by generic_visit instead of erroring -- `assert
+    # False` (pyccel's own tests/pyccel/scripts/asserts/invalid_assert1.py)
+    # previously transpiled to a program that built and ran successfully,
+    # silently skipping the check entirely (exit code 0, matching neither
+    # Python's own AssertionError nor any warning at transpile time).
+    # `--run-diff` can't exercise this directly (it bails out as soon as
+    # the reference Python run itself fails), so drive the compiled
+    # binary directly and check its own exit code instead.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xassert_false.py"
+    src.write_text(
+        "\n".join(
+            [
+                "if __name__ == \"__main__\":",
+                "    a = 0",
+                "    b = 1",
+                "    assert a == b, \"a must equal b\"",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    exe_path = tmp_path / "xassert_false_p.exe"
+    assert exe_path.exists()
+    run_proc = subprocess.run(
+        [str(exe_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode != 0, run_proc.stdout + run_proc.stderr
+
+
+def test_xp2f_assert_true_matches_python(tmp_path: Path) -> None:
+    # Companion to the failing-assert test above: a passing assert must
+    # not change program behavior/output at all.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xassert_true.py",
+        [
+            "if __name__ == \"__main__\":",
+            "    a = 0",
+            "    b = a",
+            "    assert a == b",
+            "    b = 1",
+            "    assert a != b",
+            "    assert a <= b",
+            "    assert b >= a",
+            "    print(a, b)",
+        ],
+    )
+
+
+def test_xp2f_assert_inside_function_aborts_with_nonzero_exit_code(tmp_path: Path) -> None:
+    # Companion to test_xp2f_assert_false_aborts_with_nonzero_exit_code:
+    # an assert inside a FUNCTION body (not just top-level exec code)
+    # must also actually be checked at runtime, not silently dropped.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xassert_in_function.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def check(x):",
+                "    assert x > 0, \"x must be positive\"",
+                "    return x * 2",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(check(-5))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    exe_path = tmp_path / "xassert_in_function_p.exe"
+    assert exe_path.exists()
+    run_proc = subprocess.run(
+        [str(exe_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode != 0, run_proc.stdout + run_proc.stderr
+
+
+def test_xp2f_np_sign_int_argument_not_promoted_to_real(tmp_path: Path) -> None:
+    # Regression test: np.sign(int_value) reused a real-valued
+    # `sign(1.0_dp, a0)` template while explicitly excluding "sign" from
+    # the int->real promotion just above it, pairing a real 1.0_dp with
+    # an unpromoted integer argument -- a gfortran "'b' argument of
+    # 'sign' intrinsic must be the same type and kind as 'a'" (pyccel's
+    # own tests/pyccel/scripts/numpy/numpy_sign.py). np.sign also
+    # preserves an int argument's own int-ness (numpy's sign(int) is an
+    # int, not a float).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_sign_int.py",
+        [
+            "import numpy as np",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(np.sign(0))",
+            "    print(np.sign(42))",
+            "    print(np.sign(-42))",
+            "    print(np.sign(np.int8(0)))",
+            "    print(np.sign(np.int8(42)))",
+            "    print(np.sign(np.int8(-42)))",
+            "    print(np.sign(np.int64(0)))",
+            "    print(np.sign(np.int64(-42)))",
+        ],
+    )
+
+
+def test_xp2f_np_sign_zero_value_matches_numpy(tmp_path: Path) -> None:
+    # Regression test: even with matching real types, Fortran's SIGN(A,
+    # B) treats a zero B as positive-signed, so np.sign(0.0)/np.sign(
+    # -0.0) came out 1.0/-1.0 instead of numpy's own 0.0/0.0.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnp_sign_zero.py",
+        [
+            "import numpy as np",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(np.sign(0.0))",
+            "    print(np.sign(-0.0))",
+            "    print(np.sign(4.2))",
+            "    print(np.sign(-4.2))",
+        ],
+    )
+
+
+def test_xp2f_class_annotated_self_attribute_assignment_field(tmp_path: Path) -> None:
+    # Regression test: `self.z: float = 10.0` (an annotated attribute
+    # assignment inside __init__, alongside a plain `self.x = 3`) --
+    # pyccel's own tests/pyccel/scripts/classes/class_variables.py --
+    # only matched an ast.Assign-shaped field-defining statement, never
+    # ast.AnnAssign, so `z` never became a declared struct field at all;
+    # the constructor still tried to execute the assignment against the
+    # already-built struct -- gfortran: "'z' is not a member of the
+    # ... structure".
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_annassign_field.py",
+        [
+            "class A:",
+            "    x: int",
+            "",
+            "    def __init__(self: \"A\"):",
+            "        self.x = 3",
+            "        self.z: float = 10.0",
+            "",
+            "    def get_4(self: \"A\"):",
+            "        return 4",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    myA = A()",
+            "    print(myA.x)",
+            "    print(myA.z)",
+        ],
+    )
+
+
+def test_xp2f_class_instance_aliasing_shares_mutations(tmp_path: Path) -> None:
+    # Regression test: `my_a_ptr = my_a` (pyccel's own tests/pyccel/
+    # scripts/classes/class_pointer.py) previously compiled to a plain
+    # Fortran derived-type value-copy assignment -- mutating through
+    # `my_a_ptr` afterward left `my_a` untouched, unlike Python, where
+    # both names refer to the SAME object. `my_a_ptr` is now declared a
+    # POINTER (assigned via `=>`) to the already-declared `target`
+    # `my_a`, so a mutation through either name is visible through both.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_pointer_alias.py",
+        [
+            "class A:",
+            "    def __init__(self, a: int):",
+            "        self._a = a",
+            "",
+            "    def get_a(self):",
+            "        return self._a",
+            "",
+            "    def set_a(self, a: int):",
+            "        self._a = a",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    my_a = A(3)",
+            "    my_a_ptr = my_a",
+            "    print(my_a.get_a())",
+            "    print(my_a_ptr.get_a())",
+            "    my_a_ptr.set_a(4)",
+            "    print(my_a.get_a())",
+            "    print(my_a_ptr.get_a())",
+        ],
+    )
+
+
+def test_xp2f_negative_variable_index_read_and_write(tmp_path: Path) -> None:
+    # Regression test: a[-1] (a literal negative index) was already
+    # special-cased at the AST level, but a[v] where v is a VARIABLE
+    # that happens to be negative at runtime (v = -1) fell through to
+    # the generic `(v + 1)` 0-based-to-1-based mapping -- (-1 + 1) = 0,
+    # an out-of-bounds Fortran subscript -- a hard runtime crash, not a
+    # decline. Confirmed both for reading (print(a[v])) and writing
+    # (a[v] = ...). Surfaced by pyccel's own tests/pyccel/scripts/
+    # arrays_view.py's array_view_negative_var (once its own pyccel-only
+    # @allow_negative_index decorator is stripped).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnegative_variable_index.py",
+        [
+            "import numpy as np",
+            "",
+            "if __name__ == \"__main__\":",
+            "    a = np.array([1, 2, 3, 4, 5])",
+            "    v = -1",
+            "    print(a[v])",
+            "    a[v] = 99",
+            "    print(a)",
+        ],
+    )
+
+
+def test_xp2f_negative_variable_index_2d_tuple_subscript(tmp_path: Path) -> None:
+    # Companion to test_xp2f_negative_variable_index_read_and_write,
+    # covering the 2D scalar+slice tuple-subscript shape (a[v, 1:])
+    # pyccel's own array_view_negative_var actually uses -- a separate
+    # nested _idx1_expr helper had the exact same un-wraparound-safe
+    # `(v + 1)` fallback.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnegative_variable_index_2d.py",
+        [
+            "import numpy as np",
+            "",
+            "if __name__ == \"__main__\":",
+            "    a = np.array([[1, 2, 3], [4, 5, 6], [7, 9, 5]])",
+            "    v = -1",
+            "    x = a[v, 1:]",
+            "    print(x[0])",
+            "    print(x[1])",
+        ],
+    )
+
+
+def test_xp2f_type_print_numpy_scalar_and_array_dtypes(tmp_path: Path) -> None:
+    # Regression test: print(type(x)) had no branch at all for complex
+    # (fell through to a generic "unknown"), couldn't distinguish
+    # np.int8/16/32/64 from a plain int (all printed "<class 'int'>"),
+    # couldn't distinguish np.float64 from a plain float, and ignored
+    # array-ness entirely (type(np.ones(3)) printed "<class 'float'>"
+    # instead of "<class 'numpy.ndarray'>") -- pyccel's own tests/
+    # pyccel/scripts/runtest_type_print.py and
+    # runtest_array_type_print.py.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtype_print_numpy_dtypes.py",
+        [
+            "import numpy as np",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(type(int(3)))",
+            "    print(type(np.int16(3)))",
+            "    print(type(np.int32(3)))",
+            "    print(type(np.int64(3)))",
+            "    print(type(float(3)))",
+            "    print(type(np.float32(3)))",
+            "    print(type(np.float64(3)))",
+            "    print(type(complex(3)))",
+            "    print(type(np.complex64(3)))",
+            "    print(type(np.complex128(3)))",
+            "    a = np.ones(3)",
+            "    print(type(a))",
+        ],
+    )
+
+
+def test_xp2f_class_field_constructed_inline_from_another_class(tmp_path: Path) -> None:
+    # Regression test: `self.param = A(5)` inside another class's
+    # __init__ (constructing an already-known user class inline as a
+    # field's OWN value, as opposed to receiving one as a constructor
+    # parameter) wasn't recognized as a field-defining shape at all --
+    # collect_dataclass_info's per-class scan had no branch for "field
+    # value is a call to another known user class" -- so the whole
+    # outer class was never registered, and its own constructor call
+    # failed as "unsupported call: B()".
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_field_from_nested_ctor.py",
+        [
+            "class A:",
+            "    def __init__(self, x: int):",
+            "        self.x = x",
+            "",
+            "",
+            "class B:",
+            "    def __init__(self):",
+            "        self.param = A(5)",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    p = B()",
+            "    print(p.param.x)",
+        ],
+    )
+
+
+def test_xp2f_attribute_and_method_access_chained_off_call_result(tmp_path: Path) -> None:
+    # Regression test: `get_A().x` / `get_A().f()` (attribute or method
+    # access chained DIRECTLY off a call to a function that constructs
+    # and returns a user class instance, with no intermediate variable)
+    # -- pyccel's own tests/pyccel/scripts/classes/classes_5.py -- has
+    # no single-expression Fortran equivalent: a derived-type function's
+    # result cannot be the leftmost part of a component/type-bound-
+    # procedure reference at all (gfortran: "The leftmost part-ref in a
+    # data-ref cannot be a function reference"). Now hoisted into a
+    # temporary variable first (rewrite_call_attribute_access_to_temp),
+    # then accessed on that -- the same shape `a = get_A(); a.x` already
+    # worked for.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xcall_result_attribute_access.py",
+        [
+            "class A:",
+            "    def __init__(self, x: int):",
+            "        self.x = x",
+            "",
+            "    def f(self):",
+            "        return self.x + 2",
+            "",
+            "",
+            "def get_A():",
+            "    a_cls = A(3)",
+            "    return a_cls",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    b = get_A().x",
+            "    c = get_A().f() + 3",
+            "    print(b)",
+            "    print(c)",
+        ],
+    )
+
+
+def test_xp2f_function_returns_class_constructor_call_directly(tmp_path: Path) -> None:
+    # Regression test: `def get_A(): return A(4)` -- no explicit `-> T`
+    # annotation, and the class instance is constructed directly in the
+    # `return` (no intermediate Name) -- misdeclared its own result
+    # variable as plain integer once called as an argument to another
+    # function (`get_x_from_A(get_A())`, pyccel's own tests/pyccel/
+    # scripts/classes/classes_7.py): _all_returns_same_struct_type only
+    # recognized a bare-Name return already known via dict_typed_vars,
+    # and get_A's own (fresh, per-function) prescan has no Assign
+    # statement left to register such a Name from at all in this exact
+    # shape -- a declared-vs-assigned type mismatch ("Cannot convert
+    # TYPE(a_t) to INTEGER").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xfn_returns_ctor_call_directly.py",
+        [
+            "class A:",
+            "    def __init__(self, x: int):",
+            "        self.x = x",
+            "",
+            "",
+            "def get_A():",
+            "    return A(4)",
+            "",
+            "",
+            "def get_x_from_A(a: \"A\"):",
+            "    return a.x",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(get_x_from_A(get_A()))",
+        ],
+    )
+
+
+def test_xp2f_class_computed_array_field_with_dtype_kwarg(tmp_path: Path) -> None:
+    # Regression test: `self.field = np.ones(n, dtype=int)` inside
+    # __init__ (a computed array field whose dtype= overrides the
+    # default "real") was rejected outright by
+    # _computed_array_field_template, which required NO keyword
+    # arguments at all -- so the WHOLE CLASS silently failed to
+    # register (not just this one field), breaking every OTHER method
+    # on it too (pyccel's own tests/pyccel/scripts/classes/
+    # classes_9.py's MyClass: even `self.param1` in an unrelated method
+    # failed as "unsupported attribute expr").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_computed_array_field_dtype.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "class MyClass:",
+            "    def __init__(self, param1: \"int\", n: \"int\"):",
+            "        self.param1 = param1",
+            "        self.param2 = np.ones(n, dtype=int)",
+            "",
+            "    def get_param(self):",
+            "        print(self.param1, self.param2)",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    m = MyClass(2, 4)",
+            "    m.get_param()",
+        ],
+    )
+
+
+def test_xp2f_bare_math_import_used_only_inside_local_function(tmp_path: Path) -> None:
+    # Regression test: `from math import gcd` (a supported bare-name
+    # math import, MATH_DIRECT_IMPORT_SUPPORTED) used only inside a
+    # local function (pyccel's own tests/pyccel/scripts/
+    # pyccel_generated_compilation_dependency.py) previously went
+    # completely undetected by the runtime-helper-needed scan: that
+    # scan re-derives its own math/scipy/statistics/time/sys alias
+    # dicts from whatever (sub-)tree it's handed, but the specific tree
+    # views generate_flat builds for it (assembled from exec statements
+    # + local function defs) have already had their own top-level
+    # Import/ImportFrom nodes excluded -- so gcd_int_scalar never made
+    # it into the module's own `use python_mod, only: ...` list at all,
+    # a gfortran "has no IMPLICIT type" for a symbol the generated code
+    # otherwise correctly tried to call.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xbare_math_import_in_local_func.py",
+        [
+            "from math import gcd",
+            "",
+            "",
+            "def f(a: int, b: int):",
+            "    s = gcd(a, b)",
+            "    return s + 1",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(f(12, 18))",
+            "    print(f(17, 5))",
+        ],
+    )
+
+
+def test_xp2f_class_computed_property_getter(tmp_path: Path) -> None:
+    # Regression test: a @property-decorated method whose body is a
+    # COMPUTED expression (not the exact single-statement `return
+    # self.FIELD` passthrough shape) was silently dropped by
+    # rewrite_class_methods_to_toplevel -- its own docstring says this
+    # should "surface as a clean unsupported call/undefined-name
+    # failure", but the property's own read site (`obj.my_val`) was
+    # left as a plain attribute access with nothing rewriting it,
+    # producing a confusing Fortran build error instead ("'my_val' is
+    # not a member of the ... structure"). Now hoisted into a real
+    # function (ClassName_propname(self)), with every bare read of the
+    # property (including from another method, via `self.prop`)
+    # rewritten into a call to it.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xclass_computed_property.py",
+        [
+            "class A:",
+            "    def __init__(self, n: int):",
+            "        self._n = n",
+            "",
+            "    @property",
+            "    def my_val(self):",
+            "        return self._n * 10",
+            "",
+            "    def describe(self):",
+            "        return self.my_val + 1",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    b = A(3)",
+            "    print(b.my_val)",
+            "    print(b.describe())",
+        ],
+    )
+
+
+def test_xp2f_underscore_discard_scalar_and_array(tmp_path: Path) -> None:
+    # Regression test: `_ = expr` (Python's conventional "discard this
+    # value" idiom, e.g. pyccel's own test_create_arr: `_ =
+    # np.ones(i); return True`) -- every _mark_*/_mark_alloc_* method
+    # special-cased "_" as "never declared", but the actual statement-
+    # emission code doesn't share that convention: it still emitted a
+    # real allocate/assignment statement referencing _'s aliased
+    # Fortran name (v_name) regardless, producing "has no IMPLICIT
+    # type"/"neither a data pointer nor an allocatable variable" for
+    # both a scalar and an array discard.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xunderscore_discard.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def f_scalar(i: int):",
+            "    _ = i * 2",
+            "    return True",
+            "",
+            "",
+            "def f_array(i: int):",
+            "    _ = np.ones(i)",
+            "    return True",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(f_scalar(7))",
+            "    print(f_array(7))",
+        ],
+    )
+
+
+def test_xp2f_return_none_in_otherwise_void_function(tmp_path: Path) -> None:
+    # Regression test: `return None` as an early-exit guard clause
+    # inside a function with NO other value-returning return anywhere
+    # (pyccel's own test_return.py: `def divide_by(a, b): if abs(b) <
+    # 0.1: return None; ...`) was misclassified as a genuine value-
+    # returning function -- two duplicate "does this function return a
+    # value" checks both tested `st.value is not None`, true even for
+    # an explicit None constant -- so it was declared as a `function`
+    # with a bogus result variable instead of a `subroutine`, then
+    # (once that classification was fixed) left a leftover "-1"
+    # Optional-int-sentinel assignment referencing a now-undeclared
+    # result variable. A genuinely mixed Optional[int]-style function
+    # (some branches return None, others return a real value) still
+    # gets the sentinel assignment correctly -- only a WHOLLY void
+    # function's own `return None` is now a bare `return`.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xreturn_none_void_function.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def divide_by(a: \"float[:]\", b: \"float\"):",
+            "    if abs(b) < 0.1:",
+            "        return None",
+            "    for i, ai in enumerate(a):",
+            "        a[i] = ai / b",
+            "",
+            "",
+            "def find_index(x: \"int\"):",
+            "    if x < 0:",
+            "        return None",
+            "    return x * 2",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    x = np.ones(5)",
+            "    b = 0.01",
+            "    divide_by(x, b)",
+            "    print(x)",
+            "    b = 4.0",
+            "    divide_by(x, b)",
+            "    print(x)",
+            "",
+            "    a = find_index(5)",
+            "    print(a)",
+            "    c = find_index(-3)",
+            "    print(c is None)",
+        ],
+    )
+
+
+def test_xp2f_return_none_as_final_statement_of_void_function(tmp_path: Path) -> None:
+    # Regression test for a SECOND, separate copy of the same bug fixed
+    # by test_xp2f_return_none_in_otherwise_void_function above: pyccel's
+    # own Burkardt-style helpers commonly end with `return None` as the
+    # LAST statement of an otherwise-void function (e.g.
+    # examples/xasa183_inferred.py's `timestamp()`: `t = time.time();
+    # print(time.ctime(t)); return None`, no other return anywhere).
+    # This exact shape is handled by a DIFFERENT code path than an early-
+    # exit `return None` buried inside an if/for -- _emit_local_function
+    # has its own inline, duplicate `isinstance(s, ast.Return)` handling
+    # for a function's statement loop (to suppress a redundant `return`
+    # when it's the final statement), entirely separate from
+    # translator.visit_Return, and it was never updated with the
+    # `void_return`/is_none(...) guard that visit_Return already has --
+    # so `s.value is not None` was still True for a `Constant(value=None)`
+    # node, falling through to `{result} = -1`, a bogus assignment to a
+    # result variable never declared for a void function ("has no
+    # IMPLICIT type").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xreturn_none_final_statement.py",
+        [
+            "def log_value(n: int) -> None:",
+            "    x = n * 2",
+            "    print(x)",
+            "    return None",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    log_value(21)",
+        ],
+    )
+
+
+def test_xp2f_iso_fortran_env_kind_use_in_proc_module_program(tmp_path: Path) -> None:
+    # Regression test: the PROGRAM unit never got its own `use, intrinsic
+    # :: iso_fortran_env` line when use_proc_module is True (a local
+    # function exists, so the program relies on `use {proc_mod}, only:
+    # dp, ...`) -- but a literal kind-suffixed integer (from an
+    # np.int32(...)-style cast) can still appear directly in the
+    # program's own exec-level code, with no `int32` symbol in scope
+    # ("Missing kind-parameter"). Now always emitted (matching the
+    # module's own unconditional line), relying on the already-correct
+    # per-unit remove_unused_use_only_imports pass to prune it back down.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xiso_fortran_env_program.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def f(a: \"int32\", b: \"int32\"):",
+            "    return a + b",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(f(np.int32(3), np.int32(4)))",
+        ],
+    )
+
+
+def test_xp2f_conj_alias_and_non_complex_conjugate_imag(tmp_path: Path) -> None:
+    # Regression test: `.conj()` wasn't recognized as `.conjugate()`'s
+    # alias (2 sites: _expr_kind's Call-kind-inference and expr()'s
+    # Call-codegen); separately, Fortran's CONJG/AIMAG intrinsics
+    # strictly require COMPLEX operands, but the existing
+    # .conjugate()/.imag codegen unconditionally emitted conjg()/aimag()
+    # regardless of the operand's kind -- crashing for logical/int/real
+    # operands (never actually reachable/tested before the .conj() fix
+    # unblocked the rest of this file's own functions). bool.conjugate()
+    # returns an int in Python (bool subclasses int); int/float
+    # .conjugate() is a no-op passthrough; int/bool .imag is 0 (an int);
+    # real .imag is 0.0.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xconj_imag_non_complex.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def complex64_conj(a: \"complex64\", b: \"complex64\"):",
+            "    return (a + b).conj()",
+            "",
+            "",
+            "def float_conjugate(a: \"float\", b: \"float\"):",
+            "    return (a + b).conjugate()",
+            "",
+            "",
+            "def int_conjugate(a: \"int\", b: \"int\"):",
+            "    return (a + b).conjugate()",
+            "",
+            "",
+            "def bool_conjugate(a: \"bool\", b: \"bool\"):",
+            "    return (a or b).conjugate()",
+            "",
+            "",
+            "def imag_direct():",
+            "    a = 1 + 2j",
+            "    return a.imag",
+            "",
+            "",
+            "def real_direct():",
+            "    a = 1.5",
+            "    return a.imag",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(complex64_conj(np.complex64(3 + 4j), np.complex64(1 + 2j)))",
+            "    print(float_conjugate(3.5, 1.2))",
+            "    print(int_conjugate(3, 4))",
+            "    print(bool_conjugate(True, False))",
+            "    print(imag_direct())",
+            "    print(real_direct())",
+        ],
+    )
+
+
+def test_xp2f_complex_builtin_single_and_two_arg_complex_operands(tmp_path: Path) -> None:
+    # Regression test: Python's complex(z) with a SINGLE argument that's
+    # already complex must return z unchanged (both real and imaginary
+    # parts) -- the codegen unconditionally did `cmplx(real(z, kind=dp),
+    # 0.0_dp, kind=dp)`, silently discarding the imaginary part.
+    # Separately, complex(re, im) with either argument itself complex
+    # computes `re + im*1j` using full COMPLEX arithmetic (a rotation by
+    # 1j for the imag argument, not just taking its real part) -- e.g.
+    # complex(1, -2j) == (3-0j), complex(2.8-7j, 1) == (2.8-6j).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xcomplex_builtin_complex_operands.py",
+        [
+            "def cast_complex_literal():",
+            "    a = complex(2.8 + 7j)",
+            "    return a",
+            "",
+            "",
+            "def create_complex_literal_int_complex():",
+            "    a = complex(1, -2j)",
+            "    return a",
+            "",
+            "",
+            "def create_complex_literal_complex_int():",
+            "    a = complex(2.8 - 7j, 1)",
+            "    return a",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(cast_complex_literal())",
+            "    print(create_complex_literal_int_complex())",
+            "    print(create_complex_literal_complex_int())",
+        ],
+    )
+
+
+def test_xp2f_chained_comparison_expressions(tmp_path: Path) -> None:
+    # Regression test: a Python chained comparison (`a <= b < c`) was
+    # rejected outright ("chained compares not supported") -- now
+    # decomposed into the conjunction of each adjacent pair, reusing the
+    # existing single-op Compare codegen for each.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xchained_comparison.py",
+        [
+            "def in_range(a: float, b: float, c: float):",
+            "    return a <= b < c",
+            "",
+            "",
+            "def triple(a: int, b: int, c: int, d: int):",
+            "    return a < b < c < d",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(in_range(0.0, 1.0, 2.0))",
+            "    print(in_range(0.0, 10.0, 2.0))",
+            "    print(triple(1, 2, 3, 4))",
+            "    print(triple(1, 2, 2, 4))",
+        ],
+    )
+
+
+def test_xp2f_round_variable_ndigits(tmp_path: Path) -> None:
+    # Regression test: round(x, ndigits) required ndigits to be a
+    # compile-time constant ("round() currently supports a constant-
+    # integer ndigits argument"), even though py_round_ndigits's own
+    # `ndigits` dummy is a plain runtime integer, not a constant --
+    # pyccel's own test_builtins.py: `def round_ndigits(x, i): return
+    # round(x, i)`. Also fixed a SEPARATE bug this exposed: _expr_kind
+    # had no case for the bare `round` builtin at all, so a function
+    # whose only return expression was `round(x, i)` (a real x) fell
+    # through to a generic default and was misclassified -- silently
+    # producing an integer-typed result instead of the correct real one
+    # (and round(x) with no ndigits always returns an int, checked too).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xround_variable_ndigits.py",
+        [
+            "def round_int(x: float):",
+            "    return round(x)",
+            "",
+            "",
+            "def round_ndigits(x: float, i: int):",
+            "    return round(x, i)",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(round_int(3.345))",
+            "    print(round_int(6.5))",
+            "    print(round_ndigits(3.343, 2))",
+            "    print(round_ndigits(3323.0, -2))",
+        ],
+    )
+
+
+def test_xp2f_listcomp_zip_and_enumerate_tuple_targets(tmp_path: Path) -> None:
+    # Regression test: a list-comprehension generator whose target is a
+    # Tuple of Names iterating over zip(...)/enumerate(...) was rejected
+    # outright ("ListComp currently supports only single-generator
+    # form") -- pyccel's own functionals.py: `[i + j + k for i, j, k in
+    # zip(a, b, c)]`, `[i * j for i, j in enumerate(a)]`. Now desugared
+    # into a single-Name-target generator over range(), which the
+    # existing lowering already handles. zip()'s own arguments are
+    # iterated to the length of the SHORTEST one (Python's own zip()
+    # truncates, never raises) -- using only the first argument's own
+    # length previously crashed with an out-of-bounds Fortran index the
+    # moment two zip() arguments had different lengths.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlistcomp_zip_enumerate_targets.py",
+        [
+            "def functional_with_zip():",
+            "    a = [x**2 for x in range(8)]",
+            "    b = [0, 1, 2]",
+            "    c = [k - y for k, y in zip(a, b)]",
+            "    return len(c), c[0], c[1], c[2]",
+            "",
+            "",
+            "def functional_with_enumerate():",
+            "    a = [x + 1 for x in range(10)]",
+            "    b = [i * j for i, j in enumerate(a)]",
+            "    return len(b), b[0], b[1], b[2]",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    n1, c0, c1, c2 = functional_with_zip()",
+            "    print(n1)",
+            "    print(c0)",
+            "    print(c1)",
+            "    print(c2)",
+            "    n2, b0, b1, b2 = functional_with_enumerate()",
+            "    print(n2)",
+            "    print(b0)",
+            "    print(b1)",
+            "    print(b2)",
+        ],
+    )
+
+
+def test_xp2f_tuple_assign_subscript_target_swap(tmp_path: Path) -> None:
+    # Regression test: `T1, T2, ... = V1, V2, ...` required every target
+    # to be a plain Name ("tuple assignment targets must be names"),
+    # rejecting the common element-swap idiom `l[i], l[j] = l[j], l[i]`
+    # -- pyccel's own test_epyccel_expressions.py: swap by fixed AND
+    # variable index. Now desugared into temp-variable assignments
+    # (preserving Python's own tuple-assignment evaluation order: every
+    # RHS value computed once, before any target is written to)
+    # whenever at least one target is a Subscript/Attribute.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtuple_assign_subscript_swap.py",
+        [
+            "def swp_index1(a: int, b: int, c: int):",
+            "    l = [a, b, c]",
+            "    l[0], l[1] = l[1], l[0]",
+            "    return l[0], l[1], l[2]",
+            "",
+            "",
+            "def swp_index2(i: int, j: int):",
+            "    l = [1, 2, 3]",
+            "    l[i], l[j] = l[j], l[i]",
+            "    return l[0], l[1], l[2]",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    v0, v1, v2 = swp_index1(2, 4, 8)",
+            "    print(v0)",
+            "    print(v1)",
+            "    print(v2)",
+            "    w0, w1, w2 = swp_index2(0, 2)",
+            "    print(w0)",
+            "    print(w1)",
+            "    print(w2)",
+        ],
+    )
+
+
+def test_xp2f_toplevel_array_wrongly_promoted_to_parameter(tmp_path: Path) -> None:
+    # Regression test: a top-level array assigned from a literal
+    # np.array([...]) and never plain-reassigned/element-assigned gets
+    # promoted to a Fortran PARAMETER (compile-time constant) as an
+    # optimization -- but the "is this array ever mutated" safety check
+    # (_name_used_as_call_arg) only recognized a `call SUBROUTINE(...)`
+    # STATEMENT, never a locally-defined FUNCTION call embedded in an
+    # ordinary expression (`print *, bump(arr)`) -- and xp2f.py emits
+    # any Python function that both mutates a parameter and returns a
+    # value as a Fortran `function`, not a `subroutine`. So `arr` got
+    # wrongly promoted to a PARAMETER even though `bump` mutates it in
+    # place, and gfortran refused to bind a PARAMETER to bump's own
+    # intent(inout) dummy ("Named constant ... in variable definition
+    # context").
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xarray_wrongly_promoted_parameter.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def bump(a: \"int[:]\"):",
+            "    a[0] = a[0] + 1",
+            "    return a",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    arr = np.array([10, 20, 30, 40])",
+            "    print(bump(arr))",
+        ],
+    )
+
+
+def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
+    # Regression test for three interacting bugs found together via
+    # pyccel's own highorder_functions.py `high_valuedarg_1(a, function:
+    # "(int)(int)" = f1)`:
+    # 1. A callback parameter's own DEFAULT value wasn't considered when
+    #    inferring the callback's actual return kind -- defaulted to
+    #    `real`, causing a Fortran interface type-mismatch build error
+    #    once the default got materialized into an explicit call-site
+    #    argument (f1 returns int, not real).
+    # 2. prune_unreachable_local_functions's reachability walk never
+    #    scanned a function's own args.defaults/kw_defaults -- a
+    #    function referenced ONLY as another's callback default (never
+    #    called directly) was wrongly pruned as unreachable.
+    # 3. inline_simple_value_returning_local_functions's own separate
+    #    "fully inlined away, drop it" cleanup had the identical blind
+    #    spot, and was actually the one silently deleting `f1` in
+    #    practice before the pruning pass ever ran.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xcallback_default_value.py",
+        [
+            "def f1(a: int):",
+            "    return a",
+            "",
+            "",
+            "def high_valuedarg_1(a: int, fn_cb: \"(int)(int)\" = f1):",
+            "    x = fn_cb(a)",
+            "    return x",
+            "",
+            "",
+            "def test_valuedarg_1():",
+            "    x = high_valuedarg_1(2)",
+            "    return x",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(test_valuedarg_1())",
+        ],
+    )
+
+
+def test_xp2f_generator_chained_flatten_sum(tmp_path: Path) -> None:
+    # Regression test: a list-comprehension/generator chaining 2+
+    # dependent, unfiltered `for` clauses purely to flatten a multi-rank
+    # array before summing every element -- pyccel's own
+    # test_epyccel_generators.py: `sum(aii for ai in a for aii in ai)`
+    # -- hit the same "single-generator form" restriction as the zip/
+    # enumerate case. Rather than lowering element-by-element, this
+    # exact shape (chained generators, elt is exactly the innermost
+    # bound name) is now recognized directly as Fortran's own SUM
+    # intrinsic with no `dim=` argument (which already reduces over
+    # every element regardless of rank) -- verified for both 2D and 3D.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xgenerator_flatten_sum.py",
+        [
+            "import numpy as np",
+            "",
+            "",
+            "def sum_var2(a: \"int[:,:]\"):",
+            "    return sum(aii for ai in a for aii in ai)",
+            "",
+            "",
+            "def sum_var2_3d(a: \"int[:,:,:]\"):",
+            "    return sum(aiii for ai in a for aii in ai for aiii in aii)",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    x2d = np.array([[1, 2, 3], [4, 5, 6]], dtype=int)",
+            "    print(sum_var2(x2d))",
+            "    x3d = np.array([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=int)",
+            "    print(sum_var2_3d(x3d))",
+        ],
+    )
+
+
+def test_xp2f_list_pop_expr_context_index_and_clear_reverse(tmp_path: Path) -> None:
+    # Regression test for a cluster of list-method gaps found together
+    # via pyccel's own lists.py:
+    # 1. list.pop() used in a return/expression context (not just plain
+    #    assignment or a bare statement) -- `return a.pop()`, `return
+    #    a.pop() + 3`, `return a.pop(a.pop(0))` -- now hoisted into a
+    #    preceding temp assignment via a new AST rewrite, innermost pop
+    #    first (matching Python's own inner-before-outer call evaluation
+    #    order for the nested-pop-as-index case).
+    # 2. list.pop(index) with an explicit index (positive or negative)
+    #    was unconditionally rejected everywhere ("pop with index is not
+    #    yet supported") -- now supported with Python-style negative-
+    #    index wraparound, via a new shared _emit_indexed_pop helper.
+    # 3. list.clear() -- completely unimplemented before this (no code
+    #    path at all).
+    # 4. list.reverse() -- completely unimplemented before this (no code
+    #    path at all).
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xlist_pop_clear_reverse.py",
+        [
+            "def pop_last_element():",
+            "    a = [1, 3, 45]",
+            "    return a.pop()",
+            "",
+            "",
+            "def pop_expression():",
+            "    a = [1, 3, 45]",
+            "    return a.pop() + 3",
+            "",
+            "",
+            "def pop_as_arg():",
+            "    a = [1, 3, 45]",
+            "    return a.pop(a.pop(0))",
+            "",
+            "",
+            "def pop_negative_index():",
+            "    a = [1, 3, 45]",
+            "    return a.pop(-1)",
+            "",
+            "",
+            "def clear_1():",
+            "    a = [1, 2, 3]",
+            "    a.clear()",
+            "    return a",
+            "",
+            "",
+            "def list_reverse():",
+            "    a_int = [1, 2, 3]",
+            "    a_int.reverse()",
+            "    return a_int[0], a_int[-1]",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    print(pop_last_element())",
+            "    print(pop_expression())",
+            "    print(pop_as_arg())",
+            "    print(pop_negative_index())",
+            "    print(clear_1())",
+            "    r0, r1 = list_reverse()",
+            "    print(r0)",
+            "    print(r1)",
+        ],
+    )
+
+
+def test_xp2f_tuple_return_of_in_expressions_rank(tmp_path: Path) -> None:
+    # Regression test: `_rank_expr`'s generic ast.Compare handling
+    # assumed elementwise-broadcast semantics (correct for `<`/`>`/`==`
+    # between arrays, where the result shares the operands' own rank),
+    # and wrongly applied the same "max of operand ranks" formula to
+    # `in`/`not in` -- which in Python always yields a single scalar
+    # bool, regardless of the right-hand side's own rank. Pyccel's own
+    # lists.py: `return (1 in a), (5 in a), (3 in a)` with `a` a rank-1
+    # list -- each tuple element was wrongly declared a rank-1
+    # allocatable result instead of a scalar logical, crashing at
+    # runtime ("Assignment of scalar to unallocated array") the moment
+    # the actual scalar `any(...)` codegen was assigned into it.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xtuple_return_in_expr_rank.py",
+        [
+            "def list_contains():",
+            "    a = [1, 3, 4, 7, 10, 3]",
+            "    return (1 in a), (5 in a), (3 in a)",
+            "",
+            "",
+            "if __name__ == \"__main__\":",
+            "    r0, r1, r2 = list_contains()",
+            "    print(r0)",
+            "    print(r1)",
+            "    print(r2)",
+        ],
+    )

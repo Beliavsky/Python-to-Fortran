@@ -4156,6 +4156,553 @@ def rewrite_math_const_from_import_to_attribute(tree):
     return out
 
 
+def rewrite_call_attribute_access_to_temp(tree):
+    """`get_A().x` (attribute/method access chained DIRECTLY off a call
+    to a function that constructs and returns a user class instance, no
+    intermediate variable -- e.g. pyccel's own tests/pyccel/scripts/
+    classes/classes_5.py: `b = get_A().x`, `c = get_A().f() + 3`) has no
+    single-expression Fortran equivalent: unlike a POINTER-valued
+    function (not what a plain constructor-returning function is here),
+    a derived-type function's result cannot be the "leftmost part-ref"
+    of a component/type-bound-procedure reference at all (gfortran:
+    "The leftmost part-ref in a data-ref cannot be a function
+    reference") -- there is no text-level fix, only hoisting the call
+    into a temporary variable first, then accessing the component/
+    procedure on THAT (exactly the shape `a = get_A(); a.x` already
+    works for).
+
+    A function is treated as "class-returning" here by the same
+    conservative rule generate_flat's own (much later) dict_return_types
+    detection uses -- every `return` resolves to a direct constructor
+    call of a KNOWN class, or a Name bound from one -- replicated at
+    this plain-AST level since this pass runs well before that later,
+    translator-driven analysis exists. Must run before
+    rewrite_class_methods_to_toplevel (every call site in this file's
+    tree-prep chain already places it there) so ast.ClassDef nodes are
+    still intact to collect class names from.
+    """
+    class_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+    if not class_names:
+        return tree
+
+    class_returning = set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        rets = [st for st in ast.walk(fn) if isinstance(st, ast.Return) and st.value is not None]
+        if not rets:
+            continue
+        ctor_bound = {}
+        for st in ast.walk(fn):
+            if (
+                isinstance(st, ast.Assign)
+                and len(st.targets) == 1
+                and isinstance(st.targets[0], ast.Name)
+                and isinstance(st.value, ast.Call)
+                and isinstance(st.value.func, ast.Name)
+                and st.value.func.id in class_names
+            ):
+                ctor_bound[st.targets[0].id] = st.value.func.id
+        ok = True
+        for st in rets:
+            rv = st.value
+            if isinstance(rv, ast.Call) and isinstance(rv.func, ast.Name) and rv.func.id in class_names:
+                continue
+            if isinstance(rv, ast.Name) and rv.id in ctor_bound:
+                continue
+            ok = False
+            break
+        if ok:
+            class_returning.add(fn.name)
+
+    if not class_returning:
+        return tree
+
+    counter = [0]
+    changed = [False]
+
+    class _Finder(ast.NodeTransformer):
+        def __init__(self):
+            self.hoisted = []
+
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in class_returning
+            ):
+                counter[0] += 1
+                # No leading underscore: Fortran identifiers must start
+                # with a letter, and _aliased_name renames one that
+                # doesn't (e.g. to "v_ctor_tmp_1") for actual emission --
+                # but dict_typed_vars gets populated (by prescan) keyed
+                # on the RAW, un-aliased name, so a leading-underscore
+                # temp here caused a real mismatch: _struct_type_of's
+                # own Name lookup normalizes through _aliased_name FIRST,
+                # missing the entry prescan filed under the raw key.
+                tmp_name = f"ctor_tmp_{counter[0]}"
+                assign = ast.Assign(
+                    targets=[ast.Name(id=tmp_name, ctx=ast.Store())],
+                    value=node.value,
+                )
+                ast.copy_location(assign, node)
+                ast.fix_missing_locations(assign)
+                self.hoisted.append(assign)
+                changed[0] = True
+                return ast.copy_location(
+                    ast.Attribute(value=ast.Name(id=tmp_name, ctx=ast.Load()), attr=node.attr, ctx=node.ctx),
+                    node,
+                )
+            return node
+
+    def _process_body(body):
+        new_body = []
+        for stmt in body:
+            stmt = _BodyRewriter().visit(stmt)
+            finder = _Finder()
+            stmt = finder.visit(stmt)
+            new_body.extend(finder.hoisted)
+            new_body.append(stmt)
+        return new_body
+
+    class _BodyRewriter(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            return node
+
+        def visit_If(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            node.orelse = _process_body(node.orelse)
+            return node
+
+        def visit_For(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            node.orelse = _process_body(node.orelse)
+            return node
+
+        def visit_While(self, node):
+            self.generic_visit(node)
+            node.body = _process_body(node.body)
+            node.orelse = _process_body(node.orelse)
+            return node
+
+    out = ast.Module(body=_process_body(tree.body), type_ignores=getattr(tree, "type_ignores", []))
+    if not changed[0]:
+        return tree
+    ast.fix_missing_locations(out)
+    return out
+
+
+def rewrite_listcomp_zip_target_to_index(tree):
+    """Rewrite a list-comprehension generator whose target is a Tuple of
+    Names iterating over `zip(A, B, C, ...)` -- e.g. pyccel's own
+    functionals.py: `[i + j + k for i, j, k in zip(a, b, c)]` -- into an
+    equivalent single-Name-target generator over `range(len(A))`, with
+    every use of each original tuple-target name (in the comprehension's
+    own element expression and every generator's own filter conditions)
+    replaced by an explicit `A[idx]`/`B[idx]`/`C[idx]` subscript.
+
+    Also handles the same shape for a 2-tuple target iterating over
+    `enumerate(X)` -- e.g. pyccel's own functionals.py: `[i * j for i, j
+    in enumerate(a)]` -- where the first tuple-target name IS the index
+    itself (left as a bare Name reference, no subscript needed) and the
+    second is rewritten to `X[idx]`, exactly like a single-argument zip()
+    would be if Python's enumerate() were spelled `zip(range(len(X)), X)`.
+
+    This project's own ListComp lowering (both the inline elementwise
+    "pack"-based expr() codegen and the explicit-loop statement-level
+    rewrite right below this function) only ever recognizes a plain
+    single-Name target -- a zip()/enumerate() with a tuple target was
+    previously rejected outright ("ListComp currently supports only
+    single-generator form"), even though after this desugaring it becomes
+    exactly the single-Name-target/range()-iterator shape those already
+    handle.
+
+    Deliberately conservative: only rewrites when every zip() argument (or
+    the sole enumerate() argument) is a bare Name or Attribute -- always
+    directly addressable in Fortran, so subscripting it again with the
+    new index variable is always valid syntax. A Subscript is explicitly
+    EXCLUDED even though it usually reads fine standalone: when it's a
+    SLICE (`arg[-5:-1]`), it denotes an array-valued temporary, and
+    Fortran has no syntax to subscript a slice expression a second time
+    inline (`arg(lo:hi)(idx)` is "Unclassifiable statement") -- avoiding
+    that (rather than only excluding the slice sub-case) also sidesteps
+    needing to re-emit a non-trivial index expression once per element
+    read. zip()'s own arguments are iterated to the length of the
+    SHORTEST one (Python's own zip() truncates, never raises) --
+    `range(min(len(A), len(B), ...))`, not just `len(A)`, to match.
+    """
+    counter = [0]
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
+    def _next_idx_name():
+        while True:
+            counter[0] += 1
+            cand = f"zip_idx_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    def _simple_repeatable(n):
+        return isinstance(n, (ast.Name, ast.Attribute))
+
+    class _NameToSubscript(ast.NodeTransformer):
+        def __init__(self, mapping):
+            self.mapping = mapping
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and node.id in self.mapping:
+                base = self.mapping[node.id]
+                idx_ref = ast.copy_location(ast.Name(id=self.idx_name, ctx=ast.Load()), node)
+                if base is None:
+                    # enumerate()'s own index name -- already exactly the
+                    # new range()-generator's own loop variable (with a
+                    # `start=N` offset, if any, already folded directly
+                    # into that range's own lower bound -- see below), no
+                    # further rewriting needed here.
+                    return idx_ref
+                # X[idx] -- or, for enumerate(X, start=N), X[idx - N]
+                # (idx itself already runs N..N+len(X)-1, so it must be
+                # re-zeroed before indexing X). Keeping the loop variable
+                # itself a bare, undecorated reference to the OTHER
+                # target name (rather than wrapping IT in an offset
+                # expression) is deliberate: this project's own ListComp
+                # kind-inference (_expr_kind) only recognizes a bare
+                # `Name == loop_var` element expression as "shares the
+                # iterable's own kind" -- burying the loop variable inside
+                # a BinOp would silently fall back to a wrong default kind
+                # for the enumerate()-index target, exactly the failure
+                # this indexing choice avoids.
+                idx_expr = idx_ref
+                if self.start_expr is not None:
+                    idx_expr = ast.copy_location(
+                        ast.BinOp(left=idx_ref, op=ast.Sub(), right=copy.deepcopy(self.start_expr)), node
+                    )
+                return ast.copy_location(
+                    ast.Subscript(value=copy.deepcopy(base), slice=idx_expr, ctx=ast.Load()), node
+                )
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_ListComp(self, node):
+            self.generic_visit(node)
+            for gen in node.generators:
+                if not (isinstance(gen.target, ast.Tuple) and all(isinstance(e, ast.Name) for e in gen.target.elts)):
+                    continue
+                is_zip = (
+                    isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "zip"
+                    and len(gen.iter.args) == len(gen.target.elts)
+                    and len(gen.iter.args) >= 1
+                    and not gen.iter.keywords
+                    and all(_simple_repeatable(a) for a in gen.iter.args)
+                )
+                enum_start = None
+                if (
+                    isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "enumerate"
+                    and len(gen.iter.keywords) == 1
+                    and gen.iter.keywords[0].arg == "start"
+                ):
+                    enum_start = gen.iter.keywords[0].value
+                is_enumerate = (
+                    isinstance(gen.iter, ast.Call)
+                    and isinstance(gen.iter.func, ast.Name)
+                    and gen.iter.func.id == "enumerate"
+                    and len(gen.target.elts) == 2
+                    and len(gen.iter.args) == 1
+                    and (not gen.iter.keywords or enum_start is not None)
+                    and _simple_repeatable(gen.iter.args[0])
+                )
+                if not (is_zip or is_enumerate):
+                    continue
+                idx_name = _next_idx_name()
+                if is_zip:
+                    mapping = {t.id: a for t, a in zip(gen.target.elts, gen.iter.args)}
+                    len_calls = [
+                        ast.Call(func=ast.Name(id="len", ctx=ast.Load()), args=[copy.deepcopy(a)], keywords=[])
+                        for a in gen.iter.args
+                    ]
+                    # Python's zip() truncates to the SHORTEST argument
+                    # (pyccel's own functionals.py: `zip(a, b)` where a
+                    # has 8 elements and b only 3) -- using the first
+                    # argument's own length unconditionally previously
+                    # read past the end of every shorter argument,
+                    # crashing with a Fortran out-of-bounds runtime error
+                    # instead of silently (and correctly) truncating.
+                    bound = len_calls[0] if len(len_calls) == 1 else ast.Call(func=ast.Name(id="min", ctx=ast.Load()), args=len_calls, keywords=[])
+                    range_args = [bound]
+                else:
+                    # enumerate(X[, start=N]): first target name is the
+                    # index itself (mapped to None -- substituted with a
+                    # bare Name reference to the new loop variable, whose
+                    # own range already starts at N); second is X[idx],
+                    # re-zeroed via idx - N when a start= is present (see
+                    # _NameToSubscript).
+                    mapping = {gen.target.elts[0].id: None, gen.target.elts[1].id: gen.iter.args[0]}
+                    len_arg = gen.iter.args[0]
+                    len_call = ast.Call(func=ast.Name(id="len", ctx=ast.Load()), args=[copy.deepcopy(len_arg)], keywords=[])
+                    if enum_start is not None:
+                        range_args = [
+                            copy.deepcopy(enum_start),
+                            ast.BinOp(left=copy.deepcopy(enum_start), op=ast.Add(), right=len_call),
+                        ]
+                    else:
+                        range_args = [len_call]
+                subst = _NameToSubscript(mapping)
+                subst.idx_name = idx_name
+                subst.start_expr = enum_start
+                node.elt = subst.visit(node.elt)
+                for g2 in node.generators:
+                    g2.ifs = [subst.visit(cond) for cond in g2.ifs]
+                gen.target = ast.copy_location(ast.Name(id=idx_name, ctx=ast.Store()), gen)
+                gen.iter = ast.copy_location(
+                    ast.Call(func=ast.Name(id="range", ctx=ast.Load()), args=range_args, keywords=[]),
+                    gen,
+                )
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
+def rewrite_pop_call_expr_to_temp(tree):
+    """Hoist a `list_var.pop(...)` call that appears anywhere OTHER than
+    the two directly-supported statement shapes -- a plain `x =
+    list_var.pop(...)` assignment, or a bare `list_var.pop(...)`
+    expression statement (its own return value discarded) -- into a
+    preceding temp-variable assignment, replacing the original call site
+    with a reference to that temp. Covers pyccel's own lists.py: `return
+    a.pop()`, `return a.pop() + 3`, and `return a.pop(a.pop(0))` (a pop()
+    call nested inside another pop() call's own index argument).
+
+    list_var.pop(...) has a real side effect (it mutates the list AND
+    yields the removed element), so this project's translator-level
+    codegen for it only ever fires for those two statement shapes above
+    -- anything else (a return statement, an arithmetic expression, a
+    nested call argument) previously surfaced as a generic "unsupported
+    call" decline instead of being recognized at all.
+
+    Processes pop-calls from the innermost outward (via a post-order
+    NodeTransformer) so `a.pop(a.pop(0))` hoists the inner `a.pop(0)`
+    into its own temp BEFORE the outer call is hoisted using that temp
+    as its own index argument -- exactly Python's own left-to-right,
+    inner-before-outer call evaluation order.
+    """
+    counter = [0]
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
+    def _next_tmp():
+        while True:
+            counter[0] += 1
+            cand = f"pop_tmp_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    def _is_pop_call(n):
+        return (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "pop"
+            and isinstance(n.func.value, ast.Name)
+            and len(n.args) <= 1
+            and not n.keywords
+        )
+
+    class _PopHoister(ast.NodeTransformer):
+        def __init__(self):
+            self.hoisted = []
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if not _is_pop_call(node):
+                return node
+            tmp = _next_tmp()
+            assign = ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=node)
+            ast.copy_location(assign, node)
+            ast.fix_missing_locations(assign)
+            self.hoisted.append(assign)
+            return ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), node)
+
+        # Don't descend into a nested function/lambda's own body/defaults --
+        # a pop() call there belongs to that inner scope's own statement
+        # list, handled separately when this rewrite recurses into it.
+        def visit_FunctionDef(self, node):
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            return node
+
+        def visit_Lambda(self, node):
+            return node
+
+    class _Rewriter(ast.NodeTransformer):
+        def _process_body(self, stmts):
+            out = []
+            for st in stmts:
+                st = self.visit(st)
+                if st is None:
+                    continue
+                stmts_to_add = st if isinstance(st, list) else [st]
+                for one in stmts_to_add:
+                    if (
+                        isinstance(one, ast.Assign)
+                        and len(one.targets) == 1
+                        and isinstance(one.targets[0], ast.Name)
+                        and _is_pop_call(one.value)
+                    ):
+                        out.append(one)
+                        continue
+                    if isinstance(one, ast.Expr) and _is_pop_call(one.value):
+                        out.append(one)
+                        continue
+                    hoister = _PopHoister()
+                    new_one = hoister.visit(one)
+                    out.extend(hoister.hoisted)
+                    out.append(new_one)
+            return out
+
+        def visit_FunctionDef(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_If(self, node):
+            node.test = node.test
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_For(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_While(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_With(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_Module(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
+def rewrite_tuple_assign_subscript_targets_to_temps(tree):
+    """Rewrite `T1, T2, ... = V1, V2, ...` (a flat tuple/list assignment
+    with a literal tuple/list on both sides, same length) into temp-
+    variable assignments -- `tmp1 = V1; tmp2 = V2; ...; T1 = tmp1; T2 =
+    tmp2; ...` -- whenever at least one target is a Subscript or
+    Attribute rather than a plain Name, e.g. pyccel's own
+    test_epyccel_expressions.py: `l[0], l[1] = l[1], l[0]` (swap two list
+    elements) or `l[i], l[j] = l[j], l[i]` (swap by variable index).
+
+    This project's own tuple-assignment codegen (many call sites, each
+    handling a different RHS shape -- a function call returning a tuple,
+    a tuple literal, ...) uniformly requires every target to be a plain
+    Name ("tuple assignment targets must be names"), which a `l[i], l[j]
+    = ...`-style element swap can never satisfy. Desugaring into temps
+    first sidesteps all of that machinery entirely: each resulting
+    statement is a single, ordinary assignment (Name = expr, then
+    Subscript/Attribute = Name) that the existing single-target
+    assignment codegen already handles natively -- while still preserving
+    Python's own tuple-assignment evaluation order (every RHS value
+    computed once, before any target is written to, which is exactly why
+    `a, b = b, a` swaps correctly without a temp in Python in the first
+    place).
+
+    Deliberately narrow: only a FLAT tuple/list target and value (no
+    nested Tuple/List sub-targets, no Starred, no call/attribute RHS
+    values needing unpacking) of matching, equal length are considered --
+    anything else is left completely untouched for the existing
+    machinery, which already handles the plain-all-Names case natively
+    and may handle other shapes (e.g. nested-tuple targets) this rewrite
+    doesn't need to touch.
+    """
+    counter = [0]
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
+    def _next_tmp_name():
+        while True:
+            counter[0] += 1
+            cand = f"swap_tmp_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            self.generic_visit(node)
+            if not (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                and isinstance(node.value, (ast.Tuple, ast.List))
+            ):
+                return node
+            targets = node.targets[0].elts
+            values = node.value.elts
+            if len(targets) != len(values) or not targets:
+                return node
+            if not all(isinstance(t, (ast.Name, ast.Subscript, ast.Attribute)) for t in targets):
+                return node
+            if not any(isinstance(t, (ast.Subscript, ast.Attribute)) for t in targets):
+                # All-Name targets are already handled natively -- leave
+                # untouched.
+                return node
+            out = []
+            tmp_names = []
+            for v in values:
+                tmp = _next_tmp_name()
+                tmp_names.append(tmp)
+                out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=v), node))
+            for t, tmp in zip(targets, tmp_names):
+                out.append(ast.copy_location(ast.Assign(targets=[t], value=ast.Name(id=tmp, ctx=ast.Load())), node))
+            return out
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
 def rewrite_listcomp_array_assign_calls_to_loop(tree):
     """Rewrite `TARGET = np.array([ELT for VAR in ITERABLE])` (or
     np.asarray(...)) into an equivalent explicit loop, and likewise for
@@ -5363,6 +5910,7 @@ def rewrite_class_methods_to_toplevel(tree):
     (no `self` to annotate -- skipped, same fail-clean stance).
     """
     property_field_flat = {}
+    property_computed_to_proc = {}
     method_to_proc = {}
     changed = False
 
@@ -5406,10 +5954,46 @@ def rewrite_class_methods_to_toplevel(tree):
             if not isinstance(member, ast.FunctionDef) or member.name == "__init__":
                 kept_body.append(member)
                 continue
-            if member.name in local_property_fields or _is_property_decorated(member):
-                # Either inlined via property_field_flat above, or an
-                # unsupported property shape dropped outright -- either
-                # way it's never emitted as a procedure.
+            if member.name in local_property_fields:
+                # Inlined via property_field_flat above.
+                changed = True
+                continue
+            if _is_property_decorated(member):
+                if not member.args.args:
+                    # No `self` param at all to hoist against -- leave
+                    # the original "drop outright" fallback (fails
+                    # clean later, same as before this branch existed).
+                    changed = True
+                    continue
+                # A COMPUTED (non-trivial-passthrough) @property getter
+                # -- e.g. `@property def my_val(self): return self._n *
+                # 10` -- previously silently dropped outright here,
+                # which this function's own docstring says should
+                # "surface as a clean unsupported call/undefined-name
+                # failure" but actually surfaced as a confusing Fortran
+                # BUILD error instead ("'my_val' is not a member of the
+                # ... structure": the property's read-site,
+                # `obj.my_val`, was left as a plain attribute access
+                # with nothing rewriting it, since only the exact
+                # single-statement passthrough shape above ever did).
+                # Hoisted exactly like a regular method (same
+                # new-name convention just below), but recorded
+                # separately (property_computed_to_proc, not
+                # method_to_proc): a property is read as a bare
+                # attribute (`obj.prop`), never called with `()`, so
+                # its call sites need an Attribute node rewritten
+                # directly into a Call -- not an existing Call's own
+                # func swapped out, which is what method_to_proc's own
+                # rewriter does.
+                new_name = f"{cname}_{member.name}"
+                new_fn = copy.deepcopy(member)
+                new_fn.name = new_name
+                new_fn.decorator_list = []
+                new_fn.args.args[0].annotation = ast.Name(id=cname, ctx=ast.Load())
+                ast.copy_location(new_fn, member)
+                ast.fix_missing_locations(new_fn)
+                class_hoisted.append(new_fn)
+                property_computed_to_proc[member.name] = new_name
                 changed = True
                 continue
             if not member.args.args:
@@ -5441,6 +6025,19 @@ def rewrite_class_methods_to_toplevel(tree):
             if isinstance(node.ctx, ast.Load) and node.attr in property_field_flat:
                 return ast.copy_location(
                     ast.Attribute(value=node.value, attr=property_field_flat[node.attr], ctx=ast.Load()),
+                    node,
+                )
+            if isinstance(node.ctx, ast.Load) and node.attr in property_computed_to_proc:
+                # `obj.prop` (a bare read, already generic_visit-ed above)
+                # -> `ClassName_prop(obj)`, the same computed-property
+                # hoisting property_computed_to_proc's own comment
+                # describes.
+                return ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id=property_computed_to_proc[node.attr], ctx=ast.Load()),
+                        args=[node.value],
+                        keywords=[],
+                    ),
                     node,
                 )
             return node
@@ -8685,7 +9282,8 @@ def _name_used_as_call_arg(lines, name, start, end):
     """True if `name` is passed, as a bare actual argument (not merely
     read inside a larger expression -- Fortran can't bind an expression
     to an intent(out)/inout dummy anyway, so that's always safe), to a
-    `call` statement in `lines[start:end]` at a position that ISN'T
+    `call` statement OR a locally-defined FUNCTION call embedded in an
+    ordinary expression, in `lines[start:end]`, at a position that ISN'T
     confirmed intent(in) via _callee_dummy_intent_is_in.
 
     Used by the constant-promotion passes as a disqualifier: a plain
@@ -8694,36 +9292,72 @@ def _name_used_as_call_arg(lines, name, start, end):
     confirmed intent(in) binding is exactly as safe as any other read, so
     it does NOT disqualify -- unlike an unresolved callee (python_mod
     helper, etc.), which still does, conservatively.
+
+    A `call` statement is only ONE of the two shapes a mutating callee
+    can appear in: xp2f.py emits any Python function whose body both
+    mutates a parameter AND returns a value as a Fortran `function`
+    (never a `subroutine`), so it's invoked from an ordinary expression
+    context instead (`print *, bump(arr)`, `x = bump(arr) + 1`), which
+    the `call`-only scan below silently missed entirely -- letting `arr`
+    get promoted to a PARAMETER even though `bump` mutates it in place,
+    "Named constant ... in variable definition context" at the call site
+    once gfortran refuses to bind a PARAMETER to bump's own intent(inout)
+    dummy. _callee_dummy_intent_is_in has no `function`-header case (only
+    `subroutine`), so a bare-arg binding to any known local function is
+    conservatively treated as a possible mutation outright, with no
+    intent-resolution attempted for it yet.
     """
     call_start_re = re.compile(r"^\s*call\s+([A-Za-z_]\w*)\s*\(", flags=re.IGNORECASE)
     tok_re = re.compile(r"\b" + re.escape(name) + r"\b", flags=re.IGNORECASE)
     bare_arg_re = re.compile(r"^" + re.escape(name) + r"(\s*\(.*\))?$", flags=re.IGNORECASE)
+    func_call_re = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    known_func_cache = {}
+
+    def _is_known_function(ident):
+        if ident not in known_func_cache:
+            fre = re.compile(
+                rf"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*function\s+{re.escape(ident)}\s*\(",
+                flags=re.IGNORECASE,
+            )
+            known_func_cache[ident] = any(fre.match(ln2.split("!", 1)[0]) for ln2 in lines)
+        return known_func_cache[ident]
+
     k = start
     while k < end:
         code_k = lines[k].split("!", 1)[0]
         m = call_start_re.match(code_k)
-        if not m:
-            k += 1
-            continue
-        joined, end_k = _joined_call_stmt(lines, k)
-        mj = call_start_re.match(joined)
-        if not mj or not tok_re.search(joined):
+        if m:
+            joined, end_k = _joined_call_stmt(lines, k)
+            mj = call_start_re.match(joined)
+            if mj and tok_re.search(joined):
+                callee = mj.group(1)
+                open_idx = mj.end() - 1
+                close_idx = _find_matching_rparen_simple(joined, open_idx)
+                if close_idx < 0:
+                    return True
+                args = _split_top_level_commas_simple(joined[open_idx + 1 : close_idx])
+                for idx_a, a in enumerate(args):
+                    if not tok_re.search(a):
+                        continue
+                    if not bare_arg_re.match(a.strip()):
+                        continue
+                    if not _callee_dummy_intent_is_in(lines, callee, idx_a):
+                        return True
             k = end_k + 1
             continue
-        callee = mj.group(1)
-        open_idx = mj.end() - 1
-        close_idx = _find_matching_rparen_simple(joined, open_idx)
-        if close_idx < 0:
-            return True
-        args = _split_top_level_commas_simple(joined[open_idx + 1 : close_idx])
-        for idx_a, a in enumerate(args):
-            if not tok_re.search(a):
-                continue
-            if not bare_arg_re.match(a.strip()):
-                continue
-            if not _callee_dummy_intent_is_in(lines, callee, idx_a):
-                return True
-        k = end_k + 1
+        if tok_re.search(code_k):
+            for fm in func_call_re.finditer(code_k):
+                ident = fm.group(1)
+                if ident.lower() == name.lower() or not _is_known_function(ident):
+                    continue
+                open_idx = fm.end() - 1
+                close_idx = _find_matching_rparen_simple(code_k, open_idx)
+                if close_idx < 0:
+                    continue
+                fargs = _split_top_level_commas_simple(code_k[open_idx + 1 : close_idx])
+                if any(bare_arg_re.match(a.strip()) for a in fargs):
+                    return True
+        k += 1
     return False
 
 
@@ -12322,6 +12956,33 @@ def detect_needed_helpers(tree):
     time_aliases, time_func_aliases = collect_time_aliases(tree)
     sys_aliases, sys_func_aliases = collect_sys_aliases(tree)
     math_aliases, math_func_aliases = collect_math_aliases(tree)
+    # `tree` here can be a SUBSET view built for this one scan (e.g.
+    # generate_flat's own proc_tree/helper_scan_tree, assembled from
+    # exec_nodes + local_funcs with top-level Import/ImportFrom nodes
+    # already excluded) -- so a bare `from math import gcd` (or scipy/
+    # statistics/time/sys equivalent) used only inside a local function
+    # went completely undetected here even though it's a real, plain
+    # top-level import in the actual program: this function's own
+    # from-scratch collect_*_aliases(tree) calls just above found
+    # nothing to alias at all, silently never adding the helper it
+    # needs to `needed` -- no `use` statement for it ever got emitted
+    # (confirmed via a real build failure, "has no IMPLICIT type",
+    # derived from pyccel's own tests/pyccel/scripts/
+    # pyccel_generated_compilation_dependency.py's own `from math import
+    # gcd`). translator.global_*_aliases (set once, from the true,
+    # unmodified whole-program tree, before any such subsetting) is the
+    # authoritative source of truth whenever it's already been
+    # populated by the time this runs -- merge it in defensively.
+    linalg_aliases = linalg_aliases | getattr(translator, "global_linalg_aliases", set())
+    scipy_aliases = scipy_aliases | getattr(translator, "global_scipy_special_aliases", set())
+    statistics_aliases = statistics_aliases | getattr(translator, "global_statistics_aliases", set())
+    statistics_func_aliases = {**getattr(translator, "global_statistics_func_aliases", {}), **statistics_func_aliases}
+    time_aliases = time_aliases | getattr(translator, "global_time_aliases", set())
+    time_func_aliases = {**getattr(translator, "global_time_func_aliases", {}), **time_func_aliases}
+    sys_aliases = sys_aliases | getattr(translator, "global_sys_aliases", set())
+    sys_func_aliases = {**getattr(translator, "global_sys_func_aliases", {}), **sys_func_aliases}
+    math_aliases = math_aliases | getattr(translator, "global_math_aliases", set())
+    math_func_aliases = {**getattr(translator, "global_math_func_aliases", {}), **math_func_aliases}
     np_helper_map = {
         "arange": {"arange_int"},
         "linspace": {"linspace"},
@@ -15567,9 +16228,43 @@ def collect_dataclass_info(tree):
             and v.func.value.id in {"np", "numpy"}
             and v.func.attr in {"ones", "zeros", "empty"}
             and len(v.args) == 1
-            and not v.keywords
+            and all(kw.arg == "dtype" for kw in v.keywords)
+            and len(v.keywords) <= 1
         ):
-            return ("real", 1, copy.deepcopy(v))
+            # A dtype= override (e.g. `self.field = np.ones(n,
+            # dtype=int)`, pyccel's own tests/pyccel/scripts/classes/
+            # classes_9.py's MyClass) picks a different field kind than
+            # the "real is the default for all three" case this
+            # function originally only handled -- same dtype_txt
+            # substring convention used for np.array's own dtype=
+            # kind inference elsewhere (_expr_kind's np.array/asarray
+            # branches). Without this, ANY keyword argument at all
+            # (not just a non-dtype one) unconditionally rejected the
+            # whole field -- and with it, the WHOLE CLASS, since
+            # nothing else recognizes this shape either -- silently
+            # breaking every method on the class, not just this field
+            # ("unsupported attribute expr: self.param1", a completely
+            # unrelated field, once __init__ itself failed to fully
+            # register).
+            kind = "real"
+            if v.keywords:
+                dtype_txt = ""
+                dv = v.keywords[0].value
+                if isinstance(dv, ast.Name):
+                    dtype_txt = dv.id.lower()
+                elif isinstance(dv, ast.Attribute) and isinstance(dv.value, ast.Name) and dv.value.id in {"np", "numpy"}:
+                    dtype_txt = dv.attr.lower()
+                if "float" in dtype_txt:
+                    kind = "real"
+                elif "complex" in dtype_txt:
+                    kind = "complex"
+                elif "int" in dtype_txt:
+                    kind = "int"
+                elif "bool" in dtype_txt:
+                    kind = "logical"
+                else:
+                    return None
+            return (kind, 1, copy.deepcopy(v))
         return None
 
     def _field_kind(ann):
@@ -15797,6 +16492,31 @@ def collect_dataclass_info(tree):
                         ckind, crank, ctemplate = computed
                         fields.append((st.targets[0].attr, ckind, crank, None, (tuple(pmap.keys()), ctemplate)))
                         continue
+                    if (
+                        isinstance(st.value, ast.Call)
+                        and isinstance(st.value.func, ast.Name)
+                        and st.value.func.id in class_to_type
+                    ):
+                        # `self.param = A(5)` -- constructing ANOTHER
+                        # already-known user class inline (as opposed to
+                        # receiving one as a constructor parameter, the
+                        # shape `_field_kind`'s own "struct:" annotation
+                        # recognition already handles). Treated exactly
+                        # like any other "computed" field template just
+                        # above: the field's own kind is the OTHER
+                        # class's struct type, and its defining
+                        # expression (the constructor call itself,
+                        # substituting outer ctor params if it happens to
+                        # reference any) is re-rendered at construction
+                        # time via the same user_class_types Call-
+                        # lowering every other constructor call already
+                        # goes through.
+                        _other_tnm = class_to_type[st.value.func.id]
+                        fields.append((
+                            st.targets[0].attr, f"struct:{_other_tnm}", 0, None,
+                            (tuple(pmap.keys()), copy.deepcopy(st.value)),
+                        ))
+                        continue
                 if isinstance(st, ast.Pass):
                     continue
                 if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Global, ast.Nonlocal, ast.Import, ast.ImportFrom)) or (
@@ -15896,18 +16616,50 @@ def user_class_ann_text(ann):
     return txt
 
 
-def _all_returns_same_struct_type(fn, dict_typed_vars):
+def _all_returns_same_struct_type(fn, dict_typed_vars, user_class_types=None):
     """If `fn` has no explicit user-class return annotation but every one
     of its `return EXPR` statements hands back a bare Name already known
     (via `dict_typed_vars`, e.g. a struct-typed parameter) to be the SAME
     struct type, return that type's name; else None. Covers a function
     like pyccel's own `choose_A(a1, a2, b)` -- `if b: return a1 else:
     return a2` -- which has no `-> T` annotation at all, only inferable
-    from its own return statements."""
+    from its own return statements.
+
+    ALSO covers a `return` handing back a DIRECT constructor Call to a
+    known user class (`return A(3)`, not first bound to a Name) when
+    `user_class_types` is given -- e.g. `def get_A(): return A(4)`
+    (pyccel's own tests/pyccel/scripts/classes/classes_7.py's get_A, in
+    the exact shape an earlier "inline this local variable directly
+    into its own return" simplification pass leaves it in). Without
+    this, this function's own per-function prescan (dict_typed_vars,
+    reset and rebuilt fresh for each local function individually) has
+    no Assign statement left to register a struct-typed Name from at
+    all -- dict_typed_vars comes back completely empty -- and THIS
+    function's Name-only check then also fails, so the result variable
+    silently defaulted to plain integer while the body still assigned a
+    genuine struct value to it, a declared-vs-assigned type mismatch
+    ("Cannot convert TYPE(...) to INTEGER"). generate_flat's OWN,
+    separate dict_return_types detection (used by CALLERS, via
+    _struct_type_of) already recognizes exactly this same Call shape --
+    this mirrors that same rule for the callee's OWN declaration.
+    """
     ret_vals = [r.value for r in ast.walk(fn) if isinstance(r, ast.Return) and r.value is not None]
-    if not ret_vals or not all(isinstance(v, ast.Name) and v.id in dict_typed_vars for v in ret_vals):
+    if not ret_vals:
         return None
-    tnms = {dict_typed_vars[v.id] for v in ret_vals}
+    tnms = set()
+    for v in ret_vals:
+        if isinstance(v, ast.Name) and v.id in dict_typed_vars:
+            tnms.add(dict_typed_vars[v.id])
+            continue
+        if (
+            user_class_types
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in user_class_types
+        ):
+            tnms.add(user_class_types[v.func.id])
+            continue
+        return None
     if len(tnms) != 1:
         return None
     return next(iter(tnms))
@@ -17791,7 +18543,21 @@ def _value_returns_excluding_nested(fn_node):
             return None
 
         def visit_Return(self, node):
-            if node.value is not None:
+            # `return None` (an explicit None-constant return, e.g.
+            # `if cond: return None` as an early-exit guard clause) is
+            # semantically a VOID return -- identical to a bare `return`
+            # with no value at all -- but node.value IS a real AST node
+            # here (an ast.Constant wrapping None), not Python's own
+            # None, so the naive `node.value is not None` check treated
+            # it as a genuine value-carrying return. That misled every
+            # caller of this function (deciding whether a local function
+            # needs a result variable at all, i.e. FUNCTION vs.
+            # SUBROUTINE) into declaring a function with a bogus result
+            # variable for one that's actually void -- a gfortran "has a
+            # type, which is not consistent with the CALL" the moment
+            # it's called like the subroutine it actually is everywhere
+            # else in the same function body.
+            if node.value is not None and not is_none(node.value):
                 self.returns.append(node)
 
     visitor = _ReturnVisitor(fn_node)
@@ -19717,6 +20483,24 @@ def inline_simple_value_returning_local_functions(exec_body, local_funcs):
                 for n in ast.walk(st):
                     if isinstance(n, ast.Name):
                         still_called.add(n.id)
+            # A parameter's own DEFAULT value (e.g. pyccel's own
+            # highorder_functions.py: `def high_valuedarg_1(a, function:
+            # "(int)(int)" = f1): ...`) is a live reference to `f1` too --
+            # structurally a sibling of fn.body on the FunctionDef node,
+            # not part of fn.body itself, so the scan above never sees it.
+            # Missing it here wrongly declared `f1` "fully inlined away"
+            # (it's never called directly anywhere, only referenced as
+            # this default) and dropped it from local_funcs entirely --
+            # even though a caller that relies on the default
+            # (`high_valuedarg_1(2)`, no explicit override) gets it
+            # materialized into an explicit actual argument at the call
+            # site later, referencing a symbol that no longer exists.
+            for _d in list(fn.args.defaults) + list(fn.args.kw_defaults):
+                if _d is None:
+                    continue
+                for n in ast.walk(_d):
+                    if isinstance(n, ast.Name):
+                        still_called.add(n.id)
         fully_inlined = set(eligible) - still_called
         if fully_inlined:
             local_funcs[:] = [
@@ -20379,6 +21163,15 @@ class translator(ast.NodeVisitor):
         self.broadcast_row2 = set()
         self.nonzero_tuple_vars = set()
         self.function_result_name = function_result_name
+        # Set explicitly by _emit_local_function once it knows whether
+        # THIS function is void (see its own comment); visit_Return
+        # consults it to decide whether `return None` needs a bare
+        # `return` (void function) or the "-1" Optional-int sentinel
+        # assignment (a genuine value-returning function that also
+        # returns None on some branch). Defaults to False so any other
+        # translator instance/context (never told otherwise) keeps the
+        # existing sentinel-assignment behavior unchanged.
+        self.void_return = False
         self.comment_map = comment_map or {}
         self._last_comment_line = 0
         self.tuple_return_funcs = set(tuple_return_funcs or [])
@@ -20406,6 +21199,23 @@ class translator(ast.NodeVisitor):
         # a pointer can legally point at it).
         self.class_pointer_alias_of = {}
         self.class_pointer_targets = set()
+        # A scalar variable ever assigned a negative integer literal
+        # (`v = -1`) anywhere in the whole program -- used to make a
+        # bare-Name array-subscript index (`a[v]`, `a[v, 1:]`, ...)
+        # wraparound-safe (Python's own negative-index semantics)
+        # instead of the plain `(v + 1)` Fortran-1-based mapping every
+        # OTHER (provably non-negative, e.g. loop-variable) scalar index
+        # still uses unchanged. Without this, a runtime-negative index
+        # silently produced an out-of-bounds Fortran subscript (a hard
+        # crash, not a decline) -- confirmed via a minimal `v = -1;
+        # a[v]` repro and pyccel's own tests/pyccel/scripts/
+        # arrays_view.py's array_view_negative_var (once its own
+        # pyccel-only @allow_negative_index decorator -- this project's
+        # only other signal for "might be negative" -- is stripped).
+        # Deliberately narrow (a literal-assignment signal, not general
+        # sign analysis) to avoid a wraparound check on every ordinary,
+        # already-correct, non-negative index.
+        self.maybe_negative_int_vars = set()
         self.dict_typed_vars = {}
         self.pandas_df_vars = {}
         self.pandas_df_index_label = {}
@@ -21603,8 +22413,6 @@ class translator(ast.NodeVisitor):
         return picked[0] if len(picked) == 1 else picked
 
     def _mark_int(self, name):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21628,8 +22436,6 @@ class translator(ast.NodeVisitor):
         self.ints.add(name)
 
     def _force_mark_int(self, name):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21650,8 +22456,6 @@ class translator(ast.NodeVisitor):
         self.alloc_char_rank.pop(name, None)
 
     def _mark_real(self, name, kind_tag=None):
-        if name == "_":
-            return
         if name in self.params:
             return
         name = self._aliased_name(name)
@@ -21668,8 +22472,6 @@ class translator(ast.NodeVisitor):
         self.complexes.discard(name)
 
     def _mark_complex(self, name):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21686,8 +22488,6 @@ class translator(ast.NodeVisitor):
         self.reals.discard(name)
 
     def _mark_log(self, name):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21703,8 +22503,6 @@ class translator(ast.NodeVisitor):
         self.complexes.discard(name)
 
     def _mark_char(self, name):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21719,8 +22517,6 @@ class translator(ast.NodeVisitor):
         self.logs.discard(name)
 
     def _mark_alloc_int(self, name, rank=1):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21745,8 +22541,6 @@ class translator(ast.NodeVisitor):
         self.alloc_char_rank.pop(name, None)
 
     def _mark_alloc_real(self, name, rank=1, kind_tag=None):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21773,8 +22567,6 @@ class translator(ast.NodeVisitor):
         self.alloc_char_rank.pop(name, None)
 
     def _mark_alloc_complex(self, name, rank=1):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21799,8 +22591,6 @@ class translator(ast.NodeVisitor):
         self.alloc_char_rank.pop(name, None)
 
     def _mark_alloc_log(self, name, rank=1):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21825,8 +22615,6 @@ class translator(ast.NodeVisitor):
         self.alloc_char_rank.pop(name, None)
 
     def _mark_alloc_char(self, name, rank=1):
-        if name == "_":
-            return
         if name in self.reserved_names:
             return
         if name in self.params:
@@ -21928,6 +22716,16 @@ class translator(ast.NodeVisitor):
         "unsupported attribute expr"/"unsupported assign" before this)."""
         if isinstance(node, ast.Name):
             return self.dict_typed_vars.get(self._aliased_name(node.id))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            # A function whose every `return` resolves to a known class
+            # instance (dict_return_types) -- e.g. `def get_A(): ...;
+            # return a_cls` -- so `get_A().x` (attribute access chained
+            # DIRECTLY off the call, no intermediate variable) resolves
+            # too; Fortran itself allows a component reference on a
+            # function-call result directly (`get_A()%x`), so the
+            # read/write struct-field paths that consult _struct_type_of
+            # need no hoisting-to-a-temp here, just this recognition.
+            return self.dict_return_types.get(node.func.id)
         if isinstance(node, ast.Attribute):
             base_tnm = self._struct_type_of(node.value)
             if base_tnm is None:
@@ -22205,7 +23003,14 @@ class translator(ast.NodeVisitor):
                 return self._expr_kind(node.value)
             if node.attr == "flat":
                 return self._expr_kind(node.value)
-            if node.attr in {"real", "imag"}:
+            if node.attr == "imag":
+                # Matches the expr() codegen fix: Python's own x.imag is
+                # 0.0 (a float) for a real base, 0 (an int) for an
+                # int/bool base -- (5).imag == 0, an int, not (5.5).imag
+                # == 0.0, a float -- and a real (AIMAG's actual result
+                # kind) for a genuinely complex base.
+                return "int" if self._expr_kind(node.value) not in {"real", "complex"} else "real"
+            if node.attr == "real":
                 return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in {"pi", "nan", "inf", "NINF"}:
                 return "real"
@@ -22912,8 +23717,14 @@ class translator(ast.NodeVisitor):
                 and len(node.args) <= 1
             ):
                 return None
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
-                return self._expr_kind(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"conjugate", "conj"} and len(node.args) == 0:
+                # bool.conjugate()/.conj() returns an int in Python
+                # (inherited from int, since bool is an int subclass),
+                # not a bool -- matches the merge(1, 0, ...) codegen
+                # this same shape gets (Fortran's CONJG rejects LOGICAL
+                # outright).
+                _base_kind = self._expr_kind(node.func.value)
+                return "int" if _base_kind == "logical" else _base_kind
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 tgt = self.vectorize_aliases[node.func.id]
                 if tgt in self.local_return_specs:
@@ -23014,6 +23825,27 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.id in {"complex"}:
                     return "complex"
+                if node.func.id == "round" and len(node.args) >= 1:
+                    # Mirrors the actual codegen logic in expr()'s own
+                    # `round` branch. This branch was missing entirely,
+                    # so a function whose only return expression was
+                    # `round(x, i)` (a real x, variable ndigits i --
+                    # pyccel's own test_builtins.py: `def round_ndigits(x,
+                    # i): return round(x, i)`) fell through to
+                    # _expr_kind's generic unmatched-Call default and was
+                    # misclassified.
+                    if len(node.args) == 1:
+                        # The 1-arg form (no ndigits) always returns a
+                        # genuine Python int, regardless of the
+                        # argument's own kind (round(3.5) -> 4, an int;
+                        # round(True) -> 1; round(3) -> 3).
+                        return "int"
+                    # The 2-arg (ndigits) form preserves the first
+                    # argument's own int-vs-real-vs-bool kind instead
+                    # (round(int, ndigits) -> int, round(float, ndigits)
+                    # -> float, round(bool, ndigits) -> int).
+                    k0 = self._expr_kind(node.args[0])
+                    return "int" if k0 == "logical" else k0
             if (
                 isinstance(node.func, ast.Attribute)
                 and self._is_scipy_special_call_attr(node.func)
@@ -24463,6 +25295,23 @@ class translator(ast.NodeVisitor):
             return ":" if lb == "1" and ub == extent_expr else f"{lb}:{ub}"
         return f"{lb}:{ub}:{step_val}"
 
+    def _scalar_idx1_expr(self, a, dim_size_expr):
+        """0-based Python scalar subscript -> 1-based Fortran index.
+
+        A bare Name flagged by maybe_negative_int_vars (ever assigned a
+        negative integer literal somewhere in the program) gets Python's
+        own negative-index wraparound (MODULO -- unlike Fortran's own
+        MOD, this follows the sign of the SECOND argument, matching
+        Python's `%`/negative-index semantics exactly) instead of the
+        plain `(v + 1)` every other (provably non-negative-looking)
+        scalar index still gets -- see maybe_negative_int_vars's own
+        comment for why a runtime-negative index needs this at all
+        (previously a hard out-of-bounds crash, not a decline).
+        """
+        if isinstance(a, ast.Name) and a.id in self.maybe_negative_int_vars:
+            return f"(modulo({self.expr(a)}, {dim_size_expr}) + 1)"
+        return f"({self.expr(a)} + 1)"
+
     def _const_int_value(self, node):
         if isinstance(node, ast.Constant) and isinstance(node.value, int):
             return int(node.value)
@@ -24620,9 +25469,10 @@ class translator(ast.NodeVisitor):
                 # A general runtime index (e.g. `dates.iloc[n]` where n
                 # is a variable, not a literal) -- assumed non-negative,
                 # unlike the literal case above (which special-cases
-                # negative Python-style indices); a runtime negative
-                # index isn't supported here.
-                fidx = f"({self.expr(node.slice)} + 1)"
+                # negative Python-style indices), UNLESS n is flagged by
+                # maybe_negative_int_vars (see its own comment), in which
+                # case _scalar_idx1_expr makes it Python-wraparound-safe.
+                fidx = self._scalar_idx1_expr(node.slice, f"size({arr_expr})")
             return f"{arr_expr}({fidx})"
         return None
 
@@ -26763,6 +27613,71 @@ class translator(ast.NodeVisitor):
             return None
         return {"df_id": df_id, "op": opmap[op_cls], "left_kind": left_kind, "rhs_node": rhs_scalar}
 
+    def _emit_indexed_pop(self, lst, idx_node, result_name=None):
+        """Emit `list_var.pop(idx)` (any int-valued idx expression,
+        positive or negative -- pyccel's own lists.py: `a.pop(1)`,
+        `a.pop(-1)`, `a.pop(a.pop(0))`) as an explicit block: compute the
+        wraparound (Python-style negative-index) position, optionally
+        capture the removed element into `result_name` (None for the
+        bare-statement, value-discarding form), then splice the element
+        out via a whole-array reassignment -- the same array-rebuild
+        approach the existing no-index pop() (and insert()) already use,
+        just generalized to remove from an arbitrary position instead of
+        only the last one.
+
+        Was previously unconditionally rejected ("pop with index is not
+        yet supported") at every call site -- both the no-index-only
+        assign-context and bare-statement-context pop() handlers -- even
+        though indexed pop() is pyccel's own primary/most-used shape.
+        """
+        idx_txt = self.expr(idx_node)
+        self.o.w("block")
+        self.o.push()
+        self.o.w("integer :: pop_idx, pop_n")
+        self.o.w(f"pop_n = size({lst})")
+        self.o.w(f"pop_idx = int({idx_txt})")
+        self.o.w("if (pop_idx < 0) pop_idx = pop_n + pop_idx")
+        self.o.w("pop_idx = pop_idx + 1")
+        if result_name is not None:
+            self.o.w(f"{result_name} = {lst}(pop_idx)")
+        self.o.w("if (pop_n > 1) then")
+        self.o.push()
+        self.o.w(f"{lst} = [{lst}(:pop_idx - 1), {lst}(pop_idx + 1:)]")
+        self.o.pop()
+        self.o.w("else")
+        self.o.push()
+        self.o.w(f"deallocate({lst})")
+        self.o.w(f"allocate({lst}(0))")
+        self.o.pop()
+        self.o.w("end if")
+        self.o.pop()
+        self.o.w("end block")
+
+    def _full_flatten_genexpr_base(self, node):
+        """If `node` is a ListComp/GeneratorExp that chains 2+ dependent,
+        unfiltered `for` clauses purely to flatten a multi-rank array
+        before reducing over every element -- `aii for ai in a for aii in
+        ai` (each clause's own iterable is exactly the PREVIOUS clause's
+        bound name; `elt` is exactly the innermost clause's own bound
+        name, unchanged) -- return the AST node for the base array (`a`
+        above). Returns None for any other shape (a single generator, a
+        filtered generator, an elt expression that transforms the bound
+        name, generators that aren't chained this way, ...), so callers
+        can fall back to whatever they'd otherwise do.
+        """
+        if not isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+            return None
+        gens = node.generators
+        if len(gens) < 2 or any(g.ifs for g in gens) or any(not isinstance(g.target, ast.Name) for g in gens):
+            return None
+        if not (isinstance(node.elt, ast.Name) and node.elt.id == gens[-1].target.id):
+            return None
+        base = gens[0].iter
+        for i in range(1, len(gens)):
+            if not (isinstance(gens[i].iter, ast.Name) and gens[i].iter.id == gens[i - 1].target.id):
+                return None
+        return base
+
     def _rank_expr(self, node):
         if (
             isinstance(node, ast.Call)
@@ -27024,6 +27939,20 @@ class translator(ast.NodeVisitor):
                 return base_r - 1
             return 0
         if isinstance(node, ast.Compare):
+            if any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+                # `x in arr` / `x not in arr` always yields a single
+                # Python bool -- unlike `<`/`>`/`==`/etc. between two
+                # arrays (elementwise broadcasting, correctly reusing the
+                # operands' own rank below), `in`/`not in` never
+                # broadcasts, regardless of the right-hand side's own
+                # rank. Reusing the generic max-of-operand-ranks formula
+                # here wrongly inherited the membership target's rank
+                # (pyccel's own lists.py: `return (1 in a), (5 in a), (3
+                # in a)` with `a` a rank-1 list -- each element wrongly
+                # declared a rank-1 allocatable result instead of a
+                # scalar logical, crashing at runtime the moment a
+                # scalar `any(...)` result was assigned into it).
+                return 0
             r = self._rank_expr(node.left)
             for c in node.comparators:
                 r = max(r, self._rank_expr(c))
@@ -29485,7 +30414,27 @@ class translator(ast.NodeVisitor):
 
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
-                raise NotImplementedError("chained compares not supported")
+                # A Python chained comparison (`a <= b < c`) is short for
+                # the conjunction of each adjacent pair (`a <= b and b <
+                # c`) -- pyccel's own test_compare_expressions.py exercises
+                # this directly (in_range: `a <= b < c`). Decompose into
+                # pairwise ast.Compare nodes and AND their generated text
+                # together, reusing every existing single-op Compare
+                # branch below rather than duplicating its logic. Each
+                # interior operand's own expr() text is emitted twice
+                # (once as the right side of one pair, once as the left
+                # side of the next) -- a no-op for the plain Name/Constant
+                # operands this construct is normally written with, but
+                # not a fully faithful single-evaluation translation of an
+                # operand with side effects (e.g. a function call).
+                operands = [node.left] + list(node.comparators)
+                parts = []
+                for i, op in enumerate(node.ops):
+                    pair = ast.Compare(left=operands[i], ops=[op], comparators=[operands[i + 1]])
+                    ast.copy_location(pair, node)
+                    ast.fix_missing_locations(pair)
+                    parts.append(f"({self.expr(pair)})")
+                return "(" + " .and. ".join(parts) + ")"
             op = type(node.ops[0])
             if op is ast.Is or op is ast.IsNot:
                 a = node.left
@@ -30127,7 +31076,7 @@ class translator(ast.NodeVisitor):
                         if k == 1:
                             return dim_size_expr
                         return f"({dim_size_expr} - {k - 1})"
-                    return f"({self.expr(a)} + 1)"
+                    return self._scalar_idx1_expr(a, dim_size_expr)
                 # 3D ellipsis indexing, e.g. b[..., 0] or b[0, ...]
                 if isinstance(a0, ast.Constant) and a0.value is Ellipsis:
                     if self._rank_expr(node.value) == 3:
@@ -30176,7 +31125,7 @@ class translator(ast.NodeVisitor):
                 def _idx_or_slice_expr(a, dim1):
                     if isinstance(a, ast.Slice):
                         return self._slice_triplet(a, _dim_size_expr(dim1))
-                    return f"({self.expr(a)} + 1)"
+                    return self._scalar_idx1_expr(a, _dim_size_expr(dim1))
 
                 # Support NumPy axis insertion with None/newaxis by indexing in the
                 # base rank first and then inserting singleton axes via SPREAD.
@@ -30266,8 +31215,9 @@ class translator(ast.NodeVisitor):
                     idx = f"({base_first_dim_size_expr} - {k - 1})"
             else:
                 # Python indexing is 0-based; default scalar subscripts map to
-                # Fortran 1-based indices.
-                idx = f"({self.expr(node.slice)} + 1)"
+                # Fortran 1-based indices (wraparound-safe if node.slice is a
+                # bare Name flagged by maybe_negative_int_vars).
+                idx = self._scalar_idx1_expr(node.slice, base_first_dim_size_expr if base_rank > 1 else base_size_expr)
             if base_rank > 1:
                 trailing = ", ".join(":" for _ in range(base_rank - 1))
                 return f"{base}({idx}, {trailing})"
@@ -30999,8 +31949,21 @@ class translator(ast.NodeVisitor):
                         raise NotImplementedError("statistics.multimode currently supports integer iterables")
                     return f"multimode_int({x_expr})"
 
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
-                return f"conjg({self.expr(node.func.value)})"
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"conjugate", "conj"} and len(node.args) == 0:
+                # Fortran's CONJG intrinsic strictly requires COMPLEX --
+                # confirmed it rejects INTEGER and REAL too, not just
+                # LOGICAL ("'z' argument of 'conjg' intrinsic must be
+                # COMPLEX"), despite int.conjugate()/float.conjugate()/
+                # bool.conjugate() all being valid, no-op-ish calls in
+                # Python (bool.conjugate(), inherited from int since bool
+                # is an int subclass, returns an INT, not a bool -- the
+                # only one of the three that isn't a plain passthrough).
+                _base_kind = self._expr_kind(node.func.value)
+                if _base_kind == "logical":
+                    return f"merge(1, 0, {self.expr(node.func.value)})"
+                if _base_kind == "complex":
+                    return f"conjg({self.expr(node.func.value)})"
+                return self.expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
                 return self.expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist" and len(node.args) == 0:
@@ -31690,8 +32653,19 @@ class translator(ast.NodeVisitor):
                         return -int(n.operand.value)
                     return None
 
-                nd = _const_int_ndigits(node.args[1]) if len(node.args) == 2 else None
-                if nd is not None:
+                if len(node.args) == 2:
+                    # py_round_ndigits's own `ndigits` dummy argument is a
+                    # plain `integer, intent(in)` (not a compile-time
+                    # constant) -- a runtime-variable ndigits (pyccel's
+                    # own test_builtins.py: `def round_ndigits(x, i):
+                    # return round(x, i)`) works exactly the same as a
+                    # literal one, so only fall back to the constant-
+                    # folded text when the argument isn't itself a
+                    # literal (purely cosmetic: keeps the emitted Fortran
+                    # a plain integer literal instead of `int(...)` noise
+                    # for the overwhelmingly common constant-ndigits case).
+                    nd_const = _const_int_ndigits(node.args[1])
+                    nd = str(nd_const) if nd_const is not None else self.expr(node.args[1])
                     if k0 == "real":
                         a0r = a0
                     elif k0 == "logical":
@@ -31706,7 +32680,7 @@ class translator(ast.NodeVisitor):
                         # power-of-ten multiple for ndigits < 0).
                         return f"int({rounded})"
                     return rounded
-                raise NotImplementedError("round() currently supports a constant-integer ndigits argument")
+                raise NotImplementedError("round() currently supports at most 2 arguments")
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id not in self.local_func_arg_names
@@ -31735,6 +32709,28 @@ class translator(ast.NodeVisitor):
                     return f"{bare_math_map[bare_name]}({a0_expr})"
                 if bare_name == "sum" and len(node.args) in {1, 2}:
                     a0 = node.args[0]
+                    _flatten_base = self._full_flatten_genexpr_base(a0)
+                    if _flatten_base is not None:
+                        # sum(aii for ai in a for aii in ai) -- pyccel's
+                        # own test_epyccel_generators.py -- chains
+                        # multiple dependent `for` clauses purely to
+                        # flatten a multi-rank array before summing every
+                        # element (each clause's iterable is exactly the
+                        # previous clause's own bound name, with no
+                        # filters anywhere, ending in `elt` being the
+                        # innermost bound name unchanged). This project's
+                        # general GeneratorExp/ListComp lowering only ever
+                        # accepts a single generator -- but there's no
+                        # need to lower this shape element-by-element at
+                        # all: Fortran's own SUM intrinsic with no `dim=`
+                        # argument already reduces over every element of
+                        # an array regardless of its rank, exactly
+                        # matching what this nested-flatten idiom computes.
+                        base_expr = self.expr(_flatten_base)
+                        reduced = f"sum({base_expr})"
+                        if len(node.args) == 2:
+                            return f"({reduced} + {self.expr(node.args[1])})"
+                        return reduced
                     a0_expr = self.expr(a0)
                     if self._expr_kind(a0) == "logical":
                         reduced = f"count({a0_expr})"
@@ -31817,9 +32813,35 @@ class translator(ast.NodeVisitor):
                 return f"int({a0}, kind={_target_kind})"
             if isinstance(node.func, ast.Name) and node.func.id == "complex":
                 if len(node.args) == 2:
-                    return f"cmplx(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp), kind=dp)"
+                    a0 = self.expr(node.args[0])
+                    a1 = self.expr(node.args[1])
+                    if self._expr_kind(node.args[0]) == "complex" or self._expr_kind(node.args[1]) == "complex":
+                        # Python's complex(re, im) computes re + im*1j
+                        # using full COMPLEX arithmetic when either
+                        # argument is itself complex (pyccel's own
+                        # complex_func.py: complex(1, -2j) == (3-0j),
+                        # complex(2.8-7j, 1) == (2.8-6j), etc.) -- simply
+                        # taking each argument's real part (as the plain
+                        # real/int case below does) silently discards
+                        # this rotation by 1j.
+                        return f"(cmplx({a0}, kind=dp) + cmplx({a1}, kind=dp) * (0.0_dp, 1.0_dp))"
+                    return f"cmplx(real({a0}, kind=dp), real({a1}, kind=dp), kind=dp)"
                 if len(node.args) == 1:
-                    return f"cmplx(real({self.expr(node.args[0])}, kind=dp), 0.0_dp, kind=dp)"
+                    # Python's complex(z) with a SINGLE argument that is
+                    # already complex returns z unchanged (both real and
+                    # imaginary parts preserved) -- e.g. numpy_sign.py's
+                    # own complex_pos(): `complex(1 + 2j)` must stay
+                    # `1+2j`, not collapse to its real part with a
+                    # fabricated zero imaginary part. Fortran's CMPLX
+                    # intrinsic disallows passing a second (Y) argument
+                    # when X is itself complex, so a complex argument
+                    # needs its own single-argument `cmplx(x, kind=dp)`
+                    # form (kind-conversion only); a real/int argument
+                    # still gets the real-plus-zero-imaginary form.
+                    a0 = self.expr(node.args[0])
+                    if self._expr_kind(node.args[0]) == "complex":
+                        return f"cmplx({a0}, kind=dp)"
+                    return f"cmplx(real({a0}, kind=dp), 0.0_dp, kind=dp)"
                 raise NotImplementedError("complex() expects one or two arguments")
             if (
                 isinstance(node.func, ast.Attribute)
@@ -31895,6 +32917,38 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("bytearray(...) currently supports bytearray(character[, 'ascii'/'utf-8'])")
             if isinstance(node.func, ast.Name) and node.func.id == "type" and len(node.args) == 1:
                 a0 = node.args[0]
+                # A direct `np.XXX(...)`/`numpy.XXX(...)` scalar-cast
+                # call names its own numpy dtype unambiguously -- prefer
+                # that over the general kind/rank-tag dispatch below,
+                # which can't always tell a numpy scalar apart from a
+                # plain Python one (e.g. np.float64(x) and a plain
+                # float(x) are BOTH represented as real(kind=dp); only
+                # np.float32 happens to have a genuinely different
+                # Fortran kind to key off of). Doesn't follow an
+                # intermediate variable back to its own constructing
+                # call (e.g. `x = np.int16(3); type(x)`) -- narrower than
+                # a fully general fix, but covers the direct-argument
+                # shape pyccel's own tests/pyccel/scripts/
+                # runtest_type_print.py actually exercises.
+                _np_scalar_ctor_names = {
+                    "int8", "int16", "int32", "int64",
+                    "float32", "float64",
+                    "complex64", "complex128",
+                }
+                if (
+                    isinstance(a0, ast.Call)
+                    and isinstance(a0.func, ast.Attribute)
+                    and isinstance(a0.func.value, ast.Name)
+                    and a0.func.value.id in {"np", "numpy"}
+                    and a0.func.attr in _np_scalar_ctor_names
+                ):
+                    return fstr(f"<class 'numpy.{a0.func.attr}'>")
+                if self._rank_expr(a0) > 0:
+                    # Any numpy array, whatever its own element dtype, is
+                    # a numpy.ndarray -- previously fell straight through
+                    # to the scalar element-kind dispatch below (e.g.
+                    # type(np.ones(3)) wrongly returned "<class 'float'>").
+                    return fstr("<class 'numpy.ndarray'>")
                 k0 = self._expr_kind(a0)
                 rtag = self._expr_real_kind_tag(a0)
                 if k0 == "real" and rtag == "real32":
@@ -31907,6 +32961,12 @@ class translator(ast.NodeVisitor):
                     return fstr("<class 'bool'>")
                 if k0 == "char":
                     return fstr("<class 'str'>")
+                if k0 == "complex":
+                    # Previously missing entirely -- any complex value
+                    # (a plain Python complex(...), not caught by the
+                    # direct-np.-call check above) fell all the way
+                    # through to the generic "unknown" fallback.
+                    return fstr("<class 'complex'>")
                 return fstr("unknown")
             if isinstance(node.func, ast.Name) and node.func.id == "repr" and len(node.args) == 1:
                 return f"py_str({self.expr(node.args[0])})"
@@ -36644,7 +37704,18 @@ class translator(ast.NodeVisitor):
             if node.attr == "real":
                 return f"real({self.expr(node.value)}, kind=dp)"
             if node.attr == "imag":
-                return f"aimag({self.expr(node.value)})"
+                # Fortran's AIMAG intrinsic strictly requires COMPLEX --
+                # a real/int/bool .imag (Python: always 0, but int- or
+                # bool-valued for a non-float base, e.g. (5).imag == 0,
+                # an int, not (5.5).imag == 0.0, a float) previously
+                # called aimag() unconditionally, a hard "'z' argument
+                # of 'aimag' intrinsic must be COMPLEX".
+                _base_kind = self._expr_kind(node.value)
+                if _base_kind == "complex":
+                    return f"aimag({self.expr(node.value)})"
+                if _base_kind == "real":
+                    return "0.0_dp"
+                return "0"
             if node.attr == "shape":
                 if self._is_pandas_df_ref_node(node.value):
                     # The vendored DataFrame_index_date `shape()` overload is
@@ -37655,6 +38726,29 @@ class translator(ast.NodeVisitor):
                     self.alloc_log_rank.pop(tname, None)
                     self.alloc_char_rank.pop(tname, None)
                     self.alloc_complex_rank.pop(tname, None)
+                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    _nv = node.value
+                    _is_neg_int_lit = (
+                        isinstance(_nv, ast.UnaryOp)
+                        and isinstance(_nv.op, ast.USub)
+                        and isinstance(_nv.operand, ast.Constant)
+                        and isinstance(_nv.operand.value, int)
+                        and not isinstance(_nv.operand.value, bool)
+                        and _nv.operand.value > 0
+                    ) or (
+                        isinstance(_nv, ast.Constant)
+                        and isinstance(_nv.value, int)
+                        and not isinstance(_nv.value, bool)
+                        and _nv.value < 0
+                    )
+                    if _is_neg_int_lit:
+                        # See maybe_negative_int_vars's own comment at its
+                        # __init__ declaration: this variable might hold a
+                        # negative value at runtime, so a bare-Name
+                        # subscript using it needs Python's own wraparound
+                        # indexing, not the plain (v + 1) every other
+                        # scalar index still gets.
+                        self.maybe_negative_int_vars.add(node.targets[0].id)
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
@@ -43837,31 +44931,33 @@ class translator(ast.NodeVisitor):
             # Preserve None in state only; optional-call lowering omits it.
             return
 
-        # x = list_var.pop()
+        # x = list_var.pop() / x = list_var.pop(idx)
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
             and v.func.attr == "pop"
             and isinstance(v.func.value, ast.Name)
+            and len(v.args) <= 1
         ):
             lst = self._resolve_list_alias(v.func.value.id)
-            if len(v.args) != 0:
-                raise NotImplementedError("pop with index is not yet supported")
             if self._rank_expr(ast.Name(id=lst, ctx=ast.Load())) != 1:
                 raise NotImplementedError("pop currently supports only rank-1 list-backed arrays")
             self.o.w(f"if (.not. allocated({lst}) .or. size({lst}) <= 0) stop 'pop from empty list'")
-            self.o.w(f"{t.id} = {lst}(size({lst}))")
-            self.o.w(f"if (size({lst}) > 1) then")
-            self.o.push()
-            self.o.w(f"{lst} = {lst}(:size({lst}) - 1)")
-            self.o.pop()
-            self.o.w("else")
-            self.o.push()
-            self.o.w(f"deallocate({lst})")
-            self.o.w(f"allocate({lst}(0))")
-            self.o.pop()
-            self.o.w("end if")
+            if len(v.args) == 0:
+                self.o.w(f"{t.id} = {lst}(size({lst}))")
+                self.o.w(f"if (size({lst}) > 1) then")
+                self.o.push()
+                self.o.w(f"{lst} = {lst}(:size({lst}) - 1)")
+                self.o.pop()
+                self.o.w("else")
+                self.o.push()
+                self.o.w(f"deallocate({lst})")
+                self.o.w(f"allocate({lst}(0))")
+                self.o.pop()
+                self.o.w("end if")
+                return
+            self._emit_indexed_pop(lst, v.args[0], t.id)
             return
 
         # x = random.random() -> call random_number(x)
@@ -48710,6 +49806,20 @@ class translator(ast.NodeVisitor):
                 return
             if self.function_result_name is None:
                 raise NotImplementedError("return value only supported in function context")
+            if self.void_return and is_none(node.value):
+                # This whole function is void (see void_return's own
+                # comment at its translator-instance assignment site in
+                # _emit_local_function) -- `return None` here is just
+                # another early-exit guard clause, exactly like a bare
+                # `return`, not a genuine Optional-result sentinel (that
+                # convention below is only correct when this SAME
+                # function also has a real value-returning return
+                # elsewhere). Emitting the "-1"/deallocate sentinel
+                # assignment here would reference this function's own
+                # result variable, which -- correctly -- was never
+                # declared at all for a function classified as void.
+                self.o.w("return")
+                return
             # `return None` from a function that otherwise returns an array
             # (e.g. a sentinel for "invalid input, bail out") -- an
             # unallocated result stands in for None; see the matching
@@ -51478,15 +52588,16 @@ class translator(ast.NodeVisitor):
             self.o.w("end block")
             return
 
-        if isinstance(c.func, ast.Attribute) and c.func.attr == "pop":
+        if isinstance(c.func, ast.Attribute) and c.func.attr == "pop" and len(c.args) <= 1:
             if not isinstance(c.func.value, ast.Name):
                 raise NotImplementedError("pop target must be a name")
-            if len(c.args) != 0:
-                raise NotImplementedError("pop with index is not yet supported")
             name = self._resolve_list_alias(c.func.value.id)
             if self._rank_expr(ast.Name(id=name, ctx=ast.Load())) != 1:
                 raise NotImplementedError("pop currently supports only rank-1 list-backed arrays")
             self.o.w(f"if (.not. allocated({name}) .or. size({name}) <= 0) stop 'pop from empty list'")
+            if len(c.args) == 1:
+                self._emit_indexed_pop(name, c.args[0])
+                return
             self.o.w(f"if (size({name}) > 1) then")
             self.o.push()
             self.o.w(f"{name} = {name}(:size({name}) - 1)")
@@ -51497,6 +52608,38 @@ class translator(ast.NodeVisitor):
             self.o.w(f"allocate({name}(0))")
             self.o.pop()
             self.o.w("end if")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and c.func.attr == "clear"
+            and isinstance(c.func.value, ast.Name)
+            and len(c.args) == 0
+            and not c.keywords
+            and self._rank_expr(ast.Name(id=self._resolve_list_alias(c.func.value.id), ctx=ast.Load())) == 1
+        ):
+            # list_var.clear() -- pyccel's own lists.py: clear_1/clear_2.
+            # Empty the list in place, matching the existing "shrink to
+            # zero elements" branch already used by pop()'s own last-
+            # element-removed case.
+            name = self._resolve_list_alias(c.func.value.id)
+            self.o.w(f"if (allocated({name})) deallocate({name})")
+            self.o.w(f"allocate({name}(0))")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and c.func.attr == "reverse"
+            and isinstance(c.func.value, ast.Name)
+            and len(c.args) == 0
+            and not c.keywords
+            and self._rank_expr(ast.Name(id=self._resolve_list_alias(c.func.value.id), ctx=ast.Load())) == 1
+        ):
+            # list_var.reverse() -- pyccel's own lists.py: list_reverse.
+            # In-place reversal via a negative-stride whole-array section
+            # (safe even for a length-0 or length-1 array).
+            name = self._resolve_list_alias(c.func.value.id)
+            self.o.w(f"{name} = {name}(size({name}):1:-1)")
             return
 
         def _emit_sys_exit_call(exit_name, args):
@@ -56299,6 +57442,13 @@ def _emit_local_function(
         elif rk0 == "char":
             tr._mark_char(ret_name)
     void_return = (not tuple_return) and (not dict_return) and (len(returns) == 0)
+    # Consulted by visit_Return: a `return None` inside an otherwise-
+    # void function (every OTHER return is a bare `return`/`return
+    # None` too -- see void_return's own computation) must emit a bare
+    # `return`, not the "-1" Optional-int sentinel assignment that's
+    # correct ONLY when this same function ALSO has a genuine value-
+    # returning return elsewhere (a real Optional[int]-style result).
+    tr.void_return = void_return
 
     # Normalize tuple-unpacked locals from name sources (e.g. `x0, x1 = x`)
     # so element kinds follow the source collection kind.
@@ -59070,7 +60220,7 @@ def _emit_local_function(
             ret_decl = "complex(kind=dp)"
         elif user_class_ann_text(fn.returns) in dict(user_class_types or {}):
             ret_decl = f"type({dict(user_class_types or {})[user_class_ann_text(fn.returns)]})"
-        elif _all_returns_same_struct_type(fn, tr.dict_typed_vars) is not None:
+        elif _all_returns_same_struct_type(fn, tr.dict_typed_vars, user_class_types) is not None:
             # No explicit `-> T` return annotation, but every `return`
             # statement hands back a bare struct-typed variable/parameter
             # (all the same class) -- e.g. pyccel's own `choose_A(a1, a2,
@@ -59080,7 +60230,7 @@ def _emit_local_function(
             # real/int default (int, since neither ret_spec nor any
             # earlier branch matched), and the body's own `func_res = a1`
             # (a TYPE(a_t)) failed to compile against it.
-            ret_decl = f"type({_all_returns_same_struct_type(fn, tr.dict_typed_vars)})"
+            ret_decl = f"type({_all_returns_same_struct_type(fn, tr.dict_typed_vars, user_class_types)})"
         elif ret_spec in {"real", "complex", "logical", "char"}:
             if ret_spec == "real":
                 ret_decl = "real(kind=dp)"
@@ -59433,7 +60583,21 @@ def _emit_local_function(
             continue
         if isinstance(s, ast.Return):
             # Avoid emitting a redundant RETURN when this is the final statement.
-            if s.value is not None:
+            # `return None` inside an otherwise-void function (void_return,
+            # computed above from _value_returns_excluding_nested, which
+            # already excludes is_none(...) returns) is just another
+            # early-exit guard clause, not a genuine Optional-result
+            # sentinel -- e.g. Burkardt-style `def timestamp(): ...;
+            # return None` with no other return anywhere. This loop-level
+            # Return handling is a SEPARATE, duplicate copy of
+            # translator.visit_Return's own equivalent check (which
+            # already guards this correctly via self.void_return) --
+            # without the same guard here, `s.value is not None` is still
+            # True for a `Constant(value=None)` node, so this fell through
+            # into the value-returning branch below and emitted
+            # `{function_result_name} = -1`, referencing a result variable
+            # that -- correctly -- was never declared for a void function.
+            if s.value is not None and not (void_return and is_none(s.value)):
                 if tuple_return:
                     if (
                         isinstance(s.value, ast.Call)
@@ -63359,6 +64523,35 @@ def generate_flat(
                     if _kw.arg in _cb_params and isinstance(_kw.value, ast.Name):
                         _merge_actual_cb_spec(_callee_name, _kw.arg, _kw.value.id)
 
+        # A callback parameter's own DEFAULT value (e.g. pyccel's own
+        # highorder_functions.py: `def high_valuedarg_1(a: int, function:
+        # "(int)(int)" = f1): ...`) is just as authoritative evidence of
+        # its actual shape as an explicit call-site argument -- arguably
+        # more so, since a caller that never overrides it (`x =
+        # high_valuedarg_1(2)`) relies ENTIRELY on the default's own
+        # signature. The explicit-call-site scan just above only walks
+        # ast.Call nodes' own .args/.keywords, never a function's own
+        # ast.arguments.defaults, so a callback param whose default is
+        # NEVER explicitly overridden anywhere had no actual-shape
+        # evidence at all -- falling back to the generic "real" default
+        # and producing a genuine Fortran interface-mismatch build error
+        # once the default got materialized into an explicit actual
+        # argument at the call site (test_valuedarg_1: high_valuedarg_1(2)
+        # -> high_valuedarg_1(2, f1), f1 returning int, not real).
+        for _fn_node in local_funcs or []:
+            if not isinstance(_fn_node, ast.FunctionDef):
+                continue
+            _callee_name = _fn_node.name
+            _cb_params = set(local_func_callback_params.get(_callee_name, set()))
+            if not _cb_params:
+                continue
+            _pos_args = list(_fn_node.args.args)
+            _defaults = list(_fn_node.args.defaults)
+            if _defaults:
+                for _arg_node, _dflt in zip(_pos_args[len(_pos_args) - len(_defaults):], _defaults):
+                    if _arg_node.arg in _cb_params and isinstance(_dflt, ast.Name):
+                        _merge_actual_cb_spec(_callee_name, _arg_node.arg, _dflt.id)
+
         for _fn_node in local_funcs or []:
             if not isinstance(_fn_node, ast.FunctionDef):
                 continue
@@ -64256,7 +65449,15 @@ def generate_flat(
     def _has_value_return_in_body(stmts):
         for st in stmts:
             if isinstance(st, ast.Return):
-                if st.value is not None:
+                # `return None` (an explicit None-constant return, e.g.
+                # an early-exit guard clause) is semantically VOID --
+                # identical to a bare `return` -- but st.value IS a
+                # real ast.Constant(None) node here, not Python's own
+                # None, so a naive `st.value is not None` check treated
+                # it as a genuine value-carrying return, keeping an
+                # otherwise-void function out of local_void_funcs (see
+                # this same fix's twin in _value_returns_excluding_nested).
+                if st.value is not None and not is_none(st.value):
                     return True
                 continue
             # Do not inspect nested scopes when classifying this function.
@@ -66205,8 +67406,16 @@ def generate_flat(
     # module. remove_unused_ieee_arithmetic_use prunes this back out
     # per program/module unit when its own body has no ieee symbols.
     o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan, ieee_positive_inf, ieee_negative_inf")
-    if not use_proc_module:
-        o.w("use, intrinsic :: iso_fortran_env, only: real32, real64, int8, int16, int32, int64")
+    # Always emitted (even in proc-module mode, where dp/sp already come
+    # from the proc module's own `use`): a literal kind-suffixed integer
+    # (e.g. `int(3_int32, kind=int32)`, from np.int32(...)-style casts)
+    # can appear directly in the program's own exec-level code even when
+    # every local function lives in a module -- the module's own `use
+    # ..., only: dp, ...` re-export never includes raw kind names like
+    # int32. remove_unused_use_only_imports prunes this back down to
+    # just what's actually referenced (via kind-suffix detection), per
+    # program/module unit, exactly like it already does for the module.
+    o.w("use, intrinsic :: iso_fortran_env, only: real32, real64, int8, int16, int32, int64")
     o.w("implicit none")
     if not use_proc_module:
         o.w("integer, parameter :: sp = real32")
@@ -67164,6 +68373,9 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = ast.parse(src_text, filename=source_name)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
+    tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
@@ -67174,6 +68386,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
+    tree = rewrite_call_attribute_access_to_temp(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
@@ -67453,7 +68666,20 @@ def prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=N
         if fn is None:
             continue
         needed.add(name)
-        for ref in _local_function_refs(fn.body, local_names):
+        # A default value on one of fn's own parameters (e.g. pyccel's own
+        # highorder_functions.py: `def high_valuedarg_1(a, function:
+        # "(int)(int)" = f1): ...`) can itself reference another local
+        # function -- structurally a sibling of fn.body on the
+        # FunctionDef node (fn.args.defaults/kw_defaults), not part of
+        # fn.body itself, so a scan of fn.body alone never discovers it.
+        # An unreferenced-elsewhere default like `f1` above was pruned
+        # from the output entirely even though a caller that relies on
+        # the default (`high_valuedarg_1(2)`, no explicit override) gets
+        # it materialized into an explicit actual argument at the call
+        # site later, in transpile_file's own default-argument-expansion
+        # pass -- referencing a symbol that no longer exists.
+        _default_nodes = list(fn.args.defaults) + [d for d in fn.args.kw_defaults if d is not None]
+        for ref in _local_function_refs(fn.body, local_names) | _local_function_refs(_default_nodes, local_names):
             if ref not in needed:
                 queue.append(ref)
 
@@ -67487,6 +68713,9 @@ def transpile_file(
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
+    tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
@@ -67497,6 +68726,7 @@ def transpile_file(
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
+    tree = rewrite_call_attribute_access_to_temp(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
@@ -67511,6 +68741,7 @@ def transpile_file(
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
+    tree = rewrite_call_attribute_access_to_temp(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     tree = normalize_scipy_submodule_attribute_calls(tree)
@@ -68166,6 +69397,9 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = ast.parse(src)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
+    tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
+    tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
@@ -68176,6 +69410,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_nested_callback_functions_to_toplevel(tree)
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
+    tree = rewrite_call_attribute_access_to_temp(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     validate_imports_supported(tree, py_path)
