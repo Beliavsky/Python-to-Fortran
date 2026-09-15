@@ -14883,6 +14883,53 @@ def test_inline_reassigned_parameter_preserves_call_semantics(body: str) -> None
     assert expected[1] == [-1, 0, 5]
 
 
+@pytest.mark.parametrize("inferred, comment, expected", [
+    ("real", "int", "real"),
+    ("alloc_real", "int", "alloc_real"),
+    ("complex", "int", "complex"),
+    ("alloc_complex", "real", "alloc_complex"),
+    ("int", "int", "int"),
+    ("int", "real", "real"),
+    (None, "int", "int"),
+])
+def test_numeric_comment_kind_does_not_narrow(inferred, comment, expected) -> None:
+    assert xp2f._numeric_comment_kind(inferred, comment) == expected
+
+
+@pytest.mark.parametrize("sentinel", ["np.inf", "-np.inf", "np.nan", "float('inf')", "2.5"])
+def test_xp2f_tuple_return_preserves_real_sentinel(tmp_path: Path, sentinel: str) -> None:
+    # Burkardt matrix_chain_brute documents the final cost as integer,
+    # but its local cost also holds infinity. Comments cannot narrow the
+    # storage required by executable assignments, including fractional values.
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xreal_sentinel.py",
+        [
+            "import numpy as np",
+            "def integer_cost(n):",
+            "    total = 0",
+            "    for i in range(n):",
+            "        total = total + i",
+            "    return total",
+            "def search(n):",
+            "    # Output:",
+            "    # integer cost: the minimal cost.",
+            "    if n == 0:",
+            "        cost = 0",
+            "        return cost, n",
+            "    cost = " + sentinel,
+            "    for i in range(n):",
+            "        candidate = integer_cost(i)",
+            "        if i > 0:",
+            "            cost = candidate",
+            "    return cost, n",
+            "for n in range(3):",
+            "    cost, count = search(n)",
+            "    print(float(cost), count)",
+        ],
+    )
+
+
 def test_xp2f_inline_reassigned_parameter_wrap_compile_diff(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(
         tmp_path,

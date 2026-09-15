@@ -59849,7 +59849,7 @@ def _emit_local_function(
                 if isinstance(_src0, str):
                     comment_kind_hint, comment_rank_hint = _comment_arg_spec_hint_for_emit(fn, _src0)
                     if comment_kind_hint in {"int", "real", "logical", "char", "complex"}:
-                        kind_hint = comment_kind_hint
+                        kind_hint = _numeric_comment_kind(kind_hint, comment_kind_hint)
                         if comment_rank_hint is not None:
                             rank_hint = max(rank_hint, int(comment_rank_hint))
                 if isinstance(_src0, str) and _src0 in arg_meta:
@@ -60260,7 +60260,7 @@ def _emit_local_function(
                 if _body_kind is not None and kind_hint in {None, "real", "int", "logical", "complex", "char"}:
                     kind_hint = _body_kind
             if comment_kind_hint in {"int", "real", "logical", "char", "complex"}:
-                kind_hint = comment_kind_hint
+                kind_hint = _numeric_comment_kind(kind_hint, comment_kind_hint)
                 if comment_rank_hint is not None:
                     rank_hint = max(rank_hint, int(comment_rank_hint))
             if kind_hint in {"int", "alloc_int"}:
@@ -61221,6 +61221,15 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
         ):
             result[fn.name] = ("DataFrame_str_index", [], None)
     return result
+
+
+def _numeric_comment_kind(inferred_kind, comment_kind):
+    """Do not let a documentation hint narrow known floating-point storage."""
+    if inferred_kind in {"complex", "alloc_complex"} and comment_kind in {"int", "real"}:
+        return inferred_kind
+    if inferred_kind in {"real", "alloc_real"} and comment_kind == "int":
+        return inferred_kind
+    return comment_kind
 
 
 def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None, user_class_types=None, structured_type_components=None):
@@ -65851,7 +65860,8 @@ def generate_flat(
                 continue
             _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _nm)
             if _ck in {"int", "real", "logical", "char", "complex"}:
-                base_kinds[_i] = _ck
+                _dk, _dr = _name_direct_assign_spec(fn, _nm, _tr_fn)
+                base_kinds[_i] = _numeric_comment_kind(_dk, _ck)
                 if _cr is not None:
                     base_ranks[_i] = max(int(base_ranks[_i]), int(_cr))
                 refined_any = True
@@ -67394,7 +67404,9 @@ def generate_flat(
                                             continue
                                         _ck_comment, _cr_comment = _comment_arg_spec_hint_for_fn(fn, _src_comment)
                                         if _ck_comment in {"int", "real", "logical", "char", "complex"}:
-                                            _ok_comment[_j_comment] = _ck_comment
+                                            _ok_comment[_j_comment] = _numeric_comment_kind(
+                                                _ok_comment[_j_comment], _ck_comment
+                                            )
                                             if _cr_comment is not None:
                                                 _or_comment[_j_comment] = max(int(_or_comment[_j_comment]), int(_cr_comment))
                                             _changed_comment = True
