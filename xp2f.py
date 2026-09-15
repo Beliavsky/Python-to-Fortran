@@ -20539,6 +20539,23 @@ def inline_simple_value_returning_local_functions(exec_body, local_funcs):
                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
                         local_names.add(n.id)
         mapping = dict(zip(param_names, call_args))
+        argument_bindings = []
+        if local_names.intersection(param_names):
+            # A reassigned parameter is a local binding, not a permanent
+            # alias for the original argument expression. Capture ALL actual
+            # arguments first, in call order, so later loads see reassigned
+            # values without re-evaluating arguments or changing the caller.
+            local_names.update(param_names)
+            for param, arg in zip(param_names, call_args):
+                bound_name = f"{param}{suffix}"
+                binding = ast.Assign(
+                    targets=[ast.Name(id=bound_name, ctx=ast.Store())],
+                    value=copy.deepcopy(arg),
+                )
+                ast.copy_location(binding, target_node)
+                ast.fix_missing_locations(binding)
+                argument_bindings.append(binding)
+                mapping[param] = ast.Name(id=bound_name, ctx=ast.Load())
         local_rename = {nm: f"{nm}{suffix}" for nm in local_names}
 
         class _Subst(ast.NodeTransformer):
@@ -20559,7 +20576,7 @@ def inline_simple_value_returning_local_functions(exec_body, local_funcs):
         assign_stmt = ast.Assign(targets=[copy.deepcopy(target_node)], value=ret_expr)
         ast.copy_location(assign_stmt, target_node)
         ast.fix_missing_locations(assign_stmt)
-        return new_body[:-1] + [assign_stmt]
+        return argument_bindings + new_body[:-1] + [assign_stmt]
 
     def _make_inliner(exclude_name=None):
         class _Inliner(ast.NodeTransformer):

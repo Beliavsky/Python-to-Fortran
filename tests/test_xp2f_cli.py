@@ -14846,6 +14846,70 @@ def test_xp2f_tuple_assign_subscript_target_swap(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("body", [
+    "value = lo + ((value - lo) % (hi - lo + 1))\nreturn value",
+    "before = value\nvalue = value + lo\nvalue = value * hi\nreturn before + value",
+    "value = lo\nlo = hi\nhi = value\nreturn value + lo + hi",
+])
+def test_inline_reassigned_parameter_preserves_call_semantics(body: str) -> None:
+    # Execute the transformed AST as Python to isolate the inliner from
+    # subsequent type inference and Fortran postprocessing.
+    source = "def helper(value, lo, hi):\n" + "\n".join(
+        "    " + line for line in body.splitlines()
+    ) + "\nresult = helper(actual(-1), actual(0), actual(5))\n"
+
+    def execute(module):
+        seen = []
+
+        def actual(value):
+            seen.append(value)
+            return value
+
+        namespace = {"actual": actual}
+        exec(compile(ast.fix_missing_locations(module), "<inline-test>", "exec"), namespace)
+        return namespace["result"], seen
+
+    expected = execute(ast.parse(source))
+    tree = ast.parse(source)
+    functions = [tree.body[0]]
+    statements = tree.body[1:]
+    xp2f.inline_simple_value_returning_local_functions(statements, functions)
+    assert not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "helper"
+        for statement in statements for node in ast.walk(statement)
+    )
+    assert execute(ast.Module(body=functions + statements, type_ignores=[])) == expected
+    assert expected[1] == [-1, 0, 5]
+
+
+def test_xp2f_inline_reassigned_parameter_wrap_compile_diff(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xinline_reassigned_wrap.py",
+        [
+            "def wrap(value, lo, hi):",
+            "    value = lo + ((value - lo) % (hi - lo + 1))",
+            "    return value",
+            "",
+            "def exercise(n):",
+            "    total = 0",
+            "    for i in range(n):",
+            "        left = wrap(i - 1, 0, n - 1)",
+            "        right = wrap(i + 1, 0, n - 1)",
+            "        total = total + left + right",
+            "        print(left, right)",
+            "    return total",
+            "",
+            "original = -1",
+            "wrapped = wrap(original, 0, 5)",
+            "print(original, wrapped)",
+            "answer = exercise(6)",
+            "print(answer)",
+        ],
+    )
+
+
 def test_xp2f_toplevel_array_wrongly_promoted_to_parameter(tmp_path: Path) -> None:
     # Regression test: a top-level array assigned from a literal
     # np.array([...]) and never plain-reassigned/element-assigned gets
