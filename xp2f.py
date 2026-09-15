@@ -353,7 +353,13 @@ def simplify_narrow_redundant_arith_parens(lines):
             # argument-list paren -- e.g. "acos(-1.0_dp)" -- never a
             # decorative wrapper to strip; removing it would delete the
             # call's parens entirely, not just some redundant grouping.
-            if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] == "_"):
+            # Immediately preceded by ")" is the same call-paren case one
+            # level up: FUNC(args)(index) indexes the array-valued
+            # RESULT of the preceding call (e.g. isclose_real(...)(1),
+            # from an all-scalar np.isclose() call) -- that "(index)" is
+            # exactly as mandatory as a call's own argument-list parens,
+            # never a decorative wrapper either.
+            if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] == "_" or code[m.start() - 1] == ")"):
                 return m.group(0)
             if _preceded_by_mandatory_paren_keyword(code, m.start()):
                 return m.group(0)
@@ -377,8 +383,15 @@ def simplify_narrow_redundant_arith_parens(lines):
             # argument-list, e.g. "size(k)" or "sqrt(n)" -- never strip
             # that. A decorative wrapper always has something else (an
             # operator, comma, "=", "(", or start-of-line) right before
-            # it once whitespace is skipped.
-            if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] == "_"):
+            # it once whitespace is skipped. Immediately preceded by ")"
+            # is the same case one level up: FUNC(args)(1) indexes the
+            # array-valued RESULT of the preceding call (found mining
+            # TheAlgorithms/Python's own linear_algebra/gauss_jordan.py:
+            # `not np.isclose(scalar, 0)` lowers to an all-scalar
+            # isclose_real(...)(1) call, and stripping this "(1)" down to
+            # a bare "1" left "isclose_real(...)1) then" -- a syntax
+            # error, not just a style regression).
+            if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] == "_" or code[m.start() - 1] == ")"):
                 return m.group(0)
             if _preceded_by_mandatory_paren_keyword(code, m.start()):
                 return m.group(0)
@@ -2802,6 +2815,26 @@ def is_const_int(node):
     return isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool)
 
 
+def is_const_negative_int(node):
+    """True for a compile-time-constant negative integer, however
+    spelled (a literal `-7`, or a bare negative `ast.Constant` such as
+    the one produced by constant-folding). Python's `int ** int` is
+    only ever an int when the exponent is non-negative -- a NEGATIVE
+    integer exponent always makes the result a float (e.g. `10**-7`
+    == 1e-07), so this is used to catch that case statically wherever
+    the exponent is a literal (found mining TheAlgorithms/Python's own
+    bisection.py: `abs(start - mid) > 10**-7` silently evaluated as
+    `> 0` in Fortran, since bare integer `**` with a negative exponent
+    computes 1 divided by a large integer via INTEGER division,
+    i.e. 0 -- turning the loop's convergence threshold into zero and
+    hanging it in an effectively infinite loop)."""
+    if is_const_int(node):
+        return node.value < 0
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) and is_const_int(node.operand):
+        return node.operand.value > 0
+    return False
+
+
 def is_const_str(node):
     return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
@@ -2937,6 +2970,17 @@ def const_int_expr_to_fortran(node, allowed_names=None):
         if isinstance(node.op, ast.Mult):
             return f"({left} * {right})"
         if isinstance(node.op, ast.Pow):
+            # Same reasoning as the ast.Div case just below: a NEGATIVE
+            # integer exponent always makes Python's int ** int a float
+            # (10**-7 == 1e-07), so it's never a valid integer-constant
+            # expression either -- returning None here (rather than
+            # emitting `(left ** right)`, which Fortran would evaluate
+            # as bare INTEGER exponentiation, silently truncating to 0)
+            # falls through to the normal real-valued codegen path,
+            # which itself already coerces the base to real for exactly
+            # this case (see is_const_negative_int).
+            if is_const_negative_int(node.right):
+                return None
             return f"({left} ** {right})"
         if isinstance(node.op, ast.FloorDiv):
             return f"({left} / {right})"
@@ -13182,7 +13226,7 @@ def detect_needed_helpers(tree):
         "savetxt": {"savetxt_real_2d"},
         "pad": {"pad2d_int", "pad2d_real"},
         "allclose": {"allclose"},
-        "isclose": {"isclose_real"},
+        "isclose": {"isclose_real", "isclose_scalar_real"},
         "isfinite": {"complex_isfinite"},
         "isinf": {"complex_isinf"},
         "isnan": {"complex_isnan"},
@@ -23244,6 +23288,11 @@ class translator(ast.NodeVisitor):
             if isinstance(node.op, ast.Mult):
                 if (lk == "char" and rk == "int") or (lk == "int" and rk == "char"):
                     return "char"
+            if isinstance(node.op, ast.Pow) and lk == "int" and rk == "int" and is_const_negative_int(node.right):
+                # Python's int ** int stays int only for a non-negative
+                # exponent -- a literal negative one always produces a
+                # float (10**-7 == 1e-07). See is_const_negative_int.
+                return "real"
             if lk == "complex" or rk == "complex":
                 return "complex"
             if lk == "real" or rk == "real":
@@ -24668,19 +24717,22 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"eye", "identity"}
             ):
                 # eye/identity accept a dtype= too -- previously ignored,
-                # always declaring the result real. Only "int" is
-                # handled: the underlying eye()/identity() helper always
-                # produces a real array regardless of the requested
-                # dtype, and Fortran's own implicit real->int conversion
-                # on assignment happens to make that work correctly for
-                # an int target (every element is an exact 0.0/1.0) --
-                # but there's no equivalent implicit real->logical
-                # conversion, so claiming "logical" here without also
-                # teaching the codegen call site to wrap the result in an
-                # explicit (eye(...) /= 0) would trade a silently-wrong
-                # value for a compile-time crash instead. Left as a
-                # documented gap rather than fixed.
+                # always declaring the result real. "int" works via
+                # Fortran's own implicit real->int conversion on
+                # assignment (every element is an exact 0.0/1.0). "bool"
+                # now works too -- the eye()/identity() codegen call
+                # site (below) wraps the result in an explicit
+                # `(eye(...) /= 0)` whenever dtype=bool/logical is
+                # requested, so _expr_kind and the actual emitted text
+                # agree. Found mining TheAlgorithms/Python's own
+                # linear_algebra/jacobi_iteration_method.py:
+                # `~np.eye(n, dtype=bool)` needs a LOGICAL kind for the
+                # unary `~`/Invert codegen (`.not.`) to even be
+                # recognized; it otherwise fell through to "unsupported
+                # unary op".
                 dtype_txt = self._np_dtype_text(node)
+                if "bool" in dtype_txt:
+                    return "logical"
                 if "int" in dtype_txt:
                     return "int"
                 return "real"
@@ -24814,13 +24866,6 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr == "eye"
-            ):
-                return "real"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
                 and node.func.attr in {"triu", "tril"}
                 and len(node.args) >= 1
             ):
@@ -24890,6 +24935,23 @@ class translator(ast.NodeVisitor):
                     return "int"
                 return self._expr_kind(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
+                return self._expr_kind(node.func.value)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "tolist"
+                and len(node.args) == 0
+            ):
+                # `arr.tolist()` is a transparent pass-through of arr's
+                # own kind here (see the matching _rank_expr case for
+                # this same call, which already passes rank through) --
+                # xp2f represents the "python list" result as just the
+                # same underlying array, never a distinct runtime type.
+                # Missing this case defaulted an untyped .tolist() call
+                # used as a function's own return expression to "int"
+                # (found mining TheAlgorithms/Python's own
+                # matrix_inversion.py: `return inv_matrix.tolist()`
+                # silently truncated every element of a REAL matrix to
+                # integer 0).
                 return self._expr_kind(node.func.value)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -30495,6 +30557,15 @@ class translator(ast.NodeVisitor):
                 return f"ishft({a}, int({b}))"
             if op is ast.RShift:
                 return f"ishft({a}, -int({b}))"
+            if op is ast.Pow and lk0 == "int" and rk0 == "int" and is_const_negative_int(node.right):
+                # Matches the same rule in _expr_kind: `int ** negative_int`
+                # is always a float in Python, but bare Fortran INTEGER
+                # ** INTEGER with a negative exponent computes 1 divided
+                # by a large integer via integer division (i.e. 0),
+                # silently zeroing e.g. a `10**-7` convergence threshold.
+                # Coercing the base to real makes Fortran's ** compute
+                # the correct fractional result.
+                a = f"real({a}, kind=dp)"
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.UnaryOp):
@@ -34824,9 +34895,17 @@ class translator(ast.NodeVisitor):
                     _rtol = self._dp_cast_if_needed(_rtol_node, self.expr(_rtol_node))
                 if _atol_node is not None:
                     _atol = self._dp_cast_if_needed(_atol_node, self.expr(_atol_node))
-                _call = f"isclose_real({_a0_txt}, {_a1_txt}, {_rtol}, {_atol}, {_equal_nan})"
                 if _ra == 0 and _rb == 0:
-                    return f"{_call}(1)"
+                    # isclose_real(...)([a],[b],...)(1) -- indexing a
+                    # plain (non-pointer) array-valued function's result
+                    # right at the call site -- is a syntax error in
+                    # standard Fortran, not just non-idiomatic (confirmed
+                    # directly with gfortran; found mining
+                    # TheAlgorithms/Python's own gauss_jordan.py:
+                    # `not np.isclose(scalar, 0)`). Dispatch to the
+                    # scalar counterpart instead of wrapping/indexing.
+                    return f"isclose_scalar_real({_a0_cast}, {_a1_cast}, {_rtol}, {_atol}, {_equal_nan})"
+                _call = f"isclose_real({_a0_txt}, {_a1_txt}, {_rtol}, {_atol}, {_equal_nan})"
                 return _call
             if (
                 isinstance(node.func, ast.Attribute)
@@ -35363,7 +35442,14 @@ class translator(ast.NodeVisitor):
                 def _int_arg_expr(n):
                     txt = self.expr(n)
                     return txt if self._expr_kind(n) == "int" else f"int({txt})"
-                return f"eye({_int_arg_expr(n_node)}, {_int_arg_expr(m_node)})"
+                _eye_call = f"eye({_int_arg_expr(n_node)}, {_int_arg_expr(m_node)})"
+                if "bool" in self._np_dtype_text(node):
+                    # eye() always returns real (see _expr_kind's own
+                    # matching comment) -- dtype=bool needs an explicit
+                    # comparison to actually produce the LOGICAL result
+                    # _expr_kind now promises for this call.
+                    return f"({_eye_call} /= 0)"
+                return _eye_call
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -45219,7 +45305,44 @@ class translator(ast.NodeVisitor):
         if isinstance(t, ast.Name) and is_none(v):
             if t.id in self.dict_typed_vars:
                 return
-            # Preserve None in state only; optional-call lowering omits it.
+            if t.id in self.optional_dummy_args:
+                # A genuine optional Fortran dummy argument: present()
+                # already represents "no value" natively, no assignment
+                # needed. Preserve None in state only; optional-call
+                # lowering omits it.
+                return
+            if t.id in self.callable_aliases:
+                return
+            _anm = self._aliased_name(t.id)
+            if (
+                _anm in self.alloc_reals
+                or _anm in self.alloc_ints
+                or _anm in self.alloc_logs
+                or _anm in self.alloc_complexes
+                or _anm in self.alloc_chars
+                or _anm in self.chars
+            ):
+                return
+            # A plain scalar LOCAL manually used as a "not found yet"
+            # sentinel (e.g. `pivot_row = None` at the top of a loop
+            # body, later checked via `pivot_row is None`/`is not None`
+            # -- see the matching Compare-operator codegen, which
+            # already lowers that check to `x == -1`/`x /= -1` for
+            # exactly this non-optional, non-dict, non-alloc case) is
+            # NOT a one-time "declare as absent" event the way an
+            # Optional dummy argument is -- it needs the SAME -1
+            # sentinel value actually (re-)written every time this
+            # statement executes, or a stale value from an earlier loop
+            # iteration silently survives into the current one. Found
+            # mining TheAlgorithms/Python's own
+            # linear_algebra/gauss_jordan.py: `pivot_row = None` reset
+            # at the top of the outer `for col in range(cols):` loop was
+            # dropped entirely, so a column with no valid pivot reused
+            # the PREVIOUS column's pivot_row instead of skipping via
+            # `if pivot_row is None: continue` -- corrupting the
+            # algorithm's own output, and (dividing by the resulting
+            # wrong, often-zero pivot) crashing with SIGFPE.
+            self.o.w(f"{t.id} = -1")
             return
 
         # x = list_var.pop() / x = list_var.pop(idx)
@@ -50162,6 +50285,43 @@ class translator(ast.NodeVisitor):
                 if res_rank == 1 and rhs_rank > 1:
                     rhs_txt = self.expr(node.value)
                     expr_txt = f"reshape({rhs_txt}, [size({rhs_txt})])"
+            # `return np.array((), dtype=...)` / `return ()` -- a common
+            # "invalid input, bail out with an empty array" idiom (found
+            # mining TheAlgorithms/Python's own gaussian_elimination.py:
+            # `if rows != columns: return np.array((), dtype=float)`,
+            # alongside a normal-path `return x` where x is a genuine
+            # rank-2 array). A Fortran `[...]` array constructor is
+            # always rank 1, so when the function's OTHER return path(s)
+            # make its result rank 2+, this empty-array return needs an
+            # explicit reshape to the right rank or the two return
+            # statements disagree on rank -- a hard compile error
+            # ("Incompatible ranks N and 1 in assignment").
+            def _is_empty_array_literal_expr(n):
+                if isinstance(n, (ast.Tuple, ast.List)) and not n.elts:
+                    return True
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and is_numpy_name_node(n.func.value)
+                    and n.func.attr in {"array", "asarray"}
+                    and len(n.args) >= 1
+                    and isinstance(n.args[0], (ast.Tuple, ast.List))
+                    and not n.args[0].elts
+                ):
+                    return True
+                return False
+            if _is_empty_array_literal_expr(node.value):
+                res_nm = self.function_result_name
+                res_rank = max(
+                    int(self.alloc_real_rank.get(res_nm, 0)),
+                    int(self.alloc_int_rank.get(res_nm, 0)),
+                    int(self.alloc_log_rank.get(res_nm, 0)),
+                    int(self.alloc_complex_rank.get(res_nm, 0)),
+                    int(self.alloc_char_rank.get(res_nm, 0)),
+                )
+                if res_rank >= 2:
+                    zeros = ", ".join(["0"] * res_rank)
+                    expr_txt = f"reshape({expr_txt}, [{zeros}])"
             if expr_txt.strip().lower() != self.function_result_name.lower():
                 self.o.w(f"{self.function_result_name} = {expr_txt}")
         self.o.w("return")
@@ -50780,6 +50940,48 @@ class translator(ast.NodeVisitor):
             self.o.w("end if")
             self.o.pop()
             self.o.w("end block")
+            return
+
+        # for x in reversed(range(...)): -- a common Python idiom for
+        # counting down (found mining TheAlgorithms/Python's own
+        # gaussian_elimination.py: `for row in reversed(range(rows)):`).
+        # Reuses the SAME start/stop/step parsing and upper-bound logic
+        # as the plain forward-range case below, just running the
+        # resulting Fortran DO loop from its own upper bound down to its
+        # own start with a negated step -- both bounds are already
+        # exactly what the forward loop would use, so no new arithmetic
+        # is needed, and it's correct for any (not just unit) step.
+        if (
+            isinstance(node.target, ast.Name)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "reversed"
+            and len(node.iter.args) == 1
+            and not getattr(node.iter, "keywords", [])
+            and isinstance(node.iter.args[0], ast.Call)
+            and isinstance(node.iter.args[0].func, ast.Name)
+            and node.iter.args[0].func.id == "range"
+            and not getattr(node.iter.args[0], "keywords", [])
+        ):
+            r_start, r_stop, r_step = self._range_parts(node.iter.args[0])
+            var = node.target.id
+            if var == "_":
+                var = "i_"
+            else:
+                var = self._aliased_name(var)
+            self._mark_int(var)
+            f_start = self._as_integer_loop_expr(r_start)
+            f_step = self._as_integer_loop_expr(r_step)
+            f_upper = self._as_integer_loop_expr(r_stop, self._upper_from_stop(r_stop, r_step))
+            if is_const_int(r_step) and r_step.value == 1:
+                f_step_neg = "-1"
+            else:
+                f_step_neg = f"-({f_step})"
+            self.o.w(f"do {var} = {f_upper}, {f_start}, {f_step_neg}")
+            self.o.push()
+            _visit_loop_body_and_close_rebinds()
+            self.o.pop()
+            self.o.w("end do")
             return
 
         # for k, v in D.items() where D = {k: expr(k) for k in ITER} -- see
@@ -55475,6 +55677,24 @@ def _emit_local_function(
         current_function_name=fn.name,
         structured_type_components=structured_type_components,
     )
+    # A parameter whose Python name happens to collide with a Fortran
+    # keyword (e.g. a callback argument literally named `function`,
+    # found mining TheAlgorithms/Python's own bisection.py) is declared
+    # under its RAW name via arg_emit_map (which only special-cases
+    # "dp"/"eye"), but every body reference to it goes through
+    # _aliased_name, which independently renames any self.reserved_names
+    # hit (e.g. to "xfunction") -- with nothing syncing the two, the
+    # body silently reads an unrelated, never-declared "xfunction"
+    # instead of the actual parameter ("has no IMPLICIT type"). This is
+    # the exact same gap the df_arg_types block below already works
+    # around for DataFrame parameters specifically; generalize it to
+    # every parameter. Resolving now is idempotent (memoizes into
+    # tr.name_aliases), so it's safe even for names df_arg_types (or
+    # anything else) also resolves later.
+    for _a in args:
+        _a_alias = tr._aliased_name(_a)
+        if _a_alias != _a:
+            arg_emit_map[_a] = _a_alias
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
@@ -61561,6 +61781,26 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 continue
             rr = int(tr_ctx._rank_expr(_rhs))
             kk = tr_ctx._expr_kind(_rhs)
+            if kk is None and any(
+                isinstance(_cn, ast.Call) and isinstance(_cn.func, ast.Name) and _cn.func.id in fn_arg_names
+                for _cn in ast.walk(_rhs)
+            ):
+                # This disposable tr_ctx (unlike _emit_local_function's
+                # own per-function translator) has no visibility at all
+                # into which of fn_node's own parameters are callbacks,
+                # let alone what they return -- so _expr_kind can't
+                # resolve a call to one, however it's wrapped (e.g.
+                # `error = abs(f(a))`, found mining
+                # TheAlgorithms/Python's own
+                # maths/numerical_analysis/newton_raphson.py). Every
+                # untyped scalar callback interface this codebase emits
+                # defaults to a real argument/result regardless (see
+                # any *_cb_if interface block), so default to that same
+                # convention here rather than leaving the tuple-return
+                # element's kind (and so its declaration at every call
+                # site) undetermined -- which previously left it
+                # completely UNDECLARED ("has no IMPLICIT type").
+                kk = "real"
             if rr > best_rank:
                 best_rank = rr
                 best_kind = kk
@@ -63454,6 +63694,27 @@ def generate_flat(
                             if _bk in {"int", "real", "logical", "char", "complex"}:
                                 _kk = _bk
                                 _rr = int(tr_ctx._rank_expr(_st.value))
+                        elif _kk is None and any(
+                            isinstance(_cn, ast.Call) and isinstance(_cn.func, ast.Name)
+                            and _cn.func.id in {a.arg for a in (list(fn_node.args.args) + list(fn_node.args.kwonlyargs))}
+                            for _cn in ast.walk(_st.value)
+                        ):
+                            # tr_ctx has no visibility into which of
+                            # fn_node's own parameters are callbacks, let
+                            # alone what they return, so _expr_kind can't
+                            # resolve a call to one however it's wrapped
+                            # (e.g. `error = abs(f(a))`, found mining
+                            # TheAlgorithms/Python's own
+                            # maths/numerical_analysis/newton_raphson.py
+                            # -- left `error` with no determined kind at
+                            # all, so a caller unpacking `root, err =
+                            # newton_raphson(...)` never declared `err`,
+                            # "has no IMPLICIT type"). Every untyped
+                            # scalar callback interface this codebase
+                            # emits defaults to real regardless (see any
+                            # *_cb_if interface block) -- default to that
+                            # same convention here.
+                            _kk = "real"
                     # A bare whole-number float literal (e.g. `d = 0.0` used
                     # as a placeholder in an early-exit branch) is weak
                     # evidence for "real" and shouldn't outrank genuine int
@@ -63984,6 +64245,43 @@ def generate_flat(
                 if not any(isinstance(_x, ast.Name) and _x.id in _aliases for _x in ast.walk(_st)):
                     continue
                 for _x in ast.walk(_st):
+                    if (
+                        isinstance(_x, ast.Call)
+                        and isinstance(_x.func, ast.Attribute)
+                        and _x.func.attr == "astype"
+                        and isinstance(_x.func.value, ast.Name)
+                        and _x.func.value.id in _aliases
+                        and _x.args
+                    ):
+                        # ARG.astype(float)/.astype(np.float64)/
+                        # .astype("float64") is direct, unambiguous
+                        # evidence that ARG itself is (being converted
+                        # to) real -- much stronger than the OTHER
+                        # checks below, which only catch an unrelated
+                        # math/numpy call sharing the same statement.
+                        # Missing this meant a rebound parameter like
+                        # `vertices = vertices.astype(float).copy()`
+                        # got no real-evidence credit at all unless it
+                        # ALSO happened to appear in an unrelated np./
+                        # math. call in the same statement (found
+                        # mining TheAlgorithms/Python's own
+                        # linear_algebra/gauss_jordan.py: coefficients
+                        # got the "real" merge only because it also
+                        # appears in `np.isclose(coefficients[...], 0)`
+                        # on the very same line; vertices, identically
+                        # rebound via .astype(float).copy() but never
+                        # passed to a math/numpy call, silently got
+                        # merged back to "int" instead).
+                        _dtype_arg = _x.args[0]
+                        _dtype_txt = ""
+                        if isinstance(_dtype_arg, ast.Name):
+                            _dtype_txt = _dtype_arg.id.lower()
+                        elif isinstance(_dtype_arg, ast.Attribute):
+                            _dtype_txt = _dtype_arg.attr.lower()
+                        elif is_const_str(_dtype_arg):
+                            _dtype_txt = str(_dtype_arg.value).lower()
+                        if "float" in _dtype_txt or "complex" in _dtype_txt:
+                            return True
                     if isinstance(_x, ast.Constant) and isinstance(_x.value, (float, complex)):
                         return True
                     if isinstance(_x, ast.BinOp) and isinstance(_x.op, ast.Div):
@@ -65866,9 +66164,36 @@ def generate_flat(
                     base_ranks[_i] = max(int(base_ranks[_i]), int(_cr))
                 refined_any = True
                 continue
-            if _nm in _arg_kind_by_name:
+            if _nm in _arg_kind_by_name and _arg_rank_by_name.get(_nm, 0) == 0:
+                # _rk_h/_rr_h (and so _arg_kind_by_name) only ever carry
+                # the PLAIN scalar kind tag ("real", never "alloc_real")
+                # -- fine for the scalar case this refinement is meant
+                # for, but wrong when the tuple-return source name is
+                # itself a rank>0 REBOUND parameter (e.g. `def
+                # transform(coefficients, vertices): coefficients =
+                # coefficients.astype(float).copy(); ...; return
+                # coefficients, vertices` -- both source names match
+                # their own rank-2 parameter). Without this guard,
+                # base_kinds got overwritten with a bare "real" while
+                # base_ranks correctly kept rank 2, an inconsistent
+                # "real"+rank>0 combination that the tuple-unpack
+                # call-site declaration logic (visit_Assign's
+                # tuple_return_funcs branch) doesn't expect -- it only
+                # trusts rank when kind is already "alloc_real" (that
+                # combination is reserved for a different, deliberate
+                # vectorized-tuple case), so it silently zeroed the
+                # rank back to scalar, declaring the caller's own
+                # receiving variable as a bare real instead of a rank-2
+                # allocatable and crashing the build with "Rank
+                # mismatch" (found mining TheAlgorithms/Python's own
+                # linear_algebra/gauss_jordan.py). The sibling
+                # _name_direct_assign_spec-based refinement just below
+                # already has this exact same rank==0 guard; matching
+                # it here leaves the already-correct alloc_real-tagged
+                # base_kinds/base_ranks (from tuple_return_out_kinds's
+                # own first pass) untouched for the rank>0 case.
                 base_kinds[_i] = _arg_kind_by_name[_nm]
-                base_ranks[_i] = _arg_rank_by_name.get(_nm, 0)
+                base_ranks[_i] = 0
                 refined_any = True
                 continue
             _dk, _dr = _name_direct_assign_spec(fn, _nm, _tr_fn)

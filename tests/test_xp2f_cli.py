@@ -15668,3 +15668,444 @@ def test_xp2f_np_power_array_args_not_misdetected_as_rng_distribution(tmp_path: 
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xnp_power_rank_p.f90").read_text(encoding="utf-8")
     assert "call print_array_3d" not in out_text
+
+def test_xp2f_for_loop_reversed_range(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # linear_algebra/gaussian_elimination.py: `for row in
+    # reversed(range(rows)):` fell straight to "only for .. in range(..)
+    # or for .. in sorted(..) supported". Fixed by reusing the same
+    # start/stop/step parsing the forward-range case already has, just
+    # swapping the bounds with a negated step.
+    src = tmp_path / "xreversed_range.py"
+    src.write_text(
+        "\n".join(
+            [
+                "if __name__ == \"__main__\":",
+                "    for i in reversed(range(5)):",
+                "        print(i)",
+                "    for i in reversed(range(2, 9, 3)):",
+                "        print(i)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_return_empty_array_literal_matches_other_rank2_return(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # linear_algebra/gaussian_elimination.py: `return np.array((),
+    # dtype=float)` (an "invalid input" sentinel) alongside a normal-path
+    # `return x` where x is rank-2 crashed the build ("Incompatible
+    # ranks 2 and 1 in assignment") since a Fortran array constructor
+    # is always rank 1. Fixed by reshaping the empty-array return to
+    # match the function's actual declared rank.
+    src = tmp_path / "xempty_array_return.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "",
+                "def maybe_identity(n, m):",
+                "    if n != m:",
+                "        return np.array((), dtype=float)",
+                "    return np.zeros((n, m), dtype=float) + 1.0",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    a = maybe_identity(2, 3)",
+                "    print(a.size)",
+                "    b = maybe_identity(2, 2)",
+                "    print(b[0, 0], b[1, 1])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_parameter_named_like_fortran_keyword_function(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # maths/numerical_analysis/bisection.py: a callback parameter
+    # literally named `function` was declared under its raw name but
+    # every body reference to it was independently renamed to
+    # "xfunction" by the general Fortran-reserved-word aliasing
+    # mechanism -- with nothing syncing the two, the build failed with
+    # "Function 'xfunction' has no IMPLICIT type". Fixed by resolving
+    # (and syncing) the alias for every parameter, not just DataFrame
+    # ones (which already had this fix).
+    src = tmp_path / "xreserved_word_param.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def apply_twice(function, x):",
+                "    return function(function(x))",
+                "",
+                "",
+                "def square(x):",
+                "    return x * x",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(apply_twice(square, 2.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_int_pow_negative_literal_exponent_is_real(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # maths/numerical_analysis/bisection.py: `10**-7` (used as a
+    # convergence threshold: `abs(start - mid) > 10**-7`) compiled but
+    # silently evaluated to Fortran INTEGER 0 -- `int ** int` with a
+    # negative exponent computes 1 divided by a large integer via
+    # INTEGER division -- since Python's int**negative_int is always a
+    # float (1e-07) but xp2f emitted bare integer operands. This turned
+    # the loop's guard into `> 0`, hanging the compiled program in a
+    # genuine infinite loop (confirmed directly: the built .exe never
+    # terminated). Also affected a separate module-level
+    # constant-folding pass (the same class of bug already fixed once
+    # for `/` vs `//`, but not extended to `**`).
+    src = tmp_path / "xpow_negative_exponent.py"
+    src.write_text(
+        "\n".join(
+            [
+                "if __name__ == \"__main__\":",
+                "    x = 10**-7",
+                "    print(x)",
+                "    y = 1.0",
+                "    print(y > 10**-7)",
+                "    start = 0.0",
+                "    mid = 0.0",
+                "    print(abs(start - mid) > 10**-7)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+def test_xp2f_tolist_return_kind_matches_base_array(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # linear_algebra/matrix_inversion.py: `return inv_matrix.tolist()`
+    # silently truncated every element of a REAL matrix to integer 0.
+    # _rank_expr already passed a .tolist() call's rank through to its
+    # base array, but _expr_kind had no matching case, so an untyped
+    # .tolist() return defaulted the function's own result kind to int.
+    src = tmp_path / "xtolist_return_kind.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "",
+                "def halve(matrix):",
+                "    m = np.array(matrix) / 2.0",
+                "    return m.tolist()",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(halve([[1.0, 3.0], [5.0, 7.0]]))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_tuple_return_matching_param_name_gets_correct_rank_and_kind(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # linear_algebra/gauss_jordan.py: a local function returning a
+    # tuple of two rank-2 arrays (`return coefficients, vertices`,
+    # where BOTH names are also the function's own rebound parameters)
+    # crashed the caller-side tuple-unpack declaration with "Rank
+    # mismatch" -- a refinement pass overwrote the correct
+    # alloc_real+rank tag with a bare "real" (losing the array-ness)
+    # whenever the tuple-return source name matched a parameter name.
+    src = tmp_path / "xtuple_return_param_name_rank.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "",
+                "def halve_both(a, b):",
+                "    a = a.astype(float).copy()",
+                "    b = b.astype(float).copy()",
+                "    a[0] /= 2.0",
+                "    b[0] /= 2.0",
+                "    return a, b",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    x = np.array([[4.0, 6.0], [8.0, 10.0]])",
+                "    y = np.array([[20.0], [40.0]])",
+                "    out_x, out_y = halve_both(x, y)",
+                "    print(out_x)",
+                "    print(out_y)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_np_isclose_two_scalars_not_indexed_as_array_result(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # linear_algebra/gauss_jordan.py: `not np.isclose(scalar, 0)`
+    # lowered to `isclose_real([a], [b], ...)(1)` -- indexing a plain
+    # (non-pointer) array-valued function's result at the call site,
+    # which is a syntax error in standard Fortran (confirmed directly
+    # with gfortran), not just non-idiomatic. A separate paren-
+    # simplification pass then further mangled the already-invalid
+    # text into a different-looking syntax error, masking the real
+    # problem. Fixed by dispatching to a genuine scalar-returning
+    # isclose_scalar_real helper for the all-scalar case instead.
+    src = tmp_path / "xisclose_two_scalars.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "",
+                "def check(x, y):",
+                "    return not np.isclose(x, y)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(check(1.0, 1.0 + 1e-12))",
+                "    print(check(1.0, 2.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_none_sentinel_local_reset_every_loop_iteration(tmp_path: Path) -> None:
+    # Real, serious bug found mining TheAlgorithms/Python's own
+    # linear_algebra/gauss_jordan.py: `pivot_row = None` at the top of
+    # an outer loop body (a manual "not found yet" scalar sentinel,
+    # later checked via `pivot_row is None`) was silently dropped from
+    # the generated Fortran entirely -- the codegen's "`x = None` is a
+    # no-op, present() already represents absence" rule (correct for a
+    # genuine Optional dummy argument) was applied unconditionally to
+    # every plain-Name `= None`. Without the reset, a later outer
+    # iteration that found no match reused the PREVIOUS iteration's
+    # stale value instead of correctly skipping -- confirmed directly
+    # to crash the real algorithm with a divide-by-zero SIGFPE.
+    src = tmp_path / "xnone_sentinel_reset.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def find_it(vals):",
+                "    for col in range(2):",
+                "        pivot_row = None",
+                "        for row in range(len(vals)):",
+                "            if col == 0 and vals[row] == 2:",
+                "                pivot_row = row",
+                "                break",
+                "        if pivot_row is None:",
+                "            print(col, -1)",
+                "            continue",
+                "        print(col, pivot_row)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    find_it([1, 2, 3])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_np_eye_dtype_bool_is_logical(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # linear_algebra/jacobi_iteration_method.py: `~np.eye(n,
+    # dtype=bool)` crashed with "unsupported unary op", since
+    # _expr_kind's np.eye/np.identity handling ignored dtype=bool
+    # entirely (a previously-documented gap: "Left as a documented gap
+    # rather than fixed", since the codegen call site also needed
+    # updating). Fixed by wrapping the (always-real) eye() helper call
+    # in an explicit `(eye(...) /= 0)` whenever dtype=bool/logical is
+    # requested.
+    src = tmp_path / "xeye_dtype_bool.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(np.eye(3, dtype=bool))",
+                "    print(~np.eye(3, dtype=bool))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_tuple_return_element_from_callback_call_defaults_to_real(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # maths/numerical_analysis/newton_raphson.py: a local function
+    # returning a tuple whose ONLY evidence for one element's kind came
+    # from a callback call (`error = abs(f(a))`, then `return a,
+    # error`) left that element with no determined kind at all -- none
+    # of the kind-inference helpers used for a tuple-return element
+    # have any visibility into which of the function's own parameters
+    # are callbacks. The caller's own unpacked variable (`err` in
+    # `root, err = newton_raphson(...)`) was then never declared at
+    # all, "has no IMPLICIT type". Fixed by defaulting to real when an
+    # unresolved right-hand side calls one of the function's own
+    # parameters, matching the convention every untyped scalar
+    # callback interface this codebase emits already uses.
+    src = tmp_path / "xtuple_return_from_callback.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def root_and_residual(f, x0):",
+                "    x = x0",
+                "    for _ in range(50):",
+                "        residual = abs(f(x))",
+                "        if residual < 1e-9:",
+                "            return x, residual",
+                "        x = x - f(x) / 2.0",
+                "    return x, residual",
+                "",
+                "",
+                "def g(x):",
+                "    return x - 3.0",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    root, err = root_and_residual(g, 0.0)",
+                "    print(root, err)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout

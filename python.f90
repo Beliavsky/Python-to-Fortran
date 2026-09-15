@@ -283,6 +283,7 @@ public :: pad2d_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):i
 public :: pad2d_real !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:real(dp):intent(in) desc="2D constant pad for real matrix"
 public :: allclose !@pyapi kind=function ret=logical args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="NumPy-like allclose on 1D arrays"
 public :: isclose_real !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="element-wise version of allclose (NumPy's isclose), a or b may have length 1 to broadcast"
+public :: isclose_scalar_real !@pyapi kind=function ret=logical args=a:real(dp):intent(in),b:real(dp):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="scalar counterpart of isclose_real, for np.isclose() with two scalar arguments"
 public :: allclose_integer !@pyapi kind=function ret=logical args=a:integer(:):intent(in),b:integer(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional desc="NumPy-like allclose on 1D integer arrays"
 public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="2x2 covariance matrix for two real vectors"
 public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional desc="covariance matrix for observations in rows (numpy rowvar=False)"
@@ -6677,7 +6678,7 @@ contains
          end do
       end function allclose_integer
 
-      function isclose_real(a, b, rtol, atol, equal_nan) result(mask)
+      pure function isclose_real(a, b, rtol, atol, equal_nan) result(mask)
          ! Element-wise version of allclose_real's same tolerance test
          ! (abs(a-b) <= atol + rtol*abs(b)) and the same NaN handling
          ! (a NaN element is never "close" unless equal_nan is true and
@@ -6724,6 +6725,35 @@ contains
             end if
          end do
       end function isclose_real
+
+      pure function isclose_scalar_real(a, b, rtol, atol, equal_nan) result(is_close)
+         ! Scalar counterpart of isclose_real, same tolerance test and
+         ! NaN handling -- needed because a plain (non-pointer) array-
+         ! valued function's result can't be indexed at the call site in
+         ! standard Fortran (`isclose_real([a], [b], ...)(1)` is a
+         ! syntax error, not just non-idiomatic: confirmed directly with
+         ! gfortran), which is what xp2f.py used to emit whenever BOTH
+         ! np.isclose() arguments were scalar. Found mining
+         ! TheAlgorithms/Python's own linear_algebra/gauss_jordan.py:
+         ! `not np.isclose(scalar, 0)`.
+         real(kind=dp), intent(in) :: a, b
+         real(kind=dp), intent(in), optional :: rtol, atol
+         logical, intent(in), optional :: equal_nan
+         logical :: is_close
+         real(kind=dp) :: rtolv, atolv
+         logical :: eqnan
+         rtolv = 1.0e-5_dp
+         atolv = 1.0e-8_dp
+         eqnan = .false.
+         if (present(rtol)) rtolv = rtol
+         if (present(atol)) atolv = atol
+         if (present(equal_nan)) eqnan = equal_nan
+         if (ieee_is_nan(a) .or. ieee_is_nan(b)) then
+            is_close = eqnan .and. ieee_is_nan(a) .and. ieee_is_nan(b)
+         else
+            is_close = abs(a - b) <= atolv + rtolv * abs(b)
+         end if
+      end function isclose_scalar_real
 
       pure function cov2_real(x, y, ddof) result(c)
          real(kind=dp), intent(in) :: x(:), y(:)
