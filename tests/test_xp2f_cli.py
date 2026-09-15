@@ -16109,3 +16109,87 @@ def test_xp2f_tuple_return_element_from_callback_call_defaults_to_real(tmp_path:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+def test_xp2f_large_int_pow_inside_local_function_does_not_overflow_int32(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # physics/relativistic_velocity_summation.py: a module-level integer
+    # constant (c = 299792458, the speed of light) squared via c**2
+    # inside a local function's own expression exceeds Fortran's default
+    # 4-byte INTEGER range (~2.1e9) even though it fits comfortably in
+    # int64, and even though Python's own arbitrary-precision int handles
+    # it trivially -- a hard gfortran compile-time error ("Result of
+    # exponentiation ... exceeds the range of INTEGER(4)"). Fixed by
+    # detecting a provably-overflowing INT**INT at codegen time and
+    # widening the base via int(base, kind=8); a companion fix lets a
+    # local function's own scope-isolated translator (which deliberately
+    # has an empty params dict) still recognize a module-level integer
+    # constant's own value for this overflow check.
+    src = tmp_path / "xlarge_int_pow.py"
+    src.write_text(
+        "\n".join(
+            [
+                "c = 299792458",
+                "",
+                "",
+                "def relativistic_velocity_summation(object_velocity, frame_velocity):",
+                "    numerator = object_velocity + frame_velocity",
+                "    denominator = 1 + object_velocity * frame_velocity / c**2",
+                "    return numerator / denominator",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(relativistic_velocity_summation(200000000.0, 200000000.0))",
+                "    print(relativistic_velocity_summation(299792458.0, 100000000.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_toplevel_int_const_pow_overflow_used_inline_in_real_expr(tmp_path: Path) -> None:
+    # Companion bug to the local-function case above: a module-level
+    # integer constant squared directly inside a top-level real-valued
+    # expression (1.0 / c**2) hit the same int32 overflow at Fortran
+    # compile time. Also exercises const_int_expr_to_fortran's own
+    # overflow check, which now declines to constant-fold c**2 into a
+    # Fortran `integer, parameter ::` initializer (which would itself
+    # fail to compile), falling through to the fixed runtime codegen
+    # path instead.
+    src = tmp_path / "xtoplevel_const_pow_overflow.py"
+    src.write_text(
+        "\n".join(
+            [
+                "c = 299792458",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(1.0 / c**2)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout

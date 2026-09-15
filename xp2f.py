@@ -2934,13 +2934,58 @@ def is_none(node):
     )
 
 
-def const_int_expr_to_fortran(node, allowed_names=None):
+def _const_int_expr_value(node, values):
+    """Best-effort literal INT VALUE of the same restricted expression
+    shape const_int_expr_to_fortran accepts (a parallel, value-computing
+    walk, not just text) -- None if any part isn't known. Used only to
+    check for integer-exponentiation overflow before committing to a
+    constant fold; never itself decides whether an expression is a
+    valid Fortran integer-constant expression."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.Name):
+        return values.get(node.id)
+    if isinstance(node, ast.UnaryOp):
+        inner = _const_int_expr_value(node.operand, values)
+        if inner is None:
+            return None
+        if isinstance(node.op, ast.UAdd):
+            return inner
+        if isinstance(node.op, ast.USub):
+            return -inner
+        return None
+    if isinstance(node, ast.BinOp):
+        left = _const_int_expr_value(node.left, values)
+        right = _const_int_expr_value(node.right, values)
+        if left is None or right is None:
+            return None
+        try:
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Pow) and right >= 0:
+                return left ** right
+            if isinstance(node.op, ast.FloorDiv) and right != 0:
+                return left // right
+            if isinstance(node.op, ast.Mod) and right != 0:
+                return left % right
+        except (OverflowError, ZeroDivisionError):
+            return None
+    return None
+
+
+def const_int_expr_to_fortran(node, allowed_names=None, values=None):
     """
     Return Fortran integer-constant expression text for a restricted Python AST,
     or None if expression is not a safe integer constant expression.
     """
     if allowed_names is None:
         allowed_names = set()
+    if values is None:
+        values = {}
 
     if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
         return str(node.value)
@@ -2949,7 +2994,7 @@ def const_int_expr_to_fortran(node, allowed_names=None):
         return node.id if node.id in allowed_names else None
 
     if isinstance(node, ast.UnaryOp):
-        inner = const_int_expr_to_fortran(node.operand, allowed_names)
+        inner = const_int_expr_to_fortran(node.operand, allowed_names, values)
         if inner is None:
             return None
         if isinstance(node.op, ast.UAdd):
@@ -2959,8 +3004,8 @@ def const_int_expr_to_fortran(node, allowed_names=None):
         return None
 
     if isinstance(node, ast.BinOp):
-        left = const_int_expr_to_fortran(node.left, allowed_names)
-        right = const_int_expr_to_fortran(node.right, allowed_names)
+        left = const_int_expr_to_fortran(node.left, allowed_names, values)
+        right = const_int_expr_to_fortran(node.right, allowed_names, values)
         if left is None or right is None:
             return None
         if isinstance(node.op, ast.Add):
@@ -2980,6 +3025,24 @@ def const_int_expr_to_fortran(node, allowed_names=None):
             # which itself already coerces the base to real for exactly
             # this case (see is_const_negative_int).
             if is_const_negative_int(node.right):
+                return None
+            # A compile-time-computable value that overflows default
+            # (4-byte) INTEGER range is a hard gfortran compile error
+            # ("Result of exponentiation ... exceeds the range of
+            # INTEGER(4)"), even though Python's own arbitrary-
+            # precision int handles it fine -- found mining
+            # TheAlgorithms/Python's own
+            # physics/relativistic_velocity_summation.py: a module-
+            # level `c = 299792458` (safely within int32 on its own)
+            # squared via `c ** 2` (== 8.99e16). Declining the fold
+            # here (rather than emitting `(left ** right)` as an
+            # `integer, parameter`) falls through to the normal
+            # runtime codegen path instead, which widens the base to
+            # int64 for exactly this overflowing case (see
+            # is_const_int/module_int_consts in expr()'s own Pow
+            # handling).
+            _pow_val = _const_int_expr_value(node, values)
+            if _pow_val is not None and not (-(2**31) <= _pow_val <= 2**31 - 1):
                 return None
             return f"({left} ** {right})"
         if isinstance(node.op, ast.FloorDiv):
@@ -3011,6 +3074,7 @@ def find_parameters(tree):
     # module-level integer constant expression assigned once => integer, parameter
     counts = count_assignments(tree)
     params = {}
+    param_values = {}
     for node in tree.body:
         if not (
             isinstance(node, ast.Assign)
@@ -3021,9 +3085,13 @@ def find_parameters(tree):
         k = node.targets[0].id
         if counts.get(k, 0) != 1:
             continue
-        expr_txt = const_int_expr_to_fortran(node.value, allowed_names=set(params.keys()))
+        expr_txt = const_int_expr_to_fortran(node.value, allowed_names=set(params.keys()), values=param_values)
         if expr_txt is not None:
             params[k] = strip_redundant_outer_parens_expr(expr_txt)
+            try:
+                param_values[k] = int(params[k])
+            except (TypeError, ValueError):
+                pass
     return params
 
 
@@ -21549,6 +21617,7 @@ class translator(ast.NodeVisitor):
         self.dict_var_components = {}
         self.synthetic_slices = dict(translator.global_synthetic_slices)
         self.synthetic_slice_meta = dict(translator.global_synthetic_slice_meta)
+        self.module_int_consts = dict(getattr(translator, "global_module_int_consts", {}))
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
         self.linalg_aliases = set(translator.global_linalg_aliases)
         self.scipy_special_aliases = set(translator.global_scipy_special_aliases)
@@ -23011,6 +23080,14 @@ class translator(ast.NodeVisitor):
                 return "real"
             nm = self._aliased_name(self._resolve_list_alias(node.id))
             if nm in self.params:
+                return "int"
+            if nm in self.module_int_consts:
+                # self.params is deliberately empty for a local
+                # function's own translator (see where
+                # module_int_consts itself is populated), so this is
+                # the local-function-context fallback for the exact
+                # same "is this name a known-value module-level integer
+                # constant" question.
                 return "int"
             for bn, bk, _br in reversed(self.open_type_rebind_meta):
                 if bn == nm:
@@ -30566,6 +30643,39 @@ class translator(ast.NodeVisitor):
                 # Coercing the base to real makes Fortran's ** compute
                 # the correct fractional result.
                 a = f"real({a}, kind=dp)"
+            if op is ast.Pow and lk0 == "int" and rk0 == "int" and is_const_int(node.right):
+                # A compile-time-computable INTEGER**INTEGER whose exact
+                # value overflows default (4-byte) INTEGER range is a
+                # HARD gfortran compile error ("Result of exponentiation
+                # ... exceeds the range of INTEGER(4)"), even though
+                # Python's own arbitrary-precision int handles it fine
+                # -- found mining TheAlgorithms/Python's own
+                # physics/relativistic_velocity_summation.py: a module-
+                # level constant `c = 299792458` (safely within int32 on
+                # its own) squared via `c**2` inside another expression
+                # (== 8.99e16, comfortably within int64 but not int32).
+                # Widening the base to int64 only for this specific,
+                # known-to-overflow case matches what Fortran's own
+                # mixed-kind promotion already does automatically for
+                # the surrounding expression, without touching every
+                # other, non-overflowing integer expression.
+                _base_val = None
+                if is_const_int(node.left):
+                    _base_val = int(node.left.value)
+                elif isinstance(node.left, ast.Name) and node.left.id in self.params:
+                    try:
+                        _base_val = int(str(self.params[node.left.id]).strip("() "))
+                    except (TypeError, ValueError):
+                        _base_val = None
+                elif isinstance(node.left, ast.Name) and node.left.id in self.module_int_consts:
+                    _base_val = self.module_int_consts[node.left.id]
+                if _base_val is not None:
+                    try:
+                        _pow_val = _base_val ** int(node.right.value)
+                    except OverflowError:
+                        _pow_val = None
+                    if _pow_val is not None and not (-(2**31) <= _pow_val <= 2**31 - 1):
+                        a = f"int({a}, kind=8)"
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.UnaryOp):
@@ -69620,6 +69730,27 @@ def transpile_file(
             specialize_lambda_function_args(_fn.body, local_funcs)
 
     params = find_parameters(effective_tree)
+    # A local function's own translator is deliberately constructed with
+    # params={} (its own _mark_int/_mark_real/etc. guard the SAME name
+    # against being re-declared when it's a module-level PARAMETER, and
+    # unconditionally sharing the real params dict with every local
+    # function would wrongly suppress that guard for a local variable
+    # that legitimately just happens to shadow a module constant's
+    # name). But that leaves a local function's own codegen with no way
+    # to recognize a Name as a known-value module constant at all --
+    # needed for e.g. detecting that `c ** 2` (c a module-level
+    # `c = 299792458`) overflows default 4-byte INTEGER range even
+    # though `c` itself does not (found mining TheAlgorithms/Python's
+    # own physics/relativistic_velocity_summation.py). This is a
+    # separate, read-only "what value does this name have" table (not
+    # used for any "is this already declared" guard), safe to share
+    # into every local function's own translator instance.
+    translator.global_module_int_consts = {}
+    for _pk, _pv in params.items():
+        try:
+            translator.global_module_int_consts[_pk] = int(str(_pv).strip("() "))
+        except (TypeError, ValueError):
+            pass
     translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
     translator.global_linalg_aliases = collect_linalg_aliases(tree)
     (
