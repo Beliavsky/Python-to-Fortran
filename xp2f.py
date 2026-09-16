@@ -21873,6 +21873,17 @@ class translator(ast.NodeVisitor):
             return False
         return attrs is None or attr in set(attrs)
 
+    def _is_builtin_sum(self, node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "sum"
+            and node.func.id not in self.numpy_func_aliases
+            and node.func.id not in self.local_func_arg_names
+            and node.func.id not in self.local_generic_overloads
+            and len(node.args) in {1, 2}
+        )
+
     def _is_numpy_array_ctor_call(self, call_node):
         if not isinstance(call_node, ast.Call):
             return False
@@ -23549,6 +23560,18 @@ class translator(ast.NodeVisitor):
                 if k0 in {"real", "complex"}:
                     return k0
                 return "int"
+            if self._is_builtin_sum(node):
+                base = self._full_flatten_genexpr_base(node.args[0])
+                k0 = self._expr_kind(base if base is not None else node.args[0])
+                start = node.args[1] if len(node.args) == 2 else next(
+                    (kw.value for kw in node.keywords if kw.arg == "start"), None
+                )
+                kinds = {k0, self._expr_kind(start) if start is not None else "int"}
+                if "complex" in kinds:
+                    return "complex"
+                if "real" in kinds:
+                    return "real"
+                return "int" if k0 in {"int", "logical"} else k0
             if np_attr in {"min", "max"} and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
             if np_attr in {"shape", "size"} and len(node.args) >= 1:
@@ -28445,6 +28468,15 @@ class translator(ast.NodeVisitor):
                 if axis_node is None:
                     return 0
                 return r0 if keepdims else max(0, r0 - 1)
+            if self._is_builtin_sum(node):
+                # Python iterates over axis 0, unlike np.sum's default
+                # all-elements reduction. Flattened generators are scalar.
+                base = self._full_flatten_genexpr_base(node.args[0])
+                rank = 0 if base is not None else max(0, self._rank_expr(node.args[0]) - 1)
+                start = node.args[1] if len(node.args) == 2 else next(
+                    (kw.value for kw in node.keywords if kw.arg == "start"), None
+                )
+                return max(rank, self._rank_expr(start) if start is not None else 0)
             if np_attr == "shape" and len(node.args) >= 1:
                 return 1
             if np_attr == "size" and len(node.args) >= 1:
@@ -33141,8 +33173,13 @@ class translator(ast.NodeVisitor):
                     if bare_name != "abs" and self._expr_kind(a0) in {"int", "logical"}:
                         a0_expr = f"real({a0_expr}, kind=dp)"
                     return f"{bare_math_map[bare_name]}({a0_expr})"
-                if bare_name == "sum" and len(node.args) in {1, 2}:
+                if self._is_builtin_sum(node):
                     a0 = node.args[0]
+                    if any(kw.arg != "start" for kw in node.keywords) or (len(node.args) == 2 and node.keywords):
+                        raise NotImplementedError("sum() supports only iterable and an optional start")
+                    start = node.args[1] if len(node.args) == 2 else next(
+                        (kw.value for kw in node.keywords if kw.arg == "start"), None
+                    )
                     _flatten_base = self._full_flatten_genexpr_base(a0)
                     if _flatten_base is not None:
                         # sum(aii for ai in a for aii in ai) -- pyccel's
@@ -33162,16 +33199,17 @@ class translator(ast.NodeVisitor):
                         # matching what this nested-flatten idiom computes.
                         base_expr = self.expr(_flatten_base)
                         reduced = f"sum({base_expr})"
-                        if len(node.args) == 2:
-                            return f"({reduced} + {self.expr(node.args[1])})"
+                        if start is not None:
+                            return f"({reduced} + {self.expr(start)})"
                         return reduced
                     a0_expr = self.expr(a0)
+                    dim = ", dim=1" if self._rank_expr(a0) > 1 else ""
                     if self._expr_kind(a0) == "logical":
-                        reduced = f"count({a0_expr})"
+                        reduced = f"count({a0_expr}{dim})"
                     else:
-                        reduced = f"sum({a0_expr})"
-                    if len(node.args) == 2:
-                        return f"({reduced} + {self.expr(node.args[1])})"
+                        reduced = f"sum({a0_expr}{dim})"
+                    if start is not None:
+                        return f"({reduced} + {self.expr(start)})"
                     return reduced
             if isinstance(node.func, ast.Name) and node.func.id == "int" and len(node.args) == 1:
                 a0 = node.args[0]

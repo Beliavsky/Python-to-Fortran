@@ -14930,6 +14930,61 @@ def test_xp2f_tuple_return_preserves_real_sentinel(tmp_path: Path, sentinel: str
     )
 
 
+@pytest.mark.parametrize("list_name", ["index", "sum", "items"])
+@pytest.mark.parametrize("tuple_result", [True, False])
+def test_xp2f_return_appended_list_with_reserved_name(
+    tmp_path: Path, list_name: str, tuple_result: bool
+) -> None:
+    returned = f"i, {list_name}" if tuple_result else list_name
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xreserved_append.py",
+        [
+            "def collect(n):",
+            f"    {list_name} = []",
+            "    i = 0",
+            "    if n == 0:",
+            f"        return {returned}",
+            "    while i < n:",
+            f"        {list_name}.append(i + 1)",
+            "        i = i + 1",
+            f"    return {returned}",
+            "for n in [0, 1, 3, 33]:",
+            "    count, values = collect(n)" if tuple_result else "    values = collect(n)",
+            "    print(len(values))",
+            "    for value in values:",
+            "        print(value)",
+        ],
+    )
+
+
+@pytest.mark.parametrize("parameter", ["rank", "sum", "value"])
+@pytest.mark.parametrize("initial", ["4", "4.5"])
+def test_xp2f_rebound_reserved_parameter_uses_declared_dummy(
+    tmp_path: Path, parameter: str, initial: str
+) -> None:
+    zero = "0.0" if "." in initial else "0"
+    negative = "-1.0" if "." in initial else "-1"
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xrebound_dummy.py",
+        [
+            f"def advance({parameter}, n):",
+            f"    if {parameter} < 0:",
+            f"        {parameter} = {zero}",
+            f"        return {parameter}, n",
+            "    for i in range(n):",
+            f"        {parameter} = {parameter} + 1",
+            f"    return {parameter}, n",
+            "original = " + initial,
+            "updated, count = advance(original, 3)",
+            "print(original, updated, count)",
+            f"updated, count = advance({negative}, 3)",
+            "print(updated, count)",
+        ],
+    )
+
+
 def test_xp2f_inline_reassigned_parameter_wrap_compile_diff(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(
         tmp_path,
@@ -15027,6 +15082,35 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
             "",
             "if __name__ == \"__main__\":",
             "    print(test_valuedarg_1())",
+        ],
+    )
+
+
+def test_xp2f_builtin_sum_reduces_only_first_axis(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xbuiltin_matrix_sum.py",
+        [
+            "import numpy as np",
+            "from numpy import sum as np_sum",
+            "def columns(a: 'float[:,:]'):",
+            "    return sum(a)",
+            "def frobenius(a: 'float[:,:]'):",
+            "    return np.sqrt(sum(sum(a ** 2)))",
+            "a = np.array([[1.5, 2.0, 3.0], [4.0, 5.0, 6.0]])",
+            "print(columns(a))",
+            "print(frobenius(a))",
+            "print(sum(a, 0.5))",
+            "print(sum(a, start=0.5))",
+            "print(np.sum(a))",
+            "print(np_sum(a))",
+            "print(a.sum())",
+            "print(sum(np.array([1, 2, 3])))",
+            "print(sum(np.array([[1, 2, 3], [4, 5, 6]])))",
+            "print(sum(a > 2.0))",
+            "cube = np.array([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]])",
+            "print(sum(cube))",
+            "print(sum(sum(sum(cube))))",
         ],
     )
 
