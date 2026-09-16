@@ -15164,6 +15164,33 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_numpy_sum_positional_axis(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xsum_positional_axis.py", [
+        "import numpy as np",
+        "from numpy import sum as np_sum",
+        "def column_totals(a: 'float[:,:]'):",
+        "    return np.sum(a, 0)",
+        "a = np.array([[1.5, 2.0, 3.0], [4.0, 5.0, 6.0]])",
+        "print(column_totals(a))",
+        "print(np.sum(a, 1))",
+        "print(np.sum(a, axis=0))",
+        "print(np.sum(a, axis=1))",
+        "print(np.sum(a, 0, keepdims=True))",
+        "print(np.sum(a, 1, keepdims=True))",
+        "print(np_sum(a, 0))",
+        "print(np.sum(np.sum(a, 0)))",
+        "print(np.sum(np.sum(a, 1)))",
+        "print(np.sum(np.sum(a)))",
+        "print(np.sum(a > 2.0, 0))",
+        "print(np.sum(a > 2.0, 1))",
+        "i = np.array([[1, 2, 3], [4, 5, 6]])",
+        "print(np.sum(i, 0))",
+        "print(np.sum(i, 1))",
+        "cube = np.array([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]])",
+        "print(np.sum(cube, 1))",
+    ])
+
+
 def test_xp2f_builtin_sum_reduces_only_first_axis(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(
         tmp_path,

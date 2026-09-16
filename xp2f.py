@@ -34118,12 +34118,16 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.args[0].func.value, ast.Name)
                     and node.args[0].func.value.id == "np"
                     and node.args[0].func.attr == "sum"
-                    and not any(_kw.arg == "axis" for _kw in getattr(node.args[0], "keywords", []))
+                    and self._rank_expr(node.args[0]) == 0
+                    and len(node.args) == 1
+                    and not node.keywords
                 ):
                     return self.expr(node.args[0])
                 a0 = self.expr(node.args[0])
                 a0_kind = self._expr_kind(node.args[0])
-                axis_node = None
+                # NumPy accepts axis either positionally or by keyword.
+                # Keep this consistent with reduction rank inference.
+                axis_node = node.args[1] if len(node.args) >= 2 else None
                 keepdims = False
                 for kw in node.keywords:
                     if kw.arg == "axis":
