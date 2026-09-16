@@ -123,6 +123,32 @@ end module lstsq_test
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_xpfunc2f_inlines_multikey_lexsort_helpers(tmp_path: Path) -> None:
+    source = """module sort_test
+use, intrinsic :: iso_fortran_env, only: real64
+use python_mod, only: lexsort_keys
+implicit none
+integer, parameter :: dp = real64
+contains
+function first_row(a) result(r)
+real(dp), intent(in) :: a(:,:)
+integer :: r
+integer, allocatable :: indices(:)
+indices = lexsort_keys(transpose(a), reverse_keys=.true.)
+r = indices(1)
+end function first_row
+end module sort_test
+"""
+    inlined, unresolved = xpfunc2f.inline_python_mod_helpers(source)
+    assert unresolved == []
+    assert "use python_mod" not in inlined.lower()
+    src = tmp_path / "sort_test.f90"
+    src.write_text(inlined, encoding="utf-8")
+    proc = subprocess.run(["gfortran", "-fcheck=all", "-c", str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_xpfunc2f_scalar_only_happy_path(tmp_path: Path) -> None:
     # The original, already-established scalar-only case: count_primes
     # (tuple return of two ints) + its one dependency is_prime -- must

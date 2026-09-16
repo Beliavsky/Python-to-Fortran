@@ -499,6 +499,12 @@ interface linalg_solve
    module procedure linalg_solve_complex_vec, linalg_solve_complex_mat
 end interface linalg_solve
 
+public :: lexsort_keys
+interface lexsort_keys
+   module procedure lexsort_keys_int, lexsort_keys_real
+   module procedure lexsort_packed_int, lexsort_packed_real
+end interface lexsort_keys
+
 public :: linalg_lstsq, linalg_lstsq_x
 interface linalg_lstsq
    module procedure linalg_lstsq_vec, linalg_lstsq_mat
@@ -9457,5 +9463,180 @@ GO TO 1001
 1001 RETURN
 !     ********** LAST CARD OF DCMQR2 **********
 END SUBROUTINE dcmqr2
+
+      function lexsort_keys_int(keys, reverse_keys) result(idx)
+         integer, intent(in) :: keys(:,:)
+         logical, optional, intent(in) :: reverse_keys
+         integer, allocatable :: idx(:), work(:)
+         integer :: n, nk, i, width, lo, mid, hi, p, q, dest, key, first, last, step
+         logical :: left_first
+         ! Stable bottom-up merge sort. Key rows are ordered least to most
+         ! significant, as in NumPy. Reversing key priority implements
+         ! lexsort(matrix.T[::-1]) without subscripting a temporary transpose.
+         nk = size(keys,1)
+         n = size(keys,2)
+         if (nk == 0) error stop "lexsort: need at least one key"
+         allocate(idx(n), work(n))
+         do i = 1, n
+            idx(i) = i - 1
+         end do
+         first = nk
+         last = 1
+         step = -1
+         if (present(reverse_keys)) then
+            if (reverse_keys) then
+               first = 1
+               last = nk
+               step = 1
+            end if
+         end if
+         width = 1
+         do while (width < n)
+            lo = 1
+            do while (lo <= n)
+               mid = min(lo + width, n + 1)
+               hi = min(lo + 2*width - 1, n)
+               p = lo
+               q = mid
+               dest = lo
+               do while (p < mid .and. q <= hi)
+                  left_first = .true.
+                  do key = first, last, step
+                     if (keys(key,idx(p)+1) < keys(key,idx(q)+1)) exit
+                     if (keys(key,idx(p)+1) > keys(key,idx(q)+1)) then
+                        left_first = .false.
+                        exit
+                     end if
+                  end do
+                  if (left_first) then
+                     work(dest) = idx(p)
+                     p = p + 1
+                  else
+                     work(dest) = idx(q)
+                     q = q + 1
+                  end if
+                  dest = dest + 1
+               end do
+               do while (p < mid)
+                  work(dest) = idx(p)
+                  p = p + 1
+                  dest = dest + 1
+               end do
+               do while (q <= hi)
+                  work(dest) = idx(q)
+                  q = q + 1
+                  dest = dest + 1
+               end do
+               lo = hi + 1
+            end do
+            idx = work
+            if (width > n/2) exit
+            width = 2*width
+         end do
+      end function lexsort_keys_int
+
+      function lexsort_keys_real(keys, reverse_keys) result(idx)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
+         real(dp), intent(in) :: keys(:,:)
+         logical, optional, intent(in) :: reverse_keys
+         integer, allocatable :: idx(:), work(:)
+         integer :: n, nk, i, width, lo, mid, hi, p, q, dest, key, first, last, step
+         logical :: left_first
+         ! Stable bottom-up merge sort. Key rows are ordered least to most
+         ! significant, as in NumPy. Reversing key priority implements
+         ! lexsort(matrix.T[::-1]) without subscripting a temporary transpose.
+         nk = size(keys,1)
+         n = size(keys,2)
+         if (nk == 0) error stop "lexsort: need at least one key"
+         allocate(idx(n), work(n))
+         do i = 1, n
+            idx(i) = i - 1
+         end do
+         first = nk
+         last = 1
+         step = -1
+         if (present(reverse_keys)) then
+            if (reverse_keys) then
+               first = 1
+               last = nk
+               step = 1
+            end if
+         end if
+         width = 1
+         do while (width < n)
+            lo = 1
+            do while (lo <= n)
+               mid = min(lo + width, n + 1)
+               hi = min(lo + 2*width - 1, n)
+               p = lo
+               q = mid
+               dest = lo
+               do while (p < mid .and. q <= hi)
+                  left_first = .true.
+                  do key = first, last, step
+                  ! NaNs sort after finite values; two NaNs tie at this key.
+                  if (ieee_is_nan(keys(key,idx(p)+1))) then
+                     if (.not. ieee_is_nan(keys(key,idx(q)+1))) left_first = .false.
+                     if (.not. ieee_is_nan(keys(key,idx(q)+1))) exit
+                     cycle
+                  else if (ieee_is_nan(keys(key,idx(q)+1))) then
+                     exit
+                  end if
+                     if (keys(key,idx(p)+1) < keys(key,idx(q)+1)) exit
+                     if (keys(key,idx(p)+1) > keys(key,idx(q)+1)) then
+                        left_first = .false.
+                        exit
+                     end if
+                  end do
+                  if (left_first) then
+                     work(dest) = idx(p)
+                     p = p + 1
+                  else
+                     work(dest) = idx(q)
+                     q = q + 1
+                  end if
+                  dest = dest + 1
+               end do
+               do while (p < mid)
+                  work(dest) = idx(p)
+                  p = p + 1
+                  dest = dest + 1
+               end do
+               do while (q <= hi)
+                  work(dest) = idx(q)
+                  q = q + 1
+                  dest = dest + 1
+               end do
+               lo = hi + 1
+            end do
+            idx = work
+            if (width > n/2) exit
+            width = 2*width
+         end do
+      end function lexsort_keys_real
+
+      function lexsort_packed_int(values, lengths) result(idx)
+         integer, intent(in) :: values(:)
+         integer, intent(in) :: lengths(:)
+         integer, allocatable :: idx(:)
+         integer :: nk, n
+         nk = size(lengths)
+         if (nk == 0) error stop "lexsort: need at least one key"
+         n = lengths(1)
+         if (any(lengths /= n)) error stop "lexsort: key size mismatch"
+         idx = lexsort_keys_int(transpose(reshape(values, [n,nk])))
+      end function lexsort_packed_int
+
+      function lexsort_packed_real(values, lengths) result(idx)
+         real(dp), intent(in) :: values(:)
+         integer, intent(in) :: lengths(:)
+         integer, allocatable :: idx(:)
+         integer :: nk, n
+         nk = size(lengths)
+         if (nk == 0) error stop "lexsort: need at least one key"
+         n = lengths(1)
+         if (any(lengths /= n)) error stop "lexsort: key size mismatch"
+         idx = lexsort_keys_real(transpose(reshape(values, [n,nk])))
+      end function lexsort_packed_real
 
 end module python_mod

@@ -15164,6 +15164,96 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_mesh_etoe_lexsort_fixture(tmp_path: Path) -> None:
+    # Core of Burkardt's MIT-licensed mesh_etoe, with an in-memory fixture
+    # instead of the missing boxy_elements.txt/pool_elements.txt files.
+    _run_xp2f_compile_diff(tmp_path, "xmesh_etoe_fixture.py", [
+        "import numpy as np",
+        "def mesh_etoe(etov):",
+        "    e_num, e_order = etov.shape",
+        "    r = np.zeros((e_order*e_num, 4), dtype=int)",
+        "    row = 0",
+        "    for e in range(e_num):",
+        "        v2 = etov[e,e_order-1]",
+        "        for o in range(e_order):",
+        "            v1 = v2",
+        "            v2 = etov[e,o]",
+        "            r[row,0] = min(v1,v2)",
+        "            r[row,1] = max(v1,v2)",
+        "            r[row,2] = o",
+        "            r[row,3] = e",
+        "            row = row + 1",
+        "    r = r[np.lexsort(r.T[::-1])]",
+        "    etoe = -np.ones((e_num,e_order))",
+        "    row = 0",
+        "    while True:",
+        "        if e_num*e_order <= row+1:",
+        "            break",
+        "        if r[row,0] != r[row+1,0] or r[row,1] != r[row+1,1]:",
+        "            row = row+1",
+        "        else:",
+        "            s1 = r[row,2]",
+        "            e1 = r[row,3]",
+        "            s2 = r[row+1,2]",
+        "            e2 = r[row+1,3]",
+        "            etoe[e1,s1] = e2",
+        "            etoe[e2,s2] = e1",
+        "            row = row+2",
+        "    return etoe",
+        "etov = np.array([[0, 1, 2], [2, 1, 3], [2, 3, 4]])",
+        "neighbors = mesh_etoe(etov)",
+        "for i in range(3):",
+        "    for j in range(3):",
+        "        print(neighbors[i,j])",
+    ])
+
+
+def test_xp2f_lexsort_rejects_bad_key_shapes(tmp_path: Path) -> None:
+    for keys, message in [
+        ("(np.array([1,2]), np.array([3]))", "key size mismatch"),
+        ("np.zeros((0,3))", "need at least one key"),
+    ]:
+        src = tmp_path / "xbad_lexsort.py"
+        src.write_text(f"import numpy as np\np = np.lexsort({keys})\nprint(p)\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        exe = tmp_path / ("xbad_lexsort_p.exe" if sys.platform == "win32" else "xbad_lexsort_p")
+        run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True,
+                             check=False, timeout=30)
+        assert run.returncode != 0, run.stdout + run.stderr
+        assert message in run.stdout + run.stderr
+
+
+def test_xp2f_lexsort_multiple_keys_stable_row_selection(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xlexsort_rows.py", [
+        "import numpy as np",
+        "def ordered(a):",
+        "    b = a[np.lexsort(a.T[::-1])]",
+        "    return b",
+        "a = np.array([[1, 2, 4, 0], [1, 1, 9, 0], [0, 9, 9, 1], [1, 2, 3, 2], [1, 2, 3, 1], [1, 2, 3, 1]])",
+        "p = np.lexsort(a.T[::-1])",
+        "print(p)",
+        "b = ordered(a)",
+        "for i in range(6):",
+        "    for j in range(4):",
+        "        print(b[i,j])",
+        "a = a[np.lexsort(a.T[::-1])]",
+        "print(a[:,0])",
+        "print(np.lexsort((a[:,3], a[:,2], a[:,1], a[:,0])))",
+        "print(np.lexsort((a[:,0],)))",
+        "r = np.array([[2.0, 1.0, 2.0, 1.0, 2.0], [3.0, 1.0, 3.0, 1.0, 2.0], [0.0, 0.0, 0.0, 0.0, 0.0]])",
+        "print(np.lexsort(r))",
+        "print(np.lexsort(r, axis=0))",
+        "print(np.lexsort(r[::-1], axis=-1))",
+        "print(np.lexsort((np.array([1, 0, 1, 0]), np.array([0.5, 0.5, -1.0, 0.5]))))",
+        "nan_keys = np.array([[2.0, 1.0, 0.0, 1.0], [np.nan, 1.0, np.nan, 1.0]])",
+        "print(np.lexsort(nan_keys))",
+        "print(np.lexsort(np.zeros((3,0))))",
+        "print(np.lexsort(np.zeros((1,4))))",
+    ])
+
+
 def test_xp2f_matrix_exponential_test9(tmp_path: Path) -> None:
     # Burkardt's r8mat_expm3 deliberately uses real parts of the eigenpairs.
     # The NAG test matrix has a conjugate pair, so both the eig output types

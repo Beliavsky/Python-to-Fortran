@@ -6647,6 +6647,7 @@ def function_is_pure(fn_node, known_pure_calls=None):
         # cannot be PURE unless the emitted Fortran helper is too.
         "eye",
         "identity",
+        "lexsort",
         "default_rng",
         "loadtxt",
         "genfromtxt",
@@ -13297,7 +13298,7 @@ def detect_needed_helpers(tree):
         "histogram2d": {"histogram2d_real_edges"},
         "setdiff1d": {"setdiff1d_int"},
         "intersect1d": {"intersect1d_int"},
-        "lexsort": {"lexsort2_int", "lexsort2_real"},
+        "lexsort": {"lexsort_keys", "lexsort2_int", "lexsort2_real"},
         "ravel_multi_index": {"ravel_multi_index_2d"},
         "unravel_index": {"unravel_index_2d"},
         "kron": {"kron_2d"},
@@ -36285,27 +36286,35 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "lexsort"
                 and len(node.args) >= 1
             ):
-                k0_node = None
-                k1_node = None
-                if isinstance(node.args[0], (ast.Tuple, ast.List)) and len(node.args[0].elts) == 2:
-                    k0_node = node.args[0].elts[0]
-                    k1_node = node.args[0].elts[1]
+                axis_node = next((kw.value for kw in node.keywords if kw.arg == "axis"),
+                                 node.args[1] if len(node.args) > 1 else None)
+                if axis_node is not None and _const_int_expr_value(axis_node, {}) not in {0, -1}:
+                    raise NotImplementedError("np.lexsort supports axis 0 or -1 for one-dimensional keys")
+                if isinstance(node.args[0], (ast.Tuple, ast.List)):
+                    keys = node.args[0].elts
+                    if not keys or any(self._rank_expr(key) != 1 for key in keys):
+                        raise NotImplementedError("np.lexsort expects one-dimensional numeric keys")
+                    kinds = [self._expr_kind(key) for key in keys]
+                    if any(kind not in {"int", "real"} for kind in kinds):
+                        raise NotImplementedError("np.lexsort currently supports integer and real keys")
+                    texts = [self.expr(key) for key in keys]
+                    lengths = ", ".join(f"size({txt})" for txt in texts)
+                    if "real" in kinds:
+                        texts = [f"real({txt}, kind=dp)" for txt in texts]
+                    return f"lexsort_keys([{', '.join(texts)}], [{lengths}])"
                 elif self._rank_expr(node.args[0]) == 2:
-                    keys_expr = self.expr(node.args[0])
-                    k0_txt = f"{keys_expr}(1, :)"
-                    k1_txt = f"{keys_expr}(2, :)"
-                    kk = self._expr_kind(node.args[0])
-                    if kk == "int":
-                        return f"lexsort2_int({k0_txt}, {k1_txt})"
-                    return f"lexsort2_real({k0_txt}, {k1_txt})"
+                    keys_node = node.args[0]
+                    reverse_keys = False
+                    if (isinstance(keys_node, ast.Subscript)
+                            and isinstance(keys_node.slice, ast.Slice)
+                            and keys_node.slice.lower is None and keys_node.slice.upper is None
+                            and _const_int_expr_value(keys_node.slice.step, {}) == -1):
+                        keys_node = keys_node.value
+                        reverse_keys = True
+                    flag = ", reverse_keys=.true." if reverse_keys else ""
+                    return f"lexsort_keys({self.expr(keys_node)}{flag})"
                 else:
-                    raise NotImplementedError("np.lexsort currently expects two keys")
-                ky = self.expr(k0_node)
-                kx = self.expr(k1_node)
-                kk = self._expr_kind(k0_node)
-                if kk == "int":
-                    return f"lexsort2_int({ky}, {kx})"
-                return f"lexsort2_real({ky}, {kx})"
+                    raise NotImplementedError("np.lexsort expects a key matrix or a tuple of vectors")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
