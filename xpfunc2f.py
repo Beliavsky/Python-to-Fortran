@@ -1127,6 +1127,18 @@ def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
 
         alloc_stmt_re = re.compile(r"^\s*allocate\s*\(", re.IGNORECASE)
 
+        # An explicit-shape output has no allocation status. In particular,
+        # an append accumulator's initial allocate(name(0)) is not its final
+        # size, and its later capacity-management code cannot survive this
+        # rewrite. Reject before changing declarations or deleting allocations.
+        for line in target_lines:
+            if re.search(rf"\ballocated\s*\(\s*{re.escape(name)}\s*\)",
+                         _strip_comment(line), re.IGNORECASE):
+                raise UnsupportedFunction(
+                    f"{target_name!r}'s array result {name!r} uses dynamic allocation "
+                    "status -- cannot rewrite it as an explicit-shape output"
+                )
+
         def _find_own_alloc():
             # Finds `name`'s own `NAME(SIZE_EXPR)` array-spec inside an
             # `allocate(...)` statement, via a balanced-paren scan (not a
@@ -1139,6 +1151,7 @@ def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
             # prevents recognizing it -- each top-level, comma-separated
             # item inside the statement's own outer parens is checked in
             # turn for `name`'s own.
+            found = None
             for i in range(1, len(target_lines)):
                 code = _strip_comment(target_lines[i])
                 pm = alloc_stmt_re.match(code)
@@ -1160,8 +1173,14 @@ def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
                 for k, item in enumerate(items):
                     im = re.match(rf"^\s*{re.escape(name)}\s*\((.*)\)\s*$", item.strip(), re.IGNORECASE | re.DOTALL)
                     if im:
-                        return i, im.group(1).strip(), items, k
-            return None, None, None, None
+                        if found is not None:
+                            raise UnsupportedFunction(
+                                f"{target_name!r}'s array result {name!r} has multiple "
+                                "allocations -- cannot derive its final size from "
+                                "the first allocation"
+                            )
+                        found = i, im.group(1).strip(), items, k
+            return found if found is not None else (None, None, None, None)
 
         alloc_i, size_expr, alloc_items, alloc_item_idx = _find_own_alloc()
         if alloc_i is None:

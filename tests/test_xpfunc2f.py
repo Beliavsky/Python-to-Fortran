@@ -114,14 +114,10 @@ def test_xpfunc2f_run_both_matches_for_array_target(tmp_path: Path) -> None:
 
 
 def test_xpfunc2f_rejects_data_dependent_array_result_size(tmp_path: Path) -> None:
-    # The "primes in an array"-style case discussed alongside this
-    # feature: an array result built by an unbounded accumulator
-    # (append-in-a-loop) has a size that's NOT a simple function of the
-    # arguments -- must stay rejected with a clear message, not silently
-    # bridge something wrong. (This specific accumulator shape uses a
-    # different xp2f.py-internal representation than the arange_int-
-    # range-length idiom rewrite_target_for_f2py recognizes, so it's
-    # rejected for a different, but equally correct, reason.)
+    # This particular result has length max(n, 0), but the generated
+    # append accumulator uses dynamic allocation. Until that representation
+    # is supported, reject it at extraction rather than treating its initial
+    # zero-length allocation as the final result size.
     src = tmp_path / "xmakerange.py"
     src.write_text(
         "\n".join(
@@ -142,6 +138,29 @@ def test_xpfunc2f_rejects_data_dependent_array_result_size(tmp_path: Path) -> No
     proc = _run_xpfunc2f([str(src), "make_range", "--out-dir", str(tmp_path)], tmp_path)
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "Extract: FAIL" in proc.stdout, proc.stdout + proc.stderr
+    assert "dynamic allocation" in proc.stdout, proc.stdout + proc.stderr
+    assert "F2PY Build:" not in proc.stdout, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("body, message", [
+    (["allocate(y(0))", "allocate(y(n))"], "multiple allocations"),
+    (["allocate(y(0), work(n))", "allocate(y(n))"], "multiple allocations"),
+    (["if (.not. ALLOCATED(Y)) then", "allocate(y(n))", "end if"],
+     "dynamic allocation"),
+])
+def test_rewrite_target_for_f2py_rejects_dynamic_result_storage(body, message) -> None:
+    lines = [
+        "function f(n) result(y)",
+        "integer, intent(in) :: n",
+        "real(kind=dp), allocatable :: y(:)",
+        "real(kind=dp), allocatable :: work(:)",
+        *body,
+        "end function f",
+    ]
+    original = lines.copy()
+    with pytest.raises(xpfunc2f.UnsupportedFunction, match=message):
+        xpfunc2f.rewrite_target_for_f2py(lines, 0, len(lines) - 1, "f")
+    assert lines == original
 
 
 def test_xpfunc2f_rejects_rank2_array_argument(tmp_path: Path) -> None:
