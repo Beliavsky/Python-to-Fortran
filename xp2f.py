@@ -1799,13 +1799,25 @@ def simplify_redundant_dp_cast_general(lines):
 
         dp_names = set()
         int_names = set()
+        declared_names = set()
+        shadowed_names = set()
         for k in range(u0, u1 + 1):
-            if _ends_continued(out[k]) or out[k].lstrip().startswith("&"):
+            if out[k].lstrip().startswith("&"):
                 continue
-            code = out[k].split("!", 1)[0].rstrip("\r\n")
+            code, _ = _join_stmt(out, k)
             m = decl_re.match(code)
             if not m:
                 continue
+            # A BLOCK may redeclare an outer complex/integer variable as
+            # real(dp). This procedure-wide lookup is not scope-aware, so
+            # no declaration of a shadowed name proves a cast redundant.
+            for ent in fpurity.split_top_level_commas(m.group(3)):
+                em = re.match(r"^\s*([A-Za-z_]\w*)", ent)
+                if em:
+                    name = em.group(1).lower()
+                    if name in declared_names:
+                        shadowed_names.add(name)
+                    declared_names.add(name)
             attrs = m.group(2).strip()
             ts = typespec_re.match(attrs)
             if not ts:
@@ -1817,6 +1829,8 @@ def simplify_redundant_dp_cast_general(lines):
                     continue
                 (dp_names if is_dp else int_names).add(em.group(1).lower())
 
+        dp_names -= shadowed_names
+        int_names -= shadowed_names
         if dp_names:
             k = u0
             while k <= u1:

@@ -5871,6 +5871,45 @@ def test_fortran_simplify_redundant_dp_cast_general_covers_min_max_mod() -> None
     assert "real(min(a, b), kind=dp)" in joined, joined
 
 
+@pytest.mark.parametrize("outer_type", ["complex(kind=dp)", "integer"])
+@pytest.mark.parametrize("continued", [False, True])
+def test_redundant_dp_cast_preserves_shadowed_variable(outer_type, continued) -> None:
+    declaration = ([f"   {outer_type} :: other, &", "      & c"] if continued
+                   else [f"   {outer_type} :: c"])
+    lines = [
+        "function f() result(z)",
+        *declaration,
+        "   real(kind=dp) :: z, unshadowed",
+        "   block",
+        "      real(kind=dp) :: c",
+        "      c = 1.0_dp",
+        "      z = real(c, kind=dp)",
+        "   end block",
+        "   z = real(c, kind=dp)",
+        "   z = real(unshadowed, kind=dp)",
+        "end function f",
+    ]
+    out = "\n".join(xp2f.simplify_redundant_dp_cast_general(lines))
+    assert out.count("real(c, kind=dp)") == 2, out
+    assert "z = unshadowed" in out, out
+
+
+def test_xp2f_real_part_after_branch_type_rebinding(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xreal_rebound.py", [
+        "import numpy as np",
+        "def largest(flag):",
+        "    if flag:",
+        "        c = np.array([1.0, 2.0])",
+        "        result = np.max(np.real(c))",
+        "    else:",
+        "        c = np.array([3.0 + 8.0j, 4.0 - 9.0j])",
+        "        result = np.max(np.real(c))",
+        "    return result",
+        "print(largest(True))",
+        "print(largest(False))",
+    ])
+
+
 def test_xp2f_simplifies_redundant_dp_cast_general_end_to_end(tmp_path: Path) -> None:
     # Companion end-to-end test: real(exp(...), kind=dp) and
     # real(array_element, kind=dp) shapes, run through the full
