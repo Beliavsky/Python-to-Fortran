@@ -42101,9 +42101,9 @@ class translator(ast.NodeVisitor):
                     elif k == "complex":
                         self._mark_alloc_complex(t.id, rank=rk)
                     elif k == "logical":
-                        self._mark_alloc_log(t.id)
+                        self._mark_alloc_log(t.id, rank=rk)
                     else:
-                        self._mark_alloc_int(t.id)
+                        self._mark_alloc_int(t.id, rank=rk)
 
                 # np.array([...]) / np.asarray([...])
                 if (
@@ -43900,6 +43900,39 @@ class translator(ast.NodeVisitor):
             )
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
             _tuple_out_or_src_names = set(self.tuple_return_out_names or []) | set(getattr(self, "tuple_return_src_names", []) or [])
+            if (
+                isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Attribute)
+                and v.func.attr == "astype"
+                and _expr_uses_name(v.func.value, t.id)
+                and not is_function_result_target
+                and t.id not in _tuple_out_or_src_names
+            ):
+                cast_kind = self._expr_kind(v)
+                cast_rank = self._rank_expr(v)
+                visible_kind, visible_rank = self._visible_kind_rank(t.id)
+                if (
+                    cast_kind in {"int", "real", "logical"}
+                    and cast_rank > 0
+                    and (cast_kind, cast_rank) != (visible_kind, visible_rank)
+                ):
+                    # Evaluate before shadowing: assigning int(a) back into a
+                    # real array loses the dtype change and taints reductions.
+                    cast_expr = self.expr(v)
+                    tmp_name = f"xp2f_cast_{getattr(node, 'lineno', 0)}"
+                    taken = set(self.var_type_first_seen) | set(self.name_aliases.values())
+                    taken.update(self.params)
+                    taken.update(self.dummy_arg_names)
+                    taken.update(n.id for n in ast.walk(v) if isinstance(n, ast.Name))
+                    taken.update(n for n, _, _ in self.open_type_rebind_meta)
+                    taken_lower = {n.lower() for n in taken}
+                    while tmp_name.lower() in taken_lower:
+                        tmp_name += "_"
+                    self._open_type_rebind_block(tmp_name, cast_kind, cast_rank)
+                    self.o.w(f"{tmp_name} = {cast_expr}")
+                    self._open_type_rebind_block(t.id, cast_kind, cast_rank)
+                    self.o.w(f"call move_alloc({tmp_name}, {self._aliased_name(t.id)})")
+                    return
             if rk is not None and t.id in _tuple_out_or_src_names:
                 rk = None
             if is_function_result_target:

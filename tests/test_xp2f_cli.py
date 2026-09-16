@@ -15164,6 +15164,82 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_mesh_vtoe_loadtxt_integer_rebind(tmp_path: Path) -> None:
+    # Core of Burkardt's MIT-licensed mesh_vtoe. Keep the original
+    # load/transpose/self-cast path, using a tiny zero-based mesh.
+    (tmp_path / "elements.txt").write_text("0 1 2\n2 1 3\n2 3 4\n4 3 5\n", encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xmesh_vtoe_fixture.py", [
+        "import numpy as np",
+        "def sortrows(x):",
+        "    x = x[np.lexsort(x.T[::-1])]",
+        "    return x",
+        "def mesh_vtoe(e_order, e_num, etov, v_num):",
+        "    # Input:",
+        "    # integer E_ORDER, the order of the elements.",
+        "    # integer E_NUM, the number of elements.",
+        "    # integer ETOV(E_ORDER,E_NUM), the vertices of each element.",
+        "    # integer V_NUM, the number of vertices.",
+        "    ve = np.zeros([e_order*e_num, 2], dtype=int)",
+        "    k = 0",
+        "    for e in range(e_num):",
+        "        for o in range(e_order):",
+        "            ve[k,0] = etov[o,e]",
+        "            ve[k,1] = e",
+        "            k = k + 1",
+        "    ve = sortrows(ve)",
+        "    vtoe_pointer = np.zeros(v_num+1, dtype=int)",
+        "    old = 0",
+        "    for k in range(e_order*e_num):",
+        "        new = ve[k,0]",
+        "        if new != old:",
+        "            for v in range(old+1, new+1):",
+        "                vtoe_pointer[v] = k",
+        "            old = new",
+        "    vtoe_pointer[v_num] = e_order*e_num",
+        "    vtoe = np.zeros(e_order*e_num)",
+        "    vtoe[0:e_order*e_num] = ve[0:e_order*e_num,1]",
+        "    return vtoe_pointer, vtoe",
+        "def fixture():",
+        "    etov = np.loadtxt('elements.txt')",
+        "    etov = etov.T",
+        "    etov = etov.astype(int)",
+        "    element_order = etov.shape[0]",
+        "    element_num = etov.shape[1]",
+        "    v_base = np.min(etov)",
+        "    v_num = np.max(etov)",
+        "    if v_base == 0:",
+        "        v_num = v_num + 1",
+        "    pointers, elements = mesh_vtoe(element_order, element_num, etov, v_num)",
+        "    print(pointers)",
+        "    for i in range(element_order*element_num):",
+        "        print(elements[i])",
+        "fixture()",
+    ])
+
+
+def test_xp2f_self_astype_preserves_values_and_rank(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xself_astype.py", [
+        "import numpy as np",
+        "a = np.array([[-2.75, 0.0, 3.5], [4.25, -5.5, 6.75]])",
+        "original = a.copy()",
+        "a = a.astype(int)",
+        "print(a.shape[0], a.shape[1])",
+        "print(a)",
+        "print(original)",
+        "a = a.astype(float)",
+        "a = a + 0.5",
+        "print(a)",
+        "a = a.astype(int)",
+        "print(a)",
+        "a = a.astype(bool)",
+        "a = a.astype(int)",
+        "print(a)",
+        "b = np.array([-1.75, 0.0, 2.5])",
+        "b = b.astype(int)",
+        "print(b)",
+    ])
+
+
 def test_xp2f_mesh_etoe_lexsort_fixture(tmp_path: Path) -> None:
     # Core of Burkardt's MIT-licensed mesh_etoe, with an in-memory fixture
     # instead of the missing boxy_elements.txt/pool_elements.txt files.
