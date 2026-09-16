@@ -71,6 +71,33 @@ end module eigen_test
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_xpfunc2f_inlines_complex_solve_helpers(tmp_path: Path) -> None:
+    source = """module solve_test
+use, intrinsic :: iso_fortran_env, only: real64
+use python_mod, only: linalg_solve
+implicit none
+integer, parameter :: dp = real64
+contains
+function solve_total(a, b) result(r)
+complex(dp), intent(in) :: a(:,:), b(:)
+real(dp) :: r
+r = sum(real(linalg_solve(a, b), dp))
+end function solve_total
+end module solve_test
+"""
+    inlined, unresolved = xpfunc2f.inline_python_mod_helpers(source)
+    assert unresolved == []
+    assert "use python_mod" not in inlined.lower()
+    for name in ("linalg_solve_vec", "linalg_solve_mat",
+                 "linalg_solve_complex_vec", "linalg_solve_complex_mat"):
+        assert name in inlined.lower()
+    src = tmp_path / "solve_test.f90"
+    src.write_text(inlined, encoding="utf-8")
+    proc = subprocess.run(["gfortran", "-fcheck=all", "-c", str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_xpfunc2f_scalar_only_happy_path(tmp_path: Path) -> None:
     # The original, already-established scalar-only case: count_primes
     # (tuple return of two ints) + its one dependency is_prime -- must

@@ -496,6 +496,7 @@ end interface str_concat
 
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
+   module procedure linalg_solve_complex_vec, linalg_solve_complex_mat
 end interface linalg_solve
 
 interface linalg_solve_safe
@@ -5787,6 +5788,48 @@ contains
          allocate(x(1:n,1:nrhs))
          x = bc
       end function linalg_solve_mat
+
+      function linalg_solve_complex_vec(a, b) result(x)
+         complex(dp), intent(in) :: a(:,:), b(:)
+         complex(dp), allocatable :: x(:), xm(:,:)
+         xm = linalg_solve_complex_mat(a, reshape(b, [size(b), 1]))
+         x = xm(:,1)
+      end function linalg_solve_complex_vec
+
+      function linalg_solve_complex_mat(a, b) result(x)
+         complex(dp), intent(in) :: a(:,:), b(:,:)
+         complex(dp), allocatable :: x(:,:)
+         real(dp), allocatable :: ac(:,:), bc(:,:)
+         integer, allocatable :: ipiv(:)
+         integer :: n, nrhs, info
+         interface
+            subroutine dgesv(n, nrhs, a, lda, ipiv, b, ldb, info)
+               integer, intent(in) :: n, nrhs, lda, ldb
+               integer, intent(out) :: ipiv(*), info
+               double precision, intent(inout) :: a(lda,*), b(ldb,*)
+            end subroutine dgesv
+         end interface
+         n = size(a, 1)
+         if (size(a,2) /= n) error stop "linalg_solve: matrix must be square"
+         if (size(b,1) /= n) error stop "linalg_solve: rhs row mismatch"
+         nrhs = size(b,2)
+         allocate(x(n,nrhs))
+         if (n == 0 .or. nrhs == 0) return
+         ! A X = B is equivalent to [Re(A),-Im(A); Im(A),Re(A)]
+         ! times [Re(X); Im(X)] = [Re(B); Im(B)]. Reuse the bundled
+         ! pivoted LAPACK solver, without introducing a complex LAPACK dependency.
+         allocate(ac(2*n,2*n), bc(2*n,nrhs), ipiv(2*n))
+         ac(1:n,1:n) = real(a, dp)
+         ac(1:n,n+1:2*n) = -aimag(a)
+         ac(n+1:2*n,1:n) = aimag(a)
+         ac(n+1:2*n,n+1:2*n) = real(a, dp)
+         bc(1:n,:) = real(b, dp)
+         bc(n+1:2*n,:) = aimag(b)
+         call dgesv(2*n, nrhs, ac, 2*n, ipiv, bc, 2*n, info)
+         if (info > 0) error stop "linalg_solve: singular matrix"
+         if (info < 0) error stop "linalg_solve: dgesv invalid argument"
+         x = cmplx(bc(1:n,:), bc(n+1:2*n,:), dp)
+      end function linalg_solve_complex_mat
 
       function linalg_cholesky(a) result(l)
          real(kind=dp), intent(in) :: a(:,:)

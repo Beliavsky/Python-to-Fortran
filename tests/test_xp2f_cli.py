@@ -15164,6 +15164,135 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_lstsq_matrix_rhs_preserves_rank(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xlstsq_matrix_rhs.py", [
+        "import numpy as np",
+        "from numpy import linalg as la",
+        "def fit(a, b):",
+        "    x, residuals, rank, s = np.linalg.lstsq(a, b, rcond=None)",
+        "    result = x.transpose()",
+        "    return result",
+        "a = np.array([[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]])",
+        "b = np.array([[2.0, 3.0, 1.0], [4.0, -2.0, 5.0], [3.0, 1.0, 2.0]])",
+        "x = fit(a, b)",
+        "print(x.shape[0], x.shape[1])",
+        "for i in range(3):",
+        "    for j in range(2):",
+        "        print(x[i,j])",
+        "v, _, _, _ = np.linalg.lstsq(a, b[:,0], rcond=None)",
+        "print(v[0], v[1])",
+        "out = np.zeros((4, 5))",
+        "out[1:3, 1:4], residuals, rank, s = la.lstsq(a, b, rcond=None)",
+        "for i in range(4):",
+        "    for j in range(5):",
+        "        print(out[i,j])",
+    ])
+
+
+def test_xp2f_complex_solve_errors(tmp_path: Path) -> None:
+    for a, b, message in [
+        ("[[1j, 2j], [2j, 4j]]", "[1j, 2j]", "singular matrix"),
+        ("[[1j, 2j]]", "[1j]", "matrix must be square"),
+        ("[[1j, 0j], [0j, 1j]]", "[1j]", "rhs row mismatch"),
+    ]:
+        src = tmp_path / "xbad_complex_solve.py"
+        src.write_text("import numpy as np\n"
+                       f"a = np.array({a})\nb = np.array({b})\n"
+                       "x = np.linalg.solve(a, b)\nprint(x)\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        exe = tmp_path / ("xbad_complex_solve_p.exe" if sys.platform == "win32" else "xbad_complex_solve_p")
+        run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True,
+                             check=False, timeout=30)
+        assert run.returncode != 0, run.stdout + run.stderr
+        assert message in run.stdout + run.stderr
+
+
+def test_xp2f_complex_matrix_exponential(tmp_path: Path) -> None:
+    # Reduced from John Burkardt's MIT-licensed c8mat_expm1.
+    _run_xp2f_compile_diff(tmp_path, "xcomplex_expm.py", [
+        "import numpy as np",
+        "def c8mat_expm1(n, a):",
+        "    q = 6",
+        "    a2 = a.copy()",
+        "    a_norm = np.linalg.norm(a2, np.inf)",
+        "    ee = int(np.log2(a_norm)) + 1",
+        "    s = max(0, ee + 1)",
+        "    a2 = a2 / (2.0 ** s)",
+        "    x = a2.copy()",
+        "    c = 0.5",
+        "    e = np.eye(n, dtype=np.complex64) + c * a2",
+        "    d = np.eye(n, dtype=np.complex64) - c * a2",
+        "    p = True",
+        "    for k in range(2, q + 1):",
+        "        c = c * float(q-k+1) / float(k*(2*q-k+1))",
+        "        x = np.dot(a2, x)",
+        "        e = e + c*x",
+        "        if p:",
+        "            d = d + c*x",
+        "        else:",
+        "            d = d - c*x",
+        "        p = not p",
+        "    e = np.linalg.solve(d, e)",
+        "    for k in range(s):",
+        "        e = np.dot(e, e)",
+        "    return e",
+        "for k in range(4):",
+        "    if k == 0:",
+        "        a = np.array([[1+0j, 0j], [0j, 2+0j]])",
+        "    elif k == 1:",
+        "        a = np.array([[3j, 0j], [0j, -4j]])",
+        "    elif k == 2:",
+        "        a = np.array([[5+6j, 0j], [0j, 7-8j]])",
+        "    else:",
+        "        a = np.array([[1+2j, 2-1j], [-3j, -1+1j]])",
+        "    e = c8mat_expm1(2, a)",
+        "    for i in range(2):",
+        "        for j in range(2):",
+        "            print(e[i,j].real, e[i,j].imag)",
+    ])
+
+
+def test_xp2f_complex_solve_vector_matrix_and_mixed_inputs(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcomplex_solve.py", [
+        "import numpy as np",
+        "def solve_vector(a, b):",
+        "    return np.linalg.solve(a, b)",
+        "def solve_matrix(a, b):",
+        "    return np.linalg.solve(a, b)",
+        "a = np.array([[0j, 2+1j], [3-2j, 1j]])",
+        "b = np.array([1+4j, 2-3j])",
+        "original_a = a.copy()",
+        "original_b = b.copy()",
+        "x = solve_vector(a, b)",
+        "print(x[0].real, x[0].imag, x[1].real, x[1].imag)",
+        "print(np.max(np.abs(a - original_a)), np.max(np.abs(b - original_b)))",
+        "c = np.array([[1+4j, 2j], [2-3j, 5+1j]])",
+        "original_c = c.copy()",
+        "y = solve_matrix(a, c)",
+        "for i in range(2):",
+        "    for j in range(2):",
+        "        print(y[i,j].real, y[i,j].imag)",
+        "print(np.max(np.abs(c - original_c)))",
+        "r = np.array([[2.0, 1.0], [1.0, 3.0]])",
+        "iv = np.array([1, 2])",
+        "im = np.array([[1, 2], [3, 4]])",
+        "x1 = np.linalg.solve(r, b)",
+        "x2 = np.linalg.solve(a, iv)",
+        "y1 = np.linalg.solve(r, c)",
+        "y2 = np.linalg.solve(a, im)",
+        "for i in range(2):",
+        "    print(x1[i].real, x1[i].imag, x2[i].real, x2[i].imag)",
+        "    for j in range(2):",
+        "        print(y1[i,j].real, y1[i,j].imag, y2[i,j].real, y2[i,j].imag)",
+        "rx = np.linalg.solve(r, iv)",
+        "print(rx[0], rx[1])",
+        "empty = np.linalg.solve(np.zeros((0,0), dtype=complex), np.zeros(0, dtype=complex))",
+        "print(len(empty))",
+    ])
+
+
 def test_xp2f_complex_eigvals_matches_numpy(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
     rng = np.random.default_rng(1729)

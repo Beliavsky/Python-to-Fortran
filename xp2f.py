@@ -23966,6 +23966,8 @@ class translator(ast.NodeVisitor):
                 return "int"
             if self._is_linalg_call(node.func, {"eigvals"}) and len(node.args) >= 1:
                 return "complex"
+            if self._is_linalg_call(node.func, {"solve"}) and len(node.args) >= 2:
+                return "complex" if any(self._expr_kind(arg) == "complex" for arg in node.args[:2]) else "real"
             if self._is_linalg_call(node.func, {"solve", "cholesky", "det", "inv", "cond", "eig", "eigh", "svd", "qr", "lstsq", "pinv", "matrix_power", "eigvalsh", "multi_dot"}):
                 return "real"
             if (
@@ -34623,6 +34625,11 @@ class translator(ast.NodeVisitor):
                     _a0 = f"real({_a0}, kind=dp)"
                 if self._rank_expr(node.args[1]) > 0 and self._expr_kind(node.args[1]) in {"int", "logical"}:
                     _a1 = f"real({_a1}, kind=dp)"
+                if self._expr_kind(node) == "complex":
+                    if self._expr_kind(node.args[0]) != "complex":
+                        _a0 = f"cmplx({_a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) != "complex":
+                        _a1 = f"cmplx({_a1}, kind=dp)"
                 return f"linalg_solve({_a0}, {_a1})"
             if self._is_linalg_call(node.func, {"cholesky"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
@@ -39722,7 +39729,9 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(outs[2], rank=2)
                         continue
                     if node.value.func.attr == "lstsq" and len(outs) >= 1:
-                        self._mark_alloc_real(outs[0], rank=1)
+                        first_t = node.targets[0].elts[0]
+                        if isinstance(first_t, ast.Name) and len(node.value.args) >= 2:
+                            self._mark_alloc_real(first_t.id, rank=max(1, self._rank_expr(node.value.args[1])))
                         continue
                 if (
                     len(node.targets) == 1
@@ -45075,14 +45084,16 @@ class translator(ast.NodeVisitor):
                 # NumPy lstsq returns (x, residuals, rank, s).  Lower x via
                 # normal equations for this subset and ignore the remaining
                 # tuple items.
+                sol_rank = max(1, self._rank_expr(v.args[1]))
                 if isinstance(first_t, ast.Name):
-                    self._mark_alloc_real(first_t.id, 1)
+                    self._mark_alloc_real(first_t.id, sol_rank)
                     self.o.w(f"{first_t.id} = {sol}")
                 else:
                     tmp = f"xp2f_lstsq_x_{getattr(node, 'lineno', 0)}"
                     self.o.w("block")
                     self.o.push()
-                    self.o.w(f"real(kind=dp), allocatable :: {tmp}(:)")
+                    dims = ",".join(":" for _ in range(sol_rank))
+                    self.o.w(f"real(kind=dp), allocatable :: {tmp}({dims})")
                     self.o.w(f"{tmp} = {sol}")
                     self.o.w(f"{self.expr(first_t)} = {tmp}")
                     self.o.pop()
