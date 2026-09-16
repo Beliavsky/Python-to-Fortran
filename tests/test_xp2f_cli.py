@@ -15164,6 +15164,127 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_complex_eigvals_matches_numpy(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    rng = np.random.default_rng(1729)
+    burkardt = np.array([[4+7j, -10-3j, 1+6j],
+                         [-7+1j, 4+6j, -2+3j],
+                         [-5+2j, 4+11j, -3-6j]])
+    cases = [np.array([[2-3j]]), np.zeros((3, 3), complex),
+             np.diag([2+3j, 2+3j, -1j]),
+             np.array([[1+2j, 1j], [0j, 1+2j]]),
+             burkardt, 0.5 * (burkardt + burkardt.conj().T),
+             burkardt * 1e200, burkardt * 1e-200]
+    for n in (2, 3, 5, 8):
+        cases.append(rng.normal(size=(n, n)) + 1j*rng.normal(size=(n, n)))
+    lines = ["import numpy as np", "def show(a):",
+             "    w = np.linalg.eigvals(a)",
+             "    for i in range(len(w)):",
+             "        print(w[i].real, w[i].imag)",
+             "    for i in range(a.shape[0]):",
+             "        for j in range(a.shape[1]):",
+             "            print(a[i, j].real, a[i, j].imag)"]
+    for a in cases:
+        lines.append(f"show(np.array({a.tolist()!r}))")
+    lines.append("show(np.zeros((0, 0), dtype=complex))")
+    src = tmp_path / "xcomplex_eigvals.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    exe = tmp_path / ("xcomplex_eigvals_p.exe" if sys.platform == "win32" else "xcomplex_eigvals_p")
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True,
+                         check=False, timeout=60)
+    assert run.returncode == 0, run.stdout + run.stderr
+    numbers = iter(float(s.replace("D", "E")) for s in run.stdout.split())
+    for a in cases:
+        n = len(a)
+        actual = np.array([complex(next(numbers), next(numbers)) for _ in range(n)])
+        # Eigenvalue ordering is unspecified. Match as a multiset, not by index,
+        # and normalize before comparison so tiny/huge matrices are meaningful.
+        scale = np.max(np.abs(a)) or 1.0
+        expected = list(np.linalg.eigvals(a / scale))
+        for value in actual / scale:
+            index = int(np.argmin(np.abs(np.asarray(expected) - value)))
+            np.testing.assert_allclose(value, expected.pop(index), rtol=1e-10, atol=1e-12)
+        unchanged = np.array([complex(next(numbers), next(numbers)) for _ in range(n*n)])
+        np.testing.assert_allclose(unchanged.reshape(a.shape), a, rtol=1e-14, atol=0)
+    assert list(numbers) == []
+
+
+def test_xp2f_complex_eigvals_rejects_invalid_input(tmp_path: Path) -> None:
+    for values, message in [
+        ("[[1j, 2j]]", "matrix must be square"),
+        ("[[complex(np.nan, 0.0)]]", "matrix must contain only finite values"),
+        ("[[complex(0.0, np.inf)]]", "matrix must contain only finite values"),
+    ]:
+        src = tmp_path / "xbad_eigvals.py"
+        src.write_text("import numpy as np\n"
+                       f"a = np.array({values})\n"
+                       "w = np.linalg.eigvals(a)\nprint(w)\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        exe = tmp_path / ("xbad_eigvals_p.exe" if sys.platform == "win32" else "xbad_eigvals_p")
+        run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True,
+                             check=False, timeout=30)
+        assert run.returncode != 0, run.stdout + run.stderr
+        assert message in run.stdout + run.stderr
+
+
+def test_xp2f_complex_log_norm_and_real_eigvals(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcomplex_log_norm.py", [
+        "import numpy as np",
+        "def log_norm(a):",
+        "    b = 0.5 * (a + np.conjugate(np.transpose(a)))",
+        "    c = np.linalg.eigvals(b)",
+        "    return np.max(np.real(c))",
+        "a = np.array([[4+7j, -10-3j, 1+6j], [-7+1j, 4+6j, -2+3j], [-5+2j, 4+11j, -3-6j]])",
+        "print(log_norm(a))",
+        "r = np.array([[0.0, -1.0], [1.0, 0.0]])",
+        "w = np.linalg.eigvals(r)",
+        "print(np.max(w.imag), np.min(w.imag), np.sum(w.real))",
+    ])
+
+
+def test_xp2f_matrix_norms_and_complex_branch_returns(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xmatrix_norms.py", [
+        "import numpy as np",
+        "def matrix(k):",
+        "    if k == 0:",
+        "        a = np.array([[3.0, 1.0, 0.0], [0.0, 4.0, 2.0]])",
+        "    else:",
+        "        a = np.array([[3.0 + 2.0j, 1.0j, 0.0j], [0.0j, 4.0 - 1.0j, 2.0j]])",
+        "    return a",
+        "def check(a):",
+        "    # Input:",
+        "    # real/complex A(M,N), the matrix.",
+        "    print(np.linalg.norm(a, 1))",
+        "    print(np.linalg.norm(a, 2))",
+        "    print(np.linalg.norm(a, np.inf))",
+        "    print(np.linalg.norm(a, -np.inf))",
+        "    print(np.linalg.norm(a))",
+        "    print(np.linalg.norm(a, 'fro'))",
+        "for k in range(2):",
+        "    a = matrix(k)",
+        "    print(a[0, 0].real, a[0, 0].imag)",
+        "    d = np.diag(a)",
+        "    print(d.real)",
+        "    print(d.imag)",
+        "    restored = np.diag(d)",
+        "    print(restored[0, 0].real, restored[0, 0].imag)",
+        "    check(a)",
+        "r = np.array([[3.0, 1.0, 0.0], [0.0, 4.0, 2.0]])",
+        "print(np.linalg.norm(r, 2))",
+        "kept = np.linalg.norm(r, 1, keepdims=True)",
+        "print(kept.shape[0], kept.shape[1], kept[0, 0])",
+        "rows = np.linalg.norm(r, 2, axis=1)",
+        "print(rows[0], rows[1])",
+        "print(np.linalg.norm(np.array([3.0, 4.0]), 2))",
+        "print(np.linalg.norm(np.array([[3, 1], [0, 4]]), 2))",
+    ])
+
+
 def test_xp2f_numpy_sum_positional_axis(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xsum_positional_axis.py", [
         "import numpy as np",

@@ -6758,9 +6758,16 @@ def function_is_pure(fn_node, known_pure_calls=None):
                 if np_chain is not None:
                     leaf = np_chain[-1].lower()
                     inner = {seg.lower() for seg in np_chain[1:-1]}
-                    if "linalg" in inner and leaf in {"det", "inv", "solve", "lstsq"}:
+                    if "linalg" in inner and leaf in {"det", "inv", "solve", "lstsq", "eigvals"}:
                         self.ok = False
                         return
+                    if "linalg" in inner and leaf == "norm":
+                        order = next((kw.value for kw in node.keywords if kw.arg == "ord"),
+                                     node.args[1] if len(node.args) >= 2 else None)
+                        if isinstance(order, ast.Constant) and order.value == 2:
+                            # Matrix order 2 lowers to an impure LAPACK SVD.
+                            self.ok = False
+                            return
                     if leaf in impure_np_leaf_calls or any(seg in impure_np_chain_segments for seg in inner):
                         self.ok = False
                         return
@@ -14400,6 +14407,11 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_inv")
                 elif node.func.attr == "cond":
                     needed.add("linalg_cond")
+                elif node.func.attr == "norm":
+                    order = next((kw.value for kw in node.keywords if kw.arg == "ord"),
+                                 node.args[1] if len(node.args) >= 2 else None)
+                    if isinstance(order, ast.Constant) and order.value == 2:
+                        needed.add("matrix_norm2")
                 elif node.func.attr == "matrix_rank":
                     needed.add("linalg_matrix_rank")
                 elif node.func.attr == "eigvals":
@@ -14431,7 +14443,12 @@ def detect_needed_helpers(tree):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id in linalg_aliases
             ):
-                if node.func.attr == "solve":
+                if node.func.attr == "norm":
+                    order = next((kw.value for kw in node.keywords if kw.arg == "ord"),
+                                 node.args[1] if len(node.args) >= 2 else None)
+                    if isinstance(order, ast.Constant) and order.value == 2:
+                        needed.add("matrix_norm2")
+                elif node.func.attr == "solve":
                     needed.add("linalg_solve")
                 elif node.func.attr == "cholesky":
                     needed.add("linalg_cholesky")
@@ -22132,6 +22149,20 @@ class translator(ast.NodeVisitor):
                 # _rank_expr side's own keepdims handling above.
                 return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
             return reduced
+        if self._rank_expr(node.args[0]) == 2:
+            if ord_node is None or is_none(ord_node) or ord_is_fro:
+                reduced = f"sqrt(sum({sq_term}))"
+            elif ord_is_two:
+                reduced = f"matrix_norm2({a0})"
+            elif ord_is_one:
+                reduced = f"maxval(sum(abs({a0}), dim=1))"
+            elif ord_is_posinf:
+                reduced = f"maxval(sum(abs({a0}), dim=2))"
+            elif ord_is_neginf:
+                reduced = f"minval(sum(abs({a0}), dim=2))"
+            else:
+                raise NotImplementedError("unsupported matrix norm order")
+            return f"reshape([{reduced}], [1, 1])" if keepdims else reduced
         if ord_node is None or ord_is_fro or ord_is_two:
             return f"sqrt(sum({sq_term}))"
         if ord_is_posinf:
@@ -24147,6 +24178,8 @@ class translator(ast.NodeVisitor):
                         return "real"
                     if spec in {"int", "alloc_int"}:
                         return "int"
+                    if spec in {"complex", "alloc_complex"}:
+                        return "complex"
                 if node.func.id in {"open", "len", "ord", "int", "isqrt", "size"}:
                     return "int"
                 if node.func.id == "isinstance":
@@ -28524,6 +28557,8 @@ class translator(ast.NodeVisitor):
                         axis_node = kw.value
                     elif kw.arg == "keepdims":
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                if keepdims and self._rank_expr(node.args[0]) == 2:
+                    return 2
                 if axis_node is not None:
                     if keepdims:
                         # keepdims=True keeps the reduced axis as a
@@ -28799,7 +28834,7 @@ class translator(ast.NodeVisitor):
                     rr_hint = int(self.local_return_ranks.get(node.func.id, 0))
                     if rr_hint > 0:
                         return rr_hint
-                if node.func.id in self.local_return_specs and self.local_return_specs[node.func.id] in {"alloc_real", "alloc_int", "alloc_log"}:
+                if node.func.id in self.local_return_specs and self.local_return_specs[node.func.id] in {"alloc_real", "alloc_int", "alloc_log", "alloc_complex"}:
                     rr_hint = int(self.local_return_ranks.get(node.func.id, 0))
                     if rr_hint > 0:
                         return rr_hint
@@ -62012,9 +62047,12 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 # site) undetermined -- which previously left it
                 # completely UNDECLARED ("has no IMPLICIT type").
                 kk = "real"
+            if kk == "complex" and best_kind in {None, "int", "real", "complex"}:
+                best_kind = "complex"
             if rr > best_rank:
                 best_rank = rr
-                best_kind = kk
+                if best_kind != "complex":
+                    best_kind = kk
             elif best_kind is None and kk is not None:
                 best_kind = kk
             if isinstance(_rhs, ast.Name):
@@ -64531,7 +64569,11 @@ def generate_flat(
                 merged_kinds.append(hk)
             elif hk == "real" and bk in {"int", "logical", "char", "complex"}:
                 merged_kinds.append(bk)
-            elif hk == "complex" and bk in {"int", "logical", "char", "real"}:
+            elif hk == "complex" and bk in {"int", "real"}:
+                # Real-valued operations (norm, abs, real) do not imply
+                # real input. Preserve observed imaginary components.
+                merged_kinds.append(hk)
+            elif hk == "complex" and bk in {"logical", "char"}:
                 merged_kinds.append(bk)
             else:
                 merged_kinds.append(hk)
