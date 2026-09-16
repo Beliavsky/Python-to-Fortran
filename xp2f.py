@@ -6758,7 +6758,7 @@ def function_is_pure(fn_node, known_pure_calls=None):
                 if np_chain is not None:
                     leaf = np_chain[-1].lower()
                     inner = {seg.lower() for seg in np_chain[1:-1]}
-                    if "linalg" in inner and leaf in {"det", "inv", "solve", "lstsq", "eigvals"}:
+                    if "linalg" in inner and leaf in {"det", "inv", "solve", "lstsq", "eigvals", "eig"}:
                         self.ok = False
                         return
                     if "linalg" in inner and leaf == "norm":
@@ -9931,6 +9931,12 @@ def promote_immediate_scalar_constants(lines):
         # hence the second, substring-based check.
         reassigned = False
         cond_reassign_re = re.compile(rf"(?:^\s*|\)\s*|;\s*){re.escape(nm)}\s*=(?!=)", flags=re.IGNORECASE)
+        # A DO control variable is assigned by the loop itself, even if
+        # there is no ordinary assignment to it in the loop body.
+        do_reassign_re = re.compile(
+            rf"(?:^|;)\s*(?:\d+\s+)?(?:\w+\s*:\s*)?do\s+(?:\d+\s+)?{re.escape(nm)}\s*=",
+            flags=re.IGNORECASE,
+        )
         for k in range(j + 1, scope_end):
             code_k = out[k].split("!", 1)[0].strip()
             mk = asn_re.match(code_k)
@@ -9938,6 +9944,9 @@ def promote_immediate_scalar_constants(lines):
                 reassigned = True
                 break
             if cond_reassign_re.search(code_k):
+                reassigned = True
+                break
+            if do_reassign_re.search(code_k):
                 reassigned = True
                 break
         if not reassigned and _name_used_as_call_arg(out, nm, j + 1, scope_end):
@@ -14396,7 +14405,7 @@ def detect_needed_helpers(tree):
                 if node.func.attr == "solve":
                     needed.add("linalg_solve")
                 elif node.func.attr == "lstsq":
-                    needed.add("linalg_solve")
+                    needed.update({"linalg_lstsq", "linalg_lstsq_x"})
                 elif node.func.attr == "cholesky":
                     needed.add("linalg_cholesky")
                 elif node.func.attr == "det":
@@ -14473,7 +14482,7 @@ def detect_needed_helpers(tree):
                 elif node.func.attr == "qr":
                     needed.add("linalg_qr_reduced")
                 elif node.func.attr == "lstsq":
-                    needed.add("linalg_solve")
+                    needed.update({"linalg_lstsq", "linalg_lstsq_x"})
                 elif node.func.attr == "pinv":
                     needed.add("linalg_pinv")
                 elif node.func.attr == "matrix_power":
@@ -22055,6 +22064,17 @@ class translator(ast.NodeVisitor):
         kinds = self.local_func_arg_kinds.get(callee, [])
         want = kinds[idx] if idx < len(kinds) else None
         return self._coerce_expr_kind(arg_node, arg_expr, want)
+
+    def _lstsq_args(self, node):
+        if any(self._expr_kind(arg) == "complex" for arg in node.args[:2]):
+            raise NotImplementedError("np.linalg.lstsq currently supports real inputs only")
+        args = [f"real({self.expr(arg)}, kind=dp)" if self._expr_kind(arg) == "int"
+                else self.expr(arg) for arg in node.args[:2]]
+        rcond = next((kw.value for kw in node.keywords if kw.arg == "rcond"),
+                     node.args[2] if len(node.args) > 2 else None)
+        if rcond is not None and not (isinstance(rcond, ast.Constant) and rcond.value is None):
+            args.append(f"rcond=real({self.expr(rcond)}, kind=dp)")
+        return args
 
     def _norm_expr(self, node):
         a0 = self.expr(node.args[0])
@@ -31284,12 +31304,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.slice.value, int)
                 and int(node.slice.value) == 0
             ):
-                a0 = self.expr(node.value.args[0])
-                b0 = self.expr(node.value.args[1])
-                return (
-                    f"linalg_solve(matmul(transpose({a0}), {a0}), "
-                    f"matmul(transpose({a0}), {b0}))"
-                )
+                return f"linalg_lstsq_x({', '.join(self._lstsq_args(node.value))})"
             # Collapse nested reverse slices: a[i:j][::-1] -> a(j:i:-1)
             if (
                 isinstance(node.value, ast.Subscript)
@@ -39712,8 +39727,8 @@ class translator(ast.NodeVisitor):
                 ):
                     outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
                     if node.value.func.attr == "eig" and len(outs) >= 2:
-                        self._mark_alloc_real(outs[0], rank=1)
-                        self._mark_alloc_real(outs[1], rank=2)
+                        self._mark_alloc_complex(outs[0], rank=1)
+                        self._mark_alloc_complex(outs[1], rank=2)
                         continue
                     if node.value.func.attr == "eigh" and len(outs) >= 2:
                         self._mark_alloc_real(outs[0], rank=1)
@@ -39732,6 +39747,12 @@ class translator(ast.NodeVisitor):
                         first_t = node.targets[0].elts[0]
                         if isinstance(first_t, ast.Name) and len(node.value.args) >= 2:
                             self._mark_alloc_real(first_t.id, rank=max(1, self._rank_expr(node.value.args[1])))
+                        for idx, target in enumerate(node.targets[0].elts[1:], start=1):
+                            if isinstance(target, ast.Name) and target.id != "_":
+                                if idx == 2:
+                                    self._mark_int(self._aliased_name(target.id))
+                                else:
+                                    self._mark_alloc_real(target.id, rank=1)
                         continue
                 if (
                     len(node.targets) == 1
@@ -45075,29 +45096,34 @@ class translator(ast.NodeVisitor):
                 first_t = t.elts[0]
                 if not isinstance(first_t, (ast.Name, ast.Subscript)):
                     raise NotImplementedError("np.linalg.lstsq first tuple target must be a name or subscript")
-                a0 = self.expr(v.args[0])
-                b0 = self.expr(v.args[1])
-                sol = (
-                    f"linalg_solve(matmul(transpose({a0}), {a0}), "
-                    f"matmul(transpose({a0}), {b0}))"
-                )
-                # NumPy lstsq returns (x, residuals, rank, s).  Lower x via
-                # normal equations for this subset and ignore the remaining
-                # tuple items.
+                args = self._lstsq_args(v)
                 sol_rank = max(1, self._rank_expr(v.args[1]))
-                if isinstance(first_t, ast.Name):
-                    self._mark_alloc_real(first_t.id, sol_rank)
-                    self.o.w(f"{first_t.id} = {sol}")
-                else:
-                    tmp = f"xp2f_lstsq_x_{getattr(node, 'lineno', 0)}"
-                    self.o.w("block")
-                    self.o.push()
-                    dims = ",".join(":" for _ in range(sol_rank))
-                    self.o.w(f"real(kind=dp), allocatable :: {tmp}({dims})")
-                    self.o.w(f"{tmp} = {sol}")
-                    self.o.w(f"{self.expr(first_t)} = {tmp}")
-                    self.o.pop()
-                    self.o.w("end block")
+                tmp = f"xp2f_lstsq_{getattr(node, 'lineno', 0)}"
+                names = [tmp + suffix for suffix in ("_x", "_res", "_rank", "_s")]
+                self.o.w("block")
+                self.o.push()
+                dims = ",".join(":" for _ in range(sol_rank))
+                self.o.w(f"real(kind=dp), allocatable :: {names[0]}({dims}), {names[1]}(:), {names[3]}(:)")
+                self.o.w(f"integer :: {names[2]}")
+                call_args = args[:2] + names + args[2:]
+                self.o.w(f"call linalg_lstsq({', '.join(call_args)})")
+                for idx, target in enumerate(t.elts):
+                    if isinstance(target, ast.Starred):
+                        if not (idx == 1 and len(t.elts) == 2 and isinstance(target.value, ast.Name) and target.value.id == "_"):
+                            raise NotImplementedError("lstsq supports only a trailing starred discard")
+                        break
+                    if isinstance(target, ast.Name) and target.id == "_":
+                        continue
+                    if idx >= 4 or not isinstance(target, (ast.Name, ast.Subscript)):
+                        raise NotImplementedError("unsupported lstsq tuple target")
+                    if isinstance(target, ast.Name):
+                        if idx == 2:
+                            self._mark_int(self._aliased_name(target.id))
+                        else:
+                            self._mark_alloc_real(target.id, sol_rank if idx == 0 else 1)
+                    self.o.w(f"{self.expr(target)} = {names[idx]}")
+                self.o.pop()
+                self.o.w("end block")
                 return
             outs = []
             for e in t.elts:
@@ -45118,13 +45144,16 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("tuple assignment targets must be names or starred ignores")
             if v.func.attr == "eig" and len(v.args) >= 1 and len(outs) >= 2:
                 out0, out1 = outs[0], outs[1]
+                eig_arg = self.expr(v.args[0])
+                if self._expr_kind(v.args[0]) == "int":
+                    eig_arg = f"real({eig_arg}, kind=dp)"
                 if out0 != "_" and out1 != "_":
-                    self.o.w(f"call linalg_eig({self.expr(v.args[0])}, {out0}, {out1})")
+                    self.o.w(f"call linalg_eig({eig_arg}, {out0}, {out1})")
                 else:
                     self.o.w("block")
                     self.o.push()
-                    self.o.w("real(kind=dp), allocatable :: w_eig_tmp(:), v_eig_tmp(:,:)")
-                    self.o.w(f"call linalg_eig({self.expr(v.args[0])}, w_eig_tmp, v_eig_tmp)")
+                    self.o.w("complex(kind=dp), allocatable :: w_eig_tmp(:), v_eig_tmp(:,:)")
+                    self.o.w(f"call linalg_eig({eig_arg}, w_eig_tmp, v_eig_tmp)")
                     if out0 != "_":
                         self.o.w(f"{out0} = w_eig_tmp")
                     if out1 != "_":
@@ -45204,32 +45233,6 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{outs[0]} = merge((-1.0_dp), 1.0_dp, ({det_tmp} < 0.0_dp))")
                 if outs[1] != "_":
                     self.o.w(f"{outs[1]} = log(abs({det_tmp}))")
-                return
-            if v.func.attr == "lstsq" and len(v.args) >= 2 and len(t.elts) >= 1:
-                first_t = t.elts[0]
-                if not isinstance(first_t, ast.Name):
-                    raise NotImplementedError("np.linalg.lstsq first tuple target must be a name")
-                a0 = self.expr(v.args[0])
-                b0 = self.expr(v.args[1])
-                # NumPy lstsq returns (x, residuals, rank, s); lower x for this subset
-                # via normal equations and ignore remaining tuple items.
-                self.o.w(
-                    f"{first_t.id} = linalg_solve(matmul(transpose({a0}), {a0}), "
-                    f"matmul(transpose({a0}), {b0}))"
-                )
-                return
-            if v.func.attr == "lstsq" and len(v.args) >= 2 and len(t.elts) >= 1:
-                first_t = t.elts[0]
-                if not isinstance(first_t, ast.Name):
-                    raise NotImplementedError("np.linalg.lstsq first tuple target must be a name")
-                a0 = self.expr(v.args[0])
-                b0 = self.expr(v.args[1])
-                # NumPy lstsq returns (x, residuals, rank, s); for current subset
-                # lower x via normal equations and ignore the remaining tuple items.
-                self.o.w(
-                    f"{first_t.id} = linalg_solve(matmul(transpose({a0}), {a0}), "
-                    f"matmul(transpose({a0}), {b0}))"
-                )
                 return
         # tuple unpacking from np.meshgrid(x, y, indexing='xy'/'ij')
         if (
@@ -64577,6 +64580,16 @@ def generate_flat(
             elif hk == "int" and bk != "int":
                 merged_kinds.append(bk)
             elif hk == "real" and bk == "int" and _arg_has_explicit_real_evidence(arg_nm):
+                merged_kinds.append(hk)
+            elif hk == "real" and bk == "complex" and not any(
+                (isinstance(n, ast.Name) and n.id == arg_nm and isinstance(n.ctx, ast.Store))
+                or (isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)
+                    and any(isinstance(x, ast.Name) and x.id == arg_nm for x in ast.walk(n.value)))
+                for n in ast.walk(fn)
+            ):
+                # A complex result (e.g. A @ an eigenvector) does not imply
+                # complex input A. Preserve observed real inputs unless the
+                # body actually rebinds or mutates the argument.
                 merged_kinds.append(hk)
             elif hk == "real" and bk in {"int", "logical", "char", "complex"}:
                 merged_kinds.append(bk)

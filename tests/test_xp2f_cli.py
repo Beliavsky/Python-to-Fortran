@@ -15164,6 +15164,137 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_matrix_exponential_test9(tmp_path: Path) -> None:
+    # Burkardt's r8mat_expm3 deliberately uses real parts of the eigenpairs.
+    # The NAG test matrix has a conjugate pair, so both the eig output types
+    # and the real-part conversions must survive translation.
+    _run_xp2f_compile_diff(tmp_path, "xmatrix_exponential_test9.py", [
+        "import numpy as np",
+        "def exp_via_eig(a):",
+        "    cevals, cevecs = np.linalg.eig(a)",
+        "    evals = cevals.real",
+        "    evecs = cevecs.real",
+        "    exp_evals = np.exp(evals)",
+        "    d2 = np.diag(exp_evals)",
+        "    b = np.dot(evecs, d2)",
+        "    bt = b.transpose()",
+        "    at = evecs.transpose()",
+        "    et, residuals, rank, s = np.linalg.lstsq(at, bt, rcond=None)",
+        "    e = et.transpose()",
+        "    return e",
+        "a = np.array([[1.0, 3.0, 3.0, 3.0], [2.0, 1.0, 2.0, 3.0], [2.0, 1.0, 1.0, 3.0], [2.0, 2.0, 2.0, 1.0]])",
+        "e = exp_via_eig(a)",
+        "for i in range(4):",
+        "    for j in range(4):",
+        "        print(e[i,j])",
+    ])
+
+
+def test_xp2f_eig_real_matrix_with_complex_eigenpairs(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcomplex_eigenpairs.py", [
+        "import numpy as np",
+        "def check(a):",
+        "    w, v = np.linalg.eig(a)",
+        "    for j in range(len(w)):",
+        "        print(w[j].real, w[j].imag)",
+        "        err = np.dot(a, v[:,j]) - w[j]*v[:,j]",
+        "        print(np.max(np.abs(err)))",
+        "        print(np.sum(np.abs(v[:,j])**2))",
+        "    print(np.sum(a))",
+        "check(np.array([[0.0, -1.0], [1.0, 0.0]]))",
+        "check(np.array([[2.0, 0.0, 0.0], [0.0, 0.0, -3.0], [0.0, 3.0, 0.0]]))",
+        "check(np.array([[2.0, 1.0], [0.0, 3.0]]))",
+        "a = np.array([[0, -1], [1, 0]])",
+        "w, _ = np.linalg.eig(a)",
+        "print(w[0].imag, w[1].imag)",
+        "_, v = np.linalg.eig(a)",
+        "print(np.sum(np.abs(v)**2))",
+        "w, v = np.linalg.eig(np.zeros((0,0)))",
+        "print(len(w), v.shape[0], v.shape[1])",
+    ])
+
+
+def test_xp2f_lstsq_svd_rank_deficient_and_diagnostics(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xlstsq_svd.py", [
+        "import numpy as np",
+        "def report(a, b, cut):",
+        "    x, residuals, rank, s = np.linalg.lstsq(a, b, rcond=cut)",
+        "    print(rank, len(residuals), len(s), x.shape[0], x.shape[1])",
+        "    for i in range(x.shape[0]):",
+        "        for j in range(x.shape[1]):",
+        "            print(x[i,j])",
+        "    for i in range(len(residuals)):",
+        "        print(residuals[i])",
+        "    for i in range(len(s)):",
+        "        print(s[i])",
+        "a = np.array([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]])",
+        "b = np.array([[1.0, 0.0], [2.0, 1.0], [4.0, 2.0]])",
+        "report(a, b, -1.0)",
+        "report(np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]]), np.array([[2.0], [3.0]]), -1.0)",
+        "report(np.array([[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]]), b, -1.0)",
+        "report(np.zeros((3,2)), b, -1.0)",
+        "report(np.zeros((0,2)), np.zeros((0,1)), -1.0)",
+        "report(np.zeros((3,0)), b, -1.0)",
+        "report(a, np.zeros((3,0)), -1.0)",
+        "d = np.array([[1.0, 0.0], [0.0, 0.0001]])",
+        "rhs = np.array([[1.0], [1.0]])",
+        "report(d, rhs, 0.001)",
+        "report(d, rhs, 0.0)",
+        "v = np.array([1.0, 2.0, 4.0])",
+        "x, residuals, rank, s = np.linalg.lstsq(a, v, rcond=None)",
+        "print(x[0], x[1], rank, len(residuals))",
+        "z = np.linalg.lstsq(a, v)[0]",
+        "print(z[0], z[1])",
+        "z2 = np.linalg.lstsq(d, np.array([1, 1]), 0.001)[0]",
+        "print(z2[0], z2[1])",
+        "full = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])",
+        "x, residuals, rank, s = np.linalg.lstsq(full, v, rcond=None)",
+        "print(x[0], x[1], rank, residuals[0])",
+        "ai = np.array([[1, 2], [2, 4]])",
+        "xi = np.linalg.lstsq(ai, np.array([1, 2]), rcond=None)[0]",
+        "print(xi[0], xi[1])",
+    ])
+
+
+@pytest.mark.parametrize("loop", ["do k = 1, n", "outer: do K = 1, n", "do 100 k = 1, n"])
+def test_scalar_constant_promotion_keeps_do_variables(loop: str) -> None:
+    lines = ["subroutine f(n)", "integer, intent(in) :: n", "integer :: k",
+             "integer :: fixed", "k = 0", "fixed = 7", "block", loop,
+             "print *, k, fixed", "end do", "end block", "end subroutine f"]
+    result = "\n".join(xp2f.promote_immediate_scalar_constants(lines))
+    assert "parameter :: k" not in result
+    assert "k = 0" in result
+    assert "parameter :: fixed = 7" in result
+
+
+def test_xp2f_initialized_loop_variable_in_branch(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xinitialized_loop.py", [
+        "import numpy as np",
+        "def matrix(n, which):",
+        "    a = np.zeros((n, n))",
+        "    if which == 13:",
+        "        k = 0",
+        "        for i in range(n):",
+        "            a[i, i] = 1.0",
+        "        value = 1.0",
+        "        for k in range(1, n):",
+        "            value = value / float(k)",
+        "            for i in range(n-k):",
+        "                a[i, i+k] = value",
+        "        value = 1.0 / 10.0**n",
+        "        for k in range(1, n):",
+        "            value = value / float(k)",
+        "            for j in range(k):",
+        "                a[n+j-k, j] = value",
+        "    return a",
+        "for n in range(1, 5):",
+        "    a = matrix(n, 13)",
+        "    for i in range(n):",
+        "        for j in range(n):",
+        "            print(a[i,j])",
+    ])
+
+
 def test_xp2f_lstsq_matrix_rhs_preserves_rank(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xlstsq_matrix_rhs.py", [
         "import numpy as np",

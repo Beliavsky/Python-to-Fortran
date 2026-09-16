@@ -263,7 +263,7 @@ public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:
 public :: linalg_cond !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="2-norm condition number using SVD singular values"
 public :: linalg_matrix_rank !@pyapi kind=function ret=integer args=a:real(dp)(:,:):intent(in) desc="numerical matrix rank using SVD singular values and NumPy-like tolerance"
 public :: linalg_eigvals !@pyapi kind=function ret=complex(dp)(:) args=a:real(dp)(:,:):intent(in) desc="eigenvalues of real or complex square matrix"
-public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="right eigenpairs of real square matrix using LAPACK DGEEV (real-spectrum only)"
+public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:complex(dp)(:):intent(out),v:complex(dp)(:,:):intent(out) desc="complex right eigenpairs of real square matrix using LAPACK DGEEV"
 public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
 public :: linalg_eigvalsh !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) desc="eigenvalues only of real symmetric matrix using LAPACK DSYEV (jobz='N')"
 public :: linalg_pinv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="Moore-Penrose pseudo-inverse via economy SVD"
@@ -498,6 +498,14 @@ interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
    module procedure linalg_solve_complex_vec, linalg_solve_complex_mat
 end interface linalg_solve
+
+public :: linalg_lstsq, linalg_lstsq_x
+interface linalg_lstsq
+   module procedure linalg_lstsq_vec, linalg_lstsq_mat
+end interface linalg_lstsq
+interface linalg_lstsq_x
+   module procedure linalg_lstsq_x_vec, linalg_lstsq_x_mat
+end interface linalg_lstsq_x
 
 interface linalg_solve_safe
    module procedure linalg_solve_safe_vec
@@ -5706,6 +5714,76 @@ contains
          end do
       end function interp_1d
 
+      subroutine linalg_lstsq_mat(a, b, x, residuals, rnk, s, rcond)
+         real(dp), intent(in) :: a(:,:), b(:,:)
+         real(dp), allocatable, intent(out) :: x(:,:), residuals(:), s(:)
+         integer, intent(out) :: rnk
+         real(dp), optional, intent(in) :: rcond
+         real(dp), allocatable :: u(:,:), vt(:,:), projected(:,:)
+         real(dp) :: cutoff
+         integer :: m, n, k, j
+         m = size(a,1)
+         n = size(a,2)
+         k = min(m,n)
+         if (size(b,1) /= m) error stop "linalg_lstsq: rhs row mismatch"
+         allocate(x(n,size(b,2)), source=0.0_dp)
+         rnk = 0
+         if (k == 0) then
+            allocate(s(0))
+         else
+            call linalg_svd_econ(a, u, s, vt)
+            cutoff = epsilon(1.0_dp) * real(max(m,n), dp)
+            if (present(rcond)) then
+               cutoff = rcond
+               if (cutoff < 0.0_dp) cutoff = epsilon(1.0_dp)
+            end if
+            cutoff = cutoff * s(1)
+            rnk = count(s > cutoff)
+            projected = matmul(transpose(u), b)
+            do j = 1, k
+               if (s(j) > cutoff) then
+                  projected(j,:) = projected(j,:) / s(j)
+               else
+                  projected(j,:) = 0.0_dp
+               end if
+            end do
+            x = matmul(transpose(vt), projected)
+         end if
+         ! NumPy reports residual sums only for full-column-rank,
+         ! overdetermined systems, even if other systems have nonzero error.
+         if (rnk == n .and. m > n) then
+            residuals = sum((b - matmul(a,x))**2, dim=1)
+         else
+            allocate(residuals(0))
+         end if
+      end subroutine linalg_lstsq_mat
+
+      subroutine linalg_lstsq_vec(a, b, x, residuals, rnk, s, rcond)
+         real(dp), intent(in) :: a(:,:), b(:)
+         real(dp), allocatable, intent(out) :: x(:), residuals(:), s(:)
+         integer, intent(out) :: rnk
+         real(dp), optional, intent(in) :: rcond
+         real(dp), allocatable :: xm(:,:)
+         call linalg_lstsq_mat(a, reshape(b, [size(b),1]), xm, residuals, rnk, s, rcond)
+         x = xm(:,1)
+      end subroutine linalg_lstsq_vec
+
+      function linalg_lstsq_x_mat(a, b, rcond) result(x)
+         real(dp), intent(in) :: a(:,:), b(:,:)
+         real(dp), optional, intent(in) :: rcond
+         real(dp), allocatable :: x(:,:), residuals(:), s(:)
+         integer :: rnk
+         call linalg_lstsq_mat(a, b, x, residuals, rnk, s, rcond)
+      end function linalg_lstsq_x_mat
+
+      function linalg_lstsq_x_vec(a, b, rcond) result(x)
+         real(dp), intent(in) :: a(:,:), b(:)
+         real(dp), optional, intent(in) :: rcond
+         real(dp), allocatable :: x(:), residuals(:), s(:)
+         integer :: rnk
+         call linalg_lstsq_vec(a, b, x, residuals, rnk, s, rcond)
+      end function linalg_lstsq_x_vec
+
       function linalg_solve_vec(a, b) result(x)
          real(kind=dp), intent(in) :: a(:,:), b(:)
          real(kind=dp), allocatable :: x(:)
@@ -6029,9 +6107,9 @@ contains
 
       subroutine linalg_eig(a, w, v)
          real(kind=dp), intent(in) :: a(:,:)
-         real(kind=dp), allocatable, intent(out) :: w(:), v(:,:)
+         complex(kind=dp), allocatable, intent(out) :: w(:), v(:,:)
          real(kind=dp), allocatable :: ac(:,:), wr(:), wi(:), vr(:,:), vl_dummy(:,:), work(:)
-         integer :: n, info, lwork
+         integer :: n, info, lwork, j
          interface
             subroutine dgeev(jobvl, jobvr, n, a, lda, wr, wi, vl, ldvl, vr, ldvr, work, lwork, info)
                character(len=1), intent(in) :: jobvl, jobvr
@@ -6042,7 +6120,9 @@ contains
             end subroutine dgeev
          end interface
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_eig: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_eig: matrix must be square"
+         allocate(w(n), v(n,n))
+         if (n == 0) return
          allocate(ac(1:n,1:n), source=a)
          allocate(wr(1:n), wi(1:n))
          allocate(vr(1:n,1:n))
@@ -6050,15 +6130,26 @@ contains
          allocate(work(1))
          lwork = -1
          call dgeev('N', 'V', n, ac, n, wr, wi, vl_dummy, 1, vr, n, work, lwork, info)
-         if (info /= 0) stop "linalg_eig: dgeev workspace query failed"
+         if (info /= 0) error stop "linalg_eig: dgeev workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dgeev('N', 'V', n, ac, n, wr, wi, vl_dummy, 1, vr, n, work, lwork, info)
-         if (info /= 0) stop "linalg_eig: dgeev failed"
-         if (maxval(abs(wi)) > 1.0e-12_dp) stop "linalg_eig: complex eigenvalues not supported in this transpiler path"
-         allocate(w(1:n), source=wr)
-         allocate(v(1:n,1:n), source=vr)
+         if (info /= 0) error stop "linalg_eig: dgeev failed"
+         w = cmplx(wr, wi, kind=dp)
+         ! DGEEV stores a conjugate pair's eigenvectors in two real columns:
+         ! VR(:,j) + i*VR(:,j+1), followed by its complex conjugate.
+         j = 1
+         do while (j <= n)
+            if (wi(j) == 0.0_dp) then
+               v(:,j) = cmplx(vr(:,j), 0.0_dp, kind=dp)
+               j = j + 1
+            else
+               v(:,j) = cmplx(vr(:,j), vr(:,j+1), kind=dp)
+               v(:,j+1) = conjg(v(:,j))
+               j = j + 2
+            end if
+         end do
       end subroutine linalg_eig
 
       subroutine linalg_eigh(a, w, v)

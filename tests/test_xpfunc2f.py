@@ -98,6 +98,31 @@ end module solve_test
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_xpfunc2f_inlines_svd_lstsq_helpers(tmp_path: Path) -> None:
+    source = """module lstsq_test
+use, intrinsic :: iso_fortran_env, only: real64
+use python_mod, only: linalg_lstsq_x
+implicit none
+integer, parameter :: dp = real64
+contains
+function fit_total(a, b) result(r)
+real(dp), intent(in) :: a(:,:), b(:)
+real(dp) :: r
+r = sum(linalg_lstsq_x(a, b))
+end function fit_total
+end module lstsq_test
+"""
+    inlined, unresolved = xpfunc2f.inline_python_mod_helpers(source)
+    assert unresolved == []
+    assert "use python_mod" not in inlined.lower()
+    assert "subroutine linalg_svd_econ" in inlined.lower()
+    src = tmp_path / "lstsq_test.f90"
+    src.write_text(inlined, encoding="utf-8")
+    proc = subprocess.run(["gfortran", "-fcheck=all", "-c", str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_xpfunc2f_scalar_only_happy_path(tmp_path: Path) -> None:
     # The original, already-established scalar-only case: count_primes
     # (tuple return of two ints) + its one dependency is_prime -- must
