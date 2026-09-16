@@ -14613,6 +14613,45 @@ def test_xp2f_iso_fortran_env_kind_use_in_proc_module_program(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize("operation", ["np.conj", "np.conjugate", "conjugate_alias"])
+def test_xp2f_numpy_conjugation_preserves_kind_and_rank(tmp_path: Path, operation: str) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xnumpy_conjugate.py",
+        [
+            "import numpy as np",
+            "from numpy import conjugate as conjugate_alias",
+            "def real_matrix(a: 'float[:,:]'):",
+            f"    return {operation}(np.transpose(a))",
+            "def complex_matrix(a: 'complex[:,:]'):",
+            f"    return {operation}(np.transpose(a))",
+            f"print({operation}(2.5))",
+            f"print({operation}(3))",
+            f"print({operation}(1.0 + 2.0j))",
+            f"print({operation}(True))",
+            "r = np.array([1.5, -2.5, 3.0])",
+            "i = np.array([1, -2, 3])",
+            "z = np.array([1.0 + 2.0j, 3.0 - 4.0j])",
+            f"print({operation}(r))",
+            f"print({operation}(i))",
+            f"zout = {operation}(z)",
+            "print(zout.real)",
+            "print(zout.imag)",
+            f"b = {operation}(np.array([True, False]))",
+            "print(b)",
+            "print(b + 2)",
+            "a = np.array([[1.5, 2.0, 3.0], [4.0, 5.0, 6.0]])",
+            "print(real_matrix(a))",
+            f"print({operation}(np.array([[1, 2, 3], [4, 5, 6]])))",
+            "c = np.array([[1.0 + 2.0j, 3.0 - 4.0j], [5.0 + 6.0j, 7.0 - 8.0j]])",
+            "cout = complex_matrix(c)",
+            "for row in range(2):",
+            "    for col in range(2):",
+            "        print(cout[row, col].real, cout[row, col].imag)",
+        ],
+    )
+
+
 def test_xp2f_conj_alias_and_non_complex_conjugate_imag(tmp_path: Path) -> None:
     # Regression test: `.conj()` wasn't recognized as `.conjugate()`'s
     # alias (2 sites: _expr_kind's Call-kind-inference and expr()'s

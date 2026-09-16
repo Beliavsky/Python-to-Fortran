@@ -24448,13 +24448,11 @@ class translator(ast.NodeVisitor):
                 ak = self._expr_kind(node.args[0])
                 return "real" if ak == "complex" else ak
             if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr in {"conj", "conjugate"}
+                self._is_numpy_call(node.func, {"conj", "conjugate"})
                 and len(node.args) >= 1
             ):
-                return self._expr_kind(node.args[0])
+                kind = self._expr_kind(node.args[0])
+                return "int" if kind == "logical" else kind
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -28468,6 +28466,8 @@ class translator(ast.NodeVisitor):
                 if axis_node is None:
                     return 0
                 return r0 if keepdims else max(0, r0 - 1)
+            if np_attr in {"conj", "conjugate"} and node.args:
+                return self._rank_expr(node.args[0])
             if self._is_builtin_sum(node):
                 # Python iterates over axis 0, unlike np.sum's default
                 # all-elements reduction. Flattened generators are scalar.
@@ -34135,13 +34135,18 @@ class translator(ast.NodeVisitor):
                     _a0 = f"merge(1, 0, {_a0})"
                 return f"cmplx({_a0}, kind=dp)"
             if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr in {"conj", "conjugate"}
+                self._is_numpy_call(node.func, {"conj", "conjugate"})
                 and len(node.args) == 1
             ):
-                return f"conjg({self.expr(node.args[0])})"
+                arg = self.expr(node.args[0])
+                kind = self._expr_kind(node.args[0])
+                # CONJG accepts only complex operands. NumPy conjugation
+                # preserves real/integer values and converts bool to integer.
+                if kind in {"real", "int"}:
+                    return arg
+                if kind == "logical":
+                    return f"merge(1, 0, {arg})"
+                return f"conjg({arg})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
