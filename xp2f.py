@@ -6628,6 +6628,11 @@ def function_is_pure(fn_node, known_pure_calls=None):
         "binom",
     }
     impure_np_leaf_calls = {
+        # Both lower to the eye generic backed by non-PURE eye_real in
+        # python.f90. Mathematical purity alone is insufficient: callers
+        # cannot be PURE unless the emitted Fortran helper is too.
+        "eye",
+        "identity",
         "default_rng",
         "loadtxt",
         "genfromtxt",
@@ -10587,8 +10592,12 @@ def normalize_zero_based_unit_stride_loops(lines):
         # excluded since that pattern is handled by its own `1:iv - 1`
         # rewrite further down. Detect any other bare use and skip the
         # rewrite entirely rather than risk silently wrong Fortran.
+        # Only a complete, positive, unsuffixed integer offset is handled
+        # by the rebasing substitutions. A prefix such as the 0 in 0.5_dp
+        # must not hide a use of the original zero-based induction value.
+        # Zero also needs iv - 1 after rebasing, which this pass does not emit.
         bare_re = re.compile(
-            rf"\b{re.escape(iv)}\b(?!\s*\+\s*\d+)",
+            rf"\b{re.escape(iv)}\b(?!\s*\+\s*[1-9]\d*(?![\w.]))",
             flags=re.IGNORECASE,
         )
         one_colon_re = re.compile(rf"1\s*:\s*{re.escape(iv)}\b", flags=re.IGNORECASE)
@@ -10633,7 +10642,7 @@ def normalize_zero_based_unit_stride_loops(lines):
                 i += 1
                 continue
 
-            plus1_pat = re.compile(rf"\b{re.escape(iv)}\s*\+\s*1\b", flags=re.IGNORECASE)
+            plus1_pat = re.compile(rf"\b{re.escape(iv)}\s*\+\s*1(?![\w.])", flags=re.IGNORECASE)
             plus1_hits = 0
             for k in range(i + 1, j):
                 ck = out[k].split("!", 1)[0]
@@ -10675,7 +10684,7 @@ def normalize_zero_based_unit_stride_loops(lines):
                     flags=re.IGNORECASE,
                 )
                 code = re.sub(
-                    rf"\b{re.escape(iv)}\s*\+\s*(\d+)\b",
+                    rf"\b{re.escape(iv)}\s*\+\s*([1-9]\d*)(?![\w.])",
                     lambda mm: _shift_plus_rev(mm),
                     code,
                     flags=re.IGNORECASE,
@@ -10714,7 +10723,7 @@ def normalize_zero_based_unit_stride_loops(lines):
             continue
 
         # Only apply when i+1 is clearly the dominant indexing style in body.
-        plus1_pat = re.compile(rf"\b{re.escape(iv)}\s*\+\s*1\b", flags=re.IGNORECASE)
+        plus1_pat = re.compile(rf"\b{re.escape(iv)}\s*\+\s*1(?![\w.])", flags=re.IGNORECASE)
         plus1_hits = 0
         for k in range(i + 1, j):
             ck = out[k].split("!", 1)[0]
@@ -10758,7 +10767,7 @@ def normalize_zero_based_unit_stride_loops(lines):
                 flags=re.IGNORECASE,
             )
             code = re.sub(
-                rf"\b{re.escape(iv)}\s*\+\s*(\d+)\b",
+                rf"\b{re.escape(iv)}\s*\+\s*([1-9]\d*)(?![\w.])",
                 lambda m: _shift_plus(m),
                 code,
                 flags=re.IGNORECASE,
@@ -21676,7 +21685,27 @@ class translator(ast.NodeVisitor):
         self.argparse_namespaces = {}
 
     def _list_capacity_var(self, name):
-        return f"xp2f_cap_{name}"
+        return f"xp2f_cap_{self._aliased_name(self._resolve_list_alias(name))}"
+
+    def _list_count_var(self, name):
+        """Look up source-keyed list metadata using either spelling."""
+        name = self._resolve_list_alias(name)
+        if name in self.list_counts:
+            return self.list_counts[name]
+        for source, alias in self.name_aliases.items():
+            if alias == name and source in self.list_counts:
+                return self.list_counts[source]
+        return None
+
+    def _return_value_expr(self, node):
+        if isinstance(node, ast.Name):
+            name = self._aliased_name(self._resolve_list_alias(node.id))
+            count = self._list_count_var(name)
+            if count is not None and self._rank_expr(node) == 1:
+                # The backing array may have spare capacity; Python returns
+                # only the elements that have actually been appended.
+                return f"{name}(:{count})"
+        return self.expr(node)
 
     def _list_print_helper_name(self, name):
         name = self._aliased_name(name)
@@ -47452,7 +47481,7 @@ class translator(ast.NodeVisitor):
         # list = []
         if isinstance(t, ast.Name) and isinstance(v, ast.List) and len(v.elts) == 0:
             name = self._aliased_name(self._resolve_list_alias(t.id))
-            cnt = self.list_counts.get(name, None)
+            cnt = self._list_count_var(name)
             if cnt is not None:
                 self.o.w(f"if (allocated({name})) deallocate({name})")
                 final_size = self.char_list_final_sizes.get(name)
@@ -47474,6 +47503,11 @@ class translator(ast.NodeVisitor):
                     # rare: one per distinct length seen, not one per
                     # append).
                     self.o.w(f"allocate(character(len=1) :: {name}(max(0, {final_size})))")
+                elif self._rank_expr(ast.Name(id=name, ctx=ast.Load())) == 1:
+                    if name in self.alloc_chars:
+                        self.o.w(f"allocate(character(len=1) :: {name}(0))")
+                    else:
+                        self.o.w(f"allocate({name}(0))")
                 self.o.w(f"{cnt} = 0")
                 self.o.w(f"{self._list_capacity_var(name)} = 0")
                 return
@@ -50324,7 +50358,7 @@ class translator(ast.NodeVisitor):
                 for j, e in enumerate(node.value.elts):
                     e_txt = _maybe_rank_stable_ifexp_expr(e)
                     if e_txt is None:
-                        e_txt = self.expr(e)
+                        e_txt = self._return_value_expr(e)
                     self.o.w(f"{self.tuple_return_out_names[j]} = {e_txt}")
                 self.o.w("return")
                 return
@@ -50377,9 +50411,9 @@ class translator(ast.NodeVisitor):
                 if rank_stable is not None:
                     expr_txt = rank_stable
                 else:
-                    expr_txt = self.expr(node.value)
+                    expr_txt = self._return_value_expr(node.value)
             else:
-                expr_txt = self.expr(node.value)
+                expr_txt = self._return_value_expr(node.value)
             # When a branch returns a higher-rank array but the function result
             # is rank-1, flatten conservatively to keep generated Fortran valid.
             if isinstance(node.value, ast.Name):
@@ -52847,7 +52881,7 @@ class translator(ast.NodeVisitor):
         if isinstance(c.func, ast.Attribute) and c.func.attr == "append":
             if not isinstance(c.func.value, ast.Name):
                 raise NotImplementedError("append target must be a name")
-            name = self._resolve_list_alias(c.func.value.id)
+            name = self._aliased_name(self._resolve_list_alias(c.func.value.id))
             if len(c.args) != 1:
                 raise NotImplementedError("append expects exactly one argument")
             if name in self.structured_array_types:
@@ -52888,7 +52922,7 @@ class translator(ast.NodeVisitor):
                 self.o.w("end if")
                 return
             arg_rank = max(0, int(self._rank_expr(c.args[0])))
-            cnt = self.list_counts.get(name, None)
+            cnt = self._list_count_var(name)
             val = self.expr(c.args[0])
             name_is_alloc = (
                 name not in self.dummy_arg_names
@@ -53061,13 +53095,13 @@ class translator(ast.NodeVisitor):
         if isinstance(c.func, ast.Attribute) and c.func.attr == "extend":
             if not isinstance(c.func.value, ast.Name):
                 raise NotImplementedError("extend target must be a name")
-            name = self._resolve_list_alias(c.func.value.id)
+            name = self._aliased_name(self._resolve_list_alias(c.func.value.id))
             if len(c.args) != 1:
                 raise NotImplementedError("extend expects exactly one argument")
             if self._rank_expr(c.args[0]) == 0:
                 raise NotImplementedError("extend expects a rank-1 iterable argument")
             vals = self.expr(c.args[0])
-            cnt = self.list_counts.get(name, None)
+            cnt = self._list_count_var(name)
             name_is_alloc = (
                 name not in self.dummy_arg_names
                 and (
@@ -58608,18 +58642,21 @@ def _emit_local_function(
         alloc_logs_set.discard(_nm)
         alloc_complexes_set.discard(_nm)
         alloc_chars_set.discard(_nm)
-    alloc_logs_set -= set(args)
-    alloc_ints_set -= set(args)
-    alloc_reals_set -= set(args)
-    alloc_complexes_set -= set(args)
-    alloc_chars_set -= set(args)
+    # Prescan stores resolved Fortran names, whereas args contains Python
+    # spellings. Neither spelling of a dummy belongs in local declarations.
+    dummy_decl_names = set(args) | set(arg_emit_map.values())
+    alloc_logs_set -= dummy_decl_names
+    alloc_ints_set -= dummy_decl_names
+    alloc_reals_set -= dummy_decl_names
+    alloc_complexes_set -= dummy_decl_names
+    alloc_chars_set -= dummy_decl_names
     if tuple_return:
         alloc_logs_set -= set(out_names)
         alloc_ints_set -= set(out_names)
         alloc_reals_set -= set(out_names)
         alloc_complexes_set -= set(out_names)
         alloc_chars_set -= set(out_names)
-    remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names)) | module_global_names
+    remove_names = dummy_decl_names | ({ret_name} if not tuple_return else set(out_names)) | module_global_names
     rng_scalar_names = set(getattr(tr, "rng_vars", set())) - remove_names
     complexes = sorted(((tr.complexes | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "complex"}) - remove_names - polyroots_targets) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
     local_list_capacity_names = {tr._list_capacity_var(_nm) for _nm in local_list_counts}
@@ -61142,20 +61179,23 @@ def _emit_local_function(
     if tr.uses_csv_split_line and needed_helpers is not None:
         needed_helpers.add("csv_split_line")
     for arg, alias, _decl_kind, _arr_rank in local_rebind_aliases:
-        _init_rhs = arg
+        # Body references now resolve to the writable local copy; initialize
+        # it from the original emitted dummy, not the raw Python spelling.
+        _input_name = arg_emit_map.get(arg, arg)
+        _init_rhs = _input_name
         _decl_lk = str(_decl_kind).lower()
         _arg_k0 = arg_meta.get(arg, (None, 0, None))[0]
         _arg_k0s = str(_arg_k0).lower() if _arg_k0 is not None else ""
         if "real" in _decl_lk:
             if "logical" in _arg_k0s:
-                _init_rhs = f"merge(1.0_dp, 0.0_dp, {arg})"
+                _init_rhs = f"merge(1.0_dp, 0.0_dp, {_input_name})"
             elif "integer" in _arg_k0s:
-                _init_rhs = f"real({arg}, kind=dp)"
+                _init_rhs = f"real({_input_name}, kind=dp)"
         elif "complex" in _decl_lk:
             if "logical" in _arg_k0s:
-                _init_rhs = f"cmplx(merge(1.0_dp, 0.0_dp, {arg}), 0.0_dp, kind=dp)"
+                _init_rhs = f"cmplx(merge(1.0_dp, 0.0_dp, {_input_name}), 0.0_dp, kind=dp)"
             elif "integer" in _arg_k0s or "real" in _arg_k0s:
-                _init_rhs = f"cmplx({arg}, 0.0_dp, kind=dp)"
+                _init_rhs = f"cmplx({_input_name}, 0.0_dp, kind=dp)"
         o.w(f"{alias} = {_init_rhs}")
     for arg, alias, dflt_expr, arr_rank in optional_default_inits:
         if int(arr_rank) == 0:
@@ -61292,7 +61332,7 @@ def _emit_local_function(
                     for j, e in enumerate(s.value.elts):
                         rhs = _maybe_rank_stable_ifexp_expr_local(e)
                         if rhs is None:
-                            rhs = tr.expr(e)
+                            rhs = tr._return_value_expr(e)
                         o.w(f"{out_names[j]} = {rhs}")
                 else:
                     if dict_return and isinstance(s.value, ast.Dict):
@@ -61338,7 +61378,7 @@ def _emit_local_function(
                             elif ob is not None and isinstance(b, ast.Name) and isinstance(ob, ast.Name) and ob.id == b.id:
                                 rhs = tr.expr(ob)
                         if rhs is None:
-                            rhs = tr.expr(rv)
+                            rhs = tr._return_value_expr(rv)
                         if rhs.strip().lower() != tr.function_result_name.lower():
                             o.w(f"{tr.function_result_name} = {rhs}")
             if i != len(fn.body) - 1:
