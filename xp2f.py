@@ -28964,13 +28964,9 @@ class translator(ast.NodeVisitor):
                     return 2
                 if node.func.attr == "identity":
                     return 2
-                if node.func.attr in {"zeros", "ones", "empty"}:
-                    if len(node.args) >= 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
-                        return max(1, len(node.args[0].elts))
-                    return 1
-                if node.func.attr == "full" and len(node.args) >= 1:
-                    if isinstance(node.args[0], (ast.Tuple, ast.List)):
-                        return max(1, len(node.args[0].elts))
+                if node.func.attr in {"zeros", "ones", "empty", "full"}:
+                    if node.args:
+                        return max(1, self._shape_rank_hint(node.args[0]))
                     return 1
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -43242,6 +43238,57 @@ class translator(ast.NodeVisitor):
             return
         t = node.targets[0]
         v = node.value
+        # These assignment lowerings allocate/write the destination before
+        # finishing the RHS. Preserve any old destination read (including
+        # shape, fill values, keywords and slices), not just a bare first
+        # argument. Ordinary Fortran expression assignments need no snapshot.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and self._is_numpy_call(v.func, {
+                "tril", "triu", "zeros_like", "ones_like", "empty_like", "copy",
+                "zeros", "ones", "empty", "full", "repeat", "argsort", "sort",
+            })
+            and _expr_uses_name(v, t.id)
+            # The sort handler already handles this exact case in place.
+            and not (
+                self._is_numpy_call(v.func, {"sort"}) and v.args
+                and isinstance(v.args[0], ast.Name) and v.args[0].id == t.id
+            )
+        ):
+            old_kind, old_rank = self._visible_kind_rank(t.id)
+            if old_kind in {"int", "real", "complex", "logical"} and old_rank and old_rank > 0:
+                old_expr = self.expr(t)
+                snapshot = f"xp2f_saved_{getattr(node, 'lineno', 0)}"
+                taken = set(self.var_type_first_seen) | set(self.name_aliases.values())
+                taken.update(self.params)
+                taken.update(self.dummy_arg_names)
+                taken.update(self.fortran_name_owner)
+                taken.update(n for n, _, _ in self.open_type_rebind_meta)
+                taken.update(n.id for n in ast.walk(v) if isinstance(n, ast.Name))
+                taken_lower = {n.lower() for n in taken}
+                while snapshot.lower() in taken_lower:
+                    snapshot += "_"
+                snapshot_depth = len(self.open_type_rebind_stack) + 1
+                self._open_type_rebind_block(snapshot, old_kind, old_rank)
+                self.o.w(f"{snapshot} = {old_expr}")
+
+                class ReplaceOldDestination(ast.NodeTransformer):
+                    def visit_Name(self, n):
+                        if isinstance(n.ctx, ast.Load) and n.id == t.id:
+                            return ast.copy_location(ast.Name(id=snapshot, ctx=ast.Load()), n)
+                        return n
+
+                rewritten = copy.copy(node)
+                rewritten.value = ReplaceOldDestination().visit(copy.deepcopy(v))
+                self.visit_Assign(rewritten)
+                if len(self.open_type_rebind_stack) == snapshot_depth:
+                    self._close_one_type_rebind_block()
+                else:
+                    # A new dtype/rank binding must remain visible, but the
+                    # saved input is no longer needed after this assignment.
+                    self.o.w(f"deallocate({snapshot})")
+                return
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Name)

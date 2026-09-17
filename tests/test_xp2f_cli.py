@@ -15164,6 +15164,59 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_numpy_self_assignment_triangles(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xself_triangles.py", [
+        "import numpy as np",
+        "for k in range(-3,4):",
+        "    a = np.array([[1.,2.,3.], [4.,5.,6.]])",
+        "    a = np.tril(a, k)",
+        "    print(a)",
+        "    b = np.array([[1,2], [3,4], [5,6]])",
+        "    b = np.triu(b, k=k)",
+        "    print(b)",
+        "a = np.array([[1.,2.,3.], [4.,5.,6.]])",
+        "a = np.tril(a)",
+        "a = a + a.T.T",
+        "print(a)",
+    ])
+
+
+def test_xp2f_numpy_self_assignment_constructors(tmp_path: Path) -> None:
+    lines = ["import numpy as np"]
+    for expr in ["np.zeros_like(a)", "np.ones_like(a)", "np.copy(a)",
+                 "np.zeros(a.shape)", "np.ones(a.shape)",
+                 "np.full(a.shape, a[0,0] + a[-1,-1])"]:
+        lines += ["a = np.array([[1.,2.,3.], [4.,5.,6.]])", f"a = {expr}", "print(a)"]
+    # Only the shape of an empty allocation is defined, not its contents.
+    for expr in ["np.empty_like(a)", "np.empty(a.shape)"]:
+        lines += ["a = np.array([[1.,2.,3.], [4.,5.,6.]])", f"a = {expr}",
+                  "print(a.shape[0], a.shape[1])", "a[:,:] = 7.0", "print(a)"]
+    lines += ["v = np.array([3.,1.,2.])", "v = np.zeros_like(v)", "print(v)",
+              "v = np.ones_like(v)", "print(v)", "v = np.copy(v)", "print(v)"]
+    _run_xp2f_compile_diff(tmp_path, "xself_constructors.py", lines)
+
+
+def test_xp2f_numpy_self_assignment_repeat_sort(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xself_repeat_sort.py", [
+        "import numpy as np",
+        "a = np.array([[2.,3.,1.], [6.,4.,5.]])",
+        "a = np.repeat(a, 2, axis=0)",
+        "print(a)",
+        "a = np.repeat(a, int(a[0,0]), axis=1)",
+        "print(a)",
+        "a = np.sort(a, axis=0)",
+        "print(a)",
+        "a = np.sort(a, axis=1)",
+        "print(a)",
+        "v = np.array([3.,1.,4.,2.])",
+        "v = np.sort(v[::-1])",
+        "print(v)",
+        "p = np.array([3,1,4,2])",
+        "p = np.argsort(p)",
+        "print(p)",
+    ])
+
+
 def test_xp2f_chebyshev_vector_callback_ranks(tmp_path: Path) -> None:
     # Adapted from Burkardt's MIT-licensed chebyshev.py. The callbacks
     # are elementwise but must have array interfaces when passed to coeff.
