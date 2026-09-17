@@ -15223,6 +15223,55 @@ def test_xp2f_numpy_self_assignment_repeat_sort(tmp_path: Path) -> None:
     ])
 
 
+def test_normalize_unused_callable_arguments_keeps_evaluated_and_used_arguments() -> None:
+    tree = ast.parse('''
+def callback(x):
+    return x * x
+def ignore(x, exact):
+    return x + 1
+def use(x, exact):
+    return exact(x)
+def shadow(callback):
+    return ignore(1, callback)
+ignore(1, callback)
+ignore(x=2, exact=callback)
+ignore(1, callback(2))
+use(1, callback)
+''')
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    body = [n for n in tree.body if not isinstance(n, ast.FunctionDef)]
+    xp2f.normalize_unused_callable_arguments(body, functions)
+    assert isinstance(body[0].value.args[1], ast.Constant)
+    assert isinstance(body[1].value.keywords[1].value, ast.Constant)
+    assert isinstance(body[2].value.args[1], ast.Call)
+    assert isinstance(body[3].value.args[1], ast.Name)
+    assert isinstance(functions[-1].body[0].value.args[1], ast.Name)
+
+
+def test_xp2f_unused_callback_arguments(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xunused_callbacks.py", [
+        "import numpy as np",
+        "def exact1(x):",
+        "    return x*(1.0-x)/2.0",
+        "def exact2(x):",
+        "    return x*(x-1.0)*np.exp(x)",
+        "def solve(n, exact):",
+        "    x = np.linspace(0.0, 1.0, n+1)",
+        "    return x, n",
+        "def evaluated():",
+        "    print(123)",
+        "    return 0",
+        "u, n = solve(4, exact1)",
+        "v, m = solve(exact=exact2, n=4)",
+        "w, k = solve(4, evaluated())",
+        "print(u)",
+        "print(v)",
+        "print(w)",
+        "print(n, m, k)",
+        "print(round(exact1(0.5), 8), round(exact2(0.5), 8))",
+    ])
+
+
 def test_specialize_named_slice_callbacks_reuses_clones_and_preserves_defaults() -> None:
     tree = ast.parse('''
 def constant(x):

@@ -18965,6 +18965,46 @@ def _specialize_local_fn_with_lambda(
     return new_fn
 
 
+def normalize_unused_callable_arguments(exec_body, local_funcs):
+    """Represent ignored, statically known function arguments with a sentinel.
+
+    An unused Python parameter needs no Fortran procedure interface. Replacing
+    a bare local function reference (never a call expression) preserves argument
+    evaluation while avoiding incompatible data/procedure dummy declarations.
+    """
+    functions = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
+    unused = {}
+    for name, fn in functions.items():
+        referenced = {n.id for st in fn.body for n in ast.walk(st) if isinstance(n, ast.Name)}
+        unused[name] = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
+                        if a.arg not in referenced}
+    scopes = [(exec_body, set())]
+    for fn in functions.values():
+        bound = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+        bound.update(n.id for st in fn.body for n in ast.walk(st)
+                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+        scopes.append((fn.body, bound))
+    for body, bound in scopes:
+        for st in body:
+            for call in ast.walk(st):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                        and call.func.id in functions and call.func.id not in bound):
+                    continue
+                fn = functions[call.func.id]
+                formals = fn.args.posonlyargs + fn.args.args
+                if any(isinstance(a, ast.Starred) for a in call.args):
+                    continue
+                def ignored_function(arg, formal):
+                    return (formal in unused[fn.name] and isinstance(arg, ast.Name)
+                            and arg.id in functions and arg.id not in bound)
+                for i, arg in enumerate(call.args):
+                    if i < len(formals) and ignored_function(arg, formals[i].arg):
+                        call.args[i] = ast.copy_location(ast.Constant(value=0), arg)
+                for kw in call.keywords:
+                    if ignored_function(kw.value, kw.arg):
+                        kw.value = ast.copy_location(ast.Constant(value=0), kw.value)
+
+
 def specialize_named_slice_callbacks(exec_body, local_funcs):
     """Bind distinct known callbacks used on slices before rank inference.
 
@@ -70151,6 +70191,7 @@ def transpile_file(
             specialize_lambda_function_args(_fn.body, local_funcs)
 
     specialize_named_slice_callbacks(effective_tree.body, local_funcs)
+    normalize_unused_callable_arguments(effective_tree.body, local_funcs)
 
     params = find_parameters(effective_tree)
     # A local function's own translator is deliberately constructed with
