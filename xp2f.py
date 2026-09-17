@@ -57901,6 +57901,7 @@ def _emit_local_function(
         ret_rank = 0
         cb_nargs = 0
         cb_arg_kinds = {}
+        cb_arg_ranks = {}
         saw_direct_cb_call = False
         _fn_arg_kind_by_name = {}
         if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
@@ -57939,6 +57940,7 @@ def _emit_local_function(
             saw_direct_cb_call = True
             cb_nargs = max(cb_nargs, len(_n.args))
             for _i, _a in enumerate(_n.args):
+                cb_arg_ranks[_i] = max(cb_arg_ranks.get(_i, 0), int(tr._rank_expr(_a)))
                 _k = tr._expr_kind(_a)
                 if _k in {"int", "real", "logical", "char", "complex"}:
                     cb_arg_kinds[_i] = _merge_cb_kind(cb_arg_kinds.get(_i), _k)
@@ -58042,6 +58044,11 @@ def _emit_local_function(
         if actual_ret_rank > 0:
             ret_rank = max(ret_rank, actual_ret_rank)
         cb_nargs = max(cb_nargs, int(actual_cb.get("nargs", 0) or 0))
+        # Callback arrays can occur at any position (e.g. f(m, x) in
+        # compass_search), including callbacks only forwarded by a wrapper.
+        for _ia, _ar in dict(actual_cb.get("arg_ranks", {})).items():
+            cb_arg_ranks[int(_ia)] = max(cb_arg_ranks.get(int(_ia), 0), int(_ar))
+        cb_arg_ranks[0] = max(cb_arg_ranks.get(0, 0), in_rank)
         for _ia, _ak in dict(actual_cb.get("arg_kinds", {})).items():
             if _ak in {"int", "real", "complex", "logical", "char"}:
                 # Actual callback procedure dummies are stronger evidence than
@@ -58063,6 +58070,7 @@ def _emit_local_function(
             "ret_kind": ret_kind,
             "nargs": max(1, int(cb_nargs)),
             "arg_kinds": cb_arg_kinds,
+            "arg_ranks": cb_arg_ranks,
         }
     for cb, info in callback_specs.items():
         info["scalarize_vector_call"] = (
@@ -59670,8 +59678,10 @@ def _emit_local_function(
             cb_ret_kind = str(cb.get("ret_kind", "real"))
             cb_nargs = max(1, int(cb.get("nargs", 1)))
             cb_arg_kinds = dict(cb.get("arg_kinds", {}))
+            cb_arg_ranks = dict(cb.get("arg_ranks", {}))
             if bool(cb.get("scalarize_vector_call", False)):
                 cb_in_rank = 0
+                cb_arg_ranks[0] = 0
                 cb_ret_rank = 0
             iface_name = f"{proc_name}_{arg}_cb_if"
             o.w("interface")
@@ -59684,8 +59694,9 @@ def _emit_local_function(
             o.w("import dp")
             for _i, _nm in enumerate(cb_arg_names):
                 _k = cb_arg_kinds.get(_i, "real")
-                if _i == 0 and cb_in_rank > 0:
-                    dims = ",".join(":" for _ in range(cb_in_rank))
+                _rank = cb_arg_ranks.get(_i, cb_in_rank if _i == 0 else 0)
+                if _rank > 0:
+                    dims = ",".join(":" for _ in range(_rank))
                     if _k == "int":
                         o.w(f"integer, intent(in) :: {_nm}({dims})")
                     elif _k == "logical":

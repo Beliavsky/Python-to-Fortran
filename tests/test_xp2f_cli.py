@@ -15217,6 +15217,66 @@ def test_xp2f_numpy_self_assignment_repeat_sort(tmp_path: Path) -> None:
     ])
 
 
+def test_xp2f_compass_search_callback_argument_ranks(tmp_path: Path) -> None:
+    # Reduced from Burkardt's MIT-licensed compass_search.py: the second
+    # callback argument is a vector, while the first is an integer scalar.
+    _run_xp2f_compile_diff(tmp_path, "xcompass_callbacks.py", [
+        "import numpy as np",
+        "def search(f, m, x, delta, tol, limit):",
+        "    k = 0",
+        "    fx = f(m, x)",
+        "    while k < limit:",
+        "        k += 1",
+        "        decrease = False",
+        "        s = 1.0",
+        "        i = 0",
+        "        for ii in range(2*m):",
+        "            xd = x.copy()",
+        "            xd[i] = xd[i] + s*delta",
+        "            fxd = f(m, xd)",
+        "            if fxd < fx:",
+        "                x = xd.copy()",
+        "                fx = fxd",
+        "                decrease = True",
+        "                break",
+        "            s = -s",
+        "            if s == 1.0:",
+        "                i += 1",
+        "        if not decrease:",
+        "            delta /= 2.0",
+        "            if delta < tol:",
+        "                break",
+        "    return x, fx, k",
+        "def objective(m, x):",
+        "    value = 0.0",
+        "    for i in range(m-1):",
+        "        value += (1.0-x[i])**2 + 100.0*(x[i+1]-x[i]**2)**2",
+        "    return value",
+        "x0 = np.zeros(2)",
+        "x0[0] = -1.2",
+        "x0[1] = 1.0",
+        "x, fx, k = search(objective, 2, x0, 0.3, 1e-5, 20000)",
+        "print(round(x[0], 8), round(x[1], 8), round(fx, 8), k)",
+    ])
+
+
+def test_xp2f_callback_later_matrix_and_vector_arguments(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcallback_later_arrays.py", [
+        "import numpy as np",
+        "def evaluate(f, n, x, a):",
+        "    return f(n, x, a)",
+        "def objective(n, x, a):",
+        "    value = 0.0",
+        "    for i in range(n):",
+        "        value += x[i]*a[i,0]",
+        "    return value",
+        "x = np.array([2.,3.])",
+        "a = np.array([[1.,4.],[5.,6.]])",
+        "print(evaluate(objective, 2, x, a))",
+        "print(evaluate(f=objective, n=2, x=x, a=a))",
+    ])
+
+
 def test_xp2f_chebyshev_vector_callback_ranks(tmp_path: Path) -> None:
     # Adapted from Burkardt's MIT-licensed chebyshev.py. The callbacks
     # are elementwise but must have array interfaces when passed to coeff.
