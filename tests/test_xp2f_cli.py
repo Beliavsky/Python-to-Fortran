@@ -15985,6 +15985,42 @@ def test_scalar_constant_promotion_requires_complete_string_literal(rhs: str, co
 
 
 @pytest.mark.parametrize("keyword", [False, True])
+def test_xp2f_joint_tuple_argument_rank_profiles(tmp_path: Path, keyword: bool) -> None:
+    scalar_call = "a=1.0, b=3.0, x=x" if keyword else "1.0, 3.0, x"
+    vector_call = "x=x, b=right[idx], a=left[idx]" if keyword else "left[idx], right[idx], x"
+    _run_xp2f_compile_diff(tmp_path, "xjoint_tuple.py", [
+        "import numpy as np",
+        "def fixture():",
+        "    x = np.array([0.5, 1.5, 2.5])",
+        f"    f, t = evaluate({scalar_call})",
+        "    for i in range(len(f)):",
+        "        print(f[i])",
+        "    print(t)",
+        "    left = np.array([0.0, 1.0, 2.0])",
+        "    right = np.array([1.0, 3.0, 5.0])",
+        "    gather(left, right, x)",
+        "    fs, ts = evaluate(1.0, 3.0, 0.5)",
+        "    print(fs, ts)",
+        "def gather(left, right, x):",
+        "    idx = np.array([2, 0, 1], dtype=int)",
+        f"    fv, tv = evaluate({vector_call})",
+        "    for i in range(len(fv)):",
+        "        print(fv[i], tv[i])",
+        "def evaluate(a, b, x):",
+        "    # Input:",
+        "    # real A, B, endpoints.",
+        "    # real X(N), sample points.",
+        "    # Output:",
+        "    # real F(N), T(N), results.",
+        "    h = b - a",
+        "    f = x + h",
+        "    t = 2.0 * h",
+        "    return f, t",
+        "fixture()",
+    ])
+
+
+@pytest.mark.parametrize("keyword", [False, True])
 def test_xp2f_scalar_comment_preserves_array_overloads(tmp_path: Path, keyword: bool) -> None:
     actual = "x=b" if keyword else "b"
     _run_xp2f_compile_diff(tmp_path, "xcubic_overloads.py", [

@@ -44824,6 +44824,19 @@ class translator(ast.NodeVisitor):
                         if _vr is not None:
                             actual_rank = max(0, int(_vr))
                 for _prof in self.local_overload_tuple_profiles.get(v.func.id, []):
+                    if dmap.get("joint"):
+                        matches = True
+                        for _idx, _name in enumerate(formal_in):
+                            if _idx >= len(args_nodes):
+                                matches = False
+                                break
+                            _actual = args_nodes[_idx]
+                            if (self._rank_expr(_actual) != _prof["forced_ranks"].get(_name)
+                                    or self._expr_kind(_actual) != _prof["forced_kinds"].get(_name)):
+                                matches = False
+                                break
+                        if not matches:
+                            continue
                     fk = (_prof.get("forced_kinds") or {}).get(argn)
                     fr = (_prof.get("forced_ranks") or {}).get(argn)
                     if fk is not None and actual_kind is not None and fk != actual_kind:
@@ -60066,6 +60079,7 @@ def _emit_local_function(
         if (
             comment_arg_rank is not None
             and not is_elemental_fn
+            and not (local_overload_dispatch or {}).get(fn.name, {}).get("joint")
             and fn.name not in set(force_non_elemental_funcs or set())
         ):
             if not (
@@ -60655,6 +60669,8 @@ def _emit_local_function(
                 _src0 = tuple_ret_src_names[idx_out]
                 if isinstance(_src0, str):
                     comment_kind_hint, comment_rank_hint = _comment_arg_spec_hint_for_emit(fn, _src0)
+                    if (local_overload_dispatch or {}).get(fn.name, {}).get("joint"):
+                        comment_rank_hint = None
                     if comment_kind_hint in {"int", "real", "logical", "char", "complex"}:
                         kind_hint = _numeric_comment_kind(kind_hint, comment_kind_hint)
                         if comment_rank_hint is not None:
@@ -66924,6 +66940,8 @@ def generate_flat(
                         _ar = 0
                     if owner_fn is not None and isinstance(_a, ast.Name):
                         _dk, _dr = _name_direct_assign_spec(owner_fn, _a.id, tr_ctx)
+                        if _a.id in {a.arg for a in owner_fn.args.args}:
+                            _dk, _dr = _ak, _ar
                         if _dk in {"int", "real", "logical", "char", "complex"}:
                             pair_lists[_i].add((_dk, int(_dr)))
                             triad_lists[_i].add((_dk, int(_dr), bool(tr_ctx._is_python_list_expr(_a))))
@@ -66932,8 +66950,6 @@ def generate_flat(
                         pair_lists[_i].add((_ak, _ar))
                         triad_lists[_i].add((_ak, _ar, bool(tr_ctx._is_python_list_expr(_a))))
                         _profile[_i] = (_ak, _ar)
-                if len(_profile) == len(arg_names):
-                    joint_calls.append(_profile)
                 for _kw in getattr(_n, "keywords", []):
                     if _kw.arg is None or _kw.arg not in name_to_idx:
                         continue
@@ -66948,12 +66964,17 @@ def generate_flat(
                         _ar = 0
                     if owner_fn is not None and isinstance(_kw.value, ast.Name):
                         _dk, _dr = _name_direct_assign_spec(owner_fn, _kw.value.id, tr_ctx)
+                        if _kw.value.id in {a.arg for a in owner_fn.args.args}:
+                            _dk, _dr = _ak, _ar
                         if _dk in {"int", "real", "logical", "char", "complex"}:
                             pair_lists[_i].add((_dk, int(_dr)))
                             triad_lists[_i].add((_dk, int(_dr), bool(tr_ctx._is_python_list_expr(_kw.value))))
                     if _ak in {"int", "real", "logical", "char", "complex"}:
                         pair_lists[_i].add((_ak, _ar))
                         triad_lists[_i].add((_ak, _ar, bool(tr_ctx._is_python_list_expr(_kw.value))))
+                        _profile[_i] = (_ak, _ar)
+                if len(_profile) == len(arg_names):
+                    joint_calls.append(_profile)
         for _st in _top_level_scan_nodes:
             _record(_st, tr_seed, None)
         _local_ret_df_info_scan2 = _scan_local_df_return_info(local_funcs)
@@ -66982,6 +67003,22 @@ def generate_flat(
             if _local_ret_tuple_df_info_scan2:
                 _tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan2)
             _seed_struct_param_types(_tr_local_scan, _fn_scan)
+            # Calls through indexed formal arrays need the caller's inferred
+            # signature; scanning its body alone leaves these names untyped.
+            for _i, _arg in enumerate(local_func_arg_names.get(_fn_scan.name, [])):
+                _kind = local_func_arg_kinds[_fn_scan.name][_i]
+                _rank = local_func_arg_ranks[_fn_scan.name][_i]
+                if _kind not in {"int", "real", "logical", "char", "complex"}:
+                    continue
+                if _rank > 0:
+                    _mark = {"int": _tr_local_scan._mark_alloc_int, "real": _tr_local_scan._mark_alloc_real,
+                             "logical": _tr_local_scan._mark_alloc_log, "char": _tr_local_scan._mark_alloc_char,
+                             "complex": _tr_local_scan._mark_alloc_complex}[_kind]
+                    _mark(_arg, rank=_rank)
+                else:
+                    {"int": _tr_local_scan.ints, "real": _tr_local_scan.reals,
+                     "logical": _tr_local_scan.logs, "char": _tr_local_scan.chars,
+                     "complex": _tr_local_scan.complexes}[_kind].add(_arg)
             _tr_local_scan.prescan(_fn_scan.body)
             _record(_fn_scan, _tr_local_scan, _fn_scan)
         return pair_lists, triad_lists, joint_calls
@@ -67412,16 +67449,13 @@ def generate_flat(
             prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
             _comment_kind_i, _comment_rank_i = _comment_arg_spec_hint_for_fn(fn, arg_nm)
             if _comment_kind_i in {"int", "real", "logical", "char", "complex"}:
-                _want_comment_rank_i = int(_comment_rank_i or 0)
                 prs = {
                     (_comment_kind_i, r)
                     for (_k, r) in prs
-                    if _comment_rank_i is None or int(r) == _want_comment_rank_i
                 }
                 trs = {
                     (_comment_kind_i, r, is_list)
                     for (_k, r, is_list) in trs
-                    if _comment_rank_i is None or int(r) == _want_comment_rank_i
                 }
             try:
                 inferred_arg_kind = _infer_arg_kind_in_fn(fn, arg_nm)
@@ -67468,6 +67502,32 @@ def generate_flat(
         if any((not prs) for prs in pair_lists):
             continue
         varying = [i for i, prs in enumerate(pair_lists) if len(prs) > 1]
+        if len(varying) > 1 and fn.name in tuple_return_funcs:
+            # Preserve correlated scalar/vector argument profiles instead of
+            # forming a Cartesian product of independently varying dummies.
+            joint_profiles = set()
+            for call in _obs_joint_calls:
+                if len(call) != len(arg_names):
+                    continue
+                profile = []
+                for i, arg in enumerate(arg_names):
+                    kind, rank = call[i]
+                    ck, _ = _comment_arg_spec_hint_for_fn(fn, arg)
+                    pair = (ck if ck in {"int", "real", "logical", "char", "complex"} else kind, rank)
+                    if pair not in pair_lists[i]:
+                        break
+                    profile.append(pair)
+                if len(profile) == len(arg_names):
+                    joint_profiles.add(tuple(profile))
+            if len(joint_profiles) > 1:
+                specs = []
+                for index, profile in enumerate(sorted(joint_profiles)):
+                    kinds = {a: profile[i][0] for i, a in enumerate(arg_names)}
+                    ranks = {a: profile[i][1] for i, a in enumerate(arg_names)}
+                    specs.append((f"{fn.name}_profile_{index + 1}", kinds, ranks, set(), True))
+                local_overload_specs[fn.name] = specs
+                local_overload_dispatch[fn.name] = {"joint": True}
+            continue
         if len(varying) != 1:
             continue
         iv = varying[0]
@@ -67711,6 +67771,20 @@ def generate_flat(
     # callers that precede their callee in source order.
     overload_return_maps = {}
     for fn in (local_funcs or []):
+        if fn.name in tuple_return_funcs and local_overload_dispatch.get(fn.name, {}).get("joint"):
+            names = local_func_arg_names.get(fn.name, [])
+            for pname, kinds, ranks, *_ in local_overload_specs[fn.name]:
+                _, _, out_kinds, out_ranks = _local_return_maps(
+                    [fn], params,
+                    arg_rank_hints={fn.name: [ranks[a] for a in names]},
+                    arg_kind_hints={fn.name: [kinds[a] for a in names]},
+                    user_class_types=user_class_types,
+                    structured_type_components=structured_type_components,
+                )
+                local_overload_tuple_profiles.setdefault(fn.name, []).append({
+                    "proc_name": pname, "forced_kinds": kinds, "forced_ranks": ranks,
+                    "out_kinds": out_kinds.get(fn.name, []), "out_ranks": out_ranks.get(fn.name, []),
+                })
         if fn.name in tuple_return_funcs or fn.name in local_void_funcs or fn.name in dict_return_specs:
             continue
         for spec in local_overload_specs.get(fn.name, []):
@@ -68433,7 +68507,7 @@ def generate_flat(
                                             _ok_comment[_j_comment] = _numeric_comment_kind(
                                                 _ok_comment[_j_comment], _ck_comment
                                             )
-                                            if _cr_comment is not None:
+                                            if _cr_comment is not None and not local_overload_dispatch.get(fn.name, {}).get("joint"):
                                                 _or_comment[_j_comment] = max(int(_or_comment[_j_comment]), int(_cr_comment))
                                             _changed_comment = True
                                     if _changed_comment:
@@ -68442,6 +68516,7 @@ def generate_flat(
                             if (
                                 isinstance(next((r for r in ast.walk(fn) if isinstance(r, ast.Return) and isinstance(getattr(r, "value", None), ast.Tuple)), None), ast.Return)
                                 and any(int(_rr) == 0 for _rr in forced_ranks.values())
+                                and not local_overload_dispatch.get(fn.name, {}).get("joint")
                             ):
                                 _ret_tuple = next(
                                     (r.value for r in ast.walk(fn) if isinstance(r, ast.Return) and isinstance(getattr(r, "value", None), ast.Tuple)),
@@ -68482,7 +68557,7 @@ def generate_flat(
                         except Exception:
                             emit_tuple_return_out_kinds = tuple_return_out_kinds
                             emit_tuple_return_out_ranks = tuple_return_out_ranks
-                    if fn.name in tuple_return_funcs:
+                    if fn.name in tuple_return_funcs and not local_overload_dispatch.get(fn.name, {}).get("joint"):
                         prof_kinds = list((emit_tuple_return_out_kinds or {}).get(fn.name, []))
                         prof_ranks = list((emit_tuple_return_out_ranks or {}).get(fn.name, []))
                         local_overload_tuple_profiles.setdefault(fn.name, []).append(
