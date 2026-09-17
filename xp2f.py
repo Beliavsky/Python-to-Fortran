@@ -21699,6 +21699,7 @@ class translator(ast.NodeVisitor):
         self.type_rebind_targets = set()
         self.open_type_rebind_stack = []
         self.open_type_rebind_meta = []
+        self.rank_rebind_aliases = []
         self.reserved_names = set(FORTRAN_RESERVED_IDENTIFIERS)
         self.name_aliases = {}
         self.fortran_name_owner = {}
@@ -22512,6 +22513,12 @@ class translator(ast.NodeVisitor):
     def _close_one_type_rebind_block(self):
         if not self.open_type_rebind_stack:
             return
+        while self.rank_rebind_aliases and self.rank_rebind_aliases[-1][0] == len(self.open_type_rebind_stack):
+            _, source, previous = self.rank_rebind_aliases.pop()
+            if previous is None:
+                self.name_aliases.pop(source, None)
+            else:
+                self.name_aliases[source] = previous
         self.o.pop()
         self.o.w("end block")
         self.open_type_rebind_stack.pop()
@@ -29743,6 +29750,10 @@ class translator(ast.NodeVisitor):
     def _decl_rank_expr(self, node):
         """Rank from declarations/allocs only (ignores broadcast row/col markers)."""
         if isinstance(node, ast.Name):
+            nm = self._aliased_name(self._resolve_list_alias(node.id))
+            for bn, _bk, br in reversed(self.open_type_rebind_meta):
+                if bn == nm:
+                    return int(br)
             if node.id in self.alloc_reals:
                 return self.alloc_real_rank.get(node.id, 1)
             if node.id in self.alloc_complexes:
@@ -35821,8 +35832,21 @@ class translator(ast.NodeVisitor):
                             break
                     def _reshape_call(_dim_nodes):
                         _dims = ", ".join(self._reshape_dims_exprs(arr, _dim_nodes))
+                        # RESHAPE consumes its source in Fortran order, too.
+                        # Reverse the source axes for NumPy's default C order;
+                        # reversing only the destination fill order is not
+                        # sufficient for a matrix-to-vector rank change.
+                        _source = arr
+                        _source_rank = self._rank_expr(node.func.value)
+                        if _order_txt != "F" and _source_rank == 2:
+                            _source = f"transpose({arr})"
+                        elif _order_txt != "F" and _source_rank > 2:
+                            _axes = list(range(_source_rank, 0, -1))
+                            _shape = ", ".join(f"size({arr},{i})" for i in _axes)
+                            _order = ", ".join(str(i) for i in _axes)
+                            _source = f"reshape({arr}, [{_shape}], order=[{_order}])"
                         if _order_txt == "F" or len(_dim_nodes) < 2:
-                            return f"reshape({arr}, [{_dims}])"
+                            return f"reshape({_source}, [{_dims}])"
                         # See the identical np.reshape(...) fix (and its
                         # verified reasoning) just above: NumPy's own
                         # .reshape() method also defaults to row-major
@@ -35833,7 +35857,7 @@ class translator(ast.NodeVisitor):
                         # filled the result in Fortran's native column-
                         # major order instead.
                         _order_list = ", ".join(str(_i) for _i in range(len(_dim_nodes), 0, -1))
-                        return f"reshape({arr}, [{_dims}], order=[{_order_list}])"
+                        return f"reshape({_source}, [{_dims}], order=[{_order_list}])"
                     if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
                         return _reshape_call(list(node.args[0].elts))
                     if len(node.args) >= 1:
@@ -41093,6 +41117,7 @@ class translator(ast.NodeVisitor):
                     and v.func.attr == "reshape"
                     and isinstance(v.func.value, ast.Name)
                     and v.func.value.id == t.id
+                    and t.id in self.dummy_arg_names
                 ):
                     continue
                 if (
@@ -43714,6 +43739,7 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "reshape"
             and isinstance(v.func.value, ast.Name)
             and v.func.value.id == t.id
+            and t.id in self.dummy_arg_names
         ):
             # Preserve rank-intent metadata from prescan, but avoid assigning back
             # into a dummy that may be INTENT(IN); downstream expressions use the
@@ -43901,10 +43927,7 @@ class translator(ast.NodeVisitor):
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
             _tuple_out_or_src_names = set(self.tuple_return_out_names or []) | set(getattr(self, "tuple_return_src_names", []) or [])
             if (
-                isinstance(v, ast.Call)
-                and isinstance(v.func, ast.Attribute)
-                and v.func.attr == "astype"
-                and _expr_uses_name(v.func.value, t.id)
+                _expr_uses_name(v, t.id)
                 and not is_function_result_target
                 and t.id not in _tuple_out_or_src_names
             ):
@@ -43912,14 +43935,21 @@ class translator(ast.NodeVisitor):
                 cast_rank = self._rank_expr(v)
                 visible_kind, visible_rank = self._visible_kind_rank(t.id)
                 if (
-                    cast_kind in {"int", "real", "logical"}
+                    cast_kind in {"int", "real", "logical", "complex"}
                     and cast_rank > 0
                     and (cast_kind, cast_rank) != (visible_kind, visible_rank)
+                    and (
+                        (visible_rank is not None and visible_rank > 0 and cast_rank != visible_rank)
+                        or (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                            and v.func.attr == "astype")
+                    )
                 ):
-                    # Evaluate before shadowing: assigning int(a) back into a
-                    # real array loses the dtype change and taints reductions.
+                    # Evaluate using the old binding before introducing a new
+                    # dtype/rank. In particular v = v.reshape(m, 1) / norm
+                    # must read the vector, then bind a distinct matrix.
                     cast_expr = self.expr(v)
-                    tmp_name = f"xp2f_cast_{getattr(node, 'lineno', 0)}"
+                    tmp_prefix = "xp2f_rank" if cast_rank != visible_rank else "xp2f_cast"
+                    tmp_name = f"{tmp_prefix}_{getattr(node, 'lineno', 0)}"
                     taken = set(self.var_type_first_seen) | set(self.name_aliases.values())
                     taken.update(self.params)
                     taken.update(self.dummy_arg_names)
@@ -43930,6 +43960,16 @@ class translator(ast.NodeVisitor):
                         tmp_name += "_"
                     self._open_type_rebind_block(tmp_name, cast_kind, cast_rank)
                     self.o.w(f"{tmp_name} = {cast_expr}")
+                    if cast_rank != visible_rank:
+                        # A rank change gets its own storage and name. Redirect
+                        # subsequent uses in this scope, restoring the vector
+                        # binding when the branch/loop block ends. No copy or
+                        # MOVE_ALLOC is needed for the newly formed matrix.
+                        self.rank_rebind_aliases.append((
+                            len(self.open_type_rebind_stack), t.id, self.name_aliases.get(t.id)
+                        ))
+                        self.name_aliases[t.id] = tmp_name
+                        return
                     self._open_type_rebind_block(t.id, cast_kind, cast_rank)
                     self.o.w(f"call move_alloc({tmp_name}, {self._aliased_name(t.id)})")
                     return
@@ -50278,6 +50318,8 @@ class translator(ast.NodeVisitor):
                 int(self.alloc_char_rank.get(lname, 0)),
                 int(self._decl_rank_expr(t)),
             )
+            if any(bn == self._aliased_name(t.id) for bn, _, _ in self.open_type_rebind_meta):
+                tgt_rank = int(r_lhs_final)
             if (
                 tgt_rank == 1
                 and isinstance(v, ast.Call)

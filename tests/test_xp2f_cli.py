@@ -15164,6 +15164,66 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_gram_schmidt_rank_rebinding(tmp_path: Path) -> None:
+    # Burkardt's MIT-licensed gram_schmidt_tolerance: v is a vector
+    # during projection, then a matrix when appended to the basis.
+    _run_xp2f_compile_diff(tmp_path, "xgram_schmidt_rebind.py", [
+        "import numpy as np",
+        "def orthogonalize(A, tol):",
+        "    m, na = A.shape",
+        "    nu = 0",
+        "    U = np.zeros([m, nu])",
+        "    for j in range(na):",
+        "        v = A[:,j]",
+        "        for j2 in range(nu):",
+        "            vu = np.dot(v, U[:,j2])",
+        "            v = v - vu * U[:,j2]",
+        "        v_norm = np.linalg.norm(v)",
+        "        if tol < v_norm:",
+        "            v = v.reshape(m, 1) / v_norm",
+        "            nu = nu + 1",
+        "            U = np.hstack((U, v))",
+        "    return U",
+        "def check(A):",
+        "    U = orthogonalize(A, 1e-10)",
+        "    print(U.shape[0], U.shape[1])",
+        "    print(np.linalg.norm(U.T @ U - np.eye(U.shape[1])) < 1e-10)",
+        "    print(np.linalg.norm(A - U @ (U.T @ A)) < 1e-10)",
+        "    for i in range(U.shape[0]):",
+        "        for j in range(U.shape[1]):",
+        "            print(round(U[i,j], 8))",
+        "check(np.array([[1.,2.], [4.,5.], [7.,8.]]))",
+        "check(np.array([[1.,2.,3.], [4.,5.,6.], [7.,8.,9.]]))",
+        "check(np.array([[0.,1.,2.,0.], [0.,0.,0.,1.], [0.,0.,0.,0.]]))",
+        "check(np.zeros((3,2)))",
+    ])
+
+
+def test_xp2f_self_reshape_rank_rebinding(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xreshape_rebind.py", [
+        "import numpy as np",
+        "a = np.array([1.,2.,3.,4.,5.,6.])",
+        "a = a.reshape(2,3)",
+        "print(a.shape[0], a.shape[1])",
+        "print(a)",
+        "a = a.reshape(6)",
+        "print(a)",
+        "a = a.reshape(2,1,3)",
+        "a = a.reshape(6)",
+        "print(a)",
+        "a = a.reshape(2,3)",
+        "a = a.reshape(6, order='F')",
+        "print(a)",
+        "for k in range(3):",
+        "    v = np.array([1.,2.,3.]) + k",
+        "    print(np.dot(v, v))",
+        "    if k != 1:",
+        "        v = v.reshape(3,1) / 2.0",
+        "        print(v.shape[0], v.shape[1])",
+        "        print(v[:,0])",
+    ])
+
+
 def test_xp2f_mesh_vtoe_loadtxt_integer_rebind(tmp_path: Path) -> None:
     # Core of Burkardt's MIT-licensed mesh_vtoe. Keep the original
     # load/transpose/self-cast path, using a tiny zero-based mesh.
