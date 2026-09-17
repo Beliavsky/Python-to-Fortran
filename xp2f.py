@@ -29028,6 +29028,15 @@ class translator(ast.NodeVisitor):
                 if node.func.id == "spread" and len(node.args) >= 1:
                     return self._rank_expr(node.args[0]) + 1
                 if node.func.id in self.local_return_ranks:
+                    profiles = self.local_overload_dispatch.get(node.func.id, {}).get("return_profiles", [])
+                    for profile in profiles:
+                        names = self.local_func_arg_names.get(node.func.id, [])
+                        actuals = dict(zip(names, node.args))
+                        actuals.update({kw.arg: kw.value for kw in node.keywords if kw.arg is not None})
+                        if all(name in actuals and self._rank_expr(actuals[name]) == rank
+                               and self._expr_kind(actuals[name]) == profile["kinds"][name]
+                               for name, rank in profile["ranks"].items()):
+                            return profile["return_rank"]
                     rr_hint = int(self.local_return_ranks.get(node.func.id, 0))
                     if rr_hint > 0:
                         return rr_hint
@@ -67289,12 +67298,14 @@ def generate_flat(
         pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
         _comment_kind0, _comment_rank0 = _comment_arg_spec_hint_for_fn(fn, arg0)
         if _comment_kind0 in {"int", "real", "logical", "char", "complex"}:
-            _want_comment_rank0 = int(_comment_rank0 or 0)
-            pairs = {(_comment_kind0, r) for (_k, r) in pairs if _comment_rank0 is None or int(r) == _want_comment_rank0}
+            # Documentation may describe the scalar mathematical argument
+            # even when callers also pass arrays (e.g. cubic_antiderivative).
+            # Keep observed ranks; actual body requirements below still rule
+            # out scalar overloads for procedures that require an array.
+            pairs = {(_comment_kind0, r) for (_k, r) in pairs}
             triads = {
                 (_comment_kind0, r, is_list)
                 for (_k, r, is_list) in triads
-                if _comment_rank0 is None or int(r) == _want_comment_rank0
             }
         if _char_scalar_arg_pattern(fn, arg0):
             pairs = {("char", 0)}
@@ -67696,6 +67707,26 @@ def generate_flat(
                 and _curr_kinds[_i] is None
             ):
                 _curr_kinds[_i] = _bk
+    # Resolve specific result profiles before emitting any caller, including
+    # callers that precede their callee in source order.
+    overload_return_maps = {}
+    for fn in (local_funcs or []):
+        if fn.name in tuple_return_funcs or fn.name in local_void_funcs or fn.name in dict_return_specs:
+            continue
+        for spec in local_overload_specs.get(fn.name, []):
+            pname, kinds, ranks = spec[:3]
+            names = local_func_arg_names.get(fn.name, [])
+            rs, rr, _, _ = _local_return_maps(
+                [fn], params,
+                arg_rank_hints={fn.name: [ranks.get(a, local_func_arg_ranks[fn.name][i]) for i, a in enumerate(names)]},
+                arg_kind_hints={fn.name: [kinds.get(a, local_func_arg_kinds[fn.name][i]) for i, a in enumerate(names)]},
+                user_class_types=user_class_types,
+                structured_type_components=structured_type_components,
+            )
+            if fn.name in rs:
+                overload_return_maps[pname] = (rs[fn.name], rr.get(fn.name, 0))
+                local_overload_dispatch.setdefault(fn.name, {}).setdefault("return_profiles", []).append(
+                    {"kinds": kinds, "ranks": ranks, "return_rank": rr.get(fn.name, 0)})
     local_generic_overloads = set(local_overload_specs.keys())
     pure_local_calls = compute_local_functions_purity(
         local_funcs, known_pure_calls=set(known_pure_calls or set()) | set((user_class_types or {}).keys())
@@ -68349,6 +68380,15 @@ def generate_flat(
                 for spec in local_overload_specs[fn.name]:
                     pname, forced_kinds, forced_ranks = spec[:3]
                     forced_list_args = spec[3] if len(spec) >= 4 else set()
+                    emit_return_specs = local_return_specs
+                    emit_return_ranks = local_return_ranks
+                    if pname in overload_return_maps:
+                        # A generic's array result must not leak into its
+                        # scalar specific. Infer each specific with its own
+                        # argument profile, retaining maps for other callees.
+                        emit_return_specs = dict(local_return_specs)
+                        emit_return_ranks = dict(local_return_ranks)
+                        emit_return_specs[fn.name], emit_return_ranks[fn.name] = overload_return_maps[pname]
                     emit_tuple_return_out_kinds = tuple_return_out_kinds
                     emit_tuple_return_out_ranks = tuple_return_out_ranks
                     if fn.name in tuple_return_funcs:
@@ -68464,8 +68504,8 @@ def generate_flat(
                         comment_map=comment_map,
                         dict_return_spec=dict_return_specs.get(fn.name),
                         dict_return_types=dict_return_types,
-                        local_return_specs=local_return_specs,
-                        local_return_ranks=local_return_ranks,
+                        local_return_specs=emit_return_specs,
+                        local_return_ranks=emit_return_ranks,
                         tuple_return_out_kinds=emit_tuple_return_out_kinds,
                         tuple_return_out_ranks=emit_tuple_return_out_ranks,
                         tuple_return_funcs=tuple_return_funcs,

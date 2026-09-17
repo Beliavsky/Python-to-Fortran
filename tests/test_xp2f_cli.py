@@ -15984,6 +15984,30 @@ def test_scalar_constant_promotion_requires_complete_string_literal(rhs: str, co
     assert f"s = {rhs}" in result
 
 
+@pytest.mark.parametrize("keyword", [False, True])
+def test_xp2f_scalar_comment_preserves_array_overloads(tmp_path: Path, keyword: bool) -> None:
+    actual = "x=b" if keyword else "b"
+    _run_xp2f_compile_diff(tmp_path, "xcubic_overloads.py", [
+        "import numpy as np",
+        "def primitive(x):",
+        "    # Input:",
+        "    # real X, the argument.",
+        "    g = x * x * (5.0 + x * (-7.0 / 3.0 + x / 4.0))",
+        "    return g",
+        "def integrate(a, b):",
+        f"    q = primitive({actual}) - primitive(a)",
+        "    return q",
+        "def fixture():",
+        "    x = np.array([0.0, 1.5, 3.0])",
+        "    q = integrate(x[0], x[2])",
+        "    print(q)",
+        "    values = integrate(x, x + 1.0)",
+        "    for i in range(len(values)):",
+        "        print(values[i])",
+        "fixture()",
+    ])
+
+
 def test_xp2f_runtime_formatted_string_in_loop(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xruntime_string.py", [
         "import numpy as np",
