@@ -59920,7 +59920,11 @@ def _emit_local_function(
                 if hint_kind is None:
                     hint_kind = local_func_arg_kinds[fn.name][idx]
         if comment_arg_kind in {"int", "real", "logical", "char", "complex"}:
-            hint_kind = comment_arg_kind
+            _known_arg_ranks = (local_func_arg_ranks or {}).get(fn.name, [])
+            if 0 <= idx < len(_known_arg_ranks) and int(_known_arg_ranks[idx]) > 0:
+                hint_kind = _numeric_comment_kind(hint_kind, comment_arg_kind)
+            else:
+                hint_kind = comment_arg_kind
         inferred_hint_kind = hint_kind
         _self_norm_kind = _arg_self_normalized_kind(arg)
         _self_norm_rank = _arg_self_normalized_rank(arg)
@@ -61974,10 +61978,12 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
 
 
 def _numeric_comment_kind(inferred_kind, comment_kind):
-    """Do not let a documentation hint narrow known floating-point storage."""
+    """Do not let documentation narrow floating-point or retype boolean storage."""
     if inferred_kind in {"complex", "alloc_complex"} and comment_kind in {"int", "real"}:
         return inferred_kind
     if inferred_kind in {"real", "alloc_real"} and comment_kind == "int":
+        return inferred_kind
+    if inferred_kind in {"logical", "alloc_log"} and comment_kind in {"int", "real"}:
         return inferred_kind
     return comment_kind
 
@@ -64845,6 +64851,10 @@ def generate_flat(
                 merged_kinds.append(bk)
             elif bk is None:
                 merged_kinds.append(hk)
+            elif hk == "real" and bk == "int" and int(local_func_arg_ranks[fn.name][i]) > 0:
+                # Integer-valued assignments/comments do not change the dtype
+                # of an observed floating-point array, particularly inout data.
+                merged_kinds.append(hk)
             elif hk == "int" and bk == "real" and not _arg_has_explicit_real_evidence(arg_nm):
                 merged_kinds.append(hk)
             elif hk == "int" and bk != "int":
@@ -67598,7 +67608,11 @@ def generate_flat(
         for _i, _bk in enumerate(_base_kinds):
             _ck = _comment_kinds[_i] if _i < len(_comment_kinds) else None
             if _ck in {"int", "real", "logical", "char", "complex"} and _i < len(_curr_kinds):
-                _curr_kinds[_i] = _ck
+                _ranks = local_func_arg_ranks.get(_fn_name, [])
+                _curr_kinds[_i] = (
+                    _numeric_comment_kind(_curr_kinds[_i], _ck)
+                    if _i < len(_ranks) and int(_ranks[_i]) > 0 else _ck
+                )
                 continue
             if (
                 _bk in {"int", "logical", "char", "complex"}

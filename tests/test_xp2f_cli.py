@@ -14972,6 +14972,10 @@ def test_inline_reassigned_parameter_preserves_call_semantics(body: str) -> None
     ("alloc_real", "int", "alloc_real"),
     ("complex", "int", "complex"),
     ("alloc_complex", "real", "alloc_complex"),
+    ("logical", "int", "logical"),
+    ("logical", "real", "logical"),
+    ("alloc_log", "int", "alloc_log"),
+    ("alloc_log", "real", "alloc_log"),
     ("int", "int", "int"),
     ("int", "real", "real"),
     (None, "int", "int"),
@@ -15246,6 +15250,50 @@ use(1, callback)
     assert isinstance(body[2].value.args[1], ast.Call)
     assert isinstance(body[3].value.args[1], ast.Name)
     assert isinstance(functions[-1].body[0].value.args[1], ast.Name)
+
+
+def test_xp2f_dijkstra_array_types_override_integer_comments(tmp_path: Path) -> None:
+    # Reduced Burkardt Dijkstra algorithm, with fractional edges to detect
+    # truncation that its original integer-valued example cannot expose.
+    _run_xp2f_compile_diff(tmp_path, "xdijkstra_types.py", [
+        "import numpy as np",
+        "def nearest(n, distance, connected):",
+        "    # integer DISTANCE(N), minimum distances.",
+        "    # integer CONNECTED(N), connection flags.",
+        "    # integer D, smallest distance.",
+        "    d = 2147483647",
+        "    v = -1",
+        "    for i in range(n):",
+        "        if not connected[i] and distance[i] <= d:",
+        "            d = distance[i]",
+        "            v = i",
+        "    return d, v",
+        "def update(n, v, connected, edges, distance):",
+        "    # integer CONNECTED(N), connection flags.",
+        "    # integer EDGES(N,N), edge weights.",
+        "    # integer DISTANCE(N), minimum distances.",
+        "    for i in range(n):",
+        "        if not connected[i]:",
+        "            distance[i] = min(distance[i], distance[v]+edges[v,i])",
+        "    return distance",
+        "def distances(n, edges):",
+        "    # integer EDGES(N,N), edge weights.",
+        "    # integer DISTANCE(N), minimum distances.",
+        "    connected = np.zeros(n, dtype=bool)",
+        "    connected[0] = True",
+        "    distance = np.zeros(n)",
+        "    for i in range(1,n):",
+        "        distance[i] = edges[0,i]",
+        "    for step in range(1,n):",
+        "        d, v = nearest(n, distance, connected)",
+        "        print(d, v)",
+        "        connected[v] = True",
+        "        distance = update(n, v, connected, edges, distance)",
+        "    return distance",
+        "edges = np.array([[0.,0.75,5.,9.], [0.75,0.,1.5,6.], [5.,1.5,0.,0.5], [9.,6.,0.5,0.]])",
+        "answer = distances(4, edges)",
+        "print(answer)",
+    ])
 
 
 def test_xp2f_unused_callback_arguments(tmp_path: Path) -> None:
