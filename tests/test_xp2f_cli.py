@@ -15260,7 +15260,11 @@ def test_xp2f_compass_search_callback_argument_ranks(tmp_path: Path) -> None:
     ])
 
 
-def test_xp2f_callback_later_matrix_and_vector_arguments(tmp_path: Path) -> None:
+@pytest.mark.parametrize("integer_position", [None, "vector", "matrix"])
+@pytest.mark.parametrize("keyword_call", [False, True])
+def test_xp2f_callback_later_matrix_and_vector_arguments(
+    tmp_path: Path, integer_position: str | None, keyword_call: bool
+) -> None:
     _run_xp2f_compile_diff(tmp_path, "xcallback_later_arrays.py", [
         "import numpy as np",
         "def evaluate(f, n, x, a):",
@@ -15270,10 +15274,9 @@ def test_xp2f_callback_later_matrix_and_vector_arguments(tmp_path: Path) -> None
         "    for i in range(n):",
         "        value += x[i]*a[i,0]",
         "    return value",
-        "x = np.array([2.,3.])",
-        "a = np.array([[1.,4.],[5.,6.]])",
-        "print(evaluate(objective, 2, x, a))",
-        "print(evaluate(f=objective, n=2, x=x, a=a))",
+        "x = np.array([2,3])" if integer_position == "vector" else "x = np.array([2.,3.])",
+        "a = np.array([[1,4],[5,6]])" if integer_position == "matrix" else "a = np.array([[1.,4.],[5.,6.]])",
+        "print(evaluate(f=objective, n=2, x=x, a=a))" if keyword_call else "print(evaluate(objective, 2, x, a))",
     ])
 
 

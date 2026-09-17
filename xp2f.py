@@ -65542,7 +65542,15 @@ def generate_flat(
                     _ak = "int"
                 if _ak in {"int", "real", "complex", "logical", "char"}:
                     _info["arg_kinds"][_ia] = _promote_kind_hint(_info["arg_kinds"].get(_ia), _ak)
-                    if _force_integer_actual and _actual_name in local_func_arg_kinds and _ia < len(local_func_arg_kinds[_actual_name]):
+                    # An array dummy must have exactly the callback interface's
+                    # element type. Arithmetic with real values in the body
+                    # does not turn an integer input array into a real array.
+                    _typed_array_actual = (
+                        _ia in _wrapper_arg_kinds
+                        and _ia < len(_aranks)
+                        and int(_aranks[_ia]) > 0
+                    )
+                    if (_force_integer_actual or _typed_array_actual) and _actual_name in local_func_arg_kinds and _ia < len(local_func_arg_kinds[_actual_name]):
                         local_func_arg_kinds[_actual_name][_ia] = _ak
             for _ia, _ar in enumerate(_aranks):
                 _info["arg_ranks"][_ia] = max(int(_info["arg_ranks"].get(_ia, 0)), int(_ar))
