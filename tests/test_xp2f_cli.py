@@ -15217,6 +15217,83 @@ def test_xp2f_numpy_self_assignment_repeat_sort(tmp_path: Path) -> None:
     ])
 
 
+def test_specialize_named_slice_callbacks_reuses_clones_and_preserves_defaults() -> None:
+    tree = ast.parse('''
+def constant(x):
+    return 1.0
+def vector(x):
+    return x * 2.0
+def solve(x, f=constant, scale=2.0):
+    return f(x[1:]) * scale
+solve(data, constant)
+solve(data, f=vector, scale=3.0)
+solve(data, constant)
+solve(data)
+''')
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    body = [n for n in tree.body if not isinstance(n, ast.FunctionDef)]
+    xp2f.specialize_named_slice_callbacks(body, functions)
+    clones = [f for f in functions if f.name.startswith("solve_cb_")]
+    assert len(clones) == 2
+    assert any(f.name == "solve" for f in functions)  # Default call still needs it.
+    assert body[0].value.func.id == body[2].value.func.id
+    assert body[1].value.func.id != body[0].value.func.id
+    for clone in clones:
+        assert [a.arg for a in clone.args.args] == ["x", "scale"]
+        assert len(clone.args.defaults) == 1
+        assert clone.args.defaults[0].value == 2.0
+
+
+@pytest.mark.parametrize("extra", ["f = constant", "saved = f", "vector = 3.0"])
+def test_specialize_named_slice_callbacks_preserves_unsafe_bindings(extra: str) -> None:
+    tree = ast.parse(
+        "def constant(x):\n    return 1.0\n"
+        "def vector(x):\n    return x * 2.0\n"
+        f"def solve(x, f):\n    {extra}\n    return f(x[1:])\n"
+        "solve(data, constant)\nsolve(data, vector)\n"
+    )
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    body = [n for n in tree.body if not isinstance(n, ast.FunctionDef)]
+    before = ast.dump(tree)
+    xp2f.specialize_named_slice_callbacks(body, functions)
+    assert len(functions) == 3
+    assert ast.dump(tree) == before
+
+
+def test_xp2f_mixed_result_slice_callbacks(tmp_path: Path) -> None:
+    # The forcing callbacks in Burkardt's Poisson solvers differ in result
+    # rank: a constant broadcasts, while an elementwise formula is a vector.
+    _run_xp2f_compile_diff(tmp_path, "xmixed_slice_callbacks.py", [
+        "import numpy as np",
+        "def constant(x):",
+        "    return 1.0",
+        "def vector(x):",
+        "    return -x*(x+3.0)*np.exp(x)",
+        "def solve(n, f, scale=1.0):",
+        "    x = np.linspace(0.0, 1.0, n+1)",
+        "    r = np.zeros(n+1)",
+        "    r[1:n] = f(x[1:n])*scale/n/n",
+        "    u = np.zeros(n+1)",
+        "    it = 0",
+        "    while it < 10000:",
+        "        it += 1",
+        "        change = 0.0",
+        "        for i in range(1,n):",
+        "            old = u[i]",
+        "            u[i] = 0.5*(u[i-1]+u[i+1]+r[i])",
+        "            change += abs(u[i]-old)",
+        "        if change < 0.0001:",
+        "            break",
+        "    return u, it",
+        "u, it = solve(16, constant)",
+        "v, jt = solve(n=16, f=vector, scale=1.0)",
+        "w, kt = solve(16, constant, scale=2.0)",
+        "print(it, jt, kt)",
+        "for i in range(17):",
+        "    print(round(u[i], 9), round(v[i], 9), round(w[i], 9))",
+    ])
+
+
 def test_xp2f_compass_search_callback_argument_ranks(tmp_path: Path) -> None:
     # Reduced from Burkardt's MIT-licensed compass_search.py: the second
     # callback argument is a vector, while the first is an integer scalar.

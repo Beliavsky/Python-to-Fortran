@@ -18965,6 +18965,86 @@ def _specialize_local_fn_with_lambda(
     return new_fn
 
 
+def specialize_named_slice_callbacks(exec_body, local_funcs):
+    """Bind distinct known callbacks used on slices before rank inference.
+
+    A scalar-returning callback may broadcast into a slice while another
+    returns an array. Direct calls in separate wrapper clones preserve both
+    behaviors without imposing one Fortran procedure interface on them.
+    Only specialize unmodified parameters used exclusively as call targets.
+    """
+    fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
+    roots = list(exec_body) + list(local_funcs)
+    used_names = {n.id.lower() for root in roots for n in ast.walk(root) if isinstance(n, ast.Name)}
+    used_names.update(n.arg.lower() for root in roots for n in ast.walk(root) if isinstance(n, ast.arg))
+    used_names.update(name.lower() for name in fn_map)
+    for fn in list(local_funcs):
+        if not isinstance(fn, ast.FunctionDef) or fn.args.posonlyargs or fn.args.vararg or fn.args.kwarg:
+            continue
+        # Nested scopes and recursive wrappers require separate binding rules.
+        if any(isinstance(n, (ast.FunctionDef, ast.Lambda)) for st in fn.body for n in ast.walk(st)):
+            continue
+        nodes = list(ast.walk(fn))
+        if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == fn.name for n in nodes):
+            continue
+        parents = {id(ch): n for n in nodes for ch in ast.iter_child_nodes(n)}
+        for index, arg in enumerate(fn.args.args):
+            refs = [n for n in nodes if isinstance(n, ast.Name) and n.id == arg.arg]
+            if not refs or any(not isinstance(n.ctx, ast.Load) or not isinstance(parents.get(id(n)), ast.Call)
+                               or parents[id(n)].func is not n for n in refs):
+                continue
+            if not any(isinstance(a, ast.Subscript) and any(isinstance(s, ast.Slice) for s in ast.walk(a.slice))
+                       for n in refs for a in parents[id(n)].args):
+                continue
+            sites = []
+            for root in list(exec_body) + list(local_funcs):
+                for call in ast.walk(root):
+                    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == fn.name):
+                        continue
+                    if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+                        continue
+                    actual = call.args[index] if index < len(call.args) else next(
+                        (k.value for k in call.keywords if k.arg == arg.arg), None)
+                    if isinstance(actual, ast.Name) and actual.id in fn_map:
+                        sites.append((call, actual.id))
+            if len({name for _, name in sites}) < 2:
+                continue
+            bound = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+            bound.update(n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+            if any(name in bound for _, name in sites):
+                continue
+            clones = {}
+            for call, actual_name in sites:
+                if actual_name not in clones:
+                    suffix = 1
+                    name = f"{fn.name}_cb_{suffix}"
+                    while name.lower() in used_names:
+                        suffix += 1
+                        name = f"{fn.name}_cb_{suffix}"
+                    used_names.add(name.lower())
+                    clone = copy.deepcopy(fn)
+                    clone.name = name
+                    del clone.args.args[index]
+                    first_default = len(fn.args.args) - len(fn.args.defaults)
+                    if index >= first_default:
+                        del clone.args.defaults[index - first_default]
+                    for n in ast.walk(clone):
+                        if isinstance(n, ast.Name) and n.id == arg.arg:
+                            n.id = actual_name
+                    local_funcs.append(ast.fix_missing_locations(clone))
+                    clones[actual_name] = name
+                call.func.id = clones[actual_name]
+                if index < len(call.args):
+                    del call.args[index]
+                else:
+                    call.keywords = [k for k in call.keywords if k.arg != arg.arg]
+            # Keep the generic original if it still has any references.
+            remaining_roots = list(exec_body) + [f for f in local_funcs if f is not fn]
+            if not any(isinstance(n, ast.Name) and n.id == fn.name for root in remaining_roots for n in ast.walk(root)):
+                local_funcs.remove(fn)
+            break
+
+
 def specialize_lambda_function_args(exec_body, local_funcs):
     """
     Specialize calls like f = lambda ...; y = rk4(f, ...)
@@ -70062,6 +70142,8 @@ def transpile_file(
     for _fn in local_funcs:
         if isinstance(_fn, ast.FunctionDef):
             specialize_lambda_function_args(_fn.body, local_funcs)
+
+    specialize_named_slice_callbacks(effective_tree.body, local_funcs)
 
     params = find_parameters(effective_tree)
     # A local function's own translator is deliberately constructed with
