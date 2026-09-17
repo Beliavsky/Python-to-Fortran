@@ -14701,6 +14701,8 @@ def detect_needed_helpers(tree):
                 if re.search(r"%(?:[-+#0 ]*\d*(?:\.\d+)?)?[gG]", fmt_text):
                     needed.add("py_format_g_real")
                     needed.add("py_str_int")
+                if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[eEgG]", fmt_text):
+                    needed.add("py_format_real")
                 # Old-style "%...spec..." % args formatting (the BinOp Mod
                 # codegen's own inline lowering, see expr()'s ast.Mod
                 # handling) wraps EVERY substituted argument in py_str(...)
@@ -54577,7 +54579,7 @@ class translator(ast.NodeVisitor):
                 # Return (width, prec) as strings when present in %-specifier
                 # body (between '%' and conversion code), else (None, None).
                 import re
-                m = re.search(r"(\d+)(?:\.(\d+))?\s*$", spec_text or "")
+                m = re.fullmatch(r"[-+#0 ]*(\d+)?(?:\.(\d+))?\s*", spec_text or "")
                 if not m:
                     return None, None
                 return m.group(1), m.group(2)
@@ -54628,6 +54630,13 @@ class translator(ast.NodeVisitor):
                     ak = self._expr_kind(an)
                     ar = self._rank_expr(an)
                     int_scalar = (ak == "int" and ar == 0)
+                    if (cl in {"g", "e"} and ar == 0 and (spec_body or cl == "e")
+                            and not (int_scalar and PERCENT_FLOAT_INT_FORMAT)):
+                        flags = re.match(r"[-+#0 ]*", spec_body).group(0)
+                        items.append(("pyg_prec", an, int(prec) if prec is not None else 6,
+                                      int(width) if width is not None else 0, flags, code))
+                        i = j + 1
+                        continue
                     if cl == "g" and width is None and prec is None and ar == 0:
                         items.append(("pyg", an))
                         i = j + 1
@@ -54699,6 +54708,15 @@ class translator(ast.NodeVisitor):
                     lit = ent[1].replace("'", "''")
                     fmt_parts.append(f"'{lit}'")
                     prev_desc = False
+                elif ent[0] == "pyg_prec":
+                    fmt_parts.append("a")
+                    expr_txt = self.expr(ent[1])
+                    if self._expr_kind(ent[1]) == "logical":
+                        expr_txt = f"merge(1.0_dp, 0.0_dp, {expr_txt})"
+                    else:
+                        expr_txt = f"real({expr_txt}, kind=dp)"
+                    write_args.append(f"py_format_real({expr_txt}, {ent[2]}, {ent[3]}, '{ent[4]}', '{ent[5]}')")
+                    prev_desc = True
                 elif ent[0] == "pyg":
                     fmt_parts.append("a")
                     arg_node = ent[1]

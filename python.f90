@@ -340,6 +340,7 @@ public :: exec_cmd_status !@pyapi kind=function ret=integer args=cmd:character:i
 public :: py_time !@pyapi kind=function ret=real args= desc="wall-clock seconds from system_clock (Python time.time approximation)"
 public :: py_ctime !@pyapi kind=function ret=character args=t:real(dp):intent(in):optional desc="string timestamp approximation for Python time.ctime"
 public :: py_format_g_real !@pyapi kind=function ret=character args=x:real(dp):intent(in) desc="Python-like %g formatting helper for real scalars"
+public :: py_format_real
 public :: cumsum
 public :: cumprod
 public :: eye
@@ -1267,6 +1268,92 @@ contains
             end if
          end if
       end function py_format_g_real
+
+      function py_format_real(x, prec, width, flags, code) result(s)
+         real(kind=dp), intent(in) :: x
+         integer, intent(in) :: prec, width
+         character(len=*), intent(in) :: flags, code
+         character(len=:), allocatable :: s, buf, digits, prefix, exponent_text
+         character(len=64) :: fmt, eb
+         integer :: p, e, pos, dot, n, cut
+         logical :: alternate, upper, scientific
+         upper = code == 'G' .or. code == 'E'
+         scientific = code == 'e' .or. code == 'E'
+         p = max(1, prec)
+         if (scientific) p = max(0, prec) + 1
+         alternate = index(flags, '#') > 0
+         prefix = ''
+         if (sign(1.0_dp, x) < 0.0_dp .and. .not. ieee_is_nan(x)) then
+            prefix = '-'
+         else if (index(flags, '+') > 0) then
+            prefix = '+'
+         else if (index(flags, ' ') > 0) then
+            prefix = ' '
+         end if
+         if (.not. ieee_is_finite(x)) then
+            if (ieee_is_nan(x)) then
+               s = 'nan'
+               if (upper) s = 'NAN'
+            else
+               s = 'inf'
+               if (upper) s = 'INF'
+            end if
+         else
+            ! Round once to P significant digits before choosing notation.
+            ! A generous internal field avoids output overflow, including
+            ! subnormals and exponents with three decimal digits.
+            n = p + 16
+            allocate(character(len=n) :: buf)
+            write(fmt, '("(es",i0,".",i0,"e4)")') n, p - 1
+            write(buf, fmt) abs(x)
+            buf = trim(adjustl(buf))
+            pos = index(buf, 'E')
+            read(buf(pos+1:), *) e
+            digits = buf(:pos-1)
+            dot = index(digits, '.')
+            if (dot > 0) digits = digits(:dot-1) // digits(dot+1:)
+            if (scientific .or. e < -4 .or. e >= p) then
+               s = digits(:1)
+               if (p > 1 .or. alternate) s = s // '.' // digits(2:)
+            else
+               cut = e + 1
+               if (cut <= 0) then
+                  s = '0.' // repeat('0', -cut) // digits
+               else if (cut >= len(digits)) then
+                  s = digits // repeat('0', cut-len(digits))
+                  if (alternate) s = s // '.'
+               else
+                  s = digits(:cut) // '.' // digits(cut+1:)
+               end if
+            end if
+            if (.not. scientific .and. .not. alternate .and. index(s, '.') > 0) then
+               do while (len(s) > 0)
+                  if (s(len(s):) /= '0') exit
+                  s = s(:len(s)-1)
+               end do
+               if (s(len(s):) == '.') s = s(:len(s)-1)
+            end if
+            if (scientific .or. e < -4 .or. e >= p) then
+               write(eb, '(i0.2)') abs(e)
+               exponent_text = 'e'
+               if (upper) exponent_text = 'E'
+               if (e < 0) then
+                  exponent_text = exponent_text // '-'
+               else
+                  exponent_text = exponent_text // '+'
+               end if
+               s = s // exponent_text // trim(eb)
+            end if
+         end if
+         n = max(0, width - len(prefix) - len(s))
+         if (index(flags, '-') > 0) then
+            s = prefix // s // repeat(' ', n)
+         else if (index(flags, '0') > 0) then
+            s = prefix // repeat('0', n) // s
+         else
+            s = repeat(' ', n) // prefix // s
+         end if
+      end function py_format_real
 
       function str_format_real_fixed(x, prec) result(s)
          real(kind=dp), intent(in) :: x

@@ -2261,6 +2261,26 @@ def test_xp2f_multi_arg_print_percent_format_mixed_numeric_width_precision(tmp_p
     )
 
 
+def test_xp2f_percent_g_precision_and_minimum_width(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xpercent_g_precision.py", [
+        "import numpy as np",
+        "values = np.array([0.0, -0.0, 1.25, -12345.25, 999999.75, 0.0001, 0.00009999999, 1e-12, 1e100, 1e-300, 1e308, np.inf, -np.inf, np.nan])",
+        "for x in values:",
+        "    print('|%10.6g|' % x)",
+        "    print('|%.6g|' % x)",
+        "    print('|%2.3g|' % x)",
+        "    print('|%+012.4G|' % x)",
+        "    print('|%-12.4g|' % x)",
+        "    print('|%#.0g|' % x)",
+        "    print('|%#10.6g|' % x)",
+        "    print('|% .3g|' % x)",
+        "    print('|%10.2e|' % x)",
+        "    print('|%+.0E|' % x)",
+        "    print('|%#2.0e|' % x)",
+        "    print('value', '|%10.6g|' % x, 'end')",
+    ])
+
+
 def test_fortran_inline_percent_format_constant_vars_rewrites_name_operand() -> None:
     # Direct unit test of inline_percent_format_constant_vars: a
     # module-level, single-assignment string constant used as the LEFT
