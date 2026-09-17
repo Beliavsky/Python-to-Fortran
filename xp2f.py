@@ -44753,6 +44753,7 @@ class translator(ast.NodeVisitor):
             _codegen_df_positions = self.tuple_df_return_positions.get(v.func.id, {})
             for e in t.elts:
                 if not isinstance(e, ast.Name):
+                    out_name_pos += 1
                     continue
                 if out_name_pos in _codegen_df_positions:
                     # This tuple-return position is pd.DataFrame-
@@ -45075,9 +45076,15 @@ class translator(ast.NodeVisitor):
 
             # Avoid passing the same actual variable as both input and output in
             # a single call (undefined Fortran aliasing for INTENT(INOUT/OUT)).
-            # Use scalar temporaries for colliding output actuals.
+            # Array sections/elements are not allocatable actuals. Receive
+            # tuple results in temporaries, then assign into the destinations;
+            # this also keeps overlapping input slices intact during the call.
+            section_idx = {j for j, e in enumerate(t.elts) if isinstance(e, ast.Subscript)}
             tmp_decl = []
-            tmp_idx = sorted(set(alias_idx) | set(rank_tmp_idx))
+            # Stage every result when any target is subscripted: Python assigns
+            # left to right, so `a[i], i = f()` must use the old i for a[i].
+            section_tmp_idx = {j for j, dst in enumerate(outs) if dst != "_"} if section_idx else set()
+            tmp_idx = sorted(set(alias_idx) | set(rank_tmp_idx) | section_tmp_idx)
             if tmp_idx:
                 for j in tmp_idx:
                     k = out_kinds_hint[j] if j < len(out_kinds_hint) else "int"
@@ -45089,7 +45096,7 @@ class translator(ast.NodeVisitor):
                             rr = None
                     dst = outs[j]
                     dst_rr = None
-                    if dst != "_":
+                    if dst != "_" and j not in section_tmp_idx:
                         try:
                             _vk, _vr = self._visible_kind_rank(dst)
                             if _vk is not None and self._aliased_name(dst) not in raw_input_aliases:

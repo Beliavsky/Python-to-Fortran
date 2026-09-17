@@ -3436,7 +3436,13 @@ def test_xp2f_tuple_return_assignment_allows_subscript_targets(tmp_path: Path) -
     out_f90 = tmp_path / "xtuple_subscript_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "call f(z, x(1), x(2), y)" in out_text
+    call = re.search(r"call f\((tmp_out_1_\d+), (tmp_out_2_\d+), (tmp_out_3_\d+), (tmp_out_4_\d+)\)", _join_fortran_continuations(out_text))
+    assert call is not None, out_text
+    tz, tx1, tx2, ty = call.groups()
+    assert f"z = {tz}" in out_text
+    assert f"y = {ty}" in out_text
+    # The postprocessor combines adjacent element assignments into a section.
+    assert f"x(1:2) = [{tx1}, {tx2}]" in out_text
 
 
 def test_xp2f_compiles_np_hypot_call(tmp_path: Path) -> None:
@@ -15258,6 +15264,54 @@ def test_specialize_named_slice_callbacks_preserves_unsafe_bindings(extra: str) 
     xp2f.specialize_named_slice_callbacks(body, functions)
     assert len(functions) == 3
     assert ast.dump(tree) == before
+
+
+def test_xp2f_tuple_array_results_into_overlapping_sections(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xtuple_sections.py", [
+        "import numpy as np",
+        "def transfer(nf, uf, rf, nc):",
+        "    uc = np.zeros(nc)",
+        "    rc = np.zeros(nc)",
+        "    rc[1:nc-1] = 4.0*(rf[2:2*nc-3:2] + uf[1:2*nc-4:2] - 2.0*uf[2:2*nc-3:2] + uf[3:2*nc-2:2])",
+        "    return uc, rc",
+        "u = np.arange(12, dtype=float)**2",
+        "r = np.arange(12, dtype=float)",
+        "u[1:6], r[2:7] = transfer(9, u[0:9], r[0:9], 5)",
+        "print(u)",
+        "print(r)",
+        "u[0:10:2], r[1:11:2] = transfer(nf=9, uf=u[0:9], rf=r[0:9], nc=5)",
+        "print(u)",
+        "print(r)",
+    ])
+
+
+def test_xp2f_tuple_sections_preserve_result_types_and_positions(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xtuple_section_types.py", [
+        "import numpy as np",
+        "def results(n):",
+        "    a = np.arange(n)",
+        "    b = np.ones((2,n))*2.5",
+        "    return a, 7.25, b",
+        "a = np.zeros(6)",
+        "b = np.zeros((2,6))",
+        "a[1:4], value, b[:,2:5] = results(3)",
+        "print(a)",
+        "print(value)",
+        "print(b)",
+        "def scalars():",
+        "    return 3, 4.5",
+        "a[0], a[5] = scalars()",
+        "print(a)",
+        "def new_index_last():",
+        "    return 9.5, 3",
+        "def new_index_first():",
+        "    return 0, 8.5",
+        "index = 1",
+        "a[index], index = new_index_last()",
+        "print(a, index)",
+        "index, a[index] = new_index_first()",
+        "print(a, index)",
+    ])
 
 
 def test_xp2f_mixed_result_slice_callbacks(tmp_path: Path) -> None:
