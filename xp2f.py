@@ -9877,9 +9877,11 @@ def promote_immediate_scalar_constants(lines):
         rhs_s = rhs.strip()
         if not rhs_s:
             return False
-        # character literal
-        if (rhs_s.startswith('"') and rhs_s.endswith('"')) or (rhs_s.startswith("'") and rhs_s.endswith("'")):
-            return True
+        # Match a complete character literal, including doubled quote escapes.
+        # Merely starting/ending with quotes also accepts runtime expressions
+        # such as 'prefix' // py_str(a(i)) // 'suffix'.
+        if rhs_s.startswith(('"', "'")):
+            return re.fullmatch(r'''(?:"(?:[^"]|"")*"|'(?:[^']|'')*')''', rhs_s) is not None
         # reject obvious constructor/function forms
         if "(" in rhs_s and ")" in rhs_s and not re.search(r"\*\*|[+\-*/]", rhs_s):
             return False

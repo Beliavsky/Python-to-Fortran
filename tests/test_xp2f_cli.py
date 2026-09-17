@@ -15967,6 +15967,35 @@ def test_scalar_constant_promotion_keeps_do_variables(loop: str) -> None:
     assert "parameter :: fixed = 7" in result
 
 
+@pytest.mark.parametrize("rhs,constant", [
+    ('"hello"', True),
+    ("'it''s literal'", True),
+    ('"a ""quoted"" word"', True),
+    ('""', True),
+    ('"prefix" // py_str(a(i)) // "suffix"', False),
+    ("'prefix' // py_str(a(i)) // 'suffix'", False),
+    ('"prefix" // trim(value) // "suffix"', False),
+])
+def test_scalar_constant_promotion_requires_complete_string_literal(rhs: str, constant: bool) -> None:
+    lines = ["subroutine f()", "character(len=:), allocatable :: s",
+             f"s = {rhs}", "print *, s", "end subroutine f"]
+    result = "\n".join(xp2f.promote_immediate_scalar_constants(lines))
+    assert ("parameter :: s" in result) is constant
+    assert f"s = {rhs}" in result
+
+
+def test_xp2f_runtime_formatted_string_in_loop(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xruntime_string.py", [
+        "import numpy as np",
+        "def report(a):",
+        "    for i in range(len(a)):",
+        "        s = 'value %g done' % (a[i])",
+        "        print(s)",
+        "a = np.array([2, -3, 7])",
+        "report(a)",
+    ])
+
+
 def test_xp2f_initialized_loop_variable_in_branch(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xinitialized_loop.py", [
         "import numpy as np",
