@@ -15164,6 +15164,65 @@ def test_xp2f_callback_parameter_default_value_bugs(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_chebyshev_vector_callback_ranks(tmp_path: Path) -> None:
+    # Adapted from Burkardt's MIT-licensed chebyshev.py. The callbacks
+    # are elementwise but must have array interfaces when passed to coeff.
+    _run_xp2f_compile_diff(tmp_path, "xchebyshev_callbacks.py", [
+        "import numpy as np",
+        "def coeff(a, b, n, f):",
+        "    angle = np.linspace(1.0, 2.0*n-1, n)",
+        "    angle = angle*np.pi/(2.0*n)",
+        "    x = np.cos(angle)",
+        "    x = 0.5*(a+b) + x*0.5*(b-a)",
+        "    fx = f(x)",
+        "    c = np.zeros(n)",
+        "    for j in range(n):",
+        "        for k in range(n):",
+        "            c[j] = c[j] + fx[k]*np.cos(np.pi*j*(2*k+1)/2.0/n)",
+        "    c = 2.0*c/n",
+        "    return c",
+        "def interpolant(a, b, n, c, m, x):",
+        "    dip1 = np.zeros(m)",
+        "    di = np.zeros(m)",
+        "    y = (2.0*x-a-b)/(b-a)",
+        "    for i in range(n-1, 0, -1):",
+        "        dip2 = dip1",
+        "        dip1 = di",
+        "        di = 2.0*y*dip1-dip2+c[i]",
+        "    value = y*di-dip1+0.5*c[0]",
+        "    return value",
+        "def polynomial(x):",
+        "    # Input:",
+        "    # real X(), evaluation points.",
+        "    # Output:",
+        "    # real VALUE(), function values.",
+        "    value = (x-3.0)*(x-1.0)*(x+2.0)",
+        "    return value",
+        "def exponential(x):",
+        "    # Input:",
+        "    # real X(), evaluation points.",
+        "    # Output:",
+        "    # real VALUE(), function values.",
+        "    value = np.exp(x)",
+        "    return value",
+        "def driver():",
+        "    c = coeff(-1.0, 1.0, 12, polynomial)",
+        "    d = coeff(-1.0, 1.0, 12, f=exponential)",
+        "    x = np.linspace(-1.0, 1.0, 17)",
+        "    y = interpolant(-1.0, 1.0, 12, c, 17, x)",
+        "    z = interpolant(-1.0, 1.0, 12, d, 17, x)",
+        "    print(np.max(np.abs(y-polynomial(x))) < 1e-10)",
+        "    print(np.max(np.abs(z-exponential(x))) < 1e-10)",
+        "    for i in range(12):",
+        "        print(round(c[i], 8), round(d[i], 8))",
+        "    for i in range(17):",
+        # The dyadic cubic values are exact at nine decimal places; eight
+        # puts some on a rounding tie that roundoff can tip either way.
+        "        print(round(y[i], 9), round(z[i], 8))",
+        "driver()",
+    ])
+
+
 def test_xp2f_gram_schmidt_rank_rebinding(tmp_path: Path) -> None:
     # Burkardt's MIT-licensed gram_schmidt_tolerance: v is a vector
     # during projection, then a matrix when appended to the basis.

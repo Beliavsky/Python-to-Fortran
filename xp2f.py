@@ -59937,6 +59937,7 @@ def _emit_local_function(
                 and _local_rank_hint == 0
                 and _self_norm_rank != 1
                 and not _arg_needs_allocatable_rebind(arg)
+                and not getattr(fn, "_xp2f_callback_arg_ranks", {}).get(arg, 0)
             ):
                 arr_rank = 0
         needs_alloc_rebind = arr_rank > 0 and _arg_needs_allocatable_rebind(arg)
@@ -65075,6 +65076,9 @@ def generate_flat(
                             bool(local_func_arg_ranks.get(_a.id))
                             and int(local_func_arg_ranks[_a.id][0]) == 0
                             and int(local_return_ranks.get(_a.id, 0)) == 0
+                            # A provisional scalar default must not override
+                            # an array argument observed in the callback body.
+                            and not any(cb_sig.get((_callee_name, _cbp), (0, 0))[:2])
                         )
                         _key = (_callee_name, _cbp)
                         callback_scalar_actuals[_key] = _actual_scalar if (_key not in callback_scalar_actuals) else (callback_scalar_actuals[_key] and _actual_scalar)
@@ -65102,6 +65106,12 @@ def generate_flat(
                         callback_scalar_actual_names.add(_a.id)
                     if (not _actual_scalar) and local_func_arg_ranks[_a.id]:
                         local_func_arg_ranks[_a.id][0] = max(int(local_func_arg_ranks[_a.id][0]), int(_inr))
+                        if _inr > 0:
+                            _actual_fn = fn_map[_a.id]
+                            _cb_ranks = getattr(_actual_fn, "_xp2f_callback_arg_ranks", {})
+                            _arg0 = local_func_arg_names[_a.id][0]
+                            _cb_ranks[_arg0] = max(_cb_ranks.get(_arg0, 0), int(_inr))
+                            _actual_fn._xp2f_callback_arg_ranks = _cb_ranks
                     if local_func_arg_kinds.get(_a.id):
                         for _ia, _ak in sorted(_arg_kinds.items()):
                             if _ak in {"int", "real", "complex", "logical", "char"} and _ia < len(local_func_arg_kinds[_a.id]):
@@ -65136,6 +65146,7 @@ def generate_flat(
                             bool(local_func_arg_ranks.get(_kw.value.id))
                             and int(local_func_arg_ranks[_kw.value.id][0]) == 0
                             and int(local_return_ranks.get(_kw.value.id, 0)) == 0
+                            and not any(cb_sig.get((_callee_name, _cbp), (0, 0))[:2])
                         )
                         _key = (_callee_name, _cbp)
                         callback_scalar_actuals[_key] = _actual_scalar if (_key not in callback_scalar_actuals) else (callback_scalar_actuals[_key] and _actual_scalar)
@@ -65163,6 +65174,12 @@ def generate_flat(
                         callback_scalar_actual_names.add(_kw.value.id)
                     if (not _actual_scalar) and local_func_arg_ranks[_kw.value.id]:
                         local_func_arg_ranks[_kw.value.id][0] = max(int(local_func_arg_ranks[_kw.value.id][0]), int(_inr))
+                        if _inr > 0:
+                            _actual_fn = fn_map[_kw.value.id]
+                            _cb_ranks = getattr(_actual_fn, "_xp2f_callback_arg_ranks", {})
+                            _arg0 = local_func_arg_names[_kw.value.id][0]
+                            _cb_ranks[_arg0] = max(_cb_ranks.get(_arg0, 0), int(_inr))
+                            _actual_fn._xp2f_callback_arg_ranks = _cb_ranks
                     if local_func_arg_kinds.get(_kw.value.id):
                         for _ia, _ak in sorted(_arg_kinds.items()):
                             if _ak in {"int", "real", "complex", "logical", "char"} and _ia < len(local_func_arg_kinds[_kw.value.id]):
