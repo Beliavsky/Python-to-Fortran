@@ -6767,6 +6767,58 @@ def test_xp2f_promotes_constant_only_for_confirmed_intent_in_call_arg(tmp_path: 
     assert "integer, parameter :: k = 5" in out_text
 
 
+def test_allocate_source_merge_respects_lexical_scopes() -> None:
+    lines = '''module m
+real(kind=dp), allocatable :: a(:)
+contains
+subroutine first()
+allocate(a(2))
+a = 0.0_dp
+block
+integer, allocatable :: a(:)
+allocate(a(3))
+a = 0.0_dp
+block
+logical, allocatable :: a(:)
+allocate(a(4))
+a = .false.
+end block
+end block
+allocate(a(5))
+a = 1.0_dp
+end subroutine first
+subroutine second()
+integer, allocatable :: a(:)
+allocate(a(6))
+a = 0
+end subroutine second
+end module m'''.splitlines()
+    result = "\n".join(xp2f.merge_allocate_then_scalar_fill_to_source(lines))
+    assert "allocate(a(2), source=0.0_dp)" in result
+    assert "allocate(a(3))\na = 0.0_dp" in result
+    assert "allocate(a(4), source=.false.)" in result
+    assert "allocate(a(5), source=1.0_dp)" in result
+    assert "allocate(a(6), source=0)" in result
+
+
+def test_xp2f_allocate_source_shadowed_integer_array(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xallocate_shadowed.py", [
+        "import numpy as np",
+        "def first(n):",
+        "    a = np.zeros(n, dtype=int)",
+        "    for i in range(n):",
+        "        a[i] = 2.75 + i",
+        "    print(a)",
+        "def second(n):",
+        "    a = np.zeros(n)",
+        "    for i in range(n):",
+        "        a[i] = 2.75 + i",
+        "    print(a)",
+        "first(4)",
+        "second(4)",
+    ])
+
+
 def test_xp2f_does_not_merge_allocate_source_on_type_mismatch(tmp_path: Path) -> None:
     # `b` is a real array; the fill value `0` is a bare integer literal.
     # allocate(..., source=...) requires an EXACT type match (unlike a
@@ -15676,6 +15728,25 @@ def test_xp2f_mesh_vtoe_loadtxt_integer_rebind(tmp_path: Path) -> None:
         "    print(pointers)",
         "    for i in range(element_order*element_num):",
         "        print(elements[i])",
+        "fixture()",
+    ])
+
+
+@pytest.mark.parametrize("actual", ["a", "values=a"])
+def test_xp2f_call_hint_uses_preceding_cast(tmp_path: Path, actual: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcast_call_hint.py", [
+        "import numpy as np",
+        "def before(values):",
+        "    return values[0] + 0.25",
+        "def after(values):",
+        "    return np.array([values[0], 7])",
+        "def fixture():",
+        "    a = np.array([2.75, -3.5])",
+        f"    first = before({actual})",
+        "    a = a.astype(int)",
+        f"    second = after({actual})",
+        "    print(first)",
+        "    print(second)",
         "fixture()",
     ])
 

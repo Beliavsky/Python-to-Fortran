@@ -8258,7 +8258,7 @@ def merge_allocate_then_scalar_fill_to_source(lines):
             code0 = all_lines[k].split("!", 1)[0]
             stripped0 = code0.strip()
             if "::" not in stripped0 or not re.match(
-                r"^\s*(?:integer|real|logical|character|complex)\b", stripped0, flags=re.IGNORECASE
+                r"^\s*(?:integer|real|logical|character|complex|type|class|procedure)\b", stripped0, flags=re.IGNORECASE
             ):
                 k += 1
                 continue
@@ -8292,6 +8292,13 @@ def merge_allocate_then_scalar_fill_to_source(lines):
                         ment = re.match(r"^([A-Za-z_]\w*)", ent.strip())
                         if ment:
                             types[ment.group(1).lower()] = base_type
+                else:
+                    # An unrecognized local declaration still shadows a host
+                    # name; do not inherit the host's intrinsic type.
+                    for ent in _split_top_level_commas(md.group(3)):
+                        ment = re.match(r"^([A-Za-z_]\w*)", ent.strip())
+                        if ment:
+                            types[ment.group(1).lower()] = None
             k = kk + 1
         return types
 
@@ -8369,7 +8376,45 @@ def merge_allocate_then_scalar_fill_to_source(lines):
 
     out = list(lines)
     n = len(out)
-    declared_types = _declared_types(out)
+    # A file-wide name map lets a later procedure (or an outer variable)
+    # supply the type of a shadowed BLOCK local. Resolve declarations in
+    # lexical scopes instead, with ordinary host association for missing names.
+    scope_start = re.compile(
+        r"^\s*(?:\w+\s*:\s*)?(?:block\s*$|(?:abstract\s+)?interface\b|"
+        r"module\s+(?!procedure\b|function\b|subroutine\b)\w+|program\b|"
+        r"(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+        r"(?:[a-z][a-z0-9_()\s=,:]*\s+)?(?:function|subroutine)\b|"
+        r"type\s*(?:::|,)|associate\s*\(|select\s+(?:type|case|rank)\b)", re.IGNORECASE)
+    scope_end = re.compile(
+        r"^\s*end\s*(?:block|interface|module|program|function|subroutine|type|associate)\b",
+        re.IGNORECASE)
+    scopes = [{"parent": None, "lines": [], "opaque": False}]
+    stack = [0]
+    line_scopes = []
+    for ln in out:
+        code = ln.split("!", 1)[0].strip()
+        if not code.lower().startswith("end") and scope_start.match(code):
+            scopes.append({"parent": stack[-1], "lines": [],
+                           "opaque": bool(re.search(r"\b(?:associate\s*\(|select\s+(?:type|case|rank)\b)", code, re.I))})
+            stack.append(len(scopes) - 1)
+        line_scopes.append(stack[-1])
+        scopes[stack[-1]]["lines"].append(ln)
+        if scope_end.match(code) or (re.match(r"^end\s+select\b", code, re.I) and scopes[stack[-1]]["opaque"]):
+            if len(stack) > 1:
+                stack.pop()
+    for scope in scopes:
+        scope["types"] = _declared_types(scope["lines"])
+
+    def _visible_type(line, name):
+        scope_id = line_scopes[line]
+        while scope_id is not None:
+            scope = scopes[scope_id]
+            if scope["opaque"]:
+                return None
+            if name in scope["types"]:
+                return scope["types"][name]
+            scope_id = scope["parent"]
+        return None
     i = 0
     while i < n:
         code_i, bang_i, comment_i = out[i].partition("!")
@@ -8411,7 +8456,7 @@ def merge_allocate_then_scalar_fill_to_source(lines):
         if rhs.startswith("[") or re.search(r"\b" + re.escape(nm) + r"\b", rhs, flags=re.IGNORECASE):
             i += 1
             continue
-        base_type = declared_types.get(nm.lower())
+        base_type = _visible_type(i, nm.lower())
         if base_type is None or not _rhs_matches_type(base_type, rhs):
             i += 1
             continue
@@ -64350,6 +64395,35 @@ def generate_flat(
                 return (best_kind, best_rank)
             return _infer(name_nm)
         def _record_call_hints(scan_node, tr_ctx, fn_node=None):
+            def _actual_name_spec(name, call):
+                # A completed, unconditional cast supersedes earlier dtype
+                # evidence. Do not use a later cast, or assume that a cast in
+                # a branch dominates this call. Any intervening binding makes
+                # the ordinary conservative inference necessary again.
+                cast_spec = None
+                for stmt in fn_node.body:
+                    if any(node is call for node in ast.walk(stmt)):
+                        if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
+                            if any(isinstance(node, ast.Name) and node.id == name
+                                   and isinstance(node.ctx, (ast.Store, ast.Del))
+                                   for node in ast.walk(stmt)):
+                                cast_spec = None
+                        break
+                    if any(isinstance(node, ast.Name) and node.id == name
+                           and isinstance(node.ctx, (ast.Store, ast.Del))
+                           for node in ast.walk(stmt)):
+                        cast_spec = None
+                    if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                            and isinstance(stmt.targets[0], ast.Name)
+                            and stmt.targets[0].id == name
+                            and isinstance(stmt.value, ast.Call)
+                            and isinstance(stmt.value.func, ast.Attribute)
+                            and stmt.value.func.attr == "astype"):
+                        kind = tr_ctx._expr_kind(stmt.value)
+                        if kind in {"int", "real", "logical", "char", "complex"}:
+                            cast_spec = (kind, int(tr_ctx._rank_expr(stmt.value)))
+                return cast_spec or _name_direct_assign_spec(fn_node, name, tr_ctx)
+
             for n in ast.walk(scan_node):
                 if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
                     continue
@@ -64374,7 +64448,7 @@ def generate_flat(
                         rk[i] = _promote_kind_hint(rk[i], "int")
                     direct_actual = None
                     if isinstance(a, ast.Name) and fn_node is not None:
-                        _dk, _dr = _name_direct_assign_spec(fn_node, a.id, tr_ctx)
+                        _dk, _dr = _actual_name_spec(a.id, n)
                         if _dk in {"int", "real", "logical", "char", "complex"}:
                             direct_actual = (_dk, int(_dr))
                     ar = tr_ctx._rank_expr(a)
@@ -64400,7 +64474,7 @@ def generate_flat(
                         anm = tr_ctx._aliased_name(tr_ctx._resolve_list_alias(a.id))
                         poss = {direct_actual} if direct_actual is not None else _name_possible_specs(tr_ctx, anm)
                         if fn_node is not None:
-                            _dk, _dr = _name_direct_assign_spec(fn_node, a.id, tr_ctx)
+                            _dk, _dr = _actual_name_spec(a.id, n)
                             if _dk in {"int", "real", "logical", "char", "complex"}:
                                 poss.add((_dk, int(_dr)))
                         if poss:
@@ -64426,7 +64500,7 @@ def generate_flat(
                             rk[i] = _promote_kind_hint(rk[i], "int")
                         direct_actual = None
                         if isinstance(kw.value, ast.Name) and fn_node is not None:
-                            _dk, _dr = _name_direct_assign_spec(fn_node, kw.value.id, tr_ctx)
+                            _dk, _dr = _actual_name_spec(kw.value.id, n)
                             if _dk in {"int", "real", "logical", "char", "complex"}:
                                 direct_actual = (_dk, int(_dr))
                         ar = tr_ctx._rank_expr(kw.value)
@@ -64448,7 +64522,7 @@ def generate_flat(
                             anm = tr_ctx._aliased_name(tr_ctx._resolve_list_alias(kw.value.id))
                             poss = {direct_actual} if direct_actual is not None else _name_possible_specs(tr_ctx, anm)
                             if fn_node is not None:
-                                _dk, _dr = _name_direct_assign_spec(fn_node, kw.value.id, tr_ctx)
+                                _dk, _dr = _actual_name_spec(kw.value.id, n)
                                 if _dk in {"int", "real", "logical", "char", "complex"}:
                                     poss.add((_dk, int(_dr)))
                             if poss:
