@@ -50846,7 +50846,14 @@ class translator(ast.NodeVisitor):
             lhs = self.expr(node.target)
         rhs = self.expr(node.value)
         if isinstance(node.op, ast.Add):
-            self.o.w(f"{lhs} = {lhs} + {rhs}")
+            target_kind = self._expr_kind(node.target)
+            if isinstance(node.target, ast.Name):
+                visible_kind, _ = self._visible_kind_rank(node.target.id)
+                target_kind = visible_kind or target_kind
+            # Python string += concatenates, retaining significant spaces.
+            # Deferred-length scalar characters reallocate on assignment.
+            op = "//" if target_kind == "char" and self._expr_kind(node.value) == "char" else "+"
+            self.o.w(f"{lhs} = {lhs} {op} {rhs}")
             return
         if isinstance(node.op, ast.Sub):
             self.o.w(f"{lhs} = {lhs} - {rhs}")

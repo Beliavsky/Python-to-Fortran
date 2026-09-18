@@ -16179,6 +16179,25 @@ def test_first_deallocation_guard_keeps_intent_out_inside_loop() -> None:
     assert guard in xp2f.remove_redundant_first_guarded_deallocate(lines)
 
 
+@pytest.mark.parametrize("in_function", [False, True])
+def test_xp2f_string_augassign_preserves_spaces_and_numeric_addition(tmp_path: Path, in_function: bool) -> None:
+    body = [
+        "text = 'start '",
+        "suffix = ' end '",
+        "total = 0",
+        "for j in range(3):",
+        "    text += str(j) + '  '",
+        "    total += j",
+        "text += suffix",
+        "text += ''",
+        "print('[' + text + ']')",
+        "print(total)",
+    ]
+    if in_function:
+        body = ["def report():", *["    " + line for line in body], "report()"]
+    _run_xp2f_compile_diff(tmp_path, "xstring_augassign.py", body)
+
+
 @pytest.mark.parametrize("dtype", ["float", "int", "bool"])
 def test_xp2f_boolean_assignment_preserves_array_dtype(tmp_path: Path, dtype: str) -> None:
     _run_xp2f_compile_diff(tmp_path, "xbool_array_assignment.py", [
