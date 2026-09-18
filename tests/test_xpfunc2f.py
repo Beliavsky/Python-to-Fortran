@@ -42,6 +42,30 @@ def _run_xpfunc2f(args, cwd) -> subprocess.CompletedProcess:
     )
 
 
+def test_xpfunc2f_inlines_real_formatter_intrinsic_imports(tmp_path: Path) -> None:
+    source = """module format_test
+use, intrinsic :: iso_fortran_env, only: real64
+use python_mod, only: py_format_real
+implicit none
+integer, parameter :: dp = real64
+contains
+subroutine report(x)
+real(dp), intent(in) :: x
+print '(a)', py_format_real(x, 6, 10, '', 'g')
+end subroutine report
+end module format_test
+"""
+    inlined, unresolved = xpfunc2f.inline_python_mod_helpers(source)
+    assert unresolved == []
+    assert "use python_mod" not in inlined.lower()
+    assert "use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_is_nan" in inlined.lower()
+    src = tmp_path / "format_test.f90"
+    src.write_text(inlined, encoding="utf-8")
+    proc = subprocess.run(["gfortran", "-fcheck=all", "-c", str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_xpfunc2f_inlines_complex_eigvals_helpers(tmp_path: Path) -> None:
     # A generic eigvals must bring in both overloads and the entire DCEIGV
     # dependency chain, including its intrinsic imports, without new files.

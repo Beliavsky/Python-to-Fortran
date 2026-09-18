@@ -3353,7 +3353,10 @@ def test_xp2f_old_style_percent_d_casts_real_args_for_write(tmp_path: Path) -> N
     # same output, confirmed by this test's own successful --compile
     # (and, more directly, by that pass's own dedicated regression
     # tests' run-diff checks).
-    assert 'write(*,"(2(2x, i2), 2x, f10.4, 2x, g14.6, 1x)")' in out_text
+    # Python %g uses a minimum field width, so it is now formatted as
+    # text rather than a fixed-width Fortran G descriptor.
+    assert 'write(*,"(2(2x, i2), 2x, f10.4, 2x, a, 1x)")' in out_text
+    assert "py_format_real(1.0_dp, 6, 14, '', 'g')" in out_text
     assert "int(vals(1))" in out_text
     assert "int(vals(2))" in out_text
 

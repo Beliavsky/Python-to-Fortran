@@ -1270,6 +1270,8 @@ contains
       end function py_format_g_real
 
       function py_format_real(x, prec, width, flags, code) result(s)
+         ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_is_nan
          real(kind=dp), intent(in) :: x
          integer, intent(in) :: prec, width
          character(len=*), intent(in) :: flags, code
