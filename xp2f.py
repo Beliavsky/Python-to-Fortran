@@ -66898,7 +66898,15 @@ def generate_flat(
             _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _nm)
             if _ck in {"int", "real", "logical", "char", "complex"}:
                 _dk, _dr = _name_direct_assign_spec(fn, _nm, _tr_fn)
-                base_kinds[_i] = _numeric_comment_kind(_dk, _ck)
+                # Emitted scalar formals honor their documented kind. Match
+                # that rule for returned formals: a feedback assignment such
+                # as seed = seed + 1 can carry a stale provisional real kind.
+                # Arrays and non-formal locals retain the widening rule.
+                if (_nm in _arg_kind_by_name and _arg_rank_by_name.get(_nm, 0) == 0
+                        and _cr in {None, 0}):
+                    base_kinds[_i] = _ck
+                else:
+                    base_kinds[_i] = _numeric_comment_kind(_dk, _ck)
                 if _cr is not None:
                     base_ranks[_i] = max(int(base_ranks[_i]), int(_cr))
                 refined_any = True

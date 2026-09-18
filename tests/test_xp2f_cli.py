@@ -16137,6 +16137,34 @@ def test_xp2f_integer_branch_assignment_updates_real_recurrence(tmp_path: Path, 
     ])
 
 
+@pytest.mark.parametrize("keyword", [False, True])
+def test_xp2f_mixed_tuple_return_preserves_documented_integer_seed(tmp_path: Path, keyword: bool) -> None:
+    actuals = "n=2, seed=seed" if keyword else "2, seed"
+    _run_xp2f_compile_diff(tmp_path, "xmixed_seed.py", [
+        "import numpy as np",
+        "def next_point(n, seed):",
+        "    # Input:",
+        "    # integer N, the dimension.",
+        "    # integer SEED, the sequence index.",
+        "    # Output:",
+        "    # real QUASI(N), the next point.",
+        "    # integer SEED, the updated index.",
+        "    seed = int(np.floor(seed))",
+        "    quasi = np.zeros(n)",
+        "    for j in range(n):",
+        "        quasi[j] = (seed + j) / 8.0",
+        "    seed = seed + 1",
+        "    return [quasi, seed]",
+        "def driver():",
+        "    seed = 0",
+        "    for i in range(4):",
+        f"        [r, seed_out] = next_point({actuals})",
+        "        print('%d %.6f %.6f' % (seed_out, r[0], r[1]))",
+        "        seed = seed_out",
+        "driver()",
+    ])
+
+
 def test_xp2f_scalar_shadow_of_array_is_not_allocated(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xscalar_shadow_allocate.py", [
         "import numpy as np",
