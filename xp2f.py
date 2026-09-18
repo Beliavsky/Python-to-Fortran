@@ -11856,20 +11856,13 @@ def remove_redundant_first_guarded_deallocate(lines):
     when:
     - the next nonblank/non-comment line is allocate(x(...))
     - x has not appeared in prior executable statements
-    - and any of:
-      * no executable statements appear before this guard in the
-        procedure,
-      * x is itself an intent(out) allocatable dummy argument of the
-        enclosing procedure -- those are deallocated by the Fortran
-        standard on procedure entry regardless of what other (unrelated)
-        code ran first, or
-      * the guard itself is not nested inside any `do` loop -- a local
-        allocatable that hasn't been named yet is guaranteed unallocated
-        on entry to a fresh procedure call (F2008 5.4.3.4.2), and a
-        straight-line (non-looping) guard executes at most once per
-        call, so it can never observe a prior allocation from an earlier
-        pass through this same statement regardless of what unrelated
-        code ran first.
+    - x is a declared automatic local, or an intent(out) allocatable
+      dummy (which Fortran deallocates on entry),
+    - the guard is not inside a loop, and
+    - there is no SAVE/pointer storage or ambiguous declaration scope.
+
+    Module, host-associated, and use-associated arrays are not fresh locals:
+    they may still be allocated from an earlier call.
 
     x may also be a derived-type component (`df%values`), e.g. a freshly
     built DataFrame's own `df%values`/`df%index` allocation -- same
@@ -11969,8 +11962,9 @@ def remove_redundant_first_guarded_deallocate(lines):
             continue
 
         prior_use = False
-        saw_exec_before_guard = False
         is_intent_out_alloc = False
+        is_fresh_local = False
+        persistent_storage = False
         tok_re = re.compile(rf"\b{re.escape(var)}\b", re.IGNORECASE)
         # For a derived-type component (`df%values`), the exact-token
         # check above would miss a WHOLE-VARIABLE reassignment of the
@@ -11984,10 +11978,26 @@ def remove_redundant_first_guarded_deallocate(lines):
         if "%" in var:
             base_reassign_re = re.compile(rf"\b{re.escape(var.split('%', 1)[0])}\s*=(?!=)", re.IGNORECASE)
         k0 = 0
+        found_procedure = False
+        dummy_names = set()
         for k in range(i - 1, -1, -1):
             ck0 = out[k].split("!", 1)[0].strip()
+            if re.match(r"^program\s+\w+", ck0, re.IGNORECASE):
+                # A main program is entered once; its own declared objects
+                # are fresh here too (but not imported module variables).
+                k0 = k + 1
+                found_procedure = True
+                break
             if re_proc_start.match(ck0):
                 k0 = k + 1
+                found_procedure = True
+                signature = re.search(r"\b(?:subroutine|function)\s+\w+\s*\(([^)]*)\)", ck0, re.IGNORECASE)
+                if signature is None:
+                    found_procedure = False  # Do not guess at continued signatures.
+                else:
+                    dummy_names = {a.strip().lower() for a in signature.group(1).split(",")}
+                break
+            if re.match(r"^(?:end\b|contains\b|module\b|program\b)", ck0, re.IGNORECASE):
                 break
         # Join `&`-continued physical lines into logical statements first,
         # so a declaration's continuation lines (e.g. the 2nd+ line of a
@@ -12007,6 +12017,30 @@ def remove_redundant_first_guarded_deallocate(lines):
         if buf:
             stmts.append(" ".join(buf))
 
+        base_name = var.split("%", 1)[0].lower()
+        # Only automatic locals (or allocatable INTENT(OUT) dummies) are
+        # guaranteed unallocated on entry. Module/host/use-associated names,
+        # SAVE variables, and other dummies can retain an earlier allocation.
+        for stmt in stmts:
+            if re.match(r"^(?:block\b|end\s*block\b)", stmt, re.IGNORECASE):
+                persistent_storage = True  # Ambiguous nested declaration scope.
+            if re.match(r"^save\b", stmt, re.IGNORECASE):
+                saved = re.sub(r"^save\s*(?:::)?\s*", "", stmt, flags=re.IGNORECASE)
+                if not saved or base_name in {s.strip().lower() for s in saved.split(",")}:
+                    persistent_storage = True
+            me = re_decl_entities.match(stmt)
+            if not me or not re.match(r"^(?:integer|real|logical|character|complex|type|class)\b", me.group(1).strip(), re.IGNORECASE):
+                continue
+            for ent in fpurity.split_top_level_commas(me.group(2).replace("&", " ")):
+                nm = re.match(r"\s*([a-z_]\w*)", ent, re.IGNORECASE)
+                if not nm or nm.group(1).lower() != base_name:
+                    continue
+                attrs = me.group(1)
+                if re.search(r"\b(?:save|pointer)\b", attrs, re.IGNORECASE) or "=" in ent:
+                    persistent_storage = True
+                if base_name not in dummy_names and not re.search(r"\bintent\b", attrs, re.IGNORECASE):
+                    is_fresh_local = True
+
         for stmt in stmts:
             if re_declish.match(stmt):
                 me = re_decl_entities.match(stmt)
@@ -12015,12 +12049,11 @@ def remove_redundant_first_guarded_deallocate(lines):
                     and re.search(r"\ballocatable\b", me.group(1), re.IGNORECASE)
                     and re.search(r"\bintent\s*\(\s*out\s*\)", me.group(1), re.IGNORECASE)
                 ):
-                    for ent in me.group(2).split(","):
+                    for ent in fpurity.split_top_level_commas(me.group(2).replace("&", " ")):
                         nm = re.sub(r"\(.*\)$", "", ent.strip()).strip()
                         if nm.lower() == var.lower():
                             is_intent_out_alloc = True
                 continue
-            saw_exec_before_guard = True
             if tok_re.search(stmt) or (base_reassign_re and base_reassign_re.search(stmt)):
                 prior_use = True
                 break
@@ -12033,9 +12066,8 @@ def remove_redundant_first_guarded_deallocate(lines):
             elif re_end_do.match(ck):
                 loop_depth = max(0, loop_depth - 1)
 
-        if not prior_use and (
-            not saw_exec_before_guard or is_intent_out_alloc or loop_depth == 0
-        ):
+        if (found_procedure and not persistent_storage and not prior_use
+                and loop_depth == 0 and (is_fresh_local or is_intent_out_alloc)):
             del out[i]
             # do not advance i; next line shifts into current slot
             continue

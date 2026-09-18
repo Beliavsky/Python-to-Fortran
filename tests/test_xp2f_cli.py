@@ -16151,6 +16151,34 @@ def test_module_global_decls_preserve_constructor_rank(expression: str, rank: in
     assert xp2f.collect_module_global_decls(tree.body)["matrix"] == ("real", rank)
 
 
+@pytest.mark.parametrize("declarations, arguments, remove", [
+    (["real, allocatable :: a(:,:)"], "", True),
+    (["real, allocatable, save :: a(:,:)"], "", False),
+    (["real, allocatable :: a(:,:)", "save :: a"], "", False),
+    (["real, allocatable :: a(:,:)", "save"], "", False),
+    (["use storage_mod, only: a"], "", False),
+    ([], "", False),
+    (["real, allocatable :: a(:,:)"], "a", False),
+    (["real, allocatable, intent(inout) :: a(:,:)"], "a", False),
+    (["real, allocatable, intent(out) :: a(:,:)"], "a", True),
+    (["real, allocatable :: other(:,:), &", "& a(:,:)"], "", True),
+])
+def test_first_deallocation_guard_requires_fresh_storage(declarations, arguments, remove) -> None:
+    guard = "if (allocated(a)) deallocate(a)"
+    lines = [f"subroutine initialize({arguments})", *declarations, guard,
+             "allocate(a(2,3))", "end subroutine initialize"]
+    result = xp2f.remove_redundant_first_guarded_deallocate(lines)
+    assert (guard not in result) == remove
+
+
+def test_first_deallocation_guard_keeps_intent_out_inside_loop() -> None:
+    guard = "if (allocated(a)) deallocate(a)"
+    lines = ["subroutine initialize(a)", "real, allocatable, intent(out) :: a(:)",
+             "integer :: i", "do i = 1, 2", guard, "allocate(a(i))",
+             "end do", "end subroutine initialize"]
+    assert guard in xp2f.remove_redundant_first_guarded_deallocate(lines)
+
+
 @pytest.mark.parametrize("constructor", ["zeros", "ones", "empty"])
 def test_xp2f_global_matrix_constructor_rank(tmp_path: Path, constructor: str) -> None:
     _run_xp2f_compile_diff(tmp_path, "xglobal_matrix.py", [
@@ -16167,6 +16195,7 @@ def test_xp2f_global_matrix_constructor_rank(tmp_path: Path, constructor: str) -
         "    print(np.sum(matrix))",
         "initialize(2)",
         "report()",
+        "initialize(3)",
         "report()",
     ])
 
