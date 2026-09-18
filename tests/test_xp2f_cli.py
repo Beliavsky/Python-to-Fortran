@@ -16043,6 +16043,56 @@ def test_xp2f_joint_tuple_argument_rank_profiles(tmp_path: Path, keyword: bool) 
     ])
 
 
+@pytest.mark.parametrize("expression", ["np.diag(a)", "diag(a)"])
+def test_diag_rank_inference_waits_for_input_rank(expression: str, tmp_path: Path) -> None:
+    src = tmp_path / "xinit.py"
+    src.write_text("print(1)\n", encoding="utf-8")
+    xp2f.transpile_file(src, [], flat=True)
+    tr = xp2f.translator(xp2f.emit(), params={}, context="flat", list_counts={})
+    node = ast.parse(expression, mode="eval").body
+    assert tr._rank_expr(node) == 0
+    tr._mark_alloc_real("a", rank=1)
+    assert tr._rank_expr(node) == 2
+    tr._mark_alloc_real("a", rank=2)
+    assert tr._rank_expr(node) == 1
+
+
+def test_xp2f_jacobi_vector_rhs_and_diagonal(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xjacobi_vectors.py", [
+        "import numpy as np",
+        "def force(x):",
+        "    import numpy as np",
+        "    f = x * (x + 3.0) * np.exp(x)",
+        "    return f",
+        "def jacobi(n, a, f, u):",
+        "    # Input:",
+        "    # real A(N,N), the matrix.",
+        "    # real F(N), the right hand side.",
+        "    # real U(N), the solution.",
+        "    for it in range(1, 101):",
+        "        old = u.copy()",
+        "        u = (f - np.matmul(a, old) + np.diag(a) * old) / np.diag(a)",
+        "        residual = np.linalg.norm(np.matmul(a, u) - f) / np.sqrt(n)",
+        "        if residual < 1e-8:",
+        "            break",
+        "    return u, it, residual",
+        "def fixture():",
+        "    x = np.linspace(0.0, 1.0, 3)",
+        "    f = force(x)",
+        "    f[0] = 0.0",
+        "    f[2] = 0.0",
+        "    a = np.array([[4.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 4.0]])",
+        "    u = np.zeros(3)",
+        "    u, iterations, residual = jacobi(3, a, f, u)",
+        "    reference = np.linalg.solve(a, f)",
+        "    print(iterations)",
+        "    print('%.6g' % residual)",
+        "    for i in range(3):",
+        "        print('%.8g %.8g' % (u[i], reference[i]))",
+        "fixture()",
+    ])
+
+
 @pytest.mark.parametrize("keyword", [False, True])
 def test_xp2f_scalar_comment_preserves_array_overloads(tmp_path: Path, keyword: bool) -> None:
     actual = "x=b" if keyword else "b"

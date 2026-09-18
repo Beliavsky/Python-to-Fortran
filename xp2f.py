@@ -29003,7 +29003,7 @@ class translator(ast.NodeVisitor):
                 return 1
             if isinstance(node.func, ast.Name) and node.func.id == "diag" and len(node.args) >= 1:
                 r0 = self._rank_expr(node.args[0])
-                return 2 if r0 <= 1 else 1
+                return 0 if r0 == 0 else 2 if r0 == 1 else 1
             if isinstance(node.func, ast.Name) and node.func.id == "eye":
                 return 2
             if isinstance(node.func, ast.Name):
@@ -29427,7 +29427,12 @@ class translator(ast.NodeVisitor):
                     return max(0, r0 - 1)
                 if node.func.attr == "diag" and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
-                    if r0 <= 1:
+                    # Unknown is not evidence for a vector input. Guessing
+                    # rank 2 here permanently promotes surrounding vector
+                    # expressions before the matrix argument is discovered.
+                    if r0 == 0:
+                        return 0
+                    if r0 == 1:
                         return 2
                     return 1
                 if node.func.attr in {"triu", "tril"} and len(node.args) >= 1:
@@ -64437,6 +64442,16 @@ def generate_flat(
                         _gk, _gr = sorted(_global_specs, key=lambda kr: -kr[1])[0]
                         return (_gk, _gr)
                     return (None, 0)
+                if best_kind in {"int", "real", "logical", "complex"}:
+                    # A provisional return type can still be scalar before
+                    # interprocedural inference converges. Indexed writes to
+                    # its result establish array rank independently of that
+                    # provisional call result (e.g. fk = force(x); fk[0] = 0).
+                    for _st in ast.walk(fn_node):
+                        if isinstance(_st, ast.Subscript) and isinstance(_st.ctx, ast.Store):
+                            _rank = _subscript_chain_base_rank(_st, _name)
+                            if _rank is not None:
+                                best_rank = max(best_rank, _rank)
                 return (best_kind, best_rank)
             return _infer(name_nm)
         def _record_call_hints(scan_node, tr_ctx, fn_node=None):
@@ -64853,7 +64868,7 @@ def generate_flat(
                 _cr is not None
                 and int(_cr) > 0
                 and _rank_sets[_i]
-                and 0 in _seen_ranks
+                and _seen_ranks == {0}
                 and not _arg_has_array_body_evidence_for_fn(fn, _arg_nm)
             ):
                 local_func_arg_ranks[fn.name][_i] = 0
