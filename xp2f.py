@@ -44261,6 +44261,12 @@ class translator(ast.NodeVisitor):
                 if k_vis0 == rk[0] and int(_r_vis0) == int(rk[1]):
                     # Rank-only rebinds do not require block shadowing.
                     rk = None
+                elif (k_vis0 == "real" and int(_r_vis0) == 0
+                        and self._expr_kind(v) == "int" and self._rank_expr(v) == 0):
+                    # The inferred real scalar can hold this integer value.
+                    # Shadowing it would lose branch/loop assignments when
+                    # the local BLOCK ends (e.g. Kronrod's ai recurrence).
+                    rk = None
             # Rebinding a name on a self-referential assignment would shadow the
             # currently visible value and emit invalid Fortran (e.g. x = x + ...).
             if rk is not None and _expr_uses_name(v, t.id):
@@ -44291,6 +44297,8 @@ class translator(ast.NodeVisitor):
                         and r_rhs == 0
                     ):
                         k_rhs = "complex"
+                    if k_vis == "real" and r_vis == 0 and k_rhs == "int" and r_rhs == 0:
+                        k_rhs = "real"
                     if (
                         k_rhs is not None
                         and k_vis is not None

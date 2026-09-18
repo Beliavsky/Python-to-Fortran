@@ -16114,6 +16114,29 @@ def test_xp2f_jacobi_vector_rhs_and_diagonal(tmp_path: Path) -> None:
     ])
 
 
+@pytest.mark.parametrize("initialize", [False, True])
+def test_xp2f_integer_branch_assignment_updates_real_recurrence(tmp_path: Path, initialize: bool) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xbranch_real_recurrence.py", [
+        "def recurrence(m, even):",
+        *(["    ai = -100.0"] if initialize else []),
+        "    total = 0.0",
+        "    for iteration in range(3):",
+        "        if even:",
+        "            ai = m + m + 1",
+        "            dif = 2.0",
+        "        else:",
+        "            ai = m + 1",
+        "            dif = 1.0",
+        "        for k in range(m):",
+        "            ai = ai - dif",
+        "            total = total + ai",
+        "    ai = 0.0",
+        "    return total + ai",
+        "print(recurrence(3, True))",
+        "print(recurrence(3, False))",
+    ])
+
+
 def test_xp2f_scalar_shadow_of_array_is_not_allocated(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xscalar_shadow_allocate.py", [
         "import numpy as np",
