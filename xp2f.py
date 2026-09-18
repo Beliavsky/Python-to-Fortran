@@ -24396,7 +24396,7 @@ class translator(ast.NodeVisitor):
                         return "complex"
                 if node.func.id in {"open", "len", "ord", "int", "isqrt", "size"}:
                     return "int"
-                if node.func.id == "isinstance":
+                if node.func.id in {"isinstance", "bool"}:
                     return "logical"
                 if node.func.id == "list" and len(node.args) >= 1:
                     return self._expr_kind(node.args[0])
@@ -25375,6 +25375,8 @@ class translator(ast.NodeVisitor):
                         return "logical"
                 if node.func.value.id in self.math_aliases and node.func.attr in {"floor", "ceil", "trunc"}:
                     return "int"
+                if node.func.value.id in self.math_aliases and node.func.attr in {"radians", "degrees"}:
+                    return "real"
                 if node.func.value.id in self.math_aliases and node.func.attr in {"expm1", "log1p", "exp", "log"}:
                     if len(node.args) >= 1 and self._expr_kind(node.args[0]) == "complex":
                         return "complex"
@@ -33148,6 +33150,20 @@ class translator(ast.NodeVisitor):
                 return f"isqrt_int({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id == "pow" and len(node.args) == 3:
                 return f"mod_pow_int({self.expr(node.args[0])}, {self.expr(node.args[1])}, {self.expr(node.args[2])})"
+            if isinstance(node.func, ast.Name) and node.func.id == "pow" and len(node.args) == 2:
+                # Python's builtin pow(base, exp) (2-arg form) -- distinct
+                # from the already-handled 3-arg modular form just above --
+                # had NO codegen path at all ("unsupported call"), even
+                # though _expr_kind already inferred its result kind
+                # elsewhere. Found mining TheAlgorithms/Python's own
+                # physics/photoelectric_effect.py (`pow(10, -34)` at
+                # module level). Delegate to the identical BinOp-Pow
+                # codegen already used for `a ** b`, so this picks up the
+                # same negative-exponent real-coercion and int32-overflow
+                # widening handling for free instead of duplicating it.
+                synth = ast.BinOp(left=node.args[0], op=ast.Pow(), right=node.args[1])
+                ast.copy_location(synth, node)
+                return self.expr(synth)
             if isinstance(node.func, ast.Name) and node.func.id == "isinstance" and len(node.args) == 2:
                 if isinstance(node.args[1], ast.Name):
                     type_name = node.args[1].id
@@ -37178,6 +37194,37 @@ class translator(ast.NodeVisitor):
                     a0 = f"real({a0}, kind=dp)"
                 fmap = {"atan": "atan", "asin": "asin", "acos": "acos", "tan": "tan", "sin": "sin", "cos": "cos"}
                 return f"{fmap[node.func.attr]}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "degrees"
+                and len(node.args) == 1
+            ):
+                # math.degrees(x) -- attribute-call style (`import math;
+                # math.degrees(x)`), distinct from the already-supported
+                # np.degrees. Found mining TheAlgorithms/Python's own
+                # physics/snells_law.py: math.radians()/math.degrees()
+                # were entirely unhandled ("unsupported call"), even
+                # though the identical np.radians/np.degrees formula
+                # already existed for the numpy spelling.
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"(({a0}) * (180.0_dp / acos(-1.0_dp)))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "radians"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"(({a0}) * (acos(-1.0_dp) / 180.0_dp))"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -49575,6 +49622,30 @@ class translator(ast.NodeVisitor):
                         and is_numpy_name_node(kw.value.value)
                     ):
                         dtype_txt = kw.value.attr.lower()
+            if elts and all(self._rank_expr(e) == 1 for e in elts):
+                # `np.array([call1(...), call2(...), ...])` where each
+                # element is itself a rank-1-array-valued expression (most
+                # commonly a call to a local function returning a list/
+                # array) needs to STACK those rows into a genuine rank-2
+                # array -- a flat `[call1(...), call2(...), ...]` array
+                # constructor (this handler's own fallback below, meant
+                # for scalar elements) instead concatenates them into one
+                # long rank-1 array, which Fortran then refuses to assign
+                # into a rank-2 declared variable ("Incompatible ranks 2
+                # and 1 in assignment"). Mirrors the equivalent, already-
+                # correct handling in expr()'s own generic Call-codegen
+                # path for this exact element shape (found mining
+                # TheAlgorithms/Python's own
+                # physics/in_static_equilibrium.py: `forces =
+                # array([polar_force(...), polar_force(...), ...])`).
+                first = self.expr(elts[0])
+                vals = ", ".join(self.expr(e) for e in elts)
+                if "complex" in dtype_txt:
+                    vals = f"cmplx([{vals}], kind=dp)"
+                else:
+                    vals = f"[{vals}]"
+                self.o.w(f"{t.id} = transpose(reshape({vals}, [size({first}), {len(elts)}]))")
+                return
             def _ctor(nodes):
                 if not nodes:
                     if "complex" in dtype_txt:
@@ -50877,7 +50948,44 @@ class translator(ast.NodeVisitor):
                 if rank_stable is not None:
                     expr_txt = rank_stable
                 else:
-                    expr_txt = self._return_value_expr(node.value)
+                    try:
+                        expr_txt = self._return_value_expr(node.value)
+                    except NotImplementedError:
+                        # Fortran's MERGE (used for a simple-branch ternary
+                        # elsewhere in this codebase) evaluates BOTH
+                        # operands eagerly, unlike Python's ternary, which
+                        # only evaluates the taken branch -- unsafe when a
+                        # branch is a non-atomic expression such as a
+                        # function call. Lower to a genuine if/else
+                        # STATEMENT instead, matching Python's own
+                        # short-circuit semantics, rather than declining
+                        # outright. Found mining TheAlgorithms/Python's own
+                        # maths/grahams_law.py: `return round(sqrt(...), 6)
+                        # if validate(...) else ValueError(...)`.
+                        test_node = node.value.test
+                        test_txt = self.expr(test_node)
+                        tk = self._expr_kind(test_node)
+                        tr = max(0, int(self._rank_expr(test_node)))
+                        if tk == "logical":
+                            cond_txt = test_txt
+                        elif tk == "char":
+                            cond_txt = f"any(len_trim({test_txt}) > 0)" if tr > 0 else f"(len_trim({test_txt}) > 0)"
+                        else:
+                            cond_txt = f"any(({test_txt}) /= 0)" if tr > 0 else f"(({test_txt}) /= 0)"
+                        body_txt = self._return_value_expr(node.value.body)
+                        orelse_txt = self._return_value_expr(node.value.orelse)
+                        self.o.w(f"if ({cond_txt}) then")
+                        self.o.push()
+                        self.o.w(f"{self.function_result_name} = {body_txt}")
+                        self.o.w("return")
+                        self.o.pop()
+                        self.o.w("else")
+                        self.o.push()
+                        self.o.w(f"{self.function_result_name} = {orelse_txt}")
+                        self.o.w("return")
+                        self.o.pop()
+                        self.o.w("end if")
+                        return
             else:
                 expr_txt = self._return_value_expr(node.value)
             # When a branch returns a higher-rank array but the function result
@@ -61879,7 +61987,45 @@ def _emit_local_function(
                             elif ob is not None and isinstance(b, ast.Name) and isinstance(ob, ast.Name) and ob.id == b.id:
                                 rhs = tr.expr(ob)
                         if rhs is None:
-                            rhs = tr._return_value_expr(rv)
+                            try:
+                                rhs = tr._return_value_expr(rv)
+                            except NotImplementedError:
+                                # Same fix as translator.visit_Return's own
+                                # equivalent fallback (this is a SEPARATE,
+                                # duplicate return-statement codegen path
+                                # specific to local functions -- see that
+                                # method's own comment for the full
+                                # rationale). Fortran's MERGE evaluates both
+                                # ternary operands eagerly, unlike Python's
+                                # short-circuiting ternary, so a non-atomic
+                                # branch (e.g. a function call) needs a
+                                # genuine if/else STATEMENT instead. Found
+                                # mining TheAlgorithms/Python's own
+                                # maths/grahams_law.py.
+                                test_node = rv.test
+                                test_txt = tr.expr(test_node)
+                                tk = tr._expr_kind(test_node)
+                                trr = max(0, int(tr._rank_expr(test_node)))
+                                if tk == "logical":
+                                    cond_txt = test_txt
+                                elif tk == "char":
+                                    cond_txt = f"any(len_trim({test_txt}) > 0)" if trr > 0 else f"(len_trim({test_txt}) > 0)"
+                                else:
+                                    cond_txt = f"any(({test_txt}) /= 0)" if trr > 0 else f"(({test_txt}) /= 0)"
+                                body_txt = tr._return_value_expr(rv.body)
+                                orelse_txt = tr._return_value_expr(rv.orelse)
+                                o.w(f"if ({cond_txt}) then")
+                                o.push()
+                                o.w(f"{tr.function_result_name} = {body_txt}")
+                                o.w("return")
+                                o.pop()
+                                o.w("else")
+                                o.push()
+                                o.w(f"{tr.function_result_name} = {orelse_txt}")
+                                o.w("return")
+                                o.pop()
+                                o.w("end if")
+                                continue
                         if rhs.strip().lower() != tr.function_result_name.lower():
                             o.w(f"{tr.function_result_name} = {rhs}")
             if i != len(fn.body) - 1:

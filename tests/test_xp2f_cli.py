@@ -17779,3 +17779,219 @@ def test_xp2f_toplevel_int_const_pow_overflow_used_inline_in_real_expr(tmp_path:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+def test_xp2f_unannotated_bool_call_return_kind_is_logical(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # physics/in_static_equilibrium.py: an unannotated local function
+    # whose only return statement is `return bool(<comparison>)` got
+    # classified with return kind "int" instead of "logical" --
+    # _expr_kind had no case at all for the `bool(...)` builtin cast
+    # call (unlike `isinstance(...)`, which was already recognized).
+    # This silently printed "1"/"0" instead of "T"/"F" and, in the
+    # in_static_equilibrium repro, also produced a hard compile
+    # warning ("Conversion from LOGICAL(4) to INTEGER(4)") from
+    # assigning a merge()-based logical expression into a bare
+    # `integer :: func_res`.
+    src = tmp_path / "xbool_call_return_kind.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def check(a, b):",
+                "    return bool(a < b)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(check(1, 2))",
+                "    print(check(5, 2))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_np_array_of_rank1_returning_calls_stacks_into_rank2(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # physics/in_static_equilibrium.py: `np.array([f(...), f(...),
+    # f(...)])` where f returns a rank-1 list/array needs to STACK
+    # those rows into a genuine rank-2 array. expr()'s own generic
+    # Call-codegen already handled this correctly (wrapping in
+    # transpose(reshape(...))), but visit_Assign has its OWN, separate,
+    # dedicated `x = np.array([...])` handler that lacked the
+    # equivalent check -- its fallback just concatenated the calls into
+    # one flat rank-1 array constructor, which Fortran then refused to
+    # assign into the rank-2 declared variable ("Incompatible ranks 2
+    # and 1 in assignment").
+    src = tmp_path / "xarray_of_rank1_calls.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "",
+                "def pair(a, b):",
+                "    return [a, b]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    m = np.array([pair(1.0, 2.0), pair(3.0, 4.0), pair(5.0, 6.0)])",
+                "    print(m[0, 0], m[1, 1], m[2, 0])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_math_module_attribute_radians_degrees(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # physics/snells_law.py and physics/malus_law.py: `math.radians(x)`
+    # / `math.degrees(x)` (module-attribute-call style, `import math;
+    # math.radians(...)`) had NO codegen path at all ("unsupported
+    # call") -- the identical formula already existed for the numpy
+    # spelling (np.radians/np.degrees), but self.math_aliases's own
+    # attribute-call dispatch chain never covered these two names.
+    src = tmp_path / "xmath_radians_degrees.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import math",
+                "",
+                "",
+                "def malus_law(initial_intensity, angle):",
+                "    return initial_intensity * (math.cos(math.radians(angle)) ** 2)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(round(malus_law(10.0, 45.0), 2))",
+                "    print(round(malus_law(100.0, 60.0), 2))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_builtin_pow_two_arg_call(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # physics/photoelectric_effect.py: Python's builtin 2-arg
+    # pow(base, exp) call (distinct from the already-handled 3-arg
+    # modular form, and distinct from math.pow) had NO codegen path at
+    # all ("unsupported call"), even though _expr_kind already inferred
+    # its result kind elsewhere. Fixed by delegating to the identical
+    # BinOp-Pow codegen already used for `a ** b`, so it picks up the
+    # same negative-exponent real-coercion handling for free.
+    src = tmp_path / "xbuiltin_pow_two_arg.py"
+    src.write_text(
+        "\n".join(
+            [
+                "PLANCK_CONSTANT_JS = 6.6261 * pow(10, -34)",
+                "",
+                "",
+                "def scaled(frequency):",
+                "    return PLANCK_CONSTANT_JS * frequency",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(pow(2, 3))",
+                "    print(scaled(1000000.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_ternary_in_return_with_non_atomic_branches(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # maths/grahams_law.py: `return <call-expr> if <cond> else <call-
+    # expr>` (a ternary whose branches are non-atomic, e.g. involve a
+    # function call) was outright rejected ("IfExp requires statement-
+    # level lowering for non-atomic branches") -- Fortran's MERGE
+    # intrinsic evaluates both operands eagerly, unlike Python's own
+    # short-circuiting ternary, so this codebase's own MERGE-based
+    # ternary codegen conservatively declines non-atomic branches, but
+    # never actually implemented the documented fallback (a genuine
+    # if/else STATEMENT). This gap existed in BOTH of this codebase's
+    # two independent return-statement codegen paths: the general
+    # translator.visit_Return, and local functions' own separate,
+    # duplicate return-codegen inside _emit_local_function.
+    src = tmp_path / "xternary_return_nonatomic.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import math",
+                "",
+                "",
+                "def f(x):",
+                "    return round(math.sqrt(x), 2) if x > 0 else -1.0",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(f(4.0))",
+                "    print(f(-1.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
