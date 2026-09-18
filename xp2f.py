@@ -21867,6 +21867,7 @@ class translator(ast.NodeVisitor):
         self.type_rebind_events = {}
         self.type_rebind_targets = set()
         self.open_type_rebind_stack = []
+        self.open_type_rebind_depths = []
         self.open_type_rebind_meta = []
         self.rank_rebind_aliases = []
         self.reserved_names = set(FORTRAN_RESERVED_IDENTIFIERS)
@@ -22677,6 +22678,7 @@ class translator(ast.NodeVisitor):
         else:
             raise NotImplementedError(f"unsupported rebind target kind: {kind}")
         self.open_type_rebind_stack.append(name)
+        self.open_type_rebind_depths.append(self.o.ind)
         self.open_type_rebind_meta.append((name, kind, rr))
 
     def _close_one_type_rebind_block(self):
@@ -22691,6 +22693,7 @@ class translator(ast.NodeVisitor):
         self.o.pop()
         self.o.w("end block")
         self.open_type_rebind_stack.pop()
+        self.open_type_rebind_depths.pop()
         if self.open_type_rebind_meta:
             self.open_type_rebind_meta.pop()
 
@@ -44265,7 +44268,8 @@ class translator(ast.NodeVisitor):
             if rk is not None:
                 # Prefer sequential non-nested rebinding blocks for repeated
                 # type changes of the same variable.
-                if self.open_type_rebind_stack and self.open_type_rebind_stack[-1] == t.id:
+                if (self.open_type_rebind_stack and self.open_type_rebind_stack[-1] == t.id
+                        and self.open_type_rebind_depths[-1] == self.o.ind):
                     self._close_one_type_rebind_block()
                 self._open_type_rebind_block(t.id, rk[0], rk[1])
             else:
@@ -44990,7 +44994,8 @@ class translator(ast.NodeVisitor):
                 if k_vis0 == want_kind and int(r_vis0) == int(want_rank):
                     out_name_pos += 1
                     continue
-                if self.open_type_rebind_stack and self.open_type_rebind_stack[-1] == self._aliased_name(e.id):
+                if (self.open_type_rebind_stack and self.open_type_rebind_stack[-1] == self._aliased_name(e.id)
+                        and self.open_type_rebind_depths[-1] == self.o.ind):
                     self._close_one_type_rebind_block()
                 self._open_type_rebind_block(e.id, want_kind, want_rank)
                 out_name_pos += 1
@@ -50359,14 +50364,11 @@ class translator(ast.NodeVisitor):
         # NEW: fallback for name = <simple expr>  (e.g., largest = i)
         if isinstance(t, ast.Name):
             lname = self._aliased_name(t.id)
-            target_rank = max(
-                int(self.alloc_real_rank.get(lname, 0)),
-                int(self.alloc_int_rank.get(lname, 0)),
-                int(self.alloc_log_rank.get(lname, 0)),
-                int(self.alloc_complex_rank.get(lname, 0)),
-                int(self.alloc_char_rank.get(lname, 0)),
-                int(self._rank_expr(ast.Name(id=lname, ctx=ast.Load()))),
-            )
+            # A BLOCK-local scalar can shadow a procedure-level array.
+            # Allocation must follow the visible declaration, not the union
+            # of all ranks encountered for this name during prescan.
+            _, visible_rank = self._visible_kind_rank(t.id)
+            target_rank = max(0, int(visible_rank or 0))
             rhs_rank0 = max(0, int(self._rank_expr(v)))
             if (
                 target_rank > 0
@@ -50417,7 +50419,7 @@ class translator(ast.NodeVisitor):
             if isinstance(v, ast.IfExp):
                 rb = self._rank_expr(v.body)
                 ro = self._rank_expr(v.orelse)
-                if (rb == 0 and ro > 0) or (ro == 0 and rb > 0):
+                if target_rank > 0 and ((rb == 0 and ro > 0) or (ro == 0 and rb > 0)):
                     nm = lname
                     if (
                         nm in self.alloc_reals
@@ -64514,6 +64516,16 @@ def generate_flat(
                     ar = tr_ctx._rank_expr(a)
                     if direct_actual is not None:
                         ar = max(ar, direct_actual[1])
+                        # A scalar-commented dummy and consistently scalar
+                        # direct assignments agree more strongly than a
+                        # provisional tuple-result rank in the caller scan.
+                        # Do not apply this to caller formals (whose direct
+                        # assignment scan does not carry their input rank).
+                        _formal = local_arg_names_map.get(callee, [])[i]
+                        _, _comment_rank = _comment_arg_spec_hint_for_fn(local_fn_map[callee], _formal)
+                        if (direct_actual[1] == 0 and _comment_rank == 0
+                                and a.id not in {p.arg for p in fn_node.args.args}):
+                            ar = 0
                     rr[i] = max(rr[i], ar)
                     rrs[i].add(ar)
                     ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(a)
@@ -64566,6 +64578,10 @@ def generate_flat(
                         ar = tr_ctx._rank_expr(kw.value)
                         if direct_actual is not None:
                             ar = max(ar, direct_actual[1])
+                            _, _comment_rank = _comment_arg_spec_hint_for_fn(local_fn_map[callee], kw.arg)
+                            if (direct_actual[1] == 0 and _comment_rank == 0
+                                    and kw.value.id not in {p.arg for p in fn_node.args.args}):
+                                ar = 0
                         rr[i] = max(rr[i], ar)
                         rrs[i].add(ar)
                         ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(kw.value)

@@ -16057,6 +16057,27 @@ def test_diag_rank_inference_waits_for_input_rank(expression: str, tmp_path: Pat
     assert tr._rank_expr(node) == 1
 
 
+@pytest.mark.parametrize("control", ["for i in range(2):", "if flag:", "while flag:"])
+@pytest.mark.parametrize("tuple_assignment", [False, True])
+def test_xp2f_rebinding_does_not_close_enclosing_block(tmp_path: Path, control: str, tuple_assignment: bool) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xnested_rebind.py", [
+        "def pair():",
+        "    return 2.5, 7",
+        "def fixture(flag):",
+        "    value = 1",
+        "    print(value)",
+        "    value = 'outer'",
+        "    print(value)",
+        f"    {control}",
+        "        value, other = pair()" if tuple_assignment else "        value = 2.5",
+        "        print(value)",
+        "        value = 'inner'",
+        "        print(value)",
+        "        flag = False",
+        "fixture(True)",
+    ])
+
+
 def test_xp2f_jacobi_vector_rhs_and_diagonal(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xjacobi_vectors.py", [
         "import numpy as np",
@@ -16089,6 +16110,54 @@ def test_xp2f_jacobi_vector_rhs_and_diagonal(tmp_path: Path) -> None:
         "    print('%.6g' % residual)",
         "    for i in range(3):",
         "        print('%.8g %.8g' % (u[i], reference[i]))",
+        "fixture()",
+    ])
+
+
+def test_xp2f_scalar_shadow_of_array_is_not_allocated(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xscalar_shadow_allocate.py", [
+        "import numpy as np",
+        "def report(x, flag):",
+        "    p = x.copy()",
+        "    print(p[0])",
+        "    if flag:",
+        "        p = 3.0",
+        "        print(p)",
+        "    else:",
+        "        p = x + 1.0",
+        "        print(p[0])",
+        "x = np.array([1.5, 2.5])",
+        "report(x, True)",
+        "report(x, False)",
+    ])
+
+
+@pytest.mark.parametrize("keyword", [False, True])
+def test_xp2f_scalar_tuple_feedback_with_array_output_section(tmp_path: Path, keyword: bool) -> None:
+    actuals = "b=b, x=xx" if keyword else "b, xx"
+    _run_xp2f_compile_diff(tmp_path, "xscalar_feedback.py", [
+        "import numpy as np",
+        "def refine(b, x):",
+        "    # Input:",
+        "    # real B(N), coefficients.",
+        "    # real X, the scalar estimate.",
+        "    if x == 0.0:",
+        "        delta = 0.0",
+        "    else:",
+        "        delta = (x*x - b[0]) / (2.0*x)",
+        "    x = x - delta",
+        "    weight = 1.0 / (1.0 + x)",
+        "    return x, weight",
+        "def fixture():",
+        "    b = np.array([2.0])",
+        "    x = np.zeros(4)",
+        "    w = np.zeros(4)",
+        "    xx = 1.5",
+        "    for k in range(4):",
+        f"        xx, w[k] = refine({actuals})",
+        "        x[k] = xx",
+        "    for k in range(4):",
+        "        print('%.8g %.8g' % (x[k], w[k]))",
         "fixture()",
     ])
 
