@@ -50127,6 +50127,18 @@ class translator(ast.NodeVisitor):
 
         # subscript assignment
         if isinstance(t, ast.Subscript):
+            def _array_assignment_rhs(rhs_node, rhs_text=None):
+                # NumPy retains the destination dtype on indexed assignment;
+                # Fortran does not implicitly turn LOGICAL into numeric 0/1.
+                target_kind = self._expr_kind(t.value)
+                if isinstance(t.value, ast.Name):
+                    visible_kind, _ = self._visible_kind_rank(t.value.id)
+                    target_kind = visible_kind or target_kind
+                text = self.expr(rhs_node) if rhs_text is None else rhs_text
+                if self._expr_kind(rhs_node) == "logical" and target_kind in {"int", "real", "complex"}:
+                    return self._coerce_expr_kind(rhs_node, text, target_kind)
+                return text
+
             if (
                 isinstance(t.slice, ast.Tuple)
                 and len(t.slice.elts) == 2
@@ -50145,7 +50157,7 @@ class translator(ast.NodeVisitor):
                     mask = self.expr(a1)
                     self.o.w(f"where (({mask}))")
                     self.o.push()
-                    self.o.w(f"{row_ref} = {self.expr(v)}")
+                    self.o.w(f"{row_ref} = {_array_assignment_rhs(v)}")
                     self.o.pop()
                     self.o.w("end where")
                     return
@@ -50164,7 +50176,7 @@ class translator(ast.NodeVisitor):
                     mask = self.expr(a0)
                     self.o.w(f"where (({mask}))")
                     self.o.push()
-                    self.o.w(f"{col_ref} = {self.expr(v)}")
+                    self.o.w(f"{col_ref} = {_array_assignment_rhs(v)}")
                     self.o.pop()
                     self.o.w("end where")
                     return
@@ -50235,7 +50247,8 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"if ({mask_expr}(mask_scatter_i)) then")
                         self.o.push()
                         self.o.w("mask_scatter_k = mask_scatter_k + 1")
-                        self.o.w(f"{base_expr}(mask_scatter_i, :) = mask_scatter_tmp(mask_scatter_k, :)")
+                        scatter_rhs = _array_assignment_rhs(v, "mask_scatter_tmp(mask_scatter_k, :)")
+                        self.o.w(f"{base_expr}(mask_scatter_i, :) = {scatter_rhs}")
                         self.o.pop()
                         self.o.w("end if")
                         self.o.pop()
@@ -50380,7 +50393,7 @@ class translator(ast.NodeVisitor):
                 ):
                     self.o.w(f"where (({self.expr(t.slice)}))")
                     self.o.push()
-                    self.o.w(f"{self.expr(t.value)} = {self.expr(v.value)}")
+                    self.o.w(f"{self.expr(t.value)} = {_array_assignment_rhs(v.value)}")
                     self.o.pop()
                     self.o.w("end where")
                     return
@@ -50411,7 +50424,7 @@ class translator(ast.NodeVisitor):
                 if _unpacked_rhs is not None:
                     self.o.w(f"where (({self.expr(t.slice)}))")
                     self.o.push()
-                    self.o.w(f"{self.expr(t.value)} = {_unpacked_rhs}")
+                    self.o.w(f"{self.expr(t.value)} = {_array_assignment_rhs(v, _unpacked_rhs)}")
                     self.o.pop()
                     self.o.w("end where")
                     return
@@ -50424,16 +50437,16 @@ class translator(ast.NodeVisitor):
                 else:
                     self.o.w(f"where (({self.expr(t.slice)}))")
                     self.o.push()
-                    self.o.w(f"{self.expr(t.value)} = {self.expr(v)}")
+                    self.o.w(f"{self.expr(t.value)} = {_array_assignment_rhs(v)}")
                     self.o.pop()
                     self.o.w("end where")
                 return
             if isinstance(t.slice, ast.Slice) and t.slice.lower is None and t.slice.upper is None and t.slice.step is None:
                 if not isinstance(t.value, ast.Name):
                     raise NotImplementedError("slice assignment target must be name")
-                self.o.w(f"{t.value.id} = {self.expr(v)}")
+                self.o.w(f"{self.expr(t.value)} = {_array_assignment_rhs(v)}")
                 return
-            self.o.w(f"{self.expr(t)} = {self.expr(v)}")
+            self.o.w(f"{self.expr(t)} = {_array_assignment_rhs(v)}")
             return
 
         # x = np.append(x, row_or_rows, axis=0) for rank-2 arrays.

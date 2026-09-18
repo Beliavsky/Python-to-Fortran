@@ -16179,6 +16179,47 @@ def test_first_deallocation_guard_keeps_intent_out_inside_loop() -> None:
     assert guard in xp2f.remove_redundant_first_guarded_deallocate(lines)
 
 
+@pytest.mark.parametrize("dtype", ["float", "int", "bool"])
+def test_xp2f_boolean_assignment_preserves_array_dtype(tmp_path: Path, dtype: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xbool_array_assignment.py", [
+        "import numpy as np",
+        f"a = np.zeros(4, dtype={dtype})",
+        "for j in range(4):",
+        "    a[j] = (j != 2 * (j // 2))",
+        "print(a)",
+        "a[1:3] = np.array([True, False])",
+        "print(a)",
+        "a[:] = np.array([False, True, False, True])",
+        "print(a)",
+        "a[:] = True",
+        "print(a)",
+        f"b = np.zeros((2, 2), dtype={dtype})",
+        "b[0, 1] = True",
+        "b[1, :] = np.array([True, False])",
+        "print(b)",
+    ])
+
+
+@pytest.mark.parametrize("dtype", ["float", "int"])
+def test_xp2f_masked_boolean_assignment_to_numeric_array(tmp_path: Path, dtype: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xmasked_bool_assignment.py", [
+        "import numpy as np",
+        "mask = np.array([True, False, True])",
+        "flags = np.array([False, True, True])",
+        f"a = np.zeros(3, dtype={dtype})",
+        "a[mask] = flags[mask]",
+        "print(a)",
+        "a[mask] = (a[mask] == 0)",
+        "print(a)",
+        f"b = np.zeros((3, 3), dtype={dtype})",
+        "b[0, mask] = True",
+        "b[mask, 1] = False",
+        "print(b)",
+        "b[mask, :] = np.array([[True, False, True], [False, True, False]])",
+        "print(b)",
+    ])
+
+
 @pytest.mark.parametrize("constructor", ["zeros", "ones", "empty"])
 def test_xp2f_global_matrix_constructor_rank(tmp_path: Path, constructor: str) -> None:
     _run_xp2f_compile_diff(tmp_path, "xglobal_matrix.py", [
