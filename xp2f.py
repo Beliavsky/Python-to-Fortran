@@ -49622,7 +49622,11 @@ class translator(ast.NodeVisitor):
                         and is_numpy_name_node(kw.value.value)
                     ):
                         dtype_txt = kw.value.attr.lower()
-            if elts and all(self._rank_expr(e) == 1 for e in elts):
+            if (
+                elts
+                and all(self._rank_expr(e) == 1 for e in elts)
+                and not all(isinstance(e, (ast.List, ast.Tuple)) for e in elts)
+            ):
                 # `np.array([call1(...), call2(...), ...])` where each
                 # element is itself a rank-1-array-valued expression (most
                 # commonly a call to a local function returning a list/
@@ -49638,6 +49642,14 @@ class translator(ast.NodeVisitor):
                 # TheAlgorithms/Python's own
                 # physics/in_static_equilibrium.py: `forces =
                 # array([polar_force(...), polar_force(...), ...])`).
+                # Excludes the all-List/Tuple-elements case -- e.g. `array
+                # ([[1.0, 2.0], [3.0, 4.0]])` -- which has its own, more
+                # specific handling further down (including promotion to
+                # a named PARAMETER when possible); that path must run
+                # unshadowed, exactly as it already does in expr()'s own
+                # version of this same check (see the `all(isinstance(e,
+                # ast.List) ...)` branch checked immediately before it
+                # there).
                 first = self.expr(elts[0])
                 vals = ", ".join(self.expr(e) for e in elts)
                 if "complex" in dtype_txt:
@@ -50950,7 +50962,14 @@ class translator(ast.NodeVisitor):
                 else:
                     try:
                         expr_txt = self._return_value_expr(node.value)
-                    except NotImplementedError:
+                    except NotImplementedError as _e:
+                        if "requires statement-level lowering" not in str(_e):
+                            # A genuinely unrelated failure (e.g. an
+                            # unsupported call/attribute nested inside one
+                            # of the branches) -- must propagate as-is,
+                            # not be mistaken for the specific "non-atomic
+                            # ternary branch" case this fallback handles.
+                            raise
                         # Fortran's MERGE (used for a simple-branch ternary
                         # elsewhere in this codebase) evaluates BOTH
                         # operands eagerly, unlike Python's ternary, which
@@ -61989,7 +62008,20 @@ def _emit_local_function(
                         if rhs is None:
                             try:
                                 rhs = tr._return_value_expr(rv)
-                            except NotImplementedError:
+                            except NotImplementedError as _e:
+                                if not isinstance(rv, ast.IfExp) or "requires statement-level lowering" not in str(_e):
+                                    # A genuinely unrelated failure (rv isn't
+                                    # even a ternary, or the error came from
+                                    # some other unsupported construct
+                                    # entirely, e.g. an unsupported call or
+                                    # attribute expr) -- must propagate as
+                                    # the original error, never be mistaken
+                                    # for the specific "non-atomic ternary
+                                    # branch" case this fallback handles
+                                    # (rv.test below would otherwise crash
+                                    # with AttributeError for any non-IfExp
+                                    # rv).
+                                    raise
                                 # Same fix as translator.visit_Return's own
                                 # equivalent fallback (this is a SEPARATE,
                                 # duplicate return-statement codegen path
