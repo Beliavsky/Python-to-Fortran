@@ -16137,6 +16137,40 @@ def test_xp2f_integer_branch_assignment_updates_real_recurrence(tmp_path: Path, 
     ])
 
 
+@pytest.mark.parametrize("expression, rank", [
+    ("np.zeros(4)", 1),
+    ("np.zeros((2, 3))", 2),
+    ("np.ones(shape=[2, 3, 4])", 3),
+    ("np.empty((2, 3, 4))", 3),
+    ("np.array([[1.0, 2.0], [3.0, 4.0]])", 2),
+    ("np.asarray([[[1.0]]])", 3),
+    ("[[1.0, 2.0], [3.0, 4.0]]", 2),
+])
+def test_module_global_decls_preserve_constructor_rank(expression: str, rank: int) -> None:
+    tree = ast.parse("def initialize():\n    global matrix\n    matrix = " + expression)
+    assert xp2f.collect_module_global_decls(tree.body)["matrix"] == ("real", rank)
+
+
+@pytest.mark.parametrize("constructor", ["zeros", "ones", "empty"])
+def test_xp2f_global_matrix_constructor_rank(tmp_path: Path, constructor: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xglobal_matrix.py", [
+        "import numpy as np",
+        "def initialize(n):",
+        "    global matrix",
+        f"    matrix = np.{constructor}((n, 3))",
+        "    for i in range(n):",
+        "        for j in range(3):",
+        "            matrix[i, j] = i + 2.0*j",
+        "def report():",
+        "    global matrix",
+        "    print(matrix[1, 2])",
+        "    print(np.sum(matrix))",
+        "initialize(2)",
+        "report()",
+        "report()",
+    ])
+
+
 @pytest.mark.parametrize("keyword", [False, True])
 def test_xp2f_mixed_tuple_return_preserves_documented_integer_seed(tmp_path: Path, keyword: bool) -> None:
     actuals = "n=2, seed=seed" if keyword else "2, seed"

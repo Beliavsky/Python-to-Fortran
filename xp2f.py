@@ -15366,10 +15366,12 @@ def collect_module_global_decls(local_funcs):
             return None, 0
         if isinstance(n, (ast.List, ast.Tuple)):
             k = None
+            rank = 1
             for e in n.elts:
-                ke, _ = _infer_from_node(e)
+                ke, element_rank = _infer_from_node(e)
                 k = _merge_kind(k, ke)
-            return (k or "real"), 1
+                rank = max(rank, 1 + element_rank)
+            return (k or "real"), rank
         if isinstance(n, ast.Set):
             k = None
             for e in n.elts:
@@ -15387,6 +15389,16 @@ def collect_module_global_decls(local_funcs):
                 if n.func.value.id in {"np", "numpy"} and n.func.attr in {
                     "array", "asarray", "linspace", "arange", "zeros", "ones", "empty"
                 }:
+                    if n.func.attr in {"zeros", "ones", "empty"}:
+                        shape = n.args[0] if n.args else next(
+                            (kw.value for kw in n.keywords if kw.arg == "shape"), None
+                        )
+                        if isinstance(shape, (ast.Tuple, ast.List)):
+                            return "real", len(shape.elts)
+                    elif n.func.attr in {"array", "asarray"} and n.args:
+                        if isinstance(n.args[0], (ast.List, ast.Tuple)):
+                            _, rank = _infer_from_node(n.args[0])
+                            return "real", rank
                     return "real", 1
                 if n.func.value.id in {"np", "numpy"} and n.func.attr in {
                     "zeros_like", "ones_like", "empty_like"
