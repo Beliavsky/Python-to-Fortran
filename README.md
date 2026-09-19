@@ -4,15 +4,38 @@ Python-to-Fortran is an experimental Python, NumPy, pandas, and (partial) SciPy 
 
 The project is intended for numerical Python programs that use a Fortran-friendly subset of Python. It can infer many scalar, array, string, and pandas DataFrame cases, emit Fortran source, optionally compile it with `gfortran`, and compare Python and Fortran output for regression testing.
 
+## Why Fortran?
+
+Fortran is a practical target for numerical Python: it combines native compilation with multidimensional arrays, whole-array expressions, array sections, and explicit procedure interfaces. Suitable Python loops can become efficient compiled loops, and generated routines can use established Fortran numerical libraries.
+
+The output is inspectable source that can be compiled, profiled, modified, and reused in a Fortran project. Standalone translated programs do not require a Python interpreter at execution time, although they may require the project's Fortran helpers and other linked libraries. For workflows that should remain in Python, `xpfunc2f.py` can build supported individual functions into Python-callable extensions through NumPy's `f2py`.
+
+Speedup is workload dependent, not guaranteed. NumPy and SciPy already perform much of their numerical work in compiled libraries; translating calls to those libraries may offer little benefit. Translation and compilation also have a cost. See [Timing Results](TIMING_RESULTS.md) for measurements and the [small example](#small-example) below for a loop-heavy case.
+
+For side-by-side examples and important semantic differences, see the [Python To Fortran Syntax Guide](python_to_fortran_syntax_guide.md). It distinguishes conceptual equivalents from the transpiler's supported subset.
+
 ## Status
 
 This transpiler is useful on a substantial subset of numerical Python, but it is not a general Python compiler.
 
-Known limitations include dynamic Python features (`isinstance` dispatch, `Union`/duck-typed parameters), complex/irregular containers, reflection, and parts of NumPy that do not map directly to static Fortran. The transpiler assigns every variable exactly one Fortran type via whole-program static analysis before generating any code, so it is strongest on code with fixed, statically-determinable shapes and types, and weakest on code that leans on Python's runtime flexibility. When a program does not transpile, a small reproducer is usually the best starting point for improving `xp2f.py`.
+Known limitations include dynamic Python features (`isinstance` dispatch, `Union`/duck-typed parameters), complex/irregular containers, reflection, and parts of NumPy that do not map directly to static Fortran. The transpiler uses static analysis to infer types, array ranks, and procedure interfaces. It handles some type/rank changes through scoped declarations and specialized procedures, but not arbitrary dynamic rebinding. Array extents can be determined at runtime using allocatable arrays; their rank and element type still need to be inferable. When a program does not transpile, a small reproducer is usually the best starting point for improving `xp2f.py`.
 
 See [Timing Results](TIMING_RESULTS.md) for runtime measurements on fully passing translated numerical programs.
 
 See [Comparison with Pyccel](PYCCEL_COMPARISON.md) for how this project differs from Pyccel.
+
+### Class support
+
+A user-defined class is lowered to a Fortran derived type with plain `allocatable` (copied, not pointer-aliased) fields; each method is hoisted to a free top-level function taking `self` as an explicit first argument rather than a type-bound procedure. See [Comparison with Pyccel](PYCCEL_COMPARISON.md) for how this compares to pyccel's own pointer-based, type-bound-procedure translation.
+
+Supported, and covered by regression tests in `tests/test_xp2f_cli.py`:
+
+- Construction (including a stateless, empty `__init__`), field assignment and mutation, and `del` on an instance.
+- Composition (a class field that is itself another class instance, including one constructed inline from a nested class), and field mutation reached through nested composition.
+- Optional (`None`-defaultable) struct-typed parameters, forward-referenced string type annotations, and literal-default fields.
+- A computed field (including one built from a `dtype=` keyword) and a computed read-only property getter.
+- Instance aliasing (`b = a` shares mutations, matching Python's own reference semantics rather than copying).
+- Case-colliding field names, and a function that returns a class constructor call directly.
 
 ### pandas DataFrame support
 
@@ -174,6 +197,7 @@ Important caveats:
 - `fortran_int_kind.py`: `--int-kind` post-pass; rewrites bare `integer` declarations (and related literals/casts) to an explicit `int32`/`int64` kind, excluding external LAPACK/bridge call boundaries that require the compiler's own default kind.
 - `fortran_perf_hints.py`: `--perf-hints` diagnostic; reports (never rewrites) strided-array-access patterns that neither `--optimize-loops` nor `--int-kind` can safely fix.
 - `pyccel_wrap.py`: standalone wrapper giving [Pyccel](PYCCEL_COMPARISON.md) an `xp2f.py`-style `--compile`/`--run`/`--run-both`/`--numeric-diff` command-line interface, for comparing the two tools' translations of the same Python source.
+- `xannotate_for_pyccel.py`: infers and injects pyccel-compatible type annotations (`x: int`, `x: "float[:,:]"`) into an unannotated script's top-level functions, by tracing call-site argument types through the whole file. Unlike `xp2f.py`, pyccel requires argument annotations to translate a function; `xp2f.py` already accepts pyccel's own annotation syntax as input, so a single annotated file can be fed to both tools to cross-check their translations (and plain Python) against each other. Conservative by design: it leaves a parameter unannotated, and says why, rather than guess wrong.
 - `python.f90`: Fortran helper runtime used by translated programs.
 - `dataframe_str_index.f90`, `dataframe_index_date.f90`, `dataframe_index_datetime.f90`: pandas `DataFrame` companion types (string-indexed, date-indexed, datetime-indexed), auto-included when a translated program uses pandas.
 - `lapack_d.f90`: bundled double-precision LAPACK helpers used by some translations.
