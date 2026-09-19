@@ -9807,6 +9807,78 @@ def test_xp2f_logical_numeric_comparison_broadcasting(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xlogical_numeric_broadcast.py", lines)
 
 
+def test_xp2f_integer_product_modulo_widens_before_multiply(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xproduct_modulo.py", [
+        "def residue(a, b, m):",
+        "    return (a * b) % m",
+        "def consume(x):",
+        "    return x + 1",
+        "def power_mod(a, n, m):",
+        "    x = 1",
+        "    while n > 0:",
+        "        d = n % 2",
+        "        if d == 1:",
+        "            x = (x * a) % m",
+        "        a = (a * a) % m",
+        "        n = (n - d) // 2",
+        "    return x",
+        "for a in [282475249, -282475249, 2147483647, -2147483647, 0]:",
+        "    for b in [282475249, -282475249, 2147483647, -2147483647]:",
+        "        for m in [2147483647, -2147483647, 97, -97, 1, -1]:",
+        "            print(residue(a, b, m))",
+        "            print(consume((a * b) % m))",
+        "            print(((a * b) % m) // 2)",
+        "for n in range(11):",
+        "    print(power_mod(16807, n, 2147483647))",
+    ])
+    generated = (tmp_path / "xproduct_modulo_p.f90").read_text(encoding="utf-8")
+    assert "int(modulo(int(" in generated
+    assert "kind=int64) *" in generated
+
+
+def test_xp2f_integer_multiply_add_modulo(tmp_path: Path) -> None:
+    lines = [
+        "def consume(x):",
+        "    return x // 2",
+        "def residues(a, x, b, m):",
+    ]
+    for expr in ("a*x+b", "b+a*x", "a*x-b", "b-a*x", "(a+b)*x+b"):
+        lines.append(f"    print(consume(({expr}) % m))")
+    lines += [
+        "for a in [16807, 2147483647, -2147483647]:",
+        "    for x in [12345, 2147483647, -2147483647]:",
+        "        for b in [0, 2147483647, -2147483647]:",
+        "            for m in [2147483647, -2147483647, 97, -97, 1, -1]:",
+        "                residues(a, x, b, m)",
+        "def advance(a, b, c, seed):",
+        "    return (a * seed + b) % c",
+        "seed = 12345",
+        "for i in range(12):",
+        "    seed = advance(16807, 0, 2147483647, seed)",
+        "    print(seed)",
+    ]
+    _run_xp2f_compile_diff(tmp_path, "xmultiply_add_modulo.py", lines)
+
+
+def test_xp2f_product_modulo_keeps_real_and_array_semantics(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xproduct_modulo_other.py", [
+        "import numpy as np",
+        "def residues(a, b):",
+        "    return (a * b) % 97",
+        "def shifted_residues(a, b):",
+        "    return (a * b + 17) % 97",
+        "a = np.array([50000, -50000], dtype=np.int32)",
+        "b = np.array([50000, 50000], dtype=np.int32)",
+        "print(residues(a, b))",
+        "print(shifted_residues(a, b))",
+        "x = 50000.5",
+        "y = -50000.0",
+        "print((x * y) % 97.0)",
+        "print((x * y) % -97.0)",
+        "print((x * y + 17.0) % -97.0)",
+    ])
+
+
 def test_xp2f_pandas_df_cummax_cummin(tmp_path: Path) -> None:
     # Regression test: df.cummax()/df.cummin() -- new DataFrame_str_index/
     # DataFrame_index_date type-bound procedures (cummax_str/cummin_str

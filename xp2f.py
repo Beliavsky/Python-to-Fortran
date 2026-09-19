@@ -31201,6 +31201,37 @@ class translator(ast.NodeVisitor):
                     b = f"real({b}, kind=dp)"
                 elif rk0 == "real" and lk0 in {"int", "logical"}:
                     a = f"real({a}, kind=dp)"
+                elif (lk0 == rk0 == "int"
+                        and isinstance(node.left, ast.BinOp)
+                        and isinstance(node.left.op, (ast.Mult, ast.Add, ast.Sub))
+                        and (isinstance(node.left.op, ast.Mult)
+                             or any(isinstance(term, ast.BinOp) and isinstance(term.op, ast.Mult)
+                                    for term in (node.left.left, node.left.right)))
+                        and self._rank_expr(node.left) == 0
+                        and self._rank_expr(node.right) == 0
+                        and self._expr_kind(node.left.left) == "int"
+                        and self._expr_kind(node.left.right) == "int"):
+                    # Python integer products do not overflow at 32 bits.
+                    # Widen before multiplying OR adding, not afterward.
+                    # This includes the LCG idiom (a*x + b) % m. Two
+                    # default-integer factors plus an integer fit in int64;
+                    # the remainder fits the divisor's range. Convert only
+                    # that remainder back to the divisor's kind to preserve
+                    # call interfaces (and explicitly wide divisors).
+                    # Leave array arithmetic (NumPy fixed-width semantics)
+                    # and real modulo on their existing paths.
+                    def wide_integer_arithmetic(term):
+                        if (isinstance(term, ast.BinOp)
+                                and isinstance(term.op, (ast.Mult, ast.Add, ast.Sub))
+                                and self._expr_kind(term.left) == "int"
+                                and self._expr_kind(term.right) == "int"):
+                            symbol = {ast.Mult: "*", ast.Add: "+", ast.Sub: "-"}[type(term.op)]
+                            return (f"({wide_integer_arithmetic(term.left)} {symbol} "
+                                    f"{wide_integer_arithmetic(term.right)})")
+                        return f"int({self.expr(term)}, kind=int64)"
+                    product = wide_integer_arithmetic(node.left)
+                    return (f"int(modulo({product}, int({b}, kind=int64)), "
+                            f"kind=kind({b}))")
                 return f"modulo({a}, {b})"
             if op is ast.FloorDiv:
                 # Python // floors toward negative infinity (and, for
