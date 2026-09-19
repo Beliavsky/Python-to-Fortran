@@ -13,7 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import xpfunc2f
 
 XPFUNC2F_PATH = REPO_ROOT / "xpfunc2f.py"
-XPRIME_FUNC_PATH = REPO_ROOT / "xprime_func.py"
+XPRIME_FUNC_PATH = REPO_ROOT / "examples" / "xprime_func.py"
 XAR_ACF_PATH = REPO_ROOT / "examples" / "xar_acf.py"
 XFILTER_BOUNDS_PATH = REPO_ROOT / "examples" / "xfilter_bounds.py"
 XPARTITION_BOUNDS_PATH = REPO_ROOT / "examples" / "xpartition_bounds.py"
