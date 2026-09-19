@@ -1,6 +1,11 @@
+"""
+Simulate a VAR(2) process and recover its parameters by multivariate OLS
+using the normal equations.
+"""
+
 import numpy as np
 
-np.random.seed(123)
+rng = np.random.default_rng(123)
 
 # ------------------------------------------------------------
 # Simulate a VAR(2):
@@ -46,7 +51,7 @@ def simulate_var2(n, burn, c, A1, A2, Sigma):
     L = np.linalg.cholesky(Sigma)
 
     for t in range(2, ntot + 2):
-        e = L @ np.random.randn(k)
+        e = L @ rng.standard_normal(k)
 
         y[t] = (
             c
@@ -55,7 +60,7 @@ def simulate_var2(n, burn, c, A1, A2, Sigma):
             + e
         )
 
-    return y[burn + 2:]
+    return y[burn + 2:, :]
 
 
 def fit_var2(y):
@@ -65,17 +70,20 @@ def fit_var2(y):
     # [1, y_{t-1}', y_{t-2}']
     X = np.ones((n - 2, 1 + 2 * k))
 
-    X[:, 1:1 + k] = y[1:-1]
-    X[:, 1 + k:] = y[:-2]
+    X[:, 1:1 + k] = y[1:-1, :]
+    X[:, 1 + k:] = y[:-2, :]
 
-    # Responses y_t
-    Y = y[2:]
+    # Responses y_t (y[2:, :], not the bare y[2:] shorthand: a fresh
+    # variable's rank is inferred from its own RHS shape, and a
+    # single-slice row-shorthand on a 2D array wasn't picked up as 2D)
+    Y = y[2:, :]
 
-    # Multivariate OLS:
-    #
-    # B = argmin ||Y - X B||^2
-    #
-    B = np.linalg.lstsq(X, Y, rcond=None)[0]
+    # Multivariate OLS via the normal equations (np.linalg.lstsq(X, Y)[0]
+    # reduces to exactly this anyway): B = (X'X)^-1 X'Y = argmin ||Y-XB||^2.
+    # Solved directly rather than through lstsq's tuple-unpack lowering,
+    # whose result rank isn't picked up correctly for a matrix (multi-
+    # column) right-hand side like Y here.
+    B = np.linalg.solve(X.T @ X, X.T @ Y)
 
     c_fit = B[0]
 
@@ -96,7 +104,8 @@ def fit_var2(y):
 # Simulate
 # ------------------------------------------------------------
 
-y = simulate_var2(
+y = np.zeros((n, k))
+y[:, :] = simulate_var2(
     n,
     burn,
     c_true,
@@ -116,62 +125,40 @@ c_fit, A1_fit, A2_fit, Sigma_fit = fit_var2(y)
 # Compare true and fitted parameters
 # ------------------------------------------------------------
 
-def print_comparison(name, true, fit):
+# Two near-identical functions, not one: xp2f.py infers a fixed array
+# rank per function parameter from its call sites, and this same helper
+# would otherwise be called with both a 1D array (c) and 2D arrays
+# (A1/A2/Sigma), which it can't represent in one generated Fortran
+# subroutine.
+def print_comparison_vec(name, true, fit):
     print()
     print(name)
     print("-" * len(name))
     print("true:")
-    print(true)
+    print(np.round(true, 4))
     print()
     print("fit:")
-    print(fit)
+    print(np.round(fit, 4))
     print()
     print("fit - true:")
-    print(fit - true)
+    print(np.round(fit - true, 4))
 
 
-np.set_printoptions(precision=4, suppress=True)
+def print_comparison_mat(name, true, fit):
+    print()
+    print(name)
+    print("-" * len(name))
+    print("true:")
+    print(np.round(true, 4))
+    print()
+    print("fit:")
+    print(np.round(fit, 4))
+    print()
+    print("fit - true:")
+    print(np.round(fit - true, 4))
 
-print_comparison("Intercept c", c_true, c_fit)
-print_comparison("A1", A1_true, A1_fit)
-print_comparison("A2", A2_true, A2_fit)
-print_comparison("Innovation covariance Sigma", Sigma_true, Sigma_fit)
 
-
-# ------------------------------------------------------------
-# Put all VAR coefficients into one vector for a compact
-# comparison.
-# ------------------------------------------------------------
-
-true_params = np.concatenate([
-    c_true,
-    A1_true.ravel(),
-    A2_true.ravel()
-])
-
-fit_params = np.concatenate([
-    c_fit,
-    A1_fit.ravel(),
-    A2_fit.ravel()
-])
-
-print()
-print("Compact coefficient comparison")
-print("------------------------------")
-print("parameter       true        fit       fit-true")
-
-names = []
-
-for i in range(k):
-    names.append(f"c[{i + 1}]")
-
-for i in range(k):
-    for j in range(k):
-        names.append(f"A1[{i + 1},{j + 1}]")
-
-for i in range(k):
-    for j in range(k):
-        names.append(f"A2[{i + 1},{j + 1}]")
-
-for name, true, fit in zip(names, true_params, fit_params):
-    print(f"{name:10s} {true:10.4f} {fit:10.4f} {fit - true:10.4f}")
+print_comparison_vec("Intercept c", c_true, c_fit)
+print_comparison_mat("A1", A1_true, A1_fit)
+print_comparison_mat("A2", A2_true, A2_fit)
+print_comparison_mat("Innovation covariance Sigma", Sigma_true, Sigma_fit)
