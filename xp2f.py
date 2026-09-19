@@ -10651,6 +10651,11 @@ def normalize_zero_based_unit_stride_loops(lines):
         unsafe_re = re.compile(
             rf"\(\s*{re.escape(iv)}\s*\+\s*\d+\s*\)\s*[*/]"
             rf"|[*/]\s*\(\s*{re.escape(iv)}\s*\+\s*\d+\s*\)"
+            # In n - i + 1, the +1 is not an offset of i: replacing
+            # i+1 with i after shifting the loop loses two index positions.
+            # Multiplication/division can likewise bind more tightly than +.
+            rf"|[-*/]\s*\b{re.escape(iv)}\s*\+\s*\d+"
+            rf"|\b{re.escape(iv)}\s*\+\s*\d+\s*[*/]"
             rf"|:\s*\(?\s*{re.escape(iv)}\s*\+\s*\d+"
             rf"|{re.escape(iv)}\s*\+\s*\d+\s*\)?\s*:",
             flags=re.IGNORECASE,

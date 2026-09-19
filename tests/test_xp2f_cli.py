@@ -16179,6 +16179,40 @@ def test_first_deallocation_guard_keeps_intent_out_inside_loop() -> None:
     assert guard in xp2f.remove_redundant_first_guarded_deallocate(lines)
 
 
+@pytest.mark.parametrize("loop", ["do i = 0, n - 1", "do i = n - 1, 0, -1"])
+@pytest.mark.parametrize("index", ["n - 1 - i + 1", "2*i + 1", "n/i + 1", "i + 1*2"])
+def test_loop_rebasing_keeps_composite_index_arithmetic(loop: str, index: str) -> None:
+    lines = [loop, f"   a({index}) = b(i + 1)", "end do"]
+    assert xp2f.normalize_zero_based_unit_stride_loops(lines) == lines
+
+
+def test_loop_rebasing_still_handles_simple_indices() -> None:
+    lines = ["do i = 0, n - 1", "   a(i + 1) = b(i + 1)", "end do"]
+    assert xp2f.normalize_zero_based_unit_stride_loops(lines) == [
+        "do i = 1, n", "   a(i) = b(i)", "end do",
+    ]
+
+
+@pytest.mark.parametrize("reverse_loop", [False, True])
+def test_xp2f_reverse_indices_preserve_loop_origin(tmp_path: Path, reverse_loop: bool) -> None:
+    bounds = "n - 1, -1, -1" if reverse_loop else "n"
+    _run_xp2f_compile_diff(tmp_path, "xreverse_indices.py", [
+        "import numpy as np",
+        "def reverse_twice(n):",
+        "    b = np.arange(n, dtype=float) + 1.0",
+        "    d = np.zeros(n)",
+        "    c = np.zeros(n)",
+        f"    for i in range({bounds}):",
+        "        d[n-1-i] = b[i]",
+        f"    for i in range({bounds}):",
+        "        c[i] = d[n-1-i]",
+        "    print(d)",
+        "    print(c)",
+        "reverse_twice(1)",
+        "reverse_twice(5)",
+    ])
+
+
 @pytest.mark.parametrize("imported", [False, True])
 @pytest.mark.parametrize("dtype", ["int", "float", "complex"])
 def test_xp2f_matmul_two_vectors_returns_scalar(tmp_path: Path, imported: bool, dtype: str) -> None:
