@@ -15927,6 +15927,7 @@ MATH_DIRECT_IMPORT_SUPPORTED = {
     "log2", "log10", "gamma", "lgamma",
     "isfinite", "isinf", "isnan",
     "copysign", "hypot", "ldexp", "remainder",
+    "radians", "degrees",
 }
 
 
@@ -25487,6 +25488,7 @@ class translator(ast.NodeVisitor):
                     "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
                     "log2", "log10", "gamma", "lgamma",
                     "copysign", "hypot", "ldexp", "remainder",
+                    "radians", "degrees",
                 }:
                     return "real"
                 if mf in {"isfinite", "isinf", "isnan", "isclose"}:
@@ -28511,6 +28513,20 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Set):
             return 1
         if isinstance(node, ast.ListComp):
+            # A list comprehension whose OWN element expression is itself
+            # rank >= 1 (e.g. `[0.0] * n` inside `[[0.0] * n for _ in
+            # range(m)]`, the common "2D zero matrix" idiom) produces a
+            # genuine higher-rank array -- one extra dimension for the
+            # comprehension's own iteration, stacked on top of whatever
+            # rank each individual element already has. The previous
+            # blanket "any ListComp is rank 1" ignored this entirely,
+            # mis-declaring the result as a flat 1D array and corrupting
+            # every later `result[i][j]`-style read/write into invalid,
+            # doubly-subscripted Fortran text. Found mining
+            # TheAlgorithms/Python's own physics/hamiltonian.py.
+            _elt_rank = self._rank_expr(node.elt)
+            if _elt_rank >= 1:
+                return _elt_rank + 1
             return 1
         if isinstance(node, ast.Subscript):
             if (
@@ -33352,6 +33368,22 @@ class translator(ast.NodeVisitor):
                     if self._expr_kind(node.args[0]) in {"int", "logical"}:
                         a0 = f"real({a0}, kind=dp)"
                     return f"abs({a0})"
+                if mfn in {"radians", "degrees"} and len(node.args) == 1:
+                    # `from math import radians, degrees` (direct-import,
+                    # bare-name-call style) -- distinct from the already-
+                    # supported math.radians/math.degrees attribute-call
+                    # style. Found mining TheAlgorithms/Python's own
+                    # physics/magnetic_flux.py: `from math import cos,
+                    # radians` then a bare `radians(angle)` call had no
+                    # codegen at all ("unsupported call"), even though
+                    # both the numpy and math.-attribute-call spellings
+                    # of the identical formula already worked.
+                    a0 = self.expr(node.args[0])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if mfn == "degrees":
+                        return f"(({a0}) * (180.0_dp / acos(-1.0_dp)))"
+                    return f"(({a0}) * (acos(-1.0_dp) / 180.0_dp))"
                 if mfn == "log2" and len(node.args) == 1:
                     a0 = self.expr(node.args[0])
                     if self._expr_kind(node.args[0]) in {"int", "logical"}:

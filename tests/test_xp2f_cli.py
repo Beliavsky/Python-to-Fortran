@@ -18143,3 +18143,101 @@ def test_xp2f_ternary_in_return_with_non_atomic_branches(tmp_path: Path) -> None
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+def test_xp2f_math_direct_import_radians_degrees(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # physics/magnetic_flux.py: `from math import cos, radians` then a
+    # bare `radians(angle)` call had no codegen at all ("unsupported
+    # call") -- MATH_DIRECT_IMPORT_SUPPORTED never included "radians"/
+    # "degrees", even though both the numpy spelling (np.radians) and
+    # the math.-attribute-call spelling (math.radians(x)) already
+    # worked. Fixed by adding them to the direct-import allowlist and
+    # wiring the identical formula into the bare-name-call codegen and
+    # kind-inference dispatch already used for the other direct-import
+    # math functions.
+    src = tmp_path / "xmath_direct_import_radians_degrees.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from math import asin, cos, degrees, radians",
+                "",
+                "",
+                "def magnetic_flux(magnetic_field, area, angle):",
+                "    rad = radians(angle)",
+                "    return round(magnetic_field * area * cos(rad), 1)",
+                "",
+                "",
+                "def to_deg(x):",
+                "    return round(degrees(asin(x)), 1)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(magnetic_flux(50.0, 2.0, 60.0))",
+                "    print(magnetic_flux(1.0, 2.0, 180.0))",
+                "    print(to_deg(0.5))",
+                "    print(to_deg(1.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_list_comprehension_of_repeated_lists_infers_rank2(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # physics/hamiltonian.py: `[[0.0] * n for _ in range(n)]` (the
+    # common "2D zero matrix" idiom) followed by a double-subscript
+    # write (`hamiltonian[i][i] = x`) produced invalid Fortran
+    # ("hamiltonian(i + 1)(i + 1) = ...", "Unclassifiable statement").
+    # _rank_expr had a blanket "any ListComp is rank 1" rule that
+    # ignored the element expression's own rank entirely -- `[0.0] * n`
+    # is itself rank 1 (a repeated-list), so the whole comprehension is
+    # genuinely rank 2 (one dimension per row, one for the comprehension
+    # itself), but the mis-inferred rank-1 declaration made the
+    # existing (and otherwise correct) double-subscript-to-single-2D-
+    # subscript flattening logic decline to apply, falling through to
+    # a naive, invalid text-only nested-subscript emission instead.
+    # Fixed by making the ListComp case recurse into its own element's
+    # rank (`elt_rank + 1`) rather than assuming rank 1 unconditionally.
+    src = tmp_path / "xlistcomp_2d_repeated_list.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def identity_matrix(n):",
+                "    m = [[0.0] * n for _ in range(n)]",
+                "    for i in range(n):",
+                "        m[i][i] = 1.0",
+                "    return m",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(identity_matrix(4))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
