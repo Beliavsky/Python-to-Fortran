@@ -56542,7 +56542,21 @@ def _emit_local_function(
     # collision-avoidance _aliased_name already applies to genuine
     # Fortran keywords. Found mining TheAlgorithms/Python's own
     # physics/first_law_of_thermodynamics.py.
-    tr.reserved_names.add(fn.name)
+    #
+    # Excludes a RECURSIVE function (one that calls itself anywhere in
+    # its own body): _aliased_name's reserved-name renaming is a
+    # blanket, context-blind substitution -- it can't tell a genuine
+    # local-variable reference from a recursive self-call, so adding
+    # fn.name here would ALSO rename the function's own recursive call
+    # sites (e.g. `collatz_path(...)` inside `collatz_path` itself) to
+    # a name nothing else declares, an undefined-reference link
+    # failure. A function that both recurses AND shadows its own name
+    # with a local variable remains the pre-existing, narrower gap.
+    if not any(
+        isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == fn.name
+        for _n in ast.walk(fn)
+    ):
+        tr.reserved_names.add(fn.name)
     # A parameter whose Python name happens to collide with a Fortran
     # keyword (e.g. a callback argument literally named `function`,
     # found mining TheAlgorithms/Python's own bisection.py) is declared
