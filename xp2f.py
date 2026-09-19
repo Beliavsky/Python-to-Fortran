@@ -34896,8 +34896,12 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 a1 = self.expr(node.args[1])
-                np_name = self._numpy_call_attr(node.func)
-                if np_name == "dot" and self._rank_expr(node.args[0]) == 1 and self._rank_expr(node.args[1]) == 1:
+                if self._rank_expr(node.args[0]) == 1 and self._rank_expr(node.args[1]) == 1:
+                    # NumPy matmul, like dot, reduces two vectors to a scalar.
+                    # DOT_PRODUCT conjugates its first complex operand, unlike
+                    # NumPy; use an unconjugated product sum in that case.
+                    if any(self._expr_kind(a) == "complex" for a in node.args[:2]):
+                        return f"sum(({a0}) * ({a1}))"
                     return f"dot_product({a0}, {a1})"
                 return f"matmul({a0}, {a1})"
             if self._is_linalg_call(node.func, {"solve"}) and len(node.args) >= 2:

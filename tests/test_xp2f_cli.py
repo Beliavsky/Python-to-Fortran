@@ -16179,6 +16179,31 @@ def test_first_deallocation_guard_keeps_intent_out_inside_loop() -> None:
     assert guard in xp2f.remove_redundant_first_guarded_deallocate(lines)
 
 
+@pytest.mark.parametrize("imported", [False, True])
+@pytest.mark.parametrize("dtype", ["int", "float", "complex"])
+def test_xp2f_matmul_two_vectors_returns_scalar(tmp_path: Path, imported: bool, dtype: str) -> None:
+    call = "matmul" if imported else "np.matmul"
+    left = "[1+2j, 3-1j]" if dtype == "complex" else "[1, 3]"
+    right = "[2-1j, -1+4j]" if dtype == "complex" else "[2, -1]"
+    _run_xp2f_compile_diff(tmp_path, "xvector_matmul.py", [
+        "import numpy as np",
+        "from numpy import matmul",
+        f"a = np.array({left}, dtype={dtype})",
+        f"b = np.array({right}, dtype={dtype})",
+        f"result = {call}(np.transpose(a), b)",
+        "print(result.real)" if dtype == "complex" else "print(result)",
+        "print(result.imag)" if dtype == "complex" else "print(result + 2)",
+        f"matrix = np.array([[1, 2], [3, 4]], dtype={dtype})",
+        f"mv = {call}(matrix, b)",
+        f"vm = {call}(a, matrix)",
+        f"mm = {call}(matrix, matrix)",
+        # Compare numeric components, not Python/Fortran complex display syntax.
+        *(["print(mv.real)", "print(mv.imag)", "print(vm.real)", "print(vm.imag)",
+           "print(mm.real)", "print(mm.imag)"] if dtype == "complex"
+          else ["print(mv)", "print(vm)", "print(mm)"]),
+    ])
+
+
 @pytest.mark.parametrize("in_function", [False, True])
 def test_xp2f_string_augassign_preserves_spaces_and_numeric_addition(tmp_path: Path, in_function: bool) -> None:
     body = [
