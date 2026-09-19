@@ -38,6 +38,7 @@ from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import fortran_output as fout
 import fortran_int_kind as fikind
 import fortran_perf_hints as fphints
+import fortran_print_suppress as fpsuppress
 import fortran_loop_reorder as floop
 import fortran_post as fpost
 import fortran_purity as fpurity
@@ -14766,6 +14767,7 @@ def detect_needed_helpers(tree):
             for part in node.values:
                 if isinstance(part, ast.FormattedValue) and part.format_spec is not None:
                     needed.add("str_format_real_fixed")
+                    needed.add("str_format_real_sci")
             self.generic_visit(node)
 
         def visit_AugAssign(self, node):
@@ -30440,6 +30442,17 @@ class translator(ast.NodeVisitor):
                     if pv_kind == "int":
                         expr_txt = f"real({expr_txt}, kind=dp)"
                     piece = f"str_format_real_fixed({expr_txt}, {prec})"
+                elif pv_kind in {None, "real", "int"} and code == "e" and prec is not None and (width is None or width == "0"):
+                    # Python's scientific-notation f-string spec (e.g.
+                    # f"{work:.3e}") had no codegen at all -- only the
+                    # fixed-point ".Nf" spec was implemented. Found mining
+                    # TheAlgorithms/Python's own
+                    # physics/orbital_transfer_work.py: `return
+                    # f"{work:.3e}"`. str_format_real_sci (python.f90)
+                    # mirrors str_format_real_fixed's own approach.
+                    if pv_kind == "int":
+                        expr_txt = f"real({expr_txt}, kind=dp)"
+                    piece = f"str_format_real_sci({expr_txt}, {prec})"
                 elif pv_kind == "real" and not spec:
                     piece = f"py_str({expr_txt})"
                 else:
@@ -55430,21 +55443,36 @@ class translator(ast.NodeVisitor):
                         float_code = code if code in {"e", "f", "g"} else None
                         if float_code is not None:
                             expr_txt = f"real({expr_txt}, kind=dp)"
-                            # Fortran's plain `E` descriptor normalizes to
-                            # `0.ddddEsxx` (leading digit always 0), so
-                            # `E0.N` shows only N significant digits --
-                            # Python's `.Ne` gives d.ddd...E form, N+1 sig
-                            # figs. `ES` normalizes to that same d.ddd...
-                            # form Python/C use, so `ES0.N` matches it
-                            # exactly instead of silently rendering one
-                            # fewer significant digit.
-                            _desc = "es" if float_code == "e" else float_code
-                            if width is not None and prec is not None:
-                                fcode = f"{_desc}{width}.{prec}"
-                            elif prec is not None:
-                                fcode = f"{_desc}0.{prec}"
+                            if float_code == "e" and width is None and prec is not None:
+                                # gfortran's own ES exponent field always
+                                # uses a fixed 3 digits (e.g. E+008),
+                                # unlike Python's `.Ne` 2-digit MINIMUM
+                                # (expanding only when genuinely needed).
+                                # An explicit 2-digit `Ee` format suffix
+                                # does not reproduce this -- it hard-
+                                # overflows to asterisks for any exponent
+                                # that actually needs a 3rd digit. Route
+                                # through str_format_real_sci instead,
+                                # which strips the redundant leading zero
+                                # only when safe (see its own comment).
+                                fcode = "a"
+                                expr_txt = f"str_format_real_sci({expr_txt}, {prec})"
                             else:
-                                fcode = "g0"
+                                # Fortran's plain `E` descriptor normalizes to
+                                # `0.ddddEsxx` (leading digit always 0), so
+                                # `E0.N` shows only N significant digits --
+                                # Python's `.Ne` gives d.ddd...E form, N+1 sig
+                                # figs. `ES` normalizes to that same d.ddd...
+                                # form Python/C use, so `ES0.N` matches it
+                                # exactly instead of silently rendering one
+                                # fewer significant digit.
+                                _desc = "es" if float_code == "e" else float_code
+                                if width is not None and prec is not None:
+                                    fcode = f"{_desc}{width}.{prec}"
+                                elif prec is not None:
+                                    fcode = f"{_desc}0.{prec}"
+                                else:
+                                    fcode = "g0"
                         else:
                             if width is not None and align == "<":
                                 fcode = "a"
@@ -55469,16 +55497,24 @@ class translator(ast.NodeVisitor):
                             fcode = "l1"
                     else:
                         real_code = code if code in {"e", "f", "g"} else None
-                        # See the matching int-kind branch above: `ES`
-                        # (not plain `E`) is needed to match Python's own
-                        # `.Ne` significant-digit count.
-                        _desc = "es" if real_code == "e" else real_code
-                        if real_code is not None and width is not None and prec is not None:
-                            fcode = f"{_desc}{width}.{prec}"
-                        elif real_code is not None and prec is not None:
-                            fcode = f"{_desc}0.{prec}"
+                        if real_code == "e" and width is None and prec is not None:
+                            # See the matching int-kind branch above:
+                            # routes through str_format_real_sci rather
+                            # than a fixed 2-digit `Ee` format suffix,
+                            # which would overflow to asterisks for any
+                            # exponent that genuinely needs a 3rd digit.
+                            fcode = "a"
+                            expr_txt = f"str_format_real_sci({expr_txt}, {prec})"
                         else:
-                            fcode = "g0"
+                            # `ES` (not plain `E`) is needed to match
+                            # Python's own `.Ne` significant-digit count.
+                            _desc = "es" if real_code == "e" else real_code
+                            if real_code is not None and width is not None and prec is not None:
+                                fcode = f"{_desc}{width}.{prec}"
+                            elif real_code is not None and prec is not None:
+                                fcode = f"{_desc}0.{prec}"
+                            else:
+                                fcode = "g0"
 
                     fmt_parts.append(fcode)
                     items.append(expr_txt)
@@ -56329,7 +56365,16 @@ def _emit_local_function(
         ret_vals = [s.value for s in _value_returns_excluding_nested(fn)]
         if ret_vals and all(isinstance(v, ast.Name) and v.id == ret_vals[0].id for v in ret_vals):
             cand = ret_vals[0].id
-            if cand not in args:
+            # Fortran requires a RESULT variable's name to be DIFFERENT
+            # from the function's own name ("RESULT variable ... must be
+            # different than function name") -- reusing the bare
+            # returned variable's own name as result(...) is only safe
+            # when that name doesn't happen to equal the enclosing
+            # function's own name too (e.g. `def work(...): work = ...;
+            # return work`). Falls back to the already-computed generic
+            # func_res name in that case. Found mining TheAlgorithms/
+            # Python's own physics/first_law_of_thermodynamics.py.
+            if cand not in args and cand != fn.name:
                 ret_name = cand
 
     if fn.name == "logsumexp" and len(args) >= 3:
@@ -56482,6 +56527,22 @@ def _emit_local_function(
         current_function_name=fn.name,
         structured_type_components=structured_type_components,
     )
+    # A local variable inside a function whose name happens to match the
+    # ENCLOSING function's own name (e.g. `def work(...): work = ...;
+    # return round(work, 1)`) is a genuine Fortran restriction, not just
+    # a style issue: the function's own name is implicitly a symbol in
+    # its own scope even when using `result(func_res)`, so redeclaring it
+    # as a local variable is a hard compile error ("already has basic
+    # type"). This didn't trigger when the function returns the bare
+    # self-named variable directly (`return work`), since that path
+    # already reuses the function's own name as its `result(...)` name
+    # (legal Fortran) instead of declaring a separate local -- only the
+    # general case (returning some OTHER expression involving it, e.g.
+    # `return round(work, 1)`) hit this. Reuse the same reserved-name
+    # collision-avoidance _aliased_name already applies to genuine
+    # Fortran keywords. Found mining TheAlgorithms/Python's own
+    # physics/first_law_of_thermodynamics.py.
+    tr.reserved_names.add(fn.name)
     # A parameter whose Python name happens to collide with a Fortran
     # keyword (e.g. a callback argument literally named `function`,
     # found mining TheAlgorithms/Python's own bisection.py) is declared
@@ -70443,6 +70504,7 @@ def transpile_file(
     value_scalar_args=False,
     int_kind=None,
     perf_hints=False,
+    suppress_function_print=False,
 ):
     if src_override is not None:
         src = normalize_numpy_removed_aliases(src_override)
@@ -71078,6 +71140,21 @@ def transpile_file(
     f90_lines = enforce_space_before_inline_comments(f90_lines)
     if explain_inference:
         f90_lines = add_inference_explanation_comments(f90_lines, tree, comment_map)
+    if suppress_function_print:
+        # Opt-in (see fortran_print_suppress.py's own module docstring
+        # for the full rationale): a Fortran FUNCTION that performs
+        # output, however deeply nested in its own call graph, is a
+        # latent "recursive I/O" crash risk for ANY future caller that
+        # embeds its result directly in another print/write statement
+        # -- even if this program never does so today. Runs BEFORE the
+        # PURE-promotion pass just below, so a routine whose only
+        # purity blocker was its own (now-suppressed) I/O becomes
+        # eligible for `pure` too, rather than needing a second full
+        # postprocessing pass to notice.
+        f90_lines, _suppressed_print_warnings = fpsuppress.suppress_function_reachable_stdout_prints(f90_lines)
+        _suppressed_print_text = fpsuppress.format_warnings(_suppressed_print_warnings, stem + "_p.f90")
+        if _suppressed_print_text:
+            print(_suppressed_print_text, file=sys.stderr)
     # Promote any procedure not already marked pure/elemental to `pure`
     # wherever the EMITTED Fortran itself proves it's safe -- ground truth
     # on the generated code, not a heuristic scan of the Python source that
@@ -71333,6 +71410,7 @@ def main():
     ap.add_argument("--value-args", action="store_true", help="declare a read-only scalar dummy argument (not CHARACTER, not a derived type) VALUE instead of intent(in) -- avoids a pass-by-reference indirection on every access, a real win for hot scalar arguments (e.g. deep recursion)")
     ap.add_argument("--int-kind", choices=["int32", "int64"], default=None, help="declare integers with an explicit kind (integer, parameter :: ikind = int32|int64; integer(kind=ikind) everywhere) instead of the compiler's bare default integer -- avoids silent overflow on large values, matching pyccel's own default. Excludes a fixed set of external LAPACK/scipy.optimize-bridge boundary calls, which require plain default-kind INTEGER arguments -- see fortran_int_kind.py")
     ap.add_argument("--perf-hints", action="store_true", help="print (to stderr; never modifies the generated Fortran) a warning for each row-slice or loop-strided array access found AFTER --optimize-loops has already run -- a pattern pyccel's translation typically avoids by transposing array storage, that this project's own tools can't safely fix (would mean reshaping an array's own declared layout) -- see fortran_perf_hints.py")
+    ap.add_argument("--suppress-function-print", action="store_true", help="comment out every stdout PRINT/external-unit WRITE statement reachable (directly, or through any number of calls) from any FUNCTION in the generated Fortran -- a Fortran FUNCTION is usable inside an expression, and calling one that performs I/O from within another print/write statement's own argument list is a hard 'recursive I/O' crash at runtime, so this removes the risk globally rather than leaving it for a future caller to trip over. Prints a warning (to stderr) for every statement suppressed, since that is exactly where the Fortran translation's own console output starts to diverge from the original Python program's -- see fortran_print_suppress.py")
     ap.add_argument("--elemental", action="store_true", help="also declare a PURE procedure ELEMENTAL where the emitted Fortran proves it's safe (scalar dummies/result, no procedure dummy, never passed as a callback)")
     ap.add_argument("--max-use-only", type=int, default=None, metavar="N", help="collapse a `use MOD, only: a, b, ...` statement with more than N names into a bare `use MOD ! imports K entities` -- only for a module this same run also generated, and only when doing so can't collide with anything else visible in that use statement's own enclosing module/program")
     ap.add_argument("--list-directed-io", action="store_true", help="rewrite formatted write/print to list-directed output")
@@ -71790,6 +71868,7 @@ def main():
             value_scalar_args=args.value_args,
             int_kind=args.int_kind,
             perf_hints=args.perf_hints,
+            suppress_function_print=args.suppress_function_print,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:

@@ -141,6 +141,7 @@ public :: py_str !@pyapi kind=function ret=character args=x:any:intent(in) desc=
 public :: py_str_int
 public :: str_concat
 public :: str_format_real_fixed !@pyapi kind=function ret=character args=x:real(dp):intent(in),prec:integer:intent(in) desc="format real with fixed decimal places"
+public :: str_format_real_sci !@pyapi kind=function ret=character args=x:real(dp):intent(in),prec:integer:intent(in) desc="format real in scientific notation matching Python's {:.Ne} f-string spec"
 public :: py_float !@pyapi kind=function ret=real(dp) args=s:character:intent(in) desc="parse string to real(dp), NaN on read failure"
 public :: py_int !@pyapi kind=function ret=integer args=s:character:intent(in) desc="parse string to integer, 0 on read failure"
 public :: digits_of_str !@pyapi kind=function ret=integer(:) args=s:character:intent(in) desc="return decimal digits in a string as an integer vector"
@@ -1369,6 +1370,49 @@ contains
          write(buf, fmt) x
          s = trim(adjustl(buf))
       end function str_format_real_fixed
+
+      pure function str_format_real_sci(x, prec) result(s)
+         real(kind=dp), intent(in) :: x
+         integer, intent(in) :: prec
+         character(len=:), allocatable :: s
+         character(len=32) :: fmt
+         character(len=128) :: buf
+         integer :: p, i, epos
+         p = max(0, prec)
+         ! gfortran's own ES exponent field always uses a FIXED 3 digits
+         ! for real(dp) (e.g. E+008), regardless of the value's actual
+         ! magnitude. Python's `.Ne` spec uses a 2-digit MINIMUM,
+         ! expanding only when the magnitude genuinely needs a 3rd digit
+         ! (e.g. 1e-100 is still shown as e-100 in Python too). Forcing a
+         ! fixed 2-digit exponent width via an explicit `E2` format
+         ! descriptor suffix does NOT reproduce this -- it hard-overflows
+         ! to a field of asterisks for any exponent that actually needs a
+         ! 3rd digit, which is worse than gfortran's own always-3-digit
+         ! default. Instead, let gfortran pick its own (always-3-digit)
+         ! width, then strip exactly one redundant leading zero from the
+         ! exponent digits when present -- this reproduces Python's
+         ! variable-width behavior exactly, with no overflow risk at any
+         ! magnitude.
+         write(fmt, '("(ES0.",i0,")")') p
+         write(buf, fmt) x
+         s = trim(adjustl(buf))
+         if (p == 0) then
+            ! Python's `.0e` spec omits the decimal point entirely
+            ! (e.g. "1e+08"); Fortran's ES format always keeps a
+            ! trailing "." even with zero decimal digits (e.g. "1.E+08").
+            epos = index(s, '.')
+            if (epos > 0) s = s(1:epos-1) // s(epos+1:)
+         end if
+         epos = index(s, 'E')
+         if (epos > 0 .and. epos + 2 <= len(s)) then
+            if (s(epos+2:epos+2) == '0') then
+               s = s(1:epos+1) // s(epos+3:)
+            end if
+         end if
+         do i = 1, len(s)
+            if (s(i:i) == 'E') s(i:i) = 'e'
+         end do
+      end function str_format_real_sci
 
       function py_str_logical(x) result(s)
          logical, intent(in) :: x
