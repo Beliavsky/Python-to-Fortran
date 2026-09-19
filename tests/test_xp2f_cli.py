@@ -9768,6 +9768,45 @@ def _run_xp2f_compile_diff(tmp_path: Path, filename: str, lines: list) -> None:
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_xp2f_logical_numeric_comparisons(tmp_path: Path, reverse: bool) -> None:
+    lines = [
+        "import numpy as np",
+        "a = np.array([False, True], dtype=bool)",
+        "nums = np.array([-1.0, 0.0, 0.5, 1.0, 2.0, np.nan])",
+        "ints = np.array([-1, 0, 1, 2])",
+    ]
+    for op in ("==", "!=", "<", "<=", ">", ">="):
+        for rhs in ("0", "1", "0.0", "1.0", "2", "0.5", "True"):
+            left, right = (rhs, "a") if reverse else ("a", rhs)
+            lines.append(f"print(({left} {op} {right}).astype(int))")
+        for values in ("nums", "ints"):
+            lines.append(f"for x in {values}:")
+            left, right = ("x", "a") if reverse else ("a", "x")
+            lines.append(f"    print(({left} {op} {right}).astype(int))")
+        left, right = ("nums", "a[i]") if reverse else ("a[i]", "nums")
+        lines += ["for i in range(2):", f"    print(({left} {op} {right}).astype(int))"]
+    lines += ["for i in range(2):", "    if a[i] == 0:", "        print(0)", "    else:", "        print(1)"]
+    _run_xp2f_compile_diff(tmp_path, "xlogical_numeric_compare.py", lines)
+    generated = (tmp_path / "xlogical_numeric_compare_p.f90").read_text(encoding="utf-8")
+    assert ".not. (a(" in generated
+    assert "merge(1, 0," in generated
+
+
+def test_xp2f_logical_numeric_comparison_broadcasting(tmp_path: Path) -> None:
+    lines = [
+        "import numpy as np",
+        "a = np.array([False, True], dtype=bool)",
+        "m = np.array([[0, 1], [2, -1], [1, 0]])",
+        "b = np.array([[False, True], [True, False], [True, True]], dtype=bool)",
+        "v = np.array([0.5, 2.0])",
+    ]
+    for op in ("==", "!=", "<", "<=", ">", ">="):
+        for left, right in (("a", "m"), ("m", "a"), ("b", "v"), ("v", "b")):
+            lines.append(f"print(({left} {op} {right}).astype(int))")
+    _run_xp2f_compile_diff(tmp_path, "xlogical_numeric_broadcast.py", lines)
+
+
 def test_xp2f_pandas_df_cummax_cummin(tmp_path: Path) -> None:
     # Regression test: df.cummax()/df.cummin() -- new DataFrame_str_index/
     # DataFrame_index_date type-bound procedures (cummax_str/cummin_str
@@ -18224,6 +18263,113 @@ def test_xp2f_list_comprehension_of_repeated_lists_infers_rank2(tmp_path: Path) 
                 "",
                 "if __name__ == \"__main__\":",
                 "    print(identity_matrix(4))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+def test_xp2f_tuple_assignment_all_name_targets_preserves_simultaneity(tmp_path: Path) -> None:
+    # Real, silent-wrong-value bug found mining TheAlgorithms/Python's
+    # own maths/numerical_analysis/secant_method.py: `x0, x1 = x1, x1 -
+    # (f(x1) * (x1 - x0)) / (f(x1) - f(x0))`. Python's tuple assignment
+    # evaluates every RHS value FIRST (using the OLD values of every
+    # target), THEN assigns them all -- exactly why the classic `a, b =
+    # b, a` swap idiom needs no temp in Python. The existing codegen for
+    # an all-plain-Name tuple-unpack target emitted one sequential
+    # Fortran assignment per target IN ORDER with no temps at all, so by
+    # the second statement the first target had already been
+    # overwritten -- silently corrupting the result (or, as in the real
+    # secant_method repro, feeding a 0/0 division that crashes with a
+    # Fortran runtime "Recursive I/O"/SIGFPE). A sibling rewrite pass
+    # already fixed this correctly, with temps, for Subscript/Attribute
+    # targets -- but explicitly (and incorrectly) assumed "All-Name
+    # targets are already handled natively". Fixed by removing that
+    # bailout, so all-Name targets go through the same already-correct
+    # temp-based desugaring.
+    src = tmp_path / "xtuple_assign_all_name_targets.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def fib_pair(a, b, n):",
+                "    x0 = a",
+                "    x1 = b",
+                "    for _ in range(n):",
+                "        x0, x1 = x1, x1 + x0",
+                "    return x0, x1",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    a = 1.0",
+                "    b = 2.0",
+                "    a, b = b, a",
+                "    print(a, b)",
+                "    r0, r1 = fib_pair(1.0, 1.0, 3)",
+                "    print(r0, r1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_ternary_with_non_atomic_branches_as_list_element(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python's own
+    # maths/numerical_analysis/brent_method.py: a ternary whose branches
+    # are NOT both simple atoms (e.g. involving a comparison or a
+    # function call), used as an ELEMENT of a list literal rather than
+    # as a bare `return` value, was rejected outright ("IfExp requires
+    # statement-level lowering for non-atomic branches"). A dedicated
+    # fix already covers the `return A if test else B` shape, but that
+    # fix is specific to the return-statement codegen path and doesn't
+    # help a ternary used anywhere else in an expression. Fixed with a
+    # new, general AST-rewrite pass (rewrite_nonatomic_ternary_to_temp)
+    # that hoists such a ternary into a preceding `if test: tmp = A;
+    # else: tmp = B` block wherever it appears inside a function body
+    # (deliberately scoped to function bodies only -- hoisting at
+    # module/top-level scope hit a separate, pre-existing gap in
+    # top-level declaration collection for a name assigned only inside
+    # both branches of an if/else).
+    src = tmp_path / "xternary_nonatomic_list_element.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def classify(x, y):",
+                "    conditions = [",
+                "        x > 0 if x > y else y > 0,",
+                "        x == y,",
+                "    ]",
+                "    return any(conditions)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(classify(1.0, 2.0))",
+                "    print(classify(-1.0, -2.0))",
+                "    print(classify(3.0, 3.0))",
                 "",
             ]
         ),

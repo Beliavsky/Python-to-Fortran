@@ -4868,6 +4868,169 @@ def rewrite_pop_call_expr_to_temp(tree):
     return new_tree
 
 
+def rewrite_nonatomic_ternary_to_temp(tree):
+    """Hoist a ternary (`A if test else B`) whose branches are NOT both
+    simple atoms (a bare Name or Constant) out of whatever expression it
+    appears in, into a preceding `if test: tmp = A; else: tmp = B` block,
+    replacing the original ternary with a reference to `tmp`.
+
+    Fortran's MERGE intrinsic (this project's own codegen for a ternary
+    whose branches ARE both atoms) evaluates both operands eagerly --
+    unlike Python's own short-circuiting ternary, which only ever
+    evaluates the taken branch -- so it's only safe to use when neither
+    branch could have a side effect or fail if evaluated unconditionally.
+    For anything else (a function call, an arithmetic expression, ...)
+    this project's own codegen just declined outright ("IfExp requires
+    statement-level lowering for non-atomic branches"). A dedicated fix
+    already covers the single most common shape, `return A if test else
+    B` (translator.visit_Return / _emit_local_function's own duplicate
+    return-codegen path) -- deliberately left untouched here, via the
+    same-shaped early-return in _process_body below, to avoid any
+    interaction with that already-tested fix. This pass covers every
+    OTHER position a ternary can appear in (a list-literal element, a
+    nested call argument, ...), found mining TheAlgorithms/Python's own
+    maths/numerical_analysis/brent_method.py: `conditions = [not (... <
+    s < ...) if right > left else not (... < s < ...), ...]`.
+
+    Processes from the innermost ternary outward (a post-order
+    NodeTransformer), matching rewrite_pop_call_expr_to_temp's own
+    ordering rationale, so a ternary nested inside another ternary's own
+    branch hoists correctly, innermost first.
+    """
+    counter = [0]
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
+    def _next_tmp():
+        while True:
+            counter[0] += 1
+            cand = f"ternary_tmp_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    def _is_atomic(n):
+        return isinstance(n, (ast.Name, ast.Constant))
+
+    def _is_problematic_ifexp(n):
+        return isinstance(n, ast.IfExp) and not (_is_atomic(n.body) and _is_atomic(n.orelse))
+
+    class _TernaryHoister(ast.NodeTransformer):
+        def __init__(self):
+            self.hoisted = []
+
+        def visit_IfExp(self, node):
+            self.generic_visit(node)
+            if not _is_problematic_ifexp(node):
+                return node
+            tmp = _next_tmp()
+            if_stmt = ast.If(
+                test=node.test,
+                body=[ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=node.body)],
+                orelse=[ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=node.orelse)],
+            )
+            ast.copy_location(if_stmt, node)
+            ast.fix_missing_locations(if_stmt)
+            self.hoisted.append(if_stmt)
+            return ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), node)
+
+        # Don't descend into a nested function/lambda's own body/defaults --
+        # a ternary there belongs to that inner scope's own statement
+        # list, handled separately when this rewrite recurses into it.
+        def visit_FunctionDef(self, node):
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            return node
+
+        def visit_Lambda(self, node):
+            return node
+
+    class _Rewriter(ast.NodeTransformer):
+        def __init__(self):
+            # Only hoist inside a function body -- never at module/
+            # top-level ("exec") scope. A temp variable introduced by
+            # this rewrite at top level is silently never declared at
+            # all ("Symbol ... has no IMPLICIT type"): a genuine, PRE-
+            # EXISTING gap in the whole-program declaration-collection
+            # logic for a top-level name assigned only inside both
+            # branches of an if/else (never unconditionally) -- found
+            # via this rewrite (which produces exactly that shape) but
+            # not caused by it, and not something to fix as a side
+            # effect of this change. Confirmed the same "no IMPLICIT
+            # type" failure with a plain, hand-written top-level `if x:
+            # y = 1.0 else: y = 2.0` containing no ternary at all.
+            self._in_func = 0
+
+        def _process_body(self, stmts):
+            out = []
+            for st in stmts:
+                st = self.visit(st)
+                if st is None:
+                    continue
+                stmts_to_add = st if isinstance(st, list) else [st]
+                for one in stmts_to_add:
+                    if not self._in_func:
+                        out.append(one)
+                        continue
+                    if isinstance(one, ast.Return) and one.value is not None and _is_problematic_ifexp(one.value):
+                        # The exact `return A if test else B` shape is
+                        # already handled by a dedicated statement-level
+                        # lowering elsewhere -- leave it untouched here.
+                        out.append(one)
+                        continue
+                    hoister = _TernaryHoister()
+                    new_one = hoister.visit(one)
+                    out.extend(hoister.hoisted)
+                    out.append(new_one)
+            return out
+
+        def visit_FunctionDef(self, node):
+            self._in_func += 1
+            node.body = self._process_body(node.body)
+            self._in_func -= 1
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            self._in_func += 1
+            node.body = self._process_body(node.body)
+            self._in_func -= 1
+            return node
+
+        def visit_If(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_For(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_While(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_With(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_Module(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
 def rewrite_tuple_assign_subscript_targets_to_temps(tree):
     """Rewrite `T1, T2, ... = V1, V2, ...` (a flat tuple/list assignment
     with a literal tuple/list on both sides, same length) into temp-
@@ -4932,10 +5095,24 @@ def rewrite_tuple_assign_subscript_targets_to_temps(tree):
                 return node
             if not all(isinstance(t, (ast.Name, ast.Subscript, ast.Attribute)) for t in targets):
                 return node
-            if not any(isinstance(t, (ast.Subscript, ast.Attribute)) for t in targets):
-                # All-Name targets are already handled natively -- leave
-                # untouched.
-                return node
+            # Previously bailed out here when every target was a plain
+            # Name, on the assumption that "the existing machinery
+            # already handles the plain-all-Names case natively" -- it
+            # doesn't. That native codegen (visit_Assign's own flat-
+            # tuple-target handling) just emits one sequential Fortran
+            # assignment per target, in order -- so `x0, x1 = x1, x1 +
+            # x0` becomes `x0 = x1` then `x1 = x1 + x0`, except by the
+            # second statement x0 has ALREADY been overwritten to the
+            # new value, silently corrupting the result (or, worse,
+            # triggering a 0/0 floating-point exception when the
+            # corrupted value feeds a division, as in
+            # maths/numerical_analysis/secant_method.py's own `x0, x1 =
+            # x1, x1 - (f(x1) * (x1 - x0)) / (f(x1) - f(x0))`). This is
+            # exactly the same "must read every value before writing any
+            # target" hazard the Subscript/Attribute case above already
+            # exists to fix -- even the classic `a, b = b, a` swap idiom
+            # was broken by it. Desugaring through temps uniformly,
+            # regardless of target kind, sidesteps the bug at its root.
             out = []
             tmp_names = []
             for v in values:
@@ -31349,14 +31526,34 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported compare op")
             a0 = self.expr(node.left)
             b0 = self.expr(node.comparators[0])
-            a = a0
-            b = b0
+            left_kind = self._expr_kind(node.left)
+            right_kind = self._expr_kind(node.comparators[0])
             if op in (ast.Eq, ast.NotEq):
-                left_kind = self._expr_kind(node.left)
-                right_kind = self._expr_kind(node.comparators[0])
                 if left_kind == "logical" and right_kind == "logical":
                     logical_op = ".eqv." if op is ast.Eq else ".neqv."
-                    return f"({a} {logical_op} {b})"
+                    return f"({a0} {logical_op} {b0})"
+                # Python bools have numeric values 0/1. For literal 0/1,
+                # preserve the logical operand directly (including arrays).
+                for kind, logical_expr, other in (
+                    (left_kind, a0, node.comparators[0]),
+                    (right_kind, b0, node.left),
+                ):
+                    if (kind == "logical" and isinstance(other, ast.Constant)
+                            and isinstance(other.value, (int, float))
+                            and not isinstance(other.value, bool)
+                            and other.value in (0, 1)):
+                        negate = (other.value == 0) == (op is ast.Eq)
+                        return f"(.not. ({logical_expr}))" if negate else f"({logical_expr})"
+            # General comparisons must use numeric values, not truthiness:
+            # True == 2 is false, and True < 0.5 is false. Convert before
+            # broadcasting so mixed-rank operands retain their shapes.
+            numeric_kinds = {"int", "real", "complex", "logical"}
+            if left_kind == "logical" and right_kind in numeric_kinds:
+                a0 = f"merge(1, 0, {a0})"
+            if right_kind == "logical" and left_kind in numeric_kinds:
+                b0 = f"merge(1, 0, {b0})"
+            a = a0
+            b = b0
             # Limited broadcasting for comparisons: rank-2 with rank-1.
             if self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1:
                 if self._is_col2_expr(node.comparators[0]):
@@ -70229,6 +70426,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
@@ -70571,6 +70769,7 @@ def transpile_file(
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
@@ -71295,6 +71494,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
