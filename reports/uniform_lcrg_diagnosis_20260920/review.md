@@ -49,3 +49,27 @@ integer-only modular arithmetic.
 exact powers, and records products and remainders in `analysis.json`. Logs are
 stored alongside the probe. A full pytest run is unnecessary for this
 investigation-only change.
+
+## Follow-up: reject unsafe comment-driven scalar narrowing
+
+The translator now rejects observed real scalar arguments when the selected
+procedure still declares that parameter integer based on comments. It does not
+silently promote all calls to real, which could lose integer precision in other
+call sites. Full specialization of this case remains future work.
+
+Integer actual arguments, explicit caller-side int conversions, and an
+unconditional callee-side `x = int(x)` before any other use remain supported.
+A conditional or later conversion is not treated as permission to narrow at
+entry. Existing array-handling paths are not changed by this scalar diagnostic.
+
+`check.py --check-rejection` verifies the new diagnostic on the reduced case.
+The default checker mode and existing logs describe the pre-fix behavior and
+require the pre-fix translator. A full pytest checkpoint is recommended after
+this inference validation change.
+
+The full current uniform.py translation also encounters this conflict earlier:
+line 1669 passes `a*x-c` to integer-comment parameter `i` of `i4_modp`, after
+`x` is returned by congruence (whose general path uses a floating-point work
+array). It now stops there with the explicit diagnostic. The isolated LCRG
+probe separately verifies the intended lcrg_evaluate diagnostic; this change
+does not claim the complete uniform.py now translates or runs successfully.

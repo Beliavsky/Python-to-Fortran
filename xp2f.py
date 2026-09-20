@@ -22648,6 +22648,14 @@ class translator(ast.NodeVisitor):
                 have = visible_kind
         if have is None or have == want:
             return arg_expr
+        comment_target = getattr(arg_node, "_xp2f_comment_integer_target", None)
+        if comment_target and want == "int" and have == "real" and self._rank_expr(arg_node) == 0:
+            callee, parameter = comment_target
+            raise NotImplementedError(
+                f"unsupported real scalar argument for integer-comment parameter '{parameter}' "
+                f"of '{callee}': implicit integer conversion would change Python semantics; "
+                "use an explicit int(...) conversion only if integer arithmetic is intended"
+            )
         if want == "char":
             if isinstance(arg_node, ast.BinOp) and isinstance(arg_node.op, ast.Mult):
                 def _int_of_char_expr(n):
@@ -68508,6 +68516,56 @@ def generate_flat(
                 and _curr_kinds[_i] is None
             ):
                 _curr_kinds[_i] = _bk
+    # Do not silently narrow an observed real scalar merely because a comment
+    # describes the dummy as integer. Promoting the shared procedure to real
+    # is not a safe substitute either: integer callers can need exact products.
+    # Until these comment-conflicting signatures can be specialized end-to-end,
+    # diagnose the unsupported call instead of changing Python arithmetic.
+    comment_integer_guards = {}
+    for fn in (local_funcs or []):
+        if fn.name in local_overload_specs:
+            continue
+        names = local_func_arg_names.get(fn.name, [])
+        kinds = local_func_arg_kinds.get(fn.name, [])
+        ranks = local_func_arg_ranks.get(fn.name, [])
+        comments = comment_func_arg_kinds.get(fn.name, [])
+        candidates = [i for i in range(len(names))
+                      if i < len(kinds) and kinds[i] == "int"
+                      and i < len(ranks) and ranks[i] == 0
+                      and i < len(comments) and comments[i] == "int"]
+        for i in candidates:
+            # An unconditional int(arg) before any other use makes the
+            # conversion explicit in Python too. A later/conditional cast
+            # must not excuse narrowing before earlier computations.
+            explicit_conversion = False
+            for st in fn.body:
+                if not any(isinstance(n, ast.Name) and n.id == names[i] for n in ast.walk(st)):
+                    continue
+                explicit_conversion = (
+                    isinstance(st, ast.Assign) and len(st.targets) == 1
+                    and isinstance(st.targets[0], ast.Name) and st.targets[0].id == names[i]
+                    and isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Name)
+                    and st.value.func.id == "int" and len(st.value.args) == 1
+                    and not st.value.keywords and isinstance(st.value.args[0], ast.Name)
+                    and st.value.args[0].id == names[i]
+                )
+                break
+            if not explicit_conversion:
+                comment_integer_guards[(fn.name, i)] = names[i]
+    # Check the actual's final type at emission, not a provisional return-kind
+    # guess (e.g. an integer seed fed back from a local function in a loop).
+    for root in [tree] + list(local_funcs or []):
+        for call in ast.walk(root):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
+                continue
+            names = local_func_arg_names.get(call.func.id, [])
+            actuals = list(enumerate(call.args))
+            actuals += [(names.index(kw.arg), kw.value) for kw in call.keywords if kw.arg in names]
+            for i, actual in actuals:
+                parameter = comment_integer_guards.get((call.func.id, i))
+                if parameter is not None:
+                    actual._xp2f_comment_integer_target = (call.func.id, parameter)
+
     # Resolve specific result profiles before emitting any caller, including
     # callers that precede their callee in source order.
     overload_return_maps = {}

@@ -7,6 +7,23 @@ Compare results against Python and, where possible, independent reference values
 or mathematical checks. Output comparisons should account for printed precision,
 random inputs, and differences in array display conventions.
 
+## Integer comments conflicting with real scalar arguments
+
+When a procedure parameter remains integer-typed from source comments but a
+caller supplies a known real scalar, the transpiler rejects the conflicting
+call instead of silently inserting an integer conversion. Specializing these
+comment-conflicting integer/real calls is not yet supported generally. Integer
+calls and explicit conversions remain supported, including an unconditional
+`x = int(x)` before any other use in the callee.
+
+This catches Burkardt's `uniform.py` LCRG case: `np.zeros` stores floating-point
+seeds, but `lcrg_evaluate` documents integer parameters. Converting those seeds
+to integers changes large-product rounding and subsequent modular arithmetic.
+The former translation matched the exact integer generator but not Python's
+floating-point computation. Use explicit `int(...)` only when integer arithmetic
+is actually intended. `--ignore-comments` matches the reduced diagnostic's
+floating-point results, but has not been validated as a whole-program workaround.
+
 ## Percent formatting without a conversion specifier
 
 Expressions such as `'RMS error = ' % value` are rejected with an explicit

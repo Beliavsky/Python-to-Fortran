@@ -13,6 +13,15 @@ def run(cmd, name):
     (OUT/(name+'.log')).write_text(proc.stdout+proc.stderr,encoding='utf-8')
     assert proc.returncode == 0, proc.stdout+proc.stderr
     return proc.stdout
+if '--check-rejection' in sys.argv:
+    proc = subprocess.run([sys.executable,str(ROOT/'xp2f.py'),str(OUT/'probe.py'),
+                           '--out',str(OUT/'probe_rejected_p.f90')],cwd=OUT,
+                          capture_output=True,text=True,timeout=240)
+    assert proc.returncode != 0
+    assert "integer-comment parameter 'x' of 'lcrg_evaluate'" in proc.stdout+proc.stderr
+    print(proc.stdout+proc.stderr)
+    sys.exit(0)
+
 run([sys.executable,str(ROOT/'xp2f.py'),str(OUT/'probe.py'),str(ROOT/'python.f90'),
      '--compile','--compiler',FLAGS], 'build')
 outputs = [run([sys.executable,str(OUT/'probe.py')],'python'),run([str(OUT/'probe_p.exe')],'fortran')]

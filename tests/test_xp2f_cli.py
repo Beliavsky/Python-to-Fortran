@@ -15985,6 +15985,45 @@ def test_xp2f_whitespace_split_checks_bounds_before_character_access(tmp_path: P
     ])
 
 
+@pytest.mark.parametrize('actual', ['1.5', 'values[0]', 'x=values[0]'])
+@pytest.mark.parametrize('cast', ['', '    if x > 0:\n        x = int(x)\n'])
+def test_xp2f_rejects_comment_driven_real_scalar_narrowing(tmp_path: Path, actual: str, cast: str) -> None:
+    src = tmp_path / 'xcomment_narrowing.py'
+    src.write_text(
+        'import numpy as np\ndef f(x):\n    # integer X, the value.\n'
+        + cast + '    return (984943658 * x) % 2147483647\n'
+        + 'values = np.array([207482415.0])\nprint(f(207482415))\n'
+        + f'print(f({actual}))\n', encoding='utf-8')
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "integer-comment parameter 'x' of 'f'" in proc.stdout + proc.stderr
+    assert 'implicit integer conversion would change Python semantics' in proc.stdout + proc.stderr
+
+
+def test_xp2f_integer_comment_explicit_scalar_conversions_remain_supported(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, 'xexplicit_integer_calls.py', [
+        'import numpy as np',
+        'def step(x):',
+        '    # integer X, the value.',
+        '    return (984943658 * x) % 2147483647',
+        'def normalized(x):',
+        '    # integer X, the value.',
+        '    x = int(x)',
+        '    return (984943658 * x) % 2147483647',
+        'values = np.array([207482415.0, 1.5])',
+        'print(step(207482415))',
+        'print(step(int(values[0])))',
+        'print(step(x=int(values[1])))',
+        'print(normalized(values[0]))',
+        'print(normalized(values[1]))',
+        'seed = 207482415',
+        'for i in range(4):',
+        '    seed = step(seed)',
+        '    print(seed)',
+    ])
+
+
 def test_xp2f_mesh_vtoe_loadtxt_integer_rebind(tmp_path: Path) -> None:
     # Core of Burkardt's MIT-licensed mesh_vtoe. Keep the original
     # load/transpose/self-cast path, using a tiny zero-based mesh.
