@@ -51,6 +51,25 @@ rows match Python within 1e-14 absolute tolerance. Explicit column selection was
 also tested successfully. These checks do not establish general support for all
 file shapes or identical array display formatting.
 
+## Gram-Schmidt on dependent columns
+
+Burkardt's `gram_schmidt.py`, `cgs2` A3 test, tries to normalize four columns in
+three dimensions. Its first three columns span the space; the fourth orthogonal
+residual is mathematically zero. The source checks only whether its computed
+norm is greater than zero, so roundoff can become a spurious unit vector.
+
+On the fixed audit input, Python and Fortran produced identical first three
+orthonormal columns, with relative reconstruction error about 2.5e-16. Their
+fourth residual norms were about 1.88e-15 and 2.02e-15. After normalization, one
+fourth-column entry differed by about 0.20, and neither fourth column was
+orthogonal to the first three. Python with explicit sequential scalar reductions
+reproduced the Fortran result, isolating this case to reduction-order sensitivity.
+
+The source's tolerance-based `cgs4` variant discards the fourth column on this
+input. Rank-aware tolerances or a rank-revealing method are algorithm choices,
+not transformations the transpiler applies automatically. This diagnosis covers
+the investigated `cgs2` case, not every Gram-Schmidt variant or input.
+
 ## Eigenvector-based matrix exponentials: a diagnosed example
 
 Burkardt's `matrix_exponential.py`, test #10, uses the matrix
