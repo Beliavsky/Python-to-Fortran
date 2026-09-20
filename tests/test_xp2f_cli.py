@@ -15941,6 +15941,21 @@ def test_xp2f_self_reshape_rank_rebinding(tmp_path: Path) -> None:
     ])
 
 
+def test_xp2f_whitespace_split_checks_bounds_before_character_access(tmp_path: Path) -> None:
+    # Both scans must guard substring access explicitly: Fortran .and. is not
+    # short-circuiting. File readers commonly split lines without a final space.
+    _run_xp2f_compile_diff(tmp_path, 'xsplit_bounds.py', [
+        'def show(s):',
+        '    words = s.split()',
+        '    for word in words:',
+        '        print(word)',
+        "show('-1')",
+        "show('0 1 2')",
+        "show('  3  4   ')",
+        "show('\\t5\\t6\\t')",
+    ])
+
+
 def test_xp2f_mesh_vtoe_loadtxt_integer_rebind(tmp_path: Path) -> None:
     # Core of Burkardt's MIT-licensed mesh_vtoe. Keep the original
     # load/transpose/self-cast path, using a tiny zero-based mesh.

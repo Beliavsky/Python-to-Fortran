@@ -4753,12 +4753,16 @@ contains
          if (.not. present(sep)) then
             i = 1
             do while (i <= len(s))
-               do while (i <= len(s) .and. (s(i:i) == " " .or. s(i:i) == achar(9)))
+               ! Fortran does not guarantee short-circuit evaluation of .and.
+               ! Check the bound before evaluating the substring expression.
+               do while (i <= len(s))
+                  if (.not. (s(i:i) == " " .or. s(i:i) == achar(9))) exit
                   i = i + 1
                end do
                if (i > len(s)) exit
                j = i
-               do while (j <= len(s) .and. .not. (s(j:j) == " " .or. s(j:j) == achar(9)))
+               do while (j <= len(s))
+                  if (s(j:j) == " " .or. s(j:j) == achar(9)) exit
                   j = j + 1
                end do
                call append_strvec(out, s(i:j - 1))
