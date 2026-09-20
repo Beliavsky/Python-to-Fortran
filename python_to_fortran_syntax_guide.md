@@ -193,6 +193,8 @@ For complex vectors, NumPy `matmul` does not conjugate the first operand, wherea
 
 Linear solves, eigenproblems, and other supported `np.linalg`/SciPy calls may use helper routines and numerical-library bridges rather than Fortran intrinsics. A successful translation still needs numerical validation, especially for ill-conditioned problems and differences in floating-point evaluation order.
 
+Taking `.real` of computed eigenvectors can discard information essential to a later calculation, even when their imaginary parts are small. See [Numerical Limitations](NUMERICAL_LIMITATIONS.md) for a defective-matrix example where this changes the rank of a subsequent least-squares problem.
+
 ## Functions and Multiple Results
 
 A scalar-returning Python function can become a Fortran function:

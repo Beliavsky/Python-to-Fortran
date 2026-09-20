@@ -20,6 +20,8 @@ This transpiler is useful on a substantial subset of numerical Python, but it is
 
 Known limitations include dynamic Python features (`isinstance` dispatch, `Union`/duck-typed parameters), complex/irregular containers, reflection, and parts of NumPy that do not map directly to static Fortran. The transpiler uses static analysis to infer types, array ranks, and procedure interfaces. It handles some type/rank changes through scoped declarations and specialized procedures, but not arbitrary dynamic rebinding. Array extents can be determined at runtime using allocatable arrays; their rank and element type still need to be inferable. When a program does not transpile, a small reproducer is usually the best starting point for improving `xp2f.py`.
 
+Successful compilation or execution does not establish numerical equivalence. Different numerical-library implementations can produce different results for sensitive algorithms even when the translation preserves the source operations. See [Numerical Limitations](NUMERICAL_LIMITATIONS.md), including a diagnosed eigenvector-based matrix-exponential example.
+
 See [Timing Results](TIMING_RESULTS.md) for runtime measurements on fully passing translated numerical programs.
 
 See [Comparison with Pyccel](PYCCEL_COMPARISON.md) for how this project differs from Pyccel.
