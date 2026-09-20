@@ -9901,6 +9901,19 @@ def test_xp2f_nonliteral_raise_is_rejected_not_omitted(tmp_path: Path) -> None:
     assert 'raise currently supports' in run.stdout + run.stderr
 
 
+def test_xp2f_single_column_quadrature_explicit_usecols(tmp_path: Path) -> None:
+    (tmp_path / 'nodes.txt').write_text('-1\n1\n', encoding='utf-8')
+    (tmp_path / 'weights.txt').write_text('0.5\n0.5\n', encoding='utf-8')
+    _run_xp2f_compile_diff(tmp_path, 'xcolumn_quadrature.py', [
+        'import numpy as np',
+        "x = np.loadtxt('nodes.txt', usecols=0)",
+        "w = np.loadtxt('weights.txt', usecols=0)",
+        'for degree in range(5):',
+        '    quad = np.dot(w, x ** degree)',
+        "    print('%24.16f %2d' % (quad, degree))",
+    ])
+
+
 def test_xp2f_integer_product_with_real_addend(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xinteger_product_real_addend.py", [
         "def residues(a, seed, offset, m):",

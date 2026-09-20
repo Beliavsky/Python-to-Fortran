@@ -7,6 +7,27 @@ Compare results against Python and, where possible, independent reference values
 or mathematical checks. Output comparisons should account for printed precision,
 random inputs, and differences in array display conventions.
 
+## Text-file array rank: single-column `loadtxt`
+
+NumPy normally returns a one-dimensional array when `np.loadtxt(path)` reads a
+single-column file with multiple rows. The transpiler currently assumes a matrix
+for this call without scalar column selection. This can change a vector dot
+product into matrix multiplication and cause a runtime shape error.
+
+For a known single-column file with multiple rows, explicitly selecting the column
+is a tested workaround:
+
+```python
+x = np.loadtxt(path, usecols=0)
+```
+
+This selects column zero; it is not a general replacement for loading multicolumn
+data. It also does not resolve all of NumPy's scalar/vector/matrix squeezing rules.
+The limitation was reproduced in Burkardt's `chebyshev1_exactness` and
+`chebyshev2_exactness`. Copies using explicit column selection matched Python's
+22 quadrature-error rows within 1e-14 absolute tolerance. The original programs
+still require a rank-handling fix; the workaround is not an automatic correction.
+
 ## Eigenvector-based matrix exponentials: a diagnosed example
 
 Burkardt's `matrix_exponential.py`, test #10, uses the matrix
