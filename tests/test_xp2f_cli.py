@@ -9914,6 +9914,58 @@ def test_xp2f_single_column_quadrature_explicit_usecols(tmp_path: Path) -> None:
     ])
 
 
+@pytest.mark.parametrize('dtype,comment_kind', [('float', 'real'), ('int', 'integer'), ('bool', 'logical')])
+def test_xp2f_loadtxt_documented_vector_context(tmp_path: Path, dtype: str, comment_kind: str) -> None:
+    (tmp_path / 'values.txt').write_text('0\n2\n', encoding='utf-8')
+    _run_xp2f_compile_diff(tmp_path, 'xvector_context.py', [
+        'import numpy as np',
+        'def first(v):',
+        f'    # {comment_kind} V(N), the vector.',
+        '    return v[0]',
+        f"v = np.loadtxt('values.txt', dtype={dtype})",
+        'print(first(v))',
+        'print(v.size)',
+    ])
+    generated = (tmp_path / 'xvector_context_p.f90').read_text(encoding='utf-8')
+    helper_kind = {'float': 'real', 'int': 'int', 'bool': 'logical'}[dtype]
+    assert f'loadtxt_{helper_kind}_vector' in generated
+    exe = tmp_path / 'xvector_context_p.exe'
+    for contents, message in [('1 2\n3 4\n', 'file contains a matrix'), ('1\n', 'would return a scalar')]:
+        (tmp_path / 'values.txt').write_text(contents, encoding='utf-8')
+        run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+        assert run.returncode != 0
+        assert message in run.stdout + run.stderr
+    (tmp_path / 'values.txt').write_text('0 2\n', encoding='utf-8')
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
+def test_xp2f_loadtxt_matrix_context_is_preserved(tmp_path: Path) -> None:
+    (tmp_path / 'matrix.txt').write_text('1 2\n3 4\n', encoding='utf-8')
+    _run_xp2f_compile_diff(tmp_path, 'xmatrix_context.py', [
+        'import numpy as np',
+        'def corner(a):',
+        '    # real A(M,N), the matrix.',
+        '    return a[1,1]',
+        "a = np.loadtxt('matrix.txt')",
+        'print(corner(a))',
+        'print(a.shape[0], a.shape[1])',
+        'print(a @ a)',
+    ])
+    generated = (tmp_path / 'xmatrix_context_p.f90').read_text(encoding='utf-8')
+    assert 'loadtxt_real_2d' in generated
+    assert 'loadtxt_real_vector' not in generated
+
+
+@pytest.mark.parametrize('options,extra', [(', ndmin=2', ''), (', usecols=0', ''), ('', 'print(v[0,0])'), ('', 'v = np.ones(2)')])
+def test_infer_loadtxt_vector_context_avoids_explicit_or_conflicting_uses(options: str, extra: str) -> None:
+    tree = ast.parse('import numpy as np\ndef first(v):\n    return v[0]\nv = np.loadtxt("x.txt"' + options + ')\nprint(first(v))\n' + extra)
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    xp2f.infer_loadtxt_vector_context(tree.body, functions, {2: ['real V(N), the vector.']})
+    load = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'loadtxt')
+    assert not getattr(load, '_xp2f_vector_loadtxt', False)
+
+
 def test_xp2f_integer_product_with_real_addend(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xinteger_product_real_addend.py", [
         "def residues(a, seed, offset, m):",

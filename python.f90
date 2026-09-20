@@ -304,6 +304,7 @@ public :: filtfilt_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:)
 public :: lfilter_zi_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in) desc="steady-state IIR filter initial state for a unit step input (scipy.signal.lfilter_zi)"
 public :: detrend_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),dtype:character:intent(in):optional desc="remove linear or constant trend (scipy.signal.detrend)"
 public :: find_peaks_int !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),height:real(dp):intent(in):optional,distance:integer:intent(in):optional desc="0-based local-maxima indices (scipy.signal.find_peaks, indices only)"
+public :: loadtxt_real_vector, loadtxt_int_vector, loadtxt_logical_vector
 public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load real matrix text file with basic numpy-like options"
 public :: loadtxt_real_1d !@pyapi kind=function ret=real(dp)(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected real column as vector"
 public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load integer matrix from text file"
@@ -1702,6 +1703,40 @@ contains
             end do
          end function count_tokens
       end function loadtxt_real_2d
+
+      function loadtxt_real_vector(path, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         real(dp), allocatable :: x(:), matrix(:,:)
+         matrix = loadtxt_real_2d(path, skiprows=skiprows, max_rows=max_rows, &
+            skip_footer=skip_footer, delimiter=delimiter, comments=comments)
+         if (size(matrix,1) > 1 .and. size(matrix,2) > 1) then
+            error stop 'loadtxt: vector required by program context, but file contains a matrix: ' // trim(path)
+         end if
+         if (size(matrix) == 1) then
+            error stop 'loadtxt: vector required by program context, but NumPy would return a scalar: ' // trim(path)
+         end if
+         x = reshape(matrix, [size(matrix)])
+      end function loadtxt_real_vector
+
+      function loadtxt_int_vector(path, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         integer, allocatable :: x(:)
+         x = int(loadtxt_real_vector(path, skiprows=skiprows, max_rows=max_rows, &
+            skip_footer=skip_footer, delimiter=delimiter, comments=comments))
+      end function loadtxt_int_vector
+
+      function loadtxt_logical_vector(path, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         logical, allocatable :: x(:)
+         x = loadtxt_real_vector(path, skiprows=skiprows, max_rows=max_rows, &
+            skip_footer=skip_footer, delimiter=delimiter, comments=comments) /= 0.0_dp
+      end function loadtxt_logical_vector
 
       function loadtxt_real_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
          character(len=*), intent(in) :: path

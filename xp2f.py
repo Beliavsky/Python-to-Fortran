@@ -13592,7 +13592,7 @@ def detect_needed_helpers(tree):
         "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real"},
         "convolve": {"convolve_real", "convolve_int"},
         "correlate": {"correlate_real"},
-        "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
+        "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_vector", "loadtxt_int_vector", "loadtxt_logical_vector"},
         "genfromtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
         "savetxt": {"savetxt_real_2d"},
         "pad": {"pad2d_int", "pad2d_real"},
@@ -29422,6 +29422,8 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"polyfit", "poly1d"} and len(node.args) >= 1:
                     return 1
                 if node.func.attr in {"loadtxt", "genfromtxt"} and len(node.args) >= 1:
+                    if getattr(node, '_xp2f_vector_loadtxt', False):
+                        return 1
                     if self._loadtxt_usecols_scalar(node):
                         return 1
                     return 2
@@ -37347,7 +37349,9 @@ class translator(ast.NodeVisitor):
                     parts.append(f"comments={comments_txt}")
                 if (not scalar_usecols) and usecols_txt is not None:
                     parts.append(f"usecols={usecols_txt}")
-                if scalar_usecols:
+                if getattr(node, '_xp2f_vector_loadtxt', False):
+                    helper_name = f"{helper_base}_vector"
+                elif scalar_usecols:
                     helper_name = f"{helper_base}_1d"
                 else:
                     helper_name = f"{helper_base}_2d"
@@ -56337,6 +56341,64 @@ def _comment_token_rank_for_name(token, name):
     return max(1, len(dim_parts))
 
 
+def infer_loadtxt_vector_context(body, local_funcs, comment_map):
+    """Honor documented vector parameters for single-assignment text loads.
+
+    The corresponding runtime reader checks the data is actually vector-shaped.
+    Do not guess from a filename or change loads explicitly requesting a shape.
+    """
+    hints = {}
+    for fn in local_funcs:
+        ranks = {}
+        for arg in fn.args.args:
+            found = set()
+            for line in range(fn.lineno, getattr(fn, 'end_lineno', fn.lineno) + 1):
+                for comment in (comment_map or {}).get(line, []):
+                    match = re.match(r'^\s*(?:integer|int|real|float|logical|bool|complex)\s+(.+)$', comment, re.I)
+                    if match:
+                        for token in _comment_decl_tokens(match[1].split(':', 1)[0]):
+                            rank = _comment_token_rank_for_name(token.strip(), arg.arg)
+                            if rank is not None:
+                                found.add(rank)
+            if len(found) == 1:
+                ranks[arg.arg] = found.pop()
+        hints[fn.name] = (fn.args.args, ranks)
+
+    def scope_nodes(statements):
+        for st in statements:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            yield st
+            yield from scope_nodes(ast.iter_child_nodes(st))
+
+    for statements in [body] + [fn.body for fn in local_funcs]:
+        nodes = list(scope_nodes(statements))
+        stores = {}
+        expected = {}
+        for node in nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                stores[node.id] = stores.get(node.id, 0) + 1
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in hints:
+                args, ranks = hints[node.func.id]
+                pairs = [(arg.arg, value) for arg, value in zip(args, node.args)]
+                pairs += [(kw.arg, kw.value) for kw in node.keywords if kw.arg]
+                for parameter, actual in pairs:
+                    if parameter in ranks and isinstance(actual, ast.Name):
+                        expected.setdefault(actual.id, set()).add(ranks[parameter])
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and isinstance(node.slice, ast.Tuple):
+                expected.setdefault(node.value.id, set()).add(len(node.slice.elts))
+        for node in nodes:
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+                continue
+            name, call = node.targets[0].id, node.value
+            if (stores.get(name) == 1 and expected.get(name) == {1}
+                    and isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and is_numpy_name_node(call.func.value) and call.func.attr == 'loadtxt'
+                    and len(call.args) == 1
+                    and not any(kw.arg in {'ndmin', 'unpack', 'usecols'} or kw.arg is None for kw in call.keywords)):
+                call._xp2f_vector_loadtxt = True
+
+
 def _arg_has_rank1_subscript_use(fn, name):
     saw_rank1 = False
     for node in ast.walk(fn):
@@ -71083,6 +71145,8 @@ def transpile_file(
 
     specialize_named_slice_callbacks(effective_tree.body, local_funcs)
     normalize_unused_callable_arguments(effective_tree.body, local_funcs)
+
+    infer_loadtxt_vector_context(effective_tree.body, local_funcs, comment_map)
 
     params = find_parameters(effective_tree)
     # A local function's own translator is deliberately constructed with

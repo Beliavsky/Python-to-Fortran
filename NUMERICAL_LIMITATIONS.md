@@ -10,9 +10,17 @@ random inputs, and differences in array display conventions.
 ## Text-file array rank: single-column `loadtxt`
 
 NumPy normally returns a one-dimensional array when `np.loadtxt(path)` reads a
-single-column file with multiple rows. The transpiler currently assumes a matrix
-for this call without scalar column selection. This can change a vector dot
-product into matrix multiplication and cause a runtime shape error.
+single-column file with multiple rows. The transpiler can infer a vector when a
+direct, singly assigned load is passed to a local function parameter documented
+as rank one (for example, `# real X(N), the vector.`). The generated reader checks
+the actual file shape: a single row or column is accepted, but a matrix or a
+single value (which NumPy would return as a scalar) produces an explicit error.
+Explicit shape/column options and conflicting rank evidence are not overridden.
+
+Without such evidence or scalar column selection, the default remains a matrix.
+General data-dependent scalar/vector/matrix squeezing is not supported. This can
+still change a vector dot product into matrix multiplication and cause a runtime
+shape error in programs whose intended rank cannot be inferred.
 
 For a known single-column file with multiple rows, explicitly selecting the column
 is a tested workaround:
@@ -24,9 +32,11 @@ x = np.loadtxt(path, usecols=0)
 This selects column zero; it is not a general replacement for loading multicolumn
 data. It also does not resolve all of NumPy's scalar/vector/matrix squeezing rules.
 The limitation was reproduced in Burkardt's `chebyshev1_exactness` and
-`chebyshev2_exactness`. Copies using explicit column selection matched Python's
-22 quadrature-error rows within 1e-14 absolute tolerance. The original programs
-still require a rank-handling fix; the workaround is not an automatic correction.
+`chebyshev2_exactness`. With context-based inference, both original programs now
+compile and run on four-point quadrature fixtures, and all 22 quadrature-error
+rows match Python within 1e-14 absolute tolerance. Explicit column selection was
+also tested successfully. These checks do not establish general support for all
+file shapes or identical array display formatting.
 
 ## Eigenvector-based matrix exponentials: a diagnosed example
 
