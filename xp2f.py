@@ -31226,6 +31226,11 @@ class translator(ast.NodeVisitor):
                         if not parts:
                             return fstr("")
                         return " // ".join(parts)
+                    if ok and arg_i == 0 and arg_nodes:
+                        raise NotImplementedError(
+                            "unsupported old-style string format: arguments supplied but no conversion specifier; "
+                            "use an explicit conversion such as %g or print(label, value) if a value is intended"
+                        )
                 if lk0 == "real" and rk0 in {"int", "logical"}:
                     b = f"real({b}, kind=dp)"
                 elif rk0 == "real" and lk0 in {"int", "logical"}:
@@ -55204,25 +55209,16 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError(f"unsupported old-style print format code '%{code}'")
                 i = j + 1
             if arg_i != len(arg_nodes):
-                if arg_i == 0 and len(arg_nodes) == 1:
-                    an = arg_nodes[0]
-                    ak = self._expr_kind(an)
-                    ar = self._rank_expr(an)
-                    if ar == 0:
-                        if ak == "int":
-                            items.append(("desc", "i0", an, False))
-                            arg_i = 1
-                        elif ak == "real":
-                            items.append(("pyg", an))
-                            arg_i = 1
-                        elif ak == "logical":
-                            items.append(("desc", "l1", an, False))
-                            arg_i = 1
-                        elif ak in {"char", "str"}:
-                            items.append(("desc", "a", an, False))
-                            arg_i = 1
-                if arg_i != len(arg_nodes):
-                    raise NotImplementedError("unsupported old-style print format: argument count mismatch")
+                if arg_i == 0:
+                    # NumPy scalars can leave this string unchanged, whereas
+                    # ordinary Python scalars can raise TypeError. We do not
+                    # retain enough scalar provenance to choose between them.
+                    # Appending a value would be wrong in either case.
+                    raise NotImplementedError(
+                        "unsupported old-style string format: arguments supplied but no conversion specifier; "
+                        "use an explicit conversion such as %g or print(label, value) if a value is intended"
+                    )
+                raise NotImplementedError("unsupported old-style print format: argument count mismatch")
 
             fmt_parts = []
             write_args = []

@@ -3317,6 +3317,35 @@ def test_xp2f_compiles_multiple_name_assignment_once(tmp_path: Path) -> None:
     assert "a = b" in out_text
 
 
+@pytest.mark.parametrize('statement', [
+    "print('label' % value)",
+    "print('prefix', 'label' % value)",
+    "text = 'label' % value\nprint(text)",
+    "print('100%%' % value)",
+    "print('label' % (value,))",
+])
+@pytest.mark.parametrize('rhs', ['1.0', 'np.linalg.norm(np.array([1.0, 2.0]))'])
+def test_xp2f_rejects_percent_arguments_without_conversion(tmp_path: Path, statement: str, rhs: str) -> None:
+    src = tmp_path / 'xmissing_conversion.py'
+    src.write_text('import numpy as np\nvalue = ' + rhs + '\n' + statement + '\n', encoding='utf-8')
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert 'arguments supplied but no conversion specifier' in proc.stdout + proc.stderr
+
+
+def test_xp2f_percent_empty_tuple_and_escaped_percent_remain_valid(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, 'xpercent_empty_tuple.py', [
+        "print('label' % ())",
+        "print('100%%' % ())",
+        "print('prefix', '100%%' % ())",
+        "text = '100%%' % ()",
+        'print(text)',
+        "print('value=%g %%' % 1.25)",
+        "print('prefix', 'value=%g %%' % 1.25)",
+    ])
+
+
 def test_xp2f_old_style_percent_d_casts_real_args_for_write(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xpercent_d_float.py"

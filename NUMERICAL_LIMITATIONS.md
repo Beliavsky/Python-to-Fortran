@@ -7,6 +7,19 @@ Compare results against Python and, where possible, independent reference values
 or mathematical checks. Output comparisons should account for printed precision,
 random inputs, and differences in array display conventions.
 
+## Percent formatting without a conversion specifier
+
+Expressions such as `'RMS error = ' % value` are rejected with an explicit
+diagnostic when a supplied argument has no conversion specifier to consume it.
+Ordinary Python scalars can raise `TypeError` here, while NumPy scalars can leave
+the label unchanged. The transpiler does not retain enough scalar provenance to
+reproduce that distinction; it must not silently append the value.
+
+If displaying the value is intended, use `'RMS error = %g' % value` or
+`print('RMS error = ', value)`. Literal-only formats with an empty argument tuple,
+such as `'100%%' % ()`, remain supported. This conservative restriction catches
+the two affected RMS-label statements in Burkardt's `jacobi_poisson_1d.py`.
+
 ## Text-file array rank: single-column `loadtxt`
 
 NumPy normally returns a one-dimensional array when `np.loadtxt(path)` reads a
