@@ -9860,6 +9860,69 @@ def test_xp2f_integer_multiply_add_modulo(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xmultiply_add_modulo.py", lines)
 
 
+@pytest.mark.parametrize("options", ["", ", dtype=int, usecols=[0]"])
+def test_xp2f_loadtxt_missing_file_fails_but_empty_file_is_allowed(tmp_path: Path, options: str) -> None:
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    source = tmp_path / "xmissing_loadtxt.py"
+    source.write_text("import numpy as np\na = np.loadtxt('values.txt'" + options + ")\nprint('loaded')\nprint(a)\n", encoding="utf-8")
+    build = subprocess.run([sys.executable, str(XP2F_PATH), str(source), "--compile"], cwd=tmp_path, capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    exe = tmp_path / "xmissing_loadtxt_p.exe"
+    missing = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert missing.returncode != 0
+    assert 'loadtxt: cannot open "values.txt"' in missing.stdout + missing.stderr
+    assert 'loaded' not in missing.stdout
+    (tmp_path / "values.txt").write_text('', encoding='utf-8')
+    empty = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert empty.returncode == 0, empty.stdout + empty.stderr
+    assert 'loaded' in empty.stdout
+    (tmp_path / "values.txt").write_text('0 2\n3 4\n', encoding='utf-8')
+    valid = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    assert 'loaded' in valid.stdout
+
+
+def test_xp2f_literal_exception_guard_stops_execution(tmp_path: Path) -> None:
+    source = tmp_path / 'xraise_guard.py'
+    source.write_text("def checked(x):\n    if x < 0:\n        raise ValueError('negative input')\n    return x\na = checked(1)\nprint(a)\nb = checked(-1)\nprint('UNREACHABLE', b)\n", encoding='utf-8')
+    build = subprocess.run([sys.executable, str(XP2F_PATH), str(source), '--compile'], cwd=tmp_path, capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(tmp_path / 'xraise_guard_p.exe')], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode != 0
+    assert 'ValueError: negative input' in run.stdout + run.stderr
+    assert 'UNREACHABLE' not in run.stdout
+
+
+def test_xp2f_nonliteral_raise_is_rejected_not_omitted(tmp_path: Path) -> None:
+    source = tmp_path / 'xraise_dynamic.py'
+    source.write_text("def checked(x):\n    if x < 0:\n        raise ValueError(str(x))\n    return x\nprint(checked(-1))\n", encoding='utf-8')
+    run = subprocess.run([sys.executable, str(XP2F_PATH), str(source)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode != 0
+    assert 'raise currently supports' in run.stdout + run.stderr
+
+
+def test_xp2f_integer_product_with_real_addend(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xinteger_product_real_addend.py", [
+        "def residues(a, seed, offset, m):",
+        "    value = a * seed + offset",
+        "    print(value % m)",
+        "    print((offset + a * seed) % m)",
+        "    print((a * seed - offset) % m)",
+        "    print((offset - a * seed) % m)",
+        "for a in [984943658, -984943658, 2147483647]:",
+        "    for seed in [12345, -12345, 2147483645]:",
+        "        for offset in [0.0, 0.25, -0.25]:",
+        "            residues(a, seed, offset, 2147483647)",
+        "            residues(a, seed, offset, -97)",
+        "def cancellation(a, b, offset):",
+        "    print(a * b + offset)",
+        "cancellation(2147483647, 2147483645, -4.6116860098374533e18)",
+    ])
+    generated = (tmp_path / "xinteger_product_real_addend_p.f90").read_text(encoding="utf-8")
+    compact = "".join(generated.replace("&", "").split())
+    assert "real(int(a,kind=int64)*int(seed,kind=int64),kind=dp)" in compact
+
+
 def test_xp2f_product_modulo_keeps_real_and_array_semantics(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xproduct_modulo_other.py", [
         "import numpy as np",

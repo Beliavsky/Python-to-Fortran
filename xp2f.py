@@ -6890,7 +6890,8 @@ def function_is_pure(fn_node, known_pure_calls=None):
             self.ok = True
 
         def visit_Raise(self, node):
-            # Exceptions are not emitted as executable calls in generated Fortran.
+            # Literal exception guards lower to ERROR STOP, which does not
+            # require an impure procedure call.
             return
 
         def visit_Assert(self, node):
@@ -30193,6 +30194,17 @@ class translator(ast.NodeVisitor):
             return 0
         return self._rank_expr(node)
 
+    def _wide_integer_arithmetic(self, node):
+        """Evaluate a scalar integer arithmetic subtree using int64 intermediates."""
+        if (isinstance(node, ast.BinOp)
+                and isinstance(node.op, (ast.Mult, ast.Add, ast.Sub))
+                and self._expr_kind(node.left) == "int"
+                and self._expr_kind(node.right) == "int"):
+            symbol = {ast.Mult: "*", ast.Add: "+", ast.Sub: "-"}[type(node.op)]
+            return (f"({self._wide_integer_arithmetic(node.left)} {symbol} "
+                    f"{self._wide_integer_arithmetic(node.right)})")
+        return f"int({self.expr(node)}, kind=int64)"
+
     def expr(self, node):
         def _module_attr_root_name(n):
             cur = n
@@ -30945,6 +30957,21 @@ class translator(ast.NodeVisitor):
                 return f"matmul({a0}, {b0})"
             a = a0
             b = b0
+            # Python evaluates an integer product exactly before mixing it
+            # with a float. A real destination/other operand does not widen
+            # Fortran's integer multiplication. Widen first, then convert
+            # the completed product (not its factors) to preserve rounding.
+            if (op in {ast.Add, ast.Sub}
+                    and self._rank_expr(node.left) == 0
+                    and self._rank_expr(node.right) == 0):
+                if (lk0 == "int" and rk0 == "real"
+                        and isinstance(node.left, ast.BinOp)
+                        and isinstance(node.left.op, ast.Mult)):
+                    a = f"real({self._wide_integer_arithmetic(node.left)}, kind=dp)"
+                elif (lk0 == "real" and rk0 == "int"
+                        and isinstance(node.right, ast.BinOp)
+                        and isinstance(node.right.op, ast.Mult)):
+                    b = f"real({self._wide_integer_arithmetic(node.right)}, kind=dp)"
             if op in {ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv}:
                 if lk0 == "logical" and self._rank_expr(node.left) == 0:
                     a = f"merge(1, 0, {a})"
@@ -31220,16 +31247,7 @@ class translator(ast.NodeVisitor):
                     # call interfaces (and explicitly wide divisors).
                     # Leave array arithmetic (NumPy fixed-width semantics)
                     # and real modulo on their existing paths.
-                    def wide_integer_arithmetic(term):
-                        if (isinstance(term, ast.BinOp)
-                                and isinstance(term.op, (ast.Mult, ast.Add, ast.Sub))
-                                and self._expr_kind(term.left) == "int"
-                                and self._expr_kind(term.right) == "int"):
-                            symbol = {ast.Mult: "*", ast.Add: "+", ast.Sub: "-"}[type(term.op)]
-                            return (f"({wide_integer_arithmetic(term.left)} {symbol} "
-                                    f"{wide_integer_arithmetic(term.right)})")
-                        return f"int({self.expr(term)}, kind=int64)"
-                    product = wide_integer_arithmetic(node.left)
+                    product = self._wide_integer_arithmetic(node.left)
                     return (f"int(modulo({product}, int({b}, kind=int64)), "
                             f"kind=kind({b}))")
                 return f"modulo({a}, {b})"
@@ -51168,6 +51186,22 @@ class translator(ast.NodeVisitor):
             return
         raise NotImplementedError("unsupported augassign op")
 
+    def visit_Raise(self, node):
+        exc = node.exc
+        if (node.cause is None and isinstance(exc, ast.Call)
+                and isinstance(exc.func, ast.Name)
+                and exc.func.id in {"Exception", "ValueError", "RuntimeError", "TypeError",
+                                    "IndexError", "KeyError", "OSError", "FileNotFoundError",
+                                    "ZeroDivisionError", "NotImplementedError", "AssertionError"}
+                and not exc.keywords and len(exc.args) <= 1
+                and (not exc.args or is_const_str(exc.args[0]))):
+            message = exc.func.id
+            if exc.args:
+                message += ": " + exc.args[0].value
+            self.o.w(f"error stop {fstr(message)}")
+            return
+        raise NotImplementedError("raise currently supports built-in exceptions with a literal string message only")
+
     def visit_Return(self, node):
         self._emit_comments_for(node)
         def _maybe_rank_stable_ifexp_expr(n):
@@ -51516,8 +51550,6 @@ class translator(ast.NodeVisitor):
 
         def _is_noop_stmt(s):
             if isinstance(s, ast.Pass):
-                return True
-            if isinstance(s, ast.Raise):
                 return True
             if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
                 if _is_seed_noop_call(s.value):

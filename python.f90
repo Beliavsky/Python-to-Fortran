@@ -1561,7 +1561,7 @@ contains
          integer :: i1, i2, max_col0
          integer :: max_rows_loc, skip_footer_loc, nvalid, nkeep
          integer :: valid_seen
-         character(len=4096) :: line, work, delim_txt, comm_txt
+         character(len=4096) :: line, work, delim_txt, comm_txt, open_message
          real(kind=dp), allocatable :: vals(:)
          logical :: usecols_present
 
@@ -1583,10 +1583,9 @@ contains
             max_col0 = maxval(usecols)
          end if
 
-         open(newunit=u, file=trim(path), status="old", action="read", iostat=ios)
+         open(newunit=u, file=trim(path), status="old", action="read", iostat=ios, iomsg=open_message)
          if (ios /= 0) then
-            allocate(x(0,0))
-            return
+            error stop 'loadtxt: cannot open "' // trim(path) // '": ' // trim(open_message)
          end if
          do i = 1, nskip
             read(u, "(A)", iostat=ios) line
