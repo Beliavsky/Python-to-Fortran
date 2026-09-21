@@ -6519,6 +6519,31 @@ def test_xp2f_index_producing_calls_preserve_real_keys(tmp_path: Path, index: st
     assert "sorted_rows(int(x))" not in generated
 
 
+@pytest.mark.parametrize("dtype", ["int", "np.int32", "np.int64", "'int64'"])
+def test_xp2f_inline_integer_array_constructors_convert_real_values(tmp_path: Path, dtype: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xinteger_array_cast.py", [
+        "import numpy as np",
+        "def vector(a):",
+        "    print(a.size)",
+        "    for i in range(a.size):",
+        "        print(a[i])",
+        "def matrix(a):",
+        "    print(a.shape[0], a.shape[1])",
+        "    for i in range(a.shape[0]):",
+        "        for j in range(a.shape[1]):",
+        "            print(a[i, j])",
+        "v = 1.9",
+        f"vector(np.array([v, -1.9, 0.8, -0.8, 3, True], dtype={dtype}))",
+        f"matrix(np.array([[v, -1.9], [0.8, -0.8]], dtype={dtype}))",
+        f"a = np.array([[v, -1.9], [0.8, -0.8]], dtype={dtype})",
+        "matrix(a)",
+        "row1 = np.array([1.9, -1.9])",
+        "row2 = np.array([0.8, -0.8])",
+        f"matrix(np.array([row1, row2], dtype={dtype}))",
+        f"vector(np.array([], dtype={dtype}))",
+    ])
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",

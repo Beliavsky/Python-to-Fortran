@@ -39,11 +39,18 @@ Logs and separate real/integer `analysis.json` files retain the results. The
 external Burkardt source is unchanged. These checks do not certify NaNs,
 infinities, complex keys, every integer width, or all array layouts.
 
-## Separate constructor issue
+## Constructor follow-up: fixed
 
 The initial integer control used real constructor literals with `dtype=np.int64`.
 That exposed a separate code-generation problem: inference chooses an integer
 argument, but the inline constructor is emitted as a real array without the
 requested conversion, causing a compile-time argument mismatch.
-`float_constructor.py` isolates that follow-up; it is not part of the passing
-sortrows fixtures and is not fixed by the index-inference change.
+`float_constructor.py` isolates that follow-up. It now compiles and produces
+the expected integer 1 after a separate constructor-emission fix. Explicit
+integer dtypes are applied to list elements before constructing the Fortran
+array, including nested rows and lists of row vectors. The constructor path
+also uses the shared dtype parser, covering string spellings such as 'int64'.
+Regression tests compare inline arguments and named assignments for positive
+and negative fractions, mixed literals, empty arrays, and int/np.int32/np.int64
+and string dtype spellings. This fixes conversion placement; it does not claim
+new support for every NumPy integer width or out-of-range float-to-int casts.

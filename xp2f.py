@@ -34543,17 +34543,15 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
                 and isinstance(node.args[0], ast.List)
             ):
-                dtype_txt = ""
-                for kw in node.keywords:
-                    if kw.arg == "dtype":
-                        if isinstance(kw.value, ast.Name):
-                            dtype_txt = kw.value.id.lower()
-                        elif (
-                            isinstance(kw.value, ast.Attribute)
-                            and isinstance(kw.value.value, ast.Name)
-                            and is_numpy_name_node(kw.value.value)
-                        ):
-                            dtype_txt = kw.value.attr.lower()
+                dtype_txt = self._np_dtype_text(node)
+
+                def _integer_values(items):
+                    # Assignment conversion is too late for inline arguments:
+                    # the constructor itself must have the requested type.
+                    return "[integer :: " + ", ".join(
+                        self._coerce_expr_kind(e, self.expr(e), "int") for e in items
+                    ) + "]"
+
                 elts = node.args[0].elts
                 if elts and all(isinstance(e, ast.List) for e in elts):
                     nrow = len(elts)
@@ -34573,6 +34571,8 @@ class translator(ast.NodeVisitor):
                             f"real({self.expr(e)}, kind=dp)" if self._expr_kind(e) == "int" else self.expr(e)
                             for e in flat_nodes
                         ) + "]"
+                    elif "int" in dtype_txt:
+                        vals = _integer_values(flat_nodes)
                     else:
                         vals = _array_constructor(flat_nodes)
                     return f"transpose(reshape({vals}, [{ncol}, {nrow}]))"
@@ -34581,6 +34581,8 @@ class translator(ast.NodeVisitor):
                     vals = ", ".join(self.expr(e) for e in elts)
                     if "complex" in dtype_txt:
                         vals = f"cmplx([{vals}], kind=dp)"
+                    elif "int" in dtype_txt:
+                        vals = _integer_values(elts)
                     else:
                         vals = f"[{vals}]"
                     return f"transpose(reshape({vals}, [size({first}), {len(elts)}]))"
@@ -34606,6 +34608,8 @@ class translator(ast.NodeVisitor):
                         for e in elts
                     )
                     return f"[real(kind=dp) :: {vals}]"
+                if "int" in dtype_txt:
+                    return _integer_values(elts)
                 return _array_constructor(elts)
             if (
                 self._is_numpy_array_ctor_call(node)
