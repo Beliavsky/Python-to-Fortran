@@ -7643,6 +7643,30 @@ def test_xp2f_matches_out_names_across_multiple_tuple_return_statements(tmp_path
     )
 
 
+@pytest.mark.parametrize("rng_expr", ["np.random", "rng"])
+def test_xp2f_empty_permutation_and_choice_without_replacement(
+    tmp_path: Path, rng_expr: str
+) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xempty_permutation.py",
+        [
+            "import numpy as np",
+            "rng = np.random.default_rng()",
+            "empty = np.zeros(0)",
+            f"p = {rng_expr}.permutation(0)",
+            f"q = {rng_expr}.permutation(empty)",
+            f"c = {rng_expr}.choice(0, size=0, replace=False)",
+            f"d = {rng_expr}.choice(empty, size=0, replace=False)",
+            f"e = {rng_expr}.choice(5, size=0, replace=False)",
+            f"one = {rng_expr}.permutation(1)",
+            "print(len(p), len(q), len(c), len(d), len(e))",
+            "print(one[0])",
+            "print('completed')",
+        ],
+    )
+
+
 def test_xp2f_infers_rank_one_for_rng_permutation_result(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xrng_permutation_best.py"

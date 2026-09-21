@@ -18005,9 +18005,10 @@ def runtime_helper_templates():
          integer :: i, j, tmp
          real(kind=dp) :: u
          integer, allocatable :: pool(:)
-         if (npop <= 0 .or. nsamp < 0) stop "random_choice_norep: invalid sizes"
+         if (npop < 0 .or. nsamp < 0) stop "random_choice_norep: invalid sizes"
          if (nsamp > npop) stop "random_choice_norep: nsamp > npop"
          if (size(z) < nsamp) stop "random_choice_norep: output array too small"
+         if (nsamp == 0) return
          allocate(pool(1:npop))
          do i = 1, npop
             pool(i) = i - 1
