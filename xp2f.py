@@ -68518,6 +68518,27 @@ def generate_flat(
                 and _curr_kinds[_i] is None
             ):
                 _curr_kinds[_i] = _bk
+    # A shared array signature must not silently turn a vector into a column
+    # matrix. General rank-1/rank-2 function specialization is not implemented.
+    # Use fresh call-site observations (including direct assignment evidence),
+    # not just the maximum ranks propagated back from the callee signature.
+    for fn in (local_funcs or []):
+        if fn.name in local_overload_specs:
+            continue
+        rank_sets = call_rank_sets.get(fn.name, [])
+        if not any(len({r for r in rs if r > 0}) > 1 for rs in rank_sets):
+            continue
+        observed, _, _ = _observed_local_call_specs(fn.name)
+        for name, pairs in zip(local_func_arg_names.get(fn.name, []), observed):
+            ranks = sorted({r for _, r in pairs if r > 0})
+            if len(ranks) > 1:
+                raise NotImplementedError(
+                    f"mixed array ranks for function '{fn.name}', argument '{name}': "
+                    f"observed ranks {', '.join(map(str, ranks))}; "
+                    "rank-preserving specialization is not supported for this function. "
+                    "Use separate functions for vector and matrix inputs."
+                )
+
     # Do not silently narrow an observed real scalar merely because a comment
     # describes the dummy as integer. Promoting the shared procedure to real
     # is not a safe substitute either: integer callers can need exact products.

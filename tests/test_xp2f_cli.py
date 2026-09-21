@@ -6309,6 +6309,62 @@ def test_xp2f_narrow_paren_simplification_preserves_call_and_division_grouping(t
     assert re.search(r"eh2\s*/\s*eh\s*\*\s*eh\b", out_f90) is None, out_f90
 
 
+@pytest.mark.parametrize("keyword", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_xp2f_rejects_unspecialized_vector_matrix_calls(tmp_path: Path, keyword: bool, nested: bool) -> None:
+    calls = ["solve_copy(2.0, d1)", "solve_copy(2.0, d2)"]
+    if keyword:
+        calls = ["solve_copy(d=d1, scale=2.0)", "solve_copy(d=d2, scale=2.0)"]
+    driver = [
+        "rhs = np.ones((3, 2))",
+        "d1 = rhs[:, 0].copy()",
+        "d2 = rhs.copy()",
+        f"x1 = {calls[0]}",
+        f"x2 = {calls[1]}",
+        "print(x1.ndim, x2.ndim)",
+        "print(x1.shape[0], x2.shape[0], x2.shape[1])",
+        "print((x1 + np.arange(3)).sum())",
+    ]
+    if nested:
+        driver = ["def exercise():"] + ["    " + line for line in driver] + ["exercise()"]
+    src = tmp_path / "xmixed_array_ranks.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "def solve_copy(scale, d):",
+        "    x = d.copy()",
+        "    for i in range(len(d)):",
+        "        x[i] = x[i] / scale",
+        "    return x",
+        *driver, "",
+    ]), encoding="utf-8")
+    reference = subprocess.run([sys.executable, str(src)], capture_output=True, text=True)
+    assert reference.returncode == 0, reference.stderr
+    assert reference.stdout.splitlines() == ["1 2", "3 3 2", "4.5"]
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "mixed array ranks for function 'solve_copy', argument 'd': observed ranks 1, 2" in proc.stdout
+    assert "Use separate functions for vector and matrix inputs" in proc.stdout
+    assert not src.with_name("xmixed_array_ranks_p.f90").exists()
+
+
+@pytest.mark.parametrize("matrix", [False, True])
+def test_xp2f_single_array_rank_calls_still_work(tmp_path: Path, matrix: bool) -> None:
+    constructor = "np.ones((3, 2))" if matrix else "np.ones(3)"
+    _run_xp2f_compile_diff(tmp_path, "xsingle_array_rank.py", [
+        "import numpy as np",
+        "def solve_copy(scale, d):",
+        "    x = d.copy()",
+        "    for i in range(len(d)):",
+        "        x[i] = x[i] / scale",
+        "    return x",
+        f"d = {constructor}",
+        "x = solve_copy(2.0, d)",
+        "y = solve_copy(4.0, d)",
+        "print(x.ndim, y.ndim, x.sum(), y.sum())",
+    ])
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",
