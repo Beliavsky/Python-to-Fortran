@@ -6426,6 +6426,20 @@ def test_xp2f_single_array_rank_calls_still_work(tmp_path: Path, matrix: bool) -
     ])
 
 
+@pytest.mark.parametrize("name", ["dim", "dimension"])
+@pytest.mark.parametrize("enumerated", [False, True])
+def test_xp2f_iterable_loop_uses_renamed_targets(tmp_path: Path, name: str, enumerated: bool) -> None:
+    if enumerated:
+        lines = [
+            f"for {name}, sum in enumerate([1, 3, 40, 2, 1], 7):",
+            f"    print({name}, sum)",
+            f"print({name}, sum)",
+        ]
+    else:
+        lines = [f"for {name} in [1, 3, 40, 2, 1]:", f"    print({name})", f"print({name})"]
+    _run_xp2f_compile_diff(tmp_path, "xrenamed_loop.py", lines)
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",

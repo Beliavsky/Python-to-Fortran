@@ -43391,9 +43391,9 @@ class translator(ast.NodeVisitor):
                 ):
                     t0, t1 = node.target.elts
                     if isinstance(t0, ast.Name):
-                        self._mark_int("i_" if t0.id == "_" else t0.id)
+                        self._mark_int("i_" if t0.id == "_" else self._aliased_name(t0.id))
                     if isinstance(t1, ast.Name):
-                        vnm = "j_" if t1.id == "_" else t1.id
+                        vnm = "j_" if t1.id == "_" else self._aliased_name(t1.id)
                         seq = node.iter.args[0]
                         if (
                             isinstance(seq, ast.Call)
@@ -51948,23 +51948,23 @@ class translator(ast.NodeVisitor):
                 fused = True
             if not fused:
                 if idx_name is not None and enum_start_txt is not None and idx_name != "_":
-                    self._mark_int(idx_name)
-                    self.o.w(f"{idx_name} = ({enum_start_txt}) + ({iv} - 1)")
+                    self._mark_int(self._aliased_name(idx_name))
+                    self.o.w(f"{self._aliased_name(idx_name)} = ({enum_start_txt}) + ({iv} - 1)")
                 if target_name != "_":
                     if tnm_iter is not None:
                         self.dict_typed_vars[target_name] = tnm_iter
                         self.dict_var_components[target_name] = list(comp_names_iter)
                     elif k == "real":
-                        self._mark_real(target_name)
+                        self._mark_real(self._aliased_name(target_name))
                     elif k == "logical":
-                        self._mark_log(target_name)
+                        self._mark_log(self._aliased_name(target_name))
                     elif k == "complex":
-                        self._mark_complex(target_name)
+                        self._mark_complex(self._aliased_name(target_name))
                     elif k == "char":
-                        self._mark_char(target_name)
+                        self._mark_char(self._aliased_name(target_name))
                     else:
-                        self._mark_int(target_name)
-                    self.o.w(f"{target_name} = {arr_ref}({iv})")
+                        self._mark_int(self._aliased_name(target_name))
+                    self.o.w(f"{self._aliased_name(target_name)} = {arr_ref}({iv})")
                 _visit_loop_body_and_close_rebinds()
             self.o.pop()
             self.o.w("end do")
