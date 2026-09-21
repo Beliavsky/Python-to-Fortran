@@ -36,11 +36,23 @@ compared with the original Python routine, not an independent Sobol library.
 Run `python check.py` to rebuild and validate. Logs and `analysis.json` retain
 the outputs. The external Burkardt source is unchanged.
 
-## Remaining limitation
+## Integer loop/index inference follow-up
 
-Gfortran still warns about real-valued `j` loop variables and `maxcol` used
-as array indices/bounds. The tested numerical values agree, but those legacy
-extensions are a separate type-inference/Fortran-portability issue worth
-investigating next. This validation does not certify strict-standard compilation,
-every dimension/seed, or out-of-range seed handling. The original randomized
-driver and a full pytest suite were not run for this investigation.
+The follow-up corrects both warnings. Module-global inference now uses known
+local-function result kinds, so `maxcol = i4_bit_hi1(atmost)` declares an integer.
+The source's `j` temporarily holds floating-point results of `np.floor`, then
+is reused as an integer range target. Liveness analysis, including enclosing
+loop back edges, allows those later loops to use a scoped integer `j` without
+changing any subsequent observation of the original variable.
+
+When a noninteger target remains live after the loop, escapes through global
+state, or is needed to evaluate its own range bounds, this scoped conversion
+is declined with an explicit unsupported-case diagnostic. In particular, an
+empty range must not silently convert a preexisting floating value to integer.
+This is deliberately narrower than general Python dynamic-type support.
+
+The Sobol probe passes `gfortran -std=f2008 -pedantic-errors` as well as all
+297 comparison records. `check.py` now records that strict compilation in
+`strict_build.log`. Every dimension/seed and out-of-range seed handling are
+not certified. The original randomized driver and a full pytest suite were
+not run for this investigation.

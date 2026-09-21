@@ -15554,7 +15554,59 @@ def normalize_scipy_submodule_attribute_calls(tree):
     return ast.fix_missing_locations(new_tree)
 
 
-def collect_module_global_decls(local_funcs):
+def annotate_loop_target_liveness(nodes):
+    """Conservatively mark range targets whose value is dead after the loop.
+
+    Include loop back edges: a read on the next enclosing-loop iteration
+    must not be mistaken for a dead value. Unsupported compound statements
+    are treated as reading all referenced names, with no definite kills.
+    """
+    def reads(node):
+        return {n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+    escaped = {name for st in nodes for n in ast.walk(st)
+               if isinstance(n, (ast.Global, ast.Nonlocal)) for name in n.names}
+
+    def block(stmts, after):
+        live = set(after)
+        for st in reversed(stmts):
+            if isinstance(st, (ast.For, ast.While)):
+                if isinstance(st, ast.For):
+                    st._xp2f_dead_range_target = (
+                        isinstance(st.target, ast.Name)
+                        and st.target.id not in live | escaped
+                    )
+                    control = reads(st.iter)
+                else:
+                    control = reads(st.test)
+                tail = block(st.orelse, live) | live
+                head = tail | control
+                while True:
+                    body = block(st.body, head | tail)
+                    if isinstance(st, ast.For) and isinstance(st.target, ast.Name):
+                        body.discard(st.target.id)
+                    new_head = head | body
+                    if new_head == head:
+                        break
+                    head = new_head
+                live = head
+            elif isinstance(st, ast.If):
+                live = reads(st.test) | block(st.body, live) | block(st.orelse, live)
+            elif isinstance(st, ast.Assign):
+                killed = {t.id for t in st.targets if isinstance(t, ast.Name)}
+                live = (live - killed) | reads(st)
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                annotate_loop_target_liveness(st.body)
+                live |= reads(st)
+            else:
+                live |= reads(st)
+        return live
+
+    block(nodes, set())
+
+
+def collect_module_global_decls(local_funcs, local_return_specs=None, local_return_ranks=None):
     """Collect Python `global` names used in local functions with rough type/rank."""
     if not local_funcs:
         return {}
@@ -15604,6 +15656,10 @@ def collect_module_global_decls(local_funcs):
             kr, _ = _infer_from_node(n.right)
             return (_merge_kind(kl, kr) or "real"), 0
         if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Name):
+                spec = (local_return_specs or {}).get(n.func.id)
+                if spec in {"int", "real", "logical", "char", "complex"}:
+                    return spec, int((local_return_ranks or {}).get(n.func.id, 0))
             if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name):
                 if n.func.value.id in {"np", "numpy"} and n.func.attr in {
                     "array", "asarray", "linspace", "arange", "zeros", "ones", "empty"
@@ -39095,6 +39151,9 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError(f"unsupported expr: {type(node).__name__}")
 
     def prescan(self, nodes):
+        if not getattr(self, "_range_liveness_scanned", False):
+            annotate_loop_target_liveness(nodes)
+            self._range_liveness_scanned = True
         empty_list_append_kind = {}
         index_name_hits = set()
         asarray_aliases = {}
@@ -52851,6 +52910,23 @@ class translator(ast.NodeVisitor):
         f_step = self._as_integer_loop_expr(step)
         f_upper = self._as_integer_loop_expr(stop, self._upper_from_stop(stop, step))
 
+        # Python range assigns integers even when this name held a real
+        # earlier. A scoped integer is safe when the loop value is dead
+        # afterward; it also preserves the outer value for zero iterations.
+        loop_kind, loop_rank = self._visible_kind_rank(var)
+        scoped_integer = loop_kind in {"real", "complex", "logical", "char"}
+        if scoped_integer:
+            bound_uses_target = any(isinstance(n, ast.Name) and n.id == node.target.id
+                                   for n in ast.walk(node.iter))
+            if (loop_rank != 0 or bound_uses_target
+                    or not getattr(node, "_xp2f_dead_range_target", False)):
+                raise NotImplementedError(
+                    f"range target '{node.target.id}' at line {getattr(node, 'lineno', '?')} "
+                    f"changes from {loop_kind} to integer and cannot be safely scoped; "
+                    "use a separate integer loop variable"
+                )
+            self._open_type_rebind_block(node.target.id, "int", 0)
+
         if is_const_int(step) and step.value == 1:
             self.o.w(f"do {var} = {f_start}, {f_upper}")
         else:
@@ -52859,6 +52935,9 @@ class translator(ast.NodeVisitor):
         _visit_loop_body_and_close_rebinds()
         self.o.pop()
         self.o.w("end do")
+
+        if scoped_integer:
+            self._close_one_type_rebind_block()
 
     def visit_While(self, node):
         self._emit_comments_for(node)
@@ -65780,7 +65859,8 @@ def generate_flat(
     _early_global_decls = {}
     if local_funcs:
         _early_global_decls = collect_top_level_shared_decls(tree, local_funcs=local_funcs, params=params)
-        _early_global_decls.update(collect_module_global_decls(local_funcs))
+        _early_global_decls.update(collect_module_global_decls(
+            local_funcs, local_return_specs, local_return_ranks))
         for _fn in (local_funcs or []):
             if not isinstance(_fn, ast.FunctionDef):
                 continue
@@ -69105,7 +69185,8 @@ def generate_flat(
     _force_rng_param_kinds()
 
     module_text = ""
-    module_global_decls = collect_module_global_decls(local_funcs)
+    module_global_decls = collect_module_global_decls(
+        local_funcs, local_return_specs, local_return_ranks)
     for _gnm, (_gk, _gr) in _early_global_decls.items():
         if _gnm not in module_global_decls:
             continue

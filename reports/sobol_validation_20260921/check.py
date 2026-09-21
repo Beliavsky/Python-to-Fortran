@@ -17,6 +17,8 @@ def run(command, name):
 
 python = run([sys.executable, 'probe.py'], 'python')
 run([sys.executable, str(ROOT/'xp2f.py'), 'probe.py', '--compile'], 'build')
+run(['gfortran', '-std=f2008', '-pedantic-errors', '-c', 'probe_p.f90',
+     '-o', 'probe_strict.o'], 'strict_build')
 fortran = run([str(OUT/'probe_p.exe')], 'fortran')
 assert len(python) == len(fortran), (len(python),len(fortran))
 for i,(p,f) in enumerate(zip(python,fortran)):

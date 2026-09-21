@@ -6440,6 +6440,67 @@ def test_xp2f_iterable_loop_uses_renamed_targets(tmp_path: Path, name: str, enum
     _run_xp2f_compile_diff(tmp_path, "xrenamed_loop.py", lines)
 
 
+def test_xp2f_range_rebinds_dead_real_target_as_integer(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xreal_then_range.py", [
+        "import numpy as np",
+        "def exercise(n):",
+        "    a = np.array([2.0, 4.0, 6.0])",
+        "    for k in range(2):",
+        "        j = np.floor(7.5)",
+        "        print(j)",
+        "        for j in range(n, 0, -1):",
+        "            print(j, a[j-1])",
+        "        j = np.floor(9.5)",
+        "        print(j)",
+        "exercise(0)",
+        "exercise(3)",
+    ])
+    generated = tmp_path / "xreal_then_range_p.f90"
+    compiled = subprocess.run(["gfortran", "-std=f2008", "-pedantic-errors", "-c", str(generated)],
+                              cwd=tmp_path, capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+
+
+@pytest.mark.parametrize("tail", ["print(j)", "for k in range(2):\n    print(j)\n    for j in range(3):\n        print(j)"])
+def test_xp2f_rejects_live_real_range_target(tmp_path: Path, tail: str) -> None:
+    src = tmp_path / "xlive_range.py"
+    if tail.startswith("for k"):
+        body = "j = 1.5\n" + tail
+    else:
+        body = "j = 1.5\nfor j in range(0):\n    print(j)\n" + tail
+    src.write_text(body + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "range target 'j'" in proc.stdout, proc.stdout + proc.stderr
+    assert "cannot be safely scoped" in proc.stdout
+
+
+def test_module_global_decls_use_local_function_result_kind() -> None:
+    functions = ast.parse("def setup():\n    global count\n    count = count_bits(31)\n").body
+    assert xp2f.collect_module_global_decls(functions, {"count_bits": "int"}) == {"count": ("int", 0)}
+    assert xp2f.collect_module_global_decls(functions, {"count_bits": "real"}) == {"count": ("real", 0)}
+
+
+def test_xp2f_integer_global_return_used_in_range(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xinteger_global.py", [
+        "def count_bits(n):",
+        "    result = 0",
+        "    while n > 0:",
+        "        result += 1",
+        "        n = n // 2",
+        "    return result",
+        "def exercise():",
+        "    global maxcol",
+        "    maxcol = count_bits(31)",
+        "    for j in range(maxcol):",
+        "        print(j)",
+        "exercise()",
+    ])
+    generated = (tmp_path / "xinteger_global_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"integer\s*::[^\n]*\bmaxcol\b", generated), generated
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",
