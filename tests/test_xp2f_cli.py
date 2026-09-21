@@ -6281,9 +6281,9 @@ def test_xp2f_narrow_paren_simplification_preserves_call_and_division_grouping(t
     # argument-list paren, turning `acos(-1.0_dp)` into the syntactically
     # invalid `acos-1.0_dp`. Replaced with a narrower, hand-verified
     # simplification restricted to two provably-safe shapes: a negated
-    # bare atom (unary minus has no associativity to disturb) unwrapped
-    # anywhere except immediately after another +/- or inside a call's
-    # own parens, and a `*`/`/`-only group unwrapped ONLY as the operand
+    # bare atom unwrapped except before a power, after another arithmetic
+    # operator, or inside a call's own parens, and a `*`/`/`-only group
+    # unwrapped ONLY as the operand
     # of a genuinely binary `+`/`-` (never `*`/`/`, which is exactly the
     # unsafe division-reordering case above).
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
@@ -6307,6 +6307,41 @@ def test_xp2f_narrow_paren_simplification_preserves_call_and_division_grouping(t
     out_f90 = (tmp_path / "xnarrow_paren_p.f90").read_text(encoding="utf-8")
     assert "acos-1.0" not in out_f90, out_f90
     assert re.search(r"eh2\s*/\s*eh\s*\*\s*eh\b", out_f90) is None, out_f90
+
+
+def test_xp2f_preserves_signed_power_parentheses() -> None:
+    lines = [
+        "x = (-1.0_dp) ** i",
+        "x = (-a)**i",
+        "x = ((-a) ** i)",
+        "x = a ** (-i)",
+        "x = a * (-b)",
+        "x = a / (-b)",
+        "x = (-a) ** (-i)",
+        "x = (a ** b) ** i",
+        "x = a ** (b * i)",
+        "x = (a * b) ** i",
+    ]
+    assert xp2f.simplify_narrow_redundant_arith_parens(lines) == lines
+    assert xp2f.simplify_narrow_redundant_arith_parens(
+        ["x = (-a) * b"]
+    ) == ["x = -a * b"]
+
+
+def test_xp2f_runs_signed_power_bases_and_exponents(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xsigned_power.py",
+        [
+            "a = 2.0",
+            "b = 3.0",
+            "for i in range(5):",
+            "    print((-1.0)**i, (-2.0)**i, (-a)**i, -(a**i))",
+            "    print(a**(-i), (-a)**(-i))",
+            "    print((a*b)**i, (a**b)**i, a**(b*i))",
+            "    print((i+1.0)*(-1.0)**i)",
+        ],
+    )
 
 
 def test_xp2f_strips_parens_around_bare_atom() -> None:

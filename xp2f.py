@@ -200,14 +200,14 @@ def normalize_numpy_removed_aliases(src_text):
 
 
 def simplify_narrow_redundant_arith_parens(lines):
-    """Strip parentheses in four narrow, hand-verified-safe shapes:
+    """Strip parentheses in five narrow shapes:
 
     (1) A single negated bare atom, `(-NAME)` or `(-NUMBER)`, unwrapped to
-        `-NAME`/`-NUMBER` -- unary minus always binds tighter than every
-        binary operator in Fortran, and negating a SINGLE atom has no
-        internal structure or associativity to disturb, so this is safe
-        in any context except immediately after another +/- (which could
-        otherwise create an ambiguous double-sign token run like `- -a`).
+        `-NAME`/`-NUMBER`, except as a power base: exponentiation binds
+        tighter than unary minus, so `(-a)**i` must retain its grouping.
+        Also retain parentheses after arithmetic operators to avoid
+        consecutive operators such as `** -a` or `* -a` (not standard
+        Fortran), and preserve mandatory call/statement parentheses.
 
     (2) A `*`/`/`-only sub-expression (no top-level +/-/, inside) as the
         right-hand operand of a genuinely BINARY `+` or `-`, unwrapped to
@@ -367,7 +367,9 @@ def simplify_narrow_redundant_arith_parens(lines):
             j = m.start() - 1
             while j >= 0 and code[j] in " \t":
                 j -= 1
-            if j >= 0 and code[j] in "+-":
+            if j >= 0 and code[j] in "+-*/":
+                return m.group(0)
+            if code[m.end():].lstrip().startswith("**"):
                 return m.group(0)
             return f"-{m.group(1)}"
 
