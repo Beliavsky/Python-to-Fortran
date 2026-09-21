@@ -7667,6 +7667,29 @@ def test_xp2f_empty_permutation_and_choice_without_replacement(
     )
 
 
+def test_xp2f_int_converts_boolean_expressions(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xint_bool.py",
+        [
+            "import numpy as np",
+            "def positive(x):",
+            "    return x > 0",
+            "def show(x):",
+            "    print(int(positive(x)))",
+            "print(int(True), int(False))",
+            "flags = np.array([True, False], dtype=bool)",
+            "for i in range(2):",
+            "    flag = flags[i]",
+            "    print(int(flag), int(flags[i]), int(i == 0), int(not flag))",
+            "show(-1)",
+            "show(1)",
+            "print(int(positive(-2)), int(positive(2)))",
+            "print(int(-1.9), int(2.9), int(3))",
+        ],
+    )
+
+
 def test_xp2f_infers_rank_one_for_rng_permutation_result(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xrng_permutation_best.py"

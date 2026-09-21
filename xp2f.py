@@ -33903,6 +33903,8 @@ class translator(ast.NodeVisitor):
                     return reduced
             if isinstance(node.func, ast.Name) and node.func.id == "int" and len(node.args) == 1:
                 a0 = node.args[0]
+                if self._expr_kind(a0) == "logical":
+                    return f"merge(1, 0, {self.expr(a0)})"
                 if self._expr_kind(a0) == "char":
                     return f"nint(py_float({self.expr(a0)}))"
                 return f"int({self.expr(a0)})"
