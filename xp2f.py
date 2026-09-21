@@ -68527,7 +68527,10 @@ def generate_flat(
                     # Compare/BoolOp subtrees when looking for direct index
                     # usage.
                     def _name_used_as_index(_node):
-                        if isinstance(_node, (ast.Compare, ast.BoolOp)):
+                        # An integer-valued call result does not require
+                        # integer inputs: lexsort/argsort accept real keys,
+                        # and even int(x) explicitly accepts a real x.
+                        if isinstance(_node, (ast.Compare, ast.BoolOp, ast.Call)):
                             return False
                         if isinstance(_node, ast.Name) and _node.id == _arg_nm:
                             return True

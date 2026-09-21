@@ -6501,6 +6501,24 @@ def test_xp2f_integer_global_return_used_in_range(tmp_path: Path) -> None:
     assert re.search(r"integer\s*::[^\n]*\bmaxcol\b", generated), generated
 
 
+@pytest.mark.parametrize("index", ["np.lexsort(x.T[::-1])", "np.argsort(x[:, 0])"])
+def test_xp2f_index_producing_calls_preserve_real_keys(tmp_path: Path, index: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xreal_sort_keys.py", [
+        "import numpy as np",
+        "def sorted_rows(x):",
+        f"    x = x[{index}]",
+        "    return x",
+        "def exercise(x):",
+        "    y = sorted_rows(x)",
+        "    for i in range(y.shape[0]):",
+        "        for j in range(y.shape[1]):",
+        "            print(y[i, j], x[i, j])",
+        "exercise(np.array([[0.5, 2.], [0.25, 9.], [-0.5, -1.], [-0.25, 8.]]))",
+    ])
+    generated = (tmp_path / "xreal_sort_keys_p.f90").read_text(encoding="utf-8")
+    assert "sorted_rows(int(x))" not in generated
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",
