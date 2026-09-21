@@ -6311,7 +6311,8 @@ def test_xp2f_narrow_paren_simplification_preserves_call_and_division_grouping(t
 
 @pytest.mark.parametrize("keyword", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
-def test_xp2f_rejects_unspecialized_vector_matrix_calls(tmp_path: Path, keyword: bool, nested: bool) -> None:
+@pytest.mark.parametrize("matrix_first", [False, True])
+def test_xp2f_specializes_vector_matrix_calls(tmp_path: Path, keyword: bool, nested: bool, matrix_first: bool) -> None:
     calls = ["solve_copy(2.0, d1)", "solve_copy(2.0, d2)"]
     if keyword:
         calls = ["solve_copy(d=d1, scale=2.0)", "solve_copy(d=d2, scale=2.0)"]
@@ -6325,6 +6326,8 @@ def test_xp2f_rejects_unspecialized_vector_matrix_calls(tmp_path: Path, keyword:
         "print(x1.shape[0], x2.shape[0], x2.shape[1])",
         "print((x1 + np.arange(3)).sum())",
     ]
+    if matrix_first:
+        driver[3:5] = reversed(driver[3:5])
     if nested:
         driver = ["def exercise():"] + ["    " + line for line in driver] + ["exercise()"]
     src = tmp_path / "xmixed_array_ranks.py"
@@ -6340,12 +6343,70 @@ def test_xp2f_rejects_unspecialized_vector_matrix_calls(tmp_path: Path, keyword:
     reference = subprocess.run([sys.executable, str(src)], capture_output=True, text=True)
     assert reference.returncode == 0, reference.stderr
     assert reference.stdout.splitlines() == ["1 2", "3 3 2", "4.5"]
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout
+    generated = src.with_name("xmixed_array_ranks_p.f90").read_text(encoding="utf-8")
+    assert "function solve_copy_d_real_r1" in generated
+    assert "function solve_copy_d_real_r2" in generated
+
+
+def test_xp2f_tridiagonal_vector_matrix_specializations(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xtridiagonal_ranks.py", [
+        "import numpy as np",
+        "def solve(a, b, c, d):",
+        "    for i in range(1, len(d)):",
+        "        s = a[i] / b[i-1]",
+        "        b[i] = b[i] - s*c[i-1]",
+        "        d[i] = d[i] - s*d[i-1]",
+        "    x = d.copy()",
+        "    for i in range(len(d)-1, -1, -1):",
+        "        if i == len(d)-1:",
+        "            x[i] = x[i] / b[i]",
+        "        else:",
+        "            x[i] = (x[i] - c[i]*x[i+1]) / b[i]",
+        "    return x",
+        "def exercise():",
+        "    a = np.full(3, -0.75)",
+        "    b = np.full(3, 4.0)",
+        "    c = np.full(3, 0.5)",
+        "    rhs = np.ones((3, 2))",
+        "    rhs[:, 1] = 2.0",
+        "    b1 = b.copy()",
+        "    b2 = b.copy()",
+        "    d1 = rhs[:, 0].copy()",
+        "    d2 = rhs.copy()",
+        "    x1 = solve(a, b1, c, d1)",
+        "    x2 = solve(a, b2, c, d2)",
+        "    print(d1.ndim, d2.ndim, x1.ndim, x2.ndim)",
+        "    print(x1.shape[0], x2.shape[0], x2.shape[1])",
+        "    for i in range(3):",
+        "        print(x1[i], x2[i, 0], x2[i, 1], d1[i], d2[i, 0])",
+        "    print((x1 + np.arange(3)).sum())",
+        "exercise()",
+    ])
+
+
+def test_xp2f_rejects_unspecialized_vector_rank3_calls(tmp_path: Path) -> None:
+    src = tmp_path / "xunsupported_ranks.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "def copy_array(d):",
+        "    x = d.copy()",
+        "    for i in range(len(d)):",
+        "        x[i] = x[i] / 2.0",
+        "    return x",
+        "v = np.ones(3)",
+        "t = np.ones((3, 2, 2))",
+        "x = copy_array(v)",
+        "y = copy_array(t)",
+        "print(x.ndim, y.ndim)",
+    ]), encoding="utf-8")
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
                           cwd=tmp_path, capture_output=True, text=True)
     assert proc.returncode != 0
-    assert "mixed array ranks for function 'solve_copy', argument 'd': observed ranks 1, 2" in proc.stdout
-    assert "Use separate functions for vector and matrix inputs" in proc.stdout
-    assert not src.with_name("xmixed_array_ranks_p.f90").exists()
+    assert "observed ranks 1, 3" in proc.stdout, proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize("matrix", [False, True])

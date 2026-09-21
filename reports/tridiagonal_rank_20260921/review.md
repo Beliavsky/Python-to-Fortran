@@ -17,20 +17,21 @@ vector and a matrix from a common caller. Before the diagnostic was added,
 Matching dimension lengths and individual solver values therefore did not
 establish equivalent shapes or broadcasting behavior.
 
-The transpiler merges argument ranks into a shared signature. Existing
-specialization handles selected cases, but does not provide general
-vector/matrix specialization for value-returning functions. A new guard
-rejects observed conflicting positive array ranks when no specialization
-has been selected. It names the function, argument, and observed ranks and
-recommends separate functions for vector and matrix inputs. This is a
-conservative unsupported-case diagnostic, not a rank-specialization fix.
+The original cause was merging argument ranks into a shared signature.
+The first change added a diagnostic; the follow-up now specializes
+value-returning functions with one argument varying between rank 1 and rank 2,
+of the same numeric kind, and fixed profiles for all other arguments. Separate
+Fortran procedures are exposed through a generic interface. Result ranks are
+inferred per specialization, and callers must bypass shared-signature rank
+promotion. Forced argument kinds also take precedence over a range-use heuristic.
 
-Both this reproducer and the original mixed-rank tridiagonal probe now fail
-translation explicitly. The earlier tridiagonal numerical results remain
-historical evidence; that combined-rank checker is no longer expected to
-compile until rank-preserving specialization is implemented or its callers
-use separate rank-specific routines.
+Both this reproducer and the original mixed-rank tridiagonal probe now compile
+and pass. The tridiagonal checker additionally verifies the actual argument
+and result ranks and lengths for sizes 1, 2, 5, and 9. Maximum solution error
+remains 1.11e-16 and maximum scaled residual 1.39e-18 for both languages.
+The diagnostic remains for unsupported observed rank combinations, including
+the tested vector/rank-3 case. This is not general arbitrary-rank specialization.
 
 Regression coverage checks positional/keyword calls at module scope and
-inside a caller, and successful single-rank vector and matrix cases. Existing
+inside a caller, either call order, and successful single-rank vector and matrix cases. Existing
 supported specialization tests are also included in the focused test run.

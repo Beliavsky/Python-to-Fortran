@@ -46175,6 +46175,7 @@ class translator(ast.NodeVisitor):
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Name)
             and v.func.id in self.local_func_arg_ranks
+            and v.func.id not in self.local_generic_overloads
         ):
             call_id = v.func.id
             args_nodes = self._build_local_call_actual_nodes(call_id, v)
@@ -60694,7 +60695,7 @@ def _emit_local_function(
                 local_func_arg_kinds[fn.name][idx] = "int"
         if _arg_integer_seed_recurrence(arg):
             hint_kind = "int"
-        if _self_norm_kind is None and _arg_used_as_index_or_range(arg):
+        if _self_norm_kind is None and not forced_arg_kind and _arg_used_as_index_or_range(arg):
             hint_kind = "int"
             if (
                 local_func_arg_kinds is not None
@@ -68518,8 +68519,40 @@ def generate_flat(
                 and _curr_kinds[_i] is None
             ):
                 _curr_kinds[_i] = _bk
+    # Specialize a single vector/matrix argument using complete observed call
+    # profiles. Do not invent combinations or override the ranks with the
+    # maximum shared signature inferred earlier.
+    for fn in (local_funcs or []):
+        if (fn.name in local_overload_specs or fn.name in local_void_funcs
+                or fn.name in tuple_return_funcs or fn.name in dict_return_specs):
+            continue
+        rank_sets = call_rank_sets.get(fn.name, [])
+        if not any(1 in rs and 2 in rs for rs in rank_sets):
+            continue
+        observed, _, joint = _observed_local_call_specs(fn.name)
+        names = local_func_arg_names.get(fn.name, [])
+        varying = [i for i, pairs in enumerate(observed) if len(pairs) > 1]
+        if len(varying) != 1:
+            continue
+        iv = varying[0]
+        if ({r for _, r in observed[iv]} != {1, 2}
+                or len({k for k, _ in observed[iv]}) != 1
+                or any(not pairs for pairs in observed)):
+            continue
+        profiles = {tuple(call[i] for i in range(len(names))) for call in joint}
+        if len(profiles) != 2:
+            continue
+        specs = []
+        for profile in sorted(profiles):
+            kinds = {a: profile[i][0] for i, a in enumerate(names)}
+            ranks = {a: profile[i][1] for i, a in enumerate(names)}
+            pname = f"{fn.name}_{names[iv]}_{kinds[names[iv]]}_r{ranks[names[iv]]}"
+            specs.append((pname, kinds, ranks, set(), True))
+        local_overload_specs[fn.name] = specs
+        local_overload_dispatch[fn.name] = {"arg_index": iv}
+
     # A shared array signature must not silently turn a vector into a column
-    # matrix. General rank-1/rank-2 function specialization is not implemented.
+    # matrix. Rank combinations not handled by specialization remain unsupported.
     # Use fresh call-site observations (including direct assignment evidence),
     # not just the maximum ranks propagated back from the callee signature.
     for fn in (local_funcs or []):
