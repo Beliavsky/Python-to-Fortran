@@ -6309,6 +6309,72 @@ def test_xp2f_narrow_paren_simplification_preserves_call_and_division_grouping(t
     assert re.search(r"eh2\s*/\s*eh\s*\*\s*eh\b", out_f90) is None, out_f90
 
 
+def test_xp2f_joint_rank_forwarding_is_explicitly_rejected(tmp_path: Path) -> None:
+    src = tmp_path / "xjoint_forward.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "def leaf(x, y):",
+        "    z = x + y",
+        "    for repeat in range(1):",
+        "        z = z + 0.0",
+        "    return z",
+        "def wrapper(x, y):",
+        "    z = leaf(x, y)",
+        "    for repeat in range(1):",
+        "        z = z + 0.0",
+        "    return z",
+        "v = np.ones(3)",
+        "m = np.ones((2, 3))",
+        "print(wrapper(v, v))",
+        "print(wrapper(m, m))",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "forwarding joint argument profiles is not yet supported" in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("keyword", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_xp2f_joint_scalar_vector_matrix_signatures(tmp_path: Path, keyword: bool, nested: bool) -> None:
+    driver = [
+        "v = np.array([1.0, 2.0, 4.0])",
+        "m = np.array([[1.0, 2.0, 4.0], [3.0, 5.0, 7.0]])",
+    ]
+    profiles = [("2.0", "v"), ("2.0", "m"), ("v", "v"), ("m", "m"),
+                ("v", "2.0"), ("m", "2.0"), ("2.0", "3.0")]
+    for index, (x, y) in enumerate(profiles):
+        actuals = f"y={y}, x={x}" if keyword else f"{x}, {y}"
+        driver += [f"r{index} = combine({actuals})", f"print(reduced({actuals}))"]
+        if index == 6:
+            driver += [f"print(r{index})"]
+        elif index in {0, 2, 4}:
+            driver += [f"print(r{index}.ndim, r{index}.shape[0])",
+                       "for i in range(3):", f"    print(r{index}[i])"]
+        else:
+            driver += [f"print(r{index}.ndim, r{index}.shape[0], r{index}.shape[1])",
+                       "for i in range(2):", "    for j in range(3):",
+                       f"        print(r{index}[i,j])"]
+    if nested:
+        driver = ["def exercise():"] + ["    " + line for line in driver] + ["exercise()"]
+    _run_xp2f_compile_diff(tmp_path, "xjoint_ranks.py", [
+        "import numpy as np",
+        "def combine(x, y):",
+        "    z = x + 2.0*y",
+        "    for repeat in range(1):",
+        "        z = z + 0.0",
+        "    return z",
+        "def reduced(x, y):",
+        "    return np.sum(x + y)",
+        *driver,
+    ])
+    generated = (tmp_path / "xjoint_ranks_p.f90").read_text(encoding="utf-8")
+    assert "function combine_x_real_r0_y_real_r2" in generated
+    assert "function combine_x_real_r2_y_real_r0" in generated
+    assert "function combine_x_real_r1_y_real_r2" not in generated
+    assert "function combine_x_real_r2_y_real_r1" not in generated
+
+
 @pytest.mark.parametrize("keyword", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize("matrix_first", [False, True])

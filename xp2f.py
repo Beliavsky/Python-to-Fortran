@@ -34813,6 +34813,11 @@ class translator(ast.NodeVisitor):
                 a0_kind = self._expr_kind(node.args[0])
                 # NumPy accepts axis either positionally or by keyword.
                 # Keep this consistent with reduction rank inference.
+                if self._rank_expr(node.args[0]) == 0 and len(node.args) == 1 and not node.keywords:
+                    # A scalar specialization still accepts np.sum(value).
+                    # Fortran SUM requires an array; scalar Boolean sums
+                    # additionally produce integer zero/one.
+                    return self._coerce_expr_kind(node.args[0], a0, "int") if a0_kind == "logical" else a0
                 axis_node = node.args[1] if len(node.args) >= 2 else None
                 keepdims = False
                 for kw in node.keywords:
@@ -68614,7 +68619,7 @@ def generate_flat(
                 and _curr_kinds[_i] is None
             ):
                 _curr_kinds[_i] = _bk
-    # Specialize a single vector/matrix argument using complete observed call
+    # Specialize scalar/vector/matrix arguments using complete observed call
     # profiles. Do not invent combinations or override the ranks with the
     # maximum shared signature inferred earlier.
     for fn in (local_funcs or []):
@@ -68622,26 +68627,42 @@ def generate_flat(
                 or fn.name in tuple_return_funcs or fn.name in dict_return_specs):
             continue
         rank_sets = call_rank_sets.get(fn.name, [])
-        if not any(1 in rs and 2 in rs for rs in rank_sets):
+        if not any(len(rs & {0, 1, 2}) > 1 for rs in rank_sets):
             continue
         observed, _, joint = _observed_local_call_specs(fn.name)
         names = local_func_arg_names.get(fn.name, [])
         varying = [i for i, pairs in enumerate(observed) if len(pairs) > 1]
-        if len(varying) != 1:
+        if not varying:
             continue
         iv = varying[0]
-        if ({r for _, r in observed[iv]} != {1, 2}
-                or len({k for k, _ in observed[iv]}) != 1
-                or any(not pairs for pairs in observed)):
+        if (any(not pairs for pairs in observed)
+                or any(len({k for k, _ in pairs}) != 1
+                       or not {r for _, r in pairs} <= {0, 1, 2}
+                       for pairs in observed)):
             continue
         profiles = {tuple(call[i] for i in range(len(names))) for call in joint}
-        if len(profiles) != 2:
+        if len(profiles) < 2:
             continue
+        if len(varying) > 1:
+            forwarded = next((
+                n.func.id for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id in local_func_arg_names
+            ), None)
+            if forwarded is not None:
+                # Shared callee signatures still describe the merged ranks,
+                # not each caller profile. Do not silently reshape forwarded
+                # arguments until profile propagation supports this case.
+                raise NotImplementedError(
+                    f"joint-rank specialization for '{fn.name}' calls local function "
+                    f"'{forwarded}'; forwarding joint argument profiles is not yet supported"
+                )
         specs = []
         for profile in sorted(profiles):
             kinds = {a: profile[i][0] for i, a in enumerate(names)}
             ranks = {a: profile[i][1] for i, a in enumerate(names)}
-            pname = f"{fn.name}_{names[iv]}_{kinds[names[iv]]}_r{ranks[names[iv]]}"
+            suffix = "_".join(f"{names[i]}_{kinds[names[i]]}_r{ranks[names[i]]}" for i in varying)
+            pname = f"{fn.name}_{suffix}"
             specs.append((pname, kinds, ranks, set(), True))
         local_overload_specs[fn.name] = specs
         local_overload_dispatch[fn.name] = {"arg_index": iv}
