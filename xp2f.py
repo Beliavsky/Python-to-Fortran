@@ -24579,6 +24579,10 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.attr in {"all", "any"}:
                     return "logical"
+                if node.func.attr == "sum" and self._expr_kind(node.func.value) == "logical":
+                    # Boolean sums lower to COUNT, whose result is integer,
+                    # not the element kind of the input mask.
+                    return "int"
                 return self._expr_kind(node.func.value)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -37531,6 +37535,7 @@ class translator(ast.NodeVisitor):
                 if len(node.args) == 1:
                     cond = self.expr(node.args[0])
                     # 1D subset used by many codes; equivalent to np.where(cond)[0].
+                    cond = self._coerce_expr_kind(node.args[0], cond, "logical")
                     return f"pack(arange_int(0, size({cond}), 1), {cond})"
                 raise NotImplementedError("np.where supports one-arg or three-arg forms")
             if (
@@ -38513,7 +38518,7 @@ class translator(ast.NodeVisitor):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
                 if k0 in {"int", "logical"}:
-                    a0 = f"real({a0}, kind=dp)"
+                    a0 = self._coerce_expr_kind(node.args[0], a0, "real")
                 return f"sqrt({a0})"
             if (
                 isinstance(node.func, ast.Attribute)

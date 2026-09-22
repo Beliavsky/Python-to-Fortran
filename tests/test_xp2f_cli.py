@@ -7667,6 +7667,62 @@ def test_xp2f_empty_permutation_and_choice_without_replacement(
     )
 
 
+@pytest.mark.parametrize("condition", ["np.sqrt(x != 0.0)", "x", "x.astype(int)"])
+def test_xp2f_where_numeric_condition_and_boolean_sqrt(tmp_path: Path, condition: str) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xwhere_numeric.py",
+        [
+            "import numpy as np",
+            "def integrand(x, y):",
+            "    result = np.zeros(len(x))",
+            "    i = np.where(np.sqrt(3.0 - x - 2.0*y != 0.0))",
+            "    result[i] = 1.0 / np.sqrt(3.0 - x[i] - 2.0*y[i])",
+            "    return result",
+            "x = np.array([0.0, -2.0, 0.0, 3.0])",
+            f"indices = np.where({condition})[0]",
+            "for j in range(len(indices)):",
+            "    print(indices[j])",
+            "print(np.sqrt(True), np.sqrt(False))",
+            "flags = np.array([True, False, True], dtype=bool)",
+            "roots = np.sqrt(flags)",
+            "for j in range(3):",
+            "    print(roots[j])",
+            "a = np.array([0.0, 0.25, 0.5, 1.0])",
+            "b = np.array([0.0, 0.5, 0.25, 1.0])",
+            "values = integrand(a, b)",
+            "for j in range(4):",
+            "    print(values[j])",
+            "empty = np.zeros(0)",
+            "empty_indices = np.where(np.sqrt(empty != 0.0))[0]",
+            "zero_indices = np.where(np.zeros(3))[0]",
+            "print(len(empty_indices), len(zero_indices))",
+        ],
+    )
+
+
+def test_xp2f_boolean_method_sum_keeps_integer_result(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(
+        tmp_path,
+        "xbool_sum_kind.py",
+        [
+            "import numpy as np",
+            "def count_positive(x):",
+            "    mask = x > 0.0",
+            "    return int(mask.sum())",
+            "a = np.array([1.0, -1.0, 2.0, 3.0])",
+            "mask = a > 0.0",
+            "total = mask.sum()",
+            "print(total, int(mask.sum()), float(mask.sum()), count_positive(a))",
+            "print(int((a > 0.0).sum()), int(np.sum(mask)))",
+            "print(int(mask.any()), int(mask.all()))",
+            "print(int(np.zeros(0, dtype=bool).sum()))",
+            "print(int(np.zeros(3, dtype=bool).sum()))",
+            "print(int(np.ones(3, dtype=bool).sum()))",
+        ],
+    )
+
+
 def test_xp2f_int_converts_boolean_expressions(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(
         tmp_path,
