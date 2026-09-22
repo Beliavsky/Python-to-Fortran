@@ -6309,29 +6309,52 @@ def test_xp2f_narrow_paren_simplification_preserves_call_and_division_grouping(t
     assert re.search(r"eh2\s*/\s*eh\s*\*\s*eh\b", out_f90) is None, out_f90
 
 
-def test_xp2f_joint_rank_forwarding_is_explicitly_rejected(tmp_path: Path) -> None:
-    src = tmp_path / "xjoint_forward.py"
-    src.write_text("\n".join([
-        "import numpy as np",
-        "def leaf(x, y):",
-        "    z = x + y",
-        "    for repeat in range(1):",
-        "        z = z + 0.0",
-        "    return z",
-        "def wrapper(x, y):",
-        "    z = leaf(x, y)",
-        "    for repeat in range(1):",
-        "        z = z + 0.0",
-        "    return z",
-        "v = np.ones(3)",
-        "m = np.ones((2, 3))",
-        "print(wrapper(v, v))",
-        "print(wrapper(m, m))",
-    ]), encoding="utf-8")
+@pytest.mark.parametrize("leaf_first", [False, True])
+def test_xp2f_forwards_joint_rank_profiles(tmp_path: Path, leaf_first: bool) -> None:
+    functions = [
+        ["def wrapper(x, y):", "    z = middle(y=y, x=x)",
+         "    for repeat in range(1):", "        z = z + 0.0", "    return z"],
+        ["def middle(x, y):", "    z = leaf(x, y)",
+         "    for repeat in range(1):", "        z = z + 0.0", "    return z"],
+        ["def leaf(x, y):", "    z = x + 2.0*y",
+         "    for repeat in range(1):", "        z = z + 0.0", "    return z"],
+        ["def reduced(x, y):", "    z = reduce_leaf(x=x, y=y)",
+         "    for repeat in range(1):", "        z = z + 0.0", "    return z"],
+        ["def reduce_leaf(x, y):", "    return np.sum(x + y)"],
+    ]
+    if leaf_first:
+        functions.reverse()
+    lines = ["import numpy as np"] + [line for fn in functions for line in fn]
+    lines += ["v = np.array([1.0, 2.0, 4.0])",
+              "m = np.array([[1.0, 2.0, 4.0], [3.0, 5.0, 7.0]])"]
+    for i, (x, y, rank) in enumerate([
+        ("2.0", "3.0", 0), ("2.0", "v", 1), ("2.0", "m", 2),
+        ("v", "2.0", 1), ("m", "2.0", 2), ("v", "v", 1), ("m", "m", 2),
+    ]):
+        lines += [f"a{i} = wrapper(y={y}, x={x})", f"print(reduced({x}, {y}))"]
+        if rank == 0:
+            lines += [f"print(a{i})"]
+        elif rank == 1:
+            lines += [f"print(a{i}.ndim, a{i}.shape[0])",
+                      "for j in range(3):", f"    print(a{i}[j])"]
+        else:
+            lines += [f"print(a{i}.ndim, a{i}.shape[0], a{i}.shape[1])",
+                      "for j in range(2):", "    for k in range(3):", f"        print(a{i}[j,k])"]
+    _run_xp2f_compile_diff(tmp_path, "xjoint_forward.py", lines)
+    generated = (tmp_path / "xjoint_forward_p.f90").read_text(encoding="utf-8")
+    for name in ["wrapper", "middle", "leaf", "reduced", "reduce_leaf"]:
+        assert f"function {name}_x_real_r0_y_real_r0" in generated
+        assert f"function {name}_x_real_r0_y_real_r2" in generated
+        assert f"function {name}_x_real_r1_y_real_r2" not in generated
+
+
+def test_xp2f_rejects_multidimensional_where_indices(tmp_path: Path) -> None:
+    src = tmp_path / "xwhere_matrix.py"
+    src.write_text("import numpy as np\na = np.ones((2, 3))\ni = np.where(a > 0)\nprint(i)\n", encoding="utf-8")
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
                           cwd=tmp_path, capture_output=True, text=True)
     assert proc.returncode != 0
-    assert "forwarding joint argument profiles is not yet supported" in proc.stdout + proc.stderr
+    assert "requires a tuple of index arrays" in proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize("keyword", [False, True])

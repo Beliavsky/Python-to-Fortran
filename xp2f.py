@@ -25956,6 +25956,8 @@ class translator(ast.NodeVisitor):
                 and self.local_return_specs[node.func.id] in {"alloc_real", "alloc_int", "alloc_log"}
                 and len(node.args) >= 1
             ):
+                if self.local_overload_dispatch.get(node.func.id, {}).get("return_profiles"):
+                    return f"size({self.expr(node)})" if self._rank_expr(node) > 0 else None
                 return f"size({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -37538,6 +37540,11 @@ class translator(ast.NodeVisitor):
                                 a2 = f"real({a2}, kind=dp)"
                     return f"merge({a1}, {a2}, {cond})"
                 if len(node.args) == 1:
+                    if self._rank_expr(node.args[0]) > 1:
+                        raise NotImplementedError(
+                            "one-argument np.where with a multidimensional condition "
+                            "requires a tuple of index arrays; only rank-1 conditions are supported"
+                        )
                     cond = self.expr(node.args[0])
                     # 1D subset used by many codes; equivalent to np.where(cond)[0].
                     cond = self._coerce_expr_kind(node.args[0], cond, "logical")
@@ -42053,6 +42060,10 @@ class translator(ast.NodeVisitor):
                 ):
                     spec = self.local_return_specs[v.func.id]
                     rr_v = max(0, int(self._rank_expr(v)))
+                    if rr_v == 0 and self.local_overload_dispatch.get(v.func.id, {}).get("return_profiles"):
+                        spec = {"alloc_real": "real", "alloc_int": "int",
+                                "alloc_log": "logical", "alloc_complex": "complex",
+                                "alloc_char": "char"}.get(spec, spec)
                     if spec == "alloc_real":
                         self._mark_alloc_real(t.id, rank=max(1, rr_v))
                     elif spec == "alloc_int":
@@ -58536,6 +58547,7 @@ def _emit_local_function(
             and isinstance(_rhs.func, ast.Name)
             and local_return_ranks is not None
             and _rhs.func.id in local_return_ranks
+            and not (local_overload_dispatch or {}).get(_rhs.func.id, {}).get("return_profiles")
         ):
             _rr = max(_rr, int(local_return_ranks.get(_rhs.func.id, 0)))
         if (
@@ -62876,11 +62888,13 @@ def _numeric_comment_kind(inferred_kind, comment_kind):
     return comment_kind
 
 
-def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None, user_class_types=None, structured_type_components=None):
+def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None, user_class_types=None, structured_type_components=None, call_context=None):
     tuple_out = {}
     tuple_out_ranks = {}
-    scalar_or_array = {}
-    scalar_or_array_ranks = {}
+    call_context = call_context or {}
+    own_names = {fn.name for fn in (local_funcs or [])}
+    scalar_or_array = {k: v for k, v in call_context.get("specs", {}).items() if k not in own_names}
+    scalar_or_array_ranks = {k: v for k, v in call_context.get("ranks", {}).items() if k not in own_names}
     _fn_walk_cache = {}
     _fn_return_cache = {}
     _infer_arg_rank_local_cache = {}
@@ -63132,6 +63146,13 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 _callee = _rhs.func.id
                 _ret_spec = scalar_or_array.get(_callee, tr_ctx.local_return_specs.get(_callee))
                 _ret_rank = int(scalar_or_array_ranks.get(_callee, tr_ctx.local_return_ranks.get(_callee, 1)))
+                if tr_ctx.local_overload_dispatch.get(_callee, {}).get("return_profiles"):
+                    _ret_rank = int(tr_ctx._rank_expr(_rhs))
+                    _kind = tr_ctx._expr_kind(_rhs)
+                    _ret_spec = ({"int": "alloc_int", "real": "alloc_real",
+                                  "logical": "alloc_log", "complex": "alloc_complex",
+                                  "char": "alloc_char"}.get(_kind)
+                                 if _ret_rank > 0 else _kind)
                 if _ret_spec == "alloc_int":
                     best_rank = max(best_rank, max(1, _ret_rank))
                     if best_kind is None:
@@ -63298,7 +63319,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             if isinstance(_rhs, ast.Call) and isinstance(_rhs.func, ast.Name):
                 _callee = _rhs.func.id
                 _spec = scalar_or_array.get(_callee)
-                if _spec is not None:
+                if _spec is not None and not tr_ctx.local_overload_dispatch.get(_callee, {}).get("return_profiles"):
                     _rank = int(scalar_or_array_ranks.get(_callee, 0))
                     if _rank > best_rank:
                         best_rank = _rank
@@ -63365,6 +63386,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 function_result_name=_function_result_var_name(fn),
                 local_return_specs=scalar_or_array,
                 local_return_ranks=scalar_or_array_ranks,
+                local_func_arg_names=call_context.get("names", {}),
+                local_overload_dispatch=call_context.get("dispatch", {}),
                 tuple_return_funcs=set(tuple_out.keys()),
                 tuple_return_out_kinds=tuple_out,
                 tuple_return_out_ranks=tuple_out_ranks,
@@ -67754,6 +67777,7 @@ def generate_flat(
     local_overload_specs = {}
     local_overload_dispatch = {}
     local_overload_tuple_profiles = {}
+    profile_scan_enabled = False
     def _observed_local_call_specs(fn_name):
         arg_names = list(local_func_arg_names.get(fn_name, []))
         pair_lists = [set() for _ in arg_names]
@@ -67831,45 +67855,47 @@ def generate_flat(
         for _fn_scan in (local_funcs or []):
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
-            _tr_local_scan = translator(
-                emit(),
-                params=params,
-                context="flat",
-                list_counts=list_counts,
-                char_list_final_sizes=char_list_final_sizes,
-                tuple_return_funcs=set(_prov_tuple_out.keys()),
-                tuple_return_out_kinds=_prov_tuple_out,
-                tuple_return_out_ranks=_prov_tuple_out_ranks,
-                local_return_specs=_prov_scalar_specs,
-                # See the matching fix on tr_seed near this function's
-                # construction, above.
-                local_return_ranks=_prov_scalar_ranks,
-                user_class_types=user_class_types,
-                structured_type_components=structured_type_components,
-            )
-            if _local_ret_df_info_scan2:
-                _tr_local_scan.local_df_return_info.update(_local_ret_df_info_scan2)
-            if _local_ret_tuple_df_info_scan2:
-                _tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan2)
-            _seed_struct_param_types(_tr_local_scan, _fn_scan)
-            # Calls through indexed formal arrays need the caller's inferred
-            # signature; scanning its body alone leaves these names untyped.
-            for _i, _arg in enumerate(local_func_arg_names.get(_fn_scan.name, [])):
-                _kind = local_func_arg_kinds[_fn_scan.name][_i]
-                _rank = local_func_arg_ranks[_fn_scan.name][_i]
-                if _kind not in {"int", "real", "logical", "char", "complex"}:
-                    continue
-                if _rank > 0:
-                    _mark = {"int": _tr_local_scan._mark_alloc_int, "real": _tr_local_scan._mark_alloc_real,
-                             "logical": _tr_local_scan._mark_alloc_log, "char": _tr_local_scan._mark_alloc_char,
-                             "complex": _tr_local_scan._mark_alloc_complex}[_kind]
-                    _mark(_arg, rank=_rank)
-                else:
-                    {"int": _tr_local_scan.ints, "real": _tr_local_scan.reals,
-                     "logical": _tr_local_scan.logs, "char": _tr_local_scan.chars,
-                     "complex": _tr_local_scan.complexes}[_kind].add(_arg)
-            _tr_local_scan.prescan(_fn_scan.body)
-            _record(_fn_scan, _tr_local_scan, _fn_scan)
+            _owner_specs = local_overload_specs.get(_fn_scan.name, []) if profile_scan_enabled else []
+            for _owner_spec in (_owner_specs or [None]):
+                _tr_local_scan = translator(
+                    emit(),
+                    params=params,
+                    context="flat",
+                    list_counts=list_counts,
+                    char_list_final_sizes=char_list_final_sizes,
+                    tuple_return_funcs=set(_prov_tuple_out.keys()),
+                    tuple_return_out_kinds=_prov_tuple_out,
+                    tuple_return_out_ranks=_prov_tuple_out_ranks,
+                    local_return_specs=_prov_scalar_specs,
+                    # See the matching fix on tr_seed near this function's
+                    # construction, above.
+                    local_return_ranks=_prov_scalar_ranks,
+                    user_class_types=user_class_types,
+                    structured_type_components=structured_type_components,
+                )
+                if _local_ret_df_info_scan2:
+                    _tr_local_scan.local_df_return_info.update(_local_ret_df_info_scan2)
+                if _local_ret_tuple_df_info_scan2:
+                    _tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan2)
+                _seed_struct_param_types(_tr_local_scan, _fn_scan)
+                # Calls through indexed formal arrays need the caller's inferred
+                # signature; scanning its body alone leaves these names untyped.
+                for _i, _arg in enumerate(local_func_arg_names.get(_fn_scan.name, [])):
+                    _kind = _owner_spec[1].get(_arg) if _owner_spec else local_func_arg_kinds[_fn_scan.name][_i]
+                    _rank = _owner_spec[2].get(_arg, 0) if _owner_spec else local_func_arg_ranks[_fn_scan.name][_i]
+                    if _kind not in {"int", "real", "logical", "char", "complex"}:
+                        continue
+                    if _rank > 0:
+                        _mark = {"int": _tr_local_scan._mark_alloc_int, "real": _tr_local_scan._mark_alloc_real,
+                                 "logical": _tr_local_scan._mark_alloc_log, "char": _tr_local_scan._mark_alloc_char,
+                                 "complex": _tr_local_scan._mark_alloc_complex}[_kind]
+                        _mark(_arg, rank=_rank)
+                    else:
+                        {"int": _tr_local_scan.ints, "real": _tr_local_scan.reals,
+                         "logical": _tr_local_scan.logs, "char": _tr_local_scan.chars,
+                         "complex": _tr_local_scan.complexes}[_kind].add(_arg)
+                _tr_local_scan.prescan(_fn_scan.body)
+                _record(_fn_scan, _tr_local_scan, _fn_scan)
         return pair_lists, triad_lists, joint_calls
     for fn in (local_funcs or []):
         if fn.name not in local_void_funcs:
@@ -68619,53 +68645,52 @@ def generate_flat(
                 and _curr_kinds[_i] is None
             ):
                 _curr_kinds[_i] = _bk
-    # Specialize scalar/vector/matrix arguments using complete observed call
-    # profiles. Do not invent combinations or override the ranks with the
-    # maximum shared signature inferred earlier.
-    for fn in (local_funcs or []):
-        if (fn.name in local_overload_specs or fn.name in local_void_funcs
-                or fn.name in tuple_return_funcs or fn.name in dict_return_specs):
-            continue
-        rank_sets = call_rank_sets.get(fn.name, [])
-        if not any(len(rs & {0, 1, 2}) > 1 for rs in rank_sets):
-            continue
-        observed, _, joint = _observed_local_call_specs(fn.name)
-        names = local_func_arg_names.get(fn.name, [])
-        varying = [i for i, pairs in enumerate(observed) if len(pairs) > 1]
-        if not varying:
-            continue
-        iv = varying[0]
-        if (any(not pairs for pairs in observed)
-                or any(len({k for k, _ in pairs}) != 1
-                       or not {r for _, r in pairs} <= {0, 1, 2}
-                       for pairs in observed)):
-            continue
-        profiles = {tuple(call[i] for i in range(len(names))) for call in joint}
-        if len(profiles) < 2:
-            continue
-        if len(varying) > 1:
-            forwarded = next((
-                n.func.id for n in ast.walk(fn)
-                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                and n.func.id in local_func_arg_names
-            ), None)
-            if forwarded is not None:
-                # Shared callee signatures still describe the merged ranks,
-                # not each caller profile. Do not silently reshape forwarded
-                # arguments until profile propagation supports this case.
-                raise NotImplementedError(
-                    f"joint-rank specialization for '{fn.name}' calls local function "
-                    f"'{forwarded}'; forwarding joint argument profiles is not yet supported"
-                )
-        specs = []
-        for profile in sorted(profiles):
-            kinds = {a: profile[i][0] for i, a in enumerate(names)}
-            ranks = {a: profile[i][1] for i, a in enumerate(names)}
-            suffix = "_".join(f"{names[i]}_{kinds[names[i]]}_r{ranks[names[i]]}" for i in varying)
-            pname = f"{fn.name}_{suffix}"
-            specs.append((pname, kinds, ranks, set(), True))
-        local_overload_specs[fn.name] = specs
-        local_overload_dispatch[fn.name] = {"arg_index": iv}
+    # Propagate complete profiles down local calls, never Cartesian products.
+    profile_scan_enabled = True
+    joint_rank_managed = set()
+    joint_rank_targets = set()
+    for _joint_pass in range(len(local_funcs or []) + 2):
+        joint_rank_changed = False
+        for fn in (local_funcs or []):
+            if ((fn.name in local_overload_specs and fn.name not in joint_rank_managed) or fn.name in local_void_funcs
+                    or fn.name in tuple_return_funcs or fn.name in dict_return_specs):
+                continue
+            rank_sets = call_rank_sets.get(fn.name, [])
+            if fn.name not in joint_rank_targets and not any(len(rs & {0, 1, 2}) > 1 for rs in rank_sets):
+                continue
+            observed, _, joint = _observed_local_call_specs(fn.name)
+            names = local_func_arg_names.get(fn.name, [])
+            varying = [i for i, pairs in enumerate(observed) if len(pairs) > 1]
+            if not varying:
+                continue
+            iv = varying[0]
+            if (any(not pairs for pairs in observed)
+                    or any(len({k for k, _ in pairs}) != 1
+                           or not {r for _, r in pairs} <= {0, 1, 2}
+                           for pairs in observed)):
+                continue
+            profiles = {tuple(call[i] for i in range(len(names))) for call in joint}
+            if len(profiles) < 2:
+                continue
+            specs = []
+            for profile in sorted(profiles):
+                kinds = {a: profile[i][0] for i, a in enumerate(names)}
+                ranks = {a: profile[i][1] for i, a in enumerate(names)}
+                suffix = "_".join(f"{names[i]}_{kinds[names[i]]}_r{ranks[names[i]]}" for i in varying)
+                pname = f"{fn.name}_{suffix}"
+                specs.append((pname, kinds, ranks, set(), True))
+            if local_overload_specs.get(fn.name) != specs:
+                joint_rank_changed = True
+            joint_rank_managed.add(fn.name)
+            joint_rank_targets.update(n.func.id for n in ast.walk(fn)
+                                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                                      and n.func.id in local_func_arg_names)
+            local_overload_specs[fn.name] = specs
+            local_overload_dispatch[fn.name] = {"arg_index": iv}
+        if not joint_rank_changed:
+            break
+    else:
+        raise NotImplementedError("local joint-rank profiles did not converge")
 
     # A shared array signature must not silently turn a vector into a column
     # matrix. Rank combinations not handled by specialization remain unsupported.
@@ -68772,6 +68797,36 @@ def generate_flat(
                 overload_return_maps[pname] = (rs[fn.name], rr.get(fn.name, 0))
                 local_overload_dispatch.setdefault(fn.name, {}).setdefault("return_profiles", []).append(
                     {"kinds": kinds, "ranks": ranks, "return_rank": rr.get(fn.name, 0)})
+    # Resolve forwarded results in each signature's context. Fresh inference
+    # per pass avoids retaining the merged rank of another specialization.
+    for _return_pass in range(len(joint_rank_managed) + 2):
+        _return_changed = False
+        for fn in (local_funcs or []):
+            if fn.name not in joint_rank_managed:
+                continue
+            names = local_func_arg_names[fn.name]
+            profiles = []
+            for pname, kinds, ranks, *_ in local_overload_specs[fn.name]:
+                rs, rr, _, _ = _local_return_maps(
+                    [fn], params,
+                    arg_rank_hints={fn.name: [ranks[a] for a in names]},
+                    arg_kind_hints={fn.name: [kinds[a] for a in names]},
+                    user_class_types=user_class_types,
+                    structured_type_components=structured_type_components,
+                    call_context={"specs": local_return_specs, "ranks": local_return_ranks,
+                                  "names": local_func_arg_names, "dispatch": local_overload_dispatch},
+                )
+                if fn.name in rs:
+                    result = (rs[fn.name], rr.get(fn.name, 0))
+                    if overload_return_maps.get(pname) != result:
+                        _return_changed = True
+                    overload_return_maps[pname] = result
+                    profiles.append({"kinds": kinds, "ranks": ranks, "return_rank": result[1]})
+            local_overload_dispatch[fn.name]["return_profiles"] = profiles
+        if not _return_changed:
+            break
+    else:
+        raise NotImplementedError("local joint-rank result profiles did not converge")
     local_generic_overloads = set(local_overload_specs.keys())
     pure_local_calls = compute_local_functions_purity(
         local_funcs, known_pure_calls=set(known_pure_calls or set()) | set((user_class_types or {}).keys())
