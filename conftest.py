@@ -2,6 +2,8 @@ import atexit
 import datetime
 import os
 
+pytest_plugins = ["pytest_runlog"]
+
 _start_dt = datetime.datetime.now()
 
 

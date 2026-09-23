@@ -222,3 +222,27 @@ Run the pytest suite:
 ```console
 python -m pytest
 ```
+
+Every configured pytest run automatically saves timestamped reports under
+`reports/pytest/`, including when using `pytest -q`. These generated files are
+ignored by Git:
+
+- `.txt`: session start/end times, elapsed wall time, counts, per-test timing,
+  and failure tracebacks with captured output, including failed rerun attempts.
+- `.jsonl`: events flushed as they arrive, plus a final machine-readable summary.
+  Partial results remain available if the run is interrupted or terminated.
+
+Reports include the invocation, configured options, Python/pytest versions, Git
+commit, and whether tracked files were modified. Parallel workers send results
+to the controller, which is the only report writer. Final test counts exclude
+extra rerun attempts; setup/teardown failures count as failed tests. Per-test
+duration sums setup, call, teardown, and all attempts, so summed test durations
+can exceed session wall time during parallel runs. Deselected counts are unknown
+(`null`) in parallel runs.
+
+An interrupted or early-stopped run is marked incomplete. If pytest is forcibly
+terminated, the text file retains its initial `running/incomplete` status and
+the JSONL file has no final summary. Failures before pytest loads this reporting
+plugin cannot be recorded. Logging I/O errors disable reporting with a diagnostic
+without changing test outcomes. Logs may contain captured application output;
+review them before sharing. No full terminal transcript is recorded.
