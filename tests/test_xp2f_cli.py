@@ -3892,7 +3892,7 @@ def test_xp2f_compiles_empty_list_reset_for_known_array(tmp_path: Path) -> None:
     assert "allocate(theta(0, 0))" in out_text or "allocate(theta(0,0))" in out_text
 
 
-def test_xp2f_marks_rebound_array_dummy_allocatable(tmp_path: Path) -> None:
+def test_xp2f_rebound_array_uses_local_allocatable(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xrebound_dummy_small.py"
     src.write_text(
@@ -3904,7 +3904,8 @@ def test_xp2f_marks_rebound_array_dummy_allocatable(tmp_path: Path) -> None:
                 "        a = []",
                 "    return a",
                 "arr = np.array([1, 2])",
-                "print(f(0, arr))",
+                "print(len(f(0, arr)))",
+                "print(len(arr), arr[0], arr[1])",
                 "",
             ]
         ),
@@ -3912,7 +3913,7 @@ def test_xp2f_marks_rebound_array_dummy_allocatable(tmp_path: Path) -> None:
     )
 
     proc = subprocess.run(
-        [sys.executable, str(XP2F_PATH), str(src)],
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -3922,8 +3923,20 @@ def test_xp2f_marks_rebound_array_dummy_allocatable(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out_f90 = tmp_path / "xrebound_dummy_small_p.f90"
     assert out_f90.exists()
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
     out_text = out_f90.read_text(encoding="utf-8")
-    assert "allocatable, intent(inout) :: a(:)" in out_text
+    assert "allocatable, intent(inout) :: a(:)" not in out_text
+    assert "intent(in) :: a(:)" in out_text
+    assert "allocatable :: a_local(:)" in out_text
+
+
+def test_xp2f_resizing_rebound_parameter_preserves_caller(tmp_path: Path) -> None:
+    lines = (REPO_ROOT / "reports" / "collatz_polynomial_validation_20260923" / "probe.py").read_text(encoding="utf-8").splitlines()
+    _run_xp2f_compile_diff(tmp_path, "xresize_parameter.py", lines)
+    generated = (tmp_path / "xresize_parameter_p.f90").read_text(encoding="utf-8")
+    evolve = generated.split("subroutine evolve(", 1)[1].split("end subroutine evolve", 1)[0]
+    assert "intent(in) :: p(:)" in evolve
+    assert "allocatable :: p_local(:)" in evolve
 
 
 def test_xp2f_compiles_transpose_of_list_of_vectors(tmp_path: Path) -> None:

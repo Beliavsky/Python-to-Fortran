@@ -61203,7 +61203,11 @@ def _emit_local_function(
             ):
                 arr_rank = 0
         needs_alloc_rebind = arr_rank > 0 and _arg_needs_allocatable_rebind(arg)
-        if needs_alloc_rebind:
+        # Resizing a Python parameter by name assignment rebinds the local
+        # name; it does not replace the caller's array. Keep the input dummy
+        # assumed-shape and let local_rebind_aliases own the allocation.
+        local_array_rebind = arr_rank > 0 and _arg_is_rebound_name(arg) and arg not in optional_args
+        if needs_alloc_rebind and not local_array_rebind:
             intent_txt = "inout"
         if (
             arg in defaults_map
@@ -61219,8 +61223,9 @@ def _emit_local_function(
         is_count_mapped_output_array = (
             arr_rank > 0
             and local_list_counts.get(arg, None) is not None
+            and not local_array_rebind
         )
-        is_alloc_rebind_output_array = arr_rank > 0 and needs_alloc_rebind
+        is_alloc_rebind_output_array = arr_rank > 0 and needs_alloc_rebind and not local_array_rebind
         if arg in (dict_arg_types or {}):
             tnm = (dict_arg_types or {})[arg]
             arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg_emit}"
