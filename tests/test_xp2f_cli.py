@@ -3939,6 +3939,45 @@ def test_xp2f_resizing_rebound_parameter_preserves_caller(tmp_path: Path) -> Non
     assert "allocatable :: p_local(:)" in evolve
 
 
+def test_xp2f_fractional_arrays_forwarded_after_rebinding(tmp_path: Path) -> None:
+    source = (REPO_ROOT / "reports" / "collatz_polynomial_validation_20260923" / "probe.py").read_text(encoding="utf-8")
+    source = source.replace("7.0", "7.25").replace("[1.0, 2.0, 3.0]", "[1.5, 2.5, 3.5]")
+    _run_xp2f_compile_diff(tmp_path, "xfractional_forward.py", source.splitlines())
+    generated = (tmp_path / "xfractional_forward_p.f90").read_text(encoding="utf-8")
+    assert "int(p_local)" not in generated
+    for name in ("grow", "show"):
+        header = f"function {name}(" if name == "grow" else f"subroutine {name}("
+        body = generated.split(header, 1)[1].split("end ", 1)[0]
+        assert "real(kind=dp), intent(in) :: p(:)" in body
+
+
+@pytest.mark.parametrize("bound", ["len(a)", "a.size", "a.shape[0]", "int(a[0])", "round(a[0])", "min(len(a), n)"])
+def test_xp2f_integer_metadata_does_not_change_array_elements(tmp_path: Path, bound: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xmetadata_kind.py", [
+        "import numpy as np",
+        "def evaluate(a, n):",
+        "    out = np.zeros((len(a), n))",
+        f"    for i in range({bound}):",
+        "        out[i, 0] = a[i]",
+        "    print(a[0], a[1], a[2])",
+        "    return out",
+        "a = np.array([2.75, -1.5, 4.125])",
+        "result = evaluate(a, 2)",
+        "for i in range(3):", "    print(result[i, 0])",
+    ])
+    generated = (tmp_path / "xmetadata_kind_p.f90").read_text(encoding="utf-8")
+    assert "integer, intent(in) :: n" in generated
+
+
+@pytest.mark.parametrize("bound", ["int(x)", "round(x)"])
+def test_xp2f_integer_conversion_in_range_preserves_real_input(tmp_path: Path, bound: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xconverted_bound.py", [
+        "def total(x):", "    result = 0.0",
+        f"    for i in range({bound}):", "        result = result + x",
+        "    return result", "print(total(2.75))", "print(total(-1.5))",
+    ])
+
+
 def test_xp2f_compiles_transpose_of_list_of_vectors(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xtranspose_list_vectors.py"

@@ -57652,7 +57652,9 @@ def _emit_local_function(
                     (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.LShift, ast.RShift),
                 ) and (_is_direct_index_expr(node.left) or _is_direct_index_expr(node.right))
             if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in {"min", "max", "int", "len", "round", "floor", "ceil"}:
+                # min/max preserve their operand values; conversions and
+                # metadata queries constrain only their result, not inputs.
+                if isinstance(node.func, ast.Name) and node.func.id in {"min", "max"}:
                     return any(_is_direct_index_expr(_a) for _a in node.args) or any(
                         _is_direct_index_expr(getattr(_kw, "value", None)) for _kw in getattr(node, "keywords", [])
                     )
@@ -64985,7 +64987,7 @@ def generate_flat(
                 if isinstance(n, ast.Call):
                     # range(n), range(a, n, s), ...
                     if isinstance(n.func, ast.Name) and n.func.id == "range":
-                        if any(any(isinstance(x, ast.Name) and x.id == nm for x in ast.walk(a)) for a in n.args):
+                        if any(_is_direct_index_expr(a) for a in n.args):
                             return _ret("int")
                     # numpy shape-bearing constructors.
                     if (
@@ -64996,12 +64998,7 @@ def generate_flat(
                         and n.args
                     ):
                         a0 = n.args[0]
-                        if isinstance(a0, ast.Name) and a0.id == nm:
-                            return _ret("int")
-                        if isinstance(a0, (ast.Tuple, ast.List)) and any(
-                            any(isinstance(x, ast.Name) and x.id == nm for x in ast.walk(e))
-                            for e in a0.elts
-                        ):
+                        if _is_direct_index_expr(a0):
                             return _ret("int")
                     # np.linspace(..., num=nm) / np.linspace(a,b,nm)
                     if (
@@ -68767,12 +68764,19 @@ def generate_flat(
                     elif isinstance(_dv.value, str):
                         _default_kind_by_arg[_pos_args_final[_idx].arg] = "char"
         def _semantic_int_context(_arg_nm):
+            def _name_requires_integer_value(_node):
+                # Integer-valued results (len(a), int(x), argsort(a),
+                # a.shape/size) impose no integer requirement on their inputs.
+                # Still inspect arithmetic, tuples, and actual index values.
+                if isinstance(_node, (ast.Call, ast.Attribute, ast.Compare, ast.BoolOp)):
+                    return False
+                if isinstance(_node, ast.Name):
+                    return _node.id == _arg_nm
+                return any(_name_requires_integer_value(child)
+                           for child in ast.iter_child_nodes(_node))
             for _n in ast.walk(fn):
                 if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == "range":
-                    if any(
-                        any(isinstance(_x, ast.Name) and _x.id == _arg_nm for _x in ast.walk(_a))
-                        for _a in _n.args
-                    ):
+                    if any(_name_requires_integer_value(_a) for _a in _n.args):
                         return True
                 if isinstance(_n, ast.BinOp) and isinstance(_n.op, (ast.FloorDiv, ast.Mod)):
                     if isinstance(_n.op, ast.Mod) and isinstance(_n.left, ast.Constant) and isinstance(_n.left.value, str):
@@ -68800,19 +68804,7 @@ def generate_flat(
                     # the slice expression, so don't descend into
                     # Compare/BoolOp subtrees when looking for direct index
                     # usage.
-                    def _name_used_as_index(_node):
-                        # An integer-valued call result does not require
-                        # integer inputs: lexsort/argsort accept real keys,
-                        # and even int(x) explicitly accepts a real x.
-                        if isinstance(_node, (ast.Compare, ast.BoolOp, ast.Call)):
-                            return False
-                        if isinstance(_node, ast.Name) and _node.id == _arg_nm:
-                            return True
-                        return any(
-                            _name_used_as_index(_child)
-                            for _child in ast.iter_child_nodes(_node)
-                        )
-                    if _name_used_as_index(_n.slice):
+                    if _name_requires_integer_value(_n.slice):
                         return True
                 if (
                     isinstance(_n, ast.Call)
@@ -68823,12 +68815,7 @@ def generate_flat(
                     and _n.args
                 ):
                     _a0 = _n.args[0]
-                    if isinstance(_a0, ast.Name) and _a0.id == _arg_nm:
-                        return True
-                    if isinstance(_a0, (ast.Tuple, ast.List)) and any(
-                        any(isinstance(_x, ast.Name) and _x.id == _arg_nm for _x in ast.walk(_e))
-                        for _e in _a0.elts
-                    ):
+                    if _name_requires_integer_value(_a0):
                         return True
             return False
         _final_pos_args = list(fn.args.args) + list(fn.args.kwonlyargs)

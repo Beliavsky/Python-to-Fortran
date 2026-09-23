@@ -23,7 +23,7 @@ def canonical(text):
     return lines
 
 
-def run(source, name, compare=True, require_match=True):
+def run(source, name, compare=True):
     command = [sys.executable, str(ROOT / 'xp2f.py'), str(source), '--compile',
                '--out', str(OUT / (name + '_p.f90'))]
     if compare:
@@ -31,7 +31,7 @@ def run(source, name, compare=True, require_match=True):
     proc = subprocess.run(command, cwd=OUT, capture_output=True, text=True, timeout=180)
     (OUT / (name + '.log')).write_text(proc.stdout + proc.stderr, encoding='utf-8')
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    if compare and require_match:
+    if compare:
         if name == 'corpus_probe':
             python_output = proc.stdout.split('Run (python): PASS\n', 1)[1].split('\nwrote ', 1)[0]
             fortran_output = proc.stdout.split('\nRun: PASS\n', 1)[1].split('\nRun diff:', 1)[0]
@@ -59,12 +59,11 @@ probe = OUT / 'corpus_probe.py'
 probe.write_text('\n\n'.join(functions) + '\n' + driver, encoding='utf-8')
 results['original_tests_and_caller_preservation'] = run(probe, 'corpus_probe')
 results['full_original'] = run(SOURCE, 'full', compare=False)
-# Record a distinct, unresolved argument-kind inference issue without treating
-# successful compilation of that exploratory variant as numerical validation.
+# Fractional forwarding is a mandatory numerical check after the inference fix.
 fractional = OUT / 'fractional_probe.py'
 fractional.write_text((OUT / 'probe.py').read_text(encoding='utf-8')
                       .replace('7.0', '7.25').replace('[1.0, 2.0, 3.0]', '[1.5, 2.5, 3.5]'),
                       encoding='utf-8')
-results['fractional_forwarding_followup'] = run(fractional, 'fractional_probe', require_match=False)
+results['fractional_forwarding'] = run(fractional, 'fractional_probe')
 (OUT / 'analysis.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
 print(json.dumps(results, indent=2))
