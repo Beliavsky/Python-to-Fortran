@@ -6771,6 +6771,81 @@ def test_xp2f_string_array_dtype_controls_arguments_and_results(tmp_path: Path, 
     ])
 
 
+@pytest.mark.parametrize("inner", [
+    ["for i in range(4, 7):", "    print(i)"],
+    ["for i in range(0):", "    print(i)"],
+    ["for i in range(i + 2, -1, -1):", "    print(i)"],
+    ["for i in range(4, 9):", "    if i == 6:", "        break", "    print(i)"],
+    ["for i in range(4, 7):", "    if i == 5:", "        continue", "    print(i)"],
+    ["for i in [4, 5, 6]:", "    print(i)"],
+    ["for j, i in enumerate(range(4, 7)):", "    print(j, i)"],
+    ["for i, j in enumerate(range(4, 7), start=10):", "    print(i, j)"],
+])
+def test_xp2f_nested_reused_loop_target(tmp_path: Path, inner: list) -> None:
+    src = tmp_path / "xnested_target.py"
+    src.write_text("\n".join([
+        "def exercise():",
+        "    i = 99",
+        "    i_range = 123",  # Synthetic counters must avoid user names.
+        "    for i in range(3):",
+        "        print('outer', i)",
+        *["        " + line for line in inner],
+        "        print('after inner', i)",
+        "    print('after outer', i, i_range)",
+        "exercise()", "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    assert proc.stderr.count("nested loop reuses active loop variable 'i'") == 1
+    assert "xnested_target.py:6:9: Warning:" in proc.stderr
+
+
+def test_xp2f_nested_reused_loop_target_deep_and_empty(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xdeep_target.py", [
+        "i = 99",
+        "for i in range(0):",
+        "    for i in range(3):",
+        "        print(i)",
+        "print('empty outer', i)",
+        "for i in [1, 2]:",
+        "    print('outer', i)",
+        "    for i in range(i + 1):",
+        "        print('middle', i)",
+        "        for i in range(7, 9):",
+        "            print('inner', i)",
+        "        print('after inner', i)",
+        "    print('after middle', i)",
+        "print('final', i)",
+        "for j, i in enumerate(range(3), start=5):",
+        "    print('enumerated outer', j, i)",
+        "    for i in range(4, 6):",
+        "        print(i)",
+        "    print('enumerated after inner', j, i)",
+        "print('enumerated final', j, i)",
+    ])
+
+
+def test_xp2f_nested_loop_warning_respects_scopes() -> None:
+    import ast
+
+    tree = ast.parse("\n".join([
+        "for i in range(3):",
+        "    a = [i for i in range(2)]",
+        "    def f():",
+        "        for i in range(2): pass",
+        "for i in range(2): pass",
+    ]))
+    assert xp2f._mark_nested_loop_target_reuse(tree) == []
+    tree = ast.parse("for i in range(3):\n    for j, i in enumerate([4, 5]): pass\n")
+    assert xp2f._mark_nested_loop_target_reuse(tree) == [(2, 5, "i")]
+    assert tree.body[0]._xp2f_reused_loop_target
+    assert tree.body[0].body[0]._xp2f_reused_loop_target
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",

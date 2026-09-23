@@ -52460,6 +52460,24 @@ class translator(ast.NodeVisitor):
             f_step = self._as_integer_loop_expr(step)
             f_upper = self._as_integer_loop_expr(stop, self._upper_from_stop(stop, step))
 
+            if getattr(node, "_xp2f_reused_loop_target", False):
+                counter, enum_counter = self._fresh_scoped_names("i_range", "i_enum")
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"integer :: {counter}, {enum_counter}")
+                self.o.w(f"{enum_counter} = {enum_start_txt}")
+                self.o.w(f"do {counter} = {f_start}, {f_upper}, {f_step}")
+                self.o.push()
+                self.o.w(f"{idx_var} = {enum_counter}")
+                self.o.w(f"{enum_counter} = {enum_counter} + 1")
+                self.o.w(f"{val_var} = {counter}")
+                _visit_loop_body_and_close_rebinds()
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
             self.o.w(f"{idx_var} = {enum_start_txt}")
             if is_const_int(step) and step.value == 1:
                 self.o.w(f"do {val_var} = {f_start}, {f_upper}")
@@ -53151,14 +53169,29 @@ class translator(ast.NodeVisitor):
                 )
             self._open_type_rebind_block(node.target.id, "int", 0)
 
+        # Python's iterator is independent of the visible target. Both
+        # overlapping range loops need counters: the inner loop must not
+        # advance the visible value past its last item (or set it if empty).
+        independent_counter = getattr(node, "_xp2f_reused_loop_target", False)
+        counter = var
+        if independent_counter:
+            counter = self._fresh_scoped_names("i_range")
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {counter}")
         if is_const_int(step) and step.value == 1:
-            self.o.w(f"do {var} = {f_start}, {f_upper}")
+            self.o.w(f"do {counter} = {f_start}, {f_upper}")
         else:
-            self.o.w(f"do {var} = {f_start}, {f_upper}, {f_step}")
+            self.o.w(f"do {counter} = {f_start}, {f_upper}, {f_step}")
         self.o.push()
+        if independent_counter:
+            self.o.w(f"{var} = {counter}")
         _visit_loop_body_and_close_rebinds()
         self.o.pop()
         self.o.w("end do")
+        if independent_counter:
+            self.o.pop()
+            self.o.w("end block")
 
         if scoped_integer:
             self._close_one_type_rebind_block()
@@ -64259,11 +64292,65 @@ def _parse_pyccel_proc_annotation(ann_str):
     }
 
 
+def _mark_nested_loop_target_reuse(tree):
+    """Mark loops needing independent counters; return source warning locations."""
+    diagnostics = []
+
+    class Finder(ast.NodeVisitor):
+        def __init__(self):
+            self.active = []
+
+        def visit_FunctionDef(self, node):
+            saved = self.active
+            self.active = []
+            for statement in node.body:
+                self.visit(statement)
+            self.active = saved
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+
+        def visit_For(self, node):
+            def targets(target):
+                if isinstance(target, ast.Name):
+                    return {target.id}
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    return set().union(*(targets(e) for e in target.elts))
+                if isinstance(target, ast.Starred):
+                    return targets(target.value)
+                return set()
+
+            names = targets(node.target)
+            reused = set()
+            for outer, outer_names in self.active:
+                overlap = names & outer_names
+                if overlap:
+                    outer._xp2f_reused_loop_target = True
+                    node._xp2f_reused_loop_target = True
+                    reused.update(overlap)
+            for name in sorted(reused):
+                diagnostics.append((node.lineno, node.col_offset + 1, name))
+            self.active.append((node, names))
+            for statement in node.body:
+                self.visit(statement)
+            self.active.pop()
+            for statement in node.orelse:
+                self.visit(statement)
+
+        visit_AsyncFor = visit_For
+
+    Finder().visit(tree)
+    return diagnostics
+
+
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None,
     value_scalar_args=False,
 ):
+    _mark_nested_loop_target_reuse(tree)
+    for fn in local_funcs or []:
+        _mark_nested_loop_target_reuse(fn)
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map, extra_def_nodes=local_funcs)
     char_list_final_sizes = compute_list_final_sizes(tree)
 
@@ -72438,6 +72525,17 @@ def main():
     if args.strict:
         ok = _run_strict_check(src_text, args.input_py)
         return 0 if ok else 1
+
+    try:
+        reuse_diagnostics = _mark_nested_loop_target_reuse(ast.parse(src_text))
+    except SyntaxError:
+        reuse_diagnostics = []  # Normal translation reports the syntax error.
+    for line, col, name in reuse_diagnostics:
+        print(
+            f"{src_path}:{line}:{col}: Warning: nested loop reuses active loop variable '{name}'. "
+            "The inner loop overwrites its value; consider a distinct variable name.",
+            file=sys.stderr,
+        )
 
     transpile_src_text = src_text
     if args.type:
