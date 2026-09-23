@@ -25048,17 +25048,7 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "array"
                 and len(node.args) >= 1
             ):
-                dtype_txt = ""
-                for kw in node.keywords:
-                    if kw.arg == "dtype":
-                        if isinstance(kw.value, ast.Name):
-                            dtype_txt = kw.value.id.lower()
-                        elif (
-                            isinstance(kw.value, ast.Attribute)
-                            and isinstance(kw.value.value, ast.Name)
-                            and kw.value.value.id == "np"
-                        ):
-                            dtype_txt = kw.value.attr.lower()
+                dtype_txt = self._np_dtype_text(node)
                 if "float" in dtype_txt:
                     return "real"
                 if "complex" in dtype_txt:
@@ -42987,20 +42977,10 @@ class translator(ast.NodeVisitor):
                     and len(v.args) >= 1
                     and isinstance(v.args[0], ast.List)
                 ):
-                    dtype_txt = ""
+                    dtype_txt = self._np_dtype_text(v)
                     lit_shape = self._literal_nested_shape(v.args[0])
                     rank_hint = len(lit_shape) if lit_shape is not None else 1
                     rank_hint = max(1, rank_hint)
-                    for kw in v.keywords:
-                        if kw.arg == "dtype":
-                            if isinstance(kw.value, ast.Name):
-                                dtype_txt = kw.value.id.lower()
-                            elif (
-                                isinstance(kw.value, ast.Attribute)
-                                and isinstance(kw.value.value, ast.Name)
-                                and is_numpy_name_node(kw.value.value)
-                            ):
-                                dtype_txt = kw.value.attr.lower()
                     if dtype_txt:
                         if "float" in dtype_txt:
                             self._mark_alloc_real(t.id, rank=rank_hint)
@@ -50276,17 +50256,7 @@ class translator(ast.NodeVisitor):
             name = t.id
             lit = v.args[0]
             elts = lit.elts
-            dtype_txt = ""
-            for kw in v.keywords:
-                if kw.arg == "dtype":
-                    if isinstance(kw.value, ast.Name):
-                        dtype_txt = kw.value.id.lower()
-                    elif (
-                        isinstance(kw.value, ast.Attribute)
-                        and isinstance(kw.value.value, ast.Name)
-                        and is_numpy_name_node(kw.value.value)
-                    ):
-                        dtype_txt = kw.value.attr.lower()
+            dtype_txt = self._np_dtype_text(v)
             if (
                 elts
                 and all(self._rank_expr(e) == 1 for e in elts)

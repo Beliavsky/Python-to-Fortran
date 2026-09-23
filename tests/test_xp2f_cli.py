@@ -6751,6 +6751,26 @@ def test_xp2f_inline_integer_array_constructors_convert_real_values(tmp_path: Pa
     ])
 
 
+@pytest.mark.parametrize("dtype", ["int32", "int64", "float64"])
+def test_xp2f_string_array_dtype_controls_arguments_and_results(tmp_path: Path, dtype: str) -> None:
+    # Do not use size/shape/range: integer metadata inference must not
+    # accidentally hide a constructor dtype that was ignored.
+    _run_xp2f_compile_diff(tmp_path, "xstring_array_dtype.py", [
+        "import numpy as np",
+        "def first(a):",
+        "    return a[0]",
+        "def make(x):",
+        f"    a = np.array([[x, -x], [0.8, -0.8]], dtype='{dtype}')",
+        "    return a",
+        "v = 1.9",
+        f"print(first(np.array([v, -v], dtype='{dtype}')))",
+        f"a = np.array([v, -v], dtype='{dtype}')",
+        "print(first(a), a[1])",
+        "b = make(v)",
+        "print(b[0, 0], b[0, 1], b[1, 0], b[1, 1])",
+    ])
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",
