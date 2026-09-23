@@ -503,6 +503,7 @@ interface linalg_solve
 end interface linalg_solve
 
 public :: where_indices_2d, where_axis_2d
+public :: where_pair_2d
 public :: gather_where2d
 interface gather_where2d
    module procedure gather_where2d_real, &
@@ -9643,6 +9644,26 @@ GO TO 1001
 1001 RETURN
 !     ********** LAST CARD OF DCMQR2 **********
 END SUBROUTINE dcmqr2
+
+      function where_pair_2d(rows, cols) result(idx)
+         integer, intent(in) :: rows(:), cols(:)
+         integer, allocatable :: idx(:,:)
+         integer :: n, k
+         if (size(rows) == size(cols)) then
+            n = size(rows)
+         else if (size(rows) == 1) then
+            n = size(cols)
+         else if (size(cols) == 1) then
+            n = size(rows)
+         else
+            error stop "shape mismatch in matrix index arrays"
+         end if
+         allocate(idx(2,n))
+         do k = 1, n
+            idx(1,k) = rows(min(k,size(rows)))
+            idx(2,k) = cols(min(k,size(cols)))
+         end do
+      end function where_pair_2d
 
       pure function where_indices_2d(mask) result(idx)
          logical, intent(in) :: mask(:,:)

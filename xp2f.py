@@ -13586,7 +13586,7 @@ def detect_needed_helpers(tree):
         "full": {"arange_int"},
         "nonzero": {"arange_int"},
         "argwhere": {"arange_int"},
-        "where": {"arange_int", "where_indices_2d", "where_axis_2d", "gather_where2d"},
+        "where": {"arange_int", "where_indices_2d", "where_axis_2d", "gather_where2d", "where_pair_2d"},
         "union1d": {"unique_int"},
         "tri": {"tri_int", "tri_real"},
         "moveaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
@@ -17406,6 +17406,25 @@ def _insert_procs(lines, idx_end_module, proc_blocks):
 
 
 def runtime_helper_templates():
+    where_pair_blk = """      function where_pair_2d(rows, cols) result(idx)
+         integer, intent(in) :: rows(:), cols(:)
+         integer, allocatable :: idx(:,:)
+         integer :: n, k
+         if (size(rows) == size(cols)) then
+            n = size(rows)
+         else if (size(rows) == 1) then
+            n = size(cols)
+         else if (size(cols) == 1) then
+            n = size(rows)
+         else
+            error stop "shape mismatch in matrix index arrays"
+         end if
+         allocate(idx(2,n))
+         do k = 1, n
+            idx(1,k) = rows(min(k,size(rows)))
+            idx(2,k) = cols(min(k,size(cols)))
+         end do
+      end function where_pair_2d"""
     where_indices_blk = """      pure function where_indices_2d(mask) result(idx)
          logical, intent(in) :: mask(:,:)
          integer :: idx(2,count(mask))
@@ -18817,6 +18836,7 @@ end interface gather_where2d"""
     return {
         "isqrt_int": (isqrt_pub, isqrt_blk),
         "where_indices_2d": ("public :: where_indices_2d", where_indices_blk),
+        "where_pair_2d": ("public :: where_pair_2d", where_pair_blk),
         "where_axis_2d": ("public :: where_axis_2d", where_axis_blk),
         "gather_where2d": (gather_where_pub, gather_where_blk),
         "mod_pow_int": (mod_pow_pub, mod_pow_blk),
@@ -22017,6 +22037,7 @@ class translator(ast.NodeVisitor):
         self.broadcast_row2 = set()
         self.nonzero_tuple_vars = set()
         self.matrix_where_tuple_vars = set()
+        self.matrix_where_component_vars = set()
         self.function_result_name = function_result_name
         # Set explicitly by _emit_local_function once it knows whether
         # THIS function is void (see its own comment); visit_Return
@@ -28700,9 +28721,24 @@ class translator(ast.NodeVisitor):
 
     def _where_tuple_index(self, node):
         return (isinstance(node, ast.Subscript) and (
-            self._is_matrix_where(node.slice) or (
+            self._is_where_coordinate_pair(node.slice) or self._is_matrix_where(node.slice) or (
                 isinstance(node.slice, ast.Name)
                 and node.slice.id in self.matrix_where_tuple_vars)))
+
+    def _is_matrix_where_tuple_value(self, node):
+        return self._is_matrix_where(node) or (
+            isinstance(node, ast.Name) and node.id in self.matrix_where_tuple_vars)
+
+    def _is_where_coordinate_pair(self, node):
+        return (isinstance(node, ast.Tuple) and len(node.elts) == 2
+                and all(self._rank_expr(e) == 1 and self._expr_kind(e) == "int" for e in node.elts)
+                and any(isinstance(e, ast.Name) and e.id in self.matrix_where_component_vars
+                        for e in node.elts))
+
+    def _where_index_expr(self, node):
+        if self._is_where_coordinate_pair(node):
+            return f"where_pair_2d({self.expr(node.elts[0])}, {self.expr(node.elts[1])})"
+        return self.expr(node)
 
     def _matrix_where_mask(self, node):
         value = self.expr(node)
@@ -30390,7 +30426,7 @@ class translator(ast.NodeVisitor):
         if self._where_tuple_index(node):
             if self._rank_expr(node.value) != 2:
                 raise NotImplementedError("matrix where index tuples require a rank-2 indexed array")
-            return f"gather_where2d({self.expr(node.value)}, {self.expr(node.slice)})"
+            return f"gather_where2d({self.expr(node.value)}, {self._where_index_expr(node.slice)})"
         if isinstance(node, ast.Subscript) and self._is_matrix_where(node.value):
             if not (isinstance(node.slice, ast.Constant) and node.slice.value in {0, 1}):
                 raise NotImplementedError("matrix where tuple component must be a constant 0 or 1")
@@ -39364,6 +39400,8 @@ class translator(ast.NodeVisitor):
                 self.local_assigned_names.add(n.name)
 
         def _mark_name_from_expr(_nm, _expr):
+            if (isinstance(_expr, ast.Name) and _expr.id in self.matrix_where_component_vars):
+                self.matrix_where_component_vars.add(_nm)
             if self._is_matrix_where(_expr) or (
                 isinstance(_expr, ast.Name) and _expr.id in self.matrix_where_tuple_vars
             ):
@@ -39515,6 +39553,13 @@ class translator(ast.NodeVisitor):
         for _n in nodes:
             for _m in ast.walk(_n):
                 _record_assigned_names(_m)
+                if (isinstance(_m, ast.Assign) and len(_m.targets) == 1
+                        and isinstance(_m.targets[0], (ast.Tuple, ast.List))
+                        and self._is_matrix_where_tuple_value(_m.value)):
+                    for _e in _m.targets[0].elts:
+                        if isinstance(_e, ast.Name):
+                            self._mark_alloc_int(_e.id, rank=1)
+                            self.matrix_where_component_vars.add(_e.id)
                 if (
                     isinstance(_m, ast.Assign)
                     and len(_m.targets) == 1
@@ -44046,10 +44091,25 @@ class translator(ast.NodeVisitor):
             return
         t = node.targets[0]
         v = node.value
-        if isinstance(t, (ast.Tuple, ast.List)) and self._is_matrix_where(v):
-            raise NotImplementedError(
-                "unpacking matrix np.where is not supported; assign its result to an index "
-                "variable and access components with indices[0] and indices[1]")
+        if isinstance(t, (ast.Tuple, ast.List)) and self._is_matrix_where_tuple_value(v):
+            if len(t.elts) != 2 or not all(isinstance(e, ast.Name) for e in t.elts):
+                raise NotImplementedError("matrix np.where unpacking requires exactly two name targets")
+            # Evaluate the complete RHS once, before either target is assigned.
+            saved = "xp2f_where_unpack"
+            used = {self._aliased_name(n.id).lower() for n in ast.walk(node) if isinstance(n, ast.Name)}
+            while saved.lower() in used:
+                saved += "_"
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer, allocatable :: {saved}(:,:)")
+            self.o.w(f"{saved} = {self.expr(v)}")
+            for axis, target in enumerate(t.elts, 1):
+                self._mark_alloc_int(target.id, rank=1)
+                self.matrix_where_component_vars.add(target.id)
+                self.o.w(f"{self.expr(target)} = {saved}({axis},:)")
+            self.o.pop()
+            self.o.w("end block")
+            return
         if self._where_tuple_index(t):
             if not isinstance(t.value, ast.Name) or self._rank_expr(t.value) != 2:
                 raise NotImplementedError("matrix where assignment requires a named rank-2 array")
@@ -44073,7 +44133,7 @@ class translator(ast.NodeVisitor):
             self.o.w(f"integer, allocatable :: {idx}(:,:)")
             self.o.w(f"integer :: {k}")
             self.o.w(f"{rhs} = {self._coerce_expr_kind(v, self.expr(v), kind)}")
-            self.o.w(f"{idx} = {self.expr(t.slice)}")
+            self.o.w(f"{idx} = {self._where_index_expr(t.slice)}")
             if rank:
                 self.o.w(f"if (size({rhs}) /= 1 .and. size({rhs}) /= size({idx},2)) &")
                 self.o.w('   error stop "shape mismatch in matrix indexed assignment"')
@@ -45156,6 +45216,7 @@ class translator(ast.NodeVisitor):
             and isinstance(v.slice, ast.Tuple)
             and len(v.slice.elts) == 2
             and self._rank_expr(v.value) == 2
+            and not self._where_tuple_index(v)
         ):
             i0n, i1n = v.slice.elts
             if (

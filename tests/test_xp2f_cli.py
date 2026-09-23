@@ -6389,13 +6389,38 @@ def test_xp2f_matrix_where_direct_indices(tmp_path: Path) -> None:
     ])
 
 
-def test_xp2f_matrix_where_unpack_diagnostic(tmp_path: Path) -> None:
+@pytest.mark.parametrize("named", [False, True])
+def test_xp2f_matrix_where_unpack(tmp_path: Path, named: bool) -> None:
+    setup = ["indices = np.where(a)", "rows, cols = indices"] if named else ["rows, cols = np.where(a)"]
+    _run_xp2f_compile_diff(tmp_path, "xwhere_unpack.py", [
+        "import numpy as np",
+        "a = np.array([[0., 2., 0.], [3., 0., 4.]])",
+        *setup,
+        "v = a[rows, cols]",
+        "for k in range(len(rows)):", "    print(rows[k], cols[k], v[k])",
+        "a[rows, cols] = a[rows, cols] + np.sum(a[rows, cols])",
+        "for r in range(2):", "    for c in range(3):", "        print(a[r,c])",
+        "er, ec = np.where(np.zeros((2, 3)))",
+        "empty = a[er, ec]", "print(len(er), len(ec), len(empty))",
+        "a[er, ec] = 8.",
+        "a[rows, cols] = np.array([7.])",
+        "for r in range(2):", "    for c in range(3):", "        print(a[r,c])",
+        "dup, dup = np.where(a)", "for k in range(len(dup)):", "    print(dup[k])",
+    ])
+
+
+def test_xp2f_matrix_where_unpack_arity_diagnostic(tmp_path: Path) -> None:
     src = tmp_path / "xwhere_unpack.py"
-    src.write_text("import numpy as np\na = np.ones((2, 3))\nr, c = np.where(a)\n", encoding="utf-8")
+    src.write_text("import numpy as np\na = np.ones((2, 3))\nr, c, d = np.where(a)\n", encoding="utf-8")
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
                           cwd=tmp_path, capture_output=True, text=True)
     assert proc.returncode != 0
-    assert "unpacking matrix np.where is not supported" in proc.stdout + proc.stderr
+    assert "matrix np.where unpacking requires exactly two name targets" in proc.stdout + proc.stderr
+
+
+def test_xp2f_matrix_where_unpack_function(tmp_path: Path) -> None:
+    lines = (REPO_ROOT / "reports" / "matrix_where_validation_20260923" / "unpack_probe.py").read_text(encoding="utf-8").splitlines()
+    _run_xp2f_compile_diff(tmp_path, "xwhere_unpack_function.py", lines)
 
 
 @pytest.mark.parametrize("keyword", [False, True])

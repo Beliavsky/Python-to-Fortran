@@ -21,6 +21,7 @@ def run(source, name):
 
 
 results = {'probe': run(OUT / 'probe.py', 'probe')}
+results['unpack_probe'] = run(OUT / 'unpack_probe.py', 'unpack_probe')
 source = SOURCE.read_text(encoding='utf-8')
 names = {'p00_fun'} | {f'p{i:02d}_fun' for i in range(1, 9)}
 functions = [ast.get_source_segment(source, n) for n in ast.parse(source).body

@@ -39,8 +39,8 @@ The complete pytest suite was not run; it is the recommended next checkpoint.
 ## Remaining limits
 
 This is support for local matrix index tuples, not general Python tuple support.
-Direct tuple unpacking is rejected with guidance to use a named index variable
-and its components. Rank-3 conditions remain explicitly rejected. Tuple passing,
+Direct tuple unpacking is now supported as described below.
+Rank-3 conditions remain explicitly rejected. Tuple passing,
 tuple returns, tuple display, and arbitrary independently constructed advanced
 indices are not established by this validation.
 
@@ -53,3 +53,28 @@ Additional exploratory Boolean tests exposed existing limitations in integer
 literal construction with `dtype=bool` and in mixed Boolean/integer arithmetic.
 The matrix-index regression uses Boolean literals and `np.logical_not` to
 test logical gather/scatter independently of those issues.
+
+## Tuple unpacking follow-up
+
+Supports `rows, cols = np.where(matrix_condition)`, list targets, and unpacking
+a named local matrix index tuple. Exactly two simple name targets are required;
+starred/nested targets and incorrect arity receive an explicit diagnostic.
+The complete right-hand side is evaluated once and saved before either target
+is assigned, including when a target name is repeated.
+
+Unpacked coordinates and their simple name aliases support paired reads inside
+larger expressions and paired writes. Writes snapshot the RHS as before. The
+coordinate helper checks incompatible lengths and supports length-one
+broadcasting instead of silently truncating. This is still local matrix-where
+support, not general tuple passing/returning or arbitrary advanced indexing.
+
+`unpack_probe.py` checks a local function, a side-effecting condition (one
+evaluation), list targets, temporary-name collision avoidance, all-selected
+coordinates, coordinate aliases, and overlapping writes. Pytest also checks
+direct/named tuple unpacking, empty selections, repeated targets, length-one
+RHS broadcasting, and incorrect arity.
+
+Follow-up validation: all 9 selected pytest cases passed across two runs.
+The updated checker reports MATCH for both probes and all eight original
+integrands on vector/matrix inputs; the complete original corpus program still
+compiles. The full pytest suite has not been rerun.
