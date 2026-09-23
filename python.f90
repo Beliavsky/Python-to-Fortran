@@ -502,6 +502,14 @@ interface linalg_solve
    module procedure linalg_solve_complex_vec, linalg_solve_complex_mat
 end interface linalg_solve
 
+public :: where_indices_2d, where_axis_2d
+public :: gather_where2d
+interface gather_where2d
+   module procedure gather_where2d_real, &
+      & gather_where2d_int, &
+      & gather_where2d_complex, &
+      & gather_where2d_logical
+end interface gather_where2d
 public :: lexsort_keys
 interface lexsort_keys
    module procedure lexsort_keys_int, lexsort_keys_real
@@ -9635,6 +9643,79 @@ GO TO 1001
 1001 RETURN
 !     ********** LAST CARD OF DCMQR2 **********
 END SUBROUTINE dcmqr2
+
+      pure function where_indices_2d(mask) result(idx)
+         logical, intent(in) :: mask(:,:)
+         integer :: idx(2,count(mask))
+         integer :: i, j, k
+         k = 0
+         do i = 1, size(mask,1)
+            do j = 1, size(mask,2)
+               if (.not. mask(i,j)) cycle
+               k = k + 1
+               idx(:,k) = [i-1, j-1]
+            end do
+         end do
+      end function where_indices_2d
+
+      pure function where_axis_2d(mask, axis) result(idx)
+         logical, intent(in) :: mask(:,:)
+         integer, intent(in) :: axis
+         integer :: idx(count(mask))
+         integer :: i, j, k
+         k = 0
+         do i = 1, size(mask,1)
+            do j = 1, size(mask,2)
+               if (.not. mask(i,j)) cycle
+               k = k + 1
+               if (axis == 0) then
+                  idx(k) = i-1
+               else
+                  idx(k) = j-1
+               end if
+            end do
+         end do
+      end function where_axis_2d
+
+      pure function gather_where2d_real(a, idx) result(values)
+         real(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         real(kind=dp) :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_real
+
+      pure function gather_where2d_int(a, idx) result(values)
+         integer, intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         integer :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_int
+
+      pure function gather_where2d_complex(a, idx) result(values)
+         complex(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         complex(kind=dp) :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_complex
+
+      pure function gather_where2d_logical(a, idx) result(values)
+         logical, intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         logical :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_logical
 
       function lexsort_keys_int(keys, reverse_keys) result(idx)
          integer, intent(in) :: keys(:,:)

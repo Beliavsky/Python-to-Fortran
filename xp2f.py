@@ -13586,6 +13586,7 @@ def detect_needed_helpers(tree):
         "full": {"arange_int"},
         "nonzero": {"arange_int"},
         "argwhere": {"arange_int"},
+        "where": {"arange_int", "where_indices_2d", "where_axis_2d", "gather_where2d"},
         "union1d": {"unique_int"},
         "tri": {"tri_int", "tri_real"},
         "moveaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
@@ -17405,6 +17406,83 @@ def _insert_procs(lines, idx_end_module, proc_blocks):
 
 
 def runtime_helper_templates():
+    where_indices_blk = """      pure function where_indices_2d(mask) result(idx)
+         logical, intent(in) :: mask(:,:)
+         integer :: idx(2,count(mask))
+         integer :: i, j, k
+         k = 0
+         do i = 1, size(mask,1)
+            do j = 1, size(mask,2)
+               if (.not. mask(i,j)) cycle
+               k = k + 1
+               idx(:,k) = [i-1, j-1]
+            end do
+         end do
+      end function where_indices_2d"""
+    where_axis_blk = """      pure function where_axis_2d(mask, axis) result(idx)
+         logical, intent(in) :: mask(:,:)
+         integer, intent(in) :: axis
+         integer :: idx(count(mask))
+         integer :: i, j, k
+         k = 0
+         do i = 1, size(mask,1)
+            do j = 1, size(mask,2)
+               if (.not. mask(i,j)) cycle
+               k = k + 1
+               if (axis == 0) then
+                  idx(k) = i-1
+               else
+                  idx(k) = j-1
+               end if
+            end do
+         end do
+      end function where_axis_2d"""
+    gather_where_pub = """public :: gather_where2d
+interface gather_where2d
+   module procedure gather_where2d_real, &
+      & gather_where2d_int, &
+      & gather_where2d_complex, &
+      & gather_where2d_logical
+end interface gather_where2d"""
+    gather_where_blk = """      pure function gather_where2d_real(a, idx) result(values)
+         real(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         real(kind=dp) :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_real
+
+      pure function gather_where2d_int(a, idx) result(values)
+         integer, intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         integer :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_int
+
+      pure function gather_where2d_complex(a, idx) result(values)
+         complex(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         complex(kind=dp) :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_complex
+
+      pure function gather_where2d_logical(a, idx) result(values)
+         logical, intent(in) :: a(:,:)
+         integer, intent(in) :: idx(:,:)
+         logical :: values(size(idx,2))
+         integer :: k
+         do k = 1, size(idx,2)
+            values(k) = a(idx(1,k)+1,idx(2,k)+1)
+         end do
+      end function gather_where2d_logical"""
     isqrt_pub = (
         "public :: isqrt_int       !@pyapi kind=function ret=integer "
         "args=x:integer:intent(in) desc=\"integer square root: return floor(sqrt(x)) for x >= 0\""
@@ -18738,6 +18816,9 @@ def runtime_helper_templates():
 
     return {
         "isqrt_int": (isqrt_pub, isqrt_blk),
+        "where_indices_2d": ("public :: where_indices_2d", where_indices_blk),
+        "where_axis_2d": ("public :: where_axis_2d", where_axis_blk),
+        "gather_where2d": (gather_where_pub, gather_where_blk),
         "mod_pow_int": (mod_pow_pub, mod_pow_blk),
         "floor_div_int": (floor_div_int_pub, floor_div_int_blk),
         "floor_div_real": (floor_div_real_pub, floor_div_real_blk),
@@ -21935,6 +22016,7 @@ class translator(ast.NodeVisitor):
         self.broadcast_col2 = set()
         self.broadcast_row2 = set()
         self.nonzero_tuple_vars = set()
+        self.matrix_where_tuple_vars = set()
         self.function_result_name = function_result_name
         # Set explicitly by _emit_local_function once it knows whether
         # THIS function is void (see its own comment); visit_Return
@@ -28610,7 +28692,31 @@ class translator(ast.NodeVisitor):
                 return None
         return base
 
+    def _is_matrix_where(self, node):
+        # A matrix nonzero tuple is stored internally as a 2-by-count integer
+        # array, with zero-based coordinates in NumPy's row-major order.
+        return (isinstance(node, ast.Call) and self._is_numpy_call(node.func, {"where"})
+                and len(node.args) == 1 and self._rank_expr(node.args[0]) == 2)
+
+    def _where_tuple_index(self, node):
+        return (isinstance(node, ast.Subscript) and (
+            self._is_matrix_where(node.slice) or (
+                isinstance(node.slice, ast.Name)
+                and node.slice.id in self.matrix_where_tuple_vars)))
+
+    def _matrix_where_mask(self, node):
+        value = self.expr(node)
+        if self._expr_kind(node) == "complex":
+            return f"({value}) /= (0.0_dp, 0.0_dp)"
+        return self._coerce_expr_kind(node, value, "logical")
+
     def _rank_expr(self, node):
+        if self._is_matrix_where(node):
+            return 2
+        if self._where_tuple_index(node):
+            return 1
+        if isinstance(node, ast.Subscript) and self._is_matrix_where(node.value):
+            return 1
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -30281,6 +30387,16 @@ class translator(ast.NodeVisitor):
         return f"int({self.expr(node)}, kind=int64)"
 
     def expr(self, node):
+        if self._where_tuple_index(node):
+            if self._rank_expr(node.value) != 2:
+                raise NotImplementedError("matrix where index tuples require a rank-2 indexed array")
+            return f"gather_where2d({self.expr(node.value)}, {self.expr(node.slice)})"
+        if isinstance(node, ast.Subscript) and self._is_matrix_where(node.value):
+            if not (isinstance(node.slice, ast.Constant) and node.slice.value in {0, 1}):
+                raise NotImplementedError("matrix where tuple component must be a constant 0 or 1")
+            arg = node.value.args[0]
+            mask = self._matrix_where_mask(arg)
+            return f"where_axis_2d({mask}, {node.slice.value % 2})"
         def _module_attr_root_name(n):
             cur = n
             while isinstance(cur, ast.Attribute):
@@ -37540,10 +37656,13 @@ class translator(ast.NodeVisitor):
                                 a2 = f"real({a2}, kind=dp)"
                     return f"merge({a1}, {a2}, {cond})"
                 if len(node.args) == 1:
-                    if self._rank_expr(node.args[0]) > 1:
+                    if self._rank_expr(node.args[0]) == 2:
+                        cond = self._matrix_where_mask(node.args[0])
+                        return f"where_indices_2d({cond})"
+                    if self._rank_expr(node.args[0]) > 2:
                         raise NotImplementedError(
                             "one-argument np.where with a multidimensional condition "
-                            "requires a tuple of index arrays; only rank-1 conditions are supported"
+                            "requires a tuple of index arrays; only rank-1 and rank-2 conditions are supported"
                         )
                     cond = self.expr(node.args[0])
                     # 1D subset used by many codes; equivalent to np.where(cond)[0].
@@ -39245,6 +39364,12 @@ class translator(ast.NodeVisitor):
                 self.local_assigned_names.add(n.name)
 
         def _mark_name_from_expr(_nm, _expr):
+            if self._is_matrix_where(_expr) or (
+                isinstance(_expr, ast.Name) and _expr.id in self.matrix_where_tuple_vars
+            ):
+                self.matrix_where_tuple_vars.add(_nm)
+                self._mark_alloc_int(_nm, rank=2)
+                return
             if not isinstance(_nm, str) or not _nm:
                 return
             if isinstance(_expr, (ast.List, ast.Tuple)) and len(getattr(_expr, "elts", [])) == 0:
@@ -43921,6 +44046,46 @@ class translator(ast.NodeVisitor):
             return
         t = node.targets[0]
         v = node.value
+        if isinstance(t, (ast.Tuple, ast.List)) and self._is_matrix_where(v):
+            raise NotImplementedError(
+                "unpacking matrix np.where is not supported; assign its result to an index "
+                "variable and access components with indices[0] and indices[1]")
+        if self._where_tuple_index(t):
+            if not isinstance(t.value, ast.Name) or self._rank_expr(t.value) != 2:
+                raise NotImplementedError("matrix where assignment requires a named rank-2 array")
+            rank = self._rank_expr(v)
+            if rank not in {0, 1}:
+                raise NotImplementedError("matrix indexed assignment requires a scalar or vector RHS")
+            kind = self._expr_kind(t.value)
+            decl = {"real": "real(kind=dp)", "int": "integer",
+                    "complex": "complex(kind=dp)", "logical": "logical"}.get(kind)
+            if decl is None:
+                raise NotImplementedError("matrix where assignment requires a numeric or logical array")
+            # Block-local temporaries preserve RHS-before-write semantics.
+            prefix = "xp2f_where"
+            used = {self._aliased_name(n.id).lower() for n in ast.walk(node) if isinstance(n, ast.Name)}
+            while any((prefix + suffix).lower() in used for suffix in ("_rhs", "_idx", "_k")):
+                prefix += "_"
+            rhs, idx, k = prefix + "_rhs", prefix + "_idx", prefix + "_k"
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"{decl}" + (", allocatable" if rank else "") + f" :: {rhs}" + ("(:)" if rank else ""))
+            self.o.w(f"integer, allocatable :: {idx}(:,:)")
+            self.o.w(f"integer :: {k}")
+            self.o.w(f"{rhs} = {self._coerce_expr_kind(v, self.expr(v), kind)}")
+            self.o.w(f"{idx} = {self.expr(t.slice)}")
+            if rank:
+                self.o.w(f"if (size({rhs}) /= 1 .and. size({rhs}) /= size({idx},2)) &")
+                self.o.w('   error stop "shape mismatch in matrix indexed assignment"')
+            self.o.w(f"do {k} = 1, size({idx},2)")
+            self.o.push()
+            value = f"{rhs}(min({k}, size({rhs})))" if rank else rhs
+            self.o.w(f"{self.expr(t.value)}({idx}(1,{k})+1, {idx}(2,{k})+1) = {value}")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
         # These assignment lowerings allocate/write the destination before
         # finishing the RHS. Preserve any old destination read (including
         # shape, fill values, keywords and slices), not just a bare first

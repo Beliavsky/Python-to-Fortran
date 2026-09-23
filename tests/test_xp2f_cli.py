@@ -6348,13 +6348,54 @@ def test_xp2f_forwards_joint_rank_profiles(tmp_path: Path, leaf_first: bool) -> 
         assert f"function {name}_x_real_r1_y_real_r2" not in generated
 
 
-def test_xp2f_rejects_multidimensional_where_indices(tmp_path: Path) -> None:
+def test_xp2f_rejects_rank3_where_indices(tmp_path: Path) -> None:
     src = tmp_path / "xwhere_matrix.py"
-    src.write_text("import numpy as np\na = np.ones((2, 3))\ni = np.where(a > 0)\nprint(i)\n", encoding="utf-8")
+    src.write_text("import numpy as np\na = np.ones((2, 3, 4))\ni = np.where(a > 0)\nprint(i)\n", encoding="utf-8")
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
                           cwd=tmp_path, capture_output=True, text=True)
     assert proc.returncode != 0
     assert "requires a tuple of index arrays" in proc.stdout + proc.stderr
+
+
+def test_xp2f_matrix_where_integrand(tmp_path: Path) -> None:
+    lines = (REPO_ROOT / "reports" / "matrix_where_validation_20260923" / "probe.py").read_text(encoding="utf-8").splitlines()
+    _run_xp2f_compile_diff(tmp_path, "xmatrix_integrand.py", lines)
+
+
+@pytest.mark.parametrize("dtype", ["float", "int", "bool", "complex"])
+def test_xp2f_matrix_where_paired_indices(tmp_path: Path, dtype: str) -> None:
+    literal = "[[False, True, False], [True, False, True]]" if dtype == "bool" else "[[0, 2, 0], [3, 0, 4]]"
+    update = "np.logical_not(a[i])" if dtype == "bool" else "a[i] + np.sum(a[i])"
+    _run_xp2f_compile_diff(tmp_path, "xmatrix_where.py", [
+        "import numpy as np",
+        f"a = np.array({literal}, dtype={dtype})",
+        "i = np.where(a)", "rows = i[0]", "cols = i[1]", "v = a[i]",
+        "for k in range(len(rows)):", "    print(rows[k], cols[k], v[k])",
+        f"a[i] = {update}",
+        "for r in range(2):", "    for c in range(3):", "        print(a[r,c])",
+        "j = np.where(np.zeros((2, 3)))", "empty = a[j]", "print(len(empty))",
+        "a[j] = 1", "a[i] = 0",
+        "for r in range(2):", "    for c in range(3):", "        print(a[r,c])",
+    ])
+
+
+def test_xp2f_matrix_where_direct_indices(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xmatrix_where_direct.py", [
+        "import numpy as np", "a = np.array([[0., 2., 0.], [3., 0., 4.]])",
+        "v = a[np.where(a)]", "rows = np.where(a)[0]", "cols = np.where(a)[1]",
+        "for k in range(len(v)):", "    print(rows[k], cols[k], v[k])",
+        "a[np.where(a)] = np.array([7.])",
+        "for r in range(2):", "    for c in range(3):", "        print(a[r,c])",
+    ])
+
+
+def test_xp2f_matrix_where_unpack_diagnostic(tmp_path: Path) -> None:
+    src = tmp_path / "xwhere_unpack.py"
+    src.write_text("import numpy as np\na = np.ones((2, 3))\nr, c = np.where(a)\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "unpacking matrix np.where is not supported" in proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize("keyword", [False, True])
