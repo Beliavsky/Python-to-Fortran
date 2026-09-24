@@ -14,6 +14,8 @@ Speedup is workload dependent, not guaranteed. NumPy and SciPy already perform m
 
 For side-by-side examples and important semantic differences, see the [Python To Fortran Syntax Guide](python_to_fortran_syntax_guide.md). It distinguishes conceptual equivalents from the transpiler's supported subset.
 
+For practical source-code advice, see [Writing Python for Fortran Translation](writing_python_for_fortran.md): stable types and ranks, clear naming and interfaces, array ownership, and validation. These are recommendations for easier translation, not blanket restrictions on valid Python.
+
 ## Status
 
 Use `--report-specializations` to print informational notes on stderr when a

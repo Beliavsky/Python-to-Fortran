@@ -19,7 +19,7 @@ rng = np.random.default_rng(12345)
 
 n = 10000  # trading periods
 p = 20  # number of assets
-xsd = 0.02  # per-period return volatility, in percent
+xsd = 2.0  # per-period return volatility, in percent
 rho = 0.4  # base-case equicorrelation
 
 

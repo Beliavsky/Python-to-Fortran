@@ -24,6 +24,21 @@ floating-point computation. Use explicit `int(...)` only when integer arithmetic
 is actually intended. `--ignore-comments` matches the reduced diagnostic's
 floating-point results, but has not been validated as a whole-program workaround.
 
+### A source-level congruence arithmetic failure
+
+Burkardt's `uniform.py` uses a floating-point work array inside `congruence`.
+Its 20 published cases agree with the saved Fortran output, and all 16 successful
+cases satisfy exact integer residual checks. Larger inputs can fail in Python
+itself: for `(a,b,c) = (1259289228,1358106529,1524307444)`, it returns
+`x=603115968` with no error flag, but `(a*x-c) % b = 355665976` in exact arithmetic.
+The correct canonical solution is `769316839`.
+
+A rounded product causes a floor quotient in Euclidean back-substitution to be
+off by one. An in-memory variant using arbitrary-precision integer work storage
+returns the correct answer. This is a source arithmetic defect; preserving the
+source's floating-point operations or casting the final result to integer cannot
+fix it. The transpiler does not silently replace the source algorithm.
+
 ## Percent formatting without a conversion specifier
 
 Expressions such as `'RMS error = ' % value` are rejected with an explicit

@@ -5,8 +5,9 @@
 No simulation defect was found in the deterministic cases tested. Python and
 generated Fortran both match an independent distance-based oracle for 11 cases,
 61 complete forest snapshots, and 1,107 output records per language.
-The original random case remains only partially validated: these checks do
-not establish equivalence of random ignition or intermediate spread probabilities.
+These endpoint checks alone do not establish equivalence of random ignition
+or intermediate spread probabilities. The replay follow-up below covers
+intermediate probabilities with fixed ignition.
 
 ## Method
 
@@ -54,3 +55,40 @@ Compilation uses runtime bounds checking and floating-point traps.
 Missing records and STOP messages are failures even with exit status zero.
 All three selected pytest cases passed in 51.42 seconds.
 No full pytest run was performed.
+
+## Follow-up: intermediate probabilities with shared draws
+
+`probe_replay.py` retains the same six original function bodies and tests
+10 fixed-ignition cases with probabilities 0.2, 0.5 and 0.8. It covers
+1x1, 3x3 and 6x6 grids with corner, edge and interior ignition, using explicit
+NumPy seeds 101 through 110. A tagged random marker is drawn after the initial
+state and each subsequent step. These markers deliberately consume draws:
+the probe is a controlled test, not the original corpus random trajectory.
+
+`check_replay.py` runs the current transpiler with `--rng-replay` and
+`--run-diff`, saves the combined log, and independently parses both outputs.
+Every cell, activity flag, termination count and marker matches exactly;
+burned fractions match within absolute tolerance 2e-15.
+
+It independently counts expected spread draws from the previous snapshot:
+each smoldering tree becomes burning and draws once for each in-bounds
+neighbor, regardless of the neighbor's state. The next marker must exactly
+match the corresponding recorded binary draw in both languages. The final
+cursor must consume the entire recording. This checks per-step stream
+alignment, including the final step, rather than just comparing final totals.
+Legal state transitions, burned fractions, and complete output are also checked.
+
+Result: **PASS**, 10 cases, 76 snapshots, 2,464 records per language,
+517 spread draws and 76 marker draws (593 total). Outcomes include early
+extinction, partial burning and a fully burnt grid. No new transpiler defect
+was found, and no transpiler or runtime helper changes were needed.
+
+```cmd
+python reports\fire_simulation_validation_20260921\check_replay.py
+```
+
+Evidence is saved in `replay_run.log`, `replay_analysis.json`, and the
+generated replay metadata/binary files; the command recreates them.
+Random ignition via `rng.integers` and RNG distribution quality remain
+outside this validation. No full pytest run was needed for this report-only
+follow-up.

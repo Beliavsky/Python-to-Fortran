@@ -1,3 +1,8 @@
+"""
+Simulate a VAR(2) process and recover its parameters by multivariate OLS
+using np.linalg.lstsq.
+"""
+
 import numpy as np
 
 rng = np.random.default_rng(123)

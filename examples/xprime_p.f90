@@ -1,49 +1,47 @@
-! transpiled by xp2f.py from xprime.py
+! transpiled by xp2f.py from xprime.py on 2026-09-12 08:45:09
 module xprime_proc_mod
    use, intrinsic :: iso_fortran_env, only: real64
    implicit none
    private
    integer, parameter :: dp = real64
-   real(kind=dp) :: max_prime
-   integer :: nprime
-   public :: dp, is_prime, max_prime, nprime
+   public :: dp, is_prime
 contains
 
-pure function is_prime(n) result(is_prime_result)
+pure function is_prime(n) result(func_res)
    integer, intent(in) :: n
-   logical :: is_prime_result
+   logical :: func_res
    integer :: d
    
    if (n < 2) then
-      is_prime_result = .false.
+      func_res = .false.
       return
    end if
    if (n == 2) then
-      is_prime_result = .true.
+      func_res = .true.
       return
    end if
    if (modulo(n, 2) == 0) then
-      is_prime_result = .false.
+      func_res = .false.
       return
    end if
    d = 3
-   do while (((d * d) <= n))
+   do while (d * d <= n)
       if (modulo(n, d) == 0) then
-         is_prime_result = .false.
+         func_res = .false.
          return
       end if
       d = d + 2
    end do
-   is_prime_result = .true.
+   func_res = .true.
 end function is_prime
 
 end module xprime_proc_mod
 
 program xprime
-   use xprime_proc_mod, only: is_prime, max_prime, nprime
+   use xprime_proc_mod, only: is_prime
    implicit none
    integer, parameter :: limit = 10 ** 6 ! constant from python source
-   integer :: n
+   integer :: max_prime, n, nprime
    
    nprime = 0
    do n = 2, limit

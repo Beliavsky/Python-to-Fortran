@@ -58031,11 +58031,8 @@ def _emit_local_function(
                         _ck_pow, _cr_pow = _comment_arg_spec_hint_for_emit(fn, _nm)
                         if (not _scalar_callback_fn) and _cr_pow is not None and int(_cr_pow) > 0:
                             rr = max(rr, int(_cr_pow))
-                    else:
-                        rr = max(rr, int(tr._rank_expr(_n.right)))
-                elif isinstance(_n.right, ast.Name) and _n.right.id == _nm:
-                    if not isinstance(_n.op, ast.Pow):
-                        rr = max(rr, int(tr._rank_expr(_n.left)))
+                    # For + and -, the other operand's rank is not evidence
+                    # for this argument: NumPy broadcasts scalar operands.
         return rr
 
     def _arg_integer_seed_recurrence(_nm):
@@ -60734,11 +60731,18 @@ def _emit_local_function(
                 cur = cur.value
             return cur.id if isinstance(cur, ast.Name) else None
 
+        def _target_mutates_arg(target):
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return any(_target_mutates_arg(elt) for elt in target.elts)
+            # Unpacked names are local rebindings; only writes through an
+            # element, section or attribute mutate the caller's object.
+            return isinstance(target, (ast.Subscript, ast.Attribute)) and _base_name(target) == nm
+
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.Assign):
                     for tg in n.targets:
-                        if isinstance(tg, (ast.Subscript, ast.Attribute)) and _base_name(tg) == nm:
+                        if _target_mutates_arg(tg):
                             return True
                         if isinstance(tg, ast.Name) and tg.id == nm:
                             if _is_self_normalization_assign(n.value):
@@ -64687,17 +64691,8 @@ def generate_flat(
                                         _seen,
                                     ),
                                 )
-                if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub)):
-                    if isinstance(n.left, ast.Name) and n.left.id == nm:
-                        try:
-                            rr = max(rr, int(tr_seed._rank_expr(n.right)))
-                        except Exception:
-                            pass
-                    elif isinstance(n.right, ast.Name) and n.right.id == nm:
-                        try:
-                            rr = max(rr, int(tr_seed._rank_expr(n.left)))
-                        except Exception:
-                            pass
+                # Binary arithmetic constrains the result rank, not the rank
+                # of each operand. Use call-site and direct array evidence.
         return rr
 
     _infer_arg_kind_tr_cache = {}
@@ -68006,10 +68001,13 @@ def generate_flat(
             context="flat",
             list_counts=list_counts,
             char_list_final_sizes=char_list_final_sizes,
-            tuple_return_funcs=set(_prov_tuple_out.keys()),
-            tuple_return_out_kinds=_prov_tuple_out,
-            tuple_return_out_ranks=_prov_tuple_out_ranks,
-            local_return_specs=_prov_scalar_specs,
+            tuple_return_funcs=set(tuple_return_out_kinds.keys()),
+            tuple_return_out_kinds=tuple_return_out_kinds,
+            tuple_return_out_ranks=tuple_return_out_ranks,
+            # Refinement must use the resolved callee profiles, not the
+            # provisional guesses made before argument kinds were propagated.
+            local_return_specs=local_return_specs,
+            local_return_ranks=local_return_ranks,
             user_class_types=user_class_types,
             structured_type_components=structured_type_components,
         )

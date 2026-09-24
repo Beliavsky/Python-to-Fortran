@@ -3939,6 +3939,35 @@ def test_xp2f_resizing_rebound_parameter_preserves_caller(tmp_path: Path) -> Non
     assert "allocatable :: p_local(:)" in evolve
 
 
+@pytest.mark.parametrize("target", ["value, u[i], q[i]", "[value, u[i], q[i]]"])
+def test_xp2f_tuple_element_targets_mutate_array_arguments(tmp_path: Path, target: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xtuple_mutation.py", [
+        "import numpy as np",
+        "def step(u, q):",
+        "    y = u",
+        "    u = u + 0.25",
+        "    q = q - 1",
+        "    return y, u, q",
+        "def update(u, q, untouched):",
+        "    total = 0.0",
+        "    for i in range(len(u)):",
+        f"        {target} = step(u[i], q[i])",
+        "        total += value + untouched[i]",
+        "    return total",
+        "u = np.array([1.5, -2.5])",
+        "q = np.array([4, 7], dtype=int)",
+        "untouched = np.array([10.0, 20.0])",
+        "for repeat in range(2):",
+        "    print(update(u, q, untouched))",
+        "    for i in range(len(u)):",
+        "        print(u[i], q[i], untouched[i])",
+    ])
+    generated = (tmp_path / "xtuple_mutation_p.f90").read_text(encoding="utf-8")
+    for name in ("u", "q"):
+        assert re.search(rf"intent\(inout\)\s*::[^\n]*\b{name}\(:\)", generated)
+    assert re.search(r"intent\(in\)\s*::[^\n]*\buntouched\(:\)", generated)
+
+
 def test_xp2f_fractional_arrays_forwarded_after_rebinding(tmp_path: Path) -> None:
     source = (REPO_ROOT / "reports" / "collatz_polynomial_validation_20260923" / "probe.py").read_text(encoding="utf-8")
     source = source.replace("7.0", "7.25").replace("[1.0, 2.0, 3.0]", "[1.5, 2.5, 3.5]")
