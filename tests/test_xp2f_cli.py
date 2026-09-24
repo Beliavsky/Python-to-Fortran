@@ -3968,6 +3968,34 @@ def test_xp2f_tuple_element_targets_mutate_array_arguments(tmp_path: Path, targe
     assert re.search(r"intent\(in\)\s*::[^\n]*\buntouched\(:\)", generated)
 
 
+@pytest.mark.parametrize("call_wrapper", [False, True])
+@pytest.mark.parametrize("keyword", [False, True])
+def test_xp2f_forwarded_documented_vector_does_not_create_scalar_overload(
+    tmp_path: Path, call_wrapper: bool, keyword: bool,
+) -> None:
+    call = "coefficients(values=values, n=n)" if keyword else "coefficients(n, values)"
+    _run_xp2f_compile_diff(tmp_path, "xforward_vector.py", [
+        "import numpy as np",
+        "def coefficients(n, values):",
+        "    # integer N, the number of values.",
+        "    # real VALUES(N), the data values.",
+        "    result = values.copy()",
+        "    for i in range(n):",
+        "        result[i] = result[i] + 0.25",
+        "    return result",
+        "def forward(n, values):",
+        "    # integer N, the number of values.",
+        "    # real VALUES(N), the data values.",
+        f"    return {call}",
+        "values = np.array([1.5, -2.5])",
+        "print(coefficients(2, values))",
+        *( ["print(forward(2, values))"] if call_wrapper else []),
+    ])
+    generated = (tmp_path / "xforward_vector_p.f90").read_text(encoding="utf-8")
+    assert "coefficients_values_real_s" not in generated
+    assert "interface coefficients" not in generated
+
+
 @pytest.mark.parametrize("callee_first", [True, False])
 @pytest.mark.parametrize("keyword", [False, True])
 def test_xp2f_tuple_expression_results_preserve_component_kinds(

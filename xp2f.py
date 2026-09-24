@@ -65600,13 +65600,24 @@ def generate_flat(
                         # otherwise the ONLY evidence there is).
                         _idx = next((_i for _i, _a in enumerate(_fn_params) if _a.arg == _name), None)
                         _outer_hints = call_kind_hints.get(fn_node.name)
+                        # An unassigned formal is not necessarily scalar.
+                        # Preserve its own rank evidence when it is forwarded,
+                        # including documented arrays in otherwise uncalled
+                        # wrappers. A fabricated scalar observation survives
+                        # into overload generation even after rank refinement.
+                        _outer_ranks = call_rank_hints.get(fn_node.name, [])
+                        _param_rank = max(
+                            int(_outer_ranks[_idx]) if _idx is not None and _idx < len(_outer_ranks) else 0,
+                            int(_infer_arg_rank_in_fn(fn_node, _name)),
+                            int(_comment_arg_spec_hint_for_fn(fn_node, _name)[1] or 0),
+                        )
                         if (
                             _idx is not None
                             and _outer_hints is not None
                             and _idx < len(_outer_hints)
                             and _outer_hints[_idx] in {"int", "real", "logical", "char", "complex"}
                         ):
-                            return (_outer_hints[_idx], 0)
+                            return (_outer_hints[_idx], _param_rank)
                         _pk = _infer_arg_kind_in_fn(fn_node, _name)
                         if _pk is None:
                             try:
@@ -65614,8 +65625,8 @@ def generate_flat(
                             except Exception:
                                 _pk = None
                         if _pk in {"int", "real", "logical", "char", "complex"}:
-                            return (_pk, 0)
-                        return (None, 0)
+                            return (_pk, _param_rank)
+                        return (None, _param_rank)
                     # Not assigned locally in this function, and not one of
                     # its own parameters either: fall back to a module-level
                     # constant of the same name (e.g. a default/actual
