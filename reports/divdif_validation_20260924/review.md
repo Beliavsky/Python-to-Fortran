@@ -58,3 +58,39 @@ Validation: 24 focused pytest cases passed with reruns disabled (14 new and
 existing forwarding/specialization/tuple-expression cases, plus 10 scalar
 broadcasting and scope-shadowing cases). Full pytest has not been rerun for
 this change.
+
+## Runtime-dependent result rank: diagnostic and alternative API
+
+The original `dif_value` remains unsupported. Input-rank specialization is
+not enough: even a vector input returns a scalar when its length is one,
+and a vector when its length is zero or greater than one. Merely correcting
+the scalar overload's dummy declaration would not make that result faithful.
+
+The transpiler now rejects the terminal pattern `if condition: y = y[0]`
+followed by `return y` when the inferred result variable is rank one. The
+diagnostic identifies the function and the source assignment and suggests a
+fixed-rank result or separate scalar and array entry points. This is a narrow
+guard, not general detection or support for all dynamic-return-rank code.
+String indexing, sliced vector results, and local changes not returned by
+the function are not rejected by this guard.
+
+The full source now fails translation with `runtime-dependent return rank
+in function 'dif_value'` instead of proceeding to the ambiguous-interface
+compiler error. Neither scalar/vector input normalization nor general
+dynamic result support is claimed fixed by this change.
+
+The checker additionally constructs an explicitly **adapted**
+`dif_value_vector` from the original algorithm: the input must be a vector,
+and the output always remains a vector. A separate `dif_value_scalar` wraps
+one scalar in a length-one array and extracts the single result. This changes
+the interface intentionally; it does not modify or validate the original
+mixed-rank API. Both entry points match Python and known polynomial values,
+including empty, singleton, and three-element vector cases.
+
+Validation for this follow-up: 6 new diagnostic/unit cases passed on the
+final run, and 7 existing real-sentinel and rank-rebinding cases passed.
+The initial unit tests attempted to construct a translator without its
+required global setup; those 4 test-setup failures were corrected by using
+a minimal rank-query stub and all 4 passed on rerun. Reruns were disabled
+in pytest. The adapted evaluator and original kernels report `Run diff:
+MATCH`. Full pytest is the next checkpoint.

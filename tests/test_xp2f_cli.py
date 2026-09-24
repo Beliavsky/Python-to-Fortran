@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -3966,6 +3967,42 @@ def test_xp2f_tuple_element_targets_mutate_array_arguments(tmp_path: Path, targe
     for name in ("u", "q"):
         assert re.search(rf"intent\(inout\)\s*::[^\n]*\b{name}\(:\)", generated)
     assert re.search(r"intent\(in\)\s*::[^\n]*\buntouched\(:\)", generated)
+
+
+@pytest.mark.parametrize("guard", ["n == 1", "len(y) == 1"])
+def test_xp2f_rejects_runtime_dependent_array_element_return(tmp_path: Path, guard: str) -> None:
+    src = tmp_path / "xdynamic_return.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "def evaluate(x):",
+        "    x = np.atleast_1d(x)",
+        "    n = len(x)",
+        "    y = 2.0 * x",
+        f"    if {guard}:",
+        "        y = y[0]",
+        "    return y",
+        "print(evaluate(np.array([1.5, 2.5])))",
+        "print(evaluate(np.array([1.5])))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "runtime-dependent return rank in function 'evaluate'" in proc.stdout
+    assert "fixed-rank array" in proc.stdout
+    assert not (tmp_path / "xdynamic_return_p.f90").exists()
+
+
+@pytest.mark.parametrize("body,rank", [
+    ("if n == 1:\n    y = y[0]\nreturn n", 1),
+    ("if n == 1:\n    y = y[:1]\nreturn y", 1),
+    ("if n == 1:\n    y = y[0]\nreturn y", 0),
+    ("y = y[0]\nreturn y", 1),
+])
+def test_conditional_element_return_guard_is_narrow(body: str, rank: int) -> None:
+    fn = ast.parse("def f(y, n):\n" + "\n".join("    " + line for line in body.splitlines())).body[0]
+    tr = SimpleNamespace(_rank_expr=lambda node: rank)
+    xp2f._check_conditional_element_return(fn, tr)
 
 
 @pytest.mark.parametrize("call_wrapper", [False, True])

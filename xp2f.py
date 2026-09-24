@@ -56868,6 +56868,41 @@ def _none_default_arg_is_pure_forward(fn, arg_name):
     return checker.pure_forward
 
 
+def _check_conditional_element_return(fn, tr):
+    """Reject a terminal array-to-element rebind with a dynamic return rank.
+
+    This narrow check is deliberately not a general control-flow analysis.
+    A local array-to-scalar change that is not returned is still allowed.
+    """
+    if len(fn.body) < 2:
+        return
+    branch, ret = fn.body[-2:]
+    if not (isinstance(ret, ast.Return) and isinstance(ret.value, ast.Name)
+            and isinstance(branch, ast.If) and not branch.orelse
+            and not isinstance(branch.test, ast.Constant)
+            and len(branch.body) == 1):
+        return
+    name = ret.value.id
+    node = branch.body[0]  # The CLI diagnostic formatter uses this source node.
+    if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+            and isinstance(node.value, ast.Subscript)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == name
+            and isinstance(node.value.slice, ast.Constant)
+            and type(node.value.slice.value) is int):
+        return
+    if tr._rank_expr(ast.Name(id=name, ctx=ast.Load())) != 1:
+        return
+    raise NotImplementedError(
+        f"runtime-dependent return rank in function {fn.name!r}: {name!r} is "
+        f"conditionally replaced by an array element before return; "
+        "return a fixed-rank array or use separate "
+        "scalar and array entry points"
+    )
+
+
 def _emit_local_function(
     o,
     fn,
@@ -58207,6 +58242,7 @@ def _emit_local_function(
                 tr._mark_char(a.arg)
 
     tr.prescan(fn.body)
+    _check_conditional_element_return(fn, tr)
     if fn.name in (local_df_return_info or {}):
         # tr.prescan above is scoped to just this function's own body, so
         # its own `df = pd.read_csv(path, ...)` detection can't resolve a
