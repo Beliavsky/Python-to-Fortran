@@ -64419,6 +64419,22 @@ def _mark_nested_loop_target_reuse(tree):
     return diagnostics
 
 
+def _seed_observed_argument_types(tr, fn, kind_hints, rank_hints):
+    """Supply caller evidence before scanning indexed actuals such as u[i]."""
+    kinds = kind_hints.get(fn.name, [])
+    ranks = rank_hints.get(fn.name, [])
+    for i, arg in enumerate(list(fn.args.args) + list(fn.args.kwonlyargs)):
+        kind = kinds[i] if i < len(kinds) else None
+        rank = ranks[i] if i < len(ranks) else 0
+        suffix = {"int": "int", "real": "real", "logical": "log",
+                  "complex": "complex", "char": "char"}.get(kind)
+        if suffix is not None:
+            if rank > 0:
+                getattr(tr, "_mark_alloc_" + suffix)(arg.arg, rank=rank)
+            else:
+                getattr(tr, "_mark_" + suffix)(arg.arg)
+
+
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None,
@@ -65863,6 +65879,10 @@ def generate_flat(
                 tr_local_scan.local_df_return_info.update(_local_ret_df_info_scan)
             if _local_ret_tuple_df_info_scan:
                 tr_local_scan.tuple_df_return_positions.update(_local_ret_tuple_df_info_scan)
+            # Preserve observed formal types while examining calls inside the
+            # function. In particular, u[i] must inherit u's element kind;
+            # an unseeded scan loses it even when callers establish real u.
+            _seed_observed_argument_types(tr_local_scan, _fn_scan, call_kind_hints, call_rank_hints)
             _seed_struct_param_types(tr_local_scan, _fn_scan)
             tr_local_scan.prescan(_fn_scan.body)
             _record_call_hints(_fn_scan, tr_local_scan, _fn_scan)

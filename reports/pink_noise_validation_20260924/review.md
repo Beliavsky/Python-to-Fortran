@@ -56,13 +56,39 @@ def step(u, q):
 
 That exposed another kind-inference problem: the call emitted `int(u(i+1))`
 despite a real dummy argument, and tuple output kinds were inconsistent.
-`tuple_expression_probe.py` preserves this unresolved reproducer. The final
+`tuple_expression_probe.py` preserves this reproducer. The initial
 mutation regression uses named local results, matching the original `ranh`
 structure. It passes without adding type hints. The expression-return case
-is not claimed fixed by the mutation change.
+was not fixed by the mutation change; see the follow-up below.
 
 Validation: 11 focused pytest cases passed with reruns disabled: 2 new
 mutation cases, 7 existing tuple/section cases, and 2 parameter-rebinding
-cases. The initial expression-return test failures are described above;
-that separate case remains unresolved. Full pytest has not been rerun for
-this change.
+cases. The initial expression-return test failures are described above.
+Full pytest has not been rerun for this change.
+
+## Tuple-expression inference follow-up
+
+The call-site scan inside `update` did not seed its formal parameters from
+already observed caller types. Thus `step(u[i], q[i])` lost the known real
+and integer element kinds of the two arrays. Provisional tuple-result
+guesses then reached the final call site, while the separately inferred
+callee declarations disagreed.
+
+The local call scan now seeds observed formal kinds and ranks before
+prescanning the function body. Existing expression inference consequently
+infers `step`'s components independently as real, real, integer. No blanket
+tuple promotion or cast suppression is used. The generated call no longer
+converts `u[i]` to integer, and the third output is declared integer in both
+the callee and the caller's temporary.
+
+New regression cases cover positional and keyword calls, both definition
+orders, negative fractional inputs, and updates visible after repeated calls.
+
+Validation for this follow-up: all 4 new cases passed, and all 19 selected
+existing cases passed (reruns disabled). These cover tuple-target mutation,
+resolved helper-return kinds, documented integer seeds, real sentinels,
+parameter rebinding, and joint scalar/vector/matrix rank forwarding.
+The saved expression probe compiled and reported `Run diff: MATCH`.
+The complete original pink-noise program was rebuilt and rerun with RNG
+replay; all 2,279 normalized tokens again matched at displayed precision.
+Run full `pytest -q` before starting another corpus fix.

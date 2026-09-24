@@ -1,4 +1,4 @@
-"""Separate unresolved tuple-expression kind inference case found during testing."""
+"""Regression probe for mixed tuple-expression kinds and array element updates."""
 import numpy as np
 
 

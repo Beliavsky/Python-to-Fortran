@@ -3968,6 +3968,39 @@ def test_xp2f_tuple_element_targets_mutate_array_arguments(tmp_path: Path, targe
     assert re.search(r"intent\(in\)\s*::[^\n]*\buntouched\(:\)", generated)
 
 
+@pytest.mark.parametrize("callee_first", [True, False])
+@pytest.mark.parametrize("keyword", [False, True])
+def test_xp2f_tuple_expression_results_preserve_component_kinds(
+    tmp_path: Path, callee_first: bool, keyword: bool,
+) -> None:
+    helper = ["def step(u, q):", "    return u, u + 0.25, q - 1"]
+    call = "step(q=q[i], u=u[i])" if keyword else "step(u[i], q[i])"
+    caller = [
+        "def update(u, q, untouched):",
+        "    total = 0.0",
+        "    for i in range(len(u)):",
+        f"        value, u[i], q[i] = {call}",
+        "        total += value + untouched[i]",
+        "    return total",
+    ]
+    _run_xp2f_compile_diff(tmp_path, "xtuple_expression_kinds.py", [
+        "import numpy as np",
+        *(helper + caller if callee_first else caller + helper),
+        "u = np.array([1.5, -2.5])",
+        "q = np.array([4, 7], dtype=int)",
+        "untouched = np.array([10.0, 20.0])",
+        "for repeat in range(2):",
+        "    print(update(u, q, untouched))",
+        "    for i in range(len(u)):",
+        "        print(u[i], q[i], untouched[i])",
+    ])
+    generated = (tmp_path / "xtuple_expression_kinds_p.f90").read_text(encoding="utf-8")
+    assert "int(u(" not in generated
+    step = generated.split("subroutine step(", 1)[1].split("end subroutine step", 1)[0]
+    for index, kind in [(1, r"real\(kind=dp\)"), (2, r"real\(kind=dp\)"), (3, "integer")]:
+        assert re.search(rf"{kind}, intent\(out\) ::[^\n]*\bstep_out_{index}\b", step), step
+
+
 def test_xp2f_fractional_arrays_forwarded_after_rebinding(tmp_path: Path) -> None:
     source = (REPO_ROOT / "reports" / "collatz_polynomial_validation_20260923" / "probe.py").read_text(encoding="utf-8")
     source = source.replace("7.0", "7.25").replace("[1.0, 2.0, 3.0]", "[1.5, 2.5, 3.5]")
