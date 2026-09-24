@@ -500,16 +500,28 @@ def collect_closure(target_name, procedures, lines):
             f"xp2f.py's own translation of this script (translated names: "
             f"{', '.join(sorted(procedures)) or '(none)'})"
         )
-    known = set(procedures.keys())
+    _, header, _, _ = parse_module("\n".join(lines))
+    interfaces = _find_python_mod_interfaces(_merge_continuations(header))
+    known = set(procedures) | set(interfaces)
     needed = {target}
     frontier = [target]
     while frontier:
         nm = frontier.pop()
         start, end = procedures[nm]
         for dep in find_calls(lines, start, end, known, nm):
-            if dep not in needed:
-                needed.add(dep)
-                frontier.append(dep)
+            # A generic call can select any of its concrete overloads.
+            # Keep their transitive dependencies, but not the generic name
+            # itself in the concrete-procedure set used by later passes.
+            members = interfaces[dep][2] if dep in interfaces else [dep]
+            for member in members:
+                member = member.lower()
+                if member not in procedures:
+                    raise UnsupportedFunction(
+                        f"generic interface {dep!r} refers to missing module procedure {member!r}"
+                    )
+                if member not in needed:
+                    needed.add(member)
+                    frontier.append(member)
     return needed
 
 
@@ -1925,7 +1937,7 @@ MODULE_PROCEDURE_RE = re.compile(r"^\s*module\s+procedure\s*(?:::)?\s*(.+)$", re
 
 
 def _find_python_mod_interfaces(header_lines):
-    """Scan python.f90's own module HEADER (specification section, before
+    """Scan a module HEADER (python.f90 or translated source, before
     `contains`) for a named generic `interface NAME ... end interface`
     block -- e.g. `optval`, dispatching to `optval_int`/`optval_real`/
     `optval_logical`/`optval_char` by argument type via one `module
@@ -3571,6 +3583,29 @@ def hoist_global_initializers(header, lines, needed_bodies):
 def build_trimmed_module(mod_name, header, lines, procedures, needed, override_lines=None):
     override_lines = override_lines or {}
     dropped = {nm for nm in procedures if nm not in needed}
+    header = _merge_continuations(header)
+    interfaces = _find_python_mod_interfaces(header)
+    interface_edits = {}
+    for name, (start, end, members) in interfaces.items():
+        if not members:
+            continue  # Not a module-procedure generic; leave it alone.
+        kept = [member for member in members if member.lower() in needed]
+        if kept:
+            declarations = [f"      module procedure {member}" for member in kept]
+            interface_edits[start] = (end, [header[start], *declarations, header[end]])
+        else:
+            dropped.add(name)
+            interface_edits[start] = (end, [])
+    filtered_header = []
+    i = 0
+    while i < len(header):
+        if i in interface_edits:
+            end, replacement = interface_edits[i]
+            filtered_header.extend(replacement)
+            i = end + 1
+        else:
+            filtered_header.append(header[i])
+            i += 1
     new_header = []
     # Merged to ONE logical line per statement first -- a `public ::`
     # statement listing many names (common in Burkardt-derived modules)
@@ -3589,12 +3624,13 @@ def build_trimmed_module(mod_name, header, lines, procedures, needed, override_l
     # only ever be shorter (dropped names removed), never longer, so a
     # single re-joined line is never a problem free-form Fortran can't
     # already handle.
-    for ln in _merge_continuations(header):
+    for ln in filtered_header:
         m = PUBLIC_RE.match(_strip_comment(ln))
         if m:
             names = [n.strip() for n in m.group(2).split(",")]
             kept = [n for n in names if n.lower() not in dropped]
-            new_header.append(f"{m.group(1)}{', '.join(kept)}")
+            if kept:
+                new_header.append(f"{m.group(1)}{', '.join(kept)}")
         else:
             new_header.append(ln)
 

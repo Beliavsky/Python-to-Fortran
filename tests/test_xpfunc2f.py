@@ -548,6 +548,71 @@ def test_build_trimmed_module_filters_multiline_public_statement() -> None:
     assert "public :: dp, keep_me" in new_text
 
 
+@pytest.mark.parametrize("call", ["dispatch(x)", "real_impl(x)", "x"])
+def test_extract_filters_generic_interfaces_and_keeps_dependencies(tmp_path: Path, call: str) -> None:
+    source = f"""module generic_test
+implicit none
+private
+public :: target
+public :: dispatch, unused
+interface dispatch
+    module procedure REAL_IMPL, &
+        & int_impl
+end interface dispatch
+interface unused
+    module procedure unused_impl
+end interface unused
+contains
+real function target(x) result(y)
+real, intent(in) :: x
+y = {call}
+end function target
+real function real_impl(x) result(y)
+real, intent(in) :: x
+y = helper(x)
+end function real_impl
+integer function int_impl(x) result(y)
+integer, intent(in) :: x
+y = x + 1
+end function int_impl
+real function helper(x) result(y)
+real, intent(in) :: x
+y = x + 1.0
+end function helper
+real function unused_impl(x) result(y)
+real, intent(in) :: x
+y = x
+end function unused_impl
+end module generic_test
+"""
+    mod, header, lines, procedures = xpfunc2f.parse_module(source)
+    needed = xpfunc2f.collect_closure("target", procedures, lines)
+    expected = {"target"}
+    if call != "x":
+        expected |= {"real_impl", "helper"}
+    if call == "dispatch(x)":
+        expected.add("int_impl")
+    assert needed == expected
+    trimmed = xpfunc2f.build_trimmed_module(mod, header, lines, procedures, needed)
+    assert "unused" not in trimmed
+    assert ("interface dispatch" in trimmed) == (call != "x")
+    assert ("module procedure int_impl" in trimmed) == (call == "dispatch(x)")
+    path = tmp_path / "generic_test.f90"
+    expected_value = "2.5" if call != "x" else "1.5"
+    path.write_text(trimmed + f"""
+program check
+use generic_test, only: target
+if (abs(target(1.5) - {expected_value}) > 1.e-6) stop 1
+end program check
+""", encoding="utf-8")
+    exe = tmp_path / "generic_test.exe"
+    proc = subprocess.run(["gfortran", str(path), "-o", str(exe)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    proc = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_inline_python_mod_helpers_resolves_generic_interface() -> None:
     # Regression test for examples/xbs.py's own `black_scholes` (and 3
     # other files sharing this shape): python.f90's own `optval` is a

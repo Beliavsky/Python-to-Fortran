@@ -3945,10 +3945,16 @@ def test_xp2f_fractional_arrays_forwarded_after_rebinding(tmp_path: Path) -> Non
     _run_xp2f_compile_diff(tmp_path, "xfractional_forward.py", source.splitlines())
     generated = (tmp_path / "xfractional_forward_p.f90").read_text(encoding="utf-8")
     assert "int(p_local)" not in generated
-    for name in ("grow", "show"):
-        header = f"function {name}(" if name == "grow" else f"subroutine {name}("
-        body = generated.split(header, 1)[1].split("end ", 1)[0]
-        assert "real(kind=dp), intent(in) :: p(:)" in body
+    grow = generated.split("function grow(", 1)[1].split("end function grow", 1)[0]
+    assert "real(kind=dp), intent(in) :: p(:)" in grow
+    # show also receives integer arrays, so it can now be a generic.
+    # Check the real overload without requiring integer overloads to be real.
+    show_bodies = re.findall(
+        r"^subroutine (show(?:_\w+)?)\(p\)(.*?)^end subroutine \1\b",
+        generated, re.MULTILINE | re.DOTALL,
+    )
+    assert show_bodies, generated
+    assert any("real(kind=dp), intent(in) :: p(:)" in body for _, body in show_bodies)
 
 
 @pytest.mark.parametrize("bound", ["len(a)", "a.size", "a.shape[0]", "int(a[0])", "round(a[0])", "min(len(a), n)"])
@@ -6896,6 +6902,68 @@ def test_xp2f_rank_guarded_print_helper_single_profile(tmp_path: Path, literal: 
         '            print(a[i])',
         f'show(np.array({literal}))',
     ])
+
+
+@pytest.mark.parametrize('expr', ['x - a[:]', 'a[:] - x', 'x + a[:]', 'a[:] + x'])
+@pytest.mark.parametrize('rank', [1, 2])
+def test_xp2f_broadcast_scalar_argument_stays_scalar(tmp_path: Path, expr: str, rank: int) -> None:
+    literal = '[1.0, 2.0, 4.0]' if rank == 1 else '[[1.0, 2.0], [3.0, 4.0]]'
+    _run_xp2f_compile_diff(tmp_path, 'xscalar_broadcast.py', [
+        'import numpy as np',
+        'def evaluate(a, x):',
+        f'    product = np.prod({expr})',
+        '    scalar = x * 2.0',
+        '    return product, scalar',
+        f'a = np.array({literal})',
+        'product, scalar = evaluate(a, 2.5)',
+        'print(product, scalar)',
+    ])
+    generated = (tmp_path / 'xscalar_broadcast_p.f90').read_text(encoding='utf-8')
+    body = generated.split('subroutine evaluate(', 1)[1].split('end subroutine', 1)[0]
+    assert not re.search(r'\bx\s*\(:', body)
+
+
+@pytest.mark.parametrize('callee_first', [False, True])
+def test_xp2f_tuple_outputs_use_resolved_helper_return_kinds(tmp_path: Path, callee_first: bool) -> None:
+    degree = [
+        'def degree(n, a):',
+        '    # integer N, nominal degree.',
+        '    # real A(N+1), coefficients.',
+        '    value = n',
+        '    while value > 0:',
+        '        if a[value] != 0.0:', '            break',
+        '        value = value - 1',
+        '    return value',
+    ]
+    outputs = [
+        'def outputs(n, a):',
+        '    # integer N, nominal degree.',
+        '    # real A(N+1), coefficients.',
+        '    # integer NQ, quotient degree.',
+        '    # integer NR, remainder degree.',
+        '    d = degree(n, a)',
+        '    if d == 0:',
+        '        nq = -1', '        nr = -1',
+        '        q = np.zeros(0)', '        r = np.zeros(0)',
+        '        return nq, q, nr, r',
+        '    nq = d - 1', '    nr = d - 2',
+        '    q = np.ones(nq + 1)', '    r = np.ones(nr + 1)',
+        '    return nq, q, nr, r',
+    ]
+    _run_xp2f_compile_diff(tmp_path, 'xresolved_tuple.py', [
+        'import numpy as np',
+        *(degree + outputs if callee_first else outputs + degree),
+        'def exercise():',
+        '    for n in range(4):',
+        '        a = np.ones(n + 1)',
+        '        nq, q, nr, r = outputs(n, a)',
+        '        print(nq, nr, q.size, r.size)',
+        'exercise()',
+    ])
+    generated = (tmp_path / 'xresolved_tuple_p.f90').read_text(encoding='utf-8')
+    body = generated.split('subroutine exercise(', 1)[1].split('end subroutine', 1)[0]
+    assert re.search(r'integer\s*::[^\n]*\bnq\b', body)
+    assert re.search(r'integer\s*::[^\n]*\bnr\b', body)
 
 
 def test_xp2f_preserves_signed_power_parentheses() -> None:
