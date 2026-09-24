@@ -6846,6 +6846,58 @@ def test_xp2f_nested_loop_warning_respects_scopes() -> None:
     assert tree.body[0].body[0]._xp2f_reused_loop_target
 
 
+@pytest.mark.parametrize('matrix_first', [False, True])
+def test_xp2f_rank_guarded_print_helper(tmp_path: Path, matrix_first: bool) -> None:
+    calls = ['show(v)', 'show(a=m)']
+    if matrix_first:
+        calls.reverse()
+    _run_xp2f_compile_diff(tmp_path, 'xrank_print.py', [
+        'import numpy as np',
+        'def show(a):',
+        '    # real A(N), vector or column matrix.',
+        '    print(a.ndim)',
+        '    if a.ndim == 1:',
+        '        for i in range(len(a)):',
+        '            print(a[i])',
+        '    else:',
+        '        for i in range(len(a)):',
+        '            print(a[i, 0])',
+        'v = np.array([1.25, -2.5])',
+        'm = np.array([[3.75], [-4.5]])',
+        *calls,
+        'show(np.array([7, -8], dtype=int))',
+    ])
+    src = tmp_path / 'xrank_print.py'
+    generated_default = None
+    for flags in [[], ['--report-specializations']]:
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), *flags],
+                              cwd=tmp_path, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        note = "Note: specializing 'show' for argument 'a' ranks 1, 2."
+        assert (note in proc.stderr) == bool(flags), proc.stdout + proc.stderr
+        generated = (tmp_path / 'xrank_print_p.f90').read_text(encoding='utf-8').splitlines()[1:]
+        if not flags:
+            generated_default = generated
+        else:
+            assert generated == generated_default
+
+
+@pytest.mark.parametrize('literal', ['[1.25, -2.5]', '[[1.25], [-2.5]]'])
+def test_xp2f_rank_guarded_print_helper_single_profile(tmp_path: Path, literal: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, 'xsingle_rank_print.py', [
+        'import numpy as np',
+        'def show(a):',
+        '    # real A(N), vector or column matrix.',
+        '    if a.ndim != 1:',
+        '        for i in range(len(a)):',
+        '            print(a[i, 0])',
+        '    else:',
+        '        for i in range(len(a)):',
+        '            print(a[i])',
+        f'show(np.array({literal}))',
+    ])
+
+
 def test_xp2f_preserves_signed_power_parentheses() -> None:
     lines = [
         "x = (-1.0_dp) ** i",
@@ -10642,6 +10694,54 @@ def test_xp2f_loadtxt_documented_vector_context(tmp_path: Path, dtype: str, comm
     (tmp_path / 'values.txt').write_text('0 2\n', encoding='utf-8')
     run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
+
+
+@pytest.mark.parametrize('dtype,comment_kind', [('float', 'real'), ('int', 'integer'), ('bool', 'logical')])
+def test_xp2f_loadtxt_vector_context_through_tuple_return(tmp_path: Path, dtype: str, comment_kind: str) -> None:
+    (tmp_path / 'values.txt').write_text('0\n2\n', encoding='utf-8')
+    _run_xp2f_compile_diff(tmp_path, 'xtuple_load.py', [
+        'import numpy as np',
+        'def read_values():',
+        f"    values = np.loadtxt('values.txt', dtype={dtype})",
+        '    n = len(values)',
+        '    return values, n',
+        'def forward():',
+        '    a, count = read_values()',
+        '    return a, count',
+        'def first(v):',
+        f'    # {comment_kind} V(N), the vector.',
+        '    return v[0]',
+        'v, n = forward()',
+        'print(first(v=v), v[1], n)',
+    ])
+    generated = (tmp_path / 'xtuple_load_p.f90').read_text(encoding='utf-8')
+    helper_kind = {'float': 'real', 'int': 'int', 'bool': 'logical'}[dtype]
+    assert f'loadtxt_{helper_kind}_vector' in generated
+    for contents, message in [('1 2\n3 4\n', 'file contains a matrix'), ('1\n', 'would return a scalar')]:
+        (tmp_path / 'values.txt').write_text(contents, encoding='utf-8')
+        run = subprocess.run([str(tmp_path / 'xtuple_load_p.exe')], cwd=tmp_path, capture_output=True, text=True)
+        assert run.returncode != 0
+        assert message in run.stdout + run.stderr
+
+
+@pytest.mark.parametrize('options,extra', [
+    (', ndmin=2', ''), (', usecols=0', ''),
+    ('', 'print(v[0,0])'), ('', 'v = np.ones(2)'),
+    ('', 'other, m = read_values()\nprint(other[0,0])'),
+])
+def test_infer_loadtxt_tuple_result_preserves_constraints(options: str, extra: str) -> None:
+    tree = ast.parse('\n'.join([
+        'import numpy as np',
+        'def first(v):', '    return v[0]',
+        'def read_values():',
+        f'    a = np.loadtxt("x.txt"{options})',
+        '    n = len(a)', '    return a, n',
+        'v, n = read_values()', 'print(first(v))', extra,
+    ]))
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    xp2f.infer_loadtxt_vector_context(tree.body, functions, {2: ['real V(N), the vector.']})
+    load = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'loadtxt')
+    assert not getattr(load, '_xp2f_vector_loadtxt', False)
 
 
 def test_xp2f_loadtxt_matrix_context_is_preserved(tmp_path: Path) -> None:

@@ -56687,6 +56687,7 @@ def _comment_token_rank_for_name(token, name):
 def infer_loadtxt_vector_context(body, local_funcs, comment_map):
     """Honor documented vector parameters for single-assignment text loads.
 
+    Follow single-assignment tuple results across local calls and wrappers.
     The corresponding runtime reader checks the data is actually vector-shaped.
     Do not guess from a filename or change loads explicitly requesting a shape.
     """
@@ -56714,7 +56715,8 @@ def infer_loadtxt_vector_context(body, local_funcs, comment_map):
             yield st
             yield from scope_nodes(ast.iter_child_nodes(st))
 
-    for statements in [body] + [fn.body for fn in local_funcs]:
+    scopes = {}
+    for scope, statements in [(None, body)] + [(fn.name, fn.body) for fn in local_funcs]:
         nodes = list(scope_nodes(statements))
         stores = {}
         expected = {}
@@ -56730,6 +56732,51 @@ def infer_loadtxt_vector_context(body, local_funcs, comment_map):
                         expected.setdefault(actual.id, set()).add(ranks[parameter])
             if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and isinstance(node.slice, ast.Tuple):
                 expected.setdefault(node.value.id, set()).add(len(node.slice.elts))
+        scopes[scope] = (nodes, stores, expected)
+
+    # Connect single-assignment tuple-unpacked results to their originating
+    # names. Propagate all rank evidence, including conflicts, across callers
+    # and forwarding wrappers; never turn a conflicting {1, 2} into a vector.
+    returns = {}
+    for fn in local_funcs:
+        result_nodes = [n.value for n in scopes[fn.name][0] if isinstance(n, ast.Return)]
+        if result_nodes and all(isinstance(v, ast.Tuple) for v in result_nodes):
+            arities = {len(v.elts) for v in result_nodes}
+            if len(arities) == 1:
+                returns[fn.name] = result_nodes
+    edges = []
+    for scope, (nodes, stores, expected) in scopes.items():
+        for node in nodes:
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in returns):
+                continue
+            callee = node.value.func.id
+            targets = node.targets[0].elts
+            results = returns[callee]
+            if len(targets) != len(results[0].elts):
+                continue
+            for index, target in enumerate(targets):
+                sources = [v.elts[index] for v in results]
+                if (isinstance(target, ast.Name) and stores.get(target.id) == 1
+                        and all(isinstance(v, ast.Name) and scopes[callee][1].get(v.id) == 1
+                                for v in sources)):
+                    for value in sources:
+                        edges.append(((scope, target.id), (callee, value.id)))
+    changed = True
+    while changed:
+        changed = False
+        for (left_scope, left), (right_scope, right) in edges:
+            lhs = scopes[left_scope][2].setdefault(left, set())
+            rhs = scopes[right_scope][2].setdefault(right, set())
+            combined = lhs | rhs
+            if lhs != combined or rhs != combined:
+                lhs.update(combined)
+                rhs.update(combined)
+                changed = True
+
+    for nodes, stores, expected in scopes.values():
         for node in nodes:
             if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
                 continue
@@ -56871,6 +56918,31 @@ def _emit_local_function(
     structured_type_components=None,
     value_scalar_args=False,
 ):
+    # Remove statically unreachable ndim branches before prescanning: scanning
+    # a[i, 0] in the vector specialization otherwise promotes a back to rank 2.
+    if force_arg_ranks:
+        stable_ranks = {name: rank for name, rank in force_arg_ranks.items()
+                        if not any(isinstance(n, ast.Name) and n.id == name
+                                   and isinstance(n.ctx, ast.Store) for n in ast.walk(fn))}
+        class RankBranches(ast.NodeTransformer):
+            def visit_If(self, node):
+                test = node.test
+                if (isinstance(test, ast.Compare) and len(test.ops) == 1
+                        and isinstance(test.left, ast.Attribute) and test.left.attr == "ndim"
+                        and isinstance(test.left.value, ast.Name)
+                        and test.left.value.id in stable_ranks
+                        and isinstance(test.comparators[0], ast.Constant)
+                        and isinstance(test.comparators[0].value, int)
+                        and isinstance(test.ops[0], (ast.Eq, ast.NotEq))):
+                    equal = stable_ranks[test.left.value.id] == test.comparators[0].value
+                    selected = node.body if (equal if isinstance(test.ops[0], ast.Eq) else not equal) else node.orelse
+                    result = []
+                    for statement in selected:
+                        replacement = self.visit(statement)
+                        result.extend(replacement if isinstance(replacement, list) else [replacement])
+                    return result
+                return self.generic_visit(node)
+        fn = RankBranches().visit(copy.deepcopy(fn))
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
     args = [a.arg for a in arg_nodes]
@@ -60996,7 +61068,7 @@ def _emit_local_function(
             if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
                 if hint_kind is None:
                     hint_kind = local_func_arg_kinds[fn.name][idx]
-        if comment_arg_kind in {"int", "real", "logical", "char", "complex"}:
+        if not forced_arg_kind and comment_arg_kind in {"int", "real", "logical", "char", "complex"}:
             _known_arg_ranks = (local_func_arg_ranks or {}).get(fn.name, [])
             if 0 <= idx < len(_known_arg_ranks) and int(_known_arg_ranks[idx]) > 0:
                 hint_kind = _numeric_comment_kind(hint_kind, comment_arg_kind)
@@ -64346,7 +64418,7 @@ def _mark_nested_loop_target_reuse(tree):
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None,
-    value_scalar_args=False,
+    value_scalar_args=False, specialization_notes=None,
 ):
     _mark_nested_loop_target_reuse(tree)
     for fn in local_funcs or []:
@@ -68048,6 +68120,10 @@ def generate_flat(
 
     def _is_print_only_void(fn):
         for st in fn.body:
+            if isinstance(st, (ast.If, ast.For, ast.While)):
+                if (_is_print_only_void(ast.Module(body=st.body, type_ignores=[]))
+                        and _is_print_only_void(ast.Module(body=st.orelse, type_ignores=[]))):
+                    continue
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str):
                 continue
             if isinstance(st, ast.Pass):
@@ -68200,6 +68276,11 @@ def generate_flat(
         if any((not prs) for prs in pair_lists):
             continue
         varying = [i for i, prs in enumerate(pair_lists) if len(prs) > 1]
+        rank_guard_args = {n.value.id for n in ast.walk(fn)
+                           if isinstance(n, ast.Attribute) and n.attr == "ndim"
+                           and isinstance(n.value, ast.Name) and n.value.id in arg_names}
+        if not varying and rank_guard_args:
+            varying = [arg_names.index(sorted(rank_guard_args)[0])]
         if len(varying) == 0:
             continue
         if len(varying) > 1:
@@ -68306,7 +68387,7 @@ def generate_flat(
             if k == "int" and r == 1 and (k, r, True) in triads_v and (k, r, False) not in triads_v:
                 list_args.add(arg_names[iv])
             specs.append((pname, forced_kinds, forced_ranks, list_args, True))
-        if len(specs) <= 1:
+        if len(specs) <= 1 and not rank_guard_args:
             continue
         local_overload_specs[fn.name] = specs
         if dmap:
@@ -69103,6 +69184,15 @@ def generate_flat(
     else:
         raise NotImplementedError("local joint-rank result profiles did not converge")
     local_generic_overloads = set(local_overload_specs.keys())
+    if specialization_notes is not None:
+        for name, specs in local_overload_specs.items():
+            for arg in local_func_arg_names.get(name, []):
+                ranks = sorted({spec[2][arg] for spec in specs if arg in spec[2]})
+                if len(ranks) > 1:
+                    specialization_notes.add(
+                        f"Note: specializing '{name}' for argument '{arg}' ranks "
+                        + ", ".join(map(str, ranks)) + "."
+                    )
     pure_local_calls = compute_local_functions_purity(
         local_funcs, known_pure_calls=set(known_pure_calls or set()) | set((user_class_types or {}).keys())
     )
@@ -70007,6 +70097,11 @@ def generate_flat(
         for _nm in list(_main_loaded):
             if _nm in fn_alias_map:
                 proc_main_needed.add(fn_alias_map[_nm])
+            # List/array dispatch can call a specific directly rather than
+            # the generic named in the AST. Import those possible targets;
+            # the final unused-import pass removes any that were not emitted.
+            for spec in local_overload_specs.get(_nm, []):
+                proc_main_needed.add(spec[0])
         proc_main_needed |= module_global_names
         # normalize_scipy_curve_fit_residual_helper synthesizes a residual
         # function that's only referenced via a procedure pointer in
@@ -71440,7 +71535,9 @@ def transpile_file(
     int_kind=None,
     perf_hints=False,
     suppress_function_print=False,
+    report_specializations=False,
 ):
+    specialization_notes = set() if report_specializations else None
     if src_override is not None:
         src = normalize_numpy_removed_aliases(src_override)
     else:
@@ -71828,6 +71925,7 @@ def transpile_file(
             user_class_types=user_class_types,
             rng_replay_path=rng_replay_path,
             value_scalar_args=value_scalar_args,
+            specialization_notes=specialization_notes,
         )
         used_flat_fallback = False
     else:
@@ -71850,6 +71948,7 @@ def transpile_file(
                 user_class_types=user_class_types,
                 rng_replay_path=rng_replay_path,
                 value_scalar_args=value_scalar_args,
+                specialization_notes=specialization_notes,
             )
             used_flat_fallback = True
         else:
@@ -71877,6 +71976,7 @@ def transpile_file(
                     user_class_types=user_class_types,
                     rng_replay_path=rng_replay_path,
                     value_scalar_args=value_scalar_args,
+                    specialization_notes=specialization_notes,
                 )
                 used_flat_fallback = True
 
@@ -72162,6 +72262,8 @@ def transpile_file(
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     f90 = f"! transpiled by xp2f.py from {Path(py_path).name} on {stamp}\n" + f90
     out_path.write_text(f90, encoding="utf-8")
+    for note in sorted(specialization_notes or ()):
+        print(note, file=sys.stderr)
     return out_path, used_flat_fallback, used_main_unwrap
 
 
@@ -72403,6 +72505,7 @@ def main():
     ap.add_argument("--comment", action="store_true", help="emit generated procedure/argument comments")
     ap.add_argument("--ignore-comments", action="store_true", help="ignore source comments as type/rank inference hints")
     ap.add_argument("--explain-inference", action="store_true", help="emit non-semantic Fortran comments explaining weak/comment-derived inference hints")
+    ap.add_argument("--report-specializations", action="store_true", help="report successful local function rank specializations on stderr (quiet by default)")
     ap.add_argument(
         "--compiler",
         default=default_compiler_command(),
@@ -72819,6 +72922,7 @@ def main():
             int_kind=args.int_kind,
             perf_hints=args.perf_hints,
             suppress_function_print=args.suppress_function_print,
+            report_specializations=args.report_specializations,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:

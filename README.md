@@ -16,6 +16,12 @@ For side-by-side examples and important semantic differences, see the [Python To
 
 ## Status
 
+Use `--report-specializations` to print informational notes on stderr when a
+local function is specialized for different argument ranks. These notes are
+off by default: accepting a vector on one call and a matrix on another is not
+itself a warning. Unsupported rank combinations still produce diagnostics;
+the option does not enable general dynamic-rank variables.
+
 This transpiler is useful on a substantial subset of numerical Python, but it is not a general Python compiler.
 
 Known limitations include dynamic Python features (`isinstance` dispatch, `Union`/duck-typed parameters), complex/irregular containers, reflection, and parts of NumPy that do not map directly to static Fortran. The transpiler uses static analysis to infer types, array ranks, and procedure interfaces. It handles some type/rank changes through scoped declarations and specialized procedures, but not arbitrary dynamic rebinding. Array extents can be determined at runtime using allocatable arrays; their rank and element type still need to be inferable. When a program does not transpile, a small reproducer is usually the best starting point for improving `xp2f.py`.
