@@ -20928,6 +20928,96 @@ def _reject_mixed_function_attribute_state(exec_body, local_funcs):
                     )
 
 
+def reject_numpy_slice_view_swaps(exec_body, local_funcs):
+    """Reject a bounded live-view swap that value-copy lowering changes.
+
+    Restrict to multidimensional basic slices, not Python list slices or
+    advanced NumPy indexing (which already copies). This does not attempt
+    general alias analysis.
+    """
+    def same(a, b):
+        # The source expression is identical despite Load/Store AST contexts.
+        return ast.unparse(a) == ast.unparse(b)
+
+    def section(node, scalar_names):
+        if not (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and isinstance(node.slice, ast.Tuple)):
+            return False
+        return any(isinstance(s, ast.Slice) for s in node.slice.elts) and all(
+            isinstance(s, ast.Slice) or (isinstance(s, ast.Constant) and type(s.value) is int)
+            or (isinstance(s, ast.Name) and s.id in scalar_names)
+            for s in node.slice.elts)
+
+    class Finder(ast.NodeVisitor):
+        scalar_names = set()
+
+        def visit_FunctionDef(self, node):
+            previous = self.scalar_names
+            self.scalar_names = set()
+            nodes = list(ast.walk(node))
+            for n in nodes:
+                if (isinstance(n, ast.For) and isinstance(n.target, ast.Name)
+                        and isinstance(n.iter, ast.Call) and isinstance(n.iter.func, ast.Name)
+                        and n.iter.func.id == 'range'):
+                    self.scalar_names.add(n.target.id)
+            assignments = [n for n in nodes if isinstance(n, ast.Assign)]
+
+            def integer_expr(expr):
+                if isinstance(expr, ast.Constant):
+                    return type(expr.value) is int
+                if isinstance(expr, ast.Name):
+                    return expr.id in self.scalar_names
+                if isinstance(expr, ast.BinOp) and isinstance(expr.op, (ast.Add, ast.Sub, ast.Mult)):
+                    return integer_expr(expr.left) and integer_expr(expr.right)
+                return (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+                        and is_numpy_name_node(expr.func.value) and expr.func.attr in {'argmax', 'argmin'}
+                        and len(expr.args) == 1 and not expr.keywords)
+
+            for _ in range(len(assignments) + 1):
+                before = set(self.scalar_names)
+                for n in assignments:
+                    if integer_expr(n.value):
+                        self.scalar_names.update(t.id for t in n.targets if isinstance(t, ast.Name))
+                if before == self.scalar_names:
+                    break
+            # Do not mistake a rebound vector index for basic scalar indexing.
+            while True:
+                invalid = {t.id for n in assignments if not integer_expr(n.value)
+                           for t in n.targets if isinstance(t, ast.Name)}
+                before = set(self.scalar_names)
+                self.scalar_names.difference_update(invalid)
+                if before == self.scalar_names:
+                    break
+            self.generic_visit(node)
+            self.scalar_names = previous
+
+        def generic_visit(self, node):
+            for _, field in ast.iter_fields(node):
+                if not isinstance(field, list):
+                    continue
+                for first, second, third in zip(field, field[1:], field[2:]):
+                    if not all(isinstance(s, ast.Assign) and len(s.targets) == 1
+                               for s in (first, second, third)):
+                        continue
+                    temp = first.targets[0]
+                    if (isinstance(temp, ast.Name) and section(first.value, self.scalar_names)
+                            and section(second.value, self.scalar_names)
+                            and not same(first.value, second.value)
+                            and same(first.value, second.targets[0])
+                            and same(second.value, third.targets[0])
+                            and isinstance(third.value, ast.Name) and third.value.id == temp.id
+                            and first.value.value.id == second.value.value.id):
+                        raise NotImplementedError(
+                            f"unsupported NumPy slice-view swap at line {first.lineno}: "
+                            f"'{temp.id}' aliases the original array, but Fortran assignment "
+                            "would copy it; use .copy() on the temporary's slice if a "
+                            "snapshot swap is intended"
+                        )
+            super().generic_visit(node)
+
+    Finder().visit(ast.Module(body=list(exec_body) + list(local_funcs), type_ignores=[]))
+
+
 def normalize_function_attribute_state(exec_body, local_funcs):
     """Lower function attribute state like f.attr / hasattr(f, 'attr') to globals."""
     fn_names = {fn.name for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)}
@@ -72004,6 +72094,7 @@ def transpile_file(
     normalize_scipy_curve_fit_residual_helper(effective_tree.body, local_funcs)
     normalize_inline_dict_literal_call_args(effective_tree.body, local_funcs)
     normalize_generator_call_args(effective_tree.body, local_funcs)
+    reject_numpy_slice_view_swaps(effective_tree.body, local_funcs)
     normalize_function_attribute_state(effective_tree.body, local_funcs)
     normalize_globals_membership_state(effective_tree.body, local_funcs)
     normalize_simple_record_output_helpers(effective_tree.body, local_funcs)

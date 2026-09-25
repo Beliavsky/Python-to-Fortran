@@ -32,6 +32,59 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+@pytest.mark.parametrize("source,reject", [
+    ("t = a[0,:]\na[0,:] = a[1,:]\na[1,:] = t", True),
+    ("t = a[:,0]\na[:,0] = a[:,1]\na[:,1] = t", True),
+    ("t = a[0,:].copy()\na[0,:] = a[1,:]\na[1,:] = t", False),
+    ("t = a[0,:]\na[0,:] = a[0,:]\na[0,:] = t", False),
+    ("t = a[0:1]\na[0:1] = a[1:2]\na[1:2] = t", False),
+    ("t = a[0,0]\na[0,0] = a[1,0]\na[1,0] = t", False),
+    ("def f(a):\n    j = np.array([0])\n    p = np.array([1])\n    t = a[j,:]\n    a[j,:] = a[p,:]\n    a[p,:] = t", False),
+    ("def f(a):\n    for j in range(2):\n        p = np.argmax(a[:,j])\n        p = p + j - 1\n        t = a[j,:]\n        a[j,:] = a[p,:]\n        a[p,:] = t", True),
+    ("def f(a):\n    for j in range(2):\n        p = np.argmax(a[:,j])\n        p = np.array([0])\n        t = a[j,:]\n        a[j,:] = a[p,:]\n        a[p,:] = t", False),
+])
+def test_xp2f_slice_view_swap_diagnostic_boundaries(source: str, reject: bool) -> None:
+    tree = ast.parse(source)
+    if reject:
+        with pytest.raises(NotImplementedError, match="unsupported NumPy slice-view swap"):
+            xp2f.reject_numpy_slice_view_swaps(tree.body, [])
+    else:
+        xp2f.reject_numpy_slice_view_swaps(tree.body, [])
+
+
+def test_xp2f_slice_view_swap_rejected_before_build(tmp_path: Path) -> None:
+    src = tmp_path / "xview_swap.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "a = np.array([[1.0, 2.0], [3.0, 4.0]])",
+        "t = a[0, :]",
+        "a[0, :] = a[1, :]",
+        "a[1, :] = t",
+        "print(a)", "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "Transpile: FAIL" in proc.stdout
+    assert "unsupported NumPy slice-view swap" in proc.stdout
+    assert ".copy()" in proc.stdout
+    assert "Build:" not in proc.stdout
+    assert not (tmp_path / "xview_swap_p.f90").exists()
+
+
+def test_xp2f_slice_view_swap_explicit_copy_matches(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xsnapshot_swap.py", [
+        "import numpy as np",
+        "a = np.array([[1.0, 2.0], [3.0, 4.0]])",
+        "t = a[0, :].copy()",
+        "a[0, :] = a[1, :]",
+        "a[1, :] = t",
+        "for i in range(2):",
+        "    for j in range(2):",
+        "        print(a[i, j])",
+    ])
+
+
 def _join_fortran_continuations(text: str) -> str:
     """Join "&"-continued declaration (or other) statements back onto one
     logical line, so simple substring/per-line assertions don't need to
