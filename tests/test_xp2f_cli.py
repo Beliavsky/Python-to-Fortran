@@ -3894,6 +3894,45 @@ def test_xp2f_optional_string_selector_preserves_named_state(tmp_path: Path) -> 
     ])
 
 
+@pytest.mark.parametrize("start,step", [
+    ("0", "1"), ("3", "-1"), ("-3", "1"),
+    ("0.0", "0.5"), ("1.5", "-0.5"), ("-1.5", "0.5"),
+    ("0j", "1j"), ("3j", "-1j"),
+])
+def test_xp2f_while_numeric_scalar_truth(tmp_path: Path, start: str, step: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xwhile_number.py", [
+        f"guard = {start}",
+        "count = 0",
+        "while guard:",
+        "    count += 1",
+        f"    guard += {step}",
+        "    if count == 1:",
+        "        continue",
+        "    if count > 10:",
+        "        break",
+        "print(count)",
+    ])
+
+
+def test_xp2f_while_numeric_call_is_reevaluated(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xwhile_call.py", [
+        "def remaining():",
+        "    if not hasattr(remaining, 'value'):",
+        "        remaining.value = 4",
+        "    remaining.value -= 1",
+        "    return remaining.value",
+        "count = 0",
+        "while remaining():",
+        "    count += 1",
+        "print(count)",
+        "active = True",
+        "while active:",
+        "    count += 1",
+        "    active = False",
+        "print(count)",
+    ])
+
+
 def test_xp2f_keeps_string_arg_scalar_when_indexed_for_ord(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xord_arg_small.py"

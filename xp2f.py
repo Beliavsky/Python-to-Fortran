@@ -53301,7 +53301,13 @@ class translator(ast.NodeVisitor):
     def visit_While(self, node):
         self._emit_comments_for(node)
         # Python while -> Fortran do while
-        self.o.w(f"do while ({self.expr(node.test)})")
+        test = self.expr(node.test)
+        if self._expr_kind(node.test) in {"int", "real", "complex"} and self._rank_expr(node.test) == 0:
+            # Python scalar numbers are false exactly when zero. Keep the
+            # expression in the loop condition so calls and updated variables
+            # are evaluated again on every iteration (including after cycle).
+            test = f"(({test}) /= 0)"
+        self.o.w(f"do while ({test})")
         self.o.push()
         depth0 = len(self.open_type_rebind_stack)
         for s in node.body:
