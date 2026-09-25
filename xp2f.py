@@ -3378,6 +3378,101 @@ def _strict_polymorphic_function_diagnostics(src_text):
     return diags
 
 
+def normalize_integer_chr_rebinding(local_funcs, source_tree=None):
+    """Split a definitely integer local's final, straight-line chr conversion.
+
+    Keep the character name (and its return/comment hints), renaming only the
+    earlier integer lifetime. Do not attempt loop-carried or captured state.
+    Return source locations for nonfatal type-change warnings.
+    """
+    diagnostics = []
+    if source_tree is not None:
+        for node in ast.walk(source_tree):
+            if ((isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                 and node.id in {"chr", "ord", "int"})
+                    or (isinstance(node, (ast.FunctionDef, ast.ClassDef))
+                        and node.name in {"chr", "ord", "int"})
+                    or (isinstance(node, ast.alias)
+                        and (node.asname or node.name.split(".")[0]) in {"chr", "ord", "int"})):
+                return diagnostics
+    for fn in local_funcs:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        if any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                              ast.Lambda, ast.Global, ast.Nonlocal, ast.NamedExpr,
+                              ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+               for st in fn.body for n in ast.walk(st)):
+            continue
+        occupied = {n.id.lower() for n in ast.walk(fn) if isinstance(n, ast.Name)}
+        args = {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+        occupied.update(a.lower() for a in args)
+        # A locally shadowed builtin is not Python's chr/ord/int.
+        bound = {n.id for n in ast.walk(fn)
+                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | args
+        if bound & {"chr", "ord", "int"}:
+            continue
+
+        def integer(expr, known):
+            if isinstance(expr, ast.Constant):
+                return type(expr.value) is int
+            if isinstance(expr, ast.Name):
+                return expr.id in known
+            if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, (ast.UAdd, ast.USub, ast.Invert)):
+                return integer(expr.operand, known)
+            if isinstance(expr, ast.BinOp) and isinstance(expr.op, (
+                    ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
+                    ast.BitAnd, ast.BitOr, ast.BitXor, ast.LShift, ast.RShift)):
+                return integer(expr.left, known) and integer(expr.right, known)
+            return (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
+                    and expr.func.id in {"ord", "int"})
+
+        def advance(st, known):
+            known = set(known)
+            if isinstance(st, ast.If):
+                def branch(body):
+                    state = set(known)
+                    for item in body:
+                        state = advance(item, state)
+                    return state
+                return branch(st.body) & branch(st.orelse)
+            is_int = isinstance(st, ast.Assign) and integer(st.value, known)
+            for node in ast.walk(st):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    known.discard(node.id)
+            if is_int:
+                known.update(t.id for t in st.targets if isinstance(t, ast.Name))
+            return known
+
+        known = set()
+        for index, st in enumerate(fn.body):
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1
+                    and isinstance(st.targets[0], ast.Name)
+                    and isinstance(st.value, ast.Call)
+                    and isinstance(st.value.func, ast.Name) and st.value.func.id == "chr"
+                    and len(st.value.args) == 1 and not st.value.keywords
+                    and isinstance(st.value.args[0], ast.Name)):
+                name = st.targets[0].id
+                later_writes = any(isinstance(n, ast.Name) and n.id == name
+                                   and isinstance(n.ctx, (ast.Store, ast.Del))
+                                   for item in fn.body[index + 1:] for n in ast.walk(item))
+                early_return = any(isinstance(n, (ast.Return, ast.Yield, ast.YieldFrom))
+                                   for item in fn.body[:index] for n in ast.walk(item))
+                if (name == st.value.args[0].id and name in known and name not in args
+                        and not later_writes and not early_return):
+                    fresh = name + "_code"
+                    while fresh.lower() in occupied:
+                        fresh += "_"
+                    occupied.add(fresh.lower())
+                    for item in fn.body[:index] + [st.value]:
+                        for node in ast.walk(item):
+                            if isinstance(node, ast.Name) and node.id == name:
+                                node.id = fresh
+                    diagnostics.append((st.lineno, name))
+                    known.discard(name)
+            known = advance(st, known)
+    return diagnostics
+
+
 def _strict_type_rebind_diagnostics(src_text):
     """
     Strict rule:
@@ -72077,6 +72172,12 @@ def transpile_file(
     local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
     inline_simple_value_returning_local_functions(effective_tree.body, local_funcs)
     local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
+    for line, name in normalize_integer_chr_rebinding(local_funcs, tree):
+        print(
+            f"{py_path}:{line}: Warning: variable '{name}' changes type from integer to character; "
+            "translated using separate variables. Consider distinct names for the code point and character.",
+            file=sys.stderr,
+        )
 
     # Normalize mixed-type branch-merge prints (e.g. y changes type in if/elif/else
     # then is only printed after the merge) by moving print into each branch.

@@ -32,6 +32,64 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+def test_xp2f_chr_rebinding_rot13_matches_python(tmp_path: Path) -> None:
+    src = tmp_path / "xrot13.py"
+    src.write_text("\n".join([
+        "def rotate(ch):",
+        "    i = ord(ch)",
+        "    value_code = 99",  # The generated integer name must not collide.
+        "    if 48 <= i <= 52:", "        value = i + 5",
+        "    elif 53 <= i <= 57:", "        value = i - 5",
+        "    elif 65 <= i <= 77:", "        value = i + 13",
+        "    elif 78 <= i <= 90:", "        value = i - 13",
+        "    elif 97 <= i <= 109:", "        value = i + 13",
+        "    elif 110 <= i <= 122:", "        value = i - 13",
+        "    else:", "        value = i",
+        "    value = chr(value)",
+        "    return value",
+        "for k in range(32, 127):",
+        "    ch = chr(k)",
+        "    mapped = rotate(ch)",
+        "    restored = rotate(mapped)",
+        "    print(k, ord(mapped), ord(restored))", "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stderr.count("changes type from integer to character") == 1
+    generated = src.with_name("xrot13_p.f90").read_text(encoding="utf-8")
+    assert "value_code_" in generated
+
+
+@pytest.mark.parametrize("body,rewritten", [
+    ("v = 65\nv = chr(v)\nreturn v", True),
+    ("if flag:\n    v = 65\nelse:\n    v = 66\nv = chr(v)\nreturn v", True),
+    ("if flag:\n    v = 65\nv = chr(v)\nreturn v", False),
+    ("v = 65.5\nv = chr(v)\nreturn v", False),
+    ("v = 65\nv = chr(v)\nv = 66\nreturn v", False),
+    ("for i in range(2):\n    v = 65\n    v = chr(v)\nreturn v", False),
+    ("global v\nv = 65\nv = chr(v)\nreturn v", False),
+    ("v = 65\ndef inner():\n    return v\nv = chr(v)\nreturn v", False),
+    ("v = 65\nif flag:\n    return v\nv = chr(v)\nreturn v", False),
+    ("v = 65\nchr = flag\nv = chr(v)\nreturn v", False),
+])
+def test_xp2f_chr_rebinding_boundaries(body: str, rewritten: bool) -> None:
+    tree = ast.parse("def f(flag):\n" + "\n".join("    " + line for line in body.splitlines()))
+    before = ast.dump(tree)
+    notes = xp2f.normalize_integer_chr_rebinding(tree.body)
+    assert bool(notes) == rewritten
+    if not rewritten:
+        assert ast.dump(tree) == before
+    assert not xp2f.normalize_integer_chr_rebinding(tree.body)
+
+
+def test_xp2f_chr_rebinding_does_not_rewrite_shadowed_builtin() -> None:
+    tree = ast.parse("from custom import chr\ndef f():\n    v = 65\n    v = chr(v)\n    return v\n")
+    before = ast.dump(tree)
+    assert not xp2f.normalize_integer_chr_rebinding(tree.body, tree)
+    assert ast.dump(tree) == before
+
+
 @pytest.mark.parametrize("source,reject", [
     ("t = a[0,:]\na[0,:] = a[1,:]\na[1,:] = t", True),
     ("t = a[:,0]\na[:,0] = a[:,1]\na[:,1] = t", True),
