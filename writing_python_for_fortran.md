@@ -28,6 +28,15 @@ print(total)
 
 Likewise, avoid reusing an integer index as a real-valued measurement or an array as a Boolean flag. Separate names make declarations and data flow clearer.
 
+The same advice applies across calls to persistent state, such as function
+attributes. Storing `2.0` in `store.saved` and later replacing it with
+`"Shazam!"` is valid Python, but mixed numeric/string persistent storage is
+not supported. Use separate fixed-type fields, such as `store.value` and
+`store.message`. Procedure specialization does not solve this: different
+overloads would still need to share the same changing-type value. The
+transpiler diagnoses some statically evident cases; absence of a diagnostic
+does not imply support for arbitrary mixed-type state.
+
 Fixed rank does **not** mean fixed size. A vector can have a length determined at runtime, and supported allocatable arrays can change size without changing rank. Scalar broadcasting is also natural numerical code:
 
 ```python

@@ -20852,11 +20852,88 @@ def normalize_generator_call_args(exec_body, local_funcs):
             ast.fix_missing_locations(fn)
 
 
+def _reject_mixed_function_attribute_state(exec_body, local_funcs):
+    """Reject proven string/numeric storage conflicts before state is hoisted.
+
+    Deliberately bounded: inspect literal assignments and literal actuals
+    assigned through an unchanged formal parameter. Unknown expressions are
+    not evidence of a conflict; ordinary local-function specialization is
+    unaffected.
+    """
+    funcs = {fn.name: fn for fn in local_funcs if isinstance(fn, ast.FunctionDef)}
+
+    def literal_kind(node):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                return "string"
+            if isinstance(node.value, (bool, int, float, complex)):
+                return "numeric"
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            if literal_kind(node.operand) == "numeric":
+                return "numeric"
+        return None
+
+    actual_kinds = {}
+    for root in list(exec_body) + list(funcs.values()):
+        for call in ast.walk(root):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                    and call.func.id in funcs):
+                continue
+            fn = funcs[call.func.id]
+            if any(isinstance(a, ast.Starred) for a in call.args) or any(
+                kw.arg is None for kw in call.keywords
+            ):
+                continue
+            pairs = [(a.arg, value) for a, value in zip(fn.args.args, call.args)]
+            pairs += [(kw.arg, kw.value) for kw in call.keywords if kw.arg is not None]
+            supplied = {name for name, _ in pairs}
+            names = [a.arg for a in fn.args.args]
+            defaults = list(zip(names[len(names) - len(fn.args.defaults):], fn.args.defaults))
+            defaults += [(a.arg, d) for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults)]
+            pairs += [(name, d) for name, d in defaults if name not in supplied]
+            for name, value in pairs:
+                actual_kinds.setdefault((fn.name, name), set()).add(literal_kind(value))
+
+    state_kinds = {}
+    # Include top-level direct writes as well as writes from any local function.
+    scopes = [(None, ast.Module(body=exec_body, type_ignores=[]))] + list(funcs.items())
+    for scope, root in scopes:
+        rebound = {n.id for n in ast.walk(root)
+                   if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        for node in ast.walk(root):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets, value = [node.target], node.value
+            else:
+                continue
+            kinds = {literal_kind(value)}
+            if isinstance(value, ast.Name) and value.id not in rebound:
+                kinds |= actual_kinds.get((scope, value.id), set())
+            for target in targets:
+                if not (isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in funcs):
+                    continue
+                key = (target.value.id, target.attr)
+                seen = state_kinds.setdefault(key, set())
+                seen.update(kinds)
+                if {"string", "numeric"} <= seen:
+                    raise NotImplementedError(
+                        f"mixed-type persistent state '{key[0]}.{key[1]}' at line "
+                        f"{node.lineno}: numeric and string assignments are possible "
+                        "from the observed calls (branch-insensitive analysis); "
+                        "use separate fixed-type state variables. Procedure "
+                        "specialization does not support shared mixed-type storage"
+                    )
+
+
 def normalize_function_attribute_state(exec_body, local_funcs):
     """Lower function attribute state like f.attr / hasattr(f, 'attr') to globals."""
     fn_names = {fn.name for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)}
     if not fn_names:
         return
+    _reject_mixed_function_attribute_state(exec_body, local_funcs)
 
     def _state_name(fn_name, attr_name):
         return f"{fn_name}_{attr_name}"

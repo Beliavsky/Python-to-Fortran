@@ -3828,6 +3828,34 @@ def test_xp2f_indexed_string_array_argument_stays_array(tmp_path: Path) -> None:
     assert ":: words(:)" in generated
 
 
+@pytest.mark.parametrize("update", [
+    "stored_value('Shazam!')",
+    "stored_value(value='Shazam!')",
+    "stored_value.saved = 'Shazam!'",
+])
+def test_xp2f_rejects_mixed_type_persistent_state(tmp_path: Path, update: str) -> None:
+    src = tmp_path / "xmixed_state.py"
+    src.write_text("\n".join([
+        "def stored_value(value=None):",
+        "    if not hasattr(stored_value, 'saved'):",
+        "        stored_value.saved = 2.0",
+        "    if value is not None:",
+        "        stored_value.saved = value",
+        "    return stored_value.saved",
+        "print(stored_value())",
+        update,
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "Transpile: FAIL" in proc.stdout
+    assert "mixed-type persistent state 'stored_value.saved'" in proc.stdout
+    assert "separate fixed-type state variables" in proc.stdout
+    assert "Build:" not in proc.stdout
+    assert not (tmp_path / "xmixed_state_p.f90").exists()
+
+
 def test_xp2f_optional_string_selector_preserves_named_state(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xnamed_state.py", [
         "def store(action=None, name=None, value=None):",

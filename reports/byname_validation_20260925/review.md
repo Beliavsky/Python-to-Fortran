@@ -62,3 +62,28 @@ the optional-string path used by byname is covered and passes.
 
 Logs and generated work files are reproducible artifacts, not required source
 files. Full pytest was not run for this change.
+
+## Follow-up: explicit limitation diagnostic
+
+The translator now rejects statically evident numeric/string function-attribute
+storage conflicts before emitting Fortran. `mixed_state.py` and the unchanged
+original `byname.py` both produce `Transpile: FAIL (mixed-type persistent state
+...)`, with advice to use separate fixed-type state variables. This replaces
+the ambiguous-interface or argument-mismatch compiler error in these cases.
+
+The analysis combines literal assignments and literal actual arguments passed
+through unrebound parameters, including keyword arguments and used defaults.
+It is branch-insensitive: in byname it identifies `byname.alpha` as a possible
+conflict because it does not correlate action/name selectors with value types;
+the original driver's actual string update is to beta. The diagnostic explicitly
+states that it describes possible assignments under branch-insensitive analysis.
+Unknown expressions, arbitrary wrappers, and runtime type dispatch are not
+fully analyzed. Numeric-to-numeric storage is not rejected by this check.
+
+The writing guide now briefly documents this restriction under stable variable
+types rather than adding a separate feature-specific section.
+
+Validation: seven focused pytest cases passed with reruns disabled, covering
+three rejection forms and four existing numeric persistence cases. The
+numeric-only original-function checker again matched all 13 values. Full
+pytest was not run.
