@@ -57115,7 +57115,7 @@ def _emit_local_function(
                         continue
                     rank = _comment_token_rank_for_name(token, _nm)
                     if rank is not None:
-                        return kind, rank
+                        return _comment_kind_with_numeric_default(_fn, _nm, kind), rank
         return None, None
     def _char_scalar_arg_pattern_local(arg_name):
         saw_len = False
@@ -63326,6 +63326,24 @@ def _scan_local_df_return_info(local_funcs, extra_stmts=None):
     return result
 
 
+def _comment_kind_with_numeric_default(fn, name, kind):
+    """A logical comment must not turn a numeric option default into Boolean."""
+    if kind != "logical":
+        return kind
+    positional = list(fn.args.posonlyargs) + list(fn.args.args)
+    defaults = list(zip(positional[len(positional) - len(fn.args.defaults):], fn.args.defaults))
+    defaults += list(zip(fn.args.kwonlyargs, fn.args.kw_defaults))
+    for arg, value in defaults:
+        if arg.arg != name:
+            continue
+        if isinstance(value, ast.UnaryOp) and isinstance(value.op, (ast.UAdd, ast.USub)):
+            value = value.operand
+        if isinstance(value, ast.Constant):
+            # bool subclasses int in Python; True/False must stay logical.
+            return {int: "int", float: "real", complex: "complex"}.get(type(value.value), kind)
+    return kind
+
+
 def _numeric_comment_kind(inferred_kind, comment_kind):
     """Do not let documentation narrow floating-point or retype boolean storage."""
     if inferred_kind in {"complex", "alloc_complex"} and comment_kind in {"int", "real"}:
@@ -64882,7 +64900,7 @@ def generate_flat(
                         continue
                     rank = _comment_token_rank_for_name(token, nm)
                     if rank is not None:
-                        return kind, rank
+                        return _comment_kind_with_numeric_default(fn, nm, kind), rank
         return None, None
 
     def _comment_arg_kind_hint_for_fn(fn, nm):

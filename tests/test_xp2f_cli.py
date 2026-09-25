@@ -3933,6 +3933,40 @@ def test_xp2f_while_numeric_call_is_reevaluated(tmp_path: Path) -> None:
     ])
 
 
+@pytest.mark.parametrize("default,kind", [("0", "integer"), ("-1", "integer"), ("0.5", "real(kind=dp)")])
+def test_xp2f_numeric_option_default_overrides_logical_comment(tmp_path: Path, default: str, kind: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xnumeric_option.py", [
+        f"def options(wait={default}):",
+        "    # logical wait: 0 silent, 1 verbose, 2 interactive",
+        "    verbose = 0 < wait",
+        "    interactive = 1 < wait",
+        "    return int(verbose), int(interactive)",
+        "a, b = options()",
+        "print(a, b)",
+        "a, b = options(0)",
+        "print(a, b)",
+        "a, b = options(1)",
+        "print(a, b)",
+        "a, b = options(wait=2)",
+        "print(a, b)",
+    ])
+    generated = (tmp_path / "xnumeric_option_p.f90").read_text(encoding="utf-8")
+    assert f"{kind}, intent(in), optional :: wait" in generated
+
+
+def test_xp2f_boolean_option_default_keeps_logical_comment(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xboolean_option.py", [
+        "def enabled(flag=False):",
+        "    # logical flag: whether enabled",
+        "    return int(flag)",
+        "print(enabled())",
+        "print(enabled(True))",
+        "print(enabled(flag=False))",
+    ])
+    generated = (tmp_path / "xboolean_option_p.f90").read_text(encoding="utf-8")
+    assert "logical, intent(in), optional :: flag" in generated
+
+
 def test_xp2f_keeps_string_arg_scalar_when_indexed_for_ord(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xord_arg_small.py"
