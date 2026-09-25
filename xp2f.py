@@ -42,6 +42,7 @@ import fortran_print_suppress as fpsuppress
 import fortran_loop_reorder as floop
 import fortran_post as fpost
 import fortran_purity as fpurity
+from python_size_specialization import specialize_singleton_returns
 from fortran_scan import (
     _is_wrapped_by_outer_parens,
     coalesce_simple_declarations,
@@ -13405,6 +13406,20 @@ def is_main_guard_if(node):
 
 def is_numpy_name_node(node):
     return isinstance(node, ast.Name) and node.id in {"np", "numpy"}
+
+
+def validate_numpy_atleast_call(node):
+    """Do not silently discard inputs to NumPy's variadic rank promoters."""
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and is_numpy_name_node(node.func.value)
+            and node.func.attr in {"atleast_1d", "atleast_2d", "atleast_3d"}
+            and (len(node.args) != 1 or node.keywords
+                 or isinstance(node.args[0], ast.Starred))):
+        raise NotImplementedError(
+            f"np.{node.func.attr} supports exactly one positional input in the transpiler; "
+            "multiple inputs, starred inputs, and keyword arguments are not supported; "
+            "use separate single-input calls"
+        )
 
 
 def fortran_safe_stem(stem):
@@ -29559,7 +29574,7 @@ class translator(ast.NodeVisitor):
                     return 0
                 if node.func.attr in {"delete", "insert"} and len(node.args) >= 1:
                     return 1
-                if node.func.attr in {"log", "exp", "sqrt", "asarray", "array", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"} and len(node.args) >= 1:
+                if node.func.attr in {"log", "log2", "log10", "exp", "sqrt", "asarray", "array", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "polyval" and len(node.args) >= 2:
                     return self._rank_expr(node.args[1])
@@ -30413,6 +30428,7 @@ class translator(ast.NodeVisitor):
         return f"int({self.expr(node)}, kind=int64)"
 
     def expr(self, node):
+        validate_numpy_atleast_call(node)
         if self._where_tuple_index(node):
             if self._rank_expr(node.value) != 2:
                 raise NotImplementedError("matrix where index tuples require a rank-2 indexed array")
@@ -35037,34 +35053,18 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr == "log"
+                and node.func.attr in {"exp", "log", "log2", "log10"}
                 and len(node.args) == 1
             ):
-                return f"log({self.expr(node.args[0])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr == "log2"
-                and len(node.args) == 1
-            ):
-                return f"log2({self.expr(node.args[0])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr == "log10"
-                and len(node.args) == 1
-            ):
-                return f"(log({self.expr(node.args[0])}) / log(10.0_dp))"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr == "exp"
-                and len(node.args) == 1
-            ):
-                return f"exp({self.expr(node.args[0])})"
+                a0 = self.expr(node.args[0])
+                # NumPy promotes integer arguments; Fortran EXP/LOG require
+                # real or complex arguments. Preserve complex components and
+                # use the common conversion for logical inputs as well.
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = self._coerce_expr_kind(node.args[0], a0, "real")
+                if node.func.attr == "log10":
+                    return f"(log({a0}) / log(10.0_dp))"
+                return f"{node.func.attr}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -71646,6 +71646,11 @@ def transpile_file(
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     tree = normalize_scipy_submodule_attribute_calls(tree)
     tree = normalize_scipy_signal_submodule_access(tree)
+    # Check before tuple lowering and result-kind/rank inference: multi-input
+    # calls return multiple arrays, not the first input's kind and rank.
+    for node in ast.walk(tree):
+        validate_numpy_atleast_call(node)
+    tree = specialize_singleton_returns(tree)
     translator.global_synthetic_slices = {}
     translator.global_synthetic_slice_meta = {}
     translator.global_rng_vars = set()

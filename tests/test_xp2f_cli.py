@@ -3981,8 +3981,10 @@ def test_xp2f_rejects_runtime_dependent_array_element_return(tmp_path: Path, gua
         f"    if {guard}:",
         "        y = y[0]",
         "    return y",
-        "print(evaluate(np.array([1.5, 2.5])))",
-        "print(evaluate(np.array([1.5])))",
+        "def forward(values):",
+        "    return evaluate(values)",
+        "print(forward(np.array([1.5, 2.5])))",
+        "print(forward(np.array([1.5])))",
         "",
     ]), encoding="utf-8")
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
@@ -4003,6 +4005,141 @@ def test_conditional_element_return_guard_is_narrow(body: str, rank: int) -> Non
     fn = ast.parse("def f(y, n):\n" + "\n".join("    " + line for line in body.splitlines())).body[0]
     tr = SimpleNamespace(_rank_expr=lambda node: rank)
     xp2f._check_conditional_element_return(fn, tr)
+
+
+@pytest.mark.parametrize("keyword", [False, True])
+def test_xp2f_specializes_singleton_unwrapping_calls(tmp_path: Path, keyword: bool) -> None:
+    def call(value):
+        return f"evaluate(x={value})" if keyword else f"evaluate({value})"
+    _run_xp2f_compile_diff(tmp_path, "xknown_size_return.py", [
+        "import numpy as np",
+        "def evaluate(x):",
+        "    # real X(N), the evaluation points.",
+        "    x = np.atleast_1d(x)",
+        "    n = x.shape[0]",
+        "    y = 2.0 * x + 0.25",
+        "    if n == 1:",
+        "        y = y[0]",
+        "    return y",
+        f"print({call('1.5')})",
+        f"print({call('np.array([1.5])')})",
+        f"empty = {call('np.array([], dtype=float)')}",
+        "print(empty.size)",
+        f"many = {call('np.array([1.5, 2.5])')}",
+        "print(many[0], many[1])",
+        "n = 3",
+        "points = np.linspace(0.0, 1.0, n)",
+        f"many = {call('points')}",
+        "print(many[0], many[1], many[2])",
+        "for i in range(3):",
+        "    point = i / 2.0",
+        f"    print({call('point')})",
+    ])
+
+
+@pytest.mark.parametrize("minimum_rank", [1, 2, 3])
+@pytest.mark.parametrize("form", ["assignment", "print", "unpack", "import_alias", "starred", "empty", "keyword"])
+def test_xp2f_rejects_non_single_input_atleast_calls(tmp_path: Path, minimum_rank: int, form: str) -> None:
+    name = f"atleast_{minimum_rank}d"
+    lines = ["import numpy as np", "a = np.array([1.0, 2.0])", "b = np.array([3.0])"]
+    if form == "import_alias":
+        lines += [f"from numpy import {name} as promote", "result = promote(a, b)"]
+    elif form == "print":
+        lines += [f"print(np.{name}(a, b))"]
+    elif form == "unpack":
+        lines += [f"left, right = np.{name}(a, b)", "print(left, right)"]
+    else:
+        arguments = {"assignment": "a, b", "starred": "*[a, b]", "empty": "", "keyword": "a, ignored=b"}[form]
+        lines += [f"result = np.{name}({arguments})", "print(result)"]
+    src = tmp_path / "xinvalid_atleast.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert f"np.{name} supports exactly one positional input" in proc.stdout, proc.stdout + proc.stderr
+    assert "use separate single-input calls" in proc.stdout
+    assert not (tmp_path / "xinvalid_atleast_p.f90").exists()
+
+
+@pytest.mark.parametrize("minimum_rank", [1, 2, 3])
+@pytest.mark.parametrize("dtype", ["int", "float"])
+def test_xp2f_atleast_single_input_shapes_and_values(tmp_path: Path, minimum_rank: int, dtype: str) -> None:
+    name = f"atleast_{minimum_rank}d"
+    offset = " + 0.25" if dtype == "float" else ""
+    cases = [
+        ("-2.5" if dtype == "float" else "-2", 0),
+        (f"np.arange(3, dtype={dtype}){offset}", 1),
+        (f"np.arange(6, dtype={dtype}).reshape(2, 3){offset}", 2),
+        (f"np.arange(24, dtype={dtype}).reshape(2, 3, 4){offset}", 3),
+        (f"np.array([], dtype={dtype})", 1),
+        (f"np.zeros((0, 3), dtype={dtype})", 2),
+        (f"np.zeros((2, 0), dtype={dtype})", 2),
+        (f"np.zeros((2, 0, 3), dtype={dtype})", 3),
+    ]
+    lines = ["import numpy as np"]
+    for case, (value, rank) in enumerate(cases):
+        result_rank = max(rank, minimum_rank)
+        a, b = f"a{case}", f"b{case}"
+        lines += [f"{a} = {value}", f"{b} = np.{name}({a})", f"print({b}.ndim, {b}.size)"]
+        lines += [f"print({b}.shape[{axis}])" for axis in range(result_rank)]
+        for axis in range(result_rank):
+            lines += ["    " * axis + f"for i{axis} in range({b}.shape[{axis}]):"]
+        indices = ", ".join(f"i{axis}" for axis in range(result_rank))
+        lines += ["    " * result_rank + f"print({b}[{indices}])"]
+    _run_xp2f_compile_diff(tmp_path, "xatleast_shapes.py", lines)
+
+
+@pytest.mark.parametrize("dtype", ["int", "float", "complex"])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_xp2f_numpy_transcendentals_preserve_promoted_inputs(tmp_path: Path, dtype: str, rank: int) -> None:
+    functions = ["exp", "log", "sqrt", "sin", "cos", "tan", "arcsin", "arccos",
+                 "arctan", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"]
+    if dtype != "complex":
+        functions += ["log2", "log10"]
+    lines = ["import numpy as np"]
+    for number, fn in enumerate(functions):
+        values = [1, 2, 3, 4]
+        if fn in {"arcsin", "arccos"}:
+            values = [-1, 0, 1, 0]
+        elif fn == "arctanh":
+            values = [0, 0, 0, 0]
+        if dtype == "float":
+            values = ([0.25, -0.5, 0.75, 0.0] if fn in {"arcsin", "arccos", "arctanh"}
+                      else [1.25, 2.5, 3.75, 4.0])
+        elif dtype == "complex":
+            values = [1.25 + 0.5j, 2.0 - 0.25j, 0.5 + 0.75j, 1.5 - 0.5j]
+        a, b = f"arg{number}", f"result{number}"
+        if rank == 0:
+            lines += [f"{a} = {values[0]!r}"]
+        elif rank == 1:
+            lines += [f"{a} = np.array({values!r}, dtype={dtype})"]
+        else:
+            lines += [f"{a} = np.array({[values[:2], values[2:]]!r}, dtype={dtype})"]
+        lines += [f"{b} = np.{fn}({a})"]
+        if rank:
+            lines += [f"print({b}.ndim, {b}.size)"]
+            for axis in range(rank):
+                lines += ["    " * axis + f"for i{axis} in range({b}.shape[{axis}]):"]
+        access = b if not rank else b + "[" + ", ".join(f"i{axis}" for axis in range(rank)) + "]"
+        output = f"np.real({access}), np.imag({access})" if dtype == "complex" else access
+        lines += ["    " * rank + f"print({output})"]
+    _run_xp2f_compile_diff(tmp_path, "xpromoted_math.py", lines)
+
+
+def test_xp2f_numpy_exp_integer_expression_and_import_alias(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xinteger_exp.py", [
+        "import numpy as np",
+        "from numpy import exp as exponential",
+        "def evaluate(n):",
+        "    x = n + 1",
+        "    return np.exp(x)",
+        "print(evaluate(4))",
+        "print(exponential(2 + 1))",
+        "a = np.array([0, 1, 2], dtype=int)",
+        "b = exponential(a)",
+        "for i in range(3):",
+        "    print(b[i])",
+    ])
 
 
 @pytest.mark.parametrize("call_wrapper", [False, True])

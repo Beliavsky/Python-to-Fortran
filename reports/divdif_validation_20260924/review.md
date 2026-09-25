@@ -94,3 +94,89 @@ required global setup; those 4 test-setup failures were corrected by using
 a minimal rank-query stub and all 4 passed on rerun. Reruns were disabled
 in pytest. The adapted evaluator and original kernels report `Run diff:
 MATCH`. Full pytest is the next checkpoint.
+
+## Bounded singleton-result specialization
+
+The unchanged `dif_value` is now supported when the caller's input is provably
+a scalar or a vector of known length. A conservative AST prepass creates
+separate scalar-input, singleton-vector-input, and other-vector-input entry
+points as needed. It replaces the terminal length-dependent unwrapping with
+the appropriate fixed-rank return. The incoming argument and the normalized
+local vector have distinct names, so scalar input does not acquire the rank
+from the original vector comment or from `np.atleast_1d`.
+
+This is not general support for runtime-dependent return ranks. Unknown
+lengths keep the original entry point and its diagnostic. The prepass does
+not propagate vector-size assumptions across aliases, unknown calls, shape
+mutations, or control-flow joins. Recognition is limited to the terminal
+`if n == 1: y = y[0]` idiom, where `n` is derived from the normalized input.
+It does not specialize arbitrary conditions or infer shapes through wrappers.
+
+All seven calls in the full original source are statically classified: six
+scalar calls and one call with an 11-element `linspace` vector. No edits to
+the original Python source are required. The checker now also includes the
+unchanged `dif_value`, comparing empty, singleton, three-element-vector and
+scalar calls against Python and independently specified polynomial values.
+This check passes with `Run diff: MATCH`; the previously adapted API remains
+an additional check, not the evidence for the new support.
+
+The full-source retry now reaches a different compiler error in
+`dif_append_test`: original lines 827-828 set `xval = ntab + 1` and then call
+`np.exp(xval)`. The generated `exp(xval)` passes an integer to a Fortran
+intrinsic requiring real or complex. The full program has therefore **not**
+yet compiled or had its Fortran execution validated. Integer-to-real
+promotion for NumPy transcendental functions is the next blocker to examine.
+
+Reproduce the bounded numerical check with:
+
+```
+python reports\divdif_validation_20260924\check.py
+```
+
+Add `--full` to retry the original full program; this intentionally fails
+until its remaining blocker is fixed and saves the details in `full.log`.
+
+Validation: 18 focused CLI regressions passed (new positional/keyword calls,
+unknown-length diagnostics, joint rank signatures, documented vector
+forwarding, and rank rebinding). The final specialization unit suite passed
+all 22 cases, including evaluation order, alias/shape invalidation, dtype
+restrictions, partial specialization, definition order, and Boolean
+indexing. Reruns were disabled. The updated numerical checker passed again
+after the conservative call-site checks were tightened. Run full pytest
+before proceeding to the next transpiler fix.
+
+## Integer-input transcendental promotion
+
+Fixed the next compilation blocker: `np.exp(xval)` now converts integer
+`xval` to `real(kind=dp)` before calling the Fortran intrinsic. The same
+missing conversion affected `np.log`, `np.log2`, and `np.log10`, and was
+fixed in their shared lowering. Existing real and complex arguments are
+not coerced to real. Rank inference now explicitly preserves the input
+rank for `log2` and `log10` as well.
+
+Validation: 10 new CLI cases cover integer/real/complex scalars, vectors,
+and matrices, plus integer expressions and an imported `exp` alias. The
+complex cases cover `exp`, natural `log`, `sqrt`, and the trigonometric and
+hyperbolic functions, not complex `log2`/`log10`. The existing NumPy math
+smoke test also passes. The first integer-vector case exposed the missing
+`log2` rank propagation; after the rank fix that case passed on a separate
+rerun with automatic reruns disabled. All 11 distinct cases passed.
+
+The unchanged full `divdif.py` now reports **Build: PASS** and **Run: PASS**
+with runtime checking enabled. Its default comparison reports a version
+banner difference first (`python version: 3.13.3` versus `unknown`). The
+additional full-output audit in `check.py` filters only version banners,
+timestamp lines, blank lines, and whitespace differences before checking
+text and numbers (rtol 1e-5, atol 1e-10).
+
+That audit reveals a genuine remaining presentation bug at normalized
+line 62, in `data_to_dif_display`: Python prints separate `%14f` fields,
+whereas Fortran emits `write(*,"(g0)", advance='no')` and concatenates
+values such as `1.00000000000000002.0000000000000000...`. The audit rejects
+this rather than guessing the numeric boundaries. Thus the complete
+program's numerical output has **not** yet been certified as matching.
+The independently checked interpolation kernels still pass their known
+values and `Run diff: MATCH` checks. Preserving `%f` field widths with
+`end=''` is the next concrete issue to fix; it is separate from the
+integer-input promotion fixed here. `check.py --full` intentionally
+continues to fail until that output mismatch is resolved.

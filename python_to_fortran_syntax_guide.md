@@ -150,6 +150,25 @@ a = reshape([1, 4, 2, 5, 3, 6], [2, 3])
 
 The logical rows match even though the constructor lists elements in a different order. Python `reshape`, `ravel`, transpose, and their `order=` choices must preserve element ordering, not just the final shape. `xp2f.py` may use temporaries or explicit transformations; not every NumPy layout/view operation is supported.
 
+### Promoting Array Rank
+
+Single-input `np.atleast_1d`, `np.atleast_2d`, and `np.atleast_3d` calls are
+translated using array constructors or `reshape` when promotion is needed.
+Inputs already having the requested rank or higher retain their shape.
+
+| Input shape | `atleast_1d` | `atleast_2d` | `atleast_3d` |
+|---|---|---|---|
+| Scalar | `(1,)` | `(1, 1)` | `(1, 1, 1)` |
+| `(n,)` | `(n,)` | `(1, n)` | `(1, n, 1)` |
+| `(m, n)` | `(m, n)` | `(m, n)` | `(m, n, 1)` |
+
+These shape rules also apply to zero-length dimensions. Multiple-input calls
+such as `np.atleast_2d(a, b)` are not supported and produce a diagnostic;
+write separate calls, for example `a2 = np.atleast_2d(a)` and
+`b2 = np.atleast_2d(b)`. Starred arguments and keyword arguments are also
+rejected. Shape/value support does not imply general NumPy view-sharing
+semantics, nor general support for functions with runtime-dependent result rank.
+
 ## Array Arithmetic, Broadcasting, and Masks
 
 For conforming numeric arrays, `a + b` and `a * b` are elementwise operations in both NumPy and Fortran. A scalar can participate in a Fortran array expression. NumPy's more general broadcasting, however, is not implicit in Fortran: adding a length-`m` vector to each row of an `n`-by-`m` matrix may require `spread(vector, dim=1, ncopies=n)` or loops.
