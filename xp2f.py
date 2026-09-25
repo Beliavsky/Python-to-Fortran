@@ -25947,7 +25947,8 @@ class translator(ast.NodeVisitor):
             return self._extent_expr(node.orelse)
         if isinstance(node, ast.Subscript):
             if self._expr_kind(node.value) == "char" and self._rank_expr(node.value) == 0:
-                return "char"
+                # A character or substring has a length, not an array extent.
+                return None
             if (
                 isinstance(node.value, ast.Attribute)
                 and isinstance(node.value.value, ast.Name)
@@ -66130,6 +66131,22 @@ def generate_flat(
                 continue
             _ck, _cr = _comment_arg_spec_hint_for_fn(fn, _arg_nm)
             _seen_ranks = {int(_r) for _r in _rank_sets[_i]}
+            # Indexing a caller-observed scalar string selects a character,
+            # not an array element. Body-only rank inference cannot distinguish
+            # these operations. Do not apply this override to string arrays or
+            # parameters that are rebound to another value inside the function.
+            if (
+                _seen_ranks == {0}
+                and _i < len(hint_kinds) and hint_kinds[_i] == "char"
+                and not any(
+                    isinstance(_node, ast.Name) and _node.id == _arg_nm
+                    and isinstance(_node.ctx, ast.Store)
+                    for _node in ast.walk(fn)
+                )
+            ):
+                local_func_arg_ranks[fn.name][_i] = 0
+                base_func_arg_ranks[fn.name][_i] = 0
+                _force_scalar_args.add(_arg_nm)
             if (
                 _cr is not None
                 and int(_cr) > 0

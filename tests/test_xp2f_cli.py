@@ -3794,6 +3794,78 @@ def test_xp2f_postprocess_removes_unused_print_matrix_import(tmp_path: Path) -> 
     assert "use python_mod, only: print_matrix" not in out_text
 
 
+@pytest.mark.parametrize("optional", [False, True])
+def test_xp2f_indexed_string_argument_and_local_stay_scalar(tmp_path: Path, optional: bool) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xstring_head.py", [
+        "def head(text" + ("=None" if optional else "") + "):",
+        "    if text is None:" if optional else "    if text == '':",
+        "        first = 'z'",
+        "    else:",
+        "        first = text[0]",
+        "        first = first.lower()",
+        "    return first",
+        "def tail(text):",
+        "    result = text[1:]",
+        "    return result",
+        "print(head('Alpha'))",
+        "print(head(text='Beta'))",
+        "print(tail('Gamma'))",
+    ] + (["print(head())", "print(head(None))"] if optional else []))
+    generated = (tmp_path / "xstring_head_p.f90").read_text(encoding="utf-8")
+    assert ":: text(:)" not in generated
+    assert ":: first(:)" not in generated
+
+
+def test_xp2f_indexed_string_array_argument_stays_array(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xstring_array_head.py", [
+        "import numpy as np",
+        "def head(words):",
+        "    first = words[0]",
+        "    return first",
+        "print(head(np.array(['Alpha', 'Beta'], dtype='U5')))",
+    ])
+    generated = (tmp_path / "xstring_array_head_p.f90").read_text(encoding="utf-8")
+    assert ":: words(:)" in generated
+
+
+def test_xp2f_optional_string_selector_preserves_named_state(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xnamed_state.py", [
+        "def store(action=None, name=None, value=None):",
+        "    if not hasattr(store, 'alpha'):",
+        "        store.alpha = 1.0",
+        "    if not hasattr(store, 'beta'):",
+        "        store.beta = 2.0",
+        "    if action is None:",
+        "        op = 'g'",
+        "    else:",
+        "        op = action[0]",
+        "        op = op.lower()",
+        "    if name is None:",
+        "        key = 'a'",
+        "    else:",
+        "        key = name[0]",
+        "        key = key.lower()",
+        "    if op == 's' and value is not None:",
+        "        if key == 'a':",
+        "            store.alpha = value",
+        "        else:",
+        "            store.beta = value",
+        "    if op == 'r':",
+        "        store.alpha = 1.0",
+        "        store.beta = 2.0",
+        "    if key == 'a':",
+        "        return store.alpha",
+        "    return store.beta",
+        "print(store())",
+        "print(store('SET', 'Beta', -2.5))",
+        "print(store('get', 'BETA'))",
+        "print(store('set', 'Alpha', 0.0))",
+        "print(store(None, None, None))",
+        "print(store('reset'))",
+        "print(store(action='get', name='Beta'))",
+    ])
+
+
 def test_xp2f_keeps_string_arg_scalar_when_indexed_for_ord(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xord_arg_small.py"
