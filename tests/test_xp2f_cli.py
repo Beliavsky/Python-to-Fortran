@@ -3967,6 +3967,44 @@ def test_xp2f_boolean_option_default_keeps_logical_comment(tmp_path: Path) -> No
     assert "logical, intent(in), optional :: flag" in generated
 
 
+@pytest.mark.parametrize("comparison", ["j == None", "None == j", "j != None", "None != j"])
+def test_xp2f_optional_scalar_none_equality_uses_presence(tmp_path: Path, comparison: str) -> None:
+    missing = "!=" not in comparison
+    _run_xp2f_compile_diff(tmp_path, "xoptional_equality.py", [
+        "def choose(i, j=None):",
+        f"    if {comparison}:",
+        "        j = i" if missing else "        return j",
+        "    return j" if missing else "    return i",
+        "print(choose(7))",
+        "print(choose(8, None))",
+        "print(choose(9, j=None))",
+        "print(choose(7, 0))",
+        "print(choose(7, -1))",
+        "print(choose(7, j=2))",
+    ])
+    generated = (tmp_path / "xoptional_equality_p.f90").read_text(encoding="utf-8")
+    assert "present(j)" in generated
+    assert "j_opt == -1" not in generated
+    assert "j_opt /= -1" not in generated
+
+
+def test_xp2f_optional_none_equality_keeps_falsey_scalars_present(tmp_path: Path) -> None:
+    lines = []
+    for name, value in [("real_value", "0.0"), ("complex_value", "0j"),
+                        ("logical_value", "False"), ("string_value", "''")]:
+        lines += [
+            f"def {name}(value=None):",
+            "    if value == None:",
+            "        return 0",
+            "    return 1",
+            f"print({name}())",
+            f"print({name}(None))",
+            f"print({name}(value=None))",
+            f"print({name}({value}))",
+        ]
+    _run_xp2f_compile_diff(tmp_path, "xfalsey_optional.py", lines)
+
+
 def test_xp2f_keeps_string_arg_scalar_when_indexed_for_ord(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xord_arg_small.py"

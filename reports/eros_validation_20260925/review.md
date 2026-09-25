@@ -52,3 +52,42 @@ That separate equality/None issue remains unfixed in this patch.
 
 All four focused pytest cases passed with reruns disabled; `git diff --check`
 passed. Full pytest was left for the user's overnight checkpoint.
+
+## Follow-up: scalar optional equality with None
+
+The equality/None blocker above is now fixed. For supported scalar optional
+arguments, both operand orders of `== None` / `!= None` use Fortran presence
+tests. This is deliberately not applied to array equality, which is
+elementwise in NumPy, or to user-defined equality. Explicit None keyword
+literal actuals are now omitted when the formal has
+a None default, matching the existing positional omission behavior.
+
+The full unchanged source now builds and executes with runtime checks and RNG
+replay. Both Gaussian solve test sections match Python: 71 and 92 numeric
+tokens, respectively, using rtol 1e-6 and atol 1e-8.
+
+**Numerical agreement for the whole program is not established.** Its two
+full numeric streams have 584 tokens, but contain significant mismatches.
+The first deterministic 3x3 PLU example reports residual norm
+20.846162716432968 in Python versus 16.156703330197036 in Fortran, with different
+P/L/U matrices. Python's displayed P itself contains duplicate rows, so it
+is not a valid permutation matrix. The source uses NumPy slice views as swap
+temporaries (`T = P[j,:]`) and also uses an integer matrix in this example;
+those semantics deserve separate investigation before changing either source
+or generated code. Random ill-conditioned inverse tests also differ.
+
+`check.py --check-log` reproduces the comparison from saved output. The checker
+now returns failure for the remaining numerical discrepancies even though
+compilation/execution pass. This is a run-time recovery, not a claim of full
+correctness. No original corpus source was modified.
+
+Scope note: a supplemental probe using a separate `absent = None` variable
+also exposed an undeclared local-sentinel assignment. That local-None storage
+case is deferred; the new omission handling and regression cases cover literal
+None actuals, not arbitrary variables whose runtime value may be None.
+
+Final focused validation: six pytest cases passed with reruns disabled,
+covering both operand orders of equality/inequality, omitted and positional/
+keyword literal None, legitimate 0/-1 values, falsey real/complex/logical/string
+scalars, and the existing optional-string persistent-state case. Full pytest
+was not run.

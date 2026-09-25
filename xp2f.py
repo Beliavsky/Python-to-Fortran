@@ -31805,6 +31805,18 @@ class translator(ast.NodeVisitor):
                     parts.append(f"({self.expr(pair)})")
                 return "(" + " .and. ".join(parts) + ")"
             op = type(node.ops[0])
+            if op in {ast.Eq, ast.NotEq}:
+                # For supported scalar optional values, equality with None
+                # tests absence, not the numeric sentinel used for some locals.
+                # Do not apply this to arrays: NumPy equality is elementwise,
+                # unlike `is None`.
+                other = (node.comparators[0] if is_none(node.left)
+                         else node.left if is_none(node.comparators[0]) else None)
+                if (isinstance(other, ast.Name) and other.id in self.optional_dummy_args
+                        and self._rank_expr(other) == 0
+                        and self._expr_kind(other) in {"int", "real", "complex", "logical", "char"}):
+                    present = f"present({other.id})"
+                    return f"(.not. {present})" if op is ast.Eq else present
             if op is ast.Is or op is ast.IsNot:
                 a = node.left
                 b = node.comparators[0]
@@ -34733,6 +34745,14 @@ class translator(ast.NodeVisitor):
                                 raise NotImplementedError(
                                     f"unsupported call shape for local function '{callee}': missing non-trailing argument '{names[i] if i < len(names) else i}'"
                                 )
+                        if (
+                            names and getattr(node, "keywords", [])
+                            and i < len(dfl) and is_none(dfl[i])
+                            and is_none(a)
+                        ):
+                            # Explicit keyword None has the same absence
+                            # semantics as an omitted None-defaulted argument.
+                            continue
                         ae = self.expr(a)
                         if node.func.id not in self.local_generic_overloads:
                             ae = self._coerce_local_actual_kind(node.func.id, i, a, ae)
