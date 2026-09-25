@@ -19753,6 +19753,260 @@ def specialize_lambda_function_args(exec_body, local_funcs):
         local_funcs.extend(specialized)
 
 
+def rewrite_literal_string_sequence_lengths(tree):
+    """Preserve lengths for literal-defined, read-only Python string sequences.
+
+    Keep ordinary character arrays for storage and a parallel integer array
+    for the significant lengths (including spaces). Materialized iteration
+    snapshots both arrays; element reads use one evaluated Python index.
+    """
+    occupied = {n.id.lower() for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    occupied.update(n.name.lower() for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    occupied.update(n.arg.lower() for n in ast.walk(tree) if isinstance(n, ast.arg))
+    used = False
+
+    def fresh(base):
+        while base.lower() in occupied:
+            base += "_"
+        occupied.add(base.lower())
+        return base
+
+    getter = fresh("xp2f_string_item")
+
+    def name(n, store=False):
+        return ast.Name(id=n, ctx=ast.Store() if store else ast.Load())
+
+    def assign(n, value):
+        return ast.Assign(targets=[name(n, True)], value=value)
+
+    def item_call(data, sizes, index):
+        # Preserve scalar-character evidence through the existing caller
+        # signature inference, including calls nested in another call.
+        return ast.Call(func=name("str"), args=[ast.Call(func=name(getter),
+                        args=[data, sizes, index], keywords=[])], keywords=[])
+
+    def literal(n):
+        return isinstance(n, (ast.List, ast.Tuple)) and bool(n.elts) and all(is_const_str(e) for e in n.elts)
+
+    def padded_literal(n):
+        return literal(n) and len({len(e.value) for e in n.elts}) > 1
+
+    def fail(node, detail):
+        raise NotImplementedError(
+            f"unsupported length-tracked string sequence at line {getattr(node, 'lineno', '?')}: "
+            f"{detail}; use scalar strings or a read-only literal string sequence")
+
+    def scope(body, inherited=None, args=()):
+        nonlocal used
+        nodes = [n for st in body if not isinstance(st, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef))
+                 for n in ast.walk(st)]
+        for node in nodes:
+            if isinstance(node, (ast.Global, ast.Nonlocal)) and set(node.names) & set(inherited or {}):
+                fail(node, "global/nonlocal rebinding of a tracked sequence")
+        local_names = {n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | set(args)
+        lengths = {k: v for k, v in (inherited or {}).items() if k not in local_names}
+        assignments = [n for n in nodes if isinstance(n, ast.Assign)]
+        for st in assignments:
+            if len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and padded_literal(st.value):
+                lengths.setdefault(st.targets[0].id, fresh(st.targets[0].id + "_lengths"))
+
+        def length_expr(expr):
+            if literal(expr):
+                return ast.List(elts=[ast.Constant(len(e.value)) for e in expr.elts], ctx=ast.Load())
+            if isinstance(expr, ast.Name) and expr.id in lengths:
+                return name(lengths[expr.id])
+            if isinstance(expr, ast.Subscript) and isinstance(expr.slice, ast.Slice):
+                base = length_expr(expr.value)
+                if base is not None:
+                    if any(isinstance(n, (ast.Call, ast.NamedExpr, ast.Await)) for n in ast.walk(expr.slice)):
+                        fail(expr, "side-effecting slice bounds")
+                    return ast.Subscript(value=base, slice=copy.deepcopy(expr.slice), ctx=ast.Load())
+            return None
+
+        for _ in range(len(assignments) + 1):
+            count = len(lengths)
+            for st in assignments:
+                if (len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                        and st.targets[0].id not in lengths and not literal(st.value) and length_expr(st.value) is not None):
+                    lengths[st.targets[0].id] = fresh(st.targets[0].id + "_lengths")
+            if len(lengths) == count:
+                break
+        # Only opt in sequences whose elements are consumed here. Other
+        # uses (e.g. static DataFrame column labels) keep their existing path.
+        active = set()
+        for st in body:
+            for node in ast.walk(st):
+                value = (node.value if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice)
+                         else node.iter if isinstance(node, ast.For) else None)
+                if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "enumerate" and value.args:
+                    value = value.args[0]
+                while isinstance(value, ast.Subscript):
+                    value = value.value
+                if isinstance(value, ast.Name) and value.id in lengths:
+                    active.add(value.id)
+        for _ in range(len(assignments) + 1):
+            before = set(active)
+            for st in assignments:
+                if len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                    names = {n.id for n in ast.walk(st.value) if isinstance(n, ast.Name) and n.id in lengths}
+                    target = st.targets[0].id
+                    if target in lengths and (target in active or names & active):
+                        active.add(target)
+                        active.update(names)
+            if active == before:
+                break
+        lengths = {k: v for k, v in lengths.items() if k in active or k in (inherited or {})}
+
+        def tracked(expr):
+            return any(isinstance(n, ast.Name) and n.id in lengths for n in ast.walk(expr))
+
+        class Rewrite(ast.NodeTransformer):
+            def visit_FunctionDef(self, node):
+                node.body = scope(node.body, lengths, [a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg)])
+                return node
+
+            def visit_ClassDef(self, node):
+                if tracked(node):
+                    fail(node, "captured string sequences in classes")
+                return node
+
+            def visit_Assign(self, node):
+                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in lengths:
+                    sizes = length_expr(node.value)
+                    if sizes is None:
+                        fail(node, "reassignment from an untracked source")
+                    # The sequences are read-only, so snapshot copies preserve
+                    # alias behavior even if the original name is rebound.
+                    # Avoid the generic name-alias optimization here.
+                    if isinstance(node.value, ast.Name):
+                        node.value = ast.Subscript(value=node.value, slice=ast.Slice(), ctx=ast.Load())
+                    if isinstance(sizes, ast.Name):
+                        sizes = ast.Subscript(value=sizes, slice=ast.Slice(), ctx=ast.Load())
+                    return [node, ast.copy_location(assign(lengths[node.targets[0].id], sizes), node)]
+                if any(tracked(t) for t in node.targets):
+                    fail(node, "element mutation or unpacking")
+                return self.generic_visit(node)
+
+            def visit_AugAssign(self, node):
+                if tracked(node.target):
+                    fail(node, "in-place mutation")
+                return self.generic_visit(node)
+
+            def visit_Delete(self, node):
+                if tracked(node):
+                    fail(node, "deletion")
+                return self.generic_visit(node)
+
+            def visit_Subscript(self, node):
+                nonlocal used
+                sizes = length_expr(node.value)
+                if literal(node.value) and not padded_literal(node.value):
+                    sizes = None
+                if sizes is not None and not isinstance(node.slice, ast.Slice):
+                    if not isinstance(node.ctx, ast.Load):
+                        fail(node, "element mutation")
+                    used = True
+                    return ast.copy_location(item_call(node.value, sizes, self.visit(node.slice)), node)
+                return self.generic_visit(node)
+
+            def visit_Call(self, node):
+                if (isinstance(node.func, ast.Attribute) and not literal(node.func.value)
+                        and length_expr(node.func.value) is not None):
+                    fail(node, "sequence methods or mutation")
+                # Scalar elements are lowered before checking for escaping
+                # sequences, so f(items[i]) works without a changed API.
+                node = self.generic_visit(node)
+                seq_args = [a for a in node.args if not literal(a) and length_expr(a) is not None]
+                seq_args += [k.value for k in node.keywords if not literal(k.value) and length_expr(k.value) is not None]
+                if seq_args and isinstance(node.func, ast.Name) and node.func.id not in {"len", getter}:
+                    fail(node, "passing or printing a whole string sequence")
+                return node
+
+            def visit_Return(self, node):
+                if node.value is not None and not literal(node.value) and length_expr(node.value) is not None:
+                    fail(node, "returning a whole string sequence")
+                return self.generic_visit(node)
+
+            def visit_For(self, node):
+                nonlocal used
+                sequence = node.iter
+                start = None
+                enum = isinstance(sequence, ast.Call) and isinstance(sequence.func, ast.Name) and sequence.func.id == "enumerate"
+                if enum and sequence.args:
+                    call = sequence
+                    if len(call.args) not in {1, 2} or any(k.arg != "start" for k in call.keywords):
+                        fail(node, "unsupported enumerate arguments")
+                    sequence = call.args[0]
+                    start = call.args[1] if len(call.args) == 2 else ast.Constant(0)
+                    for kw in call.keywords:
+                        if kw.arg == "start":
+                            start = kw.value
+                sizes = length_expr(sequence)
+                if literal(sequence) and not padded_literal(sequence):
+                    sizes = None
+                if sizes is None:
+                    return self.generic_visit(node)
+                if enum:
+                    if not (isinstance(node.target, (ast.Tuple, ast.List)) and len(node.target.elts) == 2
+                            and all(isinstance(t, ast.Name) for t in node.target.elts)):
+                        fail(node, "enumerate target must be two names")
+                    index_target, target = node.target.elts
+                else:
+                    if not isinstance(node.target, ast.Name):
+                        fail(node, "loop target must be a name")
+                    target = node.target
+                if target.id in lengths:
+                    fail(node, "sequence name reused as its element target")
+                used = True
+                data_tmp, len_tmp, index = fresh("string_iter"), fresh("string_lengths"), fresh("string_index")
+                if isinstance(sequence, ast.Name):
+                    sequence = ast.Subscript(value=sequence, slice=ast.Slice(), ctx=ast.Load())
+                if isinstance(sizes, ast.Name):
+                    sizes = ast.Subscript(value=sizes, slice=ast.Slice(), ctx=ast.Load())
+                before = [assign(data_tmp, sequence), assign(len_tmp, sizes)]
+                first = []
+                if enum:
+                    counter = fresh("string_counter")
+                    before.append(assign(counter, start))
+                    first.extend([assign(index_target.id, name(counter)),
+                                  ast.AugAssign(target=name(counter, True), op=ast.Add(), value=ast.Constant(1))])
+                first.append(assign(target.id, item_call(name(data_tmp), name(len_tmp), name(index))))
+                node.target = name(index, True)
+                node.iter = ast.Call(func=name("range"), args=[ast.Call(func=name("len"), args=[name(data_tmp)], keywords=[])], keywords=[])
+                node.body = first + rewrite_body(node.body)
+                node.orelse = rewrite_body(node.orelse)
+                return [ast.copy_location(st, node) for st in before] + [node]
+
+        def rewrite_body(stmts):
+            result = []
+            for st in stmts:
+                item = Rewrite().visit(st)
+                result.extend(item if isinstance(item, list) else [item])
+            return result
+        return rewrite_body(body)
+
+    tree.body = scope(tree.body)
+    if used:
+        for node in ast.walk(tree):
+            binding = (node.id if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                       else node.name if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+                       else node.arg if isinstance(node, ast.arg)
+                       else node.asname or node.name.split(".")[0] if isinstance(node, ast.alias) else None)
+            if binding in {"str", "int", "len", "range", "enumerate"}:
+                fail(node, f"shadowed builtin '{binding}'")
+        helper = ast.parse(f'''def {getter}(items, lengths, index: int) -> str:
+    position = int(index)
+    if position < 0:
+        position = len(items) + position
+    if position < 0 or position >= len(items):
+        raise IndexError('string sequence index out of range')
+    text = items[position]
+    return text[:lengths[position]]
+''').body[0]
+        tree.body.insert(0, helper)
+    return ast.fix_missing_locations(tree)
+
+
 def rewrite_nullable_string_results(tree):
     """Lower bounded string-or-None locals/results to (text, present).
 
@@ -72302,6 +72556,7 @@ def transpile_file(
         src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
     stem = Path(py_path).stem
     tree = ast.parse(src)
+    tree = rewrite_literal_string_sequence_lengths(tree)
     tree = rewrite_nullable_string_results(tree)
     nullable_string_results = getattr(tree, "_xp2f_nullable_string_results", False)
     tree = rewrite_integer_quotient_seed_divisions(tree)

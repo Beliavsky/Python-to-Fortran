@@ -74,4 +74,6 @@ A diagnostic driver iterating over a mixed-length literal string list exposed
 an independent fixed-width padding issue: a 10-character input acquired a
 trailing space. The validation therefore uses separate scalar calls instead
 of that list, and checks lengths/code points explicitly. The padding issue
-remains a candidate for a subsequent fix.
+was subsequently fixed for read-only literal-defined string lists/tuples;
+see [the string-length validation](../string_lengths_validation_20260925/review.md).
+That validation now exercises the original mixed-length list driver too.

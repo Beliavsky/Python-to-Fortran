@@ -32,6 +32,75 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+def test_xp2f_string_sequence_lengths_match_python(tmp_path: Path) -> None:
+    source = (REPO_ROOT / "reports" / "string_lengths_validation_20260925" / "probe.py").read_text(encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xstring_lengths.py", source.splitlines())
+    py = subprocess.run([sys.executable, str(tmp_path / "xstring_lengths.py")], capture_output=True, text=True, check=False)
+    ft = subprocess.run([str(tmp_path / "xstring_lengths_p.exe")], capture_output=True, text=True, check=False)
+    assert py.returncode == ft.returncode == 0
+    # Ignore only leading Fortran list-directed indentation, NOT spaces
+    # inside the delimiters (including the all-space element).
+    assert [s.strip() for s in py.stdout.splitlines()] == [s.strip() for s in ft.stdout.splitlines()]
+
+
+def test_xp2f_string_sequence_index_evaluated_once(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xstring_index_once.py", [
+        "def index():", "    print('INDEX')", "    return -1",
+        "values = ['x', 'yz  ']", "chosen = values[index()]", "print(len(chosen))",
+        "def get():", "    return values[0]",
+        "print(len(get()))",
+        "for i, s in enumerate(values, 5):",
+        "    if i == 5:", "        continue", "    print(i, len(s))",
+        "print(i, len(s))",
+    ])
+
+
+def test_xp2f_string_sequence_iteration_survives_rebinding(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xstring_snapshot.py", [
+        "values = ['a', 'bb']",
+        "for text in values:",
+        "    print(len(text))",
+        "    values = ['xxxx', '']",
+        "print(len(values[0]))",
+        "print(len(text))",
+    ])
+
+
+@pytest.mark.parametrize("tail", [
+    "values[0] = 'longer'", "values.append('z')", "values += ['z']",
+    "del values[0]", "alias = values\nalias[0] = 'z'",
+    "values = make_values()", "print(values)", "consume(values)",
+    "def mutate():\n    global values\n    values = ['z']\nmutate()",
+])
+def test_xp2f_string_sequence_unsupported_mutation_diagnosed(tail: str) -> None:
+    tree = ast.parse("values = ['x', 'yz ']\nprint(len(values[0]))\n" + tail)
+    with pytest.raises(NotImplementedError, match="unsupported length-tracked string sequence"):
+        xp2f.rewrite_literal_string_sequence_lengths(tree)
+
+
+@pytest.mark.parametrize("source", [
+    "values = ['x', 'y']\nfor s in values:\n    print(s)",
+    "columns = ['long_column', 'x']\nprint(columns)",
+    "def pair():\n    return 'long', 'x'\na, b = pair()",
+    "values = []\nfor i in range(2):\n    values.append(str(i))\nprint(values)",
+])
+def test_xp2f_string_sequence_unrelated_paths_unchanged(source: str) -> None:
+    tree = ast.parse(source)
+    before = ast.dump(tree)
+    assert ast.dump(xp2f.rewrite_literal_string_sequence_lengths(tree)) == before
+
+
+@pytest.mark.parametrize("index", [-3, 2])
+def test_xp2f_string_sequence_out_of_bounds(tmp_path: Path, index: int) -> None:
+    src = tmp_path / "xbad_string_index.py"
+    src.write_text(f"values = ['x', 'yz ']\ntext = values[{index}]\nprint(text)\n", encoding="utf-8")
+    run = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+                         cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert "Build: PASS" in run.stdout, run.stdout + run.stderr
+    assert "Run: FAIL" in run.stdout, run.stdout + run.stderr
+    assert "string sequence index out of range" in run.stdout + run.stderr
+
+
 def test_xp2f_nullable_string_results_preserve_presence(tmp_path: Path) -> None:
     source = (REPO_ROOT / "reports" / "filum_validation_20260925" / "probe.py").read_text(encoding="utf-8")
     _run_xp2f_compile_diff(tmp_path, "xnullable_string.py", source.splitlines())
