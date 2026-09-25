@@ -32,6 +32,84 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+@pytest.mark.parametrize("elements", ["[1, 2, 2, 3]", "['a', 'b', 'b', 'c']"])
+def test_xp2f_set_arguments_forwarded_through_local_calls(tmp_path: Path, elements: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xforward_sets.py", [
+        "def index(a, b):",
+        "    return len(a & b) / len(a | b)",
+        "def distance(a, b):",
+        "    return 1.0 - index(b=b, a=a)",
+        f"a = set({elements})",
+        f"b = set({ast.literal_eval(elements)[1:]!r})",
+        "print(distance(a, b))",
+        "print(distance(a, a))",
+    ])
+
+
+def test_xp2f_set_results_and_local_intermediates(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xreturned_sets.py", [
+        "def combine(a, b):",
+        "    u = a | b",
+        "    return u",
+        "def sizes(a, b):",
+        "    u = combine(a, b)",
+        "    print(len(u & a), len(u - a), len(a ^ b))",
+        "    print(len(a & b))",
+        "a = set([1, 2, 2])",
+        "b = set([3, 4])",
+        "sizes(a, b)",
+    ])
+
+
+def test_xp2f_set_analysis_preserves_boolean_array_operators(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xboolean_operators.py", [
+        "import numpy as np",
+        "def counts(a, b):",
+        "    both = a & b",
+        "    either = a | b",
+        "    print(both[0], both[1], either[0], either[1])",
+        "s = set([1, 2])",
+        "print(len(s))",
+        "counts(np.array([True, False]), np.array([True, True]))",
+    ])
+
+
+@pytest.mark.parametrize("source", [
+    "def f(a, b):\n    return a & b\nf(set([1]), set([2]))\nf([1], [2])\n",
+    "a = set([1])\nif flag:\n    a = [1]\nb = a & set([2])\n",
+])
+def test_xp2f_ambiguous_set_provenance_diagnosed(source: str) -> None:
+    tree = ast.parse(source)
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    with pytest.raises(NotImplementedError, match="ambiguous set operation"):
+        xp2f.annotate_local_set_provenance(tree.body, functions)
+
+
+def test_xp2f_set_provenance_tracks_defaults_returns_and_rebinding() -> None:
+    tree = ast.parse("\n".join([
+        "def outer(a):",
+        "    return middle(a)",
+        "def middle(a, b=set([2])):",
+        "    return a | b",
+        "x = outer(set([1]))",
+        "y = x & set([2])",
+        "x = [True]",
+        "z = x & [False]",
+    ]))
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    xp2f.annotate_local_set_provenance(tree.body, functions)
+    assert tree.body[-3].value._xp2f_set_provenance == {"set"}
+    assert tree.body[-1].value._xp2f_set_provenance == {"other"}
+    assert functions[1]._xp2f_set_args == {"a", "b"}
+    assert not xp2f.function_is_pure(functions[1])
+
+
+def test_xp2f_local_function_named_set_is_not_builtin_set() -> None:
+    tree = ast.parse("def set(a):\n    return a\nx = set([True])\ny = x & [False]\n")
+    xp2f.annotate_local_set_provenance(tree.body, [tree.body[0]])
+    assert tree.body[-1].value._xp2f_set_provenance == {"other"}
+
+
 def test_xp2f_string_sequence_lengths_match_python(tmp_path: Path) -> None:
     source = (REPO_ROOT / "reports" / "string_lengths_validation_20260925" / "probe.py").read_text(encoding="utf-8")
     _run_xp2f_compile_diff(tmp_path, "xstring_lengths.py", source.splitlines())

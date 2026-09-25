@@ -6987,6 +6987,14 @@ def function_is_pure(fn_node, known_pure_calls=None):
         def __init__(self):
             self.ok = True
 
+        def visit_BinOp(self, node):
+            # Set operators lower to non-PURE runtime helpers, unlike
+            # ordinary arithmetic and Boolean array operators.
+            if getattr(node, "_xp2f_set_provenance", None) == {"set"}:
+                self.ok = False
+                return
+            self.generic_visit(node)
+
         def visit_Raise(self, node):
             # Literal exception guards lower to ERROR STOP, which does not
             # require an impure procedure call.
@@ -19753,6 +19761,161 @@ def specialize_lambda_function_args(exec_body, local_funcs):
         local_funcs.extend(specialized)
 
 
+def annotate_local_set_provenance(body, local_funcs):
+    """Track set-vs-nonset provenance through local arguments and returns.
+
+    Element dtype/rank inference alone cannot distinguish a set from an
+    array. Use a small monotone call-graph analysis, with flow-sensitive
+    bindings and conservative branch/loop joins, before marking expressions.
+    """
+    funcs = {fn.name: fn for fn in local_funcs if isinstance(fn, ast.FunctionDef)}
+    if not any(isinstance(n, ast.Set) or (
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "set")
+            for st in list(body) + list(local_funcs) for n in ast.walk(st)):
+        return
+    arg_names = {key: [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs]
+                 for key, fn in funcs.items()}
+    incoming = {key: {arg: set() for arg in args} for key, args in arg_names.items()}
+    results = {key: set() for key in funcs}
+    SET, OTHER = frozenset({"set"}), frozenset({"other"})
+    marked = False
+
+    def merge(*envs):
+        return {name: frozenset().union(*(env.get(name, frozenset()) for env in envs))
+                for name in set().union(*(set(env) for env in envs))}
+
+    def expression(node, env):
+        if node is None:
+            return OTHER
+        if isinstance(node, ast.Name):
+            kind = env.get(node.id, frozenset())
+        elif isinstance(node, ast.Call):
+            actuals = [expression(a, env) for a in node.args]
+            keywords = {k.arg: expression(k.value, env) for k in node.keywords}
+            if isinstance(node.func, ast.Name) and node.func.id == "set" and "set" not in funcs:
+                kind = SET
+            elif isinstance(node.func, ast.Name) and node.func.id in funcs:
+                callee = node.func.id
+                params = arg_names[callee]
+                supplied = dict(zip(params, actuals))
+                supplied.update({k: v for k, v in keywords.items() if k in params})
+                fn = funcs[callee]
+                positional = fn.args.posonlyargs + fn.args.args
+                defaults = dict(zip([a.arg for a in positional[-len(fn.args.defaults):]], fn.args.defaults)) if fn.args.defaults else {}
+                defaults.update({a.arg: d for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults) if d is not None})
+                for arg in params:
+                    value = supplied[arg] if arg in supplied else (
+                        expression(defaults[arg], env) if arg in defaults else frozenset())
+                    incoming[callee][arg].update(value)
+                kind = frozenset(results[callee])
+            else:
+                # Visit the receiver too (e.g. an expression used in .copy()).
+                if isinstance(node.func, ast.Attribute):
+                    expression(node.func.value, env)
+                kind = OTHER
+        elif isinstance(node, ast.Set):
+            for elt in node.elts:
+                expression(elt, env)
+            kind = SET
+        elif isinstance(node, ast.IfExp):
+            expression(node.test, env)
+            kind = expression(node.body, env) | expression(node.orelse, env)
+        elif isinstance(node, ast.BinOp):
+            left, right = expression(node.left, env), expression(node.right, env)
+            if isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.Sub)):
+                if marked and ("set" in left or "set" in right) and (left != SET or right != SET):
+                    raise NotImplementedError(
+                        f"ambiguous set operation at line {getattr(node, 'lineno', '?')}: "
+                        "operands are not consistently sets across local calls or branches; "
+                        "use separate functions/variables for sets and arrays")
+                kind = (left | right) if left and right else frozenset()
+            else:
+                kind = OTHER
+        else:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.expr):
+                    expression(child, env)
+            kind = OTHER
+        if marked and kind:
+            node._xp2f_set_provenance = kind
+        return kind
+
+    def block(stmts, env, returned):
+        env = dict(env)
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                kind = expression(st.value, env)
+                targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        env[target.id] = kind
+                    else:
+                        expression(target, env)
+                        for n in ast.walk(target):
+                            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                                env[n.id] = frozenset()
+            elif isinstance(st, ast.If):
+                expression(st.test, env)
+                env = merge(block(st.body, env, returned), block(st.orelse, env, returned))
+            elif isinstance(st, (ast.For, ast.While)):
+                # Include zero iterations and loop-carried rebindings.
+                base = dict(env)
+                for _ in range(len(env) + 3):
+                    old = dict(env)
+                    if isinstance(st, ast.For):
+                        expression(st.iter, env)
+                        for n in ast.walk(st.target):
+                            if isinstance(n, ast.Name):
+                                env[n.id] = OTHER
+                    else:
+                        expression(st.test, env)
+                    env = merge(base, block(st.body, env, returned))
+                    if old == env:
+                        break
+                env = block(st.orelse, env, returned)
+            elif isinstance(st, ast.Return):
+                returned.update(expression(st.value, env))
+                break
+            elif isinstance(st, ast.AugAssign):
+                kind = expression(ast.copy_location(ast.BinOp(left=st.target, op=st.op, right=st.value), st), env)
+                if isinstance(st.target, ast.Name):
+                    env[st.target.id] = kind
+            else:
+                for field, value in ast.iter_fields(st):
+                    if isinstance(value, ast.expr):
+                        expression(value, env)
+                    elif isinstance(value, list):
+                        nested = [v for v in value if isinstance(v, ast.stmt)]
+                        if nested:
+                            env = merge(env, block(nested, env, returned))
+        return env
+
+    def scan():
+        globals_ = block(body, {}, set())
+        for key, fn in funcs.items():
+            bound = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+            env = {k: v for k, v in globals_.items() if k not in bound and k not in incoming[key]}
+            env.update({k: frozenset(v) for k, v in incoming[key].items()})
+            found = set()
+            block(fn.body, env, found)
+            results[key].update(found)
+            if marked:
+                fn._xp2f_set_args = {k for k, v in incoming[key].items() if v == SET}
+
+    # Each slot acquires at most two facts; this also permits recursive
+    # forwarding without relying on source-definition order.
+    limit = 2 * (sum(len(args) for args in arg_names.values()) + len(funcs)) + 3
+    for _ in range(limit):
+        before = repr((incoming, results))
+        scan()
+        if repr((incoming, results)) == before:
+            break
+    marked = True
+    scan()
+
+
 def rewrite_literal_string_sequence_lengths(tree):
     """Preserve lengths for literal-defined, read-only Python string sequences.
 
@@ -23393,6 +23556,9 @@ class translator(ast.NodeVisitor):
         return False
 
     def _is_python_set_expr(self, node):
+        provenance = getattr(node, "_xp2f_set_provenance", None)
+        if provenance is not None:
+            return provenance == {"set"}
         if isinstance(node, ast.Set):
             return True
         if (
@@ -24968,6 +25134,8 @@ class translator(ast.NodeVisitor):
                     return "complex"
                 return "real"
             if isinstance(node.op, (ast.BitAnd, ast.BitOr)):
+                if self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right):
+                    return self._expr_kind(node.left) or self._expr_kind(node.right)
                 return "logical"
             lk = self._expr_kind(node.left)
             rk = self._expr_kind(node.right)
@@ -59154,6 +59322,7 @@ def _emit_local_function(
             elif rk_hint == "char":
                 tr._mark_char(a.arg)
 
+    tr.python_set_vars.update(getattr(fn, "_xp2f_set_args", set()))
     tr.prescan(fn.body)
     _check_conditional_element_return(fn, tr)
     if fn.name in (local_df_return_info or {}):
@@ -72826,6 +72995,8 @@ def transpile_file(
 
     specialize_named_slice_callbacks(effective_tree.body, local_funcs)
     normalize_unused_callable_arguments(effective_tree.body, local_funcs)
+
+    annotate_local_set_provenance(effective_tree.body, local_funcs)
 
     infer_loadtxt_vector_context(effective_tree.body, local_funcs, comment_map)
 
