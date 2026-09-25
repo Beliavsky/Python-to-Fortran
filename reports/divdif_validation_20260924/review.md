@@ -180,3 +180,36 @@ values and `Run diff: MATCH` checks. Preserving `%f` field widths with
 `end=''` is the next concrete issue to fix; it is separate from the
 integer-input promotion fixed here. `check.py --full` intentionally
 continues to fail until that output mismatch is resolved.
+
+## Default-precision fixed formatting: full validation passes
+
+The `%14f` problem was an omitted-precision fallback, not a failure of
+non-advancing writes themselves. `_percent_format_parts` previously
+substituted `g0` when the floating-point format omitted precision. It now
+routes scalar `%f`/`%F` formats with omitted precision through
+`py_format_real` with Python's default six fractional digits. The helper's
+fixed-format branch preserves minimum field width, flags, leading zero,
+negative zero, and uppercase/lowercase non-finite spellings. Large values
+expand beyond the requested width rather than becoming asterisks.
+Explicit-precision fixed-format lowering and the optional integer-format
+override are unchanged.
+
+The unchanged full source now passes `check.py --full`: **636 normalized
+lines and 1,254 numeric values match**, using rtol 1e-5 and atol 1e-10.
+The audit excludes Python/NumPy version banners and timestamp-only lines,
+ignores blank lines, and collapses whitespace; it checks the remaining
+text as well as each numeric value. Both Python and Fortran complete,
+and Fortran runtime checks remain enabled. The ordinary CLI `--run-diff`
+still reports the version-banner difference; its comparison rules were
+not weakened to make this corpus case pass.
+
+The new integer and real formatting regressions compare raw stdout
+against Python, including adjacent fields, default six-digit precision,
+minimum-width overflow, sign/zero/left padding, negative zero, special
+values, multi-argument output, and custom `end`/`sep`. These exact-output
+checks supplement the whitespace-normalizing full-program audit.
+
+All 7 focused tests passed with automatic reruns disabled: the 2 new
+exact-output cases, 4 existing percent-format regressions, and the
+`xpfunc2f` formatter-helper extraction/compilation regression. Full pytest
+has not been run for this change and is the next checkpoint.

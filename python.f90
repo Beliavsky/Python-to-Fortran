@@ -1289,9 +1289,10 @@ contains
          character(len=:), allocatable :: s, buf, digits, prefix, exponent_text
          character(len=64) :: fmt, eb
          integer :: p, e, pos, dot, n, cut
-         logical :: alternate, upper, scientific
-         upper = code == 'G' .or. code == 'E'
+         logical :: alternate, upper, scientific, fixed
+         upper = code == 'G' .or. code == 'E' .or. code == 'F'
          scientific = code == 'e' .or. code == 'E'
+         fixed = code == 'f' .or. code == 'F'
          p = max(1, prec)
          if (scientific) p = max(0, prec) + 1
          alternate = index(flags, '#') > 0
@@ -1310,6 +1311,19 @@ contains
             else
                s = 'inf'
                if (upper) s = 'INF'
+            end if
+         else if (fixed) then
+            ! Python's field width is a minimum, not an overflow boundary.
+            ! Allow the largest finite DP value plus the requested fraction.
+            p = max(0, prec)
+            n = range(x) + p + 16
+            allocate(character(len=n) :: buf)
+            write(fmt, '("(f0.",i0,")")') p
+            write(buf, fmt) abs(x)
+            s = trim(adjustl(buf))
+            if (s(:1) == '.') s = '0' // s
+            if (p == 0 .and. .not. alternate) then
+               if (s(len(s):) == '.') s = s(:len(s)-1)
             end if
          else
             ! Round once to P significant digits before choosing notation.

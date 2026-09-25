@@ -4142,6 +4142,103 @@ def test_xp2f_numpy_exp_integer_expression_and_import_alias(tmp_path: Path) -> N
     ])
 
 
+@pytest.mark.parametrize("integer", [False, True])
+def test_xp2f_percent_f_default_precision_preserves_exact_output(tmp_path: Path, integer: bool) -> None:
+    values = "[0, 1, -2, 123456789]" if integer else "[0.0, -0.0, 0.125, -2.5, 123456789.25, 1e100]"
+    lines = ["import numpy as np", f"values = np.array({values})"]
+    for spec in ("%14f", "%f", "%4f", "%-14f", "%+014f", "% 14f", "%#14f", "%14F"):
+        lines += ["for value in values:", f"    print({spec!r} % value, end='')", "print('')"]
+        lines += [f"print('left', {spec!r} % values[1], 'right', sep='|', end='!')", "print('')"]
+    lines += ["print('%14f%14f' % (values[0], values[1]))"]
+    if not integer:
+        lines += ["for special in [np.inf, -np.inf, np.nan]:",
+                  "    print('%14f' % special, end='|')",
+                  "    print('%14F' % special, end='|')", "print('')"]
+    _run_xp2f_compile_diff(tmp_path, "xdefault_fixed_format.py", lines)
+    # --run-diff normalizes whitespace: independently enforce field widths,
+    # trailing blanks, no extra separators, and custom end/sep byte-for-byte.
+    py = subprocess.run([sys.executable, str(tmp_path / "xdefault_fixed_format.py")],
+                        cwd=tmp_path, capture_output=True, text=True, check=True)
+    exe = tmp_path / ("xdefault_fixed_format_p.exe" if sys.platform == "win32" else "xdefault_fixed_format_p")
+    ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True)
+    assert ft.stdout == py.stdout
+
+
+@pytest.mark.parametrize("use", ["unpack", "ignored", "print"])
+def test_xp2f_tuple_optional_none_preserves_persistent_state(tmp_path: Path, use: str) -> None:
+    lines = [
+        "def store(a=None, b=None, c=None):",
+        "    # real A: optional replacement.",
+        "    # real B: optional replacement.",
+        "    # real C: optional replacement.",
+        "    if not hasattr(store, 'a_saved'):",
+        "        store.a_saved = 1.25",
+        "        store.b_saved = -2.5",
+        "        store.c_saved = 3.75",
+        "    if a is not None:",
+        "        store.a_saved = a",
+        "    if b is not None:",
+        "        store.b_saved = b",
+        "    if c is not None:",
+        "        store.c_saved = c",
+        "    x = store.a_saved",
+        "    y = store.b_saved",
+        "    z = store.c_saved",
+        "    return x, y, z",
+        "missing = None",
+    ]
+    for arguments in ("", "None, None, None", "None, 19, None", "a=None, c=-1",
+                      "-1, None, -2.25", "None, -1, None", "c=None, b=None, a=None",
+                      "None, 0, None", "missing, -3, missing"):
+        call = f"store({arguments})"
+        lines += [f"x, y, z = {call}" if use == "unpack" else f"print({call})" if use == "print" else call]
+        lines += ["x, y, z = store()", "print(x, y, z)"]
+    lines += ["missing = 4.5", "x, y, z = store(missing, None, None)", "print(x, y, z)"]
+    if use != "print":
+        _run_xp2f_compile_diff(tmp_path, "xoptional_tuple_state.py", lines)
+    else:
+        # Direct tuple printing currently omits Python's parentheses/commas.
+        # Check every numeric row without making this optional-input test a
+        # regression for that independent presentation limitation.
+        src = tmp_path / "xoptional_tuple_state.py"
+        src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        py = subprocess.run([sys.executable, str(src)], cwd=tmp_path,
+                            capture_output=True, text=True, check=True)
+        exe = tmp_path / ("xoptional_tuple_state_p.exe" if sys.platform == "win32" else "xoptional_tuple_state_p")
+        ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True)
+        def rows(text):
+            return [tuple(map(float, re.sub(r"[(),]", " ", line).split()))
+                    for line in text.splitlines() if line.strip()]
+        assert rows(ft.stdout) == rows(py.stdout)
+    generated = (tmp_path / "xoptional_tuple_state_p.f90").read_text(encoding="utf-8")
+    assert "call store(-1, -1, -1" not in generated
+
+
+def test_xp2f_tuple_optional_none_keeps_other_defaults(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xoptional_tuple_defaults.py", [
+        "def pair(x=None, scale=2.5):",
+        "    if x is None:",
+        "        y = -7.0",
+        "    else:",
+        "        y = x * scale",
+        "    return y, scale",
+        "a, b = pair(None)",
+        "print(a, b)",
+        "a, b = pair(None, 4.0)",
+        "print(a, b)",
+        "a, b = pair(scale=3.0, x=None)",
+        "print(a, b)",
+        "a, b = pair(-1.0)",
+        "print(a, b)",
+        "pair(None)",
+        "pair(None, 4.0)",
+        "pair(scale=3.0, x=None)",
+    ])
+
+
 @pytest.mark.parametrize("call_wrapper", [False, True])
 @pytest.mark.parametrize("keyword", [False, True])
 def test_xp2f_forwarded_documented_vector_does_not_create_scalar_overload(

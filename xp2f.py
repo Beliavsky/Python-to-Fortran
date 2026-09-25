@@ -14935,7 +14935,7 @@ def detect_needed_helpers(tree):
                 if re.search(r"%(?:[-+#0 ]*\d*(?:\.\d+)?)?[gG]", fmt_text):
                     needed.add("py_format_g_real")
                     needed.add("py_str_int")
-                if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[eEgG]", fmt_text):
+                if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[eEfFgG]", fmt_text):
                     needed.add("py_format_real")
                 # Old-style "%...spec..." % args formatting (the BinOp Mod
                 # codegen's own inline lowering, see expr()'s ast.Mod
@@ -22952,6 +22952,46 @@ class translator(ast.NodeVisitor):
                     f"unsupported call shape for local function '{callee}': missing non-trailing argument '{names[i]}'"
                 )
         return args_nodes
+
+    def _tuple_call_input_parts(self, callee, call_node, render=None):
+        """Render explicit tuple-call inputs, omitting optional None actuals.
+
+        A gap requires keyword association for subsequent inputs and outputs;
+        it must never be filled with the expression-level -1 None sentinel.
+        Keep explicit argument order and the caller's existing coercion path.
+        """
+        actuals = self._build_local_call_actual_nodes(callee, call_node)
+        names = list(self.local_func_arg_names.get(callee, []))
+        defaults = list(self.local_func_defaults.get(callee, []))
+        if render is None:
+            def render(index, node):
+                text = self.expr(node)
+                if callee not in self.local_generic_overloads:
+                    text = self._coerce_local_actual_kind(callee, index, node, text)
+                    text = self._coerce_local_actual_rank(callee, index, node, text, actuals)
+                return text
+
+        def omit(index, node):
+            return (index < len(defaults) and is_none(defaults[index])
+                    and (is_none(node) or isinstance(node, ast.Name) and node.id in self.none_vars))
+
+        parts = []
+        named = False
+        omitted = False
+        for index, node in enumerate(call_node.args):
+            if omit(index, node):
+                named = omitted = True
+                continue
+            text = render(index, node)
+            parts.append(f"{names[index]}={text}" if named else text)
+        for kw in call_node.keywords:
+            index = names.index(kw.arg)
+            named = True
+            if omit(index, kw.value):
+                omitted = True
+                continue
+            parts.append(f"{kw.arg}={render(index, kw.value)}")
+        return parts, named or omitted or len(call_node.args) < len(names)
 
     @staticmethod
     def _is_np_vectorize_call(node):
@@ -45834,18 +45874,11 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"integer :: {loop_i}")
                 self.o.w(f"do {loop_i} = 1, size({vec_expr})")
                 self.o.push()
-                call_args = []
-                for i_arg, a_arg in enumerate(v.args):
+                def _render_vector_actual(i_arg, a_arg):
                     if i_arg == vec_idx:
-                        call_args.append(f"{vec_expr}({loop_i})")
-                    else:
-                        call_args.append(_coerced_local_actual(i_arg, a_arg))
-                for kw in getattr(v, "keywords", []):
-                    if kw.arg is None:
-                        raise NotImplementedError("**kwargs not supported")
-                    _i_kw = formal_in.index(kw.arg) if kw.arg in formal_in else -1
-                    _kw_txt = self.expr(kw.value) if _i_kw < 0 else _coerced_local_actual(_i_kw, kw.value)
-                    call_args.append(f"{kw.arg}={_kw_txt}")
+                        return f"{vec_expr}({loop_i})"
+                    return _coerced_local_actual(i_arg, a_arg)
+                call_args, _ = self._tuple_call_input_parts(v.func.id, v, _render_vector_actual)
                 for j, onm in enumerate(outs):
                     if onm == "_":
                         continue
@@ -45858,16 +45891,7 @@ class translator(ast.NodeVisitor):
                 self.o.pop()
                 self.o.w("end block")
                 return
-            args = [_coerced_local_actual(i, a) for i, a in enumerate(list(v.args))]
-            saw_named = False
-            for kw in getattr(v, "keywords", []):
-                if kw.arg is None:
-                    raise NotImplementedError("**kwargs not supported")
-                _i_kw = formal_in.index(kw.arg) if kw.arg in formal_in else -1
-                _kw_txt = self.expr(kw.value) if _i_kw < 0 else _coerced_local_actual(_i_kw, kw.value)
-                args.append(f"{kw.arg}={_kw_txt}")
-                saw_named = True
-            force_named_outs = len(v.args) < len(formal_in)
+            args, force_named_outs = self._tuple_call_input_parts(v.func.id, v, _coerced_local_actual)
             out_formals = list(self.local_tuple_return_out_names.get(v.func.id, []))
             in_actual_txt = set(args[: len(v.args)])
             raw_input_aliases = {
@@ -45975,7 +45999,7 @@ class translator(ast.NodeVisitor):
                             self.o.w(f"integer :: {tnm}")
 
             call_args = list(args)
-            if saw_named or force_named_outs:
+            if force_named_outs:
                 for j, onm in enumerate(out_actuals):
                     frm = out_formals[j] if j < len(out_formals) else f"{v.func.id}_out_{j + 1}"
                     call_args.append(f"{frm}={onm}")
@@ -53995,8 +54019,7 @@ class translator(ast.NodeVisitor):
                     return f"character(len=:), allocatable :: {_nm}"
                 return f"integer :: {_nm}"
 
-            parts = []
-            for i, a in enumerate(args_nodes):
+            def _render_ignored_tuple_actual(i, a):
                 ae = self.expr(a)
                 if fn_name not in self.local_generic_overloads:
                     ae = self._coerce_local_actual_kind(fn_name, i, a, ae)
@@ -54006,7 +54029,8 @@ class translator(ast.NodeVisitor):
                         ae = f"reshape({ae}, [size({ae}), 1])"
                     elif er == 1 and ar == 2:
                         ae = f"reshape({ae}, [size({ae})])"
-                parts.append(ae)
+                return ae
+            parts, force_named_outs = self._tuple_call_input_parts(fn_name, c, _render_ignored_tuple_actual)
             out_formals = list(self.local_tuple_return_out_names.get(fn_name, []))
             out_names = []
             self.o.w("block")
@@ -54017,7 +54041,6 @@ class translator(ast.NodeVisitor):
                 rr = out_ranks[j] if j < len(out_ranks) else 0
                 self.o.w(_tuple_tmp_decl(tmp, kind, rr))
             call_args = list(parts)
-            force_named_outs = len(c.args) < len(formal_in)
             if force_named_outs:
                 for j, onm in enumerate(out_names):
                     frm = out_formals[j] if j < len(out_formals) else f"{fn_name}_out_{j + 1}"
@@ -55506,7 +55529,8 @@ class translator(ast.NodeVisitor):
                     ak = self._expr_kind(an)
                     ar = self._rank_expr(an)
                     int_scalar = (ak == "int" and ar == 0)
-                    if (cl in {"g", "e"} and ar == 0 and (spec_body or cl == "e")
+                    if (ar == 0 and ((cl in {"g", "e"} and (spec_body or cl == "e"))
+                                     or (cl == "f" and prec is None))
                             and not (int_scalar and PERCENT_FLOAT_INT_FORMAT)):
                         flags = re.match(r"[-+#0 ]*", spec_body).group(0)
                         items.append(("pyg_prec", an, int(prec) if prec is not None else 6,
@@ -55694,15 +55718,8 @@ class translator(ast.NodeVisitor):
                 kind_hint = out_kinds[j] if j < len(out_kinds) else None
                 rank_hint = out_ranks[j] if j < len(out_ranks) else 0
                 self.o.w(_tuple_print_decl(tmp_name, kind_hint, rank_hint))
-            call_args = [self.expr(a) for a in tuple_call.args]
-            saw_named = False
-            for kw in getattr(tuple_call, "keywords", []):
-                if kw.arg is None:
-                    raise NotImplementedError("**kwargs not supported")
-                call_args.append(f"{kw.arg}={self.expr(kw.value)}")
-                saw_named = True
-            force_named_outs = len(tuple_call.args) < len(formal_in)
-            if saw_named or force_named_outs:
+            call_args, force_named_outs = self._tuple_call_input_parts(tuple_call.func.id, tuple_call)
+            if force_named_outs:
                 for j, tmp_name in enumerate(tmp_names):
                     frm = out_formals[j] if j < len(out_formals) else f"{tuple_call.func.id}_out_{j + 1}"
                     call_args.append(f"{frm}={tmp_name}")
