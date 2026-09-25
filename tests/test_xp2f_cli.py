@@ -32,6 +32,71 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+def test_xp2f_nullable_string_results_preserve_presence(tmp_path: Path) -> None:
+    source = (REPO_ROOT / "reports" / "filum_validation_20260925" / "probe.py").read_text(encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xnullable_string.py", source.splitlines())
+    run = subprocess.run([str(tmp_path / "xnullable_string_p.exe")], cwd=tmp_path,
+                         capture_output=True, text=True, check=False)
+    assert run.returncode == 0, run.stdout + run.stderr
+    delimited = [line.strip() for line in run.stdout.splitlines() if line.lstrip().startswith("[")]
+    assert delimited == ["[None]", "[None]", "[None]", "[abc  ]", "[]"]
+
+
+def test_xp2f_nullable_string_reassignment_and_forwarding(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xnullable_forward.py", [
+        "def choose(n):",
+        "    if n == 0:", "        return None",
+        "    return 'abc  '",
+        "def forward(n):",
+        "    s = choose(n)", "    return s",
+        "value_present = 123",
+        "for k in range(3):",
+        "    value = forward(k)",
+        "    copied = value", "    print(copied, value is None)",
+        "    value = ''", "    print(value is None, len(value))",
+        "    value = None", "    print(value, value is None)",
+        "    value = 'None'", "    print(value, value is not None)",
+        "print(value_present)",
+    ])
+
+
+@pytest.mark.parametrize("consumer", [
+    "print(choose(0))",
+    "value = choose(0)\nprint([value])",
+    "value = choose(0)\nprint(value == '')",
+    "value = choose(0)\nif value:\n    print('present')",
+    "value = choose(0)\nitems = [value]",
+    "value = choose(0)\nvalue += 'x'",
+    "value = choose(0)\nprint(str(value))",
+    "value = choose(0)\nprint(not value)",
+    "alias = choose\nvalue = alias(0)",
+    "value = choose(0)\ndef show():\n    print(value)\nshow()",
+    "def len(x):\n    return 99\nvalue = choose(0)\nprint(len(value))",
+    "class Box:\n    def get(self):\n        value = choose(0)\n        return value",
+])
+def test_xp2f_nullable_string_unsupported_consumers_diagnosed(consumer: str) -> None:
+    tree = ast.parse("def choose(n):\n    if n == 0:\n        return None\n    return 'abc'\n" + consumer)
+    with pytest.raises(NotImplementedError, match="unsupported string-or-None use"):
+        xp2f.rewrite_nullable_string_results(tree)
+
+
+def test_xp2f_nullable_string_pass_leaves_other_returns_unchanged() -> None:
+    tree = ast.parse("def f(n):\n    if n:\n        return None\n    return 5\nvalue = f(0)\n")
+    before = ast.dump(tree)
+    assert ast.dump(xp2f.rewrite_nullable_string_results(tree)) == before
+
+
+def test_xp2f_nullable_string_len_none_fails_at_runtime(tmp_path: Path) -> None:
+    src = tmp_path / "xnone_len.py"
+    src.write_text("def choose(n):\n    if n == 0:\n        return None\n    return ''\n"
+                   "value = choose(0)\nprint(len(value))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert "Build: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert "operation requires a string, got None" in proc.stdout + proc.stderr
+    assert "Run: FAIL" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_xp2f_chr_rebinding_rot13_matches_python(tmp_path: Path) -> None:
     src = tmp_path / "xrot13.py"
     src.write_text("\n".join([

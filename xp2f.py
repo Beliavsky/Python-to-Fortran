@@ -19753,6 +19753,359 @@ def specialize_lambda_function_args(exec_body, local_funcs):
         local_funcs.extend(specialized)
 
 
+def rewrite_nullable_string_results(tree):
+    """Lower bounded string-or-None locals/results to (text, present).
+
+    An empty string is a present value. Never encode absence in string data
+    or assign an unallocated Fortran function result. Unsupported consumers
+    are diagnosed rather than silently losing the presence bit.
+    """
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    nullable_funcs = set()
+    builtin_strings = {"chr", "str"}
+    shadowed_consumers = set()
+    for node in ast.walk(tree):
+        binding = None
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            binding = node.id
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            binding = node.name
+        elif isinstance(node, ast.arg):
+            binding = node.arg
+        elif isinstance(node, ast.alias):
+            binding = node.asname or node.name.split(".")[0]
+        builtin_strings.discard(binding)
+        if binding in {"len", "ord", "chr", "range", "print", "TypeError"}:
+            shadowed_consumers.add(binding)
+
+    def scope_nodes(body):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            yield from ast.walk(st)
+
+    def analyze(body):
+        nodes = list(scope_nodes(body))
+        strings, nullable = set(), set()
+        def string_expr(e):
+            return (isinstance(e, ast.Constant) and isinstance(e.value, str)
+                    or isinstance(e, ast.Name) and e.id in strings
+                    or isinstance(e, ast.BinOp) and isinstance(e.op, ast.Add)
+                    and string_expr(e.left) and string_expr(e.right)
+                    or isinstance(e, ast.Call) and isinstance(e.func, ast.Name)
+                    and e.func.id in (builtin_strings | nullable_funcs))
+        assignments = [n for n in nodes if isinstance(n, ast.Assign)]
+        for _ in range(len(assignments) + 1):
+            previous = (set(strings), set(nullable))
+            for st in assignments:
+                names = {t.id for t in st.targets if isinstance(t, ast.Name)}
+                if string_expr(st.value):
+                    strings.update(names)
+                if (is_none(st.value)
+                        or isinstance(st.value, ast.Name) and st.value.id in nullable
+                        or isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Name)
+                        and st.value.func.id in nullable_funcs):
+                    nullable.update(names)
+            if previous == (strings, nullable):
+                break
+        nullable &= strings
+        returns = [n.value for n in nodes if isinstance(n, ast.Return)]
+        optional_result = (bool(returns) and any(is_none(e) or isinstance(e, ast.Name)
+                           and e.id in nullable for e in returns)
+                           and any(string_expr(e) for e in returns)
+                           and all(is_none(e) or string_expr(e) for e in returns))
+        return strings, nullable, optional_result
+
+    for _ in range(len(funcs) + 1):
+        before = set(nullable_funcs)
+        for name, fn in funcs.items():
+            if analyze(fn.body)[2]:
+                nullable_funcs.add(name)
+        if nullable_funcs == before:
+            break
+    if not nullable_funcs:
+        return tree
+
+    def fail(node, detail):
+        raise NotImplementedError(
+            f"unsupported string-or-None use at line {getattr(node, 'lineno', '?')}: {detail}; "
+            "use separate string and validity variables")
+
+    if shadowed_consumers:
+        fail(tree, "shadowed string consumer builtins: " + ", ".join(sorted(shadowed_consumers)))
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            if (isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                    and child.id in nullable_funcs
+                    and not (isinstance(parent, ast.Call) and parent.func is child)):
+                fail(child, "nullable function used as a callable value")
+    module_nullable = analyze(tree.body)[1]
+    for fn in funcs.values():
+        locals_ = {n.id for n in scope_nodes(fn.body)
+                   if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        locals_.update(a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg))
+        for node in scope_nodes(fn.body):
+            if isinstance(node, ast.Name) and node.id in module_nullable - locals_:
+                fail(node, "nullable module state referenced by a function")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            if any(isinstance(n, ast.Name) and n.id in module_nullable
+                   or isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in nullable_funcs
+                   for n in ast.walk(node)):
+                fail(node, "nullable string state or function calls in classes")
+
+    def transform(body, fn=None):
+        strings, nullable, _ = analyze(body)
+        optional_result = fn is not None and fn.name in nullable_funcs
+        if not optional_result and not any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in nullable_funcs
+                for n in scope_nodes(body)):
+            return body
+        def ends_with_return(stmts):
+            return bool(stmts) and (isinstance(stmts[-1], ast.Return)
+                    or isinstance(stmts[-1], ast.If) and ends_with_return(stmts[-1].body)
+                    and ends_with_return(stmts[-1].orelse))
+        if optional_result and not ends_with_return(body):
+            fail(fn, "implicit fallthrough in a nullable string function")
+        if not nullable and not optional_result:
+            # Still diagnose unsupported expression-position nullable calls.
+            for node in scope_nodes(body):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in nullable_funcs:
+                    fail(node, "nullable function calls require a simple named assignment")
+            return body
+        if fn is not None:
+            if nullable & {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}:
+                fail(fn, "nullable parameter rebinding")
+            if any(isinstance(n, (ast.Global, ast.Nonlocal, ast.Lambda, ast.NamedExpr,
+                                  ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                                  ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+                   for st in body for n in ast.walk(st)):
+                fail(fn, "captured, global, or comprehension state")
+        occupied = {n.id.lower() for st in body for n in ast.walk(st) if isinstance(n, ast.Name)}
+        if fn is not None:
+            occupied.update(a.arg.lower() for a in ast.walk(fn.args) if isinstance(a, ast.arg))
+        flags = {}
+        for name in sorted(nullable):
+            flag = name + "_present"
+            while flag.lower() in occupied:
+                flag += "_"
+            occupied.add(flag.lower())
+            flags[name] = flag
+
+        def load(name):
+            return ast.Name(id=name, ctx=ast.Load())
+
+        def assign(name, value):
+            return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=value)
+
+        def present(value):
+            if is_none(value):
+                return ast.Constant(False)
+            if isinstance(value, ast.Name) and value.id in flags:
+                return load(flags[value.id])
+            return ast.Constant(True)
+
+        class Expressions(ast.NodeTransformer):
+            def visit_Compare(self, node):
+                if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot, ast.Eq, ast.NotEq)):
+                    other = (node.left if is_none(node.comparators[0]) else
+                             node.comparators[0] if is_none(node.left) else None)
+                    if isinstance(other, ast.Name) and other.id in flags:
+                        value = load(flags[other.id])
+                        if isinstance(node.ops[0], (ast.Is, ast.Eq)):
+                            value = ast.UnaryOp(op=ast.Not(), operand=value)
+                        return ast.copy_location(value, node)
+                return self.generic_visit(node)
+
+            def visit_Call(self, node):
+                if isinstance(node.func, ast.Name) and node.func.id in nullable_funcs:
+                    fail(node, "nullable function calls require a simple named assignment")
+                if isinstance(node.func, ast.Name) and node.func.id == "print":
+                    args = []
+                    checked_args = []
+                    for arg in node.args:
+                        if isinstance(arg, ast.Name) and arg.id in flags:
+                            fail(arg, "nullable print must be a standalone statement")
+                        else:
+                            arg = self.visit(arg)
+                            checked_args.append(arg)
+                            args.append(arg)
+                    for kw in node.keywords:
+                        if any(isinstance(n, ast.Name) and n.id in flags for n in ast.walk(kw.value)):
+                            fail(kw, "nullable print formatting argument")
+                    node.args = args
+                    # These generated expressions deliberately consume the tag.
+                    node._xp2f_nullable_print = True
+                    node._xp2f_nullable_print_checks = checked_args
+                    return node
+                return self.generic_visit(node)
+
+        def guards(expr, st):
+            if getattr(expr, "_xp2f_nullable_print", False):
+                return [check for arg in expr._xp2f_nullable_print_checks for check in guards(arg, st)]
+            names = sorted({n.id for n in ast.walk(expr) if isinstance(n, ast.Name)
+                            and isinstance(n.ctx, ast.Load) and n.id in flags})
+            if not names:
+                return []
+            if any(isinstance(n, (ast.BoolOp, ast.UnaryOp, ast.IfExp, ast.Compare, ast.List, ast.Tuple,
+                                  ast.Dict, ast.Set, ast.Attribute, ast.JoinedStr)) for n in ast.walk(expr)):
+                fail(st, "unsupported nullable string expression")
+            for call in (n for n in ast.walk(expr) if isinstance(n, ast.Call)):
+                direct_nullable = any(isinstance(a, ast.Name) and a.id in names
+                                      for a in list(call.args) + [k.value for k in call.keywords])
+                if not direct_nullable and not (isinstance(call.func, ast.Name)
+                                               and call.func.id in {"len", "ord", "chr", "range"}):
+                    fail(st, "potential side effects in a nullable string expression")
+                for arg in list(call.args) + [k.value for k in call.keywords]:
+                    if not (isinstance(arg, ast.Name) and arg.id in names):
+                        continue
+                    if isinstance(call.func, ast.Name) and call.func.id in {"len", "ord"}:
+                        continue
+                    callee = funcs.get(call.func.id) if isinstance(call.func, ast.Name) else None
+                    # A required string input whose first use is len(input)
+                    # rejects None in Python too (filename_inc's contract).
+                    arg_index = next((i for i, a in enumerate(call.args) if a is arg), None)
+                    param = (callee.args.args[arg_index].arg if callee is not None and arg_index is not None
+                             and arg_index < len(callee.args.args) else None)
+                    first = next((s for s in callee.body if any(isinstance(n, ast.Name) and n.id == param
+                                 for n in ast.walk(s))), None) if param else None
+                    prefix = callee.body[:callee.body.index(first)] if first is not None else []
+                    pure_prefix = all(
+                        isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+                        or isinstance(s, ast.Assign) and all(isinstance(t, ast.Name) for t in s.targets)
+                        and not any(isinstance(n, ast.Call) and not (
+                            isinstance(n.func, ast.Name) and n.func.id in {"len", "ord", "chr"})
+                            for n in ast.walk(s.value))
+                        for s in prefix)
+                    if (isinstance(first, ast.Assign) and isinstance(first.value, ast.Call)
+                            and isinstance(first.value.func, ast.Name) and first.value.func.id == "len"
+                            and len(first.value.args) == 1 and isinstance(first.value.args[0], ast.Name)
+                            and first.value.args[0].id == param and pure_prefix):
+                        continue
+                    fail(st, "passing a nullable string to an unsupported consumer")
+            return [ast.If(test=ast.UnaryOp(op=ast.Not(), operand=load(flags[name])),
+                           body=[ast.Raise(exc=ast.Call(func=load("TypeError"),
+                                 args=[ast.Constant("operation requires a string, got None")], keywords=[]), cause=None)],
+                           orelse=[]) for name in names]
+
+        class Statements(ast.NodeTransformer):
+            def generic_visit(self, node):
+                if isinstance(node, ast.stmt) and any(
+                        isinstance(n, ast.Name) and n.id in flags
+                        or isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                        and n.func.id in nullable_funcs for n in ast.walk(node)):
+                    fail(node, "unsupported statement consuming a nullable string")
+                return super().generic_visit(node)
+
+            def visit_FunctionDef(self, node):
+                return node
+
+            def visit_Assign(self, node):
+                if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                    if any(isinstance(n, ast.Name) and n.id in flags for n in ast.walk(node)):
+                        fail(node, "nullable unpacking or container assignment")
+                    return self.generic_visit(node)
+                name, value = node.targets[0].id, node.value
+                if name not in flags:
+                    value = Expressions().visit(value)
+                    return guards(value, node) + [ast.copy_location(assign(name, value), node)]
+                if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in nullable_funcs:
+                    checks = guards(value, node)
+                    pair = ast.Tuple(elts=[ast.Name(id=name, ctx=ast.Store()),
+                                          ast.Name(id=flags[name], ctx=ast.Store())], ctx=ast.Store())
+                    return checks + [ast.copy_location(ast.Assign(targets=[pair], value=value), node)]
+                flag = present(value)
+                if is_none(value):
+                    value = ast.Constant("")
+                elif not (isinstance(value, ast.Name) and value.id in strings
+                          or isinstance(value, ast.Constant) and isinstance(value.value, str)
+                          or isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add)):
+                    fail(node, "unsupported assignment to a nullable string")
+                checks = [] if isinstance(value, ast.Name) and value.id in flags else guards(value, node)
+                return checks + [ast.copy_location(assign(name, value), node),
+                                 ast.copy_location(assign(flags[name], flag), node)]
+
+            def visit_Return(self, node):
+                if not optional_result:
+                    return self.generic_visit(node)
+                value = node.value
+                flag = present(value)
+                if is_none(value):
+                    value = ast.Constant("")
+                if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                       and n.func.id in nullable_funcs for n in ast.walk(value)):
+                    fail(node, "nullable function calls require a simple named assignment")
+                checks = [] if isinstance(value, ast.Name) and value.id in flags else guards(value, node)
+                node.value = ast.Tuple(elts=[value, flag], ctx=ast.Load())
+                return checks + [node]
+
+            def visit_Expr(self, node):
+                display_assignments = []
+                call = node.value
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "print":
+                    for index, arg in enumerate(call.args):
+                        if isinstance(arg, ast.Name) and arg.id in flags:
+                            display = arg.id + "_display"
+                            while display.lower() in occupied:
+                                display += "_"
+                            occupied.add(display.lower())
+                            # A deferred-length temporary preserves an empty
+                            # string and trailing spaces; MERGE would pad both
+                            # alternatives to at least len('None').
+                            display_assignments.extend([
+                                assign(display, ast.Constant("None")),
+                                ast.If(test=load(flags[arg.id]), body=[assign(display, arg)], orelse=[]),
+                            ])
+                            call.args[index] = load(display)
+                node.value = Expressions().visit(node.value)
+                return display_assignments + guards(node.value, node) + [node]
+
+            def visit_If(self, node):
+                node.test = Expressions().visit(node.test)
+                if isinstance(node.test, ast.Name) and node.test.id in flags:
+                    fail(node, "nullable string truth test")
+                checks = guards(node.test, node)
+                node.body = rewrite_body(node.body)
+                node.orelse = rewrite_body(node.orelse)
+                return checks + [node]
+
+            def visit_While(self, node):
+                node.test = Expressions().visit(node.test)
+                if guards(node.test, node):
+                    fail(node, "nullable string in a while condition")
+                node.body = rewrite_body(node.body)
+                node.orelse = rewrite_body(node.orelse)
+                return node
+
+            def visit_For(self, node):
+                if any(isinstance(n, ast.Name) and n.id in flags for n in ast.walk(node.target)):
+                    fail(node, "nullable loop target")
+                node.iter = Expressions().visit(node.iter)
+                checks = guards(node.iter, node)
+                node.body = rewrite_body(node.body)
+                node.orelse = rewrite_body(node.orelse)
+                return checks + [node]
+
+        def rewrite_body(stmts):
+            result = []
+            for st in stmts:
+                rewritten = Statements().visit(st)
+                result.extend(rewritten if isinstance(rewritten, list) else [rewritten])
+            return result
+        return rewrite_body(body)
+
+    # Analyze all original bodies before changing the inferred return shapes.
+    rewritten = {name: transform(copy.deepcopy(fn.body), fn) for name, fn in funcs.items()}
+    tree.body = transform(tree.body)
+    for name, fn in funcs.items():
+        fn.body = rewritten[name]
+        if name in nullable_funcs:
+            fn.returns = None
+    tree._xp2f_nullable_string_results = True
+    return ast.fix_missing_locations(tree)
+
+
 def normalize_if_scalar_array_merges(stmts):
     """Make simple if-branch scalar/array rebinds rank-stable.
 
@@ -71949,6 +72302,8 @@ def transpile_file(
         src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
     stem = Path(py_path).stem
     tree = ast.parse(src)
+    tree = rewrite_nullable_string_results(tree)
+    nullable_string_results = getattr(tree, "_xp2f_nullable_string_results", False)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
@@ -72324,7 +72679,9 @@ def transpile_file(
         print("warning: missing helper symbols:", ", ".join(sorted(missing_helpers)))
 
     stem = Path(py_path).stem
-    if flat:
+    # Tagged string results require local tuple-return procedures. The narrow
+    # structured driver generator does not carry their signatures or guards.
+    if flat or nullable_string_results:
         f90 = generate_flat(
             effective_tree,
             stem,
