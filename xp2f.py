@@ -25004,6 +25004,28 @@ class translator(ast.NodeVisitor):
                     lk = iter_kind if (isinstance(node.elt.left, ast.Name) and node.elt.left.id == loop_var) else self._expr_kind(node.elt.left)
                     rk = iter_kind if (isinstance(node.elt.right, ast.Name) and node.elt.right.id == loop_var) else self._expr_kind(node.elt.right)
                     return _combine_binop_kind(node.elt.op, lk, rk)
+                if (
+                    isinstance(node.elt, ast.Call)
+                    and isinstance(node.elt.func, ast.Name)
+                    and node.elt.args
+                ):
+                    # A Call elt whose argument is the comprehension's own
+                    # loop variable (e.g. [round(val, 10) for val in x])
+                    # -- val is synthetic and untracked in self.reals/
+                    # self.ints/etc., so the generic self._expr_kind(node.elt)
+                    # fallback below can't resolve node.args[0]'s kind and
+                    # silently returns None, which upstream callers (e.g.
+                    # the local-function return-kind inference) then treat
+                    # as "unknown" and default to int.
+                    def _arg_kind(a):
+                        return iter_kind if (isinstance(a, ast.Name) and a.id == loop_var) else self._expr_kind(a)
+                    a0k = _arg_kind(node.elt.args[0])
+                    if node.elt.func.id == "round":
+                        if len(node.elt.args) == 1:
+                            return "int"
+                        return "int" if a0k == "logical" else a0k
+                    if node.elt.func.id == "abs" and len(node.elt.args) == 1:
+                        return "real" if a0k == "complex" else a0k
             if (
                 len(node.generators) == 2
                 and isinstance(node.generators[0].target, ast.Name)
@@ -25299,6 +25321,25 @@ class translator(ast.NodeVisitor):
                     return "char"
                 if nm in self.alloc_ints:
                     return "int"
+            if isinstance(node.value, ast.Subscript):
+                # Chained multi-dim indexing (q[i][j], q[i][j][k], ...) --
+                # the element kind is that of the ultimate base array, but
+                # the checks above only look one level deep (node.value is
+                # itself a Subscript here, not a Name), so nothing above
+                # ever fires for e.g. a 2D list-of-lists read/return.
+                _base_node, _ = self._flatten_subscript_chain(node)
+                if isinstance(_base_node, ast.Name):
+                    nm = _base_node.id
+                    if nm in self.alloc_reals:
+                        return "real"
+                    if nm in self.alloc_complexes:
+                        return "complex"
+                    if nm in self.alloc_logs:
+                        return "logical"
+                    if nm in self.alloc_chars:
+                        return "char"
+                    if nm in self.alloc_ints:
+                        return "int"
             return None
         if isinstance(node, ast.Call):
             if (
@@ -26874,6 +26915,10 @@ class translator(ast.NodeVisitor):
                     return "int"
                 if node.func.value.id in self.math_aliases and node.func.attr in {"radians", "degrees"}:
                     return "real"
+                if node.func.value.id in self.math_aliases and node.func.attr == "pow":
+                    # math.pow (unlike the builtin pow) always returns a
+                    # float in real Python, regardless of argument types.
+                    return "real"
                 if node.func.value.id in self.math_aliases and node.func.attr in {"expm1", "log1p", "exp", "log"}:
                     if len(node.args) >= 1 and self._expr_kind(node.args[0]) == "complex":
                         return "complex"
@@ -26978,6 +27023,21 @@ class translator(ast.NodeVisitor):
                 return "real"
             return None
         return None
+
+    def _truthy_cond_expr(self, test_node):
+        # Python's `if EXPR:` (and IfExp test) follows truthiness -- any
+        # nonzero int/real, or non-empty string, is True -- but Fortran's
+        # IF/MERGE condition must be LOGICAL. A bare non-logical test
+        # (e.g. `if i % 2`) compiles (gfortran rejects it: "requires a
+        # scalar LOGICAL expression") unless explicitly coerced.
+        ttxt = self.expr(test_node)
+        tk = self._expr_kind(test_node)
+        trr = max(0, int(self._rank_expr(test_node)))
+        if tk == "logical":
+            return ttxt
+        if tk == "char":
+            return f"any(len_trim({ttxt}) > 0)" if trr > 0 else f"(len_trim({ttxt}) > 0)"
+        return f"any(({ttxt}) /= 0)" if trr > 0 else f"({ttxt} /= 0)"
 
     def _extent_expr(self, node):
         """Best-effort extent expression for array-valued expressions."""
@@ -32702,6 +32762,17 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported expr: IfExp rank mismatch")
             kb = self._expr_kind(node.body)
             ko = self._expr_kind(node.orelse)
+            def _test_expr():
+                # Python's IfExp test follows truthiness (any nonzero
+                # int/real is True), but Fortran's MERGE mask must be
+                # LOGICAL -- a bare `i % 2`-style test (int, not already a
+                # Compare/BoolOp) needs an explicit `/= 0` coercion, or
+                # gfortran rejects it outright ("'mask' argument of
+                # 'merge' intrinsic must be LOGICAL").
+                ttxt = self.expr(node.test)
+                if self._expr_kind(node.test) == "logical":
+                    return ttxt
+                return f"({ttxt} /= 0)"
             if kb == "char" and ko == "char" and rb == 0 and ro == 0:
                 # Fortran's MERGE requires both character operands to share
                 # the exact same length (unlike an array constructor's
@@ -32712,7 +32783,7 @@ class translator(ast.NodeVisitor):
                 otxt = self.expr(node.orelse)
                 return (
                     f"merge({btxt} // repeat(' ', max(0, len({otxt}) - len({btxt}))), "
-                    f"{otxt} // repeat(' ', max(0, len({btxt}) - len({otxt}))), {self.expr(node.test)})"
+                    f"{otxt} // repeat(' ', max(0, len({btxt}) - len({otxt}))), {_test_expr()})"
                 )
             if kb == "char" or ko == "char":
                 raise NotImplementedError("unsupported expr: IfExp with character result")
@@ -32747,12 +32818,12 @@ class translator(ast.NodeVisitor):
                 btxt = _cast_scalar(self.expr(node.body), kb, ko)
                 otxt = self.expr(node.orelse)
                 btxt = _broadcast_scalar_to_rank(btxt, otxt, ro)
-                return f"merge({btxt}, {otxt}, {self.expr(node.test)})"
+                return f"merge({btxt}, {otxt}, {_test_expr()})"
             if ro == 0 and rb > 0:
                 btxt = self.expr(node.body)
                 otxt = _cast_scalar(self.expr(node.orelse), ko, kb)
                 otxt = _broadcast_scalar_to_rank(otxt, btxt, rb)
-                return f"merge({btxt}, {otxt}, {self.expr(node.test)})"
+                return f"merge({btxt}, {otxt}, {_test_expr()})"
             # Python IfExp short-circuits; Fortran MERGE does not guarantee that.
             # Keep MERGE use to simple branch atoms only.
             if not (
@@ -32762,7 +32833,7 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError(
                     "unsupported expr: IfExp requires statement-level lowering for non-atomic branches"
                 )
-            return f"merge({self.expr(node.body)}, {self.expr(node.orelse)}, {self.expr(node.test)})"
+            return f"merge({self.expr(node.body)}, {self.expr(node.orelse)}, {_test_expr()})"
 
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
@@ -33790,6 +33861,16 @@ class translator(ast.NodeVisitor):
                     return self._expr_kind(n)
 
                 def _map_expr(n):
+                    if isinstance(n, ast.Compare) or isinstance(n, ast.BoolOp) or (
+                        isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not)
+                    ):
+                        # A boolean-producing element (e.g. [a[i] < tol for i
+                        # in range(n)], often consumed by all()/any() after
+                        # normalize_generator_call_args rewrites a bare
+                        # GeneratorExp into a ListComp) -- _map_pred already
+                        # implements this exact op-mapping for filter (`if`)
+                        # clauses, so reuse it for the element expression too.
+                        return _map_pred(n)
                     if isinstance(n, ast.JoinedStr):
                         def _joinedstr_const_spec(spec_node):
                             if spec_node is None:
@@ -33881,6 +33962,22 @@ class translator(ast.NodeVisitor):
                     if isinstance(n, ast.Name):
                         return self.expr(n)
                     if isinstance(n, ast.Subscript):
+                        if isinstance(n.value, ast.Subscript):
+                            # Chained subscript (A[i][j], ...) -- self.expr()
+                            # on the inner Subscript alone yields an
+                            # already-sliced sub-array (e.g.
+                            # "coefficients(i + 1, :)"), and appending
+                            # another parenthesized index directly after
+                            # that is not valid Fortran syntax. Flatten the
+                            # whole chain instead and build one proper
+                            # multi-dim subscript.
+                            base_node, slices = self._flatten_subscript_chain(n)
+                            if isinstance(base_node, ast.Name) and not any(
+                                isinstance(sl, ast.Tuple) for sl in slices
+                            ):
+                                dims = [f"int({_map_expr(sl)}) + 1" for sl in slices]
+                                return f"{self.expr(base_node)}(" + ", ".join(dims) + ")"
+                            raise NotImplementedError("ListComp chained subscript currently supports only simple multi-dim indexing")
                         btxt = self.expr(n.value)
                         if isinstance(n.slice, ast.Tuple):
                             raise NotImplementedError("ListComp subscript currently supports rank-1 indexing only")
@@ -33895,6 +33992,52 @@ class translator(ast.NodeVisitor):
                         ):
                             args_m = [_map_expr(a) for a in n.args]
                             return f"{n.func.id}(" + ", ".join(args_m) + ")"
+                        if (
+                            isinstance(n.func, ast.Name)
+                            and n.func.id == "abs"
+                            and len(n.args) == 1
+                            and not getattr(n, "keywords", [])
+                        ):
+                            return f"abs({_map_expr(n.args[0])})"
+                        if (
+                            isinstance(n.func, ast.Name)
+                            and n.func.id in {"gcd", "lcm"}
+                            and len(n.args) == 2
+                            and not getattr(n, "keywords", [])
+                        ):
+                            scalar_fn = "gcd_int_scalar" if n.func.id == "gcd" else "lcm_int_scalar"
+                            return f"{scalar_fn}({_map_expr(n.args[0])}, {_map_expr(n.args[1])})"
+                        if (
+                            isinstance(n.func, ast.Name)
+                            and n.func.id == "round"
+                            and len(n.args) == 2
+                            and not getattr(n, "keywords", [])
+                        ):
+                            # Mirrors the non-ListComp round(x, ndigits)
+                            # lowering (see the top-level `expr()` round()
+                            # handling) -- banker's rounding via
+                            # py_round_ndigits, not a plain NINT.
+                            val_txt = _map_expr(n.args[0])
+                            vk = _kind_with_loopvar(n.args[0])
+                            nd_node = n.args[1]
+                            if (
+                                isinstance(nd_node, ast.Constant)
+                                and isinstance(nd_node.value, int)
+                                and not isinstance(nd_node.value, bool)
+                            ):
+                                nd = str(int(nd_node.value))
+                            else:
+                                nd = _map_expr(nd_node)
+                            if vk == "logical":
+                                val_r = f"real(merge(1, 0, {val_txt}), kind=dp)"
+                            elif vk == "int":
+                                val_r = f"real({val_txt}, kind=dp)"
+                            else:
+                                val_r = val_txt
+                            rounded = f"py_round_ndigits({val_r}, {nd})"
+                            if vk in {"int", "logical"}:
+                                return f"int({rounded})"
+                            return rounded
                         if (
                             isinstance(n.func, ast.Name)
                             and len(n.args) == 1
@@ -38891,6 +39034,33 @@ class translator(ast.NodeVisitor):
                     a0 = f"real({a0}, kind=dp)"
                 fmap = {"atan": "atan", "asin": "asin", "acos": "acos", "tan": "tan", "sin": "sin", "cos": "cos"}
                 return f"{fmap[node.func.attr]}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "pow"
+                and len(node.args) == 2
+            ):
+                # math.pow(base, exp) -- attribute-call style (`import
+                # math; math.pow(x, 2)`), distinct from the already-
+                # handled bare-name builtin pow(base, exp). Found mining
+                # TheAlgorithms/Python's own
+                # maths/numerical_analysis/square_root.py. Delegate to
+                # the identical BinOp-Pow codegen already used for
+                # `a ** b`, so this picks up the same negative-exponent
+                # real-coercion and int32-overflow widening handling for
+                # free instead of duplicating it -- except math.pow,
+                # unlike the `**` operator, ALWAYS returns a float in
+                # real Python even for two int arguments (`math.pow(2,
+                # 3) == 8.0`, not `8`), so the base is force-coerced to
+                # real first to match that.
+                base_arg = node.args[0]
+                if self._expr_kind(base_arg) in {"int", "logical"}:
+                    base_arg = ast.Call(func=ast.Name(id="float", ctx=ast.Load()), args=[base_arg], keywords=[])
+                    ast.copy_location(base_arg, node.args[0])
+                synth = ast.BinOp(left=base_arg, op=ast.Pow(), right=node.args[1])
+                ast.copy_location(synth, node)
+                return self.expr(synth)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -52013,7 +52183,7 @@ class translator(ast.NodeVisitor):
             # Statement-level lowering for ternary RHS preserves Python
             # short-circuit semantics when assigning into indexed targets.
             if isinstance(v, ast.IfExp):
-                self.o.w(f"if ({self.expr(v.test)}) then")
+                self.o.w(f"if ({self._truthy_cond_expr(v.test)}) then")
                 self.o.push()
                 self.o.w(f"{self.expr(t)} = {self.expr(v.body)}")
                 self.o.pop()
@@ -52286,7 +52456,7 @@ class translator(ast.NodeVisitor):
                     ):
                         arr_expr = self.expr(v.body if rb > 0 else v.orelse)
                         self.o.w(f"if (.not. allocated({nm})) allocate({nm}, mold={arr_expr})")
-                self.o.w(f"if ({self.expr(v.test)}) then")
+                self.o.w(f"if ({self._truthy_cond_expr(v.test)}) then")
                 self.o.push()
                 self.o.w(f"{lname} = {self.expr(v.body)}")
                 self.o.pop()

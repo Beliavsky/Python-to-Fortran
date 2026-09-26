@@ -1502,9 +1502,14 @@ contains
          character(len=*), intent(in) :: b(:)
          character(len=:), allocatable :: s(:)
          integer :: i
+         ! b's own elements are typically produced by a fixed-length
+         ! elemental helper (e.g. py_str_int_vec), so each one carries
+         ! trailing blank padding out to its full declared length --
+         ! trim it first, or that padding lands in the MIDDLE of the
+         ! concatenated result instead of at the end.
          allocate(character(len=len(a) + len(b)) :: s(size(b)))
          do i = 1, size(b)
-            s(i) = a // b(i)
+            s(i) = a // trim(b(i))
          end do
       end function str_concat_sv
 
@@ -1515,7 +1520,7 @@ contains
          integer :: i
          allocate(character(len=len(a) + len(b)) :: s(size(a)))
          do i = 1, size(a)
-            s(i) = a(i) // b
+            s(i) = trim(a(i)) // b
          end do
       end function str_concat_vs
 
@@ -1525,7 +1530,7 @@ contains
          integer :: i
          allocate(character(len=len(a) + len(b)) :: s(min(size(a), size(b))))
          do i = 1, size(s)
-            s(i) = a(i) // b(i)
+            s(i) = trim(a(i)) // trim(b(i))
          end do
       end function str_concat_vv
 

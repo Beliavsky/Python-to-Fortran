@@ -20455,3 +20455,285 @@ def test_xp2f_ternary_with_non_atomic_branches_as_list_element(tmp_path: Path) -
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_chained_subscript_return_kind_real(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/numerical_analysis/
+    # nevilles_method.py): a function whose sole return value is a
+    # chained/nested subscript read (q[i][j]) on a 2D real array built via
+    # a list-of-lists comprehension got its own Fortran result variable
+    # declared `integer` instead of `real`. _expr_kind's Subscript handling
+    # only looked one level deep (it checked node.value against a bare
+    # Name), so a chained subscript (whose node.value is itself another
+    # Subscript) fell through to its generic "unknown kind" default of
+    # None, and the function return-kind inference that consumes
+    # _expr_kind then defaulted an unresolvable kind to plain int. Fixed
+    # by flattening the whole subscript chain down to its base array name
+    # and checking that name's own tracked kind instead.
+    src = tmp_path / "xchained_subscript_return_kind.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def neville_value(x_points, y_points, x0):",
+                "    n = len(x_points)",
+                "    q = [[0.0] * n for i in range(n)]",
+                "    for i in range(n):",
+                "        q[i][1] = y_points[i]",
+                "",
+                "    for i in range(2, n):",
+                "        for j in range(i, n):",
+                "            q[j][i] = (",
+                "                (x0 - x_points[j - i + 1]) * q[j][i - 1]",
+                "                - (x0 - x_points[j]) * q[j - 1][i - 1]",
+                "            ) / (x_points[j] - x_points[j - i + 1])",
+                "",
+                "    return q[n - 1][n - 1]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(neville_value([1.0, 2.0, 3.0, 4.0, 6.0], [6.0, 7.0, 8.0, 9.0, 11.0], 5.0))",
+                "    print(neville_value([1.0, 2.0, 3.0, 4.0, 6.0], [6.0, 7.0, 8.0, 9.0, 11.0], 99.0))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_listcomp_boolean_mask_abs_round_and_chained_subscript(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/numerical_analysis/
+    # gauss_seidel_method.py): several related gaps in the
+    # list-comprehension/generator-expression scalar lowering used by
+    # all()/any()/sum() (via normalize_generator_call_args's GeneratorExp
+    # -> ListComp rewrite): a Compare/BoolOp element (e.g.
+    # all(abs(a[i]-b[i]) < tol for i in range(n))) was not supported at
+    # all; abs() and round(x, ndigits) calls as a comprehension element
+    # were not supported either (and _expr_kind's own
+    # comprehension-element-kind inference did not know how to type them
+    # when their argument was the comprehension's own loop variable, so a
+    # list-returning function's whole return array got mistyped as
+    # integer); and a chained subscript (coefficients[i][j]) used as a
+    # comprehension element inside sum(...) generated invalid Fortran
+    # syntax (indexing directly into an already-sliced sub-array
+    # expression). All fixed together since this one algorithm exercises
+    # the whole chain end to end.
+    src = tmp_path / "xlistcomp_bool_abs_round_chained.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def gauss_seidel(coefficients, rhs, tol=1e-10, max_iter=1000):",
+                "    n = len(coefficients)",
+                "    x = [0.0 for _ in range(n)]",
+                "",
+                "    for _ in range(max_iter):",
+                "        x_new = x.copy()",
+                "        for i in range(n):",
+                "            sum_before = sum(coefficients[i][j] * x_new[j] for j in range(i))",
+                "            sum_after = sum(coefficients[i][j] * x[j] for j in range(i + 1, n))",
+                "            x_new[i] = (rhs[i] - sum_before - sum_after) / coefficients[i][i]",
+                "",
+                "        if all(abs(x_new[i] - x[i]) < tol for i in range(n)):",
+                "            return [round(val, 10) for val in x_new]",
+                "",
+                "        x = x_new",
+                "",
+                "    return [round(val, 10) for val in x]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    a = [[4.0, 1.0, 2.0], [3.0, 5.0, 1.0], [1.0, 1.0, 3.0]]",
+                "    b = [4.0, 7.0, 3.0]",
+                "    result = gauss_seidel(a, b)",
+                "    for i in range(len(result)):",
+                "        print(result[i])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_ternary_truthy_int_test_merge_and_assign(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/numerical_analysis/
+    # integration_by_simpson_approx.py): a ternary whose TEST is a
+    # non-logical truthy expression (e.g. `4 if i % 2 else 2`, following
+    # Python's own truthiness rules) was passed straight through to
+    # Fortran's MERGE/IF without coercing it to LOGICAL first ("'mask'
+    # argument of 'merge' intrinsic must be LOGICAL" / "IF clause ...
+    # requires a scalar LOGICAL expression"). This bug existed
+    # independently in four separate duplicate code paths (the main
+    # expr() IfExp/MERGE codegen, and two visit_Assign statement-level
+    # if/else lowerings for subscript- and Name-targets); all four fixed
+    # via a new shared _truthy_cond_expr helper.
+    src = tmp_path / "xternary_truthy_int_test.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def f(x):",
+                "    return x * x",
+                "",
+                "",
+                "def simpson_integration(a, b, n_steps=1000, precision=4):",
+                "    h = (b - a) / n_steps",
+                "    result = f(a) + f(b)",
+                "    for i in range(1, n_steps):",
+                "        a1 = a + h * i",
+                "        result += f(a1) * (4 if i % 2 else 2)",
+                "    result *= h / 3",
+                "    return round(result, precision)",
+                "",
+                "",
+                "def pick_array(i, a, b):",
+                "    return a if i % 2 else b",
+                "",
+                "",
+                "def fill(n):",
+                "    a = [0.0] * n",
+                "    for i in range(n):",
+                "        a[i] = 1.0 if i % 2 else 2.0",
+                "    return a",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(simpson_integration(1.0, 2.0, 1000, 3))",
+                "    x = [1.0, 2.0, 3.0]",
+                "    y = [4.0, 5.0, 6.0]",
+                "    r = pick_array(3, x, y)",
+                "    print(r)",
+                "    r2 = fill(5)",
+                "    for i in range(len(r2)):",
+                "        print(r2[i])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_math_pow_attribute_style(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/numerical_analysis/
+    # square_root.py): math.pow(base, exp) (attribute-call style, `import
+    # math; math.pow(x, 2)`) was entirely unrecognized ("unsupported call:
+    # math.pow(...)"), distinct from the already-supported bare-name
+    # builtin pow(base, exp). Fixed by delegating to the existing
+    # BinOp-Pow codegen (same as `a ** b`), with the base force-coerced to
+    # real first since math.pow, unlike `**`/builtin pow, always returns a
+    # float in real Python even for two int arguments.
+    src = tmp_path / "xmath_pow_attribute.py"
+    src.write_text(
+        "\n".join(
+            [
+                "import math",
+                "",
+                "",
+                "def fx(x, a):",
+                "    return math.pow(x, 2) - a",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(fx(3.0, 4.0))",
+                "    print(math.pow(2, 3))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_listcomp_gcd_filter_and_fstring_str_concat_padding(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/proper_fractions.py):
+    # gcd() was not supported inside a list comprehension's `if` filter
+    # clause at all ("ListComp currently supports only single-generator
+    # form"), and separately, once that was fixed, the vectorized f-string
+    # list comprehension ([f"{n}/{d}" for n in range(...) if gcd(n, d) ==
+    # 1]) revealed a python.f90 runtime bug: str_concat_sv/vs/vv
+    # concatenated fixed-length character-array elements (from
+    # py_str_int_vec, which must pad every element out to a uniform
+    # declared length) without trimming them first, splicing padding
+    # spaces into the MIDDLE of the resulting string (e.g. "1" + 63 spaces
+    # + "/10" instead of "1/10"). Fixed by trimming each element before
+    # concatenating in all three str_concat variants.
+    src = tmp_path / "xlistcomp_gcd_fstring_concat.py"
+    src.write_text(
+        "\n".join(
+            [
+                "from math import gcd",
+                "",
+                "",
+                "def proper_fractions(denominator):",
+                "    return [",
+                "        f\"{numerator}/{denominator}\"",
+                "        for numerator in range(1, denominator)",
+                "        if gcd(numerator, denominator) == 1",
+                "    ]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    r = proper_fractions(10)",
+                "    for i in range(len(r)):",
+                "        print(r[i])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
