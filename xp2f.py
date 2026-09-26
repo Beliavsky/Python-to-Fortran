@@ -37312,7 +37312,10 @@ class translator(ast.NodeVisitor):
                     arr = a0
                 else:
                     op = "count"
-                    arr = f"({a0} /= 0)"
+                    # COUNT already takes a logical mask. Comparing that mask
+                    # with numeric zero is invalid Fortran (including when
+                    # it comes from an inline comparison or Boolean operator).
+                    arr = a0 if self._expr_kind(node.args[0]) == "logical" else f"({a0} /= 0)"
                 if axis_node is None:
                     if np_attr in {"all", "any"} and self._rank_expr(node.args[0]) <= 0:
                         return arr

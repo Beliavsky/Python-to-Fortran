@@ -32,6 +32,54 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+def test_xp2f_count_nonzero_boolean_expressions(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcount_boolean.py", [
+        "import numpy as np",
+        "from numpy import count_nonzero as nnz",
+        "def counts(a, b):",
+        "    return np.count_nonzero(a & b)",
+        "a = np.array([True, False, True, False])",
+        "b = np.array([True, True, False, False])",
+        "x = np.array([-1.0, 0.0, 2.0, 3.0])",
+        "print(counts(a, b))",
+        "print(np.count_nonzero(a), nnz(a | b), np.count_nonzero(~a))",
+        "print(np.count_nonzero(x > 0.0))",
+        "print(np.count_nonzero((x > 0.0) & (x < 3.0)))",
+        "print(np.count_nonzero(np.isfinite(x)))",
+        "print(np.count_nonzero(np.array([], dtype=bool)))",
+    ])
+    generated = (tmp_path / "xcount_boolean_p.f90").read_text(encoding="utf-8")
+    assert "count(a .and. b)" in generated or "count((a .and. b))" in generated
+
+
+@pytest.mark.parametrize("dtype", ["bool", "int", "float", "complex"])
+def test_xp2f_count_nonzero_numeric_and_axis_reductions(tmp_path: Path, dtype: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcount_axis.py", [
+        "import numpy as np",
+        f"a = np.array([[0, 1, 0], [2, 0, 3]], dtype={dtype})",
+        "print(np.count_nonzero(a))",
+        "c0 = np.count_nonzero(a, axis=0)",
+        "c1 = np.count_nonzero(a, axis=1)",
+        "print(c0.size, c1.size)",
+        "for i in range(c0.size):",
+        "    print(c0[i])",
+        "for i in range(c1.size):",
+        "    print(c1[i])",
+        "k0 = np.count_nonzero(a, axis=0, keepdims=True)",
+        "k1 = np.count_nonzero(a, axis=1, keepdims=True)",
+        "print(k0.shape[0], k0.shape[1], k1.shape[0], k1.shape[1])",
+        "for i in range(k0.shape[1]):",
+        "    print(k0[0, i])",
+        "for i in range(k1.shape[0]):",
+        "    print(k1[i, 0])",
+        f"empty = np.zeros((0, 3), dtype={dtype})",
+        "print(np.count_nonzero(empty))",
+        "e = np.count_nonzero(empty, axis=0)",
+        "for i in range(e.size):",
+        "    print(e[i])",
+    ])
+
+
 @pytest.mark.parametrize("elements", ["[1, 2, 2, 3]", "['a', 'b', 'b', 'c']"])
 def test_xp2f_set_arguments_forwarded_through_local_calls(tmp_path: Path, elements: str) -> None:
     _run_xp2f_compile_diff(tmp_path, "xforward_sets.py", [
