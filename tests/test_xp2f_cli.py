@@ -32,6 +32,71 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+@pytest.mark.parametrize("token, rank", [
+    ("dice[3]", 1), ("DICE (3)", 1), ("dice[2,3]", 2),
+    ("dice(2,3)", 2), ("dice", 0), ("dices[3]", None),
+])
+def test_xp2f_comment_rank_tokens(token: str, rank) -> None:
+    assert xp2f._comment_token_rank_for_name(token, "dice") == rank
+
+
+@pytest.mark.parametrize("comment, actual", [
+    ("dice[3]", "[1, 2, 1]"),
+    ("DICE(3)", "[1, 2, 1]"),
+    ("dice[2,3]", "[[1, 2, 1], [0, 1, 0]]"),
+    ("dice(2,3)", "[[1, 2, 1], [0, 1, 0]]"),
+    ("dice", "[1, 2, 1]"),
+])
+def test_xp2f_commented_array_reduction_preserves_call_rank(tmp_path: Path, comment: str, actual: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcommented_count.py", [
+        "import numpy as np",
+        "def matches(spot, dice):",
+        "    # integer spot, the chosen number.",
+        f"    # integer {comment}, the dice values.",
+        "    return np.count_nonzero(dice == spot)",
+        f"a = np.array({actual}, dtype=int)",
+        "print(matches(1, a))",
+        "print(matches(9, a))",
+    ])
+    generated = (tmp_path / "xcommented_count_p.f90").read_text(encoding="utf-8")
+    dims = "(:,:)" if actual.startswith("[[") else "(:)"
+    assert f":: dice{dims}" in generated
+    assert ":: spot" in generated
+
+
+@pytest.mark.parametrize("expression", ["np.all(dice > 0)", "np.any(dice > 0)", "nnz(dice == 1)"])
+def test_xp2f_commented_scalar_result_reductions(tmp_path: Path, expression: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcommented_reductions.py", [
+        "import numpy as np",
+        "from numpy import count_nonzero as nnz",
+        "def reduce(dice):",
+        "    # integer dice[3], input values.",
+        f"    return {expression}",
+        "print(reduce(np.array([0, 1, 1])))",
+        "print(reduce(np.array([2, 3, 4])))",
+    ])
+
+
+def test_xp2f_stale_array_comment_still_allows_scalar_call(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xstale_array_comment.py", [
+        "def f(x):",
+        "    # integer x[3], stale vector documentation.",
+        "    return x * x + 1",
+        "print(f(2))",
+    ])
+
+
+def test_xp2f_commented_reduction_scalar_vector_specializations(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcommented_any_overloads.py", [
+        "import numpy as np",
+        "def truth(x):",
+        "    # logical x[3], input values.",
+        "    return np.any(x)",
+        "print(truth(False))",
+        "print(truth(np.array([False, True, False])))",
+    ])
+
+
 def test_xp2f_count_nonzero_boolean_expressions(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xcount_boolean.py", [
         "import numpy as np",

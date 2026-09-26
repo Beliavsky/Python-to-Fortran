@@ -12,7 +12,7 @@ def main():
     parser.add_argument("source", nargs="?", type=Path, default=Path(
         "C:/python/public_domain/burkardt/chuckaluck_simulation/chuckaluck_simulation.py"))
     parser.add_argument("--ignore-comments", action="store_true",
-                        help="bypass the separate dice[3] comment-rank inference problem")
+                        help="disable comment inference for a diagnostic comparison")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     original = args.source.read_text(encoding="utf-8")
@@ -26,7 +26,8 @@ for spot in range(1, 7):
     for a in range(1, 7):
         for b in range(1, 7):
             for c in range(1, 7):
-                print(chuckaluck_payoff(spot, np.array([a, b, c], dtype=int)))
+                dice = np.array([a, b, c], dtype=int)
+                print(chuckaluck_payoff(spot, dice))
 ''', encoding="utf-8")
     command = [sys.executable, str(root / "xp2f.py"), str(src), "--compile"]
     if args.ignore_comments:

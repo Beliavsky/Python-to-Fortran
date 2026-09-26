@@ -58229,6 +58229,7 @@ def _emit_local_function(
     tuple_df_return_positions=None,
     structured_type_components=None,
     value_scalar_args=False,
+    observed_arg_ranks=None,
 ):
     # Remove statically unreachable ndim branches before prescanning: scanning
     # a[i, 0] in the vector specialization otherwise promotes a back to rank 2.
@@ -62520,9 +62521,21 @@ def _emit_local_function(
             )
             and int((local_return_ranks or {}).get(fn.name, 0) or 0) <= 0
         )
+        # A scalar result does not imply scalar arguments (e.g. reductions).
+        # The fallback below repairs stale array comments for scalar code,
+        # but must not erase array ranks actually observed at call sites.
+        # A specialized signature takes precedence over other overloads'
+        # observed ranks; elemental procedures still have scalar dummies.
+        if force_arg_ranks is not None and arg in force_arg_ranks:
+            _observed_array_arg = int(force_arg_ranks[arg]) > 0
+        else:
+            _observed_ranks = (observed_arg_ranks or [])
+            _observed_array_arg = (0 <= idx < len(_observed_ranks)
+                                   and any(int(r) > 0 for r in _observed_ranks[idx]))
         if (
             comment_arg_rank is not None
             and arr_rank > 0
+            and not (_observed_array_arg and not is_elemental_fn)
             and (fn.name in set(force_non_elemental_funcs or set()) or _single_scalar_return_func)
         ):
             def _arg_has_array_evidence(_arg_name):
@@ -71356,6 +71369,7 @@ def generate_flat(
                         dict_type_components=dict_type_components,
                         dict_arg_types=arg_dict_types,
                         df_arg_types=arg_df_types,
+                        observed_arg_ranks=call_rank_sets.get(fn.name, []),
                         local_func_arg_ranks=local_func_arg_ranks,
                         local_func_arg_kinds=local_func_arg_kinds,
                         local_func_arg_names=local_func_arg_names,
@@ -71407,6 +71421,7 @@ def generate_flat(
                     dict_type_components=dict_type_components,
                     dict_arg_types=arg_dict_types,
                     df_arg_types=arg_df_types,
+                    observed_arg_ranks=call_rank_sets.get(fn.name, []),
                     local_func_arg_ranks=local_func_arg_ranks,
                     local_func_arg_kinds=local_func_arg_kinds,
                     local_func_arg_names=local_func_arg_names,
@@ -71902,6 +71917,7 @@ def generate_flat(
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
                 df_arg_types=arg_df_types,
+                observed_arg_ranks=call_rank_sets.get(fn.name, []),
                 local_func_arg_ranks=local_func_arg_ranks,
                 local_func_arg_kinds=local_func_arg_kinds,
                 local_func_arg_names=local_func_arg_names,

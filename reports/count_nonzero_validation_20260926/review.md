@@ -40,7 +40,7 @@ handling of positional axes, negative/tuple axes, scalar inputs, and string
 truthiness is outside this change. The axis tests use the explicit,
 nonnegative keyword axes described above.
 
-## Burkardt validation and next blocker
+## Burkardt validation and the subsequent rank fix
 
 `chuckaluck_simulation/chuckaluck_simulation.py` contains the same pattern:
 
@@ -53,10 +53,10 @@ deterministic driver covering six chosen numbers and all 216 three-dice
 rolls (1296 cases). It saves generated source and build/execution logs in
 a printed temporary directory.
 
-The default translation encounters a separate problem: comment inference
-declares `dice` scalar despite the source comment `integer dice[3]` and the
-array-valued actual argument. `--ignore-comments` makes it an array and
-allows compilation. To isolate this reduction fix, run:
+Initially the default translation encountered a separate problem: `dice`
+was declared scalar despite the source comment `integer dice[3]` and the
+array-valued actual argument. `--ignore-comments` made it an array and
+allowed compilation. The initial reduction-only validation used:
 
 ```bat
 python reports\count_nonzero_validation_20260926\check.py --ignore-comments
@@ -65,6 +65,36 @@ python reports\count_nonzero_validation_20260926\check.py --ignore-comments
 With that flag, compilation and execution passed and all 1296 payoffs
 matched Python exactly.
 
-Omitting the flag reproduces the comment-rank blocker. This validation is
-of the extracted payoff function, not the complete randomized simulation.
-Neither the Burkardt source nor comment inference was changed.
+### Comment-rank follow-up (2026-09-26)
+
+The square-bracket parser already recognized `dice[3]` as rank 1. The bug
+was later in procedure emission: a fallback intended to repair stale array
+comments for scalar code reset the argument rank to zero. It used a list
+of array operations that omitted `count_nonzero`, even when call-site
+observations already established an array argument.
+
+The fallback now preserves caller-observed array ranks. Explicit overload
+signatures take precedence over observations belonging to other overloads,
+and elemental procedures retain scalar dummies. This avoids growing the
+list of recognized reductions for each similar case. User comments are
+still hints: stale array comments do not prevent genuine scalar calls.
+
+Default validation now passes without a workaround:
+
+```bat
+python reports\count_nonzero_validation_20260926\check.py
+```
+
+All 1296 payoffs match Python exactly with comment inference enabled.
+Regression cases cover bracketed and parenthesized vector/matrix comments,
+scalar-looking comments with array callers, ALL/ANY and an imported
+COUNT_NONZERO alias, stale array comments on scalar calls, and mixed
+scalar/vector specialization. The parser itself was not changed.
+
+All 16 new rank-parser and compile/run regressions passed in 169.84 seconds,
+with reruns disabled. Another 23 related reduction, broadcasting, comment,
+loadtxt, overload, and elemental tests passed in 465.92 seconds, also with
+reruns disabled: 39 targeted tests for this rank fix. No full-suite rerun.
+
+This validation is of the extracted payoff function, not the complete
+randomized simulation. The Burkardt source is unchanged.
