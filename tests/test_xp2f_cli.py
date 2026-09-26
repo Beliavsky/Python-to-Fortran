@@ -20956,3 +20956,103 @@ def test_xp2f_listcomp_gcd_filter_and_fstring_str_concat_padding(tmp_path: Path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_recursive_tuple_return_kind_uses_source_order(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/
+    # extended_euclidean_algorithm.py / maths/chinese_remainder_theorem.py):
+    # a recursive function returning a tuple, shaped as an early
+    # int-literal base-case guard `return (1, 0)` nested inside an `if`,
+    # followed by the main-path `return (y, x - y)` at the function's own
+    # top level, got its whole tuple-return kind mistyped as real instead
+    # of integer. Root cause: _local_return_maps's _returns_in_fn
+    # collected Return nodes via ast.walk, which is breadth-first -- so
+    # the shallower top-level return was picked as "the function's first/
+    # representative return" ahead of the earlier, more deeply nested
+    # base case, and its element kinds were derived from the (at that
+    # point still-unresolved) recursive call's own outputs instead,
+    # defaulting to real. Fixed by sorting collected returns by source
+    # position before taking rets[0].
+    src = tmp_path / "xrecursive_tuple_return_kind.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def extended_euclid(a, b):",
+                "    if b == 0:",
+                "        return (1, 0)",
+                "    (x, y) = extended_euclid(b, a % b)",
+                "    k = a // b",
+                "    return (y, x - k * y)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    x, y = extended_euclid(10, 6)",
+                "    print(x, y)",
+                "    x, y = extended_euclid(240, 46)",
+                "    print(x, y)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_split_subscript_outside_plain_assignment(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/
+    # decimal_to_fraction.py): `s.split(sep)[idx]` (str_split(...) returns
+    # type(strvec_t), a vector of strings) worked only when the WHOLE
+    # split() call was the direct RHS of a plain `name = ...` assignment
+    # (which has its own dedicated temp-materializing codegen). Used
+    # anywhere else -- as a return value, nested inside another call's
+    # argument, etc. -- it produced invalid Fortran, since subscripting a
+    # strvec_t requires its %v component, and Fortran flatly disallows
+    # component access directly on a function-call result ("the leftmost
+    # part-ref in a data-ref cannot be a function reference"). Separately,
+    # _expr_kind/_rank_expr didn't know this subscript shape reduces to a
+    # scalar char, so len(s.split(".")[1]) picked size(...) instead of
+    # len(...). Fixed with kind/rank additions plus a new temp-hoisting
+    # AST rewrite pass (rewrite_split_subscript_to_temp).
+    src = tmp_path / "xsplit_subscript_outside_assign.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def frac_digits(s):",
+                "    return len(s.split(\".\")[1])",
+                "",
+                "",
+                "def second_part(s):",
+                "    return s.split(\".\")[1]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(frac_digits(\"6.250\"))",
+                "    print(second_part(\"6.250\"))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout

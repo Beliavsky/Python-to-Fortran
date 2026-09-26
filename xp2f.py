@@ -5164,6 +5164,143 @@ def rewrite_nonatomic_ternary_to_temp(tree):
     return new_tree
 
 
+def rewrite_split_subscript_to_temp(tree):
+    """Hoist `EXPR.split(sep)[idx]` into a preceding `tmp = EXPR.split(sep)`
+    assignment, replacing the original with `tmp[idx]`.
+
+    `.split(...)` codegens to str_split(...), which returns type(strvec_t)
+    (a vector of strings) -- subscripting it requires accessing its `%v`
+    component, but Fortran only allows component selection on a NAMED
+    variable, never directly on a function-call result ("the leftmost
+    part-ref in a data-ref cannot be a function reference"). The one
+    shape that already works, a bare `name = EXPR.split(sep)` assignment,
+    has its own dedicated temp-materializing codegen (split_assign_tmp);
+    this pass covers every OTHER position a `.split(...)[idx]` subscript
+    can appear in (a return value, a nested call argument, ...). Found
+    mining TheAlgorithms/Python's own maths/decimal_to_fraction.py:
+    `len(str(decimal).split(".")[1])`.
+
+    Scoped to function bodies only, matching
+    rewrite_nonatomic_ternary_to_temp's own caution about a pre-existing,
+    separate gap in top-level/module-scope declaration collection --
+    not relevant here anyway, since the hoisted temp is always assigned
+    unconditionally (never split across if/else branches).
+    """
+    counter = [0]
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
+    def _next_tmp():
+        while True:
+            counter[0] += 1
+            cand = f"split_tmp_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    def _is_split_call(n):
+        return (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "split"
+            and len(n.args) <= 2
+        )
+
+    class _SplitHoister(ast.NodeTransformer):
+        def __init__(self):
+            self.hoisted = []
+
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            if not _is_split_call(node.value):
+                return node
+            tmp = _next_tmp()
+            assign = ast.Assign(
+                targets=[ast.Name(id=tmp, ctx=ast.Store())],
+                value=node.value,
+            )
+            ast.copy_location(assign, node)
+            ast.fix_missing_locations(assign)
+            self.hoisted.append(assign)
+            node.value = ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), node)
+            return node
+
+        def visit_FunctionDef(self, node):
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            return node
+
+        def visit_Lambda(self, node):
+            return node
+
+    class _Rewriter(ast.NodeTransformer):
+        def __init__(self):
+            self._in_func = 0
+
+        def _process_body(self, stmts):
+            out = []
+            for st in stmts:
+                st = self.visit(st)
+                if st is None:
+                    continue
+                stmts_to_add = st if isinstance(st, list) else [st]
+                for one in stmts_to_add:
+                    if not self._in_func:
+                        out.append(one)
+                        continue
+                    hoister = _SplitHoister()
+                    new_one = hoister.visit(one)
+                    out.extend(hoister.hoisted)
+                    out.append(new_one)
+            return out
+
+        def visit_FunctionDef(self, node):
+            self._in_func += 1
+            node.body = self._process_body(node.body)
+            self._in_func -= 1
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            self._in_func += 1
+            node.body = self._process_body(node.body)
+            self._in_func -= 1
+            return node
+
+        def visit_If(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_For(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_While(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_With(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_Module(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
 def rewrite_tuple_assign_subscript_targets_to_temps(tree):
     """Rewrite `T1, T2, ... = V1, V2, ...` (a flat tuple/list assignment
     with a literal tuple/list on both sides, same length) into temp-
@@ -25359,6 +25496,21 @@ class translator(ast.NodeVisitor):
                         return "int"
                     if ckind.startswith("logical"):
                         return "logical"
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "split"
+                and len(node.value.args) <= 2
+            ):
+                # s.split(sep)[i] -- str_split(...) returns type(strvec_t)
+                # (a vector of strings), so indexing into it yields a
+                # single CHARACTER scalar, not the strvec_t itself (whose
+                # own _expr_kind is deliberately None -- see the .split()
+                # Call-kind case above). Found mining TheAlgorithms/
+                # Python's own maths/decimal_to_fraction.py: without this,
+                # len(s.split(".")[1]) couldn't tell this was a char
+                # scalar and fell back to size(...) instead of len(...).
+                return "char"
             if isinstance(node.value, ast.Name):
                 minfo = self._dict_array_map_info(node.value.id)
                 if minfo is not None and not (
@@ -30203,6 +30355,17 @@ class translator(ast.NodeVisitor):
                     if "array" in ckind:
                         return max(1, crank)
                     return 0
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "split"
+                and len(node.value.args) <= 2
+            ):
+                # s.split(sep)[i] -- indexing into the strvec_t str_split()
+                # returns always yields a single CHARACTER scalar (rank 0),
+                # matching the analogous _expr_kind case for this same
+                # shape.
+                return 0
             if isinstance(node.value, ast.Name):
                 minfo = self._dict_array_map_info(node.value.id)
                 if minfo is not None and not (
@@ -31871,6 +32034,22 @@ class translator(ast.NodeVisitor):
 
             if isinstance(base_node, ast.Call):
                 base_expr = self.expr(base_node)
+                if (
+                    isinstance(base_node.func, ast.Attribute)
+                    and base_node.func.attr == "split"
+                ):
+                    # str.split(...) codegens to str_split(...), which
+                    # returns type(strvec_t) (needed so the whole vector
+                    # can be passed to str_join/iterated directly) -- but
+                    # subscripting it (e.g. s.split(".")[1]) needs the
+                    # plain character array underneath, via its %v
+                    # component, or index1/index2 below reject it
+                    # outright ("no specific function for the generic
+                    # 'index1'", since none of index1's real/int/logical/
+                    # complex/char overloads accept a strvec_t). Found
+                    # mining TheAlgorithms/Python's own
+                    # maths/decimal_to_fraction.py.
+                    base_expr = f"{base_expr}%v"
                 if (
                     isinstance(idx_node, ast.Tuple)
                     and len(idx_node.elts) == 2
@@ -64677,10 +64856,29 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
         key = id(fn_node)
         cached = _fn_return_cache.get(key)
         if cached is None:
-            cached = tuple(
-                s for s in _walk_fn(fn_node)
-                if isinstance(s, ast.Return) and s.value is not None
-            )
+            # ast.walk is breadth-first, so a shallow top-level `return`
+            # can be collected ahead of an earlier, more deeply nested one
+            # (e.g. a guard-clause `return` inside an `if` at the top of
+            # the function, followed by the main-path `return` at the
+            # function's own top level) -- callers below treat rets[0] as
+            # "the function's first/representative return", so sort back
+            # into source order or that assumption silently picks the
+            # wrong return statement. Found mining TheAlgorithms/Python's
+            # own maths/extended_euclidean_algorithm.py /
+            # chinese_remainder_theorem.py (a recursive tuple-returning
+            # function with exactly this base-case-guard-then-main-path
+            # shape) -- rets[0] ended up being the recursive main-path
+            # return instead of the int-literal base case, so the
+            # tuple-element kinds got derived from the (at that point
+            # still-unresolved) recursive call's own outputs instead,
+            # defaulting to real instead of int.
+            cached = tuple(sorted(
+                (
+                    s for s in _walk_fn(fn_node)
+                    if isinstance(s, ast.Return) and s.value is not None
+                ),
+                key=lambda s: (s.lineno, s.col_offset),
+            ))
             _fn_return_cache[key] = cached
         return cached
 
@@ -72702,6 +72900,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
@@ -73050,6 +73249,7 @@ def transpile_file(
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
@@ -73799,6 +73999,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
