@@ -4880,6 +4880,27 @@ def rewrite_pop_call_expr_to_temp(tree):
         def __init__(self):
             self.hoisted = []
 
+        def generic_visit(self, node):
+            # Nested statement blocks have already been processed by
+            # _Rewriter. Re-entering them here would lift their pop temps
+            # before the enclosing loop/branch, changing execution count
+            # and making conditional mutations unconditional.
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    setattr(node, field, [self.visit(item) if isinstance(item, ast.AST)
+                                         and not isinstance(item, ast.stmt) else item
+                                         for item in value])
+                elif isinstance(value, ast.AST) and not isinstance(value, ast.stmt):
+                    setattr(node, field, self.visit(value))
+            return node
+
+        def visit_While(self, node):
+            # Unlike a for iterable or an if test, a while test is
+            # evaluated repeatedly. A preceding temp is not equivalent.
+            if any(_is_pop_call(n) for n in ast.walk(node.test)):
+                raise NotImplementedError("pop in a while condition requires explicit removal inside the loop")
+            return node
+
         def visit_Call(self, node):
             self.generic_visit(node)
             if not _is_pop_call(node):
@@ -4904,6 +4925,20 @@ def rewrite_pop_call_expr_to_temp(tree):
             return node
 
     class _Rewriter(ast.NodeTransformer):
+        def generic_visit(self, node):
+            # Also process statement blocks owned by try/except and other
+            # compound nodes without teaching the hoister to cross them.
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    if value and all(isinstance(item, ast.stmt) for item in value):
+                        setattr(node, field, self._process_body(value))
+                    else:
+                        setattr(node, field, [self.visit(item) if isinstance(item, ast.AST) else item
+                                             for item in value])
+                elif isinstance(value, ast.AST):
+                    setattr(node, field, self.visit(value))
+            return node
+
         def _process_body(self, stmts):
             out = []
             for st in stmts:

@@ -1,4 +1,4 @@
-"""Remaining blocker: pop must execute inside the loop, not before it."""
+"""Regression example: pop must execute inside the loop, not before it."""
 
 
 def show():

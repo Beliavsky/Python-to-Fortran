@@ -19065,6 +19065,67 @@ def test_xp2f_generator_chained_flatten_sum(tmp_path: Path) -> None:
     )
 
 
+def test_xp2f_pop_stays_inside_loops_and_branches(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xpop_scopes.py", [
+        "def show():",
+        "    values = [1, 2, 3, 4, 5, 6]",
+        "    for i in range(2):",
+        "        for j in range(2):",
+        "            print(values.pop())",
+        "    while len(values) > 0:",
+        "        print(values.pop())",
+        "    print(len(values))",
+        "    values = [7, 8, 9]",
+        "    for i in range(3):",
+        "        if i == 1:",
+        "            print(values.pop(0))",
+        "        else:",
+        "            print(len(values))",
+        "    print(len(values))",
+        "    for i in range(0):",
+        "        print(values.pop())",
+        "    print(len(values))",
+        "show()",
+        "s = {1, 2, 3}",
+        "total = 0",
+        "for i in range(3):",
+        "    total += s.pop()",
+        "print(total, len(s))",
+    ])
+
+
+@pytest.mark.parametrize("source", [
+    "a = [1, 2, 3]\nfor i in range(2):\n    print(a.pop())\n",
+    "a = [1, 2, 3]\nif False:\n    print(a.pop())\n",
+    "a = [1, 2, 3]\nwhile len(a):\n    print(a.pop())\n",
+])
+def test_pop_rewrite_preserves_execution_scope(source: str) -> None:
+    tree = xp2f.rewrite_pop_call_expr_to_temp(ast.parse(source))
+    assert len(tree.body) == 2
+    assert isinstance(tree.body[1].body[0], ast.Assign)
+    assert isinstance(tree.body[1].body[0].value, ast.Call)
+    assert tree.body[1].body[0].value.func.attr == "pop"
+
+
+def test_pop_rewrite_rejects_repeated_condition() -> None:
+    with pytest.raises(NotImplementedError, match="pop in a while condition"):
+        xp2f.rewrite_pop_call_expr_to_temp(ast.parse("while a.pop():\n    pass\n"))
+
+
+@pytest.mark.parametrize("source", [
+    "a = [1, 2, 3]\nfor i in range(3):\n    if a.pop() > 1:\n        print(len(a))\n",
+    "a = [1, 2, 2]\nfor i in range(a.pop()):\n    print(a.pop())\n",
+    "a = [1, 2, 3]\ntry:\n    print(a.pop())\n    raise ValueError()\nexcept ValueError:\n    print(a.pop())\nfinally:\n    print(a.pop())\n",
+    "a = [1, 2, 3]\nwhile len(a) > 1:\n    print(a.pop())\nelse:\n    print(a.pop())\n",
+])
+def test_pop_rewrite_matches_python_execution(source: str) -> None:
+    expected, actual = [], []
+    exec(source, {"print": lambda *args: expected.append(args)})
+    tree = xp2f.rewrite_pop_call_expr_to_temp(ast.parse(source))
+    exec(compile(tree, "<pop rewrite>", "exec"), {"print": lambda *args: actual.append(args)})
+    assert actual == expected
+
+
 def test_xp2f_list_pop_expr_context_index_and_clear_reverse(tmp_path: Path) -> None:
     # Regression test for a cluster of list-method gaps found together
     # via pyccel's own lists.py:

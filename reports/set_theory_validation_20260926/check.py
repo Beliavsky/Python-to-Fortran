@@ -31,8 +31,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", nargs="?", type=Path, default=Path(
         "C:/python/public_domain/burkardt/set_theory/set_theory.py"))
-    parser.add_argument("--allow-known-pop-bug", action="store_true",
-                        help="accept only the documented repeated-41 pop result after checking all other results")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     work = Path(tempfile.mkdtemp(prefix="xp2f_set_theory_validation_"))
@@ -59,8 +57,6 @@ def main():
     popped = outputs[1][2]
     if len(popped) == 5 and set(popped) == expected:
         print("PASS: five distinct valid pops.")
-    elif args.allow_known_pop_bug and popped == [41] * 5:
-        print("KNOWN FAILURE: pop is hoisted outside the loop; Fortran returns 41 five times.")
     else:
         raise AssertionError(f"Incorrect Fortran pop results: {popped}")
 

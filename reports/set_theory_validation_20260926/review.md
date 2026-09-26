@@ -24,16 +24,17 @@ edits to `append_strvec` and `str_split` were preserved, not changed by this fix
 ## Validation
 
 The unchanged full Burkardt source compiles and runs. Checks against Python
-confirm 13 printed sets, cardinality, 11 membership results, and the proper
-subset result. Set order, timestamps, and version banners are not compared.
+confirm 13 printed sets, cardinality, 11 membership results, the proper
+subset result, and five distinct valid pops. Set order, timestamps, and version
+banners are not compared.
 
 ```bat
-python reports\set_theory_validation_20260926\check.py --allow-known-pop-bug
+python reports\set_theory_validation_20260926\check.py
 ```
 
 The script stores the copied source, generated Fortran, and build/run logs in
-a newly created temporary directory printed at startup. Without the explicit
-flag it fails on the remaining pop bug; it does not claim a complete pass.
+a newly created temporary directory printed at startup. The old allowance for
+the known pop bug has been removed; invalid pop results now always fail.
 
 Focused regression coverage includes all six operators, reversed ordering,
 same-size unequal sets, empty sets, character sets, cross-kind sets, a local
@@ -51,16 +52,35 @@ python -m pytest -q -n 2 --reruns 0 tests\test_xp2f_cli.py -k "set_comparison_li
 The first run preceded addition of the two diagnostic tests (now also selected
 by its broader `set_comparison` filter); those two passed in the second run.
 
-## Remaining runtime blocker: pop hoisted outside a loop
+## Fixed follow-up: pop hoisted outside a loop
 
-The original five `J.pop()` calls incorrectly return `41` five times. Generated
-Fortran removes one element before entering the loop and reuses its saved value
+The original five `J.pop()` calls incorrectly returned `41` five times. Generated
+Fortran removed one element before entering the loop and reused its saved value
 on every iteration. Python must remove and return five distinct members of
 `{1, 6, 11, 31, 41}`; their order is not prescribed.
 
-`pop_repro.py` reduces this to three elements. Its generated Fortran likewise
-executes the removal before the loop, then prints the saved `3` three times.
-This separate statement-placement bug is not fixed here.
+`pop_repro.py` reduces this to three elements. Previously its generated Fortran
+executed the removal before the loop, then printed the saved `3` three times.
+
+The expression-hoisting pass was revisiting already-processed nested statement
+blocks. It now stops at statement boundaries, leaving removal assignments in
+their original loop/branch. Other statement blocks (including try/except/finally)
+are processed independently. A pop in a while condition is explicitly rejected:
+moving it before the while would change repeated evaluation into a single call.
+
+The unchanged corpus program now passes the strict validation, including five
+distinct valid pops. Regression tests cover nested loops, while bodies, indexed
+pops, skipped branches, zero-trip loops, set cardinality, and the existing nested
+pop expression cases. AST execution comparisons also cover conditional tests,
+for iterables, exception blocks, and loop else blocks.
+
+Follow-up validation: **10 distinct focused tests passed** (6 tests in 113.93
+seconds, then 8 AST tests in 49.09 seconds, with 4 tests repeated). No full-suite
+run was performed for this follow-up.
+
+```bat
+python -m pytest -q -n 2 --reruns 0 tests\test_xp2f_cli.py -k "pop_stays or pop_rewrite or list_pop_expr"
+```
 
 ## Boundaries
 
