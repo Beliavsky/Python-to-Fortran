@@ -110,6 +110,53 @@ def test_xp2f_local_function_named_set_is_not_builtin_set() -> None:
     assert tree.body[-1].value._xp2f_set_provenance == {"other"}
 
 
+def test_xp2f_string_helper_removed_after_output_normalization(tmp_path: Path) -> None:
+    source = (REPO_ROOT / "reports" / "hv_string_helper_validation_20260925" / "probe.py").read_text(encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xorphan_string_helper.py", source.splitlines())
+    generated = (tmp_path / "xorphan_string_helper_p.f90").read_text(encoding="utf-8")
+    assert "xp2f_string_item" not in generated
+
+
+def test_xp2f_hv_normalization_removes_unused_string_helper(monkeypatch) -> None:
+    class Inspected(Exception):
+        pass
+
+    def inspect(body, funcs):
+        assert not any(getattr(fn, "_xp2f_string_length_helper", False) for fn in funcs)
+        assert any(fn.name == "print_results" for fn in funcs)
+        raise Inspected
+
+    # Stop before expensive emission: exercise the actual full-source rewrite
+    # order, complementing the existing end-to-end CSV numeric comparison.
+    monkeypatch.setattr(xp2f, "annotate_local_set_provenance", inspect)
+    with pytest.raises(Inspected):
+        xp2f.transpile_file(EXAMPLES_DIR / "xfit_hv_no_dates.py", [], False)
+
+
+@pytest.mark.parametrize("reference", ["executable", "function", "default", "none"])
+def test_xp2f_string_helper_pruning_preserves_references_and_user_functions(reference: str) -> None:
+    import copy
+
+    tree = xp2f.rewrite_literal_string_sequence_lengths(ast.parse(
+        "def xp2f_string_item():\n    return 1\n"
+        "words = ['a', 'bbb']\nprint(len(words[0]))\n"))
+    helper = next(n for n in tree.body if getattr(n, "_xp2f_string_length_helper", False))
+    user_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "xp2f_string_item")
+    assert helper.name != user_fn.name
+    helper = copy.deepcopy(helper)  # Metadata must survive specialization copies.
+    funcs = [helper, user_fn]
+    body = []
+    if reference == "executable":
+        body = ast.parse(f"{helper.name}(words, sizes, 0)").body
+    elif reference == "function":
+        funcs += ast.parse(f"def use(words, sizes):\n    return {helper.name}(words, sizes, 0)").body
+    elif reference == "default":
+        funcs += ast.parse(f"def use(callback={helper.name}):\n    return callback").body
+    kept = xp2f.prune_unused_string_length_helpers(body, funcs)
+    assert user_fn in kept
+    assert (helper in kept) == (reference != "none")
+
+
 def test_xp2f_string_sequence_lengths_match_python(tmp_path: Path) -> None:
     source = (REPO_ROOT / "reports" / "string_lengths_validation_20260925" / "probe.py").read_text(encoding="utf-8")
     _run_xp2f_compile_diff(tmp_path, "xstring_lengths.py", source.splitlines())

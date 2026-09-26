@@ -20166,8 +20166,31 @@ def rewrite_literal_string_sequence_lengths(tree):
     text = items[position]
     return text[:lengths[position]]
 ''').body[0]
+        helper._xp2f_string_length_helper = True
         tree.body.insert(0, helper)
     return ast.fix_missing_locations(tree)
+
+
+def prune_unused_string_length_helpers(exec_body, local_funcs):
+    """Drop synthetic accessors whose callers disappeared during normalization.
+
+    With no remaining callers their array element kinds cannot be inferred.
+    Only compiler-generated helpers are eligible: retain all user procedures
+    and any helper referenced by executable code, another function, or a
+    function default. The marker survives deepcopy and avoids name heuristics.
+    """
+    generated = {fn.name for fn in local_funcs
+                 if isinstance(fn, ast.FunctionDef)
+                 and getattr(fn, "_xp2f_string_length_helper", False)}
+    if not generated:
+        return local_funcs
+    referenced = _local_function_refs(exec_body, generated)
+    for fn in local_funcs:
+        if isinstance(fn, ast.FunctionDef):
+            referenced.update(_local_function_refs([fn], generated))
+    return [fn for fn in local_funcs
+            if not isinstance(fn, ast.FunctionDef)
+            or fn.name not in generated or fn.name in referenced]
 
 
 def rewrite_nullable_string_results(tree):
@@ -72996,6 +73019,7 @@ def transpile_file(
     specialize_named_slice_callbacks(effective_tree.body, local_funcs)
     normalize_unused_callable_arguments(effective_tree.body, local_funcs)
 
+    local_funcs = prune_unused_string_length_helpers(effective_tree.body, local_funcs)
     annotate_local_set_provenance(effective_tree.body, local_funcs)
 
     infer_loadtxt_vector_context(effective_tree.body, local_funcs, comment_map)
