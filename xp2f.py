@@ -65509,7 +65509,41 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             rets = list(_returns_in_fn(fn))
             if not rets:
                 continue
-            r0 = rets[0].value
+            def _is_empty_array_literal_expr_local(n):
+                # `return np.array((), dtype=...)` / `return ()` -- a
+                # common "invalid input, bail out with an empty array"
+                # idiom (see the matching _is_empty_array_literal_expr in
+                # translator.visit_Return's own codegen) -- carries no
+                # real rank/kind information (an empty literal is always
+                # a bare rank-1 constructor, regardless of what the
+                # function's OTHER return paths actually produce), so it
+                # must never be treated as "the" representative return
+                # for this whole function. rets is sorted in source
+                # order (see _returns_in_fn's own fix for why), which
+                # picks exactly this sentinel-style guard-clause return
+                # first whenever it's textually the earliest -- found
+                # mining TheAlgorithms/Python's own
+                # linear_algebra/gaussian_elimination.py: `if rows !=
+                # columns: return np.array((), dtype=float)` (first in
+                # source) alongside a normal-path `return <rank-2 array>`
+                # (later) silently collapsed the whole function to rank 1.
+                if isinstance(n, (ast.Tuple, ast.List)) and not n.elts:
+                    return True
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and is_numpy_name_node(n.func.value)
+                    and n.func.attr in {"array", "asarray"}
+                    and len(n.args) >= 1
+                    and isinstance(n.args[0], (ast.Tuple, ast.List))
+                    and not n.args[0].elts
+                ):
+                    return True
+                return False
+            r0 = next(
+                (_r.value for _r in rets if not _is_empty_array_literal_expr_local(_r.value)),
+                rets[0].value,
+            )
             if isinstance(r0, ast.Tuple):
                 kinds = []
                 ranks = []
