@@ -6987,6 +6987,13 @@ def function_is_pure(fn_node, known_pure_calls=None):
         def __init__(self):
             self.ok = True
 
+        def visit_Compare(self, node):
+            if (any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)) for op in node.ops)
+                    and any("set" in getattr(n, "_xp2f_set_provenance", ())
+                            for n in [node.left] + list(node.comparators))):
+                self.ok = False
+            self.generic_visit(node)
+
         def visit_BinOp(self, node):
             # Set operators lower to non-PURE runtime helpers, unlike
             # ordinary arithmetic and Boolean array operators.
@@ -15010,6 +15017,13 @@ def detect_needed_helpers(tree):
             needed.add("unique_char")
             self.generic_visit(node)
 
+        def visit_Compare(self, node):
+            if (any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)) for op in node.ops)
+                    and any("set" in getattr(n, "_xp2f_set_provenance", ())
+                            for n in [node.left] + list(node.comparators))):
+                needed.update({"setdiff1d_int", "setdiff1d_char"})
+            self.generic_visit(node)
+
         def visit_BinOp(self, node):
             if isinstance(node.op, ast.FloorDiv):
                 # Conservative: kind (int vs real) isn't known at this
@@ -19820,6 +19834,12 @@ def annotate_local_set_provenance(body, local_funcs):
         elif isinstance(node, ast.IfExp):
             expression(node.test, env)
             kind = expression(node.body, env) | expression(node.orelse, env)
+        elif isinstance(node, ast.Compare):
+            kinds = [expression(n, env) for n in [node.left] + list(node.comparators)]
+            if (marked and any("set" in k and k != SET for k in kinds)
+                    and any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)) for op in node.ops)):
+                raise NotImplementedError("ambiguous set comparison: use separate functions/variables for sets and arrays")
+            kind = OTHER
         elif isinstance(node, ast.BinOp):
             left, right = expression(node.left, env), expression(node.right, env)
             if isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.Sub)):
@@ -25155,6 +25175,9 @@ class translator(ast.NodeVisitor):
                 return "logical"
             return self._expr_kind(node.operand)
         if isinstance(node, ast.BinOp):
+            if (isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.Sub))
+                    and self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right)):
+                return self._expr_kind(node.left) or self._expr_kind(node.right)
             if isinstance(node.op, ast.Add):
                 lk = self._expr_kind(node.left)
                 rk = self._expr_kind(node.right)
@@ -30207,6 +30230,8 @@ class translator(ast.NodeVisitor):
                 # scalar logical, crashing at runtime the moment a
                 # scalar `any(...)` result was assigned into it).
                 return 0
+            if any(self._is_python_set_expr(n) for n in [node.left] + list(node.comparators)):
+                return 0
             r = self._rank_expr(node.left)
             for c in node.comparators:
                 r = max(r, self._rank_expr(c))
@@ -32836,6 +32861,21 @@ class translator(ast.NodeVisitor):
             return f"merge({self.expr(node.body)}, {self.expr(node.orelse)}, {_test_expr()})"
 
         if isinstance(node, ast.Compare):
+            operands = [node.left] + list(node.comparators)
+            set_comparison = (any(self._is_python_set_expr(n) for n in operands)
+                              and all(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq))
+                                      for op in node.ops))
+            if set_comparison:
+                # SIZE and set difference reuse operands. Do not duplicate
+                # arbitrary calls (or evaluate a chained call eagerly).
+                if len(node.ops) > 1 and not all(isinstance(n, ast.Name) for n in operands):
+                    raise NotImplementedError("chained set comparisons require named operands; assign expressions to variables first")
+                for operand in operands:
+                    for call in (n for n in ast.walk(operand) if isinstance(n, ast.Call)):
+                        if not (isinstance(call.func, ast.Name) and call.func.id == "set"
+                                and "set" not in self.local_func_arg_names
+                                and self._is_python_set_expr(call)):
+                            raise NotImplementedError("set comparison with a call requires assigning its result to a variable first")
             if len(node.ops) != 1 or len(node.comparators) != 1:
                 # A Python chained comparison (`a <= b < c`) is short for
                 # the conjunction of each adjacent pair (`a <= b and b <
@@ -32859,6 +32899,36 @@ class translator(ast.NodeVisitor):
                     parts.append(f"({self.expr(pair)})")
                 return "(" + " .and. ".join(parts) + ")"
             op = type(node.ops[0])
+            if set_comparison:
+                a, b = operands
+                if not all(self._is_python_set_expr(n) for n in operands):
+                    raise NotImplementedError("set comparison requires two consistently set-valued operands; use separate variables/functions for sets and arrays")
+                ka, kb = self._expr_kind(a), self._expr_kind(b)
+                at, bt = self.expr(a), self.expr(b)
+                if ka != kb:
+                    # Integers and strings are disjoint in Python. This
+                    # also handles empty set variables, whose payload
+                    # defaults to integer even beside character sets.
+                    if {ka, kb} == {"int", "char"}:
+                        if op in {ast.Gt, ast.GtE}:
+                            at, bt = bt, at
+                        result = f"(size({at}) == 0)"
+                        if op in {ast.Lt, ast.Gt}:
+                            result = f"({result} .and. size({bt}) > 0)"
+                        elif op in {ast.Eq, ast.NotEq}:
+                            result = f"({result} .and. size({bt}) == 0)"
+                        return f"(.not. {result})" if op is ast.NotEq else result
+                    raise NotImplementedError("set comparisons currently require matching integer or character element types")
+                if ka not in {"int", "char"}:
+                    raise NotImplementedError("set comparisons currently support integer or character elements")
+                if op in {ast.Gt, ast.GtE}:
+                    at, bt = bt, at
+                subset = f"size(setdiff1d_{ka}({at}, {bt})) == 0"
+                if op in {ast.LtE, ast.GtE}:
+                    return f"({subset})"
+                size_op = "<" if op in {ast.Lt, ast.Gt} else "=="
+                result = f"({subset} .and. size({at}) {size_op} size({bt}))"
+                return f"(.not. {result})" if op is ast.NotEq else result
             if op in {ast.Eq, ast.NotEq}:
                 # For supported scalar optional values, equality with None
                 # tests absence, not the numeric sentinel used for some locals.

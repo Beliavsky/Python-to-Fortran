@@ -4741,7 +4741,7 @@ contains
          end if
       end function str_rjust
 
-      subroutine append_strvec(items, tok)
+      pure subroutine append_strvec(items, tok)
          type(strvec_t), intent(inout) :: items
          character(len=*), intent(in) :: tok
          character(len=:), allocatable :: tmp(:)
@@ -4764,7 +4764,7 @@ contains
          call move_alloc(tmp, items%v)
       end subroutine append_strvec
 
-      function str_split(s, sep) result(out)
+      pure function str_split(s, sep) result(out)
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: sep
          type(strvec_t) :: out
@@ -5198,7 +5198,8 @@ contains
          do i = 2, n
             key = tmp(i)
             j = i - 1
-            do while (j >= 1 .and. tmp(j) > key)
+            do while (j >= 1)
+               if (tmp(j) <= key) exit
                tmp(j+1) = tmp(j)
                j = j - 1
             end do

@@ -32,6 +32,51 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+@pytest.mark.parametrize("values", [[1, 2, 3], ["a", "b", "c"]])
+def test_xp2f_set_comparisons_are_scalar(tmp_path: Path, values: list) -> None:
+    lines = [
+        "import numpy as np",
+        "def subset(a, b):",
+        "    return a < b",
+        f"a = set({values[:2]!r})",
+        f"b = set({values!r})",
+        f"same = set({list(reversed(values[:2]))!r})",
+        f"other = set({values[1:]!r})",
+        "empty = a - a",
+        "untyped_empty = set()",
+        "integers = set([8, 9])",
+        "print(subset(a, b), subset(b, a))",
+    ]
+    for left, right in [("a", "b"), ("a", "same"), ("a", "other"),
+                        ("empty", "a"), ("a", "empty"), ("empty", "empty"),
+                        ("set()", "a"), ("a", "set()"),
+                        ("untyped_empty", "empty"), ("integers", "a")]:
+        for op in ("<", "<=", ">", ">=", "==", "!="):
+            lines.extend([f"answer = {left} {op} {right}", "print(answer)"])
+    lines += ["print(empty < a <= b)",
+              "x = np.array([1, 2])", "y = np.array([2, 1])",
+              "z = x < y", "print(z[0], z[1])"]
+    _run_xp2f_compile_diff(tmp_path, "xset_compare.py", lines)
+
+
+def test_xp2f_ambiguous_set_comparison_diagnosed() -> None:
+    tree = ast.parse("def f(a, b):\n    return a < b\nf(set([1]), set([2]))\nf([1], [2])\n")
+    with pytest.raises(NotImplementedError, match="ambiguous set comparison"):
+        xp2f.annotate_local_set_provenance(tree.body, [tree.body[0]])
+
+
+@pytest.mark.parametrize("source, message", [
+    ("def make():\n    print('called')\n    return {1}\na = {1, 2}\nprint(make() < a)\n",
+     "assigning its result to a variable"),
+    ("a = {1}\nb = [1]\nprint(a == b)\n", "two consistently set-valued operands"),
+])
+def test_xp2f_set_comparison_limitations_diagnosed(tmp_path: Path, source: str, message: str) -> None:
+    path = tmp_path / "xset_diagnostic.py"
+    path.write_text(source, encoding="utf-8")
+    with pytest.raises(NotImplementedError, match=message):
+        xp2f.transpile_file(path, [], False)
+
+
 @pytest.mark.parametrize("token, rank", [
     ("dice[3]", 1), ("DICE (3)", 1), ("dice[2,3]", 2),
     ("dice(2,3)", 2), ("dice", 0), ("dices[3]", None),
