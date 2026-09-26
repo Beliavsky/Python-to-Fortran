@@ -5088,6 +5088,26 @@ def rewrite_mutating_call_literal_arg_to_temp(tree):
             if isinstance(st, ast.AugAssign):
                 if isinstance(st.target, (ast.Subscript, ast.Attribute)) and _base_name(st.target) == nm:
                     return True
+            if (
+                isinstance(st, ast.Call)
+                and isinstance(st.func, ast.Attribute)
+                and isinstance(st.func.value, ast.Name)
+                and st.func.value.id == nm
+                and st.func.attr in {"append", "pop", "insert", "extend", "clear", "reverse", "sort"}
+            ):
+                # A list-mutating METHOD call on the bare parameter name
+                # (no Assign/AugAssign statement at all) is exactly as
+                # caller-visible as `nm[i] = ...` -- same fix, same root
+                # cause, as translator._arg_is_assigned's own identical
+                # gap fixed earlier this session. Without this, a
+                # literal argument at a call site to such a function
+                # (e.g. `f([])`) was never hoisted into a temp, and
+                # gfortran rejected the literal directly against the
+                # correctly-inferred intent(inout) dummy. Found mining
+                # TheAlgorithms/Python's own backtracking/
+                # all_subsequences.py: `generate_all_subsequences`
+                # calling `create_state_space_tree(sequence, [], 0)`.
+                return True
         return False
 
     mutated_idx = {}
@@ -45721,6 +45741,18 @@ class translator(ast.NodeVisitor):
             ):
                 continue
             self._force_int_name(_nm, rank_hint=0)
+        # Expose for callers outside this method (e.g.
+        # _emit_local_function's own parameter-kind inference) --
+        # empty_list_append_kind was previously local to this method and
+        # discarded once it returned, even though it already correctly
+        # maps a mutated PARAMETER name (not just a local `t = []`) to
+        # the kind of whatever's been .append()-ed to it. Found mining
+        # TheAlgorithms/Python's own backtracking/all_subsequences.py:
+        # a `current_subsequence` parameter mutated only via
+        # `.append(sequence[index])`/`.pop()` (never a `= []` local
+        # assignment) had no other kind evidence and silently defaulted
+        # to real, then failed to compile against its integer caller.
+        self.empty_list_append_kind = empty_list_append_kind
 
     def validate_unsafe_if_type_merges(self, nodes):
         """Reject mixed-type if-branch merges that would be translated incorrectly.
@@ -60170,6 +60202,45 @@ def _emit_local_function(
                 return True
         return False
 
+    def _appended_sibling_kind_hint(target_arg):
+        # A parameter that's only ever grown via `.append()` and never
+        # passed a non-empty actual at any call site (e.g. a DFS
+        # accumulator always started as `[]`) has no kind evidence of
+        # its own -- but if the appended expression references ANOTHER
+        # of this function's own parameters whose kind IS already known
+        # (from call-site observations recorded in local_func_arg_kinds),
+        # reuse that instead of falling straight to an unconditional
+        # real default. Found mining TheAlgorithms/Python's own
+        # backtracking/all_subsequences.py:
+        # `current_subsequence.append(sequence[index])`, where
+        # `current_subsequence` starts out empty at every call site
+        # (including this function's own recursive self-calls) but
+        # `sequence` (a sibling int-array parameter) is not.
+        for _n in ast.walk(fn):
+            if not (
+                isinstance(_n, ast.Call)
+                and isinstance(_n.func, ast.Attribute)
+                and _n.func.attr == "append"
+                and isinstance(_n.func.value, ast.Name)
+                and _n.func.value.id == target_arg
+                and len(_n.args) == 1
+            ):
+                continue
+            _elt = _n.args[0]
+            while isinstance(_elt, ast.Subscript):
+                _elt = _elt.value
+            if isinstance(_elt, ast.Name) and _elt.id != target_arg:
+                _sib_idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == _elt.id), -1)
+                if (
+                    _sib_idx >= 0
+                    and local_func_arg_kinds is not None
+                    and fn.name in local_func_arg_kinds
+                    and _sib_idx < len(local_func_arg_kinds[fn.name])
+                    and local_func_arg_kinds[fn.name][_sib_idx] in {"int", "real", "logical", "char", "complex"}
+                ):
+                    return local_func_arg_kinds[fn.name][_sib_idx]
+        return None
+
     dict_arg_names = set((dict_arg_types or {}).keys())
     inferred_array_arg_specs = {}
     for a in arg_nodes:
@@ -60263,6 +60334,8 @@ def _emit_local_function(
                 if rr > int(local_func_arg_ranks[fn.name][idx]):
                     local_func_arg_ranks[fn.name][idx] = int(rr)
         if rr > 0:
+            if rk_hint is None:
+                rk_hint = _appended_sibling_kind_hint(a.arg)
             inferred_array_arg_specs[a.arg] = (rk_hint, rr)
             if rk_hint == "int":
                 tr._mark_alloc_int(a.arg, rank=rr)
@@ -61069,6 +61142,31 @@ def _emit_local_function(
                 tr._mark_alloc_complex(_nm, rank=_rr)
                 return
             if _nm in tr.alloc_chars or _nm in tr.chars:
+                tr._mark_alloc_char(_nm, rank=_rr)
+                return
+            # Before defaulting to real, check whether _nm is itself one
+            # of THIS function's own parameters, only ever grown via
+            # `.append()` from another sibling parameter of known kind
+            # (same rationale as _appended_sibling_kind_hint's own
+            # docstring above) -- otherwise a parameter passed onward to
+            # a recursive call of the SAME function (e.g. `create_state_
+            # space_tree(sequence, current_subsequence, index + 1)`)
+            # poisons tr.alloc_reals here before the main arg-declaration
+            # loop below ever gets a chance to consult that same
+            # evidence itself.
+            _sib_hint = None
+            if any(aa.arg == _nm for aa in arg_nodes):
+                _sib_hint = _appended_sibling_kind_hint(_nm)
+            if _sib_hint == "int":
+                tr._mark_alloc_int(_nm, rank=_rr)
+                return
+            if _sib_hint == "logical":
+                tr._mark_alloc_log(_nm, rank=_rr)
+                return
+            if _sib_hint == "complex":
+                tr._mark_alloc_complex(_nm, rank=_rr)
+                return
+            if _sib_hint == "char":
                 tr._mark_alloc_char(_nm, rank=_rr)
                 return
             # Default numeric promotion for unknown/mixed numeric locals.
@@ -62866,6 +62964,29 @@ def _emit_local_function(
                         # whose only appearance is this bare `nm += ...`.
                         if _arg_array_rank(nm) > 0 or "[:" in ann_map.get(nm, ""):
                             return True
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == nm
+                    and n.func.attr in {"append", "pop", "insert", "extend", "clear", "reverse", "sort"}
+                ):
+                    # A list-mutating METHOD call (no Assign/AugAssign
+                    # statement at all) on a bare parameter name is a
+                    # real caller-visible in-place mutation, exactly
+                    # like `nm[i] = ...` -- but neither of the checks
+                    # above ever look at ast.Call/ast.Expr shapes, so a
+                    # parameter mutated ONLY this way (never subscript-
+                    # assigned or reassigned) fell through to the
+                    # default intent(in), non-allocatable declaration.
+                    # The append/pop/etc. codegen itself then crashed
+                    # immediately ("'array' argument of 'allocated'
+                    # intrinsic must be ALLOCATABLE"). Found mining
+                    # TheAlgorithms/Python's own backtracking/
+                    # all_subsequences.py: `current_subsequence.append(
+                    # sequence[index])` / `current_subsequence.pop()`
+                    # directly on the function's own parameter.
+                    return True
         return False
 
     def _arg_is_rebound_name(nm):
@@ -62948,6 +63069,29 @@ def _emit_local_function(
 
         for st in fn.body:
             for n in ast.walk(st):
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == nm
+                    and n.func.attr in {"append", "pop", "insert", "extend", "clear", "reverse", "sort"}
+                ):
+                    # A list-mutating method call on the bare parameter
+                    # (no `nm = ...` reassignment statement at all) needs
+                    # the exact same allocatable rebind as one of the RHS
+                    # shapes below -- the append/pop codegen itself calls
+                    # allocate/deallocate/allocated directly on this
+                    # dummy, which the Fortran standard only permits when
+                    # the dummy itself carries the ALLOCATABLE attribute
+                    # (regardless of whether the actual argument at every
+                    # call site is already allocatable). Same fix, same
+                    # root cause, as translator._arg_is_assigned's own
+                    # identical gap fixed earlier this session. Found
+                    # mining TheAlgorithms/Python's own backtracking/
+                    # all_subsequences.py: `current_subsequence.append(
+                    # ...)`/`.pop()` on a parameter never reassigned via
+                    # `=`.
+                    return True
                 if not isinstance(n, ast.Assign):
                     continue
                 if not any(isinstance(tg, ast.Name) and tg.id == nm for tg in n.targets):
@@ -63534,6 +63678,25 @@ def _emit_local_function(
                 or _arg_real_context(arg)
             ):
                 arg_kind = "real(kind=dp)"
+            elif getattr(tr, "empty_list_append_kind", {}).get(arg) in {"int", "logical", "char", "complex"}:
+                # Last-resort evidence before defaulting to real: a
+                # parameter with no other kind signal here (never
+                # classified into alloc_ints/alloc_logs/alloc_complexes/
+                # alloc_chars above, and never assigned a `= []`
+                # locally either -- so the usual empty_list_append_kind
+                # consumption for THAT shape never applies) can still be
+                # mutated purely via .append()/extend()/etc. calls on
+                # the bare parameter name. prescan's own
+                # empty_list_append_kind already records exactly this
+                # element kind; consulting it here instead of falling
+                # straight to real avoids silently mistyping an
+                # int-only (or char/logical/complex-only) appended-to
+                # parameter. Found mining TheAlgorithms/Python's own
+                # backtracking/all_subsequences.py: `current_subsequence
+                # .append(sequence[index])` on a parameter that starts
+                # out empty at every call site.
+                _elk = tr.empty_list_append_kind[arg]
+                arg_kind = {"int": "integer", "logical": "logical", "char": "character(len=*)", "complex": "complex(kind=dp)"}[_elk]
             else:
                 arg_kind = "real(kind=dp)"
             dims = ",".join(":" for _ in range(arr_rank))
@@ -65928,11 +66091,52 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 tr.dict_var_components[_cpnm] = [
                     nm for nm, _, _, _, _ in (structured_type_components or {}).get(_cptnm, [])
                 ]
+            def _appended_elem_kind_from_sibling_arg(target_arg):
+                # A parameter that's only ever grown via `.append()`
+                # (never reassigned, never passed a non-empty literal at
+                # ANY call site -- e.g. a "current subsequence" DFS
+                # accumulator always started as `[]`) has no rk_h
+                # evidence of its own: every observed call-site actual is
+                # an empty list literal, carrying no element kind. If the
+                # appended expression references ANOTHER of this same
+                # function's own parameters whose kind IS already known
+                # from call-site evidence (rk_h), reuse that kind instead
+                # of falling through to the unconditional real default
+                # below. Found mining TheAlgorithms/Python's own
+                # backtracking/all_subsequences.py:
+                # `current_subsequence.append(sequence[index])`, where
+                # `sequence` (a sibling int-array parameter) is passed a
+                # real, non-empty actual at the top-level call site.
+                for _n in ast.walk(fn):
+                    if not (
+                        isinstance(_n, ast.Call)
+                        and isinstance(_n.func, ast.Attribute)
+                        and _n.func.attr == "append"
+                        and isinstance(_n.func.value, ast.Name)
+                        and _n.func.value.id == target_arg
+                        and len(_n.args) == 1
+                    ):
+                        continue
+                    _elt = _n.args[0]
+                    while isinstance(_elt, ast.Subscript):
+                        _elt = _elt.value
+                    if (
+                        isinstance(_elt, ast.Name)
+                        and _elt.id != target_arg
+                        and _elt.id in arg_idx
+                    ):
+                        _j = arg_idx[_elt.id]
+                        if _j < len(rk_h) and rk_h[_j] in {"int", "real", "logical", "char", "complex"}:
+                            return rk_h[_j]
+                return None
+
             for i, a in enumerate(fn_args_all):
                 if a.arg in _df_param_names or a.arg in _class_param_types:
                     continue
                 rr = rr_h[i] if i < len(rr_h) else 0
                 rk = rk_h[i] if i < len(rk_h) else None
+                if rk is None:
+                    rk = _appended_elem_kind_from_sibling_arg(a.arg)
                 if rr <= 0:
                     # No call-site rank hint available (e.g. this is the
                     # provisional, hint-less pass) -- fall back to a body-usage

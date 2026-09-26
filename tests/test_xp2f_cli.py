@@ -21652,3 +21652,55 @@ def test_xp2f_string_full_reverse_slice(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_append_pop_mutation_on_bare_parameter(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (backtracking/
+    # all_subsequences.py): a function parameter mutated ONLY via
+    # `.append()`/`.pop()` method calls (never a `param[i] = ...`
+    # subscript assignment or a `param = ...` reassignment) was not
+    # recognized as needing Fortran's `intent(inout)` + `allocatable`
+    # dummy-argument treatment at all -- both translator._arg_is_assigned
+    # (drives intent) and the sibling _arg_needs_allocatable_rebind
+    # (drives the allocatable attribute) only ever checked ast.Assign/
+    # ast.AugAssign statements, never an ast.Call method invocation. The
+    # append/pop codegen itself calls allocate/deallocate/allocated
+    # directly on the dummy, so it crashed immediately ("'array'
+    # argument of 'allocated' intrinsic must be ALLOCATABLE") once the
+    # parameter carried any initial evidence of its own element kind.
+    # Also exercises the accompanying literal-argument-to-mutating-call
+    # hoist fix from this session's earlier round (an empty list literal
+    # argument at the top-level call site).
+    src = tmp_path / "xappend_pop_mutation_bare_param.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def fill(source, sink, index):",
+                "    if index == len(source):",
+                "        return",
+                "    sink.append(source[index])",
+                "    fill(source, sink, index + 1)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    acc = [0]",
+                "    fill([1, 2, 3, 4], acc, 0)",
+                "    for i in range(len(acc)):",
+                "        print(acc[i])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
