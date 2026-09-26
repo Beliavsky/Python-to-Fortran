@@ -14374,6 +14374,29 @@ def test_xp2f_local_function_param_case_insensitive_collision_with_module_global
     )
 
 
+@pytest.mark.parametrize("dtype", ["int", "float"])
+def test_xp2f_unique_in_pure_local_function(tmp_path: Path, dtype: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xpure_unique.py", [
+        "import numpy as np",
+        "def distinct(a):",
+        "    return np.unique(a)",
+        "def count_distinct(a):",
+        "    return len(distinct(a))",
+        f"a = np.array([3, 2, 2, 1, 3], dtype={dtype})",
+        "b = distinct(a)",
+        "for i in range(b.size):",
+        "    print(b[i])",
+        "for i in range(a.size):",
+        "    print(a[i])",
+        "print(count_distinct(a))",
+        f"print(count_distinct(np.array([], dtype={dtype})))",
+        f"print(count_distinct(np.array([7], dtype={dtype})))",
+        f"print(count_distinct(np.array([4, 4, 4], dtype={dtype})))",
+    ])
+    generated = (tmp_path / "xpure_unique_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"\bpure\s+function\s+distinct\(", generated)
+
+
 def test_xp2f_sort_correctness_after_merge_sort_rewrite(tmp_path: Path) -> None:
     # Regression test, surfaced by a user's timing report on xpaths.py:
     # at NUM_PATHS=10**5 (with quantile_linear -- used for median/q1/q3

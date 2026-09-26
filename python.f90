@@ -5187,7 +5187,7 @@ contains
          end if
       end function cumsum_real_axis1_2d
 
-      function unique_int(x) result(y)
+      pure function unique_int(x) result(y)
          integer, intent(in) :: x(:)
          integer, allocatable :: y(:)
          integer, allocatable :: tmp(:)
@@ -5709,7 +5709,7 @@ contains
          end do
       end function eye_real
 
-      function unique_real(x) result(y)
+      pure function unique_real(x) result(y)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
          real(kind=dp), allocatable :: tmp(:)
