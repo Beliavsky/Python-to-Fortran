@@ -14756,6 +14756,16 @@ def detect_needed_helpers(tree):
                 needed.add("sort_vec")
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "sort"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id != "np"
+                and len(node.args) == 0
+                and not node.keywords
+            ):
+                # list_var.sort() -- in-place list sort.
+                needed.add("sort_vec")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "argsort"
@@ -25376,6 +25386,19 @@ class translator(ast.NodeVisitor):
             if isinstance(node.op, (ast.BitAnd, ast.BitOr)):
                 if self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right):
                     return self._expr_kind(node.left) or self._expr_kind(node.right)
+                # Python's &/| work on both bool and int operands (only
+                # bool & bool / bool | bool stays bool -- int & bool (or
+                # vice versa) is int, matching + and other arithmetic
+                # ops), but this unconditionally said "logical" even for
+                # a plain int & int -- found mining TheAlgorithms/
+                # Python's own maths/binary_exponentiation.py: `if
+                # exponent & 1:` needs exponent & 1 to be int-typed so
+                # the surrounding `if` truthy-coercion (/= 0) applies,
+                # not treated as already logical.
+                lk = self._expr_kind(node.left)
+                rk = self._expr_kind(node.right)
+                if lk == "int" or rk == "int":
+                    return "int"
                 return "logical"
             lk = self._expr_kind(node.left)
             rk = self._expr_kind(node.right)
@@ -32482,6 +32505,7 @@ class translator(ast.NodeVisitor):
                 ast.MatMult: "matmul",
                 ast.BitAnd: ".and.",
                 ast.BitOr: ".or.",
+                ast.BitXor: "ieor",
                 ast.LShift: "lshift",
                 ast.RShift: "rshift",
             }
@@ -32904,6 +32928,27 @@ class translator(ast.NodeVisitor):
                 return f"ishft({a}, int({b}))"
             if op is ast.RShift:
                 return f"ishft({a}, -int({b}))"
+            if op in (ast.BitAnd, ast.BitOr, ast.BitXor):
+                # Fortran's .and./.or. are LOGICAL-only operators -- unlike
+                # Python's &/|/^, which work equally on int and bool
+                # operands -- so an INTEGER operand needs the intrinsic
+                # bitwise functions (iand/ior/ieor) instead, or gfortran
+                # rejects it outright ("Operands of logical operator
+                # '.or.' ... are INTEGER(4)/INTEGER(4)"). Found mining
+                # TheAlgorithms/Python's own maths/binary_exponentiation.py:
+                # `if exponent & 1:`.
+                if lk0 == "logical" and rk0 == "logical":
+                    if op is ast.BitAnd:
+                        return f"({a} .and. {b})"
+                    if op is ast.BitOr:
+                        return f"({a} .or. {b})"
+                    return f"({a} .neqv. {b})"
+                if lk0 in {"int", "logical"} and rk0 in {"int", "logical"}:
+                    fn = {ast.BitAnd: "iand", ast.BitOr: "ior", ast.BitXor: "ieor"}[op]
+                    a_i = a if lk0 == "int" else f"merge(1, 0, {a})"
+                    b_i = b if rk0 == "int" else f"merge(1, 0, {b})"
+                    return f"{fn}({a_i}, {b_i})"
+                raise NotImplementedError("bitwise operator currently supports only int/bool operands")
             if op is ast.Pow and lk0 == "int" and rk0 == "int" and is_const_negative_int(node.right):
                 # Matches the same rule in _expr_kind: `int ** negative_int`
                 # is always a float in Python, but bare Fortran INTEGER
@@ -41118,6 +41163,39 @@ class translator(ast.NodeVisitor):
                     return tnm
             return None
 
+        # Pre-pass: fully populate empty_list_append_kind from every
+        # .append() call anywhere in the function BEFORE the main
+        # per-statement loop below runs. That loop processes statements
+        # in program order and consults this dict as it goes (to type an
+        # initial `t = []`), but `.append()` calls establishing the
+        # element kind almost always come AFTER the `t = []` that starts
+        # the list -- so without this upfront pass, empty_list_append_kind
+        # is still empty when `t = []` itself is processed, and the
+        # unresolved kind silently defaulted to real. Found mining
+        # TheAlgorithms/Python's own maths/factors.py: `facs = []`
+        # followed only by `facs.append(<int-valued expr>)` calls (no
+        # float ever appended) still got declared `real(kind=dp),
+        # allocatable`.
+        for _n0 in nodes:
+            for _c0 in ast.walk(_n0):
+                if not (
+                    isinstance(_c0, ast.Call)
+                    and isinstance(_c0.func, ast.Attribute)
+                    and _c0.func.attr == "append"
+                    and isinstance(_c0.func.value, ast.Name)
+                    and len(_c0.args) == 1
+                ):
+                    continue
+                _nm0 = self._resolve_list_alias(_c0.func.value.id)
+                _k0 = self._expr_kind(_c0.args[0])
+                if _k0 is None:
+                    continue
+                _prev0 = empty_list_append_kind.get(_nm0)
+                if _prev0 is None:
+                    empty_list_append_kind[_nm0] = _k0
+                elif _prev0 != _k0:
+                    empty_list_append_kind[_nm0] = "real"
+
         for _n in nodes:
             for _m in ast.walk(_n):
                 _record_assigned_names(_m)
@@ -43679,6 +43757,28 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_complex(t.id, rank=1)
                         continue
                     k = self._expr_kind(v)
+                    if k is None and isinstance(v, ast.List) and len(v.elts) == 0:
+                        # `t = []` (an empty list literal) carries no kind
+                        # information of its own -- _expr_kind correctly
+                        # returns None -- but this whole branch's fallback
+                        # for an unresolved kind is an unconditional
+                        # "real", which silently mistyped a plain
+                        # int-only list (e.g. one built via later
+                        # .append(int_expr) calls) as a real array. A
+                        # dedicated later check in this same prescan
+                        # (guarded by self.context == "flat" and keyed off
+                        # empty_list_append_kind, populated by scanning
+                        # the whole function's own .append() call sites)
+                        # already exists for exactly this case, but sits
+                        # in a separate `if`, unreachable once THIS
+                        # branch's own generic isinstance(v, ast.List)
+                        # match (from the k is None fallback below) claims
+                        # the statement first. Consult it here instead.
+                        # Found mining TheAlgorithms/Python's own
+                        # maths/factors.py: `facs = []` followed only by
+                        # `facs.append(<int-valued expr>)` got declared
+                        # `real(kind=dp), allocatable`.
+                        k = empty_list_append_kind.get(t.id)
                     rk_raw = max(0, self._rank_expr(v))
                     rk = max(1, rk_raw)
                     if rk_raw > 0:
@@ -53049,6 +53149,36 @@ class translator(ast.NodeVisitor):
                 rhs = f"real({rhs}, kind=dp)"
             self.o.w(f"{lhs} = mod({lhs}, {rhs})")
             return
+        if isinstance(node.op, ast.LShift):
+            self.o.w(f"{lhs} = ishft({lhs}, int({rhs}))")
+            return
+        if isinstance(node.op, ast.RShift):
+            self.o.w(f"{lhs} = ishft({lhs}, -int({rhs}))")
+            return
+        if isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
+            # Same kind-aware dispatch as the non-augmented BinOp case
+            # (Fortran's .and./.or. are LOGICAL-only, unlike Python's
+            # &=/|=/^=, which also work on int operands) -- found mining
+            # TheAlgorithms/Python's own maths/binary_exponentiation.py:
+            # `exponent >>= 1` alongside `if exponent & 1:` in the same
+            # function.
+            lk = self._expr_kind(node.target)
+            rk = self._expr_kind(node.value)
+            if lk == "logical" and rk == "logical":
+                if isinstance(node.op, ast.BitAnd):
+                    self.o.w(f"{lhs} = ({lhs} .and. {rhs})")
+                elif isinstance(node.op, ast.BitOr):
+                    self.o.w(f"{lhs} = ({lhs} .or. {rhs})")
+                else:
+                    self.o.w(f"{lhs} = ({lhs} .neqv. {rhs})")
+                return
+            if lk in {"int", "logical"} and rk in {"int", "logical"}:
+                fn = {ast.BitAnd: "iand", ast.BitOr: "ior", ast.BitXor: "ieor"}[type(node.op)]
+                lhs_i = lhs if lk == "int" else f"merge(1, 0, {lhs})"
+                rhs_i = rhs if rk == "int" else f"merge(1, 0, {rhs})"
+                self.o.w(f"{lhs} = {fn}({lhs_i}, {rhs_i})")
+                return
+            raise NotImplementedError("bitwise augassign currently supports only int/bool operands")
         raise NotImplementedError("unsupported augassign op")
 
     def visit_Raise(self, node):
@@ -56159,6 +56289,24 @@ class translator(ast.NodeVisitor):
             # (safe even for a length-0 or length-1 array).
             name = self._resolve_list_alias(c.func.value.id)
             self.o.w(f"{name} = {name}(size({name}):1:-1)")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and c.func.attr == "sort"
+            and isinstance(c.func.value, ast.Name)
+            and len(c.args) == 0
+            and not c.keywords
+            and self._rank_expr(ast.Name(id=self._resolve_list_alias(c.func.value.id), ctx=ast.Load())) == 1
+        ):
+            # list_var.sort() -- in-place ascending sort, same shape as
+            # .reverse()/.clear() above. python.f90's sort_vec generic
+            # interface (already used for np.sort()/sorted()) dispatches
+            # on the array's own real/int/char element type. Found
+            # mining TheAlgorithms/Python's own maths/factors.py:
+            # `facs.sort()` on a dynamically-appended list.
+            name = self._resolve_list_alias(c.func.value.id)
+            self.o.w(f"call sort_vec({name})")
             return
 
         def _emit_sys_exit_call(exit_name, args):
@@ -60510,7 +60658,30 @@ def _emit_local_function(
                     _rr = _src_rr
         if _rr <= 0:
             continue
-        _kk = tr._expr_kind(_rhs) or "real"
+        _kk = tr._expr_kind(_rhs)
+        if _kk is None and (
+            _nm in tr.alloc_ints
+            or _nm in tr.alloc_reals
+            or _nm in tr.alloc_logs
+            or _nm in tr.alloc_chars
+            or _nm in tr.alloc_complexes
+        ):
+            # _nm is already classified -- most likely by prescan's own
+            # more careful analysis (e.g. empty_list_append_kind for a
+            # dynamically-.append()-grown list). An unresolved kind here
+            # is typically a self-referential growth/accumulation
+            # expression (e.g. the capacity-doubling rewrite of
+            # `lst.append(x)`, which references lst itself) that
+            # tr._expr_kind can't meaningfully resolve -- not real
+            # evidence of anything -- so don't downgrade to an arbitrary
+            # "real" default and silently lose that earlier, better-
+            # informed classification. Found mining TheAlgorithms/
+            # Python's own maths/factors.py: `facs = []` followed only by
+            # `facs.append(<int-valued expr>)` calls got correctly
+            # classified alloc_int by prescan, then unconditionally
+            # reclassified alloc_real right here.
+            continue
+        _kk = _kk or "real"
         if _kk == "int":
             tr._mark_alloc_int(_nm, rank=_rr)
         elif _kk == "logical":
@@ -65594,6 +65765,20 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                                 kinds.append("alloc_complex")
                             elif lk_local == "char":
                                 kinds.append("alloc_char")
+                            elif lk_local is None and nm in tr.alloc_ints:
+                                # Same fix as the scalar-return case below
+                                # (see its own comment for the full
+                                # rationale): _infer_local_name_spec found
+                                # a rank but no kind for a tuple ELEMENT
+                                # too -- e.g. `return i, items` where
+                                # `items = []` is only ever grown via
+                                # `.append()` -- and this is a SEPARATE
+                                # copy of that same per-element loop, so
+                                # needs the identical guard against
+                                # silently downgrading to real. Found
+                                # mining the test suite's own
+                                # test_xp2f_return_appended_list_with_reserved_name.
+                                kinds.append("alloc_int")
                             else:
                                 kinds.append("alloc_real")
                             ranks.append(int(lr_local))
@@ -65784,6 +65969,19 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         spec = "alloc_complex"
                     elif lk_local == "char":
                         spec = "alloc_char"
+                    elif lk_local is None and nm in tr.alloc_ints:
+                        # _infer_local_name_spec found a rank (e.g. from
+                        # `nm = []` alone) but no kind for its own direct-
+                        # assignment scan -- that scan never looks at
+                        # .append() calls at all, so it can't see the
+                        # evidence prescan's own empty_list_append_kind
+                        # already used to correctly classify nm as an
+                        # int array. Don't let this weaker, kind-blind
+                        # scan silently downgrade that to real. Found
+                        # mining TheAlgorithms/Python's own maths/
+                        # factors.py: `facs = []` followed only by
+                        # `facs.append(<int-valued expr>)` calls.
+                        spec = "alloc_int"
                     else:
                         spec = "alloc_real"
                     rr_spec = int(lr_local)
@@ -66671,6 +66869,47 @@ def generate_flat(
                 if "int" in dt:
                     return _ret("int")
 
+        def _self_multiplied():
+            # nm *= nm (or nm = nm * nm) -- squaring a value only makes
+            # sense for a general numeric quantity, never for something
+            # used purely as an array index/count, so this is strong
+            # contrary evidence against the weaker "seen as a %/// operand
+            # somewhere, so it must be int" heuristic just below. Found
+            # mining TheAlgorithms/Python's own maths/
+            # binary_exponentiation.py: binary_exp_mod_iterative(1.5, 4, 3)
+            # squares its own `base` parameter every loop iteration
+            # (`base *= base`) while ALSO using it as a %-operand
+            # (`base % modulus`) -- Python's % works on floats too, so
+            # that usage alone never actually implied int, but nothing
+            # else in the body offers the "explicit real evidence" the
+            # merge step elsewhere requires to override a plain "int"
+            # conclusion here, silently discarding the correct real
+            # call-site evidence (base=1.5).
+            for _n in ast.walk(fn):
+                if (
+                    isinstance(_n, ast.AugAssign)
+                    and isinstance(_n.op, ast.Mult)
+                    and isinstance(_n.target, ast.Name)
+                    and _n.target.id == nm
+                    and isinstance(_n.value, ast.Name)
+                    and _n.value.id == nm
+                ):
+                    return True
+                if (
+                    isinstance(_n, ast.Assign)
+                    and len(_n.targets) == 1
+                    and isinstance(_n.targets[0], ast.Name)
+                    and _n.targets[0].id == nm
+                    and isinstance(_n.value, ast.BinOp)
+                    and isinstance(_n.value.op, ast.Mult)
+                    and isinstance(_n.value.left, ast.Name)
+                    and _n.value.left.id == nm
+                    and isinstance(_n.value.right, ast.Name)
+                    and _n.value.right.id == nm
+                ):
+                    return True
+            return False
+
         for st in fn.body:
             for n in ast.walk(st):
                 if not (
@@ -66683,6 +66922,8 @@ def generate_flat(
                 ):
                     continue
                 if isinstance(n.op, ast.Mod) and isinstance(n.left, ast.Constant) and isinstance(n.left.value, str):
+                    continue
+                if _self_multiplied():
                     continue
                 return _ret("int")
 
@@ -66712,6 +66953,23 @@ def generate_flat(
                 tgt = node.target
                 rhs_kind = tr_local._expr_kind(node.value)
             else:
+                return None
+            if _contains_name_ref(node.value):
+                # The RHS references nm itself (most commonly a
+                # self-referential augmented assignment like `base *=
+                # base`, but also possible via a plain Assign) -- asking
+                # tr_local (a blank-slate translator seeded with no
+                # parameter kind hints at all) for nm's OWN kind here is
+                # circular: prescan defaults an otherwise-unclassified
+                # scalar to "int", so this always reports back "int"
+                # regardless of nm's real kind, which then got trusted as
+                # "strong" evidence and silently overrode correct
+                # call-site kind evidence (e.g. a real argument that gets
+                # squared via `base *= base` in a loop). Found mining
+                # TheAlgorithms/Python's own maths/
+                # binary_exponentiation.py: binary_exp_iterative(1.5, 4)
+                # silently computed the wrong result because `base` got
+                # declared INTEGER instead of REAL.
                 return None
             if rhs_kind not in {"int", "logical", "char", "complex", "real"}:
                 return None
@@ -70335,11 +70593,28 @@ def generate_flat(
         except Exception:
             inferred_arg_kind = None
         if inferred_arg_kind == "int" and not _fn_arg_has_explicit_real_evidence(fn, arg0):
-            pairs = {(k, r) for (k, r) in pairs if k != "real"}
-            triads = {(k, r, is_list) for (k, r, is_list) in triads if k != "real"}
+            # Only narrow an actually-ambiguous candidate set -- never let
+            # a body-only heuristic (inferred_arg_kind is derived purely
+            # from usages inside fn, blind to call-site evidence) erase
+            # the SOLE real candidate that real call-site observations
+            # already established. Found mining TheAlgorithms/Python's
+            # own maths/binary_exponentiation.py: base's only body
+            # evidence was `base % modulus` (Mod doesn't actually imply
+            # int -- Python's % works on floats too) with no other
+            # explicit-real marker in the body, so this filter emptied
+            # out the one real (base=1.5) candidate observed at the
+            # actual call site.
+            _pairs_wo_real = {(k, r) for (k, r) in pairs if k != "real"}
+            _triads_wo_real = {(k, r, is_list) for (k, r, is_list) in triads if k != "real"}
+            if _pairs_wo_real:
+                pairs = _pairs_wo_real
+                triads = _triads_wo_real
         if _fn_arg_has_integer_normalization(fn, arg0):
-            pairs = {(k, r) for (k, r) in pairs if k != "real"}
-            triads = {(k, r, is_list) for (k, r, is_list) in triads if k != "real"}
+            _pairs_wo_real = {(k, r) for (k, r) in pairs if k != "real"}
+            _triads_wo_real = {(k, r, is_list) for (k, r, is_list) in triads if k != "real"}
+            if _pairs_wo_real:
+                pairs = _pairs_wo_real
+                triads = _triads_wo_real
         if len(pairs) <= 1:
             continue
         specs = []
@@ -70433,11 +70708,23 @@ def generate_flat(
                 prs = {("logical", r) if k == "int" and int(r) == 0 else (k, r) for (k, r) in prs}
                 trs = {("logical", r, is_list) if k == "int" and int(r) == 0 else (k, r, is_list) for (k, r, is_list) in trs}
             if inferred_arg_kind == "int" and not _fn_arg_has_explicit_real_evidence(fn, arg_nm):
-                prs = {(k, r) for (k, r) in prs if k != "real"}
-                trs = {(k, r, is_list) for (k, r, is_list) in trs if k != "real"}
+                # Only narrow an actually-ambiguous candidate set -- see
+                # the matching comment on the sibling single-arg case
+                # above (same fix, same root cause: a body-only "int"
+                # heuristic blind to call-site evidence must never erase
+                # the sole real candidate real call-site observations
+                # already established).
+                _prs_wo_real = {(k, r) for (k, r) in prs if k != "real"}
+                _trs_wo_real = {(k, r, is_list) for (k, r, is_list) in trs if k != "real"}
+                if _prs_wo_real:
+                    prs = _prs_wo_real
+                    trs = _trs_wo_real
             if _fn_arg_has_integer_normalization(fn, arg_nm):
-                prs = {(k, r) for (k, r) in prs if k != "real"}
-                trs = {(k, r, is_list) for (k, r, is_list) in trs if k != "real"}
+                _prs_wo_real = {(k, r) for (k, r) in prs if k != "real"}
+                _trs_wo_real = {(k, r, is_list) for (k, r, is_list) in trs if k != "real"}
+                if _prs_wo_real:
+                    prs = _prs_wo_real
+                    trs = _trs_wo_real
             if _char_scalar_arg_pattern(fn, arg_nm):
                 prs = {("char", 0)}
                 trs = {("char", 0, False)}
@@ -70639,6 +70926,46 @@ def generate_flat(
                     return _node.id == _arg_nm
                 return any(_name_requires_integer_value(child)
                            for child in ast.iter_child_nodes(_node))
+            def _is_self_multiplied():
+                # `_arg_nm *= _arg_nm` (or `_arg_nm = _arg_nm * _arg_nm`)
+                # -- squaring a value only makes sense for a general
+                # numeric quantity, so this is strong contrary evidence
+                # against the FloorDiv/Mod check below, whose own
+                # docstring-equivalent comment above already documents
+                # that Python's `//`/`%` stay real-valued for a float
+                # operand and don't actually imply int on their own.
+                # Found mining TheAlgorithms/Python's own maths/
+                # binary_exponentiation.py: binary_exp_mod_iterative's
+                # `base` is squared every iteration (`base *= base`) AND
+                # appears as a %-operand (`base % modulus`); this
+                # duplicate FloorDiv/Mod-implies-int heuristic (a second,
+                # separate copy of the same check already guarded in
+                # _infer_arg_kind_in_fn) ran in a LATER pass and clobbered
+                # the correctly-merged "real" kind back to "int".
+                for _n in ast.walk(fn):
+                    if (
+                        isinstance(_n, ast.AugAssign)
+                        and isinstance(_n.op, ast.Mult)
+                        and isinstance(_n.target, ast.Name)
+                        and _n.target.id == _arg_nm
+                        and isinstance(_n.value, ast.Name)
+                        and _n.value.id == _arg_nm
+                    ):
+                        return True
+                    if (
+                        isinstance(_n, ast.Assign)
+                        and len(_n.targets) == 1
+                        and isinstance(_n.targets[0], ast.Name)
+                        and _n.targets[0].id == _arg_nm
+                        and isinstance(_n.value, ast.BinOp)
+                        and isinstance(_n.value.op, ast.Mult)
+                        and isinstance(_n.value.left, ast.Name)
+                        and _n.value.left.id == _arg_nm
+                        and isinstance(_n.value.right, ast.Name)
+                        and _n.value.right.id == _arg_nm
+                    ):
+                        return True
+                return False
             for _n in ast.walk(fn):
                 if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == "range":
                     if any(_name_requires_integer_value(_a) for _a in _n.args):
@@ -70649,7 +70976,7 @@ def generate_flat(
                     if (
                         (isinstance(_n.left, ast.Name) and _n.left.id == _arg_nm)
                         or (isinstance(_n.right, ast.Name) and _n.right.id == _arg_nm)
-                    ):
+                    ) and not _is_self_multiplied():
                         return True
                 if (
                     isinstance(_n, ast.Subscript)

@@ -21079,3 +21079,154 @@ def test_xp2f_split_subscript_outside_plain_assignment(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_bitwise_int_operators_and_augassign(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/
+    # binary_exponentiation.py): Python's &/|/^ work on both int and bool
+    # operands, but Fortran's .and./.or. are LOGICAL-only -- an integer
+    # `n & 1` produced invalid Fortran ("Operands of logical operator
+    # '.or.' ... are INTEGER(4)/INTEGER(4)"). Separately, >>=/<<=/&=/|=/^=
+    # were entirely unimplemented ("unsupported augassign op"). Fixed by
+    # adding kind-aware iand/ior/ieor dispatch for int operands (keeping
+    # .and./.or./.neqv. for genuinely logical ones) to both the plain
+    # BinOp and AugAssign codegen paths.
+    src = tmp_path / "xbitwise_int_ops.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def binary_exp_iterative(base, exponent):",
+                "    res = 1.0",
+                "    while exponent > 0:",
+                "        if exponent & 1:",
+                "            res *= base",
+                "        base *= base",
+                "        exponent >>= 1",
+                "    return res",
+                "",
+                "",
+                "def f(n):",
+                "    return n & 1, n | 2, n ^ 3",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(binary_exp_iterative(3.0, 5))",
+                "    print(binary_exp_iterative(1.5, 4))",
+                "    a, b, c = f(10)",
+                "    print(a, b, c)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_list_sort_in_place(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/factors.py):
+    # list_var.sort() (in-place ascending sort) was entirely
+    # unimplemented ("unsupported expression call: facs.sort()"). Fixed
+    # by reusing the existing sort_vec runtime interface already used by
+    # sorted()/np.sort().
+    src = tmp_path / "xlist_sort_in_place.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def factors_of_a_number(num):",
+                "    facs = []",
+                "    facs.append(1)",
+                "    if num == 1:",
+                "        return facs",
+                "    facs.append(num)",
+                "    for i in range(2, num):",
+                "        if num % i == 0:",
+                "            facs.append(i)",
+                "    facs.sort()",
+                "    return facs",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    r = factors_of_a_number(24)",
+                "    for i in range(len(r)):",
+                "        print(r[i])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_scalar_return_of_int_only_appended_list(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (maths/factors.py): a
+    # function whose sole (non-tuple) return is a list built via `x = []`
+    # followed only by `x.append(<int expr>)` calls (no float ever
+    # appended) got declared `real(kind=dp), allocatable` instead of
+    # `integer, allocatable`. Traced through a chain of unresolved-kind-
+    # defaults-to-real bugs: empty_list_append_kind was consulted before
+    # being populated (an ordering bug), a "rank-recovery" pass
+    # unconditionally reset to real on an unresolved kind, and a
+    # scalar-return-kind helper (_infer_local_name_spec) that never looks
+    # at .append() calls at all defaulted to real whenever it found a
+    # rank but no kind. All three fixed.
+    src = tmp_path / "xscalar_return_int_appended_list.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def factors_of_a_number(num):",
+                "    facs = []",
+                "    if num < 1:",
+                "        return facs",
+                "    facs.append(1)",
+                "    if num == 1:",
+                "        return facs",
+                "    facs.append(num)",
+                "    for i in range(2, num):",
+                "        if num % i == 0:",
+                "            facs.append(i)",
+                "    return facs",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    r = factors_of_a_number(24)",
+                "    for i in range(len(r)):",
+                "        print(r[i])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
