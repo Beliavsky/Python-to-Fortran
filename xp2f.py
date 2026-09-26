@@ -4617,6 +4617,21 @@ def rewrite_listcomp_zip_target_to_index(tree):
                 return ast.copy_location(
                     ast.Subscript(value=copy.deepcopy(base), slice=idx_expr, ctx=ast.Load()), node
                 )
+            # Any OTHER Name (e.g. `min`/`max` in `min(left, right) -
+            # height`, or an unrelated variable reference) must be left
+            # completely untouched. ast.NodeTransformer treats a visitor
+            # method returning None as "delete this node from its
+            # parent" -- for a single-value field like Call.func, that
+            # SILENTLY REMOVES the field outright rather than leaving it
+            # alone, corrupting the Call node (later crashing with
+            # "'Call' object has no attribute 'func'" the next time
+            # anything accesses it). Missing this fallback was invisible
+            # as long as every element expression touched by this
+            # rewrite was itself just a bare Name/BinOp of mapped names,
+            # but broke as soon as one wrapped them in a function call --
+            # found mining TheAlgorithms/Python's own dynamic_
+            # programming/trapped_water.py: `min(left, right) - height`.
+            return node
 
     class _Rewriter(ast.NodeTransformer):
         def visit_ListComp(self, node):
@@ -4698,6 +4713,19 @@ def rewrite_listcomp_zip_target_to_index(tree):
                     gen,
                 )
             return node
+
+        # ast.GeneratorExp (sum(... for ... in zip(...)), any(...), etc.)
+        # has the exact same shape as ast.ListComp (.elt/.generators) --
+        # without this alias, a bare generator expression passed to
+        # sum()/any()/all()/... with a zip()/enumerate() tuple target
+        # never got this rewrite (only a literal `[...]` list
+        # comprehension did), so it fell through to the unrelated
+        # "ListComp currently supports only single-generator form"
+        # rejection despite having exactly one generator clause. Found
+        # mining TheAlgorithms/Python's own dynamic_programming/
+        # trapped_water.py: `sum(min(l, r) - h for l, r, h in
+        # zip(left_max, right_max, heights))`.
+        visit_GeneratorExp = visit_ListComp
 
     new_tree = _Rewriter().visit(tree)
     ast.fix_missing_locations(new_tree)
@@ -4974,6 +5002,206 @@ def rewrite_pop_call_expr_to_temp(tree):
 
         def visit_If(self, node):
             node.test = node.test
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_For(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_While(self, node):
+            node.body = self._process_body(node.body)
+            node.orelse = self._process_body(node.orelse)
+            return node
+
+        def visit_With(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_Module(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+    new_tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return new_tree
+
+
+def rewrite_mutating_call_literal_arg_to_temp(tree):
+    """Hoist a non-variable actual argument (a list/tuple literal, a call
+    result, an arithmetic expression, ...) passed to a positional
+    parameter that the callee MUTATES in place (`param[i] = ...`,
+    `param[i][j] += ...`, ...) into a preceding temp-variable assignment,
+    replacing the original argument expression with a reference to that
+    temp.
+
+    This project's own local-function codegen defaults every array
+    parameter that's written through a subscript/attribute anywhere in
+    the callee's body to Fortran `intent(inout)` (matching Python's own
+    in-place list-mutation semantics) -- correct for the common case of
+    passing an already-named variable, but a direct literal/expression
+    actual argument at such a call site is not a valid Fortran
+    "variable" and gfortran rejects it outright ("Non-variable
+    expression in variable definition context (actual argument to
+    INTENT = OUT/INOUT)"). Found mining TheAlgorithms/Python's own
+    dynamic_programming/minimum_cost_path.py:
+    `minimum_cost_path([[2, 1], [3, 1], [4, 2]])` -- `minimum_cost_path`
+    mutates its own `matrix` parameter in place (`matrix[0][i] +=
+    matrix[0][i - 1]`), so the literal 2D list passed directly at the
+    call site needs hoisting into a named temp first.
+
+    Deliberately syntactic (mirrors the translator's own
+    `_target_mutates_arg`/AugAssign-on-subscript intent-inference
+    criteria at the plain-AST level, needing no type/rank information):
+    a parameter is "mutated" here iff the callee body ever assigns
+    (Assign or AugAssign) through a Subscript/Attribute chain whose
+    ultimate base is that parameter name. A bare Name/Subscript/
+    Attribute actual argument is already a valid Fortran variable
+    reference and is left untouched -- only literals/calls/expressions
+    get hoisted.
+    """
+    funcs = {
+        fn.name: fn
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def _base_name(expr):
+        cur = expr
+        while isinstance(cur, (ast.Subscript, ast.Attribute)):
+            cur = cur.value
+        return cur.id if isinstance(cur, ast.Name) else None
+
+    def _target_mutates(target, nm):
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return any(_target_mutates(elt, nm) for elt in target.elts)
+        return isinstance(target, (ast.Subscript, ast.Attribute)) and _base_name(target) == nm
+
+    def _param_mutated_in_fn(fn, nm):
+        for st in ast.walk(fn):
+            if isinstance(st, ast.Assign):
+                for tg in st.targets:
+                    if _target_mutates(tg, nm):
+                        return True
+            if isinstance(st, ast.AugAssign):
+                if isinstance(st.target, (ast.Subscript, ast.Attribute)) and _base_name(st.target) == nm:
+                    return True
+        return False
+
+    mutated_idx = {}
+    for name, fn in funcs.items():
+        arg_names = [a.arg for a in fn.args.args]
+        idxs = {i for i, a in enumerate(arg_names) if _param_mutated_in_fn(fn, a)}
+        if idxs:
+            mutated_idx[name] = idxs
+
+    if not mutated_idx:
+        return tree
+
+    def _is_simple_actual(node):
+        cur = node
+        while isinstance(cur, (ast.Subscript, ast.Attribute)):
+            cur = cur.value
+        return isinstance(cur, ast.Name)
+
+    def _call_needs_hoist(node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in mutated_idx
+            and any(
+                i < len(node.args) and not _is_simple_actual(node.args[i])
+                for i in mutated_idx[node.func.id]
+            )
+        )
+
+    counter = [0]
+    existing_names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            existing_names.add(n.id)
+        elif isinstance(n, ast.arg):
+            existing_names.add(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            existing_names.add(n.name)
+
+    def _next_tmp():
+        while True:
+            counter[0] += 1
+            cand = f"mut_arg_tmp_{counter[0]}"
+            if cand not in existing_names:
+                existing_names.add(cand)
+                return cand
+
+    class _Hoister(ast.NodeTransformer):
+        def __init__(self):
+            self.hoisted = []
+
+        def generic_visit(self, node):
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    setattr(node, field, [self.visit(item) if isinstance(item, ast.AST)
+                                         and not isinstance(item, ast.stmt) else item
+                                         for item in value])
+                elif isinstance(value, ast.AST) and not isinstance(value, ast.stmt):
+                    setattr(node, field, self.visit(value))
+            return node
+
+        def visit_While(self, node):
+            if any(_call_needs_hoist(n) for n in ast.walk(node.test)):
+                raise NotImplementedError(
+                    "mutating call with a literal argument in a while condition "
+                    "requires explicit hoisting inside the loop"
+                )
+            return node
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if not (isinstance(node.func, ast.Name) and node.func.id in mutated_idx):
+                return node
+            for i in mutated_idx[node.func.id]:
+                if i < len(node.args) and not _is_simple_actual(node.args[i]):
+                    tmp = _next_tmp()
+                    assign = ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=node.args[i])
+                    ast.copy_location(assign, node)
+                    ast.fix_missing_locations(assign)
+                    self.hoisted.append(assign)
+                    node.args[i] = ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), node)
+            return node
+
+        def visit_FunctionDef(self, node):
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            return node
+
+        def visit_Lambda(self, node):
+            return node
+
+    class _Rewriter(ast.NodeTransformer):
+        def _process_body(self, stmts):
+            out = []
+            for st in stmts:
+                st = self.visit(st)
+                if st is None:
+                    continue
+                hoister = _Hoister()
+                new_st = hoister.visit(st)
+                out.extend(hoister.hoisted)
+                out.append(new_st)
+            return out
+
+        def visit_FunctionDef(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            node.body = self._process_body(node.body)
+            return node
+
+        def visit_If(self, node):
             node.body = self._process_body(node.body)
             node.orelse = self._process_body(node.orelse)
             return node
@@ -13785,6 +14013,21 @@ def template_derived_needed_helpers(structured_type_components):
 
 def detect_needed_helpers(tree):
     needed = set()
+    for node in ast.walk(tree):
+        # `s[::-1]` (full-string reversal) lowers to a call to the
+        # str_reverse runtime helper in translator.expr's own Subscript
+        # codegen -- unlike every other helper this function detects,
+        # that codegen path is driven by a Subscript node, not a Call,
+        # so it needs its own scan here rather than falling out of the
+        # existing node.func-based Call scanning below.
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Slice)
+            and node.slice.lower is None
+            and node.slice.upper is None
+            and is_const_number_value(node.slice.step, -1)
+        ):
+            needed.add("str_reverse")
     linalg_aliases = collect_linalg_aliases(tree)
     scipy_aliases, _ = collect_scipy_special_aliases(tree)
     statistics_aliases, statistics_func_aliases = collect_statistics_aliases(tree)
@@ -33013,7 +33256,23 @@ class translator(ast.NodeVisitor):
                 t = self.expr(node.operand)
                 k = self._expr_kind(node.operand)
                 r = max(0, int(self._rank_expr(node.operand)))
-                if k != "logical":
+                if k == "char":
+                    # Python truthiness for a string is "is it non-empty",
+                    # never a numeric zero-test -- comparing a CHARACTER
+                    # expression against integer 0 (the fallthrough below)
+                    # is a hard gfortran type-mismatch error. Matches the
+                    # len_trim(...)-based idiom visit_If's own
+                    # _if_test_expr already uses for exactly this case;
+                    # this sibling copy (UnaryOp Not, standalone from an
+                    # if-test) was missing it. Found mining
+                    # TheAlgorithms/Python's own dynamic_programming/
+                    # longest_common_substring.py: `if not text1 or not
+                    # text2: return ""`.
+                    if r > 0:
+                        t = f"any(len_trim({t}) > 0)"
+                    else:
+                        t = f"(len_trim({t}) > 0)"
+                elif k != "logical":
                     if r > 0:
                         t = f"any(({t}) /= 0)"
                     else:
@@ -33042,7 +33301,18 @@ class translator(ast.NodeVisitor):
                 t = self.expr(v)
                 k = self._expr_kind(v)
                 r = max(0, int(self._rank_expr(v)))
-                if k != "logical":
+                if k == "char":
+                    # Same char-truthiness fix as the sibling UnaryOp Not
+                    # case just above: `if text1 or text2:` truthy-tests
+                    # a bare string operand directly (no `not`), which
+                    # would otherwise fall through to the numeric `/= 0`
+                    # comparison and hit the same CHARACTER/INTEGER
+                    # type-mismatch compile error.
+                    if r > 0:
+                        t = f"any(len_trim({t}) > 0)"
+                    else:
+                        t = f"(len_trim({t}) > 0)"
+                elif k != "logical":
                     if r > 0:
                         t = f"any(({t}) /= 0)"
                     else:
@@ -33782,6 +34052,24 @@ class translator(ast.NodeVisitor):
             if base_kind == "char" and base_rank == 0:
                 char_len_expr = f"len({base})"
                 if isinstance(node.slice, ast.Slice):
+                    if (
+                        node.slice.lower is None
+                        and node.slice.upper is None
+                        and node.slice.step is not None
+                        and is_const_number_value(node.slice.step, -1)
+                    ):
+                        # `s[::-1]` -- Python's idiomatic full-string
+                        # reversal. Fortran substrings have no stride
+                        # argument at all (unlike an array section,
+                        # which DOES support a negative-stride `a(j:i:-1)`
+                        # -- see the sibling collapse a few lines above
+                        # this block), so this narrow, overwhelmingly
+                        # common special case is lowered to a dedicated
+                        # runtime helper rather than raising outright.
+                        # Found mining TheAlgorithms/Python's own
+                        # dynamic_programming/longest_palindromic_
+                        # subsequence.py: `rev = input_string[::-1]`.
+                        return f"str_reverse({base})"
                     if node.slice.step is not None and not is_const_number_value(node.slice.step, 1):
                         raise NotImplementedError("character slicing with step is not supported")
                     if node.slice.lower is None and node.slice.upper is None:
@@ -62936,7 +63224,26 @@ def _emit_local_function(
                 and idx < len(local_func_arg_kinds[fn.name])
             ):
                 local_func_arg_kinds[fn.name][idx] = "int"
-        elif hint_kind in {None, "real", "int"} and _arg_used_in_logical_ops(arg):
+        elif (
+            hint_kind in {None, "real", "int"}
+            and _arg_used_in_logical_ops(arg)
+            and _arg_array_rank(arg) == 0
+        ):
+            # `if not heights:` is Python's idiomatic "is this sequence
+            # empty" check -- _arg_used_in_logical_ops treats any bare
+            # `not <arg>` as evidence `arg` is itself a logical SCALAR,
+            # which is right for a genuine boolean flag but wrong for an
+            # array/list parameter merely being emptiness-tested. Without
+            # the rank guard, the callee's own dummy stayed a correctly-
+            # inferred integer array (a later, rank-aware pass overrides
+            # this same hint_kind for the declaration), but
+            # local_func_arg_kinds[fn.name][idx] was still persisted as
+            # "logical" -- which callers consult to decide how to coerce
+            # their OWN actual argument, producing e.g. `call f(a /= 0)`
+            # against a callee declared `integer, intent(in) ::
+            # heights(:)` (a hard kind-mismatch compile error). Found
+            # mining TheAlgorithms/Python's own dynamic_programming/
+            # trapped_water.py: `if not heights: return 0`.
             hint_kind = "logical"
             if (
                 local_func_arg_kinds is not None
@@ -73307,6 +73614,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
@@ -73656,6 +73964,7 @@ def transpile_file(
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
@@ -74406,6 +74715,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
     tree = rewrite_pop_call_expr_to_temp(tree)
+    tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)

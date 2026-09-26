@@ -21389,3 +21389,266 @@ def test_xp2f_chained_subscript_reserved_name_return_kind(tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_sum_generator_expr_zip_tuple_target(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # trapped_water.py): `sum(min(l, r) - h for l, r, h in zip(a, b, c))`
+    # -- a bare generator expression (not a list comprehension) with a
+    # zip() tuple target -- was rejected outright ("ListComp currently
+    # supports only single-generator form"), because the existing
+    # zip-target-to-index AST rewrite only ever registered a visitor for
+    # ast.ListComp, never the structurally-identical ast.GeneratorExp.
+    # Fixing that alias then exposed a SECOND, previously-unreachable bug
+    # in the same rewrite's _NameToSubscript helper: its visit_Name had
+    # no fallback `return node` for a Name outside the zip mapping (e.g.
+    # `min` in `min(left, right) - height`) -- ast.NodeTransformer
+    # treats a visitor returning None as "delete this field", so the
+    # Call's own `func` field was silently stripped, corrupting the
+    # tree. Both fixed together.
+    src = tmp_path / "xsum_genexpr_zip_tuple.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def trapped_rainwater(heights):",
+                "    if not heights:",
+                "        return 0",
+                "    length = len(heights)",
+                "    left_max = [0] * length",
+                "    left_max[0] = heights[0]",
+                "    for i in range(1, length):",
+                "        left_max[i] = max(heights[i], left_max[i - 1])",
+                "    right_max = [0] * length",
+                "    right_max[length - 1] = heights[length - 1]",
+                "    for i in range(length - 2, -1, -1):",
+                "        right_max[i] = max(heights[i], right_max[i + 1])",
+                "    return sum(",
+                "        min(left, right) - height",
+                "        for left, right, height in zip(left_max, right_max, heights)",
+                "    )",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(trapped_rainwater((0, 1, 0, 2, 1, 0, 1, 3, 2, 1, 2, 1)))",
+                "    print(trapped_rainwater((7, 1, 5, 3, 6, 4)))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_not_array_param_stays_integer_at_call_site(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # trapped_water.py and others): `if not heights: return 0` (Python's
+    # idiomatic empty-sequence check) on a rank-1 integer array
+    # parameter made _arg_used_in_logical_ops report the parameter as a
+    # logical SCALAR, regardless of rank. The callee's own declaration
+    # stayed correctly `integer, intent(in) :: heights(:)` (a separate,
+    # rank-aware pass governs that), but local_func_arg_kinds -- which
+    # CALLERS consult to decide how to coerce their own actual argument
+    # -- was still overwritten to "logical", so a caller passing an
+    # array actual argument got it wrapped in a bogus `(a /= 0)`
+    # truthiness coercion, producing a hard LOGICAL-vs-INTEGER kind
+    # mismatch at the call site. Fixed by only applying the logical
+    # override when the argument is proven scalar (rank 0).
+    src = tmp_path / "xnot_array_param_call_site.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def f(heights):",
+                "    if not heights:",
+                "        return 0",
+                "    return heights[0] + 1",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    a = (0, 1, 0, 2)",
+                "    print(f(a))",
+                "    print(f((7, 1, 5)))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_not_string_truthiness_uses_len_trim(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # longest_common_substring.py): `if not text1 or not text2: return
+    # ""` truthy-tests two character-scalar parameters directly. The
+    # UnaryOp-Not and BoolOp codegen's truthy-coercion fallback assumed
+    # every non-logical operand was numeric and emitted a bare `(t /=
+    # 0)` comparison -- a hard CHARACTER/INTEGER type-mismatch compile
+    # error for a string operand. Fixed by adding the same
+    # len_trim(...)-based char-truthiness branch visit_If's own
+    # _if_test_expr already used, matching this codebase's own
+    # established convention for "is this string non-empty".
+    src = tmp_path / "xnot_string_truthiness.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def longest_common_substring(text1, text2):",
+                "    if not text1 or not text2:",
+                "        return \"\"",
+                "    text1_length = len(text1)",
+                "    text2_length = len(text2)",
+                "    dp = [[0] * (text2_length + 1) for _ in range(text1_length + 1)]",
+                "    end_pos = 0",
+                "    max_length = 0",
+                "    for i in range(1, text1_length + 1):",
+                "        for j in range(1, text2_length + 1):",
+                "            if text1[i - 1] == text2[j - 1]:",
+                "                dp[i][j] = 1 + dp[i - 1][j - 1]",
+                "                if dp[i][j] > max_length:",
+                "                    end_pos = i",
+                "                    max_length = dp[i][j]",
+                "    return text1[end_pos - max_length : end_pos]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(longest_common_substring(\"abcdef\", \"xabded\"))",
+                "    print(longest_common_substring(\"GeeksforGeeks\", \"GeeksQuiz\"))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_literal_arg_to_mutating_local_call_hoisted(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # minimum_cost_path.py): `minimum_cost_path([[2, 1], [3, 1], [4,
+    # 2]])` passes a 2D list LITERAL directly to a function that
+    # mutates its own `matrix` parameter in place (`matrix[0][i] +=
+    # matrix[0][i - 1]`). This codebase's own local-function codegen
+    # correctly defaults such a parameter to Fortran `intent(inout)`,
+    # but a literal array constructor is not a valid Fortran "variable"
+    # actual argument for an INOUT dummy ("Non-variable expression in
+    # variable definition context"). Fixed by a new AST pre-pass that
+    # hoists a non-variable actual argument passed to a positionally
+    # known-mutated parameter into a preceding named temp.
+    src = tmp_path / "xliteral_arg_mutating_call.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def minimum_cost_path(matrix):",
+                "    for i in range(1, len(matrix[0])):",
+                "        matrix[0][i] += matrix[0][i - 1]",
+                "    for i in range(1, len(matrix)):",
+                "        matrix[i][0] += matrix[i - 1][0]",
+                "    for i in range(1, len(matrix)):",
+                "        for j in range(1, len(matrix[0])):",
+                "            matrix[i][j] += min(matrix[i - 1][j], matrix[i][j - 1])",
+                "    return matrix[-1][-1]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(minimum_cost_path([[2, 1], [3, 1], [4, 2]]))",
+                "    print(minimum_cost_path([[2, 1, 4], [2, 1, 3], [3, 2, 1]]))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_string_full_reverse_slice(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # longest_palindromic_subsequence.py): `rev = input_string[::-1]`
+    # (Python's idiomatic full-string reversal) raised outright
+    # ("character slicing with step is not supported") -- Fortran
+    # substrings have no stride argument at all, unlike an array
+    # section, which does support a negative stride. Fixed by
+    # recognizing this narrow, common special case (no start/stop, step
+    # == -1) and lowering it to a new str_reverse runtime helper.
+    src = tmp_path / "xstring_full_reverse_slice.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def longest_palindromic_subsequence(input_string):",
+                "    n = len(input_string)",
+                "    rev = input_string[::-1]",
+                "    m = len(rev)",
+                "    dp = [[-1] * (m + 1) for i in range(n + 1)]",
+                "    for i in range(n + 1):",
+                "        dp[i][0] = 0",
+                "    for i in range(m + 1):",
+                "        dp[0][i] = 0",
+                "    for i in range(1, n + 1):",
+                "        for j in range(1, m + 1):",
+                "            if input_string[i - 1] == rev[j - 1]:",
+                "                dp[i][j] = 1 + dp[i - 1][j - 1]",
+                "            else:",
+                "                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])",
+                "    return dp[n][m]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(longest_palindromic_subsequence(\"bbbab\"))",
+                "    print(longest_palindromic_subsequence(\"bbabcbcab\"))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout

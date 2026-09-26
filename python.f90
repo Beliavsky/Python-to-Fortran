@@ -159,6 +159,7 @@ public :: ends_with !@pyapi kind=function ret=logical args=s:character:intent(in
 public :: str_find !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="0-based find index or -1"
 public :: str_rfind !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="0-based reverse find index or -1"
 public :: str_replace !@pyapi kind=function ret=character args=s:character:intent(in),old:character:intent(in),new:character:intent(in) desc="replace all occurrences"
+public :: str_reverse !@pyapi kind=function ret=character args=s:character:intent(in) desc="reverse a string (Python's s[::-1])"
 public :: str_zfill !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with zeros to given width"
 public :: str_ljust !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="right-pad string with spaces to given width"
 public :: str_rjust !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with spaces to given width"
@@ -4684,6 +4685,16 @@ contains
             out = acc
          end if
       end function str_replace
+
+      pure function str_reverse(s) result(out)
+         character(len=*), intent(in) :: s
+         character(len=len(s)) :: out
+         integer :: i, n
+         n = len(s)
+         do i = 1, n
+            out(i:i) = s(n - i + 1:n - i + 1)
+         end do
+      end function str_reverse
 
       function str_zfill(s, width) result(out)
          character(len=*), intent(in) :: s
