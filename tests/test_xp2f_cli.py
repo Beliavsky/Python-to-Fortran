@@ -21230,3 +21230,162 @@ def test_xp2f_scalar_return_of_int_only_appended_list(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_nested_listcomp_shared_dontcare_name(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # edit_distance.py): a 2D zero-init via nested list comprehensions
+    # reusing the conventional "don't care" name for both generator
+    # targets ([[0 for _ in range(n)] for _ in range(m)]) was rejected
+    # ("ListComp currently supports only single-generator form"). The
+    # inner comprehension's own `_` generator target (a Store-context
+    # binding) was misidentified as a Load-context reference to the
+    # OUTER `_`, wrongly concluding the outer replication depends on the
+    # loop variable. Fixed by requiring ast.Load context when checking
+    # whether the element expression uses the loop variable.
+    src = tmp_path / "xnested_listcomp_dontcare.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def edit_distance(s1, s2):",
+                "    m = len(s1)",
+                "    n = len(s2)",
+                "    dp = [[0 for _ in range(n + 1)] for _ in range(m + 1)]",
+                "    for i in range(m + 1):",
+                "        dp[i][0] = i",
+                "    for j in range(n + 1):",
+                "        dp[0][j] = j",
+                "    for i in range(1, m + 1):",
+                "        for j in range(1, n + 1):",
+                "            if s1[i - 1] == s2[j - 1]:",
+                "                dp[i][j] = dp[i - 1][j - 1]",
+                "            else:",
+                "                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])",
+                "    return dp[m][n]",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(edit_distance(\"sunday\", \"saturday\"))",
+                "    print(edit_distance(\"kitten\", \"sitting\"))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_loop_var_read_after_normal_completion(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # knapsack.py): Python's for-loop target keeps its LAST iterated
+    # value after the loop ends normally, but Fortran's DO variable is
+    # left ONE PAST that value (do i = 1, n; ...; end do leaves i ==
+    # n + 1, not n). `return dp[n][w_], dp` read the inner loop's own
+    # `w_` after `for w_ in range(1, w + 1):` completed, and the
+    # resulting off-by-one index crashed at runtime with an
+    # out-of-bounds array access. Fixed by emitting a post-loop
+    # correction (var = var - step) whenever liveness analysis shows
+    # the loop target is read again afterward.
+    src = tmp_path / "xloopvar_after_knapsack.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def knapsack(w, wt, val, n):",
+                "    dp = [[0 for _ in range(w + 1)] for _ in range(n + 1)]",
+                "    for i in range(1, n + 1):",
+                "        for w_ in range(1, w + 1):",
+                "            if wt[i - 1] <= w_:",
+                "                dp[i][w_] = max(val[i - 1] + dp[i - 1][w_ - wt[i - 1]], dp[i - 1][w_])",
+                "            else:",
+                "                dp[i][w_] = dp[i - 1][w_]",
+                "    return dp[n][w_], dp",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    val = [60, 100, 120]",
+                "    wt = [10, 20, 30]",
+                "    w = 50",
+                "    n = 3",
+                "    best, table = knapsack(w, wt, val, n)",
+                "    print(best)",
+                "    print(table[n][w])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_chained_subscript_reserved_name_return_kind(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (dynamic_programming/
+    # longest_common_subsequence.py): a 2D DP table named `dp` (which
+    # this codebase internally renames to `xdp` to avoid colliding with
+    # its own reserved `dp` real64-kind parameter) read via chained
+    # subscripting (dp[m][n]) in a tuple return never matched any of
+    # translator.alloc_ints/alloc_reals/etc, because those sets are
+    # keyed by the ALIASED name and the chained-subscript kind-inference
+    # path used the raw (unaliased) name. It silently defaulted to
+    # real, printing e.g. "4.0000000000000000" instead of "4" for an
+    # integer-valued table entry. Fixed by resolving through the same
+    # aliasing used elsewhere before the alloc_* set membership checks.
+    src = tmp_path / "xchained_subscript_reserved_name.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def longest_common_subsequence(x, y):",
+                "    m = len(x)",
+                "    n = len(y)",
+                "    dp = [[0 for _ in range(n + 1)] for _ in range(m + 1)]",
+                "    for i in range(1, m + 1):",
+                "        for j in range(1, n + 1):",
+                "            if x[i - 1] == y[j - 1]:",
+                "                dp[i][j] = dp[i - 1][j - 1] + 1",
+                "            else:",
+                "                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])",
+                "    return dp[m][n], dp",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    length, table = longest_common_subsequence(\"GXTXAYB\", \"AGGTAB\")",
+                "    print(length)",
+                "    print(table[7][6])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout

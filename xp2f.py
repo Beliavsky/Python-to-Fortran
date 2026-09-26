@@ -25544,6 +25544,7 @@ class translator(ast.NodeVisitor):
                 nm = node.value.id
                 if nm == "sys_argv":
                     return "char"
+                nm = self._aliased_name(self._resolve_list_alias(nm))
                 if nm in self.alloc_reals:
                     return "real"
                 if nm in self.alloc_complexes:
@@ -25562,7 +25563,17 @@ class translator(ast.NodeVisitor):
                 # ever fires for e.g. a 2D list-of-lists read/return.
                 _base_node, _ = self._flatten_subscript_chain(node)
                 if isinstance(_base_node, ast.Name):
-                    nm = _base_node.id
+                    # Resolve through the same aliasing (e.g. a `dp`
+                    # variable renamed to `xdp` to avoid colliding with
+                    # this codebase's own reserved `dp` real64-kind
+                    # parameter) that self.alloc_ints/alloc_reals/etc are
+                    # actually keyed by -- without it, a chained-subscript
+                    # read of a reserved-name-colliding 2D array (e.g.
+                    # `return dp[m][n], seq`) never matched any of these
+                    # sets and silently defaulted to real elsewhere. Found
+                    # mining TheAlgorithms/Python's own dynamic_
+                    # programming/longest_common_subsequence.py.
+                    nm = self._aliased_name(self._resolve_list_alias(_base_node.id))
                     if nm in self.alloc_reals:
                         return "real"
                     if nm in self.alloc_complexes:
@@ -34139,8 +34150,20 @@ class translator(ast.NodeVisitor):
                 # [E for _ in range(n)] where E does not depend on loop variable.
                 # Lower via SPREAD so E can be scalar/vector/matrix.
                 if not gen.ifs:
+                    # A Name node matching loop_var only counts as a real
+                    # reference in Load context -- a Store-context one is
+                    # a BINDING, most commonly a nested comprehension's
+                    # own generator target reusing the same conventional
+                    # "don't care" name (`[[0 for _ in range(n)] for _ in
+                    # range(m)]`, found mining TheAlgorithms/Python's own
+                    # dynamic_programming/edit_distance.py). Without this,
+                    # the inner `_`'s own target binding was
+                    # misidentified as a reference to the OUTER `_`,
+                    # wrongly concluding this replication depends on the
+                    # loop variable and falling through to "ListComp
+                    # currently supports only single-generator form".
                     uses_loop_var = any(
-                        isinstance(_n, ast.Name) and _n.id == loop_var
+                        isinstance(_n, ast.Name) and _n.id == loop_var and isinstance(_n.ctx, ast.Load)
                         for _n in ast.walk(node.elt)
                     )
                     if (
@@ -54884,6 +54907,30 @@ class translator(ast.NodeVisitor):
         if independent_counter:
             self.o.pop()
             self.o.w("end block")
+        elif not getattr(node, "_xp2f_dead_range_target", False):
+            # Python's for-loop target keeps its LAST iterated value
+            # after the loop ends normally, but Fortran's DO variable is
+            # left ONE PAST that value (do i = 1, n; ...; end do leaves i
+            # == n + 1, not n) -- a silent off-by-one whenever the loop
+            # variable is read again afterward (annotate_loop_target_
+            # liveness's own _xp2f_dead_range_target already tells us
+            # exactly when that happens). Found mining TheAlgorithms/
+            # Python's own dynamic_programming/knapsack.py:
+            # `return dp[n][w_], dp` reads the inner loop's own `w_`
+            # after `for w_ in range(1, w + 1):` completes, and the
+            # resulting off-by-one index crashed at runtime ("Index '8'
+            # ... above upper bound of 7"). Guarded on the loop actually
+            # having run at least once, matching Fortran's own "did this
+            # DO loop execute" rule -- an empty range leaves the
+            # variable at its pre-loop value already, in both languages,
+            # so no correction is needed (or correct) there.
+            if is_const_int(step) and step.value == 1:
+                self.o.w(f"if ({f_start} <= {f_upper}) {var} = {var} - 1")
+            else:
+                self.o.w(
+                    f"if (({f_step} > 0 .and. {f_start} <= {f_upper}) .or. "
+                    f"({f_step} < 0 .and. {f_start} >= {f_upper})) {var} = {var} - ({f_step})"
+                )
 
         if scoped_integer:
             self._close_one_type_rebind_block()
