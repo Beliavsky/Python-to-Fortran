@@ -14375,6 +14375,85 @@ def test_xp2f_local_function_param_case_insensitive_collision_with_module_global
 
 
 @pytest.mark.parametrize("dtype", ["int", "float"])
+def test_xp2f_discarded_numpy_sort_flip_do_not_mutate(tmp_path: Path, dtype: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xdiscarded_numpy.py", [
+        "import numpy as np",
+        "from numpy import sort as nsort, flip as nflip",
+        "def discard(a):",
+        "    np.sort(a)",
+        "    np.flip(a)",
+        "    return a[0]",
+        f"discarded_array_r1 = np.array([3, 1, 2], dtype={dtype})",
+        "print(discard(discarded_array_r1))",
+        "nsort(discarded_array_r1)",
+        "nflip(discarded_array_r1)",
+        "for x in discarded_array_r1:",
+        "    print(x)",
+        "discarded_array_r1.sort()",
+        "for x in discarded_array_r1:",
+        "    print(x)",
+        f"empty = np.array([], dtype={dtype})",
+        "np.sort(empty)",
+        "np.flip(empty)",
+        "print(empty.size)",
+        f"m = np.array([[3, 1], [4, 2]], dtype={dtype})",
+        "np.sort(m, axis=0)",
+        "np.sort(m, -1)",
+        "np.sort(m, axis=None)",
+        "np.flip(m)",
+        "np.flip(m, axis=1)",
+        "np.flip(m, 0)",
+        "for i in range(2):",
+        "    for j in range(2):",
+        "        print(m[i, j])",
+    ])
+
+
+def test_xp2f_discarded_numpy_calls_evaluate_input_once(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xdiscarded_calls.py", [
+        "import numpy as np",
+        "def make():",
+        "    print('called')",
+        "    return np.array([3.0, 1.0, 2.0])",
+        "for i in range(2):",
+        "    np.sort(make())",
+        "    np.flip(make())",
+    ])
+
+
+def test_xp2f_discarded_numpy_calls_other_kinds_and_slices(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xdiscarded_kinds.py", [
+        "import numpy",
+        "import numpy as np",
+        "words = np.array(['c', 'a', 'b'])",
+        "numpy.sort(words)",
+        "numpy.flip(words)",
+        "for i in range(3):",
+        "    print(words[i])",
+        "flags = np.array([True, False])",
+        "numpy.flip(flags)",
+        "print(flags[0], flags[1])",
+        "z = np.array([1+2j, 3+4j])",
+        "numpy.flip(z)",
+        "print(z[0].real, z[0].imag)",
+        "a = np.array([4, 3, 1, 2])",
+        "numpy.sort(a[1:])",
+        "numpy.flip(a[1:])",
+        "for i in range(4):",
+        "    print(a[i])",
+    ])
+
+
+@pytest.mark.parametrize("call", ["np.sort(a, axis=2)", "np.flip(a, axis=-3)",
+                                  "np.sort(a, kind='unknown')", "np.flip(a, axis=get_axis())"])
+def test_xp2f_discarded_numpy_calls_validate_options(tmp_path: Path, call: str) -> None:
+    source = tmp_path / "xdiscarded_options.py"
+    source.write_text("import numpy as np\na = np.array([3, 1, 2])\n" + call + "\n", encoding="utf-8")
+    with pytest.raises(NotImplementedError, match="standalone np"):
+        xp2f.transpile_file(source, [], False)
+
+
+@pytest.mark.parametrize("dtype", ["int", "float"])
 def test_xp2f_unique_in_pure_local_function(tmp_path: Path, dtype: str) -> None:
     _run_xp2f_compile_diff(tmp_path, "xpure_unique.py", [
         "import numpy as np",

@@ -15031,7 +15031,7 @@ def detect_needed_helpers(tree):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "sort"
             ):
                 needed.add("sort_vec")
@@ -56312,28 +56312,69 @@ class translator(ast.NodeVisitor):
             isinstance(c.func, ast.Attribute)
             and isinstance(c.func.value, ast.Name)
             and is_numpy_name_node(c.func.value)
-            and c.func.attr == "sort"
-            and len(c.args) >= 1
-            and isinstance(c.args[0], ast.Name)
+            and c.func.attr in {"sort", "flip"}
         ):
-            name = self._aliased_name(c.args[0].id)
-            if self._rank_expr(c.args[0]) != 1:
-                raise NotImplementedError("standalone np.sort currently supports only rank-1 arrays")
-            self.o.w(f"call sort_vec({name})")
-            return
-
-        if (
-            isinstance(c.func, ast.Attribute)
-            and isinstance(c.func.value, ast.Name)
-            and is_numpy_name_node(c.func.value)
-            and c.func.attr == "flip"
-            and len(c.args) >= 1
-            and isinstance(c.args[0], ast.Name)
-        ):
-            name = self._aliased_name(c.args[0].id)
-            if self._rank_expr(c.args[0]) != 1:
-                raise NotImplementedError("standalone np.flip currently supports only rank-1 arrays")
-            self.o.w(f"{name} = {name}(size({name}):1:-1)")
+            # NumPy functions return a copy/view; discarding that result
+            # does NOT mutate the argument (unlike a.sort()). Evaluate
+            # the input once into a block-local copy, preserving calls
+            # with side effects and leaving caller-owned storage alone.
+            operation = c.func.attr
+            if not 1 <= len(c.args) <= 2 or any(kw.arg != "axis" for kw in c.keywords):
+                raise NotImplementedError(f"standalone np.{operation} supports an array and an optional constant axis")
+            if (len(c.args) == 2 and c.keywords) or len(c.keywords) > 1:
+                raise NotImplementedError(f"standalone np.{operation}: duplicate axis")
+            rank = self._rank_expr(c.args[0])
+            kind = self._expr_kind(c.args[0])
+            if rank not in {1, 2}:
+                raise NotImplementedError(f"standalone np.{operation} currently supports rank-1/rank-2 arrays")
+            axis = -1 if operation == "sort" else None
+            axis_node = c.args[1] if len(c.args) == 2 else c.keywords[0].value if c.keywords else None
+            if axis_node is not None:
+                try:
+                    axis = ast.literal_eval(axis_node)
+                except (ValueError, TypeError):
+                    raise NotImplementedError(f"standalone np.{operation} requires a constant integer axis or None")
+            if axis is not None and (type(axis) is not int or not -rank <= axis < rank):
+                raise NotImplementedError(f"standalone np.{operation}: unsupported or out-of-range axis")
+            if axis is not None:
+                axis %= rank
+            declarations = {"int": "integer", "real": "real(kind=dp)",
+                            "complex": "complex(kind=dp)", "logical": "logical",
+                            "char": "character(len=:)"}
+            if kind not in declarations or (operation == "sort" and kind not in {"int", "real", "char"}):
+                raise NotImplementedError(f"standalone np.{operation}: unsupported element type")
+            # Rank-distinct names also keep the later textual SIZE
+            # simplification from mixing declarations across blocks.
+            tmp, index, flat = self._fresh_scoped_names(f"discarded_array_r{rank}", "discarded_index", "discarded_flat")
+            source = self.expr(c.args[0])
+            self.o.w("block")
+            self.o.push()
+            decl = declarations[kind]
+            self.o.w(f"{decl}, allocatable :: {tmp}({','.join(':' for _ in range(rank))})")
+            if operation == "sort" and rank == 2:
+                if axis is None:
+                    self.o.w(f"{decl}, allocatable :: {flat}(:)")
+                else:
+                    self.o.w(f"integer :: {index}")
+            self.o.w(f"{tmp} = {source}")
+            if operation == "flip":
+                slices = [f"size({tmp},{d + 1}):1:-1" if axis is None or axis == d else ":"
+                          for d in range(rank)]
+                self.o.w(f"{tmp} = {tmp}({', '.join(slices)})")
+            elif rank == 1:
+                self.o.w(f"call sort_vec({tmp})")
+            elif axis is None:
+                self.o.w(f"{flat} = reshape({tmp}, [size({tmp})])")
+                self.o.w(f"call sort_vec({flat})")
+            else:
+                self.o.w(f"do {index} = 1, size({tmp},{2 if axis == 0 else 1})")
+                self.o.push()
+                section = f":,{index}" if axis == 0 else f"{index},:"
+                self.o.w(f"call sort_vec({tmp}({section}))")
+                self.o.pop()
+                self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         if (
