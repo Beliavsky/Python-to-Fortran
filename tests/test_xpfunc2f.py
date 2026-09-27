@@ -613,6 +613,49 @@ end program check
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("direct_generic", [False, True])
+def test_inline_python_mod_helpers_transitive_generic(tmp_path: Path, direct_generic: bool) -> None:
+    # quantile_linear_vec -> quantile_linear -> generic sort_vec -> specifics.
+    # An additional direct request must not duplicate the interface or bodies.
+    requested = "quantile_linear_vec" + (", sort_vec" if direct_generic else "")
+    source = f"""module m
+use, intrinsic :: iso_fortran_env, only: real64
+use python_mod, only: {requested}
+implicit none
+integer, parameter :: dp = real64
+contains
+pure function quartiles(x) result(y)
+real(dp), intent(in) :: x(:)
+real(dp), allocatable :: y(:)
+y = quantile_linear_vec(x, [0.25_dp, 0.5_dp, 0.75_dp])
+end function quartiles
+end module m
+"""
+    inlined, unresolved = xpfunc2f.inline_python_mod_helpers(source)
+    assert unresolved == []
+    assert "use python_mod" not in inlined.lower()
+    assert len(re.findall(r"(?m)^\s*interface sort_vec\s*$", inlined)) == 1
+    assert inlined.index("interface sort_vec") < inlined.index("contains")
+    for name in ("sort_real_vec", "sort_int_vec", "sort_char_vec"):
+        assert len(re.findall(rf"(?m)^\s*pure subroutine {name}\(", inlined)) == 1
+    src = tmp_path / "quantiles.f90"
+    src.write_text(inlined + """
+program check_quantiles
+use m
+implicit none
+real(dp) :: y(3)
+y = quartiles([4.0_dp, 1.0_dp, 3.0_dp, 2.0_dp])
+if (any(abs(y - [1.75_dp, 2.5_dp, 3.25_dp]) > 1.0e-12_dp)) stop 1
+end program check_quantiles
+""", encoding="utf-8")
+    exe = tmp_path / "quantiles.exe"
+    proc = subprocess.run(["gfortran", "-fcheck=all", str(src), "-o", str(exe)],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
 def test_inline_python_mod_helpers_resolves_generic_interface() -> None:
     # Regression test for examples/xbs.py's own `black_scholes` (and 3
     # other files sharing this shape): python.f90's own `optval` is a

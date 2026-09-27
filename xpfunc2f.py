@@ -2054,7 +2054,7 @@ def inline_python_mod_helpers(trimmed_text: str):
     py_mod_text = PYTHON_MOD_PATH.read_text(encoding="utf-8", errors="ignore")
     _mod_name, py_header, py_lines, py_procs = parse_module(py_mod_text)
     py_interfaces = _find_python_mod_interfaces(py_header)
-    known = set(py_procs.keys())
+    known = set(py_procs) | set(py_interfaces)
 
     # Every name declared in python.f90's own SPECIFICATION section
     # (outside `contains`), other than `dp` (see the docstring above),
@@ -2121,16 +2121,27 @@ def inline_python_mod_helpers(trimmed_text: str):
     unresolved = []
     for n in requested:
         nl = n.lower()
-        if nl in py_procs:
+        if nl in known:
             frontier.append(nl)
-        elif nl in py_interfaces:
-            needed_interfaces.add(nl)
-            frontier.extend(mem.lower() for mem in py_interfaces[nl][2])
         else:
             unresolved.append(n)
 
     while frontier:
         nm = frontier.pop()
+        # Generic calls can occur inside helpers, not just in the original
+        # USE list (e.g. quantile_linear -> sort_vec). Expand them recursively.
+        if nm in py_interfaces:
+            if nm in needed_interfaces:
+                continue
+            needed_interfaces.add(nm)
+            for member in py_interfaces[nm][2]:
+                member = member.lower()
+                if member not in py_procs:
+                    raise UnsupportedFunction(
+                        f"generic interface {nm!r} refers to missing module procedure {member!r}"
+                    )
+                frontier.append(member)
+            continue
         if nm in needed or nm not in py_procs:
             continue
         needed.add(nm)
