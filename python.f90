@@ -820,7 +820,7 @@ contains
          write(*,'(a)') ']'
       end subroutine print_char_list
 
-      subroutine grow_and_set_char(arr, idx, item)
+      pure subroutine grow_and_set_char(arr, idx, item)
          ! grow allocatable character list arr to fit index idx and item's
          ! length, then set arr(idx) = item -- the shared "list.append()"
          ! growth machinery previously inlined at every append call site.
@@ -841,7 +841,7 @@ contains
          arr(idx) = item
       end subroutine grow_and_set_char
 
-      subroutine insert_char(arr, idx, item)
+      pure subroutine insert_char(arr, idx, item)
          ! insert item into allocatable character list arr at Python-style
          ! index idx (negative counts from the end, out-of-range clamps to
          ! the nearer end), widening arr's declared length if item is
@@ -1241,7 +1241,7 @@ contains
          call print_matrix_int_2d(a)
       end subroutine print_matrix_label_int_2d
 
-      function py_str_int(x) result(s)
+      pure function py_str_int(x) result(s)
          integer, intent(in) :: x
          character(len=:), allocatable :: s
          character(len=64) :: buf
@@ -1249,7 +1249,7 @@ contains
          s = trim(adjustl(buf))
       end function py_str_int
 
-      function py_str_real(x) result(s)
+      pure function py_str_real(x) result(s)
          real(kind=dp), intent(in) :: x
          character(len=:), allocatable :: s
          character(len=128) :: buf
@@ -1384,7 +1384,7 @@ contains
          end if
       end function py_format_real
 
-      function str_format_real_fixed(x, prec) result(s)
+      pure function str_format_real_fixed(x, prec) result(s)
          real(kind=dp), intent(in) :: x
          integer, intent(in) :: prec
          character(len=:), allocatable :: s
@@ -1440,7 +1440,7 @@ contains
          end do
       end function str_format_real_sci
 
-      function py_str_logical(x) result(s)
+      pure function py_str_logical(x) result(s)
          logical, intent(in) :: x
          character(len=:), allocatable :: s
          if (x) then
@@ -1450,7 +1450,7 @@ contains
          end if
       end function py_str_logical
 
-      function py_str_char(x) result(s)
+      pure function py_str_char(x) result(s)
          character(len=*), intent(in) :: x
          character(len=:), allocatable :: s
          s = x
@@ -3008,7 +3008,7 @@ contains
          end do
       end subroutine random_multivariate_hypergeometric_samples
 
-      subroutine vm_integral(a, b, result, dk)
+      pure subroutine vm_integral(a, b, result, dk)
          ! Source: Alan Miller, amiller_mirror/random.f90 (quadrature helper for von Mises).
          real(kind=dp), intent(in) :: a, b, dk
          real(kind=dp), intent(out) :: result
@@ -3451,7 +3451,7 @@ contains
          end do
       end function arange_int
 
-      function np_insert_real_1d(a, idx, val) result(out)
+      pure function np_insert_real_1d(a, idx, val) result(out)
          real(kind=dp), intent(in) :: a(:)
          integer, intent(in) :: idx
          real(kind=dp), intent(in) :: val
@@ -3577,7 +3577,7 @@ contains
          end do
       end function geomspace
 
-      function bincount_int(x, minlength) result(c)
+      pure function bincount_int(x, minlength) result(c)
          integer, intent(in) :: x(:)
          integer, intent(in), optional :: minlength
          integer, allocatable :: c(:)
@@ -3601,7 +3601,7 @@ contains
          end do
       end function bincount_int
 
-      function searchsorted_left_int(a, v) result(idx)
+      pure function searchsorted_left_int(a, v) result(idx)
          integer, intent(in) :: a(:), v(:)
          integer, allocatable :: idx(:)
          integer :: i, lo, hi, mid, n
@@ -3622,7 +3622,7 @@ contains
          end do
       end function searchsorted_left_int
 
-      function searchsorted_right_int(a, v) result(idx)
+      pure function searchsorted_right_int(a, v) result(idx)
          integer, intent(in) :: a(:), v(:)
          integer, allocatable :: idx(:)
          integer :: i, lo, hi, mid, n
@@ -3643,7 +3643,7 @@ contains
          end do
       end function searchsorted_right_int
 
-      function searchsorted_left_int_scalar(a, v) result(idx)
+      pure function searchsorted_left_int_scalar(a, v) result(idx)
          integer, intent(in) :: a(:), v
          integer :: idx
          integer :: lo, hi, mid, n
@@ -3661,7 +3661,7 @@ contains
          idx = lo - 1
       end function searchsorted_left_int_scalar
 
-      function searchsorted_right_int_scalar(a, v) result(idx)
+      pure function searchsorted_right_int_scalar(a, v) result(idx)
          integer, intent(in) :: a(:), v
          integer :: idx
          integer :: lo, hi, mid, n
@@ -3679,7 +3679,7 @@ contains
          idx = lo - 1
       end function searchsorted_right_int_scalar
 
-      function setdiff1d_int(a, b) result(c)
+      pure function setdiff1d_int(a, b) result(c)
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:)
          integer, allocatable :: ua(:), ub(:), tmp(:)
@@ -3790,7 +3790,7 @@ contains
          end do
       end subroutine unique_int_inv_counts
 
-      function lexsort2_int(key0, key1) result(idx)
+      pure function lexsort2_int(key0, key1) result(idx)
          integer, intent(in) :: key0(:), key1(:)
          integer, allocatable :: idx(:)
          integer :: i, j, n, t
@@ -3813,7 +3813,7 @@ contains
          end do
       end function lexsort2_int
 
-      function lexsort2_real(key0, key1) result(idx)
+      pure function lexsort2_real(key0, key1) result(idx)
          real(kind=dp), intent(in) :: key0(:), key1(:)
          integer, allocatable :: idx(:)
          integer :: i, j, n, tmp
@@ -3836,14 +3836,14 @@ contains
          end do
       end function lexsort2_real
 
-      function ravel_multi_index_2d(rc, shape) result(i)
+      pure function ravel_multi_index_2d(rc, shape) result(i)
          integer, intent(in) :: rc(:), shape(:)
          integer :: i
          if (size(rc) < 2 .or. size(shape) < 2) error stop 'ravel_multi_index_2d: expected rank-2 inputs'
          i = rc(1) * shape(2) + rc(2)
       end function ravel_multi_index_2d
 
-      function unravel_index_2d(i, shape) result(rc)
+      pure function unravel_index_2d(i, shape) result(rc)
          integer, intent(in) :: i
          integer, intent(in) :: shape(:)
          integer, allocatable :: rc(:)
@@ -3853,7 +3853,7 @@ contains
          rc(2) = mod(i, shape(2))
       end function unravel_index_2d
 
-      function kron_2d(a, b) result(k)
+      pure function kron_2d(a, b) result(k)
          integer, intent(in) :: a(:,:), b(:,:)
          integer, allocatable :: k(:,:)
          integer :: i, j, p, q, ra, ca, rb, cb
@@ -3871,7 +3871,7 @@ contains
          end do
       end function kron_2d
 
-      subroutine histogram_real_edges(x, bins, h, edges)
+      pure subroutine histogram_real_edges(x, bins, h, edges)
          real(kind=dp), intent(in) :: x(:), bins(:)
          integer, allocatable, intent(out) :: h(:)
          real(kind=dp), allocatable, intent(out) :: edges(:)
@@ -3898,7 +3898,7 @@ contains
          end do
       end subroutine histogram_real_edges
 
-      subroutine histogram_int_edges(x, bins, h, edges)
+      pure subroutine histogram_int_edges(x, bins, h, edges)
          integer, intent(in) :: x(:), bins(:)
          integer, allocatable, intent(out) :: h(:), edges(:)
          integer :: i, j, nb
@@ -3924,7 +3924,7 @@ contains
          end do
       end subroutine histogram_int_edges
 
-      subroutine histogram2d_real_edges(x, y, xbins, ybins, h)
+      pure subroutine histogram2d_real_edges(x, y, xbins, ybins, h)
          ! 2D histogram with explicit real bin edges on both axes,
          ! matching numpy.histogram2d(x, y, bins=[xbins, ybins]): same
          ! per-axis binning rule as histogram_real_edges (last bin is
@@ -3969,7 +3969,7 @@ contains
          end do
       end subroutine histogram2d_real_edges
 
-      function reduceat_add_real(x, idx) result(y)
+      pure function reduceat_add_real(x, idx) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -3993,7 +3993,7 @@ contains
          end do
       end function reduceat_add_real
 
-      function reduceat_add_int(x, idx) result(y)
+      pure function reduceat_add_int(x, idx) result(y)
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -4017,7 +4017,7 @@ contains
          end do
       end function reduceat_add_int
 
-      function reduceat_mul_real(x, idx) result(y)
+      pure function reduceat_mul_real(x, idx) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -4041,7 +4041,7 @@ contains
          end do
       end function reduceat_mul_real
 
-      function reduceat_mul_int(x, idx) result(y)
+      pure function reduceat_mul_int(x, idx) result(y)
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -4065,7 +4065,7 @@ contains
          end do
       end function reduceat_mul_int
 
-      function reduceat_min_real(x, idx) result(y)
+      pure function reduceat_min_real(x, idx) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -4089,7 +4089,7 @@ contains
          end do
       end function reduceat_min_real
 
-      function reduceat_min_int(x, idx) result(y)
+      pure function reduceat_min_int(x, idx) result(y)
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -4113,7 +4113,7 @@ contains
          end do
       end function reduceat_min_int
 
-      function reduceat_max_real(x, idx) result(y)
+      pure function reduceat_max_real(x, idx) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -4137,7 +4137,7 @@ contains
          end do
       end function reduceat_max_real
 
-      function reduceat_max_int(x, idx) result(y)
+      pure function reduceat_max_int(x, idx) result(y)
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -4161,7 +4161,7 @@ contains
          end do
       end function reduceat_max_int
 
-      function reduceat_logical_and(x, idx) result(y)
+      pure function reduceat_logical_and(x, idx) result(y)
          logical, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          logical, allocatable :: y(:)
@@ -4185,7 +4185,7 @@ contains
          end do
       end function reduceat_logical_and
 
-      function reduceat_logical_or(x, idx) result(y)
+      pure function reduceat_logical_or(x, idx) result(y)
          logical, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          logical, allocatable :: y(:)
@@ -4347,7 +4347,7 @@ contains
          end if
       end function median_low_int
 
-      function median_high_int(x) result(m)
+      pure function median_high_int(x) result(m)
          integer, intent(in) :: x(:)
          integer :: m
          integer, allocatable :: xs(:)
@@ -4390,7 +4390,7 @@ contains
          m = u(best_i)
       end function mode_int
 
-      function mode_real(x) result(m)
+      pure function mode_real(x) result(m)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp) :: m
          integer :: i, j, cnt, best_c
@@ -4545,7 +4545,7 @@ contains
          end do
       end function char_in_set
 
-      function str_lstrip(s, chars) result(out)
+      pure function str_lstrip(s, chars) result(out)
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: chars
          character(len=:), allocatable :: out
@@ -4568,7 +4568,7 @@ contains
          end if
       end function str_lstrip
 
-      function str_rstrip(s, chars) result(out)
+      pure function str_rstrip(s, chars) result(out)
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: chars
          character(len=:), allocatable :: out
@@ -4590,7 +4590,7 @@ contains
          end if
       end function str_rstrip
 
-      function str_strip(s, chars) result(out)
+      pure function str_strip(s, chars) result(out)
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: chars
          character(len=:), allocatable :: out
@@ -4731,7 +4731,7 @@ contains
          end if
       end function str_zfill
 
-      function str_ljust(s, width) result(out)
+      pure function str_ljust(s, width) result(out)
          character(len=*), intent(in) :: s
          integer, intent(in) :: width
          character(len=:), allocatable :: out
@@ -4747,7 +4747,7 @@ contains
          end if
       end function str_ljust
 
-      function str_rjust(s, width) result(out)
+      pure function str_rjust(s, width) result(out)
          character(len=*), intent(in) :: s
          integer, intent(in) :: width
          character(len=:), allocatable :: out
@@ -4906,7 +4906,7 @@ contains
          if (j <= nf) fields(j) = trim(tok)
       end function csv_split_line
 
-      function str_join(sep, items) result(out)
+      pure function str_join(sep, items) result(out)
          character(len=*), intent(in) :: sep
          type(strvec_t), intent(in) :: items
          character(len=:), allocatable :: out
@@ -5285,7 +5285,7 @@ contains
          end do
       end function unique_char
 
-      function tile_int(x, reps) result(y)
+      pure function tile_int(x, reps) result(y)
          integer, intent(in) :: x(:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:)
@@ -5300,7 +5300,7 @@ contains
          end do
       end function tile_int
 
-      function tile_int_2d(x, reps0, reps1) result(y)
+      pure function tile_int_2d(x, reps0, reps1) result(y)
          integer, intent(in) :: x(:,:)
          integer, intent(in) :: reps0, reps1
          integer, allocatable :: y(:,:)
@@ -5328,7 +5328,7 @@ contains
          end do
       end function diag_from_vec_int
 
-      function cumprod_int(x) result(y)
+      pure function cumprod_int(x) result(y)
          integer, intent(in) :: x(:)
          integer, allocatable :: y(:)
          integer :: i, n
@@ -5342,7 +5342,7 @@ contains
          end if
       end function cumprod_int
 
-      function repeat_int(x, reps) result(y)
+      pure function repeat_int(x, reps) result(y)
          integer, intent(in) :: x(:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:)
@@ -5359,7 +5359,7 @@ contains
          end do
       end function repeat_int
 
-      function repeat_int_axis0_2d(x, reps) result(y)
+      pure function repeat_int_axis0_2d(x, reps) result(y)
          integer, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:,:)
@@ -5375,7 +5375,7 @@ contains
          end do
       end function repeat_int_axis0_2d
 
-      function repeat_int_axis1_2d(x, reps) result(y)
+      pure function repeat_int_axis1_2d(x, reps) result(y)
          integer, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:,:)
@@ -5527,7 +5527,7 @@ contains
          end if
       end function diagonal_real_3d_axis12
 
-      function repeat_real(x, reps) result(y)
+      pure function repeat_real(x, reps) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:)
@@ -5544,7 +5544,7 @@ contains
          end do
       end function repeat_real
 
-      function repeat_real_axis0_2d(x, reps) result(y)
+      pure function repeat_real_axis0_2d(x, reps) result(y)
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:,:)
@@ -5560,7 +5560,7 @@ contains
          end do
       end function repeat_real_axis0_2d
 
-      function repeat_real_axis1_2d(x, reps) result(y)
+      pure function repeat_real_axis1_2d(x, reps) result(y)
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:,:)
@@ -5576,7 +5576,7 @@ contains
          end do
       end function repeat_real_axis1_2d
 
-      function repeat_logical(x, reps) result(y)
+      pure function repeat_logical(x, reps) result(y)
          logical, intent(in) :: x(:)
          integer, intent(in) :: reps
          logical, allocatable :: y(:)
@@ -5593,7 +5593,7 @@ contains
          end do
       end function repeat_logical
 
-      function repeat_logical_axis0_2d(x, reps) result(y)
+      pure function repeat_logical_axis0_2d(x, reps) result(y)
          logical, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          logical, allocatable :: y(:,:)
@@ -5609,7 +5609,7 @@ contains
          end do
       end function repeat_logical_axis0_2d
 
-      function repeat_logical_axis1_2d(x, reps) result(y)
+      pure function repeat_logical_axis1_2d(x, reps) result(y)
          logical, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          logical, allocatable :: y(:,:)
@@ -5684,7 +5684,7 @@ contains
          end if
       end function diagonal_int_3d_axis12
 
-      function tile_real(x, reps) result(y)
+      pure function tile_real(x, reps) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:)
@@ -5699,7 +5699,7 @@ contains
          end do
       end function tile_real
 
-      function tile_real_2d(x, reps0, reps1) result(y)
+      pure function tile_real_2d(x, reps0, reps1) result(y)
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: reps0, reps1
          real(kind=dp), allocatable :: y(:,:)
@@ -5716,7 +5716,7 @@ contains
          end do
       end function tile_real_2d
 
-      function eye_real(n, m) result(x)
+      pure function eye_real(n, m) result(x)
          integer, intent(in) :: n
          integer, intent(in), optional :: m
          real(kind=dp), allocatable :: x(:,:)
@@ -5762,7 +5762,7 @@ contains
          deallocate(tmp)
       end function unique_real
 
-      function cumprod_real(x) result(y)
+      pure function cumprod_real(x) result(y)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
          integer :: i, n
@@ -5776,7 +5776,7 @@ contains
          end if
       end function cumprod_real
 
-      function gradient_1d(x) result(g)
+      pure function gradient_1d(x) result(g)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: g(:)
          integer :: n
@@ -5797,7 +5797,7 @@ contains
          g(n) = x(n) - x(n-1)
       end function gradient_1d
 
-      function unwrap_1d(x) result(y)
+      pure function unwrap_1d(x) result(y)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
          integer :: n, i
@@ -5917,7 +5917,7 @@ contains
          end do
       end function lcm_int
 
-      function interp_1d(x, xp, fp) result(y)
+      pure function interp_1d(x, xp, fp) result(y)
          real(kind=dp), intent(in) :: x(:), xp(:), fp(:)
          real(kind=dp), allocatable :: y(:)
          integer :: i, j, n
@@ -6304,7 +6304,7 @@ contains
          w = cmplx(wr, wi, kind=dp)
       end function linalg_eigvals_real
 
-      function linalg_eigvals_complex(a) result(w)
+      pure function linalg_eigvals_complex(a) result(w)
          use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
          complex(dp), intent(in) :: a(:,:)
          complex(dp), allocatable :: w(:)
@@ -6646,7 +6646,7 @@ contains
          if (info /= 0) stop "linalg_svd_econ: dgesvd failed"
       end subroutine linalg_svd_econ
 
-      subroutine leggauss(n, x, w)
+      pure subroutine leggauss(n, x, w)
          ! Gauss-Legendre quadrature nodes and weights on [-1, 1], matching
          ! numpy.polynomial.legendre.leggauss(n). Classic Newton-iteration
          ! algorithm (nodes are the roots of the degree-n Legendre
@@ -6685,7 +6685,7 @@ contains
          end do
       end subroutine leggauss
 
-      real(kind=dp) function quantile_linear(x, q)
+      pure real(kind=dp) function quantile_linear(x, q)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), intent(in) :: q
          real(kind=dp), allocatable :: xs(:)
@@ -6710,7 +6710,7 @@ contains
          quantile_linear = (1.0_dp - frac) * xs(lo) + frac * xs(hi)
       end function quantile_linear
 
-      function quantile_linear_vec(x, q) result(out)
+      pure function quantile_linear_vec(x, q) result(out)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), intent(in) :: q(:)
          real(kind=dp) :: out(size(q))
@@ -6720,7 +6720,7 @@ contains
          end do
       end function quantile_linear_vec
 
-      function statistics_quantiles_real(x, n) result(q)
+      pure function statistics_quantiles_real(x, n) result(q)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: n
          real(kind=dp), allocatable :: q(:)
@@ -6942,7 +6942,7 @@ contains
          end if
       end function nanargmax
 
-      subroutine unique_int_counts(a, u, cnt)
+      pure subroutine unique_int_counts(a, u, cnt)
          integer, intent(in) :: a(:)
          integer, allocatable, intent(out) :: u(:), cnt(:)
          integer :: i, j
@@ -6959,7 +6959,7 @@ contains
          end do
       end subroutine unique_int_counts
 
-      function tri_int(n, m, k) result(t)
+      pure function tri_int(n, m, k) result(t)
          integer, intent(in) :: n, m
          integer, intent(in), optional :: k
          integer, allocatable :: t(:,:)
@@ -6975,7 +6975,7 @@ contains
          end do
       end function tri_int
 
-      function tri_real(n, m, k) result(t)
+      pure function tri_real(n, m, k) result(t)
          integer, intent(in) :: n, m
          integer, intent(in), optional :: k
          real(kind=dp), allocatable :: t(:,:)
@@ -6991,7 +6991,7 @@ contains
          end do
       end function tri_real
 
-      function moveaxis3_int(a, src, dst) result(b)
+      pure function moveaxis3_int(a, src, dst) result(b)
          integer, intent(in) :: a(:,:,:)
          integer, intent(in) :: src, dst
          integer, allocatable :: b(:,:,:)
@@ -7011,7 +7011,7 @@ contains
          end if
       end function moveaxis3_int
 
-      function moveaxis3_real(a, src, dst) result(b)
+      pure function moveaxis3_real(a, src, dst) result(b)
          real(kind=dp), intent(in) :: a(:,:,:)
          integer, intent(in) :: src, dst
          real(kind=dp), allocatable :: b(:,:,:)
@@ -7031,7 +7031,7 @@ contains
          end if
       end function moveaxis3_real
 
-      function moveaxis3_logical(a, src, dst) result(b)
+      pure function moveaxis3_logical(a, src, dst) result(b)
          logical, intent(in) :: a(:,:,:)
          integer, intent(in) :: src, dst
          logical, allocatable :: b(:,:,:)
@@ -7051,7 +7051,7 @@ contains
          end if
       end function moveaxis3_logical
 
-      function pad2d_int(a, pt, pb, pl, pr, c) result(out)
+      pure function pad2d_int(a, pt, pb, pl, pr, c) result(out)
          integer, intent(in) :: a(:,:)
          integer, intent(in) :: pt, pb, pl, pr, c
          integer, allocatable :: out(:,:)
@@ -7062,7 +7062,7 @@ contains
          out(pt+1:pt+n0, pl+1:pl+n1) = a
       end function pad2d_int
 
-      function pad2d_real(a, pt, pb, pl, pr, c) result(out)
+      pure function pad2d_real(a, pt, pb, pl, pr, c) result(out)
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in) :: pt, pb, pl, pr
          real(kind=dp), intent(in) :: c
@@ -7074,7 +7074,7 @@ contains
          out(pt+1:pt+n0, pl+1:pl+n1) = a
       end function pad2d_real
 
-      logical function allclose_real(a, b, rtol, atol, equal_nan)
+      pure logical function allclose_real(a, b, rtol, atol, equal_nan)
          real(kind=dp), intent(in) :: a(:), b(:)
          real(kind=dp), intent(in), optional :: rtol, atol
          logical, intent(in), optional :: equal_nan
@@ -7107,7 +7107,7 @@ contains
          end do
       end function allclose_real
 
-      logical function allclose_integer(a, b, rtol, atol)
+      pure logical function allclose_integer(a, b, rtol, atol)
          integer, intent(in) :: a(:), b(:)
          real(kind=dp), intent(in), optional :: rtol, atol
          real(kind=dp) :: rtolv, atolv
@@ -7467,7 +7467,7 @@ contains
          end if
       end function correlate_real
 
-      function lfilter_real(b, a, x, zi) result(y)
+      pure function lfilter_real(b, a, x, zi) result(y)
          ! scipy.signal.lfilter(b, a, x), zero initial conditions unless
          ! zi is given: Direct Form II Transposed IIR/FIR recursion (the
          ! same structure scipy's own Fortran/C backend uses). b and a
@@ -7563,7 +7563,7 @@ contains
          y = tmp(size(tmp):1:-1)
       end function filtfilt_real
 
-      function detrend_real(x, dtype) result(y)
+      pure function detrend_real(x, dtype) result(y)
          ! scipy.signal.detrend(x, type='linear'|'constant').
          real(kind=dp), intent(in) :: x(:)
          character(len=*), intent(in), optional :: dtype
@@ -7604,7 +7604,7 @@ contains
          end do
       end function detrend_real
 
-      function find_peaks_int(x, height, distance) result(peaks)
+      pure function find_peaks_int(x, height, distance) result(peaks)
          ! scipy.signal.find_peaks(x, height=None, distance=None), peak
          ! indices only (0-based, numpy-compatible) -- the properties
          ! dict scipy also returns is not reproduced. Peaks are strict
@@ -7911,7 +7911,7 @@ contains
       end function fft_is_power_of_two
 
 
-      subroutine fft_dft_forward(x, y)
+      pure subroutine fft_dft_forward(x, y)
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), intent(out) :: y(:)
          integer :: j, k, nn
@@ -7931,7 +7931,7 @@ contains
       end subroutine fft_dft_forward
 
 
-      subroutine fft_dft_inverse(x, y)
+      pure subroutine fft_dft_inverse(x, y)
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), intent(out) :: y(:)
          integer :: j, k, nn
@@ -7952,7 +7952,7 @@ contains
       end subroutine fft_dft_inverse
 
 
-      subroutine fft_radix2_inplace(a, inverse)
+      pure subroutine fft_radix2_inplace(a, inverse)
          complex(kind=dp), intent(inout) :: a(:)
          logical, intent(in) :: inverse
          integer :: i, j, m, mmax, istep, n
@@ -8009,7 +8009,7 @@ contains
       end subroutine fft_radix2_inplace
 
 
-      function fft_fft_real(x, n) result(y)
+      pure function fft_fft_real(x, n) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -8038,7 +8038,7 @@ contains
       end function fft_fft_real
 
 
-      function fft_fft_complex(x, n) result(y)
+      pure function fft_fft_complex(x, n) result(y)
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -8067,7 +8067,7 @@ contains
       end function fft_fft_complex
 
 
-      function fft_ifft(x, n) result(y)
+      pure function fft_ifft(x, n) result(y)
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -8096,7 +8096,7 @@ contains
       end function fft_ifft
 
 
-      function fft_rfft(x, n) result(y)
+      pure function fft_rfft(x, n) result(y)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -8111,7 +8111,7 @@ contains
       end function fft_rfft
 
 
-      function fft_irfft(x, n) result(y)
+      pure function fft_irfft(x, n) result(y)
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          real(kind=dp), allocatable :: y(:)
@@ -8144,7 +8144,7 @@ contains
       end function fft_irfft
 
 
-      function fft_fftfreq(n, d) result(f)
+      pure function fft_fftfreq(n, d) result(f)
          integer, intent(in) :: n
          real(kind=dp), intent(in), optional :: d
          real(kind=dp), allocatable :: f(:)
@@ -8171,7 +8171,7 @@ contains
       end function fft_fftfreq
 
 
-      function fft_rfftfreq(n, d) result(f)
+      pure function fft_rfftfreq(n, d) result(f)
          integer, intent(in) :: n
          real(kind=dp), intent(in), optional :: d
          real(kind=dp), allocatable :: f(:)
@@ -8194,7 +8194,7 @@ contains
       end function fft_rfftfreq
 
 
-      function itertools_product2_int(a, b) result(out)
+      pure function itertools_product2_int(a, b) result(out)
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: out(:,:)
          integer :: i, j, k, na, nb
@@ -8213,7 +8213,7 @@ contains
       end function itertools_product2_int
 
 
-      function itertools_combinations_int(x, r) result(out)
+      pure function itertools_combinations_int(x, r) result(out)
          integer, intent(in) :: x(:), r
          integer, allocatable :: out(:,:)
          integer :: i, j, k, n
@@ -8239,7 +8239,7 @@ contains
       end function itertools_combinations_int
 
 
-      function itertools_combinations_wr_int(x, r) result(out)
+      pure function itertools_combinations_wr_int(x, r) result(out)
          integer, intent(in) :: x(:), r
          integer, allocatable :: out(:,:)
          integer :: i, j, k, n
@@ -8265,7 +8265,7 @@ contains
       end function itertools_combinations_wr_int
 
 
-      function itertools_permutations_int(x, r) result(out)
+      pure function itertools_permutations_int(x, r) result(out)
          integer, intent(in) :: x(:), r
          integer, allocatable :: out(:,:)
          integer :: i, j, k, n
@@ -8347,7 +8347,7 @@ contains
       end function sys_argv_init
 
 
-      subroutine sys_argv_delete(argv, idx1)
+      pure subroutine sys_argv_delete(argv, idx1)
          character(len=:), allocatable, intent(inout) :: argv(:)
          integer, intent(in) :: idx1
          character(len=:), allocatable :: tmp(:)
@@ -8722,7 +8722,7 @@ contains
          y = log(cmplx(1.0_dp, 0.0_dp, kind=dp) + x)
       end function log1p_complex
 
-      function complex_amin(arr) result(m)
+      pure function complex_amin(arr) result(m)
          complex(kind=dp), intent(in) :: arr(:)
          complex(kind=dp) :: m
          complex(kind=dp) :: a
@@ -8737,7 +8737,7 @@ contains
          end do
       end function complex_amin
 
-      function complex_amax(arr) result(m)
+      pure function complex_amax(arr) result(m)
          ! Adapted from pyccel's own amax_4/amax_8
          ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
          complex(kind=dp), intent(in) :: arr(:)
@@ -8771,7 +8771,7 @@ contains
 
 
 
-FUNCTION dcpabs(x, y) RESULT(fn_val)
+pure FUNCTION dcpabs(x, y) RESULT(fn_val)
 
 REAL (dp), INTENT(IN) :: x
 REAL (dp), INTENT(IN) :: y
@@ -8801,7 +8801,7 @@ END FUNCTION dcpabs
 
 
 
-SUBROUTINE dcsqrt (z, w)
+pure SUBROUTINE dcsqrt (z, w)
 
 REAL (dp), INTENT(IN)   :: z(:)
 REAL (dp), INTENT(OUT)  :: w(:)
@@ -8860,7 +8860,7 @@ END SUBROUTINE dcsqrt
 
 
 
-SUBROUTINE dceigv (ibal, ar, ai, n, wr, wi, zr, zi, ierr)
+pure SUBROUTINE dceigv (ibal, ar, ai, n, wr, wi, zr, zi, ierr)
 !-----------------------------------------------------------------------
 !           EIGENVALUES AND EIGENVECTORS OF COMPLEX MATRICES
 !
@@ -8897,7 +8897,7 @@ END SUBROUTINE dceigv
 
 
 
-SUBROUTINE dcbal(n, ar, ai, low, igh, scale)
+pure SUBROUTINE dcbal(n, ar, ai, low, igh, scale)
 
 INTEGER, INTENT(IN)        :: n
 REAL (dp), INTENT(IN OUT)  :: ar(:,:)      ! ar(nm,n)
@@ -9078,7 +9078,7 @@ END SUBROUTINE dcbal
 
 
 
-SUBROUTINE dcorth(n, low, igh, ar, ai, ortr, orti)
+pure SUBROUTINE dcorth(n, low, igh, ar, ai, ortr, orti)
 
 INTEGER, INTENT(IN)       :: n
 INTEGER, INTENT(IN)       :: low
@@ -9206,7 +9206,7 @@ END SUBROUTINE dcorth
 
 
 
-SUBROUTINE dcbabk (n, low, igh, scale, m, zr, zi)
+pure SUBROUTINE dcbabk (n, low, igh, scale, m, zr, zi)
 
 INTEGER, INTENT(IN)     :: n
 INTEGER, INTENT(IN)     :: low
@@ -9291,7 +9291,7 @@ END SUBROUTINE dcbabk
 
 
 
-SUBROUTINE dcmqr2 (n, low, igh, ortr, orti, hr, hi, wr, wi, zr, zi, ierr)
+pure SUBROUTINE dcmqr2 (n, low, igh, ortr, orti, hr, hi, wr, wi, zr, zi, ierr)
 
 INTEGER, INTENT(IN)       :: n
 INTEGER, INTENT(IN)       :: low
@@ -9687,7 +9687,7 @@ GO TO 1001
 !     ********** LAST CARD OF DCMQR2 **********
 END SUBROUTINE dcmqr2
 
-      function where_pair_2d(rows, cols) result(idx)
+      pure function where_pair_2d(rows, cols) result(idx)
          integer, intent(in) :: rows(:), cols(:)
          integer, allocatable :: idx(:,:)
          integer :: n, k
@@ -9780,7 +9780,7 @@ END SUBROUTINE dcmqr2
          end do
       end function gather_where2d_logical
 
-      function lexsort_keys_int(keys, reverse_keys) result(idx)
+      pure function lexsort_keys_int(keys, reverse_keys) result(idx)
          integer, intent(in) :: keys(:,:)
          logical, optional, intent(in) :: reverse_keys
          integer, allocatable :: idx(:), work(:)
@@ -9851,7 +9851,7 @@ END SUBROUTINE dcmqr2
          end do
       end function lexsort_keys_int
 
-      function lexsort_keys_real(keys, reverse_keys) result(idx)
+      pure function lexsort_keys_real(keys, reverse_keys) result(idx)
          use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
          real(dp), intent(in) :: keys(:,:)
          logical, optional, intent(in) :: reverse_keys
@@ -9931,7 +9931,7 @@ END SUBROUTINE dcmqr2
          end do
       end function lexsort_keys_real
 
-      function lexsort_packed_int(values, lengths) result(idx)
+      pure function lexsort_packed_int(values, lengths) result(idx)
          integer, intent(in) :: values(:)
          integer, intent(in) :: lengths(:)
          integer, allocatable :: idx(:)
@@ -9943,7 +9943,7 @@ END SUBROUTINE dcmqr2
          idx = lexsort_keys_int(transpose(reshape(values, [n,nk])))
       end function lexsort_packed_int
 
-      function lexsort_packed_real(values, lengths) result(idx)
+      pure function lexsort_packed_real(values, lengths) result(idx)
          real(dp), intent(in) :: values(:)
          integer, intent(in) :: lengths(:)
          integer, allocatable :: idx(:)
