@@ -14495,6 +14495,87 @@ def test_xp2f_discarded_numpy_calls_validate_options(tmp_path: Path, call: str) 
 
 
 @pytest.mark.parametrize("dtype", ["int", "float"])
+def test_xp2f_argsort_in_pure_local_function(tmp_path: Path, dtype: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xpure_argsort.py", [
+        "import numpy as np",
+        "def order(a):",
+        "    index = np.argsort(a)",
+        "    result = np.zeros(a.size, dtype=int)",
+        "    left = 0.0",
+        "    right = 0.0",
+        "    for i in range(a.size - 1, -1, -1):",
+        "        j = index[i]",
+        "        if left < right:",
+        "            result[j] = 0",
+        "            left = left + a[j]",
+        "        else:",
+        "            result[j] = 1",
+        "            right = right + a[j]",
+        "    return result",
+        "def show(a):",
+        "    b = order(a)",
+        "    print(b.size)",
+        "    for i in range(b.size):",
+        "        print(b[i], a[i])",
+        f"show(np.array([3, -2, 7, 1, 0], dtype={dtype}))",
+        f"show(np.array([], dtype={dtype}))",
+        f"show(np.array([7], dtype={dtype}))",
+    ])
+    generated = (tmp_path / "xpure_argsort_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"\bpure\s+function\s+order\(", generated)
+
+
+@pytest.mark.parametrize("kind,values", [("integer", "3, 1, 1, 2"),
+                                        ("real(dp)", "3.5_dp, 1.5_dp, 1.5_dp, 2.5_dp")])
+def test_argsort_pure_helpers_and_small_output_error(tmp_path: Path, kind: str, values: str) -> None:
+    # Exercise both helper APIs from an explicitly PURE caller, including
+    # stable ties. NumPy's default quicksort does not promise stable ties.
+    source = tmp_path / "pure_argsort.f90"
+    source.write_text(f"""module probe
+use python_mod, only: argsort, argsort_idx
+use, intrinsic :: iso_fortran_env, only: dp => real64
+implicit none
+contains
+pure subroutine sort_both(a, indices, wrapped)
+{kind}, intent(in) :: a(:)
+integer, intent(out) :: indices(:)
+integer, allocatable, intent(out) :: wrapped(:)
+call argsort(a, indices)
+wrapped = argsort_idx(a)
+end subroutine
+end module
+program main
+use probe
+implicit none
+{kind} :: a(4) = [{values}]
+integer :: indices(4), small(1)
+integer, allocatable :: wrapped(:)
+if (command_argument_count() > 0) then
+    call sort_both(a, small, wrapped)
+    error stop 'missing bounds diagnostic'
+end if
+call sort_both(a, indices, wrapped)
+if (any(indices /= [1, 2, 3, 0])) error stop 'indices'
+if (any(wrapped /= indices)) error stop 'wrapper'
+call sort_both(a(:0), indices(:0), wrapped)
+if (size(wrapped) /= 0) error stop 'empty'
+call sort_both(a(:1), indices(:1), wrapped)
+if (size(wrapped) /= 1 .or. wrapped(1) /= 0) error stop 'singleton'
+end program
+""", encoding="utf-8")
+    exe = tmp_path / "pure_argsort.exe"
+    build = subprocess.run(["gfortran", "-fcheck=all", str(PYTHON_HELPER_PATH),
+                            str(REPO_ROOT / "lapack_d.f90"), str(source),
+                            "-o", str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    bad = subprocess.run([str(exe), "small"], cwd=tmp_path, capture_output=True, text=True)
+    assert bad.returncode != 0
+    assert "output array too small" in bad.stdout + bad.stderr
+
+
+@pytest.mark.parametrize("dtype", ["int", "float"])
 def test_xp2f_unique_in_pure_local_function(tmp_path: Path, dtype: str) -> None:
     _run_xp2f_compile_diff(tmp_path, "xpure_unique.py", [
         "import numpy as np",

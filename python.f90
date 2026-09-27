@@ -3306,13 +3306,13 @@ contains
          end do
       end subroutine sort_char_vec
 
-      subroutine argsort_real(x, idx)
+      pure subroutine argsort_real(x, idx)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(out) :: idx(:)
          integer :: i, n
          integer, allocatable :: tmp(:)
          n = size(x)
-         if (size(idx) < n) stop "argsort_real: output array too small"
+         if (size(idx) < n) error stop "argsort_real: output array too small"
          do i = 1, n
             idx(i) = i - 1
          end do
@@ -3322,7 +3322,7 @@ contains
          end if
       end subroutine argsort_real
 
-      recursive subroutine argsort_msort_real(x, idx, tmp, lo, hi)
+      pure recursive subroutine argsort_msort_real(x, idx, tmp, lo, hi)
          ! O(n log n) stable merge sort of idx by x(idx(:)+1); insertion
          ! sort here previously made argsort O(n**2), catastrophic for
          ! large n (e.g. sorting a 10**5-element array to seed EM means).
@@ -3360,13 +3360,13 @@ contains
          idx(lo:hi) = tmp(lo:hi)
       end subroutine argsort_msort_real
 
-      subroutine argsort_int(x, idx)
+      pure subroutine argsort_int(x, idx)
          integer, intent(in) :: x(:)
          integer, intent(out) :: idx(:)
          integer :: i, n
          integer, allocatable :: tmp(:)
          n = size(x)
-         if (size(idx) < n) stop "argsort_int: output array too small"
+         if (size(idx) < n) error stop "argsort_int: output array too small"
          do i = 1, n
             idx(i) = i - 1
          end do
@@ -3376,7 +3376,7 @@ contains
          end if
       end subroutine argsort_int
 
-      recursive subroutine argsort_msort_int(x, idx, tmp, lo, hi)
+      pure recursive subroutine argsort_msort_int(x, idx, tmp, lo, hi)
          ! O(n log n) stable merge sort -- see argsort_msort_real.
          integer, intent(in) :: x(:)
          integer, intent(inout) :: idx(:), tmp(:)
@@ -3412,14 +3412,14 @@ contains
          idx(lo:hi) = tmp(lo:hi)
       end subroutine argsort_msort_int
 
-      function argsort_idx_real(x) result(idx)
+      pure function argsort_idx_real(x) result(idx)
          real(kind=dp), intent(in) :: x(:)
          integer, allocatable :: idx(:)
          allocate(idx(size(x)))
          call argsort_real(x, idx)
       end function argsort_idx_real
 
-      function argsort_idx_int(x) result(idx)
+      pure function argsort_idx_int(x) result(idx)
          integer, intent(in) :: x(:)
          integer, allocatable :: idx(:)
          allocate(idx(size(x)))

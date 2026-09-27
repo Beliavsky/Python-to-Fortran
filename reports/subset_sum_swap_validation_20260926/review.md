@@ -50,9 +50,34 @@ python -m pytest -q -n 2 --reruns 0 tests\test_xp2f_cli.py -k "discarded_numpy o
 
 ## Full corpus status
 
-The original sort-call compilation failure is gone. The unchanged full program
-still fails later at `subset_sum_swap_try`'s call to `subset_sum_swap`: the caller
-declares `xindex` as a scalar although it subsequently uses `xindex(i)` and
-passes it as an output array. Gfortran reports `Invalid procedure argument`.
-That separate selection-index output declaration issue is not fixed here, and full
-program numerical agreement has not been claimed.
+The original sort-call compilation failure exposed a second failure at
+`subset_sum_swap_try`'s call to `subset_sum_swap`: the caller declared `xindex`
+as scalar although it subsequently used `xindex(i)` and passed it as an output
+array. Gfortran reported `Invalid procedure argument`.
+
+That follow-up is now fixed. Comment-based tuple-result refinement retained
+the array rank but changed its kind tag from `alloc_real` to `real`. Caller
+declaration inference treats that plain kind as scalar and discarded the rank.
+Refinement now retains the array-kind encoding for every positive-rank result,
+across integer, real, logical, complex, and character kinds. The problem was
+not specific to the reserved name `index`.
+
+The unchanged full program now compiles, runs, and matches Python on **all seven
+problems**, including available/selected weights, achieved sums, and defects.
+Only timestamps, version banners, and whitespace are excluded from comparison.
+The misleading source comments about sorting remain unchanged; comparison is
+against the executed Python, not an amended algorithm.
+
+```bat
+python reports\subset_sum_swap_validation_20260926\check.py
+```
+
+The checker copies the original source into a fresh temporary directory and
+saves build, Python, and Fortran logs there. It prints the artifact directory.
+No changes are made to the Burkardt source.
+
+Follow-up regression testing: **16 passed** (8 new vector cases in 158.83
+seconds, then 8 matrix/character and related tuple/scalar cases in 164.71
+seconds). Fractional matrix values check that an integer comment does not
+truncate real results. Both `index` and an ordinary variable name are covered.
+The full pytest suite was not run.
