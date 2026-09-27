@@ -55328,9 +55328,12 @@ class translator(ast.NodeVisitor):
             self._open_type_rebind_block(node.target.id, "int", 0)
 
         # Python's iterator is independent of the visible target. Both
-        # overlapping range loops need counters: the inner loop must not
-        # advance the visible value past its last item (or set it if empty).
-        independent_counter = getattr(node, "_xp2f_reused_loop_target", False)
+        # overlapping range loops and targets read after the loop need
+        # counters. Assign the visible target only when an iteration starts:
+        # this preserves it after EXIT and normal completion, and leaves
+        # its previous value untouched for an empty range.
+        independent_counter = (getattr(node, "_xp2f_reused_loop_target", False)
+                               or not getattr(node, "_xp2f_dead_range_target", False))
         counter = var
         if independent_counter:
             counter = self._fresh_scoped_names("i_range")
@@ -55350,30 +55353,6 @@ class translator(ast.NodeVisitor):
         if independent_counter:
             self.o.pop()
             self.o.w("end block")
-        elif not getattr(node, "_xp2f_dead_range_target", False):
-            # Python's for-loop target keeps its LAST iterated value
-            # after the loop ends normally, but Fortran's DO variable is
-            # left ONE PAST that value (do i = 1, n; ...; end do leaves i
-            # == n + 1, not n) -- a silent off-by-one whenever the loop
-            # variable is read again afterward (annotate_loop_target_
-            # liveness's own _xp2f_dead_range_target already tells us
-            # exactly when that happens). Found mining TheAlgorithms/
-            # Python's own dynamic_programming/knapsack.py:
-            # `return dp[n][w_], dp` reads the inner loop's own `w_`
-            # after `for w_ in range(1, w + 1):` completes, and the
-            # resulting off-by-one index crashed at runtime ("Index '8'
-            # ... above upper bound of 7"). Guarded on the loop actually
-            # having run at least once, matching Fortran's own "did this
-            # DO loop execute" rule -- an empty range leaves the
-            # variable at its pre-loop value already, in both languages,
-            # so no correction is needed (or correct) there.
-            if is_const_int(step) and step.value == 1:
-                self.o.w(f"if ({f_start} <= {f_upper}) {var} = {var} - 1")
-            else:
-                self.o.w(
-                    f"if (({f_step} > 0 .and. {f_start} <= {f_upper}) .or. "
-                    f"({f_step} < 0 .and. {f_start} >= {f_upper})) {var} = {var} - ({f_step})"
-                )
 
         if scoped_integer:
             self._close_one_type_rebind_block()
@@ -70780,6 +70759,16 @@ def generate_flat(
                     base_kinds[_i] = _numeric_comment_kind(_dk, _ck)
                 if _cr is not None:
                     base_ranks[_i] = max(int(base_ranks[_i]), int(_cr))
+                # Tuple-call declaration inference encodes arrays in BOTH
+                # the kind tag and rank. Comment refinement must not turn
+                # alloc_real/rank-1 into real/rank-1: callers interpret a
+                # plain kind as scalar and discard that rank.
+                if int(base_ranks[_i]) > 0:
+                    base_kinds[_i] = {
+                        "int": "alloc_int", "real": "alloc_real",
+                        "logical": "alloc_log", "complex": "alloc_complex",
+                        "char": "alloc_char",
+                    }.get(base_kinds[_i], base_kinds[_i])
                 refined_any = True
                 continue
             if _nm in _arg_kind_by_name and _arg_rank_by_name.get(_nm, 0) == 0:

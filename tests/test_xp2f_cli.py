@@ -14409,6 +14409,26 @@ def test_xp2f_discarded_numpy_sort_flip_do_not_mutate(tmp_path: Path, dtype: str
     ])
 
 
+@pytest.mark.parametrize("name", ["index", "selected"])
+@pytest.mark.parametrize("dtype, comment", [("float", "integer"), ("int", "integer"),
+                                            ("bool", "logical"), ("complex", "complex")])
+def test_xp2f_commented_tuple_array_keeps_array_kind(tmp_path: Path, name: str, dtype: str, comment: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcomment_tuple_array.py", [
+        "import numpy as np",
+        "def select(n):",
+        f"    # {comment} {name.upper()}(N), selection flags.",
+        f"    {name} = np.zeros(n, dtype={dtype})",
+        f"    {name}[0] = 1",
+        f"    return {name}, n",
+        "def show(n):",
+        f"    {name}, count = select(n)",
+        "    print(count)",
+        "    for i in range(n):",
+        f"        print({name}[i])",
+        "show(3)",
+    ])
+
+
 def test_xp2f_discarded_numpy_calls_evaluate_input_once(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xdiscarded_calls.py", [
         "import numpy as np",
@@ -14418,6 +14438,27 @@ def test_xp2f_discarded_numpy_calls_evaluate_input_once(tmp_path: Path) -> None:
         "for i in range(2):",
         "    np.sort(make())",
         "    np.flip(make())",
+    ])
+
+
+def test_xp2f_commented_tuple_matrix_and_character_results(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcomment_tuple_matrix.py", [
+        "import numpy as np",
+        "def matrix(n):",
+        "    # integer VALUES(N,N), matrix values.",
+        "    values = np.full((n, n), 1.5)",
+        "    return values, n",
+        "def labels():",
+        "    # character WORDS(2), output labels.",
+        "    words = np.array(['yes', 'no'])",
+        "    return words, 2",
+        "a, n = matrix(2)",
+        "for i in range(n):",
+        "    for j in range(n):",
+        "        print(a[i, j])",
+        "b, m = labels()",
+        "for i in range(m):",
+        "    print(b[i])",
     ])
 
 
@@ -18445,6 +18486,61 @@ def test_xp2f_rebinding_does_not_close_enclosing_block(tmp_path: Path, control: 
     ])
 
 
+def test_xp2f_live_range_target_after_break_completion_and_empty(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xrange_final_value.py", [
+        "def last(start, stop, step, cutoff):",
+        "    i = 77",
+        "    for i in range(start, stop, step):",
+        "        if i == cutoff:",
+        "            break",
+        "    return i",
+        "print(last(1, 10, 1, 4))",
+        "print(last(1, 10, 1, 1))",
+        "print(last(1, 10, 1, 9))",
+        "print(last(1, 10, 1, -1))",
+        "print(last(1, 10, 3, 4))",
+        "print(last(1, 10, 3, -1))",
+        "print(last(10, 0, -2, 6))",
+        "print(last(10, 0, -2, -1))",
+        "print(last(5, 5, 1, -1))",
+        "print(last(5, 1, 1, -1))",
+        "print(last(1, 5, -1, -1))",
+        "i = 31",
+        "for i in range(4, 4):",
+        "    print(i)",
+        "print(i)",
+        "for i in range(1, 6):",
+        "    if i == 3:",
+        "        break",
+        "print(i)",
+        "for i in range(1, 6):",
+        "    continue",
+        "print(i)",
+        "for i in range(1, 5):",
+        "    i = 99",
+        "print(i)",
+    ])
+
+
+def test_xp2f_live_range_target_with_nested_loop(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xrange_nested_final.py", [
+        "def nested():",
+        "    i_range = 42",
+        "    for i in range(1, 4):",
+        "        for j in range(1, 6):",
+        "            if j == 2:",
+        "                break",
+        "        print(i, j)",
+        "    print(i, j, i_range)",
+        "    for k in range(5):",
+        "        for k in range(2):",
+        "            break",
+        "        break",
+        "    print(k)",
+        "nested()",
+    ])
+
+
 def test_xp2f_jacobi_vector_rhs_and_diagonal(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xjacobi_vectors.py", [
         "import numpy as np",
@@ -21373,9 +21469,9 @@ def test_xp2f_loop_var_read_after_normal_completion(tmp_path: Path) -> None:
     # n + 1, not n). `return dp[n][w_], dp` read the inner loop's own
     # `w_` after `for w_ in range(1, w + 1):` completed, and the
     # resulting off-by-one index crashed at runtime with an
-    # out-of-bounds array access. Fixed by emitting a post-loop
-    # correction (var = var - step) whenever liveness analysis shows
-    # the loop target is read again afterward.
+    # out-of-bounds array access. A separate internal counter now
+    # preserves the visible target's last value, including early
+    # exits and empty ranges (where a post-loop subtraction is wrong).
     src = tmp_path / "xloopvar_after_knapsack.py"
     src.write_text(
         "\n".join(
