@@ -14474,6 +14474,59 @@ def test_xp2f_single_result_array_specialization_no_phantom_real(tmp_path: Path)
     assert not re.search(r"function\s+flip_first\w*real", generated)
 
 
+@pytest.mark.parametrize("initial,rebindings,print_result", [
+    ("np.array([0, 2], dtype=int)", ["a = np.array([2.5, 3.75])"], "print(b[0], b[1])"),
+    ("np.array([0.0, 2.5])", ["a = np.array([2, 3], dtype=int)"], "print(b[0], b[1])"),
+    ("np.array([False, True])", ["a = np.array([2.5, 3.75])"], "print(b[0], b[1])"),
+    ("np.array([0, 2], dtype=int)", ["a = np.array([[2.5, 3.75], [4.25, 5.5]])"],
+     "print(b[0, 0], b[0, 1], b[1, 0], b[1, 1])"),
+    ("np.array([0, 2], dtype=int)", ["a = np.array([2.5, 3.75])", "a = np.array([7, 8], dtype=int)"],
+     "print(b[0], b[1])"),
+    ("np.array([0, 2], dtype=int)", ["a = np.array([2.5, 3.75])", "a = a + 0.125"],
+     "print(b[0], b[1])"),
+])
+def test_xp2f_rebound_array_parameter_result_dtype(tmp_path: Path, initial: str,
+                                                 rebindings: list, print_result: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xrebound_result.py", [
+        "import numpy as np",
+        "def changed(a):",
+        "    a[0] = 1",
+        *("    " + line for line in rebindings),
+        "    return a",
+        "a = " + initial,
+        "b = changed(a)",
+        print_result,
+    ])
+    generated = (tmp_path / "xrebound_result_p.f90").read_text(encoding="utf-8")
+    expected_kind = "integer" if "dtype=int" in rebindings[-1] else "real(kind=dp)"
+    assert re.search(rf"{re.escape(expected_kind)}, allocatable ::[^\n]*\bb\(", generated)
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("a = np.array([2.5, 3.75])\nreturn a", ("real", 1)),
+    ("a = np.array([2.5, 3.75])\na = a + 0.125\nreturn a", ("real", 1)),
+    ("if flag:\n    a = np.array([2.5, 3.75])\nreturn a", None),
+    ("for i in range(2):\n    a = np.array([2.5, 3.75])\nreturn a", None),
+    ("return a\na = np.array([2.5, 3.75])\nreturn a", None),
+])
+def test_rebound_array_result_inference_is_scoped(body: str, expected) -> None:
+    fn = ast.parse("def changed(a):\n" + "\n".join("    " + s for s in body.splitlines())).body[0]
+    # Scope mechanics only: compile/run cases above exercise real inference.
+    # Avoid constructing the full translator (and parsing all runtime helpers).
+    tr = SimpleNamespace(open_type_rebind_meta=[("other", "logical", 1)],
+                         _rank_expr=lambda node: 1)
+    def kind(node):
+        if isinstance(node, ast.Name):
+            return next((k for name, k, _ in reversed(tr.open_type_rebind_meta)
+                         if name == node.id), "int")
+        return "real"
+    tr._expr_kind = kind
+    saved = list(tr.open_type_rebind_meta)
+    assert xp2f._straight_line_rebound_array_result(fn, tr) == expected
+    assert tr.open_type_rebind_meta == saved
+    assert tr._expr_kind(ast.Name(id="a", ctx=ast.Load())) == "int"
+
+
 def test_xp2f_single_result_matrix_specialization_preserves_rank(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xmatrix_result_dtype.py", [
         "import numpy as np",

@@ -75,14 +75,30 @@ Final follow-up validation: **16 passed in 262.20 seconds**, with reruns
 disabled (six new cases and ten related regressions). The full unchanged
 `partition_brute.py` driver also passed comparison again. Full pytest was not run.
 
-### Separate remaining return-dtype issue
+### Rebound parameter return-dtype follow-up
 
 `rebound_result_repro.py` rebinds an integer array parameter to a new real array
-before returning it. Python prints `2.5 3.75`; the translation prints `2 3`.
+before returning it. Python prints `2.5 3.75`; the translation previously printed `2 3`.
 The same mismatch was reproduced with the committed `HEAD` transpiler before
 these changes, confirming that it is pre-existing.
-The generated block-local array is correctly real, but the function result
-and caller's destination are incorrectly integer. This case is intentionally
-excluded from the unchanged-array inference rule; it needs return-point type
-inference rather than preservation of the input dtype. Keep this wrong-result
-case as a priority follow-up, not an acceptable numeric difference.
+The generated block-local array was correctly real, but the function result
+and caller's destination were incorrectly integer. This case remains excluded
+from the unchanged-array inference rule.
+
+The follow-up replays unconditional assignments in a temporary type scope for
+straight-line functions returning a rebound array parameter. Both the local
+return map and procedure emission use the resulting type/rank at return.
+The original input declaration is preserved, and the temporary scope is
+restored after inference. Later rebindings supersede earlier ones; expressions
+such as `a = a + 0.125` see the preceding real-array binding.
+
+The reproducer now compiles and reports `Run diff: MATCH`. Conditional returns,
+loops, unpacking assignments, and scalar returns are deliberately outside this
+new rule; this is not a general control-flow type analysis.
+
+Validation: **15 focused tests passed in 67.40 seconds**, with reruns disabled:
+six compile/run/declaration cases, five scope-isolation cases, and four existing
+conditional-return guard cases. An earlier **13-test** compile/run selection
+also passed, including seven related specialization/fractional-array regressions
+(the six new compile/run cases overlap). The full unchanged Burkardt driver
+again matched Python. Full pytest was not run.

@@ -59111,6 +59111,53 @@ def _none_default_arg_is_pure_forward(fn, arg_name):
     return checker.pure_forward
 
 
+def _straight_line_rebound_array_result(fn, tr):
+    """Infer a returned parameter after unconditional, straight-line rebinding.
+
+    Prescan retains the input declaration for a parameter, with later types
+    living in generated blocks. Replay assignments in a temporary type scope
+    so result inference sees the binding at return, not the input declaration.
+    Leave branching/looping functions to the existing inference paths.
+    """
+    if not fn.body or not isinstance(fn.body[-1], ast.Return):
+        return None
+    value = fn.body[-1].value
+    if not isinstance(value, ast.Name) or value.id not in {
+        arg.arg for arg in fn.args.args + fn.args.kwonlyargs
+    }:
+        return None
+    if any(not isinstance(st, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Pass))
+           for st in fn.body[:-1]):
+        return None
+    saved = list(tr.open_type_rebind_meta)
+    rebound = False
+    try:
+        for st in fn.body[:-1]:
+            if isinstance(st, ast.Assign):
+                targets, rhs = st.targets, st.value
+            elif isinstance(st, ast.AnnAssign) and st.value is not None:
+                targets, rhs = [st.target], st.value
+            else:
+                continue
+            # Unpacking needs separate element inference; do not guess.
+            if any(isinstance(t, (ast.Tuple, ast.List)) for t in targets):
+                return None
+            kind, rank = tr._expr_kind(rhs), tr._rank_expr(rhs)
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    if kind not in {"int", "real", "complex", "logical", "char"}:
+                        return None
+                    tr.open_type_rebind_meta.append((target.id, kind, rank))
+                    rebound |= target.id == value.id
+        if rebound:
+            kind, rank = tr._expr_kind(value), tr._rank_expr(value)
+            if rank > 0:
+                return kind, rank
+    finally:
+        tr.open_type_rebind_meta[:] = saved
+    return None
+
+
 def _check_conditional_element_return(fn, tr):
     """Reject a terminal array-to-element rebind with a dynamic return rank.
 
@@ -61956,6 +62003,9 @@ def _emit_local_function(
         rv0 = returns[0].value
         rr0 = max(0, int(tr._rank_expr(rv0)))
         rk0 = tr._expr_kind(rv0)
+        rebound_result = _straight_line_rebound_array_result(fn, tr)
+        if rebound_result is not None:
+            rk0, rr0 = rebound_result
         if (
             isinstance(rv0, ast.Call)
             and isinstance(rv0.func, ast.Name)
@@ -66849,6 +66899,12 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         spec = "complex"
                     elif k == "char":
                         spec = "char"
+            rebound_result = _straight_line_rebound_array_result(fn, tr)
+            if rebound_result is not None:
+                result_kind, rr_spec = rebound_result
+                spec = {"int": "alloc_int", "real": "alloc_real",
+                        "logical": "alloc_log", "complex": "alloc_complex",
+                        "char": "alloc_char"}[result_kind]
             if spec is None:
                 continue
             if scalar_or_array.get(fn.name) != spec or int(scalar_or_array_ranks.get(fn.name, 0)) != int(rr_spec):

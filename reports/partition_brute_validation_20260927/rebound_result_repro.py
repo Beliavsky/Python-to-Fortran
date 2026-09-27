@@ -1,6 +1,6 @@
-"""Separate unresolved return-dtype bug; Python prints 2.5 3.75.
+"""Regression for rebound array result dtype; Python prints 2.5 3.75.
 
-The translation currently prints 2 3. Rebinding the parameter means this
+The translation previously printed 2 3. Rebinding the parameter means this
 is not an unchanged-array result; inference must track its type at return.
 """
 import numpy as np
