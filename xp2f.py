@@ -25285,7 +25285,21 @@ class translator(ast.NodeVisitor):
             return None
         return None
 
+    def _returned_array_actual(self, node):
+        spec = getattr(node, "_xp2f_returned_array_arg", None)
+        if spec is None or not isinstance(node, ast.Call):
+            return None
+        index, name = spec
+        actual = node.args[index] if index < len(node.args) else next(
+            (kw.value for kw in node.keywords if kw.arg == name), None)
+        if actual is not None and not self._is_python_list_expr(actual):
+            return actual
+        return None
+
     def _expr_kind(self, node):
+        returned_actual = self._returned_array_actual(node)
+        if returned_actual is not None:
+            return self._expr_kind(returned_actual)
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
@@ -30443,6 +30457,9 @@ class translator(ast.NodeVisitor):
         return self._coerce_expr_kind(node, value, "logical")
 
     def _rank_expr(self, node):
+        returned_actual = self._returned_array_actual(node)
+        if returned_actual is not None:
+            return self._rank_expr(returned_actual)
         if self._is_matrix_where(node):
             return 2
         if self._where_tuple_index(node):
@@ -44324,6 +44341,8 @@ class translator(ast.NodeVisitor):
                     and v.func.id in self.local_return_specs
                 ):
                     spec = self.local_return_specs[v.func.id]
+                    if self._returned_array_actual(v) is not None:
+                        spec = self._expr_kind(v)
                     rr_v = max(0, int(self._rank_expr(v)))
                     if rr_v == 0 and self.local_overload_dispatch.get(v.func.id, {}).get("return_profiles"):
                         spec = {"alloc_real": "real", "alloc_int": "int",
@@ -63775,7 +63794,7 @@ def _emit_local_function(
             else:
                 arg_decl = f"integer, intent({intent_txt}) :: {arg_emit}"
             decl_kind = "integer"
-        elif arg in tr.alloc_logs:
+        elif arg in tr.alloc_logs and not (forced_arg_kind and hint_kind != "logical"):
             if arr_rank > 0:
                 dims = ",".join(":" for _ in range(arr_rank))
                 if is_count_mapped_output_array or is_alloc_rebind_output_array:
@@ -63808,7 +63827,10 @@ def _emit_local_function(
                 arg_decl = f"character(len=*), intent({intent_txt}) :: {arg_emit}"
             decl_kind = "character(len=*)"
         elif arr_rank > 0:
-            if hint_kind == "char":
+            if forced_arg_kind and hint_kind in {"int", "real", "logical", "complex", "char"}:
+                arg_kind = {"int": "integer", "real": "real(kind=dp)", "logical": "logical",
+                            "complex": "complex(kind=dp)", "char": "character(len=*)"}[hint_kind]
+            elif hint_kind == "char":
                 arg_kind = "character(len=*)"
             elif hint_kind == "logical" or ann_is_bool or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, bool)) or _arg_used_in_logical_ops(arg):
                 arg_kind = "logical"
@@ -67034,6 +67056,30 @@ def generate_flat(
         _mark_nested_loop_target_reuse(fn)
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map, extra_def_nodes=local_funcs)
     char_list_final_sizes = compute_list_final_sizes(tree)
+
+    # Preserve actual array storage through calls returning an unchanged
+    # argument binding. Element mutation does not change a NumPy dtype.
+    # This must precede provisional scans, so an unresolved return type
+    # cannot feed back into the same variable as a fabricated real overload.
+    returned_arrays = {}
+    for fn in local_funcs or []:
+        returns = [n.value for n in ast.walk(fn) if isinstance(n, ast.Return)]
+        for index, arg in enumerate(fn.args.args):
+            name = arg.arg
+            if (returns and all(isinstance(v, ast.Name) and v.id == name for v in returns)
+                    and any(isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                            and n.value.id == name for n in ast.walk(fn))
+                    and not any(isinstance(n, ast.Name) and n.id == name
+                                and isinstance(n.ctx, (ast.Store, ast.Del)) for n in ast.walk(fn))
+                    and not any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                                and n.value.id == name and isinstance(n.ctx, (ast.Store, ast.Del))
+                                for n in ast.walk(fn))):
+                returned_arrays[fn.name] = (index, name)
+    for scope in [tree, *(local_funcs or [])]:
+        for node in ast.walk(scope):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in returned_arrays:
+                    node._xp2f_returned_array_arg = returned_arrays[node.func.id]
 
     def _seed_struct_param_types(tr_scan, fn_scan):
         # A parameter (including a hoisted method's own `self`) annotated
@@ -71277,16 +71323,17 @@ def generate_flat(
         obs_pair_lists, obs_triad_lists, _obs_joint_calls = _observed_local_call_specs(fn.name)
         triads = set(_safe_idx(call_kind_rank_islist.get(fn.name, [set()]), 0)) | set(_safe_idx(obs_triad_lists, 0))
         pairs = set(pairs) | set(_safe_idx(obs_pair_lists, 0))
-        pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
+        allowed_ranks = {0, 1, 2} if fn.name in returned_arrays else {0, 1}
+        pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in allowed_ranks}
         _comment_kind0, _comment_rank0 = _comment_arg_spec_hint_for_fn(fn, arg0)
         if _comment_kind0 in {"int", "real", "logical", "char", "complex"}:
             # Documentation may describe the scalar mathematical argument
             # even when callers also pass arrays (e.g. cubic_antiderivative).
             # Keep observed ranks; actual body requirements below still rule
             # out scalar overloads for procedures that require an array.
-            pairs = {(_comment_kind0, r) for (_k, r) in pairs}
+            pairs = {(_numeric_comment_kind(_k, _comment_kind0) if r > 0 else _comment_kind0, r) for (_k, r) in pairs}
             triads = {
-                (_comment_kind0, r, is_list)
+                (_numeric_comment_kind(_k, _comment_kind0) if r > 0 else _comment_kind0, r, is_list)
                 for (_k, r, is_list) in triads
             }
         if _char_scalar_arg_pattern(fn, arg0):

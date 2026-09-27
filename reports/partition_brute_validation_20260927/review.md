@@ -45,10 +45,44 @@ Final focused validation: **18 passed**, with reruns disabled (6 new cases in
 179.26 seconds and 12 related cases in 199.28 seconds). The full corpus checker
 also passed again after the final changes.
 
-## Separate follow-up
+## Single-result follow-up
 
-`single_result_repro.py` records a distinct limitation found during testing:
+`single_result_repro.py` records a distinct failure found during testing:
 a single-argument helper returning its mutated array to the same caller variable
 can acquire a spurious real specialization and conflicting logical signatures.
-The tuple-return fix here does not claim to resolve that single-result inference
+The initial tuple-return fix did not resolve that single-result inference
 path. Expected Python output is `1 2 1 1`.
+
+The follow-up now preserves the actual argument's dtype/rank during preliminary
+scans when a function returns that same array argument without rebinding its
+name. Previously, a provisional real return type was fed back into the caller's
+variable and became spurious evidence for a real overload. Positional and
+keyword calls are covered. Rebound parameters and Python-list actuals are not
+treated as unchanged array storage.
+
+Array declaration emission also respects explicitly specialized argument kinds
+over inferred logical use. A genuine real overload must not declare its dummy
+logical merely because the body assigns or tests Boolean values.
+
+The original reproduction now compiles and reports `Run diff: MATCH`, with no
+real specialization generated for its integer/Boolean calls. Regressions also
+exercise real arrays with fractional elements, repeated self-assignment,
+and matrix ranks. The single-result overload path now accepts matrix ranks
+for these unchanged-array results and preserves observed numeric array kinds
+despite Boolean documentation comments.
+
+Final follow-up validation: **16 passed in 262.20 seconds**, with reruns
+disabled (six new cases and ten related regressions). The full unchanged
+`partition_brute.py` driver also passed comparison again. Full pytest was not run.
+
+### Separate remaining return-dtype issue
+
+`rebound_result_repro.py` rebinds an integer array parameter to a new real array
+before returning it. Python prints `2.5 3.75`; the translation prints `2 3`.
+The same mismatch was reproduced with the committed `HEAD` transpiler before
+these changes, confirming that it is pre-existing.
+The generated block-local array is correctly real, but the function result
+and caller's destination are incorrectly integer. This case is intentionally
+excluded from the unchanged-array inference rule; it needs return-point type
+inference rather than preservation of the input dtype. Keep this wrong-result
+case as a priority follow-up, not an acceptable numeric difference.

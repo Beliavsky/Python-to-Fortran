@@ -14441,6 +14441,56 @@ def test_xp2f_discarded_numpy_calls_evaluate_input_once(tmp_path: Path) -> None:
     ])
 
 
+@pytest.mark.parametrize("keyword", [False, True])
+@pytest.mark.parametrize("comment", [False, True])
+def test_xp2f_single_result_array_specialization_preserves_dtype(tmp_path: Path, keyword: bool, comment: bool) -> None:
+    call = "flip_first(a={})" if keyword else "flip_first({})"
+    _run_xp2f_compile_diff(tmp_path, "xsingle_result_dtype.py", [
+        "import numpy as np",
+        "def flip_first(a):",
+        "    # Input:",
+        "    # bool A(N), flags." if comment else "    # Flip the first element.",
+        "    a[0] = not a[0]",
+        "    return a",
+        "a = np.array([0, 2], dtype=int)",
+        "b = np.array([False, True], dtype=bool)",
+        "c = np.array([0.0, 2.75])",
+        "a = " + call.format("a"),
+        "b = " + call.format("b"),
+        "c = " + call.format("c"),
+        "print(int(a[0]), int(a[1]), int(b[0]), int(b[1]), c[0], c[1])",
+        "a = " + call.format("a"),
+        "b = " + call.format("b"),
+        "c = " + call.format("c"),
+        "print(int(a[0]), int(a[1]), int(b[0]), int(b[1]), c[0], c[1])",
+    ])
+
+
+def test_xp2f_single_result_array_specialization_no_phantom_real(tmp_path: Path) -> None:
+    source = (REPO_ROOT / "reports" / "partition_brute_validation_20260927"
+              / "single_result_repro.py").read_text(encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xno_phantom_real.py", source.splitlines())
+    generated = (tmp_path / "xno_phantom_real_p.f90").read_text(encoding="utf-8")
+    assert not re.search(r"function\s+flip_first\w*real", generated)
+
+
+def test_xp2f_single_result_matrix_specialization_preserves_rank(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xmatrix_result_dtype.py", [
+        "import numpy as np",
+        "def flip_first(a):",
+        "    a[0, 0] = not a[0, 0]",
+        "    return a",
+        "a = np.array([[0, 2], [3, 4]], dtype=int)",
+        "b = np.array([[False, True], [True, False]], dtype=bool)",
+        "a = flip_first(a)",
+        "b = flip_first(a=b)",
+        "print(a.shape[0], a.shape[1], b.shape[0], b.shape[1])",
+        "for i in range(2):",
+        "    for j in range(2):",
+        "        print(int(a[i, j]), int(b[i, j]))",
+    ])
+
+
 @pytest.mark.parametrize("comment", ["bool", "integer", ""])
 @pytest.mark.parametrize("expressions", [False, True])
 def test_xp2f_subset_next_integer_and_boolean_arrays(tmp_path: Path, comment: str, expressions: bool) -> None:

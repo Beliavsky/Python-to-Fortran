@@ -1,4 +1,4 @@
-"""Remaining single-result specialization limitation; Python prints 1 2 1 1."""
+"""Regression for returned-array specialization; Python prints 1 2 1 1."""
 import numpy as np
 
 
