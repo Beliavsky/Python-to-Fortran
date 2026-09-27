@@ -160,6 +160,7 @@ public :: str_find !@pyapi kind=function ret=integer args=s:character:intent(in)
 public :: str_rfind !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="0-based reverse find index or -1"
 public :: str_replace !@pyapi kind=function ret=character args=s:character:intent(in),old:character:intent(in),new:character:intent(in) desc="replace all occurrences"
 public :: str_reverse !@pyapi kind=function ret=character args=s:character:intent(in) desc="reverse a string (Python's s[::-1])"
+public :: str_to_chars !@pyapi kind=function ret=character args=s:character:intent(in) desc="split a string into a rank-1 array of its own 1-character substrings"
 public :: str_zfill !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with zeros to given width"
 public :: str_ljust !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="right-pad string with spaces to given width"
 public :: str_rjust !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with spaces to given width"
@@ -4695,6 +4696,16 @@ contains
             out(i:i) = s(n - i + 1:n - i + 1)
          end do
       end function str_reverse
+
+      pure function str_to_chars(s) result(out)
+         character(len=*), intent(in) :: s
+         character(len=1), allocatable :: out(:)
+         integer :: i
+         allocate(out(len(s)))
+         do i = 1, len(s)
+            out(i) = s(i:i)
+         end do
+      end function str_to_chars
 
       function str_zfill(s, width) result(out)
          character(len=*), intent(in) :: s

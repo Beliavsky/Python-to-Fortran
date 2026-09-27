@@ -14048,6 +14048,24 @@ def detect_needed_helpers(tree):
             and is_const_number_value(node.slice.step, -1)
         ):
             needed.add("str_reverse")
+        # A single-generator, filtered ListComp/GeneratorExp MAY be
+        # iterating a character-scalar string (e.g. `sum(1 for char in s
+        # if char in vowels)`) -- that codegen path (inside expr()'s own
+        # single-generator ListComp/GeneratorExp lowering) calls
+        # str_to_chars(...) to convert the string into a proper rank-1
+        # CHARACTER array first, reusing the existing elementwise-array
+        # machinery. Detecting the char-scalar case precisely here would
+        # need real kind inference, which this plain-AST pass doesn't
+        # have -- but an unused `use, only: str_to_chars` is harmless,
+        # so over-approximate on the syntactic shape alone rather than
+        # duplicate that inference. Found mining TheAlgorithms/Python's
+        # own strings/count_vowels.py.
+        if (
+            isinstance(node, (ast.ListComp, ast.GeneratorExp))
+            and len(node.generators) == 1
+            and node.generators[0].ifs
+        ):
+            needed.add("str_to_chars")
     linalg_aliases = collect_linalg_aliases(tree)
     scipy_aliases, _ = collect_scipy_special_aliases(tree)
     statistics_aliases, statistics_func_aliases = collect_statistics_aliases(tree)
@@ -34453,6 +34471,18 @@ class translator(ast.NodeVisitor):
                     base_kind = self._expr_kind(it.func.value)
                 else:
                     base_kind = self._expr_kind(it)
+                # `for char in some_string:` inside a comprehension/
+                # generator expression -- `some_string` is a Fortran
+                # CHARACTER scalar, not an array, so `base` (currently
+                # the whole string) can't be used directly the way a
+                # real rank-1 array's `base` is below (Fortran has no
+                # elementwise broadcasting over a scalar's own
+                # characters). Only wired up for the filtered (gen.ifs)
+                # path just below, via an implied-DO array constructor --
+                # see there for why. Found mining TheAlgorithms/Python's
+                # own strings/count_vowels.py: `sum(1 for char in s if
+                # char in vowels)`.
+                _char_scalar_iter = base_kind == "char" and self._rank_expr(it) == 0
 
                 # General replication form:
                 # [E for _ in range(n)] where E does not depend on loop variable.
@@ -34763,7 +34793,24 @@ class translator(ast.NodeVisitor):
                             else:
                                 rr = self._rank_expr(rhs_node)
                                 rhs = _map_expr(rhs_node)
-                                if rr <= 0:
+                                if rr <= 0 and self._expr_kind(rhs_node) == "char":
+                                    # Python's `x in y` for two strings is
+                                    # substring containment (`"a" in
+                                    # "abc"` -> True), never whole-string
+                                    # equality -- `lhs == rhs` below
+                                    # would compare `x` against the
+                                    # ENTIRE `y`, wrongly failing whenever
+                                    # they differ in length (Fortran
+                                    # blank-pads the shorter operand
+                                    # instead of raising, so this
+                                    # silently mis-evaluated rather than
+                                    # crashing). Found mining
+                                    # TheAlgorithms/Python's own strings/
+                                    # count_vowels.py: `char in vowels`
+                                    # (`char` a single character,
+                                    # `vowels` a 10-character string).
+                                    mtxt = f"(index({rhs}, {lhs}) > 0)"
+                                elif rr <= 0:
                                     mtxt = f"({lhs} == {rhs})"
                                 elif rr == 1:
                                     mtxt = (
@@ -34804,6 +34851,39 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("ListComp filter expression is unsupported")
 
                 try:
+                    if gen.ifs and _char_scalar_iter:
+                        # Swap `base` (currently the whole string, a
+                        # Fortran CHARACTER scalar) for str_to_chars(base)
+                        # -- a genuine rank-1 CHARACTER(len=1) array, one
+                        # element per character -- so every existing
+                        # elementwise-array codegen path below (operators,
+                        # the rank-1 branch of the "in"/"not in" handling,
+                        # and the final pack(mapped, mask) call) just
+                        # works unchanged; there is no elementwise
+                        # broadcasting over a scalar CHARACTER's own
+                        # characters the way there is over a real rank-1
+                        # array, so leaving `base` as the bare scalar
+                        # string (as every other codegen path here
+                        # assumes) is not an option.
+                        base = f"str_to_chars({base})"
+                        uses_loop_var_elt = any(
+                            isinstance(_n, ast.Name) and _n.id == loop_var and isinstance(_n.ctx, ast.Load)
+                            for _n in ast.walk(node.elt)
+                        )
+                        mapped = strip_redundant_outer_parens_expr(_map_expr(node.elt))
+                        if not uses_loop_var_elt:
+                            # A constant element expression (the common
+                            # `sum(1 for char in s if ...)` "count
+                            # matches" idiom) doesn't get automatically
+                            # broadcast to an array by `pack` the way an
+                            # arithmetic/comparison expression built from
+                            # `base` naturally does -- spread it to match
+                            # the character array's own shape first.
+                            mapped = f"spread({mapped}, dim=1, ncopies=size({base}))"
+                        masks = [strip_redundant_outer_parens_expr(_map_pred(cond)) for cond in gen.ifs]
+                        if len(masks) == 1:
+                            return f"pack({mapped}, {masks[0]})"
+                        return f"pack({mapped}, ({' .and. '.join(masks)}))"
                     mapped = _map_expr(node.elt)
                     if gen.ifs:
                         mapped = strip_redundant_outer_parens_expr(mapped)
@@ -41646,6 +41726,17 @@ class translator(ast.NodeVisitor):
                         self._mark_int(_target_nm)
                     elif _kk_iter == "real":
                         self._mark_real(_target_nm)
+                elif _rr_iter == 0 and _kk_iter == "char":
+                    # `for char in s:` -- Python's per-character string
+                    # iteration (s a CHARACTER scalar, not an array).
+                    # Without this, the loop target's own declaration
+                    # was never emitted at all (prescan runs the whole
+                    # declaration-emission pass before visit_For's own
+                    # codegen even starts, so a _mark_char call made only
+                    # there is already too late), crashing with "Symbol
+                    # 'char' at (1) has no IMPLICIT type". Found mining
+                    # TheAlgorithms/Python's own strings/count_vowels.py.
+                    self._mark_char(_target_nm)
             for _c in ast.walk(_n):
                 if not (
                     isinstance(_c, ast.Call)
@@ -55098,6 +55189,38 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"if ({ios_v} /= 0) exit")
                 if target_name != "_":
                     self.o.w(f"{target_name} = {line_v}")
+                _visit_loop_body_and_close_rebinds()
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            if (
+                isinstance(node.target, ast.Name)
+                and self._expr_kind(node.iter) == "char"
+                and self._rank_expr(node.iter) == 0
+            ):
+                # `for char in s:` -- Python's per-character string
+                # iteration. `s` is a Fortran CHARACTER scalar, not an
+                # array, so it can't be iterated the rank>=1 array way
+                # just below -- lower to an explicit index-based loop
+                # over 1-length substrings instead. Found mining
+                # TheAlgorithms/Python's own strings/count_vowels.py
+                # (via `sum(1 for char in s if char in vowels)`, which
+                # falls through to a plain `for` desugaring elsewhere)
+                # and strings/manacher.py's own direct `for i in s:`.
+                it_expr = self.expr(node.iter)
+                iv = self._fresh_scoped_names("i")
+                _char_target_nm = self._aliased_name(node.target.id)
+                if node.target.id != "_":
+                    self._mark_char(_char_target_nm)
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"integer :: {iv}")
+                self.o.w(f"do {iv} = 1, len({it_expr})")
+                self.o.push()
+                if node.target.id != "_":
+                    self.o.w(f"{_char_target_nm} = {it_expr}({iv}:{iv})")
                 _visit_loop_body_and_close_rebinds()
                 self.o.pop()
                 self.o.w("end do")

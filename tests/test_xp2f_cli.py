@@ -21704,3 +21704,97 @@ def test_xp2f_append_pop_mutation_on_bare_parameter(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_for_char_in_string_statement_loop(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (strings/count_vowels.py
+    # and strings/manacher.py): `for char in s:` (Python's idiomatic
+    # per-character string iteration) was entirely unsupported as a
+    # plain for-loop statement ("only for .. in range(..) or for .. in
+    # sorted(..) supported") -- `s` is a Fortran CHARACTER scalar, not
+    # an array, so it couldn't be iterated the way a rank-1 array is.
+    # Fixed by lowering to an explicit index-based loop over 1-length
+    # substrings, in both visit_For's own codegen and prescan's
+    # declaration-emission pass (which runs first and needs the exact
+    # same recognition to declare the loop target's own kind at all).
+    src = tmp_path / "xfor_char_in_string.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def count_vowels(s):",
+                "    vowels = \"aeiouAEIOU\"",
+                "    n = 0",
+                "    for char in s:",
+                "        if char in vowels:",
+                "            n = n + 1",
+                "    return n",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(count_vowels(\"hello world\"))",
+                "    print(count_vowels(\"PYTHON\"))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
+
+
+def test_xp2f_sum_generator_over_string_chars_with_membership_filter(tmp_path: Path) -> None:
+    # Real bug found mining TheAlgorithms/Python (strings/
+    # count_vowels.py): `sum(1 for char in s if char in vowels)` -- a
+    # filtered generator expression iterating a CHARACTER SCALAR (not an
+    # array) -- produced invalid Fortran ("'array' argument of 'pack'
+    # intrinsic must be an array": the codegen treated `s` itself as the
+    # per-element operand, so `char in vowels` became a whole-string `s
+    # == vowels` comparison). Also exercises the accompanying fix for
+    # Python's `x in y` string-membership test (substring containment,
+    # not whole-string equality) via a new str_to_chars runtime helper
+    # that converts the scalar string into a genuine rank-1 CHARACTER
+    # array, reusing the existing elementwise-array comprehension
+    # codegen unchanged.
+    src = tmp_path / "xsum_genexpr_string_chars_filter.py"
+    src.write_text(
+        "\n".join(
+            [
+                "def count_vowels(s):",
+                "    vowels = \"aeiouAEIOU\"",
+                "    return sum(1 for char in s if char in vowels)",
+                "",
+                "",
+                "if __name__ == \"__main__\":",
+                "    print(count_vowels(\"hello world\"))",
+                "    print(count_vowels(\"HELLO WORLD\"))",
+                "    print(count_vowels(\"123 hello world\"))",
+                "    print(count_vowels(\"\"))",
+                "    print(count_vowels(\"a quick brown fox\"))",
+                "    print(count_vowels(\"PYTHON\"))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-both"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Build: PASS" in proc.stdout
+    assert "Run: PASS" in proc.stdout
