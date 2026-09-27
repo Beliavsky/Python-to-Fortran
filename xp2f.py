@@ -25826,6 +25826,11 @@ class translator(ast.NodeVisitor):
                 if nm == "sys_argv":
                     return "char"
                 nm = self._aliased_name(self._resolve_list_alias(nm))
+                # A block-local dtype rebind shadows the procedure's arrays.
+                # Element truth tests and casts must use that visible dtype.
+                for bn, bk, _br in reversed(self.open_type_rebind_meta):
+                    if bn == nm:
+                        return bk
                 if nm in self.alloc_reals:
                     return "real"
                 if nm in self.alloc_complexes:
@@ -65650,12 +65655,15 @@ def _comment_kind_with_numeric_default(fn, name, kind):
 
 
 def _numeric_comment_kind(inferred_kind, comment_kind):
-    """Do not let documentation narrow floating-point or retype boolean storage."""
+    """Do not let documentation narrow floats or exchange numeric/Boolean storage."""
     if inferred_kind in {"complex", "alloc_complex"} and comment_kind in {"int", "real"}:
         return inferred_kind
     if inferred_kind in {"real", "alloc_real"} and comment_kind == "int":
         return inferred_kind
     if inferred_kind in {"logical", "alloc_log"} and comment_kind in {"int", "real"}:
+        return inferred_kind
+    if (inferred_kind in {"int", "alloc_int", "real", "alloc_real", "complex", "alloc_complex"}
+            and comment_kind == "logical"):
         return inferred_kind
     return comment_kind
 
@@ -71404,11 +71412,11 @@ def generate_flat(
             _comment_kind_i, _comment_rank_i = _comment_arg_spec_hint_for_fn(fn, arg_nm)
             if _comment_kind_i in {"int", "real", "logical", "char", "complex"}:
                 prs = {
-                    (_comment_kind_i, r)
+                    (_numeric_comment_kind(_k, _comment_kind_i) if r > 0 else _comment_kind_i, r)
                     for (_k, r) in prs
                 }
                 trs = {
-                    (_comment_kind_i, r, is_list)
+                    (_numeric_comment_kind(_k, _comment_kind_i) if r > 0 else _comment_kind_i, r, is_list)
                     for (_k, r, is_list) in trs
                 }
             try:
@@ -72717,6 +72725,24 @@ def generate_flat(
                     if fn.name in tuple_return_funcs and not local_overload_dispatch.get(fn.name, {}).get("joint"):
                         prof_kinds = list((emit_tuple_return_out_kinds or {}).get(fn.name, []))
                         prof_ranks = list((emit_tuple_return_out_ranks or {}).get(fn.name, []))
+                        # A returned array argument retains the specialization's
+                        # dtype when only its elements were modified. Other
+                        # tuple positions may be literals/expressions, which
+                        # prevents the all-name return-source map from helping.
+                        _returns = [r.value for r in ast.walk(fn)
+                                    if isinstance(r, ast.Return) and r.value is not None]
+                        for _j in range(len(prof_kinds)):
+                            for _arg, _kind in (forced_kinds or {}).items():
+                                _rank = int((forced_ranks or {}).get(_arg, 0))
+                                if (_rank > 0 and _returns
+                                        and all(isinstance(r, ast.Tuple) and _j < len(r.elts)
+                                                and isinstance(r.elts[_j], ast.Name)
+                                                and r.elts[_j].id == _arg for r in _returns)
+                                        and not any(isinstance(n, ast.Name) and n.id == _arg
+                                                    and isinstance(n.ctx, ast.Store) for n in ast.walk(fn))):
+                                    prof_kinds[_j] = _kind
+                                    if _j < len(prof_ranks):
+                                        prof_ranks[_j] = _rank
                         local_overload_tuple_profiles.setdefault(fn.name, []).append(
                             {
                                 "proc_name": pname,

@@ -14441,6 +14441,51 @@ def test_xp2f_discarded_numpy_calls_evaluate_input_once(tmp_path: Path) -> None:
     ])
 
 
+@pytest.mark.parametrize("comment", ["bool", "integer", ""])
+@pytest.mark.parametrize("expressions", [False, True])
+def test_xp2f_subset_next_integer_and_boolean_arrays(tmp_path: Path, comment: str, expressions: bool) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xsubset_types.py", [
+        "import numpy as np",
+        "def advance(n, t, rank):",
+        "    # Input:",
+        f"    # {comment} T(N), subset membership.",
+        "    # Output:",
+        f"    # {comment} T(N), next subset.",
+        "    if rank == -1:",
+        "        rank = 0",
+        "        return t, 0" if expressions else "        return t, rank",
+        "    for i in range(n - 1, -1, -1):",
+        "        if not t[i]:",
+        "            t[i] = True",
+        "            rank = rank + 1",
+        "            return t, rank + 0" if expressions else "            return t, rank",
+        "        t[i] = False",
+        "    rank = -1",
+        "    return t, -1" if expressions else "    return t, rank",
+        "def show_int():",
+        "    t = np.zeros(3, dtype=np.int32)",
+        "    rank = -1",
+        "    for step in range(9):",
+        "        t, rank = advance(3, t, rank)",
+        "        print(rank, int(t[0]), int(t[1]), int(t[2]))",
+        "        if t[0]:",
+        "            print(99)",
+        "def show_bool():",
+        "    t = np.zeros(3, dtype=bool)",
+        "    rank = -1",
+        "    for step in range(9):",
+        "        t, rank = advance(3, t, rank)",
+        "        print(rank, int(t[0]), int(t[1]), int(t[2]))",
+        "        if t[0]:",
+        "            print(99)",
+        "show_int()",
+        "show_bool()",
+    ])
+    generated = (tmp_path / "xsubset_types_p.f90").read_text(encoding="utf-8")
+    assert "subroutine advance_t_int_r1" in generated
+    assert "subroutine advance_t_logical_r1" in generated
+
+
 def test_xp2f_commented_tuple_matrix_and_character_results(tmp_path: Path) -> None:
     _run_xp2f_compile_diff(tmp_path, "xcomment_tuple_matrix.py", [
         "import numpy as np",
