@@ -17209,6 +17209,14 @@ def inline_local_from_imports(tree, py_path):
     changed = False
     module_cache = {}
     module_attr_renames = {}
+    name_renames = {}
+    emitted = set()
+    canonical_names = {}
+    occupied = {n.id.lower() for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    occupied.update(n.name.lower() for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.ClassDef)))
+    owners = {n.name.lower(): ("<script>", n.name) for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
 
     def _load_exports(mod_name):
         path = resolve_sibling_module_path(mod_name, py_path)
@@ -17269,7 +17277,8 @@ def inline_local_from_imports(tree, py_path):
                 # picks it up the same way it would if the import had been
                 # written directly in the main script.
                 extra_imports.append(copy.deepcopy(st))
-        exports = {"funcs": funcs, "assigns": assigns, "classes": classes, "extra_imports": extra_imports}
+        exports = {"funcs": funcs, "assigns": assigns, "classes": classes,
+                   "extra_imports": extra_imports, "path": key}
         module_cache[key] = exports
         return exports
 
@@ -17323,9 +17332,150 @@ def inline_local_from_imports(tree, py_path):
             new_body.append(copy.deepcopy(imp_st))
             changed = True
 
+    class _BindingRewriter(ast.NodeTransformer):
+        def __init__(self, names, attrs=None):
+            self.names = names
+            self.attrs = attrs or {}
+            self.global_names = set()
+
+        def visit_Name(self, node):
+            if (isinstance(node.ctx, ast.Load) or node.id in self.global_names) and node.id in self.names:
+                return ast.copy_location(ast.Name(id=self.names[node.id], ctx=node.ctx), node)
+            return node
+
+        def visit_Attribute(self, node):
+            if (isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Name)
+                    and (node.value.id, node.attr) in self.attrs):
+                return ast.copy_location(ast.Name(id=self.attrs[(node.value.id, node.attr)],
+                                                 ctx=ast.Load()), node)
+            return self.generic_visit(node)
+
+        def visit_Global(self, node):
+            node.names = [self.names.get(n, n) for n in node.names]
+            return node
+
+        def visit_Lambda(self, node):
+            bound = {a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+            bound.update(a.arg for a in (node.args.vararg, node.args.kwarg) if a is not None)
+            node.args.defaults = [self.visit(n) for n in node.args.defaults]
+            inner = _BindingRewriter({k: v for k, v in self.names.items() if k not in bound},
+                                     {k: v for k, v in self.attrs.items() if k[0] not in bound})
+            node.body = inner.visit(node.body)
+            return node
+
+        def visit_ListComp(self, node):
+            inner = _BindingRewriter(dict(self.names), dict(self.attrs))
+            for gen in node.generators:
+                gen.iter = inner.visit(gen.iter)
+                bound = {n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name)}
+                inner.names = {k: v for k, v in inner.names.items() if k not in bound}
+                inner.attrs = {k: v for k, v in inner.attrs.items() if k[0] not in bound}
+                gen.ifs = [inner.visit(n) for n in gen.ifs]
+            if isinstance(node, ast.DictComp):
+                node.key, node.value = inner.visit(node.key), inner.visit(node.value)
+            else:
+                node.elt = inner.visit(node.elt)
+            return node
+
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+        def visit_FunctionDef(self, node):
+            # Defaults are evaluated outside the function's local scope.
+            node.args.defaults = [self.visit(n) for n in node.args.defaults]
+            node.args.kw_defaults = [self.visit(n) if n is not None else None
+                                     for n in node.args.kw_defaults]
+            bound = {a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+            bound.update(a.arg for a in (node.args.vararg, node.args.kwarg) if a is not None)
+            globals_ = set()
+
+            class _Locals(ast.NodeVisitor):
+                def visit_Name(self, n):
+                    if isinstance(n.ctx, (ast.Store, ast.Del)):
+                        bound.add(n.id)
+
+                def visit_FunctionDef(self, n):
+                    bound.add(n.name)
+
+                visit_ClassDef = visit_FunctionDef
+
+                def visit_ListComp(self, n):
+                    pass  # Comprehension targets do not bind in the function.
+
+                visit_SetComp = visit_ListComp
+                visit_DictComp = visit_ListComp
+                visit_GeneratorExp = visit_ListComp
+                visit_Lambda = visit_ListComp
+
+                def visit_Global(self, n):
+                    globals_.update(n.names)
+
+                def visit_Import(self, n):
+                    bound.update(a.asname or a.name.split('.')[0] for a in n.names)
+
+                def visit_ImportFrom(self, n):
+                    bound.update(a.asname or a.name for a in n.names)
+
+            for stmt in node.body:
+                _Locals().visit(stmt)
+            bound -= globals_
+            inner = _BindingRewriter({k: v for k, v in self.names.items() if k not in bound},
+                                     {k: v for k, v in self.attrs.items() if k[0] not in bound})
+            inner.global_names = globals_
+            node.body = [inner.visit(n) for n in node.body]
+            return node
+
+    def _canonical(exports, source, preferred):
+        key = (exports["path"], source)
+        if key not in canonical_names:
+            if source in exports["assigns"]:
+                # Module storage is distinct from a caller's from-import
+                # binding, which Python permits the caller to reassign.
+                preferred = safe_import_prefix(Path(exports["path"]).stem) + "_" + source
+            name = preferred
+            if ((name.lower() in owners and owners[name.lower()] != key)
+                    or (source in exports["assigns"] and name.lower() in occupied)):
+                stem = safe_import_prefix(Path(exports["path"]).stem) + "_" + source
+                name = stem
+                suffix = 2
+                while name.lower() in occupied or name.lower() in owners:
+                    name = f"{stem}_{suffix}"
+                    suffix += 1
+            canonical_names[key] = name
+            owners[name.lower()] = key
+            occupied.add(name.lower())
+        return canonical_names[key]
+
+    def _emit_export(exports, source, preferred):
+        name = _canonical(exports, source, preferred)
+        key = (exports["path"], source)
+        if key in emitted:
+            return name
+        emitted.add(key)  # Mark before traversing recursive dependencies.
+        if source in exports["funcs"]:
+            node = copy.deepcopy(exports["funcs"][source])
+        elif source in exports["classes"]:
+            node = copy.deepcopy(exports["classes"][source])
+        else:
+            node = copy.deepcopy(exports["assigns"][source])
+        refs = _referenced_module_names(node, exports["funcs"], exports["assigns"])
+        refs.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                    and isinstance(n.ctx, ast.Load) and n.id in exports["classes"])
+        renames = {ref: _emit_export(exports, ref, ref) for ref in sorted(refs)}
+        node = _BindingRewriter(renames).visit(node)
+        if source in exports["funcs"] or source in exports["classes"]:
+            node.name = name
+        else:
+            node = ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=node)
+        new_body.append(node)
+        return name
+
+    deferred_functions = []
+    local_functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    call_bindings = []
     for st in tree.body:
         if isinstance(st, ast.Import):
-            imported = []
             keep_aliases = []
             for al in st.names:
                 exports = _load_exports(al.name)
@@ -17335,36 +17485,19 @@ def inline_local_from_imports(tree, py_path):
                 _carry_extra_imports(exports)
                 alias_name = al.asname or al.name.split(".", 1)[0]
                 prefix = safe_import_prefix(alias_name)
-                for nm, fn_src in exports["funcs"].items():
-                    local_name = f"{prefix}_{nm}"
-                    module_attr_renames[(alias_name, nm)] = local_name
-                    fn = copy.deepcopy(fn_src)
-                    fn.name = local_name
-                    imported.append(fn)
-                for nm, val_src in exports["assigns"].items():
-                    local_name = f"{prefix}_{nm}"
-                    module_attr_renames[(alias_name, nm)] = local_name
-                    imported.append(
-                        ast.Assign(
-                            targets=[ast.Name(id=local_name, ctx=ast.Store())],
-                            value=copy.deepcopy(val_src),
-                        )
-                    )
-                for nm, cls_src in exports["classes"].items():
-                    local_name = f"{prefix}_{nm}"
-                    module_attr_renames[(alias_name, nm)] = local_name
-                    cls = copy.deepcopy(cls_src)
-                    cls.name = local_name
-                    imported.append(cls)
+                module_attr_renames = {k: v for k, v in module_attr_renames.items() if k[0] != alias_name}
+                name_renames.pop(alias_name, None)
+                symbols = list(exports["funcs"]) + list(exports["assigns"]) + list(exports["classes"])
+                # Reserve the module-qualified names before resolving helpers.
+                for nm in symbols:
+                    _canonical(exports, nm, f"{prefix}_{nm}")
+                for nm in symbols:
+                    module_attr_renames[(alias_name, nm)] = _emit_export(exports, nm, f"{prefix}_{nm}")
+                changed = True
             if keep_aliases:
                 kept = copy.copy(st)
                 kept.names = keep_aliases
                 new_body.append(kept)
-            if imported:
-                new_body.extend(imported)
-                changed = True
-            elif not keep_aliases:
-                changed = True
             continue
         if isinstance(st, ast.ImportFrom) and not getattr(st, "level", 0) and st.module:
             exports = _load_exports(st.module)
@@ -17372,116 +17505,76 @@ def inline_local_from_imports(tree, py_path):
                 new_body.append(st)
                 continue
             _carry_extra_imports(exports)
-            imported = []
-            added_src_names = set()
+            selected = []
+            symbols = {**exports["funcs"], **exports["assigns"], **exports["classes"]}
             for al in st.names:
                 if al.name == "*":
-                    # `from module import *` -- unlike a named alias,
-                    # there's no asname to rename under, so every
-                    # exported name is inlined under its own true name
-                    # (matching real Python's own star-import semantics:
-                    # every top-level name the module defines, minus a
-                    # leading-underscore "private" convention; this
-                    # project has no notion of a module's own `__all__`
-                    # to consult, so that finer real-Python override
-                    # isn't honored). Reuses the exact same per-name
-                    # inlining as an explicit `from module import name`
-                    # -- deliberately not a separate code path, so a
-                    # star import stays exactly as capable as spelling
-                    # every name out by hand.
-                    for src_name in exports["funcs"]:
-                        if src_name.startswith("_") or src_name in added_src_names:
-                            continue
-                        fn = copy.deepcopy(exports["funcs"][src_name])
-                        imported.append(fn)
-                        added_src_names.add(src_name)
-                    for src_name in exports["assigns"]:
-                        if src_name.startswith("_") or src_name in added_src_names:
-                            continue
-                        imported.append(
-                            ast.Assign(
-                                targets=[ast.Name(id=src_name, ctx=ast.Store())],
-                                value=copy.deepcopy(exports["assigns"][src_name]),
-                            )
-                        )
-                        added_src_names.add(src_name)
-                    for src_name in exports["classes"]:
-                        if src_name.startswith("_") or src_name in added_src_names:
-                            continue
-                        imported.append(copy.deepcopy(exports["classes"][src_name]))
-                        added_src_names.add(src_name)
-                    continue
-                local_name = al.asname or al.name
-                if al.name in exports["funcs"]:
-                    fn = copy.deepcopy(exports["funcs"][al.name])
-                    fn.name = local_name
-                    imported.append(fn)
-                    added_src_names.add(al.name)
-                elif al.name in exports["assigns"]:
-                    imported.append(
-                        ast.Assign(
-                            targets=[ast.Name(id=local_name, ctx=ast.Store())],
-                            value=copy.deepcopy(exports["assigns"][al.name]),
-                        )
-                    )
-                    added_src_names.add(al.name)
-                elif al.name in exports["classes"]:
-                    cls = copy.deepcopy(exports["classes"][al.name])
-                    cls.name = local_name
-                    imported.append(cls)
-                    added_src_names.add(al.name)
-
-            # Transitively pull in any other same-module function/constant
-            # that an explicitly-imported function's body calls/references
-            # but that this import statement never itself named -- see
-            # _referenced_module_names above. Kept under its ORIGINAL
-            # (unaliased) source name, matching how the calling function's
-            # body already references it unqualified: aliasing on import
-            # never changes how names resolve *inside* the source module.
-            pending = [n for n in imported if isinstance(n, ast.FunctionDef)]
-            while pending:
-                fn_node = pending.pop()
-                for ref_name in _referenced_module_names(fn_node, exports["funcs"], exports["assigns"]):
-                    if ref_name in added_src_names:
-                        continue
-                    added_src_names.add(ref_name)
-                    if ref_name in exports["funcs"]:
-                        dep_fn = copy.deepcopy(exports["funcs"][ref_name])
-                        imported.append(dep_fn)
-                        pending.append(dep_fn)
-                    else:
-                        imported.append(
-                            ast.Assign(
-                                targets=[ast.Name(id=ref_name, ctx=ast.Store())],
-                                value=copy.deepcopy(exports["assigns"][ref_name]),
-                            )
-                        )
-
-            if imported:
-                new_body.extend(imported)
+                    selected.extend((nm, nm) for nm in symbols if not nm.startswith("_"))
+                elif al.name in symbols:
+                    selected.append((al.name, al.asname or al.name))
+            for source, local in selected:
+                _canonical(exports, source, local)
+            for source, local in selected:
+                canonical = _emit_export(exports, source, local)
+                if source in exports["assigns"]:
+                    new_body.append(ast.Assign(targets=[ast.Name(id=local, ctx=ast.Store())],
+                                               value=ast.Name(id=canonical, ctx=ast.Load())))
+                    name_renames.pop(local, None)
+                else:
+                    name_renames[local] = canonical
+                module_attr_renames = {k: v for k, v in module_attr_renames.items() if k[0] != local}
+            if selected:
                 changed = True
             else:
                 new_body.append(st)
             continue
-        new_body.append(st)
+        if isinstance(st, ast.FunctionDef):
+            name_renames.pop(st.name, None)
+            module_attr_renames = {k: v for k, v in module_attr_renames.items() if k[0] != st.name}
+            deferred_functions.append(st)
+            new_body.append(st)
+        else:
+            called = {n.func.id for n in ast.walk(st) if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Name) and n.func.id in local_functions}
+            if called:
+                call_bindings.append((called, dict(name_renames), dict(module_attr_renames)))
+            new_body.append(_BindingRewriter(name_renames, module_attr_renames).visit(copy.deepcopy(st)))
+            if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                rebound = {n.id for t in targets for n in ast.walk(t)
+                           if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                for name in rebound:
+                    name_renames.pop(name, None)
+                module_attr_renames = {k: v for k, v in module_attr_renames.items() if k[0] not in rebound}
 
-    if module_attr_renames:
-        class _LocalModuleAttrRewriter(ast.NodeTransformer):
-            def visit_Attribute(self, node):
-                node = self.generic_visit(node)
-                if (
-                    isinstance(node.ctx, ast.Load)
-                    and isinstance(node.value, ast.Name)
-                    and (node.value.id, node.attr) in module_attr_renames
-                ):
-                    return ast.copy_location(
-                        ast.Name(id=module_attr_renames[(node.value.id, node.attr)], ctx=ast.Load()),
-                        node,
-                    )
-                return node
+    # A single static procedure cannot observe different imported global
+    # bindings at different calls. Reject that case rather than using the
+    # final import for an earlier call. Walk local call dependencies too.
+    for called, names_at_call, attrs_at_call in call_bindings:
+        marker = "__xp2f_rebound_import_reference"
+        names = {k: marker for k in names_at_call.keys() | name_renames.keys()
+                 if names_at_call.get(k) != name_renames.get(k)}
+        attrs = {k: marker for k in attrs_at_call.keys() | module_attr_renames.keys()
+                 if attrs_at_call.get(k) != module_attr_renames.get(k)}
+        pending, visited = list(called), set()
+        while pending and (names or attrs):
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            fn = local_functions[name]
+            probe = _BindingRewriter(names, attrs).visit(copy.deepcopy(fn))
+            if any(isinstance(n, ast.Name) and n.id == marker for n in ast.walk(probe)):
+                raise NotImplementedError(
+                    "local function observes a rebound import alias; use distinct import aliases before calling the function")
+            pending.extend(n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call)
+                           and isinstance(n.func, ast.Name) and n.func.id in local_functions)
 
-        new_body = [_LocalModuleAttrRewriter().visit(st) for st in new_body]
-        changed = True
+    # Function globals are late-bound; top-level statements above instead use
+    # the bindings at their point of execution, before a later alias rebind.
+    for fn in deferred_functions:
+        index = new_body.index(fn)
+        new_body[index] = _BindingRewriter(name_renames, module_attr_renames).visit(copy.deepcopy(fn))
 
     if changed:
         out = ast.Module(body=new_body, type_ignores=getattr(tree, "type_ignores", []))

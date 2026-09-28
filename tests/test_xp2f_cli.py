@@ -6151,6 +6151,84 @@ def test_xp2f_inlines_local_sibling_from_import_function_and_constant(tmp_path: 
     assert "print" in out_text
 
 
+@pytest.mark.parametrize("imports", [
+    ["from A import foo", "from A import foo as Afoo", "from A import *", "import A"],
+    ["import A", "from A import foo as Afoo", "from A import foo", "from A import *"],
+])
+def test_xp2f_repeated_local_imports_share_procedures(tmp_path: Path, imports: list) -> None:
+    (tmp_path / "A.py").write_text(
+        "OFFSET = 5\ndef helper(x):\n    return x + OFFSET\n"
+        "def foo(x):\n    return helper(x)\n", encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xrepeat_import.py", imports + [
+        "print(foo(3), Afoo(4), A.foo(5))",
+        "def check(foo):",
+        "    return foo + 1",
+        "print(check(10))",
+    ])
+    generated = (tmp_path / "xrepeat_import_p.f90").read_text(encoding="utf-8")
+    # One definition per source procedure, irrespective of aliases/import form.
+    headers = re.findall(r"^\s*(?:pure\s+)?function\s+(\w+)\(", generated, re.MULTILINE | re.IGNORECASE)
+    assert len(headers) == 3, headers  # foo, helper, check
+
+
+@pytest.mark.parametrize("style", ["module", "from"])
+def test_xp2f_rebound_local_imports_preserve_source_identity(tmp_path: Path, style: str) -> None:
+    for name, offset in [("A", 5), ("B", 50)]:
+        (tmp_path / f"{name}.py").write_text(
+            f"OFFSET = {offset}\ndef helper(x):\n    return x + OFFSET\n"
+            "def foo(x):\n    return helper(x)\n", encoding="utf-8")
+    if style == "module":
+        lines = ["import A as mod", "print(mod.foo(3))", "import B as mod", "print(mod.foo(3))",
+                 "import A as original", "print(original.foo(4), mod.foo(4))"]
+    else:
+        lines = ["from A import foo", "print(foo(3))", "from B import foo", "print(foo(3))",
+                 "from A import foo as original", "print(original(4), foo(4))"]
+    _run_xp2f_compile_diff(tmp_path, "xrebound_import.py", lines)
+
+
+def test_xp2f_local_imports_keep_constant_bindings_independent(tmp_path: Path) -> None:
+    (tmp_path / "A.py").write_text(
+        "VALUE = 5\ndef foo(x):\n    return x + VALUE\n", encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xconstant_import.py", [
+        "from A import VALUE as x, foo",
+        "from A import VALUE as y",
+        "x = 20",
+        "print(x, y, foo(1))",
+        "from A import VALUE as x",
+        "print(x, y)",
+        "def scope(foo):",
+        "    y = 2",
+        "    return foo + y",
+        "print(scope(10))",
+    ])
+
+
+def test_inline_local_imports_respects_expression_scopes(tmp_path: Path) -> None:
+    (tmp_path / "A.py").write_text("VALUE = 5\ndef foo(x):\n    return x + VALUE\n", encoding="utf-8")
+    tree = ast.parse("from A import foo\nfrom A import foo as alias\n"
+                     "A_VALUE = 99\n"
+                     "items = [alias for alias in range(3)]\n"
+                     "lam = lambda alias: alias + 2\n"
+                     "def f():\n    items = [alias for alias in range(3)]\n    return alias(4)\n"
+                     "answer = f()\n")
+    merged = xp2f.inline_local_from_imports(tree, tmp_path / "main.py")
+    namespace = {}
+    exec(compile(merged, "<inlined>", "exec"), namespace)
+    assert namespace["items"] == [0, 1, 2]
+    assert namespace["lam"](3) == 5
+    assert namespace["answer"] == 9
+    assert namespace["A_VALUE"] == 99
+
+
+def test_inline_local_imports_rejects_dynamic_function_binding(tmp_path: Path) -> None:
+    for name, offset in [("A", 5), ("B", 50)]:
+        (tmp_path / f"{name}.py").write_text(f"def foo(x):\n    return x + {offset}\n", encoding="utf-8")
+    tree = ast.parse("from A import foo\ndef f():\n    return foo(1)\n"
+                     "print(f())\nfrom B import foo\nprint(f())\n")
+    with pytest.raises(NotImplementedError, match="local function observes a rebound import alias"):
+        xp2f.inline_local_from_imports(tree, tmp_path / "main.py")
+
+
 def test_xp2f_inlined_sibling_function_using_math_module(tmp_path: Path) -> None:
     # Regression test: a sibling module's own `import math` statement was
     # silently dropped when inline_local_from_imports copied a FunctionDef
