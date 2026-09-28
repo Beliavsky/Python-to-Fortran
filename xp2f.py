@@ -25803,7 +25803,7 @@ class translator(ast.NodeVisitor):
                         return "real"
                     if lk == "int" and rk == "int":
                         return "int"
-                    if lk == "logical" and rk == "logical" and isinstance(op_node, (ast.BitAnd, ast.BitOr)):
+                    if lk == "logical" and rk == "logical" and isinstance(op_node, (ast.BitAnd, ast.BitOr, ast.BitXor)):
                         return "logical"
                     return None
 
@@ -26017,7 +26017,7 @@ class translator(ast.NodeVisitor):
                 if lk == "complex" or rk == "complex":
                     return "complex"
                 return "real"
-            if isinstance(node.op, (ast.BitAnd, ast.BitOr)):
+            if isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
                 if self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right):
                     return self._expr_kind(node.left) or self._expr_kind(node.right)
                 # Python's &/| work on both bool and int operands (only
@@ -34716,6 +34716,8 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported 3D tuple subscripts")
             # Logical mask indexing (NumPy): a[mask] -> pack(a, mask)
             if slice_rank > 0 and self._expr_kind(node.slice) == "logical":
+                if getattr(node, "_xp2f_c_order_mask", False):
+                    return f"pack(transpose({base}), transpose({self.expr(node.slice)}))"
                 if self._rank_expr(node.value) == 2 and self._rank_expr(node.slice) == 1:
                     m = self.expr(node.slice)
                     return (
@@ -54103,18 +54105,22 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported Boolean masked augmented assignment: NumPy requires Boolean operands and +=, *=, &=, |=, or ^=")
             if bk == "int" and (rk in {"real", "complex"} or isinstance(node.op, ast.Div)):
                 raise NotImplementedError("masked augmented assignment cannot cast the arithmetic result back to an integer array")
-            rhs = self.expr(node.value)
             # Boolean indexing yields a compact vector in Python C order.
             # Work on snapshots, then scatter: a WHERE assignment cannot use
             # a compact RHS, and may evaluate operations on unselected values.
-            if isinstance(node.value, ast.Subscript) and self._expr_kind(node.value.slice) == "logical":
-                rr = self._rank_expr(node.value.value)
-                if rr == 2 and self._rank_expr(node.value.slice) == 2:
-                    rhs = f"pack(transpose({self.expr(node.value.value)}), transpose({self.expr(node.value.slice)}))"
-            elif any(isinstance(part, ast.Subscript)
-                     and self._expr_kind(part.slice) == "logical"
-                     and self._rank_expr(part.value) > 1 for part in ast.walk(node.value)):
-                raise NotImplementedError("matrix masked augmented assignment with a compound masked RHS is not supported; use an explicit loop")
+            # Annotate a private copy so nested expressions use the same order
+            # without changing Boolean indexing elsewhere in the translation.
+            rhs_node = copy.deepcopy(node.value)
+            for part in ast.walk(rhs_node):
+                if (isinstance(part, ast.Subscript)
+                        and self._expr_kind(part.slice) == "logical"
+                        and self._rank_expr(part.slice) > 0):
+                    array_rank = self._rank_expr(part.value)
+                    if array_rank not in (1, 2) or self._rank_expr(part.slice) != array_rank:
+                        raise NotImplementedError("masked augmented assignment RHS requires full-shape rank-1 or rank-2 masks")
+                    if array_rank == 2:
+                        part._xp2f_c_order_mask = True
+            rhs = self.expr(rhs_node)
             rhs_rank = self._rank_expr(node.value)
             if rhs_rank > 1:
                 raise NotImplementedError("masked augmented assignment requires a scalar or vector RHS")

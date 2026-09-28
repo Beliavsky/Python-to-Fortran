@@ -22641,6 +22641,77 @@ def test_xp2f_masked_augassign_packed_order_and_alias(tmp_path: Path) -> None:
     ])
 
 
+@pytest.mark.parametrize("dtype", ["int", "float", "complex"])
+def test_xp2f_compound_masked_matrix_updates(tmp_path: Path, dtype: str) -> None:
+    lines = [
+        "import numpy as np",
+        f"a = np.array([[1, 2, 3], [4, 5, 6]], dtype={dtype})",
+        f"b = np.array([[7, 8, 9], [10, 11, 12]], dtype={dtype})",
+        "m = np.array([[True, False, True], [True, False, False]])",
+        "q = np.array([[False, True, False], [False, True, True]])",
+    ]
+    if dtype == "complex":
+        lines += ["a = a + 2j", "b = b - 3j"]
+    for statement in [
+        "a[m] += 2 * b[m]",
+        "a[m] *= b[m] + a[q]",
+        "a[m] -= a[m] + b[q] * 2",
+        "a[m] += b[q] + np.array([10, 20, 30])",
+        "a[m] += np.sum(b[q] * 2)",
+        "a[m] += (b[q] + 2) // 3" if dtype == "int" else "a[m] += (b[q] + 2) / 3",
+        "m = a == a + 1",  # Empty selection on both sides.
+        "a[m] += b[m] * 2 + a[m]",
+        "m = a == a",  # Full selection.
+        "a[m] += b[m] * 2 + a[m]",
+    ]:
+        lines += [statement, "for i in range(2):", "    for j in range(3):", "        print(a[i, j])"]
+    _run_xp2f_compile_diff(tmp_path, "xcompound_masked.py", lines)
+
+
+def test_xp2f_compound_masked_boolean_updates(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcompound_bool.py", [
+        "import numpy as np",
+        "a = np.array([[True, True, False], [False, True, False]])",
+        "b = np.array([[False, True, True], [True, False, True]])",
+        "m = np.array([[True, False, True], [True, False, False]])",
+        "q = np.array([[False, True, False], [False, True, True]])",
+        "a[m] ^= b[q] & ~a[m]",
+        "a[m] |= b[m] ^ a[q]",
+        "a[a] &= ~b[a] | a[a]",
+        "for i in range(2):",
+        "    for j in range(3):",
+        "        print(a[i, j])",
+    ])
+
+
+def test_xp2f_compound_masked_division_skips_unselected_zeros(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcompound_divide.py", [
+        "import numpy as np",
+        "a = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])",
+        "b = np.array([[2.0, 0.0, 4.0], [0.0, 5.0, 0.0]])",
+        "m = b != 0.0",
+        "a[m] += 1.0 / b[m] + a[m] / b[m]",
+        "for i in range(2):",
+        "    for j in range(3):",
+        "        print(a[i, j])",
+    ])
+
+
+@pytest.mark.parametrize("rhs, message", [
+    ("b + 1", "requires a scalar or vector RHS"),
+    ("b[rows] + 1", "RHS requires full-shape rank-1 or rank-2 masks"),
+])
+def test_xp2f_rejects_compound_masked_unsupported_shapes(tmp_path: Path, rhs: str, message: str) -> None:
+    src = tmp_path / "xmasked_shapes.py"
+    src.write_text("import numpy as np\na = np.ones((2, 3))\nb = np.ones((2, 3))\n"
+                   "m = a > 0\nrows = np.array([True, False])\n"
+                   f"a[m] += {rhs}\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert message in proc.stdout + proc.stderr
+
+
 @pytest.mark.parametrize("op", ["-=", "/=", "//=", "%="])
 def test_xp2f_rejects_boolean_masked_arithmetic(tmp_path: Path, op: str) -> None:
     src = tmp_path / "xbool_masked_invalid.py"
