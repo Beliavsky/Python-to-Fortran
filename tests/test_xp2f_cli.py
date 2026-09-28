@@ -6261,6 +6261,65 @@ def test_xp2f_discards_axis_reductions_in_function(tmp_path: Path) -> None:
     ])
 
 
+@pytest.mark.parametrize("formal", ["base", "data"])
+def test_xp2f_specializes_callable_captured_by_nested_callback(tmp_path: Path, formal: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xnested_callable.py", [
+        "def apply(fun, x):",
+        "    return fun(x)",
+        f"def evaluate({formal}, model, scale=2.0):",
+        "    def residual(x):",
+        f"        return model({formal}, x) * scale",
+        "    return apply(residual, 3.0)",
+        "def plus(a, x):",
+        "    return a + x",
+        "def times(a, x):",
+        "    return a * x",
+        "print(evaluate(4.0, plus))",
+        f"print(evaluate({formal}=4.0, model=times, scale=3.0))",
+        "print(evaluate(5.0, plus))",
+    ])
+
+
+def test_xp2f_specializes_imported_nested_residual_model(tmp_path: Path) -> None:
+    (tmp_path / "fit_model.py").write_text(
+        "import numpy as np\ndef sample(fun, p):\n    return fun(p)\n"
+        "def evaluate(data_x, data_y, expr, pars):\n"
+        "    def residual(p):\n        return np.sum((data_y - expr(data_x, p))**2)\n"
+        "    return sample(residual, pars)\n", encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xresidual_model.py", [
+        "import numpy as np",
+        "from fit_model import evaluate",
+        "def model(x, p):",
+        "    return p[0]*x + p[1]",
+        "x = np.array([1.0, 2.0, 3.0])",
+        "y = np.array([4.0, 7.0, 10.0])",
+        "p = np.array([2.0, 1.0])",
+        "print(evaluate(x, y, model, p))",
+    ])
+
+
+def test_nested_callable_specialization_does_not_bind_shadowed_actual() -> None:
+    tree = ast.parse("def model(x):\n    return x + 1\n"
+                     "def wrapper(fun):\n    def inner(x):\n        return fun(x)\n    return use(inner)\n"
+                     "def caller(model):\n    return wrapper(model)\n")
+    funcs = list(tree.body)
+    xp2f.specialize_named_slice_callbacks([], funcs, nested=True)
+    assert [f.name for f in funcs] == ["model", "wrapper", "caller"]
+
+
+def test_nested_callable_specialization_does_not_bind_reassigned_model() -> None:
+    tree = ast.parse("def model(x):\n    return x + 1\n"
+                     "def other(x):\n    return x * 2\n"
+                     "def wrapper(fun):\n    def inner(x):\n        return fun(x)\n    return use(inner)\n"
+                     "model = other\nwrapper(model)\n")
+    funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    body = [n for n in tree.body if not isinstance(n, ast.FunctionDef)]
+    before = ast.dump(tree)
+    xp2f.specialize_named_slice_callbacks(body, funcs, nested=True)
+    assert len(funcs) == 3
+    assert ast.dump(tree) == before
+
+
 def test_xp2f_inlined_sibling_function_using_math_module(tmp_path: Path) -> None:
     # Regression test: a sibling module's own `import math` statement was
     # silently dropped when inline_local_from_imports copied a FunctionDef
@@ -22850,3 +22909,107 @@ def test_xp2f_rejects_masked_integer_cast(tmp_path: Path, statement: str, messag
 @pytest.mark.parametrize("case", sorted(_BUG_MINING_20260927_CASES))
 def test_xp2f_bug_mining_20260927(tmp_path: Path, case: str) -> None:
     _run_xp2f_compile_diff(tmp_path, f"xbm0927_{case}.py", _BUG_MINING_20260927_CASES[case])
+
+
+@pytest.mark.parametrize("import_line, solver", [
+    ("from scipy.optimize import leastsq", "leastsq"),
+    ("from scipy.optimize import leastsq as fit", "fit"),
+    ("import scipy.optimize as opt", "opt.leastsq"),
+])
+def test_xp2f_leastsq_parameters_status_and_options(tmp_path: Path, monkeypatch, import_line: str, solver: str) -> None:
+    # Compare the returned failure status, not SciPy's accompanying warning.
+    monkeypatch.setenv("PYTHONWARNINGS", "ignore::RuntimeWarning")
+    _run_xp2f_compile_diff(tmp_path, "xleastsq.py", [
+        "import numpy as np", import_line,
+        "def residual(p):",
+        "    return np.array([p[0] - 2.0, 2.0 * (p[1] + 3.0), p[0] + p[1] + 1.0])",
+        "initial = np.array([0.0, 0.0])",
+        f"x, ier = {solver}(residual, initial, ftol=1e-9, xtol=1e-9, gtol=0.0, maxfev=1000, epsfcn=1e-12, factor=10, diag=[1.0, 2.0])",
+        "print(abs(x[0] - 2.0) < 1e-7, abs(x[1] + 3.0) < 1e-7)",
+        "print(ier >= 1 and ier <= 4)",
+        "print(initial[0], initial[1])",
+        f"limited, status = {solver}(residual, initial, maxfev=1)",
+        "print(status == 5)",
+    ])
+
+
+def test_xp2f_leastsq_imported_rosetta_model(tmp_path: Path) -> None:
+    (tmp_path / "fit_model.py").write_text(
+        "from numpy import array\nfrom scipy.optimize import leastsq\n"
+        "def find_fit(data_x, data_y, expr, pars):\n"
+        "    data_x = array(data_x)\n    data_y = array(data_y)\n"
+        "    def residual(p):\n        return data_y - expr(data_x, p)\n"
+        "    x, ier = leastsq(residual, pars)\n"
+        "    if ier != 1:\n        raise Exception('Failed to converge')\n"
+        "    return x\n", encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xrosetta_fit.py", [
+        "import numpy as np", "from fit_model import find_fit",
+        "def expression(x, pars):",
+        "    a, b, c = pars",
+        "    return a * x * np.log(b + c * x)",
+        "y = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71]",
+        "p = find_fit(range(1, len(y) + 1), y, expression, [1.0, 1.0, 1.0])",
+        "for i in range(3):",
+        "    print(p[i])",
+    ])
+
+
+@pytest.mark.parametrize("option", ["full_output=True", "Dfun=residual", "args=(2.0,)", "col_deriv=True"])
+def test_xp2f_leastsq_rejects_unsupported_options(tmp_path: Path, option: str) -> None:
+    src = tmp_path / "xleastsq_option.py"
+    src.write_text("from scipy.optimize import leastsq\n"
+                   "def residual(p):\n    return p - 1.0\n"
+                   f"x, ier = leastsq(residual, [0.0], {option})\nprint(x)\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "leastsq option" in proc.stdout + proc.stderr
+
+
+def test_xp2f_keyword_actuals_use_callee_dummy_names(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xkeyword_names.py", [
+        "def caller(data, xdata):",
+        "    print(later(xdata=5.0, data=2.0))",
+        "    print(cases(a=3.0, A=7.0))",
+        "    first, second = pair(data=data, extra=xdata)",
+        "    print(first, second)",
+        "    pair(data=data, extra=xdata)",
+        "def later(xdata, data):",
+        "    return 10.0 * xdata + data",
+        "def cases(A, a):",
+        "    return 10.0 * A + a",
+        "def pair(data, unused=None, extra=1.0):",
+        "    return data + extra, data - extra",
+        "caller(4.0, 2.0)",
+    ])
+
+
+@pytest.mark.parametrize("binding", ["parameter", "import", "from_import"])
+def test_case_collision_keywords_respect_callee_scope(binding: str) -> None:
+    signature = "target" if binding == "parameter" else ""
+    imported = "    import other as target\n" if binding == "import" else "    from other import target\n" if binding == "from_import" else ""
+    tree = ast.parse("def target(A, a):\n    return A + a\n"
+                     f"def caller({signature}):\n{imported}    return target(A=1, a=2)\n"
+                     "print(target(A=3, a=4))\n")
+    xp2f.rewrite_case_insensitive_name_collisions(tree)
+    shadowed = tree.body[1].body[-1].value
+    direct = tree.body[2].value.args[0]
+    assert [kw.arg for kw in shadowed.keywords] == ["A", "a"]
+    assert [kw.arg for kw in direct.keywords] == ["A", "a_cs"]
+
+
+def test_xp2f_leastsq_scalar_initial_value(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xleastsq_scalar.py", [
+        "from scipy.optimize import leastsq",
+        "def residual(p):", "    return p[0] * p[0] - 4.0",
+        "x, ier = leastsq(residual, 1.0)",
+        "print(abs(x[0] - 2.0) < 1e-7)",
+        "print(ier >= 1 and ier <= 4)",
+    ])
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(tmp_path / "xleastsq_scalar.py"),
+         "--compile", "--run-diff", "--int-kind", "int64"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

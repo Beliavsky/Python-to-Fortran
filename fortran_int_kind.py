@@ -71,7 +71,7 @@ import fortran_scan as fscan
 # get added to python.f90 over time) to hand-maintain a fixed name list --
 # instead this scans the actual vendored source files directly, once, the
 # first time it's needed, and caches the result.
-_BOUNDARY_SOURCE_FILES = ("python.f90", "lapack_d.f90")
+_BOUNDARY_SOURCE_FILES = ("python.f90", "lapack_d.f90", "minpack.f90")
 _BOUNDARY_SOURCE_GLOB = "*_bridge.f90"
 
 _boundary_calls_cache: Optional[frozenset] = None

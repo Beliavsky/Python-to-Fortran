@@ -6162,6 +6162,8 @@ def rewrite_case_insensitive_name_collisions(tree):
             if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 _process_function_scope(s)
 
+    keyword_renames = {}
+
     def _process_function_scope(fn):
         arg_objs = (
             list(getattr(fn.args, "posonlyargs", []))
@@ -6177,6 +6179,7 @@ def rewrite_case_insensitive_name_collisions(tree):
         for s in fn.body:
             collector.visit(s)
         renames = _compute_renames(collector.names)
+        keyword_renames[id(fn)] = {a.arg: renames[a.arg] for a in arg_objs if a.arg in renames}
         if renames:
             for a in arg_objs:
                 if a.arg in renames:
@@ -6187,6 +6190,61 @@ def rewrite_case_insensitive_name_collisions(tree):
                 _process_function_scope(s)
 
     _process_top_level_scope(tree.body)
+
+    class KeywordBindings(_ScopeCollector):
+        def visit_Import(self, node):
+            self.names.extend(a.asname or a.name.split(".")[0] for a in node.names)
+
+        def visit_ImportFrom(self, node):
+            self.names.extend(a.asname or a.name for a in node.names)
+
+    class KeywordRenamer(ast.NodeVisitor):
+        def __init__(self):
+            self.bindings = {}
+
+        def scope(self, statements, args=()):
+            previous = self.bindings
+            collector = KeywordBindings()
+            collector.names.extend(args)
+            for st in statements:
+                collector.visit(st)
+            self.bindings = {k: v for k, v in previous.items() if k not in collector.names}
+            # A reassigned function name is not a statically known callee.
+            for st in statements:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and collector.names.count(st.name) == 1:
+                    self.bindings[st.name] = keyword_renames.get(id(st), {})
+            for st in statements:
+                self.visit(st)
+            self.bindings = previous
+
+        def visit_FunctionDef(self, node):
+            for default in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                self.visit(default)
+            args = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+            args += [a for a in (node.args.vararg, node.args.kwarg) if a is not None]
+            self.scope(node.body, [a.arg for a in args])
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name):
+                renames = self.bindings.get(node.func.id, {})
+                for kw in node.keywords:
+                    kw.arg = renames.get(kw.arg, kw.arg)
+            self.generic_visit(node)
+
+        # These scopes have separate binding rules; do not borrow the
+        # enclosing scope's callee identity for a shadowed local name.
+        def visit_Lambda(self, node):
+            pass
+
+        visit_ClassDef = visit_Lambda
+        visit_ListComp = visit_Lambda
+        visit_SetComp = visit_Lambda
+        visit_DictComp = visit_Lambda
+        visit_GeneratorExp = visit_Lambda
+
+    KeywordRenamer().scope(tree.body)
     ast.fix_missing_locations(tree)
     return tree
 
@@ -6229,6 +6287,16 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
     rather than needlessly threaded, since it's already visible as-is
     everywhere in the generated Fortran.
     """
+
+    # Bind known callable arguments before closure lifting: procedure values
+    # cannot be snapshotted into numeric module globals like captured data.
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    original_ids = {id(n) for n in functions}
+    specialize_named_slice_callbacks(
+        [n for n in tree.body if not isinstance(n, ast.FunctionDef)], functions, nested=True)
+    kept_ids = {id(n) for n in functions}
+    tree.body = [n for n in tree.body if id(n) not in original_ids or id(n) in kept_ids]
+    tree.body.extend(n for n in functions if id(n) not in original_ids)
 
     def _collect_import_aliases(body):
         aliases = set()
@@ -14042,7 +14110,7 @@ def _tree_uses_scipy_least_squares(tree):
     for _n in ast.walk(tree):
         if isinstance(_n, ast.ImportFrom) and (_n.module or "").strip() == "scipy.optimize":
             for _al in _n.names:
-                if (_al.name or "").strip() == "least_squares":
+                if (_al.name or "").strip() in {"least_squares", "leastsq"}:
                     return True
     return False
 
@@ -16283,7 +16351,7 @@ def normalize_scipy_submodule_attribute_calls(tree):
     collect_scipy_special_aliases's module_aliases tracking.
     """
     SUBMODULE_FUNCS = {
-        "optimize": {"minimize", "brentq", "curve_fit", "least_squares", "minimize_scalar", "fsolve"},
+        "optimize": {"minimize", "brentq", "curve_fit", "least_squares", "leastsq", "minimize_scalar", "fsolve"},
         "stats": {"norm"},
     }
 
@@ -17157,7 +17225,7 @@ def validate_no_duplicate_top_level_defs(tree):
 # function body. (`from numpy import zeros` in md_mod.py, inlined into a
 # driver that imports `md`, otherwise hit "unsupported call: zeros(...)"
 # because collect_numpy_func_aliases never saw the import.)
-_CARRIED_MODULE_IMPORTS = {"math", "cmath", "numpy"}
+_CARRIED_MODULE_IMPORTS = {"math", "cmath", "numpy", "scipy", "scipy.optimize"}
 
 
 def safe_import_prefix(name):
@@ -20420,35 +20488,49 @@ def normalize_unused_callable_arguments(exec_body, local_funcs):
                         kw.value = ast.copy_location(ast.Constant(value=0), kw.value)
 
 
-def specialize_named_slice_callbacks(exec_body, local_funcs):
+def specialize_named_slice_callbacks(exec_body, local_funcs, nested=False):
     """Bind distinct known callbacks used on slices before rank inference.
 
     A scalar-returning callback may broadcast into a slice while another
     returns an array. Direct calls in separate wrapper clones preserve both
     behaviors without imposing one Fortran procedure interface on them.
     Only specialize unmodified parameters used exclusively as call targets.
+    With nested=True, bind known callbacks in nested functions before closure
+    lifting, including wrappers with just one known callback actual.
     """
     fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
     roots = list(exec_body) + list(local_funcs)
+    module_rebound = {n.id for st in exec_body for n in ast.walk(st)
+                      if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} if nested else set()
     used_names = {n.id.lower() for root in roots for n in ast.walk(root) if isinstance(n, ast.Name)}
     used_names.update(n.arg.lower() for root in roots for n in ast.walk(root) if isinstance(n, ast.arg))
     used_names.update(name.lower() for name in fn_map)
     for fn in list(local_funcs):
         if not isinstance(fn, ast.FunctionDef) or fn.args.posonlyargs or fn.args.vararg or fn.args.kwarg:
             continue
-        # Nested scopes and recursive wrappers require separate binding rules.
-        if any(isinstance(n, (ast.FunctionDef, ast.Lambda)) for st in fn.body for n in ast.walk(st)):
+        inner_scopes = [n for st in fn.body for n in ast.walk(st)
+                        if isinstance(n, (ast.FunctionDef, ast.Lambda, ast.ClassDef))]
+        if (not nested and inner_scopes) or (nested and (
+                not inner_scopes or any(not isinstance(n, ast.FunctionDef) for n in inner_scopes))):
             continue
+        if nested and (len({n.name for n in inner_scopes}) != len(inner_scopes)
+                       or any(isinstance(n, ast.FunctionDef) for scope in inner_scopes
+                              for st in scope.body for n in ast.walk(st))):
+            continue  # The closure lifter handles only one nesting level.
         nodes = list(ast.walk(fn))
         if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == fn.name for n in nodes):
             continue
         parents = {id(ch): n for n in nodes for ch in ast.iter_child_nodes(n)}
         for index, arg in enumerate(fn.args.args):
+            if nested and any(arg.arg in {a.arg for a in scope.args.posonlyargs + scope.args.args
+                                         + scope.args.kwonlyargs}
+                              or scope.name == arg.arg for scope in inner_scopes):
+                continue
             refs = [n for n in nodes if isinstance(n, ast.Name) and n.id == arg.arg]
             if not refs or any(not isinstance(n.ctx, ast.Load) or not isinstance(parents.get(id(n)), ast.Call)
                                or parents[id(n)].func is not n for n in refs):
                 continue
-            if not any(isinstance(a, ast.Subscript) and any(isinstance(s, ast.Slice) for s in ast.walk(a.slice))
+            if not nested and not any(isinstance(a, ast.Subscript) and any(isinstance(s, ast.Slice) for s in ast.walk(a.slice))
                        for n in refs for a in parents[id(n)].args):
                 continue
             sites = []
@@ -20461,11 +20543,24 @@ def specialize_named_slice_callbacks(exec_body, local_funcs):
                     actual = call.args[index] if index < len(call.args) else next(
                         (k.value for k in call.keywords if k.arg == arg.arg), None)
                     if isinstance(actual, ast.Name) and actual.id in fn_map:
+                        if actual.id in module_rebound:
+                            continue
+                        if nested and isinstance(root, ast.FunctionDef):
+                            caller_bound = {a.arg for a in root.args.posonlyargs + root.args.args + root.args.kwonlyargs}
+                            caller_bound.update(n.id for n in ast.walk(root) if isinstance(n, ast.Name)
+                                                and isinstance(n.ctx, ast.Store))
+                            caller_bound.update(n.name for st in root.body for n in ast.walk(st)
+                                                if isinstance(n, ast.FunctionDef))
+                            if actual.id in caller_bound:
+                                continue
                         sites.append((call, actual.id))
-            if len({name for _, name in sites}) < 2:
+            if len({name for _, name in sites}) < (1 if nested else 2):
                 continue
             bound = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
             bound.update(n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+            if nested:
+                bound.update(n.arg for n in nodes if isinstance(n, ast.arg))
+                bound.update(n.name for n in inner_scopes)
             if any(name in bound for _, name in sites):
                 continue
             clones = {}
@@ -20486,6 +20581,24 @@ def specialize_named_slice_callbacks(exec_body, local_funcs):
                     for n in ast.walk(clone):
                         if isinstance(n, ast.Name) and n.id == arg.arg:
                             n.id = actual_name
+                    if nested:
+                        # Each specialized wrapper owns its closures. Hoisting
+                        # must not create several global procedures all named
+                        # e.g. residual, nor share their captured data.
+                        inner_names = {}
+                        for scope in ast.walk(clone):
+                            if isinstance(scope, ast.FunctionDef) and scope is not clone:
+                                stem = f"{name}_{scope.name}"
+                                unique, serial = stem, 2
+                                while unique.lower() in used_names:
+                                    unique = f"{stem}_{serial}"
+                                    serial += 1
+                                used_names.add(unique.lower())
+                                inner_names[scope.name] = unique
+                                scope.name = unique
+                        for n in ast.walk(clone):
+                            if isinstance(n, ast.Name) and n.id in inner_names:
+                                n.id = inner_names[n.id]
                     local_funcs.append(ast.fix_missing_locations(clone))
                     clones[actual_name] = name
                 call.func.id = clones[actual_name]
@@ -22232,6 +22345,101 @@ def normalize_scipy_minimize_result_attrs(exec_body, local_funcs):
     for fn in (local_funcs or []):
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fn.body = [ast.fix_missing_locations(rewriter.visit(st)) for st in fn.body]
+
+
+def normalize_scipy_leastsq(exec_body, local_funcs, source_tree=None):
+    """Lower the two-result numerical-Jacobian interface, before rank inference.
+
+    Explicit initialization and a residual check expose parameter/result ranks
+    to the normal inference passes. The final marked statement calls MINPACK.
+    """
+    roots = list(exec_body) + list(local_funcs)
+    if source_tree is not None:
+        roots.append(source_tree)
+    aliases = {al.asname or al.name for root in roots for n in ast.walk(root)
+               if isinstance(n, ast.ImportFrom) and n.module == "scipy.optimize"
+               for al in n.names if al.name == "leastsq"}
+    if not aliases:
+        return
+    functions = {f.name for f in local_funcs}
+    used = {n.id.lower() for root in roots for n in ast.walk(root) if isinstance(n, ast.Name)} | {n.lower() for n in functions}
+    def fresh(stem):
+        name, i = stem, 2
+        while name.lower() in used:
+            name = f"{stem}_{i}"
+            i += 1
+        used.add(name.lower())
+        return name
+
+    class Lower(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            c = node.value
+            if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in aliases):
+                return self.generic_visit(node)
+            if len(node.targets) != 1 or not isinstance(node.targets[0], (ast.Tuple, ast.List)) or len(node.targets[0].elts) != 2 or not all(isinstance(t, ast.Name) for t in node.targets[0].elts):
+                raise NotImplementedError("leastsq requires two named outputs: solution, ier = leastsq(...)")
+            if len(c.args) > 2 or any(isinstance(a, ast.Starred) for a in c.args) or any(k.arg is None for k in c.keywords):
+                raise NotImplementedError("leastsq supports func and x0 positionally; use keywords for solver options")
+            opts = {}
+            for key, value in zip(("func", "x0"), c.args):
+                opts[key] = value
+            for kw in c.keywords:
+                if kw.arg in opts:
+                    raise NotImplementedError(f"leastsq duplicate argument: {kw.arg}")
+                opts[kw.arg] = kw.value
+            fn, x0 = opts.pop("func", None), opts.pop("x0", None)
+            if not isinstance(fn, ast.Name) or fn.id not in functions or x0 is None:
+                raise NotImplementedError("leastsq requires a known local residual function and an initial estimate")
+            for key in list(opts):
+                val = opts[key]
+                default_only = ((key == "args" and isinstance(val, ast.Tuple) and not val.elts)
+                                or (key in {"Dfun", "epsfcn", "diag"} and isinstance(val, ast.Constant) and val.value is None)
+                                or (key in {"full_output", "col_deriv"} and isinstance(val, ast.Constant) and val.value is False))
+                if default_only:
+                    del opts[key]
+                elif key not in {"ftol", "xtol", "gtol", "maxfev", "epsfcn", "factor", "diag"}:
+                    raise NotImplementedError(f"leastsq option {key!r} is not supported (only numerical Jacobians and full_output=False)")
+            x_target, ier_target = (t.id for t in node.targets[0].elts)
+            if x_target == ier_target:
+                raise NotImplementedError("leastsq solution and status targets must be distinct")
+            # Do not rebind user targets until the solver returns. A residual
+            # or an option expression can still refer to their old values.
+            x, ier = fresh("leastsq_solution"), fresh("leastsq_status")
+            wrapper, residual = fresh("leastsq_residual"), fresh("leastsq_initial_residual")
+            p, values, guess = fresh("leastsq_p"), fresh("leastsq_values"), fresh("leastsq_guess")
+            # A uniform real vector interface also accepts scalar residuals.
+            helper = ast.parse(f"def {wrapper}({p}):\n    {values} = {fn.id}({p})\n    return 1.0 * np.ravel(np.atleast_1d({values}))\n").body[0]
+            local_funcs.append(helper)
+            preparation = [ast.Assign(targets=[ast.Name(id=guess, ctx=ast.Store())], value=copy.deepcopy(x0))]
+            for key, value in list(opts.items()):
+                temp = fresh("leastsq_" + key)
+                preparation.append(ast.Assign(targets=[ast.Name(id=temp, ctx=ast.Store())], value=value))
+                opts[key] = ast.Name(id=temp, ctx=ast.Load())
+            seed = ast.Assign(targets=[ast.Name(id=x, ctx=ast.Store())],
+                              value=ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="ravel", ctx=ast.Load()),
+                                             args=[ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="atleast_1d", ctx=ast.Load()),
+                                                            args=[ast.Name(id=guess, ctx=ast.Load())], keywords=[])], keywords=[]))
+            seed.value = ast.BinOp(left=ast.Constant(value=1.0), op=ast.Mult(), right=seed.value)
+            # Dynamic initialization keeps status mutable in constant-folding
+            # passes; MINPACK overwrites it before any user-visible read.
+            init = ast.parse(f"{ier} = len({x})\n{residual} = {wrapper}({x})\n").body
+            c._xp2f_leastsq = (x, ier, wrapper, residual, opts)
+            # Retain only the normalized solution as the actual initial value.
+            c.args = [ast.Name(id=wrapper, ctx=ast.Load()), ast.Name(id=x, ctx=ast.Load())]
+            c.keywords = [ast.keyword(arg=k, value=v) for k, v in opts.items()]
+            statement = ast.Expr(value=c)
+            outputs = ast.parse(f"{x_target} = {x}\n{ier_target} = {ier}\n").body
+            return [ast.copy_location(n, node) for n in preparation + [seed] + init + [statement] + outputs]
+
+    lower = Lower()
+    for body in [exec_body] + [fn.body for fn in list(local_funcs)]:
+        new = []
+        for st in body:
+            result = lower.visit(st)
+            new.extend(result if isinstance(result, list) else [result])
+        body[:] = new
+    for root in list(exec_body) + list(local_funcs):
+        ast.fix_missing_locations(root)
 
 
 def normalize_scipy_curve_fit_residual_helper(exec_body, local_funcs):
@@ -24512,6 +24720,33 @@ class translator(ast.NodeVisitor):
         self.fortran_name_owner[alias.lower()] = name
         return alias
 
+    def _dummy_emit_names(self, names):
+        """Resolve public dummy names before any body-local rebinding aliases."""
+        # Reserve genuine formals first: the alias for `data` must not steal
+        # a later parameter literally named `xdata` (nor a fallback `data_v`).
+        for name in names:
+            if name not in self.reserved_names and name and name[0].isalpha():
+                self.fortran_name_owner.setdefault(name.lower(), name)
+        result = {}
+        for name in names:
+            alias = self._aliased_name(name)
+            result[name] = alias if alias != name else (f"{name}_v" if name in {"dp", "eye"} else name)
+        return result
+
+    def _local_keyword_name(self, callee, name):
+        # Keyword labels belong to the callee, not the caller's alias scope.
+        # Reproduce the declaration's initial namespace and parameter order;
+        # this also handles case collisions and calls to later definitions.
+        cache = getattr(self, "_local_keyword_maps", None)
+        if cache is None:
+            cache = self._local_keyword_maps = {}
+        if callee not in cache:
+            resolver = translator(None, {}, "flat", {},
+                                  local_proc_name_aliases=self.local_proc_name_aliases)
+            resolver.reserved_names.add(callee)
+            cache[callee] = resolver._dummy_emit_names(self.local_func_arg_names.get(callee, []))
+        return cache[callee].get(name, name)
+
     def _is_local_callable_symbol(self, name):
         """True when `name` refers to a locally transpilable procedure symbol."""
         return (
@@ -24909,14 +25144,14 @@ class translator(ast.NodeVisitor):
                 named = omitted = True
                 continue
             text = render(index, node)
-            parts.append(f"{names[index]}={text}" if named else text)
+            parts.append(f"{self._local_keyword_name(callee, names[index])}={text}" if named else text)
         for kw in call_node.keywords:
             index = names.index(kw.arg)
             named = True
             if omit(index, kw.value):
                 omitted = True
                 continue
-            parts.append(f"{kw.arg}={render(index, kw.value)}")
+            parts.append(f"{self._local_keyword_name(callee, kw.arg)}={render(index, kw.value)}")
         return parts, named or omitted or len(call_node.args) < len(names)
 
     @staticmethod
@@ -37253,7 +37488,7 @@ class translator(ast.NodeVisitor):
                             ae = self._coerce_local_actual_kind(node.func.id, i, a, ae)
                             ae = self._coerce_local_actual_rank(node.func.id, i, a, ae, args_nodes)
                         if names and getattr(node, "keywords", []):
-                            parts.append(f"{names[i]}={ae}")
+                            parts.append(f"{self._local_keyword_name(callee, names[i])}={ae}")
                         else:
                             parts.append(ae)
                     args = ", ".join(parts)
@@ -56198,6 +56433,45 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("only call expressions supported")
         c = node.value
 
+        if hasattr(c, "_xp2f_leastsq"):
+            x, ier, wrapper, residual, opts = c._xp2f_leastsq
+            x, ier, residual = (self._aliased_name(n) for n in (x, ier, residual))
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: ls_m, ls_n, ls_nfev, ls_maxfev, ls_mode")
+            self.o.w("integer, allocatable :: ls_ipvt(:)")
+            self.o.w("real(dp) :: ls_ftol, ls_xtol, ls_gtol, ls_epsfcn, ls_factor")
+            self.o.w("real(dp), allocatable :: ls_diag(:), ls_fjac(:,:), ls_qtf(:)")
+            self.o.w("real(dp), allocatable :: ls_w1(:), ls_w2(:), ls_w3(:), ls_w4(:)")
+            self.o.w(f"ls_n = size({x})")
+            self.o.w(f"ls_m = size({residual})")
+            self.o.w('if (ls_n < 1 .or. ls_m < ls_n) error stop "leastsq requires 1 <= n <= m"')
+            for key, default in (("ftol", "1.49012e-8_dp"), ("xtol", "1.49012e-8_dp"),
+                                 ("gtol", "0.0_dp"), ("epsfcn", "epsilon(1.0_dp)"), ("factor", "100.0_dp")):
+                value = f"real({self.expr(opts[key])}, dp)" if key in opts else default
+                self.o.w(f"ls_{key} = {value}")
+            self.o.w(f"ls_maxfev = {self.expr(opts['maxfev']) if 'maxfev' in opts else '0'}")
+            self.o.w("if (ls_maxfev == 0) ls_maxfev = 200 * (ls_n + 1)")
+            self.o.w("allocate(ls_ipvt(ls_n), ls_fjac(ls_m,ls_n), ls_qtf(ls_n))")
+            self.o.w("allocate(ls_w1(ls_n), ls_w2(ls_n), ls_w3(ls_n), ls_w4(ls_m))")
+            if "diag" in opts:
+                self.o.w(f"ls_diag = {self.expr(opts['diag'])}")
+                self.o.w('if (size(ls_diag) /= ls_n) error stop "leastsq diag length must equal n"')
+                self.o.w("ls_mode = 2")
+            else:
+                self.o.w("allocate(ls_diag(ls_n))")
+                self.o.w("ls_diag = 1.0_dp")
+                self.o.w("ls_mode = 1")
+            self.o.w(f"curvefit_user_fn => {wrapper}")
+            self.o.w(f"call lmdif(curvefit_generic_wrapper, ls_m, ls_n, {x}, {residual}, &")
+            self.o.w("   & ls_ftol, ls_xtol, ls_gtol, ls_maxfev, ls_epsfcn, ls_diag, &")
+            self.o.w(f"   & ls_mode, ls_factor, 0, {ier}, ls_nfev, ls_fjac, ls_m, ls_ipvt, &")
+            self.o.w("   & ls_qtf, ls_w1, ls_w2, ls_w3, ls_w4)")
+            self.o.w(f'if ({ier} == 0) error stop "leastsq invalid solver inputs"')
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         if self._numpy_call_attr(c.func) in {"all", "any"}:
             # A script discards a bare reduction's result; only a REPL would
             # display it. Keep evaluation (including argument side effects).
@@ -60479,10 +60753,7 @@ def _emit_local_function(
     # every parameter. Resolving now is idempotent (memoizes into
     # tr.name_aliases), so it's safe even for names df_arg_types (or
     # anything else) also resolves later.
-    for _a in args:
-        _a_alias = tr._aliased_name(_a)
-        if _a_alias != _a:
-            arg_emit_map[_a] = _a_alias
+    arg_emit_map.update(tr._dummy_emit_names(args))
     if force_list_args:
         for _nm in force_list_args:
             tr.python_list_vars.add(_nm)
@@ -73559,7 +73830,7 @@ def generate_flat(
                 "curvefit_covariance"
             )
         if _tree_uses_scipy_least_squares(_proc_use_scan_tree):
-            om.w("use minpack_module, only: lmdif1")
+            om.w("use minpack_module, only: lmdif1, lmdif")
             om.w("use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper")
         if _tree_uses_scipy_minimize_scalar(_proc_use_scan_tree):
             om.w("use fmin_module, only: fmin")
@@ -74058,7 +74329,7 @@ def generate_flat(
             "curvefit_covariance"
         )
     if _tree_uses_scipy_least_squares(_use_scan_tree):
-        o.w("use minpack_module, only: lmdif1")
+        o.w("use minpack_module, only: lmdif1, lmdif")
         o.w("use curvefit_bridge_mod, only: curvefit_user_fn, curvefit_generic_wrapper")
     if _tree_uses_scipy_minimize_scalar(_use_scan_tree):
         o.w("use fmin_module, only: fmin")
@@ -75643,6 +75914,7 @@ def transpile_file(
     normalize_scipy_minimize_args_wrapper(effective_tree.body, local_funcs)
     normalize_scipy_minimize_result_attrs(effective_tree.body, local_funcs)
     normalize_scipy_curve_fit_residual_helper(effective_tree.body, local_funcs)
+    normalize_scipy_leastsq(effective_tree.body, local_funcs, tree)
     normalize_inline_dict_literal_call_args(effective_tree.body, local_funcs)
     normalize_generator_call_args(effective_tree.body, local_funcs)
     reject_numpy_slice_view_swaps(effective_tree.body, local_funcs)

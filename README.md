@@ -71,6 +71,8 @@ Not supported, because each needs a genuine architecture extension rather than a
 
 Partial, via hand-written Fortran bridges to real numerical codes rather than transpiling SciPy's own Python source — `scipy.optimize.minimize` (BFGS, L-BFGS-B, Powell), `scipy.optimize.brentq`/`minimize_scalar`, and LAPACK-backed `scipy.linalg` routines (`lapack_d.f90`). This is the natural next area to extend: SciPy's numerical core (`optimize`, `linalg`, `interpolate`, `integrate`, `special`, `stats` distributions) fits the transpiler's static-typing model well, in contrast to pandas' dynamic-schema gaps above.
 
+`solution, ier = scipy.optimize.leastsq(residual, x0)` uses MINPACK's `lmdif` numerical-Jacobian solver. The residual must be a known local function (including supported imported functions and lifted nested callbacks). The result is a real vector; `ier` is the MINPACK status code, with 1–4 indicating success. Supported keyword options are `ftol`, `xtol`, `gtol`, `maxfev`, `epsfcn`, `factor`, and `diag`. Nonempty `args`, analytic Jacobians (`Dfun`), and `full_output=True` are not yet supported and produce translation errors. As with other callback bridges, nested/reentrant solver calls are not supported. Validate fitted values and convergence status against Python; floating-point differences can affect convergence near tolerance boundaries.
+
 ## Requirements
 
 - Python 3.11 or newer.
