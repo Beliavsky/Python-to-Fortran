@@ -25,6 +25,7 @@ import shlex
 import subprocess
 import time
 import difflib
+from collections import Counter
 import copy
 import io
 import tokenize
@@ -4319,6 +4320,161 @@ def rewrite_tuple_literal_shape_name_to_literal(tree):
     return out
 
 
+def rewrite_reversed_value_to_negative_slice(tree):
+    """`reversed(X)` -> `X[::-1]` (except `reversed(range(...))` as a loop
+    iterable, which has its own lowering), which already lowers to a reversed
+    array section, including for a slice of an array (e.g.
+    TheAlgorithms/Python sorts/pancake_sort.py: `arr[: k + 1] =
+    reversed(arr[: k + 1])` -> `arr(1:k + 1) = arr(k + 1:1:-1)`)."""
+    if any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "reversed"
+        for n in ast.walk(tree)
+    ) or any(
+        isinstance(n, ast.Name) and n.id == "reversed" and isinstance(n.ctx, ast.Store)
+        for n in ast.walk(tree)
+    ):
+        return tree
+
+    def _is_reversed_call(n):
+        return (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "reversed"
+            and len(n.args) == 1
+            and not n.keywords
+        )
+
+    def _is_reversed_range_call(n):
+        return (
+            _is_reversed_call(n)
+            and isinstance(n.args[0], ast.Call)
+            and isinstance(n.args[0].func, ast.Name)
+            and n.args[0].func.id == "range"
+        )
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_For(self, node):
+            if _is_reversed_range_call(node.iter):
+                node.iter.args = [self.visit(a) for a in node.iter.args]
+                node.target = self.visit(node.target)
+                node.body = [self.visit(st) for st in node.body]
+                node.orelse = [self.visit(st) for st in node.orelse]
+                return node
+            return self.generic_visit(node)
+
+        def visit_comprehension(self, node):
+            self.generic_visit(node)
+            rng = node.iter.args[0] if _is_reversed_range_call(node.iter) else None
+            if rng is not None and 1 <= len(rng.args) <= 2 and not rng.keywords:
+                # reversed(range(a, b)) == range(b - 1, a - 1, -1)
+                lo = rng.args[0] if len(rng.args) == 2 else ast.Constant(value=0)
+                hi = rng.args[-1]
+                minus1 = lambda e: ast.BinOp(left=copy.deepcopy(e), op=ast.Sub(), right=ast.Constant(value=1))
+                node.iter = ast.copy_location(
+                    ast.Call(
+                        func=ast.Name(id="range", ctx=ast.Load()),
+                        args=[minus1(hi), minus1(lo), ast.UnaryOp(op=ast.USub(), operand=ast.Constant(value=1))],
+                        keywords=[],
+                    ),
+                    node.iter,
+                )
+            return node
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if not _is_reversed_call(node) or _is_reversed_range_call(node):
+                return node
+            if not isinstance(node.args[0], (ast.Name, ast.Attribute, ast.Subscript)):
+                return node
+            return ast.copy_location(
+                ast.Subscript(
+                    value=node.args[0],
+                    slice=ast.Slice(
+                        lower=None,
+                        upper=None,
+                        step=ast.UnaryOp(op=ast.USub(), operand=ast.Constant(value=1)),
+                    ),
+                    ctx=ast.Load(),
+                ),
+                node,
+            )
+
+    out = _Rewriter().visit(tree)
+    ast.fix_missing_locations(out)
+    return out
+
+
+def rewrite_builtin_divmod_tuple_assign(tree):
+    """`q, r = divmod(x, y)` (e.g. TheAlgorithms/Python conversions/
+    decimal_to_binary.py: `decimal, mod = divmod(decimal, 2)`) ->
+    `q = x // y` and `r = x % y`, reusing the existing floor-division and
+    Python-modulo lowering. Python evaluates divmod(x, y) before binding
+    either name, so a target that also appears in x or y is assigned
+    last; if both do, the shape is left alone. Only side-effect-free
+    operands (names, constants, attributes, subscripts, arithmetic of
+    those) are rewritten, since each is evaluated twice."""
+    if any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "divmod"
+        for n in ast.walk(tree)
+    ) or any(
+        isinstance(n, ast.Name) and n.id == "divmod" and isinstance(n.ctx, ast.Store)
+        for n in ast.walk(tree)
+    ):
+        return tree
+
+    def _pure(n):
+        return all(
+            isinstance(m, (ast.Name, ast.Constant, ast.Attribute, ast.Subscript, ast.Slice,
+                           ast.BinOp, ast.UnaryOp, ast.Load, ast.operator, ast.unaryop,
+                           ast.expr_context))
+            for m in ast.walk(n)
+        )
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Assign(self, node):
+            self.generic_visit(node)
+            v = node.value
+            if not (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                and len(node.targets[0].elts) == 2
+                and all(isinstance(e, ast.Name) for e in node.targets[0].elts)
+                and isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Name)
+                and v.func.id == "divmod"
+                and len(v.args) == 2
+                and not v.keywords
+                and all(_pure(a) for a in v.args)
+            ):
+                return node
+            qn, rn = (e.id for e in node.targets[0].elts)
+            if qn == rn:
+                return node
+            used = {m.id for a in v.args for m in ast.walk(a) if isinstance(m, ast.Name)}
+            x, y = v.args
+
+            def _assign(name, op):
+                return ast.copy_location(
+                    ast.Assign(
+                        targets=[ast.Name(id=name, ctx=ast.Store())],
+                        value=ast.BinOp(left=copy.deepcopy(x), op=op, right=copy.deepcopy(y)),
+                    ),
+                    node,
+                )
+
+            q_stmt = _assign(qn, ast.FloorDiv())
+            r_stmt = _assign(rn, ast.Mod())
+            if qn in used and rn in used:
+                return node
+            if qn in used:
+                return [r_stmt, q_stmt]
+            return [q_stmt, r_stmt]
+
+    out = _Rewriter().visit(tree)
+    ast.fix_missing_locations(out)
+    return out
+
+
 def rewrite_math_const_from_import_to_attribute(tree):
     """`from math import nan` (or `pi`/`e`/`tau`/`inf`/`Inf`, and the same
     from `cmath`), then using the bare name `nan` directly -- e.g.
@@ -4329,6 +4485,7 @@ def rewrite_math_const_from_import_to_attribute(tree):
     is not recognized as anything in particular and falls through to
     "no IMPLICIT type". Rewrite each such bare Name reference back into
     the already-supported `math.NAME` (or `cmath.NAME`) Attribute form.
+    `from sys import maxsize` is handled the same way (-> `sys.maxsize`).
 
     Conservative: only touches a name that is never itself a Store
     target anywhere in the tree (so an unrelated local variable that
@@ -4338,13 +4495,15 @@ def rewrite_math_const_from_import_to_attribute(tree):
     "unsupported" error it always did, not a new corruption).
     """
     const_names = {"pi", "e", "tau", "nan", "inf", "Inf"}
+    sys_const_names = {"maxsize"}
     imported_from = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module in {"math", "cmath"}:
+        if isinstance(node, ast.ImportFrom) and node.module in {"math", "cmath", "sys"}:
+            names_ok = sys_const_names if node.module == "sys" else const_names
             for alias in node.names:
                 if alias.asname is not None:
                     continue
-                if alias.name in const_names:
+                if alias.name in names_ok:
                     imported_from[alias.name] = node.module
 
     if not imported_from:
@@ -7225,16 +7384,23 @@ def _subscript_chain_base_rank(node, root_name):
     if not (isinstance(cur, ast.Name) and cur.id == root_name):
         return None
     slices.reverse()
+    # A slice link keeps the rank, so the NEXT link re-indexes the same
+    # dimension (`a[lo:hi][::-1]` is rank-1 evidence, not rank-2).
     rr = 0
+    consumed = 0
     for sl in slices:
         if isinstance(sl, ast.Tuple):
-            rr += _tuple_subscript_base_rank(sl.elts)
+            consumed += _tuple_subscript_base_rank(sl.elts)
+            rr = max(rr, consumed)
         elif is_none(sl):
             continue
         elif isinstance(sl, ast.Constant) and sl.value is Ellipsis:
             continue
+        elif isinstance(sl, ast.Slice):
+            rr = max(rr, consumed + 1)
         else:
-            rr += 1
+            consumed += 1
+            rr = max(rr, consumed)
     return rr
 
 
@@ -11824,6 +11990,31 @@ def mark_recursive_procedures(lines):
         return txt.split("!", 1)[0]
 
     out = list(lines)
+    # A specific procedure behind a generic interface that calls its own
+    # generic name (the usual shape of a rank/kind-specialized overload of
+    # a self-recursive Python function) is recursive too.
+    iface_start_re = re.compile(r"^\s*interface\s+([A-Za-z_]\w*)\s*$", re.IGNORECASE)
+    iface_end_re = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
+    modproc_re = re.compile(r"^\s*module\s+procedure\s+(.+)$", re.IGNORECASE)
+    generics_of = {}
+    cur_generic = None
+    for raw in out:
+        code = _line_code_only(raw)
+        mi = iface_start_re.match(code)
+        if mi:
+            cur_generic = mi.group(1)
+            continue
+        if cur_generic is None:
+            continue
+        if iface_end_re.match(code):
+            cur_generic = None
+            continue
+        mp = modproc_re.match(code)
+        if mp:
+            for nm in mp.group(1).replace("&", " ").split(","):
+                nm = nm.strip()
+                if nm:
+                    generics_of.setdefault(nm.lower(), []).append(cur_generic)
     i = 0
     while i < len(out):
         m = start_re.match(out[i])
@@ -11841,8 +12032,11 @@ def mark_recursive_procedures(lines):
         kind = m.group("kind").lower()
         j = i + 1
         body_calls_self = False
-        call_re = re.compile(rf"\bcall\s+{re.escape(name)}\s*\(", re.IGNORECASE)
-        func_re = re.compile(rf"(?<![A-Za-z_]){re.escape(name)}\s*\(", re.IGNORECASE)
+        self_names = "|".join(
+            re.escape(nm) for nm in [name] + generics_of.get(name.lower(), [])
+        )
+        call_re = re.compile(rf"\bcall\s+(?:{self_names})\s*\(", re.IGNORECASE)
+        func_re = re.compile(rf"(?<![A-Za-z_])(?:{self_names})\s*\(", re.IGNORECASE)
         while j < len(out):
             code = _line_code_only(out[j])
             if end_re.match(code):
@@ -14063,9 +14257,15 @@ def detect_needed_helpers(tree):
         if (
             isinstance(node, (ast.ListComp, ast.GeneratorExp))
             and len(node.generators) == 1
-            and node.generators[0].ifs
         ):
             needed.add("str_to_chars")
+            if any(
+                isinstance(_n, ast.Call)
+                and isinstance(_n.func, ast.Attribute)
+                and _n.func.attr in {"upper", "lower"}
+                for _n in ast.walk(node.elt)
+            ):
+                needed.update({"to_upper", "to_lower"})
     linalg_aliases = collect_linalg_aliases(tree)
     scipy_aliases, _ = collect_scipy_special_aliases(tree)
     statistics_aliases, statistics_func_aliases = collect_statistics_aliases(tree)
@@ -15436,6 +15636,7 @@ def detect_needed_helpers(tree):
                 else:
                     needed.add("str_join")
                     needed.add("strvec_t")
+                    needed.add("str_to_chars")
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"append", "extend"}:
                 # Conservative: added whenever *any* `.append(`/`.extend(`
                 # call exists, without trying to determine ahead of time
@@ -17482,7 +17683,82 @@ def collect_dataclass_info(tree):
                 else:
                     return None
             return (kind, 1, copy.deepcopy(v))
+        # A constant-filled Python list: `[C] * n`, `[C for _ in
+        # range(n)]`, or the 2D forms `[[C for _ in range(n)] for _ in
+        # range(m)]` / `[[C] * n for _ in range(m)]` (e.g. TheAlgorithms/
+        # Python graphs/graphs_floyd_warshall.py: `self.dp = [[math.inf
+        # for j in range(n)] for i in range(n)]`), C a numeric/bool
+        # literal. The element doesn't depend on the loop variables, so
+        # the value is fully determined by the constructor arguments.
+        def _const_fill_kind(e):
+            if (
+                isinstance(e, ast.Attribute)
+                and isinstance(e.value, ast.Name)
+                and e.value.id in {"math", "np", "numpy"}
+                and e.attr in {"inf", "pi", "e", "nan"}
+            ):
+                return "real"
+            lit = _literal_field_default(e)
+            return lit[0] if lit is not None else None
+
+        def _list_fill(e):
+            """(kind, rank) of a constant-filled list expression, else None."""
+            if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Mult):
+                for lst, cnt in ((e.left, e.right), (e.right, e.left)):
+                    if isinstance(lst, ast.List) and len(lst.elts) == 1 and not isinstance(cnt, ast.List):
+                        k = _const_fill_kind(lst.elts[0])
+                        if k is not None:
+                            return (k, 1)
+                return None
+            if (
+                isinstance(e, ast.ListComp)
+                and len(e.generators) == 1
+                and not e.generators[0].ifs
+                and isinstance(e.generators[0].target, ast.Name)
+                and isinstance(e.generators[0].iter, ast.Call)
+                and isinstance(e.generators[0].iter.func, ast.Name)
+                and e.generators[0].iter.func.id == "range"
+                and len(e.generators[0].iter.args) == 1
+            ):
+                lv = e.generators[0].target.id
+                if any(isinstance(n, ast.Name) and n.id == lv and isinstance(n.ctx, ast.Load) for n in ast.walk(e.elt)):
+                    return None
+                k = _const_fill_kind(e.elt)
+                if k is not None:
+                    return (k, 1)
+                inner = _list_fill(e.elt)
+                if inner is not None and inner[1] == 1:
+                    return (inner[0], 2)
+            return None
+
+        _lf = _list_fill(v)
+        if _lf is not None:
+            return (_lf[0], _lf[1], copy.deepcopy(v))
         return None
+
+    def _call_site_arg_kind(cls_name, idx, arg_name):
+        """Kind of an unannotated __init__ parameter, from the literal
+        actual arguments of every `cls_name(...)` call in the module (all
+        must agree), else None."""
+        kinds = set()
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == cls_name):
+                continue
+            actual = None
+            if idx < len(n.args):
+                actual = n.args[idx]
+            for kw in n.keywords:
+                if kw.arg == arg_name:
+                    actual = kw.value
+            if actual is None:
+                return None
+            lit = _literal_field_default(actual)
+            if lit is None:
+                return None
+            kinds.add(lit[0])
+        if len(kinds) != 1:
+            return None
+        return (kinds.pop(), 0)
 
     def _field_kind(ann):
         """Returns (kind, rank) for a recognized field annotation, else
@@ -17584,8 +17860,10 @@ def collect_dataclass_info(tree):
                 continue
             # parameter name -> kind from annotation
             pmap = {}
-            for a in init_fn.args.args[1:]:
+            for _ai, a in enumerate(init_fn.args.args[1:]):
                 k = _field_kind(a.annotation)
+                if k is None and a.annotation is None:
+                    k = _call_site_arg_kind(node.name, _ai, a.arg)
                 if k is None:
                     ok = False
                     break
@@ -22198,8 +22476,12 @@ def normalize_generator_call_args(exec_body, local_funcs):
         def visit_Call(self, node):
             self.generic_visit(node)
             if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in call_names
+                (
+                    (isinstance(node.func, ast.Name) and node.func.id in call_names)
+                    # "sep".join(genexpr) -- str.join consumes its
+                    # iterable exactly like list(genexpr) would.
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "join")
+                )
                 and len(node.args) == 1
                 and isinstance(node.args[0], ast.GeneratorExp)
             ):
@@ -25296,7 +25578,31 @@ class translator(ast.NodeVisitor):
             return actual
         return None
 
+    def _comp_range_scope_enter(self, node):
+        """For a ListComp, the `range(...)` generator targets not already in
+        the comprehension scope (they are scalar ints inside it, whatever
+        a same-named variable outside is). Returns the set added."""
+        scope = self.__dict__.setdefault("_comp_int_scope", set())
+        new = {
+            g.target.id for g in node.generators
+            if isinstance(g.target, ast.Name)
+            and isinstance(g.iter, ast.Call)
+            and isinstance(g.iter.func, ast.Name)
+            and g.iter.func.id == "range"
+        } - scope
+        scope |= new
+        return new
+
     def _expr_kind(self, node):
+        if isinstance(node, ast.Name) and node.id in self.__dict__.get("_comp_int_scope", ()):
+            return "int"
+        if isinstance(node, ast.ListComp):
+            _new_scope = self._comp_range_scope_enter(node)
+            if _new_scope:
+                try:
+                    return self._expr_kind(node)
+                finally:
+                    self._comp_int_scope -= _new_scope
         returned_actual = self._returned_array_actual(node)
         if returned_actual is not None:
             return self._expr_kind(returned_actual)
@@ -25493,6 +25799,27 @@ class translator(ast.NodeVisitor):
 
                 if isinstance(node.elt, ast.Name) and node.elt.id == loop_var:
                     return iter_kind
+                if (
+                    isinstance(node.elt, ast.Call)
+                    and not node.elt.keywords
+                    and (
+                        (
+                            isinstance(node.elt.func, ast.Name)
+                            and node.elt.func.id == "list"
+                            and len(node.elt.args) == 1
+                            and isinstance(node.elt.args[0], ast.Name)
+                            and node.elt.args[0].id == loop_var
+                        )
+                        or (
+                            isinstance(node.elt.func, ast.Attribute)
+                            and node.elt.func.attr == "copy"
+                            and not node.elt.args
+                            and isinstance(node.elt.func.value, ast.Name)
+                            and node.elt.func.value.id == loop_var
+                        )
+                    )
+                ):
+                    return iter_kind
                 if isinstance(node.elt, ast.UnaryOp):
                     if isinstance(node.elt.operand, ast.Name) and node.elt.operand.id == loop_var:
                         return iter_kind
@@ -25622,6 +25949,8 @@ class translator(ast.NodeVisitor):
                 return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
                 return "char"
+            if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "maxsize":
+                return "int"
             if node.attr == "columns" and self._is_pandas_df_ref_node(node.value):
                 return "char"
             if node.attr == "index" and self._is_pandas_df_ref_node(node.value):
@@ -25737,6 +26066,18 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Subscript):
             if self._expr_kind(node.value) == "char" and self._rank_expr(node.value) == 0:
                 return "char"
+            _sub_root = node.value
+            while isinstance(_sub_root, ast.Subscript):
+                _sub_root = _sub_root.value
+            if (
+                isinstance(_sub_root, ast.Attribute)
+                and self._struct_type_of(_sub_root.value) is not None
+            ):
+                # An element of an array-valued struct field
+                # (`self.d[u]`, `self.dp[u][v]`) has the field's kind.
+                _fk = self._expr_kind(_sub_root)
+                if _fk in {"int", "real", "complex", "logical", "char"}:
+                    return _fk
             if (
                 isinstance(node.value, ast.Attribute)
                 and isinstance(node.value.value, ast.Name)
@@ -30457,6 +30798,15 @@ class translator(ast.NodeVisitor):
         return self._coerce_expr_kind(node, value, "logical")
 
     def _rank_expr(self, node):
+        if isinstance(node, ast.Name) and node.id in self.__dict__.get("_comp_int_scope", ()):
+            return 0
+        if isinstance(node, ast.ListComp):
+            _new_scope = self._comp_range_scope_enter(node)
+            if _new_scope:
+                try:
+                    return self._rank_expr(node)
+                finally:
+                    self._comp_int_scope -= _new_scope
         returned_actual = self._returned_array_actual(node)
         if returned_actual is not None:
             return self._rank_expr(returned_actual)
@@ -30633,6 +30983,26 @@ class translator(ast.NodeVisitor):
             _elt_rank = self._rank_expr(node.elt)
             if _elt_rank >= 1:
                 return _elt_rank + 1
+            if len(node.generators) == 1 and isinstance(node.generators[0].target, ast.Name):
+                # `[row for row in matrix]` / `[list(row) for row in
+                # matrix]` / `[row.copy() ...]`: each element is a whole
+                # row of the rank-2 iterable (the loop variable itself is
+                # untracked, so _rank_expr(node.elt) above sees rank 0).
+                _lv = node.generators[0].target.id
+                _e = node.elt
+                if (
+                    isinstance(_e, ast.Call)
+                    and not _e.keywords
+                    and (
+                        (isinstance(_e.func, ast.Name) and _e.func.id == "list" and len(_e.args) == 1)
+                        or (isinstance(_e.func, ast.Attribute) and _e.func.attr == "copy" and not _e.args)
+                    )
+                ):
+                    _e = _e.args[0] if isinstance(_e.func, ast.Name) else _e.func.value
+                if isinstance(_e, ast.Name) and _e.id == _lv:
+                    _it_rank = int(self._rank_expr(node.generators[0].iter) or 0)
+                    if _it_rank >= 2:
+                        return _it_rank
             return 1
         if isinstance(node, ast.Subscript):
             if (
@@ -33989,6 +34359,33 @@ class translator(ast.NodeVisitor):
                         while len(dims) < base_rank:
                             dims.append(":")
                         return f"{base}(" + ", ".join(dims) + ")"
+            if (
+                isinstance(root_base, ast.Attribute)
+                and len(root_slices) > 1
+                and self._struct_type_of(root_base.value) is not None
+            ):
+                # `self.dp[u][v]` on a rank-2 struct component (e.g.
+                # TheAlgorithms/Python graphs/graphs_floyd_warshall.py)
+                # -> `self%dp(u + 1, v + 1)`, like a plain 2D array name.
+                flat_dims = self._flatten_subscript_dims(root_slices)
+                base_rank = self._rank_expr(root_base)
+                if (
+                    base_rank > 0
+                    and len(flat_dims) <= base_rank
+                    and all((not is_none(sl)) for sl in flat_dims)
+                    and all(isinstance(sl, ast.Slice) or self._rank_expr(sl) == 0 for sl in flat_dims)
+                ):
+                    base = self.expr(root_base)
+                    dims = []
+                    for i_dim, sl in enumerate(flat_dims, start=1):
+                        dim_size_expr = f"size({base},{i_dim})"
+                        if isinstance(sl, ast.Slice):
+                            dims.append(self._slice_triplet(sl, dim_size_expr))
+                        else:
+                            dims.append(self._subscript_scalar_index_expr(sl, dim_size_expr))
+                    while len(dims) < base_rank:
+                        dims.append(":")
+                    return f"{base}(" + ", ".join(dims) + ")"
             # NumPy shape indexing: a.shape[0] -> size(a,1). A pandas
             # DataFrame isn't a plain array (`size()` doesn't apply to its
             # derived type), so df.shape[0]/[1] instead go through the
@@ -34389,6 +34786,72 @@ class translator(ast.NodeVisitor):
                 and node.elt.args[0].id == node.generators[0].target.id
             ):
                 return f"digits_of_str(py_str({self.expr(node.generators[0].iter.args[0])}))"
+            _nest_parts = nested_range_listcomp_parts(node)
+            if _nest_parts is not None:
+                _outer_g, _inner_g, _nest_elt = _nest_parts
+                _ido_names = (getattr(node, "_xp2f_ido_names", None) or {}).get(id(self)) or ("", "")
+                _ov, _iv = _ido_names
+                _ren = {_outer_g.target.id: _ov, _inner_g.target.id: _iv}
+
+                class _RenameIdo(ast.NodeTransformer):
+                    def visit_Name(self, n):
+                        if n.id in _ren:
+                            return ast.copy_location(ast.Name(id=_ren[n.id], ctx=n.ctx), n)
+                        return n
+
+                _nest_elt = _RenameIdo().visit(copy.deepcopy(_nest_elt))
+                ast.fix_missing_locations(_nest_elt)
+
+                def _plain_int_var(_nm):
+                    return _nm in self.ints and not any(
+                        _nm in _pool
+                        for _pool in (
+                            self.reals, self.complexes, self.logs, self.chars,
+                            self.alloc_ints, self.alloc_reals, self.alloc_complexes,
+                            self.alloc_logs, self.alloc_chars,
+                        )
+                    )
+
+                _inner_iter = _subst_len_row_with_shape(_inner_g.iter, _outer_g.target.id)
+                if (
+                    _inner_iter is not None
+                    and _plain_int_var(_ov)
+                    and _plain_int_var(_iv)
+                    and self._rank_expr(_nest_elt) == 0
+                    and self._expr_kind(_nest_elt) in {"int", "real", "logical", "complex"}
+                ):
+                    # result[y][x] = E(x, y): an implied-DO array
+                    # constructor over (x fastest, then y), reshaped to
+                    # (n_x, n_y) and transposed so the Fortran array is
+                    # indexed (y + 1, x + 1) like every other 2D list.
+                    def _implied_do_ctl(_rng, _var):
+                        _st, _sp, _sd = self._range_parts(_rng)
+                        _lo = self._coerce_expr_kind(_st, self.expr(_st), "int")
+                        _hi = self._upper_from_stop(_sp, _sd)
+                        _step = self._coerce_expr_kind(_sd, self.expr(_sd), "int")
+                        if is_const_int(_sd) and int(_sd.value) == 1:
+                            return f"{_var} = {_lo}, {_hi}"
+                        return f"{_var} = {_lo}, {_hi}, {_step}"
+
+                    def _range_count(_rng):
+                        _st, _sp, _sd = self._range_parts(_rng)
+                        _lo = self._coerce_expr_kind(_st, self.expr(_st), "int")
+                        _stop = self._coerce_expr_kind(_sp, self.expr(_sp), "int")
+                        if is_const_int(_sd) and int(_sd.value) == 1:
+                            if is_const_int(_st) and int(_st.value) == 0:
+                                return f"max(0, {_stop})"
+                            return f"max(0, {_stop} - ({_lo}))"
+                        return f"size({self._range_value_expr(_rng)})"
+
+                    _elt_txt = strip_redundant_outer_parens_expr(self.expr(_nest_elt))
+                    _ctor = (
+                        f"[(({_elt_txt}, {_implied_do_ctl(_inner_iter, _iv)}), "
+                        f"{_implied_do_ctl(_outer_g.iter, _ov)})]"
+                    )
+                    return (
+                        f"transpose(reshape({_ctor}, "
+                        f"[{_range_count(_inner_iter)}, {_range_count(_outer_g.iter)}]))"
+                    )
             if (
                 len(node.generators) == 2
                 and all(isinstance(g.target, ast.Name) for g in node.generators)
@@ -34505,6 +34968,29 @@ class translator(ast.NodeVisitor):
                 # own strings/count_vowels.py: `sum(1 for char in s if
                 # char in vowels)`.
                 _char_scalar_iter = base_kind == "char" and self._rank_expr(it) == 0
+                # Rank of the iterable itself: a rank-2 `for row in matrix`
+                # makes the loop variable a whole row (rank 1).
+                _iter_rank = 1 if (
+                    isinstance(it, ast.Call)
+                    and isinstance(it.func, ast.Name)
+                    and it.func.id == "range"
+                ) else int(self._rank_expr(it) or 0)
+                _orig_str_base = base
+                if _char_scalar_iter:
+                    # Swap `base` (the whole string, a Fortran CHARACTER
+                    # scalar) for str_to_chars(base) -- a genuine rank-1
+                    # CHARACTER(len=1) array, one element per character
+                    # -- so every elementwise-array codegen path below
+                    # (operators, elemental intrinsics, the rank-1 branch
+                    # of the "in"/"not in" handling, and pack(mapped,
+                    # mask)) works unchanged; there is no elementwise
+                    # broadcasting over a scalar CHARACTER's own
+                    # characters the way there is over a real rank-1
+                    # array.
+                    base = f"str_to_chars({base})"
+
+                def _is_loop_var(n):
+                    return isinstance(n, ast.Name) and n.id == loop_var
 
                 # General replication form:
                 # [E for _ in range(n)] where E does not depend on loop variable.
@@ -34752,6 +35238,28 @@ class translator(ast.NodeVisitor):
                             return rounded
                         if (
                             isinstance(n.func, ast.Name)
+                            and n.func.id in {"ord", "chr"}
+                            and len(n.args) == 1
+                            and not getattr(n, "keywords", [])
+                        ):
+                            _cfn = "iachar" if n.func.id == "ord" else "achar"
+                            return f"{_cfn}({_map_expr(n.args[0])})"
+                        if (
+                            isinstance(n.func, ast.Name)
+                            and len(n.args) == 1
+                            and not getattr(n, "keywords", [])
+                            and _is_loop_var(n.args[0])
+                            and _iter_rank >= 2
+                        ):
+                            # `for row in matrix` over a rank-2 array: every
+                            # row has the same length, and list(row) is the
+                            # row itself.
+                            if n.func.id == "len":
+                                return f"spread(size({base}, 2), dim=1, ncopies=size({base}, 1))"
+                            if n.func.id == "list":
+                                return base
+                        if (
+                            isinstance(n.func, ast.Name)
                             and len(n.args) == 1
                             and not getattr(n, "keywords", [])
                             and isinstance(n.args[0], ast.Name)
@@ -34770,6 +35278,14 @@ class translator(ast.NodeVisitor):
                             and len(n.args) == 0
                             and not getattr(n, "keywords", [])
                         ):
+                            if _char_scalar_iter and _is_loop_var(n.func.value) and n.func.attr in {"upper", "lower"}:
+                                # Case-map the whole string first, then split
+                                # it into characters (to_upper/to_lower are
+                                # not elemental).
+                                _case_fn = "to_upper" if n.func.attr == "upper" else "to_lower"
+                                return f"str_to_chars({_case_fn}({_orig_str_base}))"
+                            if _iter_rank >= 2 and _is_loop_var(n.func.value) and n.func.attr == "copy":
+                                return base
                             base_txt = _map_expr(n.func.value)
                             if n.func.attr == "strip":
                                 return f"trim(adjustl({base_txt}))"
@@ -34791,6 +35307,13 @@ class translator(ast.NodeVisitor):
                             op_txt = "**"
                         elif isinstance(n.op, ast.Mod):
                             return f"mod({_map_expr(n.left)}, {_map_expr(n.right)})"
+                        elif (
+                            isinstance(n.op, (ast.BitXor, ast.BitAnd, ast.BitOr))
+                            and _kind_with_loopvar(n.left) == "int"
+                            and _kind_with_loopvar(n.right) == "int"
+                        ):
+                            _bfn = {ast.BitXor: "ieor", ast.BitAnd: "iand", ast.BitOr: "ior"}[type(n.op)]
+                            return f"{_bfn}({_map_expr(n.left)}, {_map_expr(n.right)})"
                         if op_txt is not None:
                             return f"({_map_expr(n.left)} {op_txt} {_map_expr(n.right)})"
                     if isinstance(n, ast.UnaryOp):
@@ -34873,21 +35396,7 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("ListComp filter expression is unsupported")
 
                 try:
-                    if gen.ifs and _char_scalar_iter:
-                        # Swap `base` (currently the whole string, a
-                        # Fortran CHARACTER scalar) for str_to_chars(base)
-                        # -- a genuine rank-1 CHARACTER(len=1) array, one
-                        # element per character -- so every existing
-                        # elementwise-array codegen path below (operators,
-                        # the rank-1 branch of the "in"/"not in" handling,
-                        # and the final pack(mapped, mask) call) just
-                        # works unchanged; there is no elementwise
-                        # broadcasting over a scalar CHARACTER's own
-                        # characters the way there is over a real rank-1
-                        # array, so leaving `base` as the bare scalar
-                        # string (as every other codegen path here
-                        # assumes) is not an option.
-                        base = f"str_to_chars({base})"
+                    if _char_scalar_iter:
                         uses_loop_var_elt = any(
                             isinstance(_n, ast.Name) and _n.id == loop_var and isinstance(_n.ctx, ast.Load)
                             for _n in ast.walk(node.elt)
@@ -34902,6 +35411,8 @@ class translator(ast.NodeVisitor):
                             # `base` naturally does -- spread it to match
                             # the character array's own shape first.
                             mapped = f"spread({mapped}, dim=1, ncopies=size({base}))"
+                        if not gen.ifs:
+                            return mapped
                         masks = [strip_redundant_outer_parens_expr(_map_pred(cond)) for cond in gen.ifs]
                         if len(masks) == 1:
                             return f"pack({mapped}, {masks[0]})"
@@ -35534,6 +36045,13 @@ class translator(ast.NodeVisitor):
                         and isinstance(_join_src.func, ast.Attribute)
                         and _join_src.func.attr == "split"
                     )
+                    if (
+                        not _join_is_direct_split
+                        and self._expr_kind(_join_src) == "char"
+                        and self._rank_expr(_join_src) == 0
+                    ):
+                        # "sep".join(some_string) joins its characters.
+                        arg0 = f"str_to_chars({arg0})"
                     _join_arg = arg0 if _join_is_direct_split else f"strvec_t({arg0})"
                     return f"str_join({base_expr}, {_join_arg})"
                 if attr == "read" and len(node.args) == 0:
@@ -40319,6 +40837,13 @@ class translator(ast.NodeVisitor):
                     and isinstance(_join_src.func, ast.Attribute)
                     and _join_src.func.attr == "split"
                 )
+                if (
+                    not _join_is_direct_split
+                    and self._expr_kind(_join_src) == "char"
+                    and self._rank_expr(_join_src) == 0
+                ):
+                    # "sep".join(some_string) joins its characters.
+                    arg0 = f"str_to_chars({arg0})"
                 _join_arg = arg0 if _join_is_direct_split else f"strvec_t({arg0})"
                 return f"str_join({base}, {_join_arg})"
             if (
@@ -41312,6 +41837,10 @@ class translator(ast.NodeVisitor):
                 return "ieee_value(0.0_dp, ieee_positive_inf)"
             if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr == "NINF":
                 return "ieee_value(0.0_dp, ieee_negative_inf)"
+            if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "maxsize":
+                # Largest value of the default integer kind -- the usual
+                # "no bound yet" sentinel role of Python's sys.maxsize.
+                return "huge(1)"
             if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
                 self.uses_sys_argv = True
                 self._mark_alloc_char("sys_argv", rank=1)
@@ -41629,9 +42158,60 @@ class translator(ast.NodeVisitor):
                 elif _prev0 != _k0:
                     empty_list_append_kind[_nm0] = "real"
 
+        _ido_name_counts = None
+        _ido_picked_lower = set()
         for _n in nodes:
             for _m in ast.walk(_n):
                 _record_assigned_names(_m)
+                _nest_parts = nested_range_listcomp_parts(_m) if isinstance(_m, ast.ListComp) else None
+                if _nest_parts is not None:
+                    # Implied-DO indices of the nested-comprehension
+                    # lowering in expr() must be declared (implicit none).
+                    # Fresh names: the comprehension's own variables are
+                    # local to it in Python, and may share a name with an
+                    # unrelated array elsewhere.
+                    # Keyed by translator: an inlined copy of this node
+                    # (deepcopy keeps the attribute) is prescanned again
+                    # by the caller's translator, whose scope differs.
+                    _ido_by_tr = getattr(_m, "_xp2f_ido_names", None)
+                    if not isinstance(_ido_by_tr, dict):
+                        _ido_by_tr = {}
+                        _m._xp2f_ido_names = _ido_by_tr
+                    _ido_names = _ido_by_tr.get(id(self))
+                    if _ido_names is None:
+                        # Avoid every identifier used anywhere in this
+                        # scope's statements too: a same-named variable
+                        # may not have been typed yet at this point.
+                        if _ido_name_counts is None:
+                            _ido_name_counts = Counter(
+                                _x.id.lower() for _st_u in nodes for _x in ast.walk(_st_u)
+                                if isinstance(_x, ast.Name)
+                            )
+                        _own_counts = Counter(
+                            _x.id.lower() for _x in ast.walk(_m) if isinstance(_x, ast.Name)
+                        )
+                        _ido_used_lower = {
+                            _nm_u for _nm_u, _c_u in _ido_name_counts.items()
+                            if _c_u > _own_counts.get(_nm_u, 0)
+                        } | _ido_picked_lower
+                        _picked = []
+                        for _ido_base in (_nest_parts[0].target.id, _nest_parts[1].target.id):
+                            _k = 0
+                            while True:
+                                _cand = _ido_base if _k == 0 else f"{_ido_base}_{_k}"
+                                _k += 1
+                                if _cand.lower() in _ido_used_lower:
+                                    continue
+                                if self._fresh_scoped_names(_cand) != _cand:
+                                    continue
+                                break
+                            _ido_used_lower.add(_cand.lower())
+                            _ido_picked_lower.add(_cand.lower())
+                            _picked.append(_cand)
+                        _ido_names = tuple(_picked)
+                        _ido_by_tr[id(self)] = _ido_names
+                    for _ido_nm in _ido_names:
+                        self._mark_int(_ido_nm)
                 if (isinstance(_m, ast.Assign) and len(_m.targets) == 1
                         and isinstance(_m.targets[0], (ast.Tuple, ast.List))
                         and self._is_matrix_where_tuple_value(_m.value)):
@@ -53653,6 +54233,21 @@ class translator(ast.NodeVisitor):
                 message += ": " + exc.args[0].value
             self.o.w(f"error stop {fstr(message)}")
             return
+        if (node.cause is None and isinstance(exc, ast.Call)
+                and isinstance(exc.func, ast.Name)
+                and exc.func.id in {"Exception", "ValueError", "RuntimeError", "TypeError",
+                                    "IndexError", "KeyError", "OSError", "FileNotFoundError",
+                                    "ZeroDivisionError", "NotImplementedError", "AssertionError"}
+                and not exc.keywords and len(exc.args) == 1
+                and (isinstance(exc.args[0], ast.JoinedStr)
+                     or (self._expr_kind(exc.args[0]) == "char" and self._rank_expr(exc.args[0]) == 0))):
+            # A computed message (f-string, or a string variable such as
+            # `msg = f"..."; raise ValueError(msg)`) -- Fortran 2018 allows
+            # a non-constant ERROR STOP code. Found mining TheAlgorithms/
+            # Python conversions/ipv4_conversion.py: `raise
+            # ValueError(f"Invalid octet {octet}")`.
+            self.o.w(f"error stop {fstr(exc.func.id + ': ')} // {self.expr(exc.args[0])}")
+            return
         raise NotImplementedError("raise currently supports built-in exceptions with a literal string message only")
 
     def visit_Return(self, node):
@@ -54686,7 +55281,15 @@ class translator(ast.NodeVisitor):
         ):
             seq_nodes = list(node.iter.args)
             tgt_names = [t.id for t in node.target.elts]
-            if any(self._rank_expr(s) < 1 for s in seq_nodes):
+            # A CHARACTER scalar (Python str) zips character by character:
+            # the body's `seq[i_zip - 1]` substitution below is already a
+            # 1-character substring of it (e.g. TheAlgorithms/Python
+            # strings/hamming_distance.py: `for c1, c2 in zip(s1, s2):`).
+            char_scalar_seq = [
+                isinstance(s, ast.Name) and self._rank_expr(s) == 0 and self._expr_kind(s) == "char"
+                for s in seq_nodes
+            ]
+            if any(self._rank_expr(s) < 1 and not cs for s, cs in zip(seq_nodes, char_scalar_seq)):
                 raise NotImplementedError("zip loop currently expects rank-1 iterables")
             kinds = [self._expr_kind(s) or "int" for s in seq_nodes]
             supported = {"int", "real", "logical", "char"}
@@ -54716,7 +55319,10 @@ class translator(ast.NodeVisitor):
             for arr, s in zip(zip_arr_names, seq_nodes):
                 if not isinstance(s, ast.Name):
                     self.o.w(f"{arr} = {self.expr(s)}")
-            size_terms = [f"size({arr})" for arr in zip_arr_names]
+            size_terms = [
+                f"len({arr})" if cs else f"size({arr})"
+                for arr, cs in zip(zip_arr_names, char_scalar_seq)
+            ]
             if len(size_terms) == 1:
                 n_expr = size_terms[0]
             else:
@@ -55241,6 +55847,14 @@ class translator(ast.NodeVisitor):
                 self.o.w("block")
                 self.o.push()
                 self.o.w(f"integer :: {iv}")
+                if not re.fullmatch(r"[A-Za-z_]\w*(?:%[A-Za-z_]\w*)*", it_expr.strip()):
+                    # A substring `(i:i)` can only follow a variable, not
+                    # an arbitrary expression (`str_reverse(s)(i:i)` is
+                    # invalid) -- evaluate it once into a block local.
+                    _it_tmp = self._fresh_scoped_names("iter_str")
+                    self.o.w(f"character(len=:), allocatable :: {_it_tmp}")
+                    self.o.w(f"{_it_tmp} = {it_expr}")
+                    it_expr = _it_tmp
                 self.o.w(f"do {iv} = 1, len({it_expr})")
                 self.o.push()
                 if node.target.id != "_":
@@ -67102,6 +67716,139 @@ def _seed_observed_argument_types(tr, fn, kind_hints, rank_hints):
                 getattr(tr, "_mark_" + suffix)(arg.arg)
 
 
+def nested_range_listcomp_parts(node):
+    """`[[E for x in range(...)] for y in range(...)]` where E references
+    the OUTER loop variable `y` (the "2D grid built from (x, y)" idiom,
+    e.g. TheAlgorithms/Python matrix/rotate_matrix.py::make_matrix, or
+    elementwise `[[a[r][c] + b[r][c] for c in ...] for r in ...]`).
+    Returns (outer_gen, inner_gen, E) or None. The inner range may depend
+    on the outer variable only through `len(M[y])`, which the caller
+    rewrites to `M.shape[1]` (Fortran arrays are rectangular)."""
+    if not (
+        isinstance(node, ast.ListComp)
+        and len(node.generators) == 1
+        and isinstance(node.elt, ast.ListComp)
+        and len(node.elt.generators) == 1
+    ):
+        return None
+    outer = node.generators[0]
+    inner = node.elt.generators[0]
+    for g in (outer, inner):
+        if not (
+            isinstance(g.target, ast.Name)
+            and not g.ifs
+            and not getattr(g, "is_async", 0)
+            and isinstance(g.iter, ast.Call)
+            and isinstance(g.iter.func, ast.Name)
+            and g.iter.func.id == "range"
+            and 1 <= len(g.iter.args) <= 3
+            and not g.iter.keywords
+        ):
+            return None
+    ov = outer.target.id
+    iv = inner.target.id
+    if ov == iv or ov == "_" or iv == "_":
+        return None
+    elt = node.elt.elt
+    if not any(
+        isinstance(n, ast.Name) and n.id == ov and isinstance(n.ctx, ast.Load)
+        for n in ast.walk(elt)
+    ):
+        return None
+    if any(isinstance(n, (ast.ListComp, ast.GeneratorExp, ast.SetComp, ast.DictComp, ast.Lambda)) for n in ast.walk(elt)):
+        return None
+    if any(isinstance(n, ast.Name) and n.id in {ov, iv} for n in ast.walk(outer.iter)):
+        return None
+    return outer, inner, elt
+
+
+def _subst_len_row_with_shape(range_call, ov):
+    """Copy of `range_call` with every `len(M[ov])` replaced by
+    `M.shape[1]`; None if `ov` is still referenced afterwards."""
+
+    class _Sub(ast.NodeTransformer):
+        def visit_Call(self, n):
+            self.generic_visit(n)
+            if (
+                isinstance(n.func, ast.Name)
+                and n.func.id == "len"
+                and len(n.args) == 1
+                and not n.keywords
+                and isinstance(n.args[0], ast.Subscript)
+                and isinstance(n.args[0].value, ast.Name)
+                and isinstance(n.args[0].slice, ast.Name)
+                and n.args[0].slice.id == ov
+            ):
+                return ast.copy_location(
+                    ast.Subscript(
+                        value=ast.Attribute(
+                            value=ast.Name(id=n.args[0].value.id, ctx=ast.Load()),
+                            attr="shape",
+                            ctx=ast.Load(),
+                        ),
+                        slice=ast.Constant(value=1),
+                        ctx=ast.Load(),
+                    ),
+                    n,
+                )
+            return n
+
+    out = _Sub().visit(copy.deepcopy(range_call))
+    ast.fix_missing_locations(out)
+    if any(isinstance(n, ast.Name) and n.id == ov for n in ast.walk(out)):
+        return None
+    return out
+
+
+_STR_SELF_METHODS = {
+    "strip", "lstrip", "rstrip", "lower", "upper", "casefold", "title",
+    "capitalize", "swapcase", "replace", "zfill", "center", "ljust", "rjust",
+}
+
+
+def _name_rebound_only_by_self_str_method(fn, nm):
+    """True when every binding of `nm` inside `fn` is a plain
+    `nm = <string method chain / slice of nm>` (e.g. `s = s.strip()`,
+    `s = str(s).lower()`, `s = s[1:]`), so a scalar-string `nm` stays a
+    scalar string."""
+
+    def _is_self_str_expr(node):
+        if isinstance(node, ast.Name):
+            return node.id == nm
+        if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "str"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                return _is_self_str_expr(node.args[0])
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _STR_SELF_METHODS:
+                return _is_self_str_expr(node.func.value)
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            # A slice of a string is a (shorter) string.
+            return _is_self_str_expr(node.value)
+        return False
+
+    stores = 0
+    self_str_assigns = 0
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and node.id == nm and isinstance(node.ctx, ast.Store):
+            stores += 1
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == nm
+            and isinstance(node.value, (ast.Call, ast.Subscript))
+            and _is_self_str_expr(node.value)
+        ):
+            self_str_assigns += 1
+    # Any other binding form (augmented/tuple assignment, a loop target,
+    # `with ... as nm`, ...) leaves stores > self_str_assigns.
+    return stores == self_str_assigns
+
+
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None,
@@ -67181,16 +67928,23 @@ def generate_flat(
         if not (isinstance(cur, ast.Name) and cur.id == root_name):
             return None
         slices.reverse()
+        # A slice link keeps the rank, so the NEXT link re-indexes the same
+        # dimension (`a[lo:hi][::-1]` is rank-1 evidence, not rank-2).
         rr = 0
+        consumed = 0
         for sl in slices:
             if isinstance(sl, ast.Tuple):
-                rr += _tuple_subscript_base_rank(sl.elts)
+                consumed += _tuple_subscript_base_rank(sl.elts)
+                rr = max(rr, consumed)
             elif is_none(sl):
                 continue
             elif isinstance(sl, ast.Constant) and sl.value is Ellipsis:
                 continue
+            elif isinstance(sl, ast.Slice):
+                rr = max(rr, consumed + 1)
             else:
-                rr += 1
+                consumed += 1
+                rr = max(rr, consumed)
         return rr
 
     def _infer_arg_rank_in_fn(fn, nm, _seen=None):
@@ -68831,15 +69585,16 @@ def generate_flat(
             # Indexing a caller-observed scalar string selects a character,
             # not an array element. Body-only rank inference cannot distinguish
             # these operations. Do not apply this override to string arrays or
-            # parameters that are rebound to another value inside the function.
+            # parameters that are rebound to another value inside the function
+            # -- except a rebind to a string method applied to the parameter
+            # itself (`s = s.strip()`, `s = str(s).lower()`), which is still a
+            # scalar string (TheAlgorithms/Python conversions/
+            # binary_to_decimal.py: `bin_string = str(bin_string).strip()`
+            # followed by `for char in bin_string:`).
             if (
                 _seen_ranks == {0}
                 and _i < len(hint_kinds) and hint_kinds[_i] == "char"
-                and not any(
-                    isinstance(_node, ast.Name) and _node.id == _arg_nm
-                    and isinstance(_node.ctx, ast.Store)
-                    for _node in ast.walk(fn)
-                )
+                and _name_rebound_only_by_self_str_method(fn, _arg_nm)
             ):
                 local_func_arg_ranks[fn.name][_i] = 0
                 base_func_arg_ranks[fn.name][_i] = 0
@@ -73171,6 +73926,7 @@ def generate_flat(
         local_void_funcs=local_void_funcs,
         local_generic_overloads=local_generic_overloads,
         local_overload_dispatch=local_overload_dispatch,
+        local_overload_tuple_profiles=local_overload_tuple_profiles,
         user_class_types=user_class_types,
         local_func_dict_arg_types=local_func_dict_arg_types,
         local_elemental_funcs=elemental_targets,
@@ -73432,6 +74188,7 @@ def generate_flat(
                 local_generic_overloads=local_generic_overloads,
                 toplevel_shared_specs=_toplevel_shared_specs,
                 local_overload_dispatch=local_overload_dispatch,
+                local_overload_tuple_profiles=local_overload_tuple_profiles,
                 user_class_types=user_class_types,
                 structured_type_components=structured_type_components,
                 value_scalar_args=value_scalar_args,
@@ -74109,6 +74866,8 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
     tree = rewrite_math_const_from_import_to_attribute(tree)
+    tree = rewrite_builtin_divmod_tuple_assign(tree)
+    tree = rewrite_reversed_value_to_negative_slice(tree)
     tree = rewrite_tuple_literal_shape_name_to_literal(tree)
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
@@ -74459,6 +75218,8 @@ def transpile_file(
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
     tree = rewrite_math_const_from_import_to_attribute(tree)
+    tree = rewrite_builtin_divmod_tuple_assign(tree)
+    tree = rewrite_reversed_value_to_negative_slice(tree)
     tree = rewrite_tuple_literal_shape_name_to_literal(tree)
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)
@@ -75210,6 +75971,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
     tree = rewrite_math_const_from_import_to_attribute(tree)
+    tree = rewrite_builtin_divmod_tuple_assign(tree)
+    tree = rewrite_reversed_value_to_negative_slice(tree)
     tree = rewrite_tuple_literal_shape_name_to_literal(tree)
     tree = inline_percent_format_constant_vars(tree)
     tree = rewrite_case_insensitive_name_collisions(tree)

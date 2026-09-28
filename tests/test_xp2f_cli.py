@@ -11817,12 +11817,29 @@ def test_xp2f_literal_exception_guard_stops_execution(tmp_path: Path) -> None:
     assert 'UNREACHABLE' not in run.stdout
 
 
-def test_xp2f_nonliteral_raise_is_rejected_not_omitted(tmp_path: Path) -> None:
+def test_xp2f_nonliteral_raise_is_translated_not_omitted(tmp_path: Path) -> None:
+    # A computed exception message (str(x), an f-string, a message
+    # variable) becomes a non-constant ERROR STOP code; it must still stop
+    # execution with the computed message, never be silently dropped.
     source = tmp_path / 'xraise_dynamic.py'
-    source.write_text("def checked(x):\n    if x < 0:\n        raise ValueError(str(x))\n    return x\nprint(checked(-1))\n", encoding='utf-8')
-    run = subprocess.run([sys.executable, str(XP2F_PATH), str(source)], cwd=tmp_path, capture_output=True, text=True)
+    source.write_text(
+        "def checked(x):\n"
+        "    if x < 0:\n"
+        "        raise ValueError(str(x))\n"
+        "    if x > 100:\n"
+        "        raise ValueError(f'too big {x}')\n"
+        "    return x\n"
+        "print(checked(5))\n"
+        "print(checked(-1))\n"
+        "print('UNREACHABLE')\n",
+        encoding='utf-8',
+    )
+    build = subprocess.run([sys.executable, str(XP2F_PATH), str(source), '--compile'], cwd=tmp_path, capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(tmp_path / 'xraise_dynamic_p.exe')], cwd=tmp_path, capture_output=True, text=True)
     assert run.returncode != 0
-    assert 'raise currently supports' in run.stdout + run.stderr
+    assert 'ValueError: -1' in run.stdout + run.stderr
+    assert 'UNREACHABLE' not in run.stdout
 
 
 def test_xp2f_single_column_quadrature_explicit_usecols(tmp_path: Path) -> None:
@@ -22202,3 +22219,306 @@ def test_xp2f_sum_generator_over_string_chars_with_membership_filter(tmp_path: P
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
+
+
+# Regression tests for reports/xp2f_bug_mining_20260927/report.md -- each
+# case transpiles, compiles, runs, and must match CPython's output exactly.
+_BUG_MINING_20260927_CASES = {
+    # 1: nested ListComp whose element depends on both loop variables
+    "nested_listcomp_cross_index": [
+        "def make_matrix(row_size):",
+        "    return [[1 + x + y * row_size for x in range(row_size)] for y in range(row_size)]",
+        "",
+        "",
+        "def grid(n, m, h):",
+        "    k = 0",
+        "    for t in range(n):",
+        "        k = k + t",
+        "    g = [[0.5 * i + h * j + k for j in range(1, m, 2)] for i in range(n)]",
+        "    s = 0.0",
+        "    for row in g:",
+        "        for v in row:",
+        "            s = s + v",
+        "    return s",
+        "",
+        "",
+        "m = make_matrix(3)",
+        "for row in m:",
+        "    print(row)",
+        "print(grid(3, 6, 0.25))",
+        "print(grid(0, 4, 1.0))",
+    ],
+    # 2: elementwise combination of two 2D arrays
+    "nested_listcomp_matrix_addition": [
+        "def matrix_addition(matrix_a, matrix_b):",
+        "    return [",
+        "        [matrix_a[row][col] + matrix_b[row][col] for col in range(len(matrix_a[row]))]",
+        "        for row in range(len(matrix_a))",
+        "    ]",
+        "",
+        "",
+        "a = [[1, 2], [3, 4]]",
+        "b = [[5, 6], [7, 8]]",
+        "r = matrix_addition(a, b)",
+        "for row in r:",
+        "    print(row)",
+    ],
+    # 3: copying rows out of a 2D array
+    "listcomp_list_of_row_copy": [
+        "def copy_rows(matrix):",
+        "    return [list(row) for row in matrix]",
+        "",
+        "",
+        "m = [[1, 2, 3], [4, 5, 6]]",
+        "r = copy_rows(m)",
+        "for row in r:",
+        "    print(row)",
+    ],
+    # 4: all() over a per-row property
+    "all_len_row_check": [
+        "def is_square(matrix):",
+        "    len_matrix = len(matrix)",
+        "    return all(len(row) == len_matrix for row in matrix)",
+        "",
+        "",
+        "print(is_square([[1, 2], [3, 4]]))",
+        "print(is_square([[1, 2, 3], [4, 5, 6]]))",
+    ],
+    # 5: ListComp over a string's characters, not consumed by sum()
+    "listcomp_over_string_chars": [
+        "def xor_chars(content, key):",
+        "    return [chr(ord(ch) ^ key) for ch in content]",
+        "",
+        "",
+        "r = xor_chars('abc', 5)",
+        "for c in r:",
+        "    print(c)",
+    ],
+    # 6: str.join() of a generator expression
+    "join_genexpr": [
+        "def shout(message):",
+        "    return ' '.join(char.upper() for char in message)",
+        "",
+        "",
+        "def csv(v):",
+        "    return ','.join(str(x) for x in v)",
+        "",
+        "",
+        "def drop_a(s):",
+        "    return ''.join(c for c in s if c != 'a')",
+        "",
+        "",
+        "print(shout('hello'))",
+        "print(csv([1, 22, 3]))",
+        "print(drop_a('banana'))",
+    ],
+    # 7: zip() over two strings in a for loop
+    "zip_two_strings_for_loop": [
+        "def hamming_distance(s1, s2):",
+        "    n = 0",
+        "    for c1, c2 in zip(s1, s2):",
+        "        if c1 != c2:",
+        "            n = n + 1",
+        "    return n",
+        "",
+        "",
+        "print(hamming_distance('karolin', 'kathrin'))",
+    ],
+    # 8: tuple-unpacking assignment from divmod(), incl. a target that is
+    # also an operand, and negative operands
+    "divmod_tuple_unpack": [
+        "def to_binary(decimal):",
+        "    result = ''",
+        "    while decimal > 0:",
+        "        decimal, mod = divmod(decimal, 2)",
+        "        result = str(mod) + result",
+        "    return result",
+        "",
+        "",
+        "def f(a, b):",
+        "    q, r = divmod(a, b)",
+        "    return q * 100 + r",
+        "",
+        "",
+        "print(to_binary(13))",
+        "print(f(17, 5), f(-17, 5), f(17, -5))",
+    ],
+    # 9: raise with an f-string message (not triggered here; see
+    # test_xp2f_nonliteral_raise_is_translated_not_omitted for that)
+    "raise_fstring_message": [
+        "def validate_octet(octet):",
+        "    if not 0 <= octet <= 255:",
+        "        raise ValueError(f'Invalid octet {octet}')",
+        "    return octet",
+        "",
+        "",
+        "print(validate_octet(200))",
+    ],
+    # 10: slice assignment from reversed(), and reversed() elsewhere
+    "slice_assign_reversed": [
+        "def flip(arr, k):",
+        "    arr[: k + 1] = reversed(arr[: k + 1])",
+        "    return arr",
+        "",
+        "",
+        "def rev_str(s):",
+        "    out = ''",
+        "    for c in reversed(s):",
+        "        out = out + c",
+        "    return out + '|' + ''.join(reversed(s))",
+        "",
+        "",
+        "a = [5, 1, 4, 2, 3]",
+        "flip(a, 2)",
+        "print(a[0], a[1], a[2], a[3], a[4])",
+        "s = 0",
+        "for x in reversed(a):",
+        "    s = s * 10 + x",
+        "print(s)",
+        "print([j for j in reversed(range(3))])",
+        "print(rev_str('abc'))",
+    ],
+    # 11: chained-subscript assignment to a 2D-list class field
+    "class_2d_list_field_mutation": [
+        "import math",
+        "",
+        "",
+        "class Graph:",
+        "    def __init__(self, n):",
+        "        self.n = n",
+        "        self.dp = [[math.inf for j in range(n)] for i in range(n)]",
+        "",
+        "    def add_edge(self, u, v, w):",
+        "        self.dp[u][v] = w",
+        "",
+        "    def floyd_warshall(self):",
+        "        for k in range(self.n):",
+        "            for i in range(self.n):",
+        "                for j in range(self.n):",
+        "                    self.dp[i][j] = min(self.dp[i][j], self.dp[i][k] + self.dp[k][j])",
+        "",
+        "    def show_min(self, u, v):",
+        "        return self.dp[u][v]",
+        "",
+        "",
+        "g = Graph(4)",
+        "g.add_edge(0, 1, 1.0)",
+        "g.add_edge(1, 2, 2.0)",
+        "g.add_edge(2, 3, 3.0)",
+        "g.add_edge(0, 3, 10.0)",
+        "g.floyd_warshall()",
+        "print(g.show_min(0, 3))",
+        "print(g.show_min(1, 3))",
+    ],
+    # 12: `from sys import maxsize` used as a bare name
+    "from_sys_import_maxsize": [
+        "from sys import maxsize",
+        "",
+        "",
+        "def smallest(nums):",
+        "    best = maxsize",
+        "    for x in nums:",
+        "        if x < best:",
+        "            best = x",
+        "    return best",
+        "",
+        "",
+        "print(smallest([5, 2, 9, 1, 7]))",
+    ],
+    # 13: string parameter rebound via a string method / slice, then
+    # iterated by character
+    "string_reassign_then_char_iterate": [
+        "def f(s):",
+        "    s = s.strip()",
+        "    n = 0",
+        "    for char in s:",
+        "        n = n + 1",
+        "    return n",
+        "",
+        "",
+        "def bin_to_decimal(bin_string):",
+        "    bin_string = str(bin_string).strip()",
+        "    is_negative = bin_string[0] == '-'",
+        "    if is_negative:",
+        "        bin_string = bin_string[1:]",
+        "    decimal_number = 0",
+        "    for char in bin_string:",
+        "        decimal_number = 2 * decimal_number + int(char)",
+        "    return -decimal_number if is_negative else decimal_number",
+        "",
+        "",
+        "print(f('  1010  '))",
+        "print(bin_to_decimal('  101  '))",
+        "print(bin_to_decimal('-11'))",
+    ],
+    # 14: rank/kind-specialized overloads of a self-recursive function
+    # (need `recursive`), called with int, sorted-int and empty lists
+    "recursive_overload": [
+        "def count_inversions_bf(arr):",
+        "    num_inversions = 0",
+        "    n = len(arr)",
+        "    for i in range(n - 1):",
+        "        for j in range(i + 1, n):",
+        "            if arr[i] > arr[j]:",
+        "                num_inversions += 1",
+        "    return num_inversions",
+        "",
+        "",
+        "def count_inversions_recursive(arr):",
+        "    if len(arr) <= 1:",
+        "        return arr, 0",
+        "    mid = len(arr) // 2",
+        "    p = arr[0:mid]",
+        "    q = arr[mid:]",
+        "    a, inversion_p = count_inversions_recursive(p)",
+        "    b, inversions_q = count_inversions_recursive(q)",
+        "    c, cross_inversions = _count_cross_inversions(a, b)",
+        "    num_inversions = inversion_p + inversions_q + cross_inversions",
+        "    return c, num_inversions",
+        "",
+        "",
+        "def _count_cross_inversions(p, q):",
+        "    r = []",
+        "    i = j = num_inversion = 0",
+        "    while i < len(p) and j < len(q):",
+        "        if p[i] > q[j]:",
+        "            num_inversion += len(p) - i",
+        "            r.append(q[j])",
+        "            j += 1",
+        "        else:",
+        "            r.append(p[i])",
+        "            i += 1",
+        "    if i < len(p):",
+        "        r.extend(p[i:])",
+        "    else:",
+        "        r.extend(q[j:])",
+        "    return r, num_inversion",
+        "",
+        "",
+        "def main():",
+        "    arr_1 = [10, 2, 1, 5, 5, 2, 11]",
+        "    num_inversions_bf = count_inversions_bf(arr_1)",
+        "    _, num_inversions_recursive = count_inversions_recursive(arr_1)",
+        "    assert num_inversions_bf == num_inversions_recursive == 8",
+        "    print('number of inversions = ', num_inversions_bf)",
+        "    arr_1.sort()",
+        "    num_inversions_bf = count_inversions_bf(arr_1)",
+        "    _, num_inversions_recursive = count_inversions_recursive(arr_1)",
+        "    assert num_inversions_bf == num_inversions_recursive == 0",
+        "    print('number of inversions = ', num_inversions_bf)",
+        "    arr_1 = []",
+        "    num_inversions_bf = count_inversions_bf(arr_1)",
+        "    _, num_inversions_recursive = count_inversions_recursive(arr_1)",
+        "    assert num_inversions_bf == num_inversions_recursive == 0",
+        "    print('number of inversions = ', num_inversions_bf)",
+        "",
+        "",
+        "if __name__ == '__main__':",
+        "    main()",
+    ],
+}
+
+
+@pytest.mark.parametrize("case", sorted(_BUG_MINING_20260927_CASES))
+def test_xp2f_bug_mining_20260927(tmp_path: Path, case: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, f"xbm0927_{case}.py", _BUG_MINING_20260927_CASES[case])
