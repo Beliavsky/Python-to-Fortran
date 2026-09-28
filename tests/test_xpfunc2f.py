@@ -447,8 +447,47 @@ def test_infer_rank1_size_recognized_python_mod_helpers() -> None:
     size_of["xfull"] = "n + burnin"
     assert (
         xpfunc2f._infer_rank1_size("xfull(burnin + 1:size(xfull))", size_of, scalar_names)
-        == "((n + burnin)) - (burnin + 1) + 1"
+        == "max(0, ((n + burnin)) - (burnin + 1) + 1)"
     )
+
+
+def test_slice_size_rendering_preserves_normalization_and_clipping() -> None:
+    expr = "max(0, py_slice_bound(hi,n,.false.) - py_slice_bound(lo,n,.false.))"
+    names = {name: name for name in ("n", "lo", "hi")}
+    python_expr = xpfunc2f._render_slice_size(expr, names, "python")
+    c_expr = xpfunc2f._render_slice_size(expr, names, "c")
+    assert "py_slice_bound" not in c_expr and ".false." not in c_expr
+    assert "?" in c_expr
+    for n in (0, 1, 6):
+        for lo in (-100, -6, -1, 0, 2, 6, 100):
+            for hi in (-100, -6, -1, 0, 2, 6, 100):
+                assert eval(python_expr, {"min": min, "max": max}, {"n": n, "lo": lo, "hi": hi}) == len(list(range(n))[lo:hi])
+    with pytest.raises(xpfunc2f.UnsupportedFunction, match="unsupported slice result size"):
+        xpfunc2f._render_slice_size("unknown(n)", names, "c")
+    mixed_case = xpfunc2f._array_result_size_expr_to_python(
+        "max(0, N - py_slice_bound(Start,N,.false.))", {}, {"n", "start"},
+        {"n": ("integer", None, False), "start": ("integer", None, False)})
+    assert eval(mixed_case, {"min": min, "max": max}, {"N": 6, "Start": -2}) == 2
+
+
+@pytest.mark.parametrize("backend", ["f2py", "ctypes"])
+def test_xpfunc2f_bridges_clipped_slice_results(tmp_path: Path, backend: str) -> None:
+    src = tmp_path / "xslice_result.py"
+    src.write_text("import numpy as np\ndef segment(x, lo, hi):\n"
+                   "    return x[lo:hi]\n"
+                   "print(segment(np.array([1.0, 2.0, 3.0]), 0, 2))\n", encoding="utf-8")
+    proc = _run_xpfunc2f([str(src), "segment", "--out-dir", str(tmp_path), "--backend", backend], tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    check = subprocess.run([sys.executable, "-c",
+        "import numpy as np\nfrom segment_f import segment\n"
+        "for n in (0, 1, 6):\n"
+        "    x = np.arange(n, dtype=float)\n"
+        "    for lo in (-100, -6, -1, 0, 2, 6, 100):\n"
+        "        for hi in (-100, -6, -1, 0, 2, 6, 100):\n"
+        "            result = segment(x, lo, hi)\n"
+        "            assert np.array_equal(result, x[lo:hi]), (n, lo, hi, result)\n"],
+        cwd=tmp_path, capture_output=True, text=True)
+    assert check.returncode == 0, check.stdout + check.stderr
 
 
 def test_rewrite_target_for_f2py_handles_allocate_with_trailing_keyword_arg() -> None:

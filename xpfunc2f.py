@@ -284,7 +284,7 @@ def _infer_rank1_size(expr, size_of, scalar_names, dependency_resolver=None):
         length (`_SCALAR` parts contribute exactly 1 each; any part that
         resolves to None bails the WHOLE constructor, since it might
         itself be an unresolvable array).
-      - a slice `BASE(A:B)` -- length `(B) - (A) + 1`, with any
+      - a slice `BASE(A:B)` -- length `max(0, (B) - (A) + 1)`, with any
         `size(BASE)` appearing in A or B substituted for BASE's own
         already-resolved size first (e.g. `xfull(burnin + 1:
         size(xfull))`).
@@ -375,7 +375,7 @@ def _infer_rank1_size(expr, size_of, scalar_names, dependency_resolver=None):
                     flags=re.IGNORECASE,
                 )
 
-            return f"({_sub_size(b_expr)}) - ({_sub_size(a_expr)}) + 1"
+            return f"max(0, ({_sub_size(b_expr)}) - ({_sub_size(a_expr)}) + 1)"
         if len(colon_parts) == 1:
             fname = base.lower()
             arg_parts = _split_top_level(inner) if inner.strip() else []
@@ -406,6 +406,48 @@ class UnsupportedFunction(Exception):
     """Raised when the target function's own Fortran translation falls
     outside what a thin f2py wrapper can bridge for free (see module
     docstring)."""
+
+
+def _render_slice_size(expr, names, language):
+    """Render checked slice-size arithmetic for C (f2py) or Python (ctypes).
+
+    The actual Fortran bound stays unchanged. In particular, do not simplify
+    x[burnin:] to n merely because x was allocated with n + burnin elements:
+    burnin may be negative or outside the array. No arbitrary code is evaluated.
+    """
+    source = re.sub(r"\.false\.", "False", expr, flags=re.IGNORECASE)
+    source = re.sub(r"\.true\.", "True", source, flags=re.IGNORECASE)
+    try:
+        root = ast.parse(source, mode="eval").body
+    except SyntaxError as exc:
+        raise UnsupportedFunction(f"unsupported slice result size expression: {expr!r}") from exc
+
+    def render(node):
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return str(node.value)
+        if isinstance(node, ast.Name) and node.id.lower() in names:
+            return names[node.id.lower()]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            return f"({'+' if isinstance(node.op, ast.UAdd) else '-'}{render(node.operand)})"
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            op = '+' if isinstance(node.op, ast.Add) else '-' if isinstance(node.op, ast.Sub) else '*'
+            return f"({render(node.left)} {op} {render(node.right)})"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+            fn = node.func.id.lower()
+            if fn in {"min", "max"} and len(node.args) == 2:
+                return f"{fn}({render(node.args[0])}, {render(node.args[1])})"
+            if fn == "py_slice_bound" and len(node.args) == 3:
+                index, length = render(node.args[0]), render(node.args[1])
+                reverse = node.args[2]
+                if not isinstance(reverse, ast.Constant) or type(reverse.value) is not bool:
+                    raise UnsupportedFunction("slice result size requires a constant slice direction")
+                normalized = (f"(({index}) < 0 ? ({length}) + ({index}) : ({index}))" if language == "c"
+                              else f"(({length}) + ({index}) if ({index}) < 0 else ({index}))")
+                lower, upper = ("-1", f"({length}) - 1") if reverse.value else ("0", length)
+                return f"max({lower}, min({upper}, {normalized}))"
+        raise UnsupportedFunction(f"unsupported slice result size expression: {expr!r}")
+
+    return render(root)
 
 
 def _strip_comment(line: str) -> str:
@@ -1269,8 +1311,8 @@ def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
             # dimension-expression analyzer can only emit a dummy's
             # explicit-shape bound as a LITERAL C EXPRESSION in its
             # generated wrapper when it can't otherwise symbolically
-            # understand it, and neither `sign` nor `max` are C
-            # functions -- confirmed empirically: gfortran/Fortran
+            # understand it, and `sign` is not provided by its C
+            # wrapper (`min`/`max` macros ARE available). gfortran/Fortran
             # itself accepts the general form fine, but the C compile
             # step then fails ("call to undeclared function 'sign'").
             # Restricted to the overwhelmingly common step=1 case
@@ -1293,9 +1335,8 @@ def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
                     f"range with step {c_expr!r} -- only the common step=1 "
                     f"case (plain `range(a, b)`) is bridged for now, since "
                     f"f2py's own dimension-expression analyzer can't emit "
-                    f"the general closed form (it needs sign()/max(), "
-                    f"neither of which are valid in the plain C expression "
-                    f"it falls back to)"
+                    f"the general closed form (its sign() call is not "
+                    f"available in the plain C expression it falls back to)"
                 )
             size_expr = f"({b_expr}) - ({a_expr})"
         else:
@@ -1349,6 +1390,14 @@ def rewrite_target_for_f2py(lines, start, end, target_name, procedures=None):
             if "intent" not in new_decl.lower():
                 new_decl = new_decl.replace("::", "intent(out) ::", 1)
         target_lines[ri] = new_decl
+        if re.search(r"\b(?:py_slice_bound|min|max)\s*\(", size_expr, re.IGNORECASE):
+            visible = {n.lower(): n.lower() for n in arg_names + extra_args}
+            c_size = _render_slice_size(size_expr, visible, "c")
+            # F2PY keeps the FIRST dimension declaration it sees. Give its
+            # C generator an equivalent ternary/clamping expression before
+            # the real Fortran declaration; this directive is a Fortran comment.
+            type_spec = new_decl.split("::", 1)[0].split(",", 1)[0].strip()
+            target_lines.insert(ri, f"!f2py {type_spec}, intent(out), dimension({c_size}) :: {name}")
         if is_new_arg:
             extra_args.append(name)
 
@@ -2577,13 +2626,13 @@ def _inner_call_arg(name: str, c_type: str) -> str:
 def _array_result_size_expr_to_python(shape, size_source, arg_names_l, decls):
     """Translate a Fortran array-result size expression -- built ONLY
     from the target's own arguments, a synth-size dummy, integer
-    literals, and +/-/parens arithmetic (rewrite_target_for_f2py's own
-    size derivation -- see _derive_no_alloc_array_size/_infer_rank1_size
-    -- never produces anything else) -- into an equivalent Python
-    expression string for the ctypes wrapper's own pre-allocation.
+    literals, and arithmetic, including normalized/clipped slice bounds --
+    into an equivalent Python expression string for the ctypes wrapper's
+    own pre-allocation. Slice helpers and min/max are handled by the checked
+    renderer; plain arithmetic retains the existing name-substitution path.
     Fortran's `+`/`-`/parens/integer-literal syntax is ALREADY valid
     Python verbatim, and an ordinary scalar argument's own Fortran name
-    IS its Python name too -- the only substitution ever needed is a
+    IS its Python name too -- for plain arithmetic the only substitution is a
     synth-size dummy name (never itself Python-facing) -> `len(<its own
     source array's Python name>)`.
 
@@ -2594,6 +2643,14 @@ def _array_result_size_expr_to_python(shape, size_source, arg_names_l, decls):
     in this backend, rather than emitting a Python expression that could
     raise `NameError` or silently compute the wrong thing.
     """
+    if re.search(r"\b(?:py_slice_bound|min|max)\s*\(", shape, re.IGNORECASE):
+        names = {nm: f"len({src})" for nm, src in size_source.items()}
+        names.update({nm.lower(): nm for nm in re.findall(r"[a-z_]\w*", shape, re.IGNORECASE)
+                      if nm.lower() in arg_names_l and decls.get(nm.lower(), (None, None, None))[1] is None})
+        try:
+            return _render_slice_size(shape, names, "python")
+        except UnsupportedFunction:
+            return None
     result = shape
     for nm in set(re.findall(r"[a-z_]\w*", shape, re.IGNORECASE)):
         nm_l = nm.lower()
