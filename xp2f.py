@@ -54089,40 +54089,94 @@ class translator(ast.NodeVisitor):
         if (
             isinstance(node.target, ast.Subscript)
             and self._expr_kind(node.target.slice) == "logical"
+            and self._rank_expr(node.target.slice) > 0
         ):
             base = self.expr(node.target.value)
             mask = self.expr(node.target.slice)
+            rank = self._rank_expr(node.target.value)
+            if rank not in (1, 2) or self._rank_expr(node.target.slice) != rank:
+                raise NotImplementedError("masked augmented assignment requires a full-shape rank-1 or rank-2 mask")
+            bk = self._expr_kind(node.target.value)
+            rk = self._expr_kind(node.value)
+            logical_ops = (ast.Add, ast.Mult, ast.BitAnd, ast.BitOr, ast.BitXor)
+            if bk == "logical" and (rk != "logical" or not isinstance(node.op, logical_ops)):
+                raise NotImplementedError("unsupported Boolean masked augmented assignment: NumPy requires Boolean operands and +=, *=, &=, |=, or ^=")
+            if bk == "int" and (rk in {"real", "complex"} or isinstance(node.op, ast.Div)):
+                raise NotImplementedError("masked augmented assignment cannot cast the arithmetic result back to an integer array")
             rhs = self.expr(node.value)
-            if isinstance(node.op, ast.Add):
-                upd = f"{base} + {rhs}"
+            # Boolean indexing yields a compact vector in Python C order.
+            # Work on snapshots, then scatter: a WHERE assignment cannot use
+            # a compact RHS, and may evaluate operations on unselected values.
+            if isinstance(node.value, ast.Subscript) and self._expr_kind(node.value.slice) == "logical":
+                rr = self._rank_expr(node.value.value)
+                if rr == 2 and self._rank_expr(node.value.slice) == 2:
+                    rhs = f"pack(transpose({self.expr(node.value.value)}), transpose({self.expr(node.value.slice)}))"
+            elif any(isinstance(part, ast.Subscript)
+                     and self._expr_kind(part.slice) == "logical"
+                     and self._rank_expr(part.value) > 1 for part in ast.walk(node.value)):
+                raise NotImplementedError("matrix masked augmented assignment with a compound masked RHS is not supported; use an explicit loop")
+            rhs_rank = self._rank_expr(node.value)
+            if rhs_rank > 1:
+                raise NotImplementedError("masked augmented assignment requires a scalar or vector RHS")
+            decl = {"int": "integer", "real": "real(kind=dp)",
+                    "complex": "complex(kind=dp)", "logical": "logical"}
+            self.o.w("block")
+            self.o.push()
+            dims = ",".join(":" for _ in range(rank))
+            self.o.w(f"logical, allocatable :: xp2f_update_mask({dims})")
+            self.o.w(f"{decl[bk]}, allocatable :: xp2f_update_values(:)")
+            self.o.w(f"{decl[rk]}" + (", allocatable :: xp2f_update_rhs(:)" if rhs_rank else " :: xp2f_update_rhs"))
+            self.o.w(f"xp2f_update_mask = {mask}")
+            field = f"transpose({base})" if rank == 2 else base
+            selected = "transpose(xp2f_update_mask)" if rank == 2 else "xp2f_update_mask"
+            self.o.w(f"xp2f_update_values = pack({field}, {selected})")
+            self.o.w(f"xp2f_update_rhs = {rhs}")
+            rhs = "xp2f_update_rhs"
+            if rhs_rank:
+                self.o.w("if (size(xp2f_update_rhs) == 1) then")
+                self.o.push()
+                self.o.w("xp2f_update_rhs = spread(xp2f_update_rhs(1), 1, size(xp2f_update_values))")
+                self.o.pop()
+                self.o.w("end if")
+                self.o.w('if (size(xp2f_update_rhs) /= size(xp2f_update_values)) error stop "masked update RHS size mismatch"')
+            lhs = "xp2f_update_values"
+            if rk == "logical" and bk != "logical":
+                rhs = f"merge(1, 0, {rhs})"
+            if bk == "logical":
+                op = ".or." if isinstance(node.op, (ast.Add, ast.BitOr)) else ".and." if isinstance(node.op, (ast.Mult, ast.BitAnd)) else ".neqv."
+                upd = f"{lhs} {op} {rhs}"
+            elif isinstance(node.op, ast.Add):
+                upd = f"{lhs} + {rhs}"
             elif isinstance(node.op, ast.Sub):
-                upd = f"{base} - {rhs}"
+                upd = f"{lhs} - {rhs}"
             elif isinstance(node.op, ast.Mult):
-                upd = f"{base} * {rhs}"
+                upd = f"{lhs} * {rhs}"
             elif isinstance(node.op, ast.Div):
-                upd = f"{base} / {rhs}"
+                upd = f"{lhs} / {rhs}"
             elif isinstance(node.op, ast.FloorDiv):
                 bk = self._expr_kind(node.target.value)
                 rk = self._expr_kind(node.value)
                 if bk == "real" or rk == "real":
-                    lhs_e = base if bk == "real" else f"real({base}, kind=dp)"
+                    lhs_e = lhs if bk == "real" else f"real({lhs}, kind=dp)"
                     rhs_e = rhs if rk == "real" else f"real({rhs}, kind=dp)"
                     upd = f"floor_div_real({lhs_e}, {rhs_e})"
                 else:
-                    upd = f"floor_div_int({base}, {rhs})"
+                    upd = f"floor_div_int({lhs}, {rhs})"
             elif isinstance(node.op, ast.Mod):
                 bk = self._expr_kind(node.target.value)
                 rk = self._expr_kind(node.value)
                 if bk == "real" and rk in {"int", "logical"}:
                     rhs = f"real({rhs}, kind=dp)"
-                upd = f"mod({base}, {rhs})"
+                upd = f"modulo({lhs}, {rhs})"
             else:
                 raise NotImplementedError("unsupported augassign op")
-            self.o.w(f"where (({mask}))")
-            self.o.push()
-            self.o.w(f"{base} = {upd}")
+            self.o.w(f"xp2f_update_values = {upd}")
+            result = f"unpack(xp2f_update_values, {selected}, {field})"
+            if rank == 2:
+                result = f"transpose({result})"
+            self.o.w(f"{base} = {result}")
             self.o.pop()
-            self.o.w("end where")
+            self.o.w("end block")
             return
         # df *= 10 / df += df2 / etc. -- a DataFrame-typed target. Route
         # through a synthesized BinOp and expr()'s own DataFrame-arithmetic

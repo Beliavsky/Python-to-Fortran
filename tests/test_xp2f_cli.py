@@ -5334,7 +5334,7 @@ def test_xp2f_lowers_bitwise_invert_on_logical_arrays(tmp_path: Path) -> None:
     assert "mask = .not. ieee_is_nan(x)" in out_text
 
 
-def test_xp2f_lowers_masked_augassign_with_where(tmp_path: Path) -> None:
+def test_xp2f_lowers_masked_augassign_with_snapshot(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xmasked_augassign_small.py"
     src.write_text(
@@ -5364,10 +5364,12 @@ def test_xp2f_lowers_masked_augassign_with_where(tmp_path: Path) -> None:
     out_f90 = tmp_path / "xmasked_augassign_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    # xp2f's paren-simplification passes now fully strip the redundant
-    # triple wrap around the where-mask condition.
-    assert "where (.not. ieee_is_nan(x))" in out_text
-    assert "y = y + 1" in out_text
+    assert "xp2f_update_mask = .not. ieee_is_nan(x)" in out_text
+    assert "y = unpack(xp2f_update_values, xp2f_update_mask, y)" in out_text
+    run = subprocess.run([str(out_f90.with_suffix(".exe"))], cwd=tmp_path,
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert run.stdout.split() == ["1", "0", "1"]
 
 
 def test_xp2f_rng_replay_matches_python_for_normal_simulation(tmp_path: Path) -> None:
@@ -22588,6 +22590,80 @@ _BUG_MINING_20260927_CASES = {
         "    main()",
     ],
 }
+
+
+@pytest.mark.parametrize("dtype", ["int", "float", "complex", "bool"])
+def test_xp2f_masked_augassign_matrix(tmp_path: Path, dtype: str) -> None:
+    ops = ["+=", "*=", "&=", "|=", "^="] if dtype == "bool" else ["+=", "-=", "*="]
+    ops += ["//=", "%="] if dtype == "int" else ["/="] if dtype in {"float", "complex"} else []
+    lines = ["import numpy as np"]
+    for mask in ("[[True, False, True], [False, True, False]]",
+                 "[[True, True, True], [True, True, True]]",
+                 "[[False, False, False], [False, False, False]]"):
+        for op in ops:
+            for rhs in ("b[mask]", "True" if dtype == "bool" else "2", "a[mask]"):
+                values = "[[True, True, False], [False, True, False]]" if dtype == "bool" else "[[-7, 2, 5], [4, -3, 6]]"
+                if dtype == "complex":
+                    values = "[[-7+1j, 2-2j, 5+3j], [4-1j, -3+2j, 6+4j]]"
+                divisors = "[[2, 1, -2], [1, 3, 1]]" if op in {"/=", "//=", "%="} else "[[2, 0, -2], [0, 3, 0]]"
+                lines += [
+                    f"a = np.array({values}, dtype={dtype})",
+                    f"b = np.array({divisors}, dtype={dtype})",
+                    f"mask = np.array({mask})",
+                    f"a[mask] {op} {rhs}",
+                    "for i in range(2):",
+                    "    for j in range(3):",
+                    "        print(a[i, j])",
+                ]
+    _run_xp2f_compile_diff(tmp_path, "xmasked_updates.py", lines)
+
+
+def test_xp2f_masked_augassign_packed_order_and_alias(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xmasked_order.py", [
+        "import numpy as np",
+        "a = np.array([[1, 2, 3], [4, 5, 6]])",
+        "mask = a > 2",
+        "a[mask] += np.array([10, 20, 30, 40])",
+        "a[mask] *= np.array([2])",
+        "for i in range(2):",
+        "    for j in range(3):",
+        "        print(a[i, j])",
+        "b = np.array([[True, False, True], [False, True, False]])",
+        "b[b] ^= True",
+        "for i in range(2):",
+        "    for j in range(3):",
+        "        print(b[i, j])",
+        "v = np.array([-7, 2, 5])",
+        "m = v != 2",
+        "v[m] += v[m]",
+        "for i in range(3):",
+        "    print(v[i])",
+    ])
+
+
+@pytest.mark.parametrize("op", ["-=", "/=", "//=", "%="])
+def test_xp2f_rejects_boolean_masked_arithmetic(tmp_path: Path, op: str) -> None:
+    src = tmp_path / "xbool_masked_invalid.py"
+    src.write_text("import numpy as np\na = np.array([True, False])\nm = np.array([True, True])\n"
+                   f"a[m] {op} True\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "unsupported Boolean masked augmented assignment" in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("statement, message", [
+    ("a[m] /= 2", "cannot cast the arithmetic result back to an integer array"),
+    ("a[m] += 0.5", "cannot cast the arithmetic result back to an integer array"),
+])
+def test_xp2f_rejects_masked_integer_cast(tmp_path: Path, statement: str, message: str) -> None:
+    src = tmp_path / "xint_masked_invalid.py"
+    src.write_text("import numpy as np\na = np.array([1, 2])\nm = np.array([True, True])\n"
+                   + statement + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert message in proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize("case", sorted(_BUG_MINING_20260927_CASES))
