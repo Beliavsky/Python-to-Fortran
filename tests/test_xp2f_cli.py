@@ -6229,6 +6229,38 @@ def test_inline_local_imports_rejects_dynamic_function_binding(tmp_path: Path) -
         xp2f.inline_local_from_imports(tree, tmp_path / "main.py")
 
 
+@pytest.mark.parametrize("spelling", ["np.all", "np.any", "all", "any"])
+def test_xp2f_discards_standalone_numpy_reduction_with_warning(tmp_path: Path, spelling: str) -> None:
+    src = tmp_path / "xunused_reduction.py"
+    src.write_text("import numpy as np\nfrom numpy import all, any\n"
+                   "def values():\n    print('evaluated')\n    return np.array([1, 0, 3])\n"
+                   f"{spelling}(values() == [1, 2, 3])\nprint('done')\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    assert "Warning: unused expression result:" in proc.stderr
+    assert "Use print(...) if output was intended." in proc.stderr
+    executable = tmp_path / "xunused_reduction_p.exe"
+    run = subprocess.run([str(executable)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert run.stdout.split() == ["evaluated", "done"]
+
+
+def test_xp2f_discards_axis_reductions_in_function(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xunused_axis.py", [
+        "import numpy as np",
+        "def test():",
+        "    a = np.array([[True, False, True], [False, True, True]])",
+        "    np.all(a, axis=0)",
+        "    np.any(a, axis=1, keepdims=True)",
+        "    xp2f_discarded_result = np.array([True, False])",
+        "    np.any(xp2f_discarded_result)",
+        "    print('done')",
+        "test()",
+    ])
+
+
 def test_xp2f_inlined_sibling_function_using_math_module(tmp_path: Path) -> None:
     # Regression test: a sibling module's own `import math` statement was
     # silently dropped when inline_local_from_imports copied a FunctionDef

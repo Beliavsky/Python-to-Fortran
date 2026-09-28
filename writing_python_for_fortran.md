@@ -156,6 +156,13 @@ When only the kernel needs compilation, consider the supported function-extracti
 
 ## Validate behavior, not just compilation
 
+Make intended output explicit. A bare expression such as `np.all(values > 0)`
+displays a result in a Python REPL, but discards it in a script. Use
+`print(np.all(values > 0))` to display it, or assign it to a variable for later
+use. For supported standalone `np.all` and `np.any` calls, the transpiler
+evaluates and discards the result and warns about its non-use; it does not
+insert printing into the generated program.
+
 Start with a small deterministic driver that exercises the actual calculation and prints meaningful results. From the project directory, compare its Python and Fortran output with:
 
 ```console

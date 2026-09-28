@@ -56198,6 +56198,44 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("only call expressions supported")
         c = node.value
 
+        if self._numpy_call_attr(c.func) in {"all", "any"}:
+            # A script discards a bare reduction's result; only a REPL would
+            # display it. Keep evaluation (including argument side effects).
+            if len(c.args) != 1 or any(kw.arg not in {"axis", "keepdims"} for kw in c.keywords):
+                raise NotImplementedError("standalone NumPy all/any supports one input and axis/keepdims keywords only")
+            for kw in c.keywords:
+                if kw.arg == "axis" and not (is_const_int(kw.value)
+                        and 0 <= int(kw.value.value) < self._rank_expr(c.args[0])):
+                    raise NotImplementedError("standalone NumPy all/any requires a nonnegative constant axis")
+                if kw.arg == "keepdims" and not (isinstance(kw.value, ast.Constant)
+                                                  and isinstance(kw.value.value, bool)):
+                    raise NotImplementedError("standalone NumPy all/any requires a constant Boolean keepdims")
+            if (any(kw.arg == "keepdims" and kw.value.value is True for kw in c.keywords)
+                    and not any(kw.arg == "axis" for kw in c.keywords)):
+                raise NotImplementedError("standalone NumPy all/any with keepdims=True requires an explicit axis")
+            rhs = self.expr(c)
+            rank = self._rank_expr(c)
+            temporary = "xp2f_discarded_result"
+            identifiers = set(re.findall(r"\b\w+\b", rhs.lower()))
+            while temporary in identifiers:
+                temporary += "_"
+            self.o.w("block")
+            self.o.push()
+            suffix = ", allocatable" if rank else ""
+            shape = "(" + ",".join(":" for _ in range(rank)) + ")" if rank else ""
+            self.o.w(f"logical{suffix} :: {temporary}{shape}")
+            self.o.w(f"{temporary} = {rhs}")
+            self.o.pop()
+            self.o.w("end block")
+            call_txt = ast.unparse(c)
+            line = getattr(node, "lineno", getattr(c, "lineno", "?"))
+            warnings_seen = self.__dict__.setdefault("_unused_result_warnings", set())
+            if (line, call_txt) not in warnings_seen:
+                warnings_seen.add((line, call_txt))
+                print(f"line {line}: Warning: unused expression result: {call_txt}; "
+                      "evaluated and discarded. Use print(...) if output was intended.", file=sys.stderr)
+            return
+
         if (
             isinstance(c.func, ast.Attribute)
             and isinstance(c.func.value, ast.Name)
