@@ -84,34 +84,34 @@ Partial, via hand-written Fortran bridges to real numerical codes rather than tr
 Emit Fortran:
 
 ```console
-python xp2f.py path\to\program.py
+python xp2f.py path/to/program.py
 ```
 
 Emit and compile:
 
 ```console
-python xp2f.py path\to\program.py --compile
+python xp2f.py path/to/program.py --compile
 ```
 
 Run Python and translated Fortran and compare normalized output:
 
 ```console
-python xp2f.py path\to\program.py --run-diff
+python xp2f.py path/to/program.py --run-diff
 ```
 
 Also declare a procedure `elemental` (and vectorize a per-element loop that calls it) where provably safe:
 
 ```console
-python xp2f.py path\to\program.py --elemental
+python xp2f.py path/to/program.py --elemental
 ```
 
 A handful of further opt-in flags close specific performance and correctness gaps identified by comparing translations against [Pyccel](PYCCEL_COMPARISON.md) on the same source programs; each is a self-contained post-pass over the generated Fortran and defaults off, so ordinary output is unaffected:
 
 ```console
-python xp2f.py path\to\program.py --optimize-loops   # swap a column-major-unfriendly nested loop's own order, where provably safe
-python xp2f.py path\to\program.py --value-args        # declare read-only scalar dummy arguments VALUE instead of intent(in)
-python xp2f.py path\to\program.py --int-kind int64     # declare integers with an explicit kind (int32 or int64) instead of the compiler default
-python xp2f.py path\to\program.py --perf-hints          # print (never modify) a diagnostic for strided array-access patterns neither flag above can safely fix
+python xp2f.py path/to/program.py --optimize-loops   # swap a column-major-unfriendly nested loop's own order, where provably safe
+python xp2f.py path/to/program.py --value-args        # declare read-only scalar dummy arguments VALUE instead of intent(in)
+python xp2f.py path/to/program.py --int-kind int64     # declare integers with an explicit kind (int32 or int64) instead of the compiler default
+python xp2f.py path/to/program.py --perf-hints          # print (never modify) a diagnostic for strided array-access patterns neither flag above can safely fix
 ```
 
 Run a batch file list:
@@ -137,7 +137,7 @@ python xsummarize_xp2f_progress.py
 The file [examples/xprime.py](examples/xprime.py) counts primes up to one million. Running:
 
 ```console
-python xp2f.py examples\xprime.py --time-both
+python xp2f.py examples/xprime.py --time-both
 ```
 
 emits, compiles, and runs the translated Fortran program. The generated Fortran output is shown in [examples/xprime_p.f90](examples/xprime_p.f90).
