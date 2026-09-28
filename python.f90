@@ -178,6 +178,7 @@ public :: sys_argv_delete !@pyapi kind=subroutine args=argv:character(:):intent(
 public :: index1
 public :: index2
 public :: slice1
+public :: py_slice_bound
 
 public :: rank_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='min') for a plain 1D real vector"
 public :: rank_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='max') for a plain 1D real vector"
@@ -1174,6 +1175,19 @@ contains
          character(len=len(x(i, j))) :: v
          v = x(i, j)
       end function index2_char
+
+      pure elemental integer function py_slice_bound(index, n, reverse) result(bound)
+         ! Normalize an explicit Python slice index, still zero-based.
+         integer, intent(in) :: index, n
+         logical, intent(in) :: reverse
+         bound = index
+         if (bound < 0) bound = n + bound
+         if (reverse) then
+            bound = max(-1, min(n - 1, bound))
+         else
+            bound = max(0, min(n, bound))
+         end if
+      end function py_slice_bound
 
       pure function slice1_real(x, lo, hi, step) result(y)
          real(kind=dp), intent(in) :: x(:)

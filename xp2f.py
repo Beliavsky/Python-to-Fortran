@@ -14476,6 +14476,16 @@ def detect_needed_helpers(tree):
                     needed.add("slice1")
             self.generic_visit(node)
 
+        def visit_Slice(self, node):
+            for bound in (node.lower, node.upper):
+                if bound is not None and not (
+                    isinstance(bound, ast.Constant)
+                    or (isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub)
+                        and isinstance(bound.operand, ast.Constant))
+                ):
+                    needed.add("py_slice_bound")
+            self.generic_visit(node)
+
         def visit_Assign(self, node):
             if (
                 isinstance(node.value, ast.Call)
@@ -28312,41 +28322,25 @@ class translator(ast.NodeVisitor):
             if step_val == 0:
                 raise NotImplementedError("slice step cannot be zero")
 
-        def _lower_expr_fortran():
-            if slc.lower is None:
-                return extent_expr if step_val < 0 else "1"
-            lconst = _int_const(slc.lower)
-            if lconst is not None:
-                if lconst >= 0:
-                    return str(lconst + 1)
-                return f"({extent_expr} - {abs(lconst) - 1})"
-            return f"({self.expr(slc.lower)} + 1)"
+        def normalized(bound):
+            value = _int_const(bound)
+            if value is None:
+                # A helper evaluates a possibly side-effecting bound exactly
+                # once; inline MERGE would repeat it in the sign test.
+                reverse = ".true." if step_val < 0 else ".false."
+                return f"py_slice_bound({self.expr(bound)}, {extent_expr}, {reverse})"
+            # Keep the existing compact literal-bound expressions. Runtime
+            # bounds require sign normalization and clipping in the helper.
+            return str(value) if value >= 0 else f"({extent_expr} - {abs(value)})"
 
-        def _upper_expr_fortran():
-            if slc.upper is None:
-                return "1" if step_val < 0 else extent_expr
-            uconst = _int_const(slc.upper)
-            if step_val > 0:
-                if uconst is not None:
-                    if uconst >= 0:
-                        return str(uconst)
-                    return f"({extent_expr} - {abs(uconst)})"
-                if isinstance(slc.upper, ast.UnaryOp) and isinstance(slc.upper.op, ast.USub):
-                    # Python slice upper like ":-k" maps to n-k in Fortran.
-                    # Keep it symbolic to avoid evaluating non-constants here.
-                    return f"({extent_expr} - ({self.expr(slc.upper.operand)}))"
-                return self.expr(slc.upper)
-            # For negative-step slices, Python upper bound is exclusive and maps to +1 in Fortran.
-            if step_val < 0:
-                if uconst is not None:
-                    if uconst >= 0:
-                        return str(uconst + 1)
-                    return f"({extent_expr} - {abs(uconst) - 1})"
-                return f"({self.expr(slc.upper)} + 1)"
-            return self.expr(slc.upper)
-
-        lb = _lower_expr_fortran()
-        ub = _upper_expr_fortran()
+        lb = (extent_expr if step_val < 0 else "1") if slc.lower is None else f"({normalized(slc.lower)} + 1)"
+        # Python stop is exclusive. A reverse section ends at stop+1 in
+        # zero-based indices, hence stop+2 in Fortran (not stop+1).
+        if slc.upper is None:
+            ub = "1" if step_val < 0 else extent_expr
+        else:
+            stop = normalized(slc.upper)
+            ub = f"({stop} + 2)" if step_val < 0 else stop
         return lb, ub, step_val
 
     def _slice_triplet(self, slc, extent_expr):
@@ -41951,8 +41945,13 @@ class translator(ast.NodeVisitor):
             out = set()
             if enode is None:
                 return out
+            # The callee in a bound such as a[get_bound():] is a procedure,
+            # not an integer index variable. Marking it integer corrupts
+            # its generated name and the caller's USE list.
+            callees = {id(part) for call in ast.walk(enode) if isinstance(call, ast.Call)
+                       for part in ast.walk(call.func)}
             for _n in ast.walk(enode):
-                if isinstance(_n, ast.Name):
+                if isinstance(_n, ast.Name) and id(_n) not in callees:
                     out.add(_n.id)
             return out
 

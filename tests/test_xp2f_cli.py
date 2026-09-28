@@ -5155,6 +5155,77 @@ def test_xp2f_proc_module_wrapper_calls_local_main(tmp_path: Path) -> None:
     assert "hello" in run_proc.stdout
 
 
+@pytest.mark.parametrize("step", [1, 2, -1, -2])
+def test_xp2f_runtime_signed_slice_bounds(tmp_path: Path, step: int) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xsigned_slices.py", [
+        "import numpy as np",
+        "def show(a, n, start, stop):",
+        "    print(a[-n:])",
+        "    print(a[:-n])",
+        f"    print(a[start:stop:{step}])",
+        f"    print(a[start::{step}])",
+        f"    print(a[:stop:{step}])",
+        "a = np.array([1, 2, 3, 4, 5])",
+        "for n in [-9, -3, 0, 1, 3, 9]:",
+        "    for start in [-9, -3, 0, 2, 9]:",
+        "        for stop in [-9, -1, 0, 3, 9]:",
+        "            show(a, n, start, stop)",
+        "empty = np.array([], dtype=int)",
+        "show(empty, 3, -2, 4)",
+        "show(empty, 0, 2, -4)",
+    ])
+
+
+def test_xp2f_negative_variable_slices_matrices_and_assignment(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xmatrix_negative_slices.py", [
+        "import numpy as np",
+        "def show(a, n):",
+        "    print(a[-n:, :])",
+        "    print(a[:, -n:])",
+        "    print(a[-n:, -n:])",
+        "    b = a.copy()",
+        "    b[-n:, :] = -1",
+        "    b[:, -n:] = -2",
+        "    print(b)",
+        "a = np.arange(12).reshape(3, 4)",
+        "for n in [-6, -1, 0, 1, 2, 6]:",
+        "    show(a, n)",
+    ])
+
+
+def test_xp2f_explicit_reverse_slice_stops(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xreverse_slice_stops.py", [
+        "import numpy as np",
+        "a = np.array([1, 2, 3, 4, 5])",
+        "n = 3",
+        "b = a[-n:]",
+        "print(b)",
+        "print(a[4:0:-1])",
+        "print(a[-1:-4:-1])",
+        "print(a[::-1])",
+        "print(a[:-1:-1])",
+        "print(np.arange(6)[-n:])",
+    ])
+
+
+def test_xp2f_slice_bound_call_evaluated_once(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xslice_bound_call.py", [
+        "import numpy as np",
+        "def bound():",
+        "    print('bound called')",
+        "    return -3",
+        "a = np.array([1, 2, 3, 4, 5])",
+        "b = a[bound():]",
+        "print(b)",
+        "b = a[:bound()]",
+        "print(b)",
+        "b = a[bound()::-1]",
+        "print(b)",
+        "b = a[:bound():-1]",
+        "print(b)",
+    ])
+
+
 def test_xp2f_uses_first_axis_extent_for_2d_slices(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xslice_2d_first_axis_small.py"
