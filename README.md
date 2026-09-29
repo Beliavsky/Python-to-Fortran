@@ -135,6 +135,8 @@ Arguments need known element types and ranks, from annotations (for example,
 `x: float` or `x: 'float[:]'`), typed calls within the module, or supported
 unambiguous body constraints such as an integer `range` bound. Ambiguous
 interfaces are rejected rather than silently defaulted to real scalars.
+`--require-annotations` lists the parameters that still lack annotations (see
+[Type Annotations](#type-annotations)).
 Explicit fallback options are available, with warnings:
 
 ```console
@@ -218,6 +220,25 @@ Timing summary (seconds):
 ```
 
 In this example, the generated Fortran executable ran about 9.6 times faster than the original Python script. Timings are machine, compiler, and workload dependent.
+
+## Type Annotations
+
+Annotations are optional: `xp2f.py` infers types and ranks from how functions are called and used. When present, it accepts Python scalar annotations (`x: int`, `x: float`, `x: bool`, `x: complex`, `s: str`) and pyccel's array syntax as strings (`v: 'float[:]'`, `m: 'int[:,:]'`), plus user class names.
+
+Python itself ignores annotations at run time, so `xp2f.py` treats them as contracts to check rather than conversions to apply:
+
+- A call whose argument contradicts a parameter annotation is a translation error, for example `f(2.5)` for `def f(x: int)`, or a scalar passed to `v: 'float[:]'`. Previously such a call could be translated with a silent conversion (printing `4` where Python prints `5.0`) or rejected by the Fortran compiler. Numeric widening consistent with PEP 484 is allowed: an `int` for a `float` or `complex` parameter, a `bool` for an `int`.
+- A return annotation that the function body contradicts produces a warning; the translation follows the value the body actually returns, as Python does.
+
+The check uses only reliable evidence (a known kind, and a rank from a typed variable or a literal), so an unreported call is not proof that its annotation is correct.
+
+Some workflows need annotations. `--module` libraries have no call sites to infer argument types from, and pyccel requires annotations on every function. To list what is missing without translating anything:
+
+```console
+python xp2f.py path/to/library.py --require-annotations
+```
+
+This reports parameters without annotations, annotations `xp2f.py` does not recognize, and value-returning functions without a return annotation, and exits nonzero if it finds any. Methods' `self` and `cls` are exempt. `xannotate_for_pyccel.py` can add annotations inferred from call sites; review them, since the contract check has found cases where its guesses are wrong (for example a scalar `float` for an array built with `np.random.random(n)`).
 
 ## Optional Type and Rank Hints in Comments
 

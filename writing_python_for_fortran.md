@@ -104,7 +104,7 @@ Both branches return a vector and a Boolean when `values` is a vector. Callers m
 
 A function accepting vectors on some calls and matrices on others can be perfectly good Python. `xp2f.py` specializes supported local functions for different argument ranks; `--report-specializations` enables informational notes about those specializations. Separate vector and matrix entry points can simplify a complicated interface, but are not universally necessary. Arbitrary runtime type or rank dispatch is not implied by specialization support.
 
-Accurate annotations and the supported [declaration-style comments](README.md#optional-type-and-rank-hints-in-comments) can clarify intent. They are not substitutes for consistent code, nor does an annotation perform a runtime conversion in Python.
+Accurate annotations and the supported [declaration-style comments](README.md#optional-type-and-rank-hints-in-comments) can clarify intent. They are not substitutes for consistent code, nor does an annotation perform a runtime conversion in Python. For that reason `xp2f.py` checks [annotations](README.md#type-annotations) against the calls instead of converting arguments to match them: `f(2.5)` for `def f(x: int)` is reported rather than translated as `f(2)`.
 
 ## Use distinct targets for nested loops
 

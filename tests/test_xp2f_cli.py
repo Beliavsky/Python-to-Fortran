@@ -23564,3 +23564,152 @@ def test_xp2f_undefined_name_is_reported_not_translated(tmp_path: Path, lines: l
     out = proc.stdout + proc.stderr
     assert f"undefined name '{name}' in function '{function}'" in out, out
     assert not (tmp_path / "xundefined_name_p.f90").exists()
+
+
+# Annotations as checked contracts, and the --require-annotations lint.
+@pytest.mark.parametrize(
+    "lines, expected",
+    [
+        # A float passed to `x: int` used to be silently truncated (printing
+        # 4 where Python prints 5.0).
+        (
+            ["def f(x: int):", "    return x * 2", "", "", "print(f(2.5))"],
+            "argument 1 ('x') of 'f' is annotated 'int' but this call passes a float value",
+        ),
+        # A scalar passed to an array annotation used to reach gfortran as a
+        # rank mismatch.
+        (
+            ["def g(v: 'float[:]'):", "    return v[0] + 1.0", "", "", "print(g(3.0))"],
+            "argument 1 ('v') of 'g' is annotated 'float[:]' but this call passes a scalar",
+        ),
+        (
+            [
+                "import numpy as np",
+                "",
+                "",
+                "def k(m: 'int[:,:]'):",
+                "    return m[0, 0]",
+                "",
+                "",
+                "print(k(np.array([1.5, 2.0])))",
+            ],
+            "argument 1 ('m') of 'k' is annotated 'int[:,:]' but this call passes a float array",
+        ),
+    ],
+)
+def test_xp2f_annotation_contract_violation_is_reported(tmp_path: Path, lines: list, expected: str) -> None:
+    src = tmp_path / "xannotation_contract.py"
+    src.write_text("\n".join(lines + [""]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert expected in out, out
+    assert not (tmp_path / "xannotation_contract_p.f90").exists()
+
+
+def test_xp2f_annotation_contract_allows_compatible_calls(tmp_path: Path) -> None:
+    # int -> float and bool -> int follow the PEP 484 numeric tower, a
+    # matching array rank is fine, and a variable later rebound to another
+    # type (so its final declaration is not the binding at the call) must
+    # not be reported (Burkardt r8col.py-style `b = 5.0; ...; b = <matrix>`).
+    _run_xp2f_compile_diff(tmp_path, "xannotation_compatible.py", [
+        "import numpy as np",
+        "",
+        "",
+        "def half(x: float) -> float:",
+        "    return x / 2.0",
+        "",
+        "",
+        "def twice(n: int) -> int:",
+        "    return 2 * n",
+        "",
+        "",
+        "def first(v: 'float[:]') -> float:",
+        "    return v[0]",
+        "",
+        "",
+        "def fill(m: int, n: int, a: float, b: float) -> 'float[:,:]':",
+        "    r = np.zeros((m, n))",
+        "    for i in range(m):",
+        "        for j in range(n):",
+        "            r[i, j] = a + (b - a) * (i + j)",
+        "    return r",
+        "",
+        "",
+        "def main():",
+        "    print(half(3), twice(True), first(np.array([1.5, 2.5])))",
+        "    a = -5.0",
+        "    b = 5.0",
+        "    c = fill(2, 3, a, b)",
+        "    b = c * 2.0",
+        "    print(c[1, 2], b[0, 1])",
+        "",
+        "",
+        "main()",
+    ])
+
+
+def test_xp2f_return_annotation_mismatch_warns(tmp_path: Path) -> None:
+    src = tmp_path / "xreturn_annotation.py"
+    src.write_text(
+        "import numpy as np\n\n\n"
+        "def h(x: float) -> int:\n    return x * 2.5\n\n\n"
+        "def ok(n: int) -> float:\n    return n + 1\n\n\n"
+        "def vec(n: int) -> float:\n    return np.zeros(n)\n\n\n"
+        "print(h(2.0), ok(1), vec(2)[0])\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "'h' is annotated '-> int' but returns a float scalar" in proc.stderr
+    assert "'vec' is annotated '-> float' but returns a rank-1 float array" in proc.stderr
+    assert "'ok'" not in proc.stderr
+
+
+def test_xp2f_require_annotations_lint(tmp_path: Path) -> None:
+    bad = tmp_path / "xlint_bad.py"
+    bad.write_text(
+        "import numpy as np\n\n\n"
+        "class Point:\n"
+        "    def __init__(self, x: float, y):\n"
+        "        self.x = x\n"
+        "        self.y = y\n\n"
+        "    def norm(self) -> float:\n"
+        "        return (self.x ** 2 + self.y ** 2) ** 0.5\n\n\n"
+        "def mystery(a, b: np.ndarray):\n    return a\n\n\n"
+        "def dist(p: Point, q: 'Point') -> float:\n    return abs(p.x - q.x)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(bad), "--require-annotations"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    out = proc.stdout
+    assert proc.returncode == 1, out + proc.stderr
+    assert "parameter 'y' of '__init__' has no annotation" in out
+    assert "parameter 'a' of 'mystery' has no annotation" in out
+    assert "parameter 'b' of 'mystery' has an unrecognized annotation 'np.ndarray'" in out
+    assert "'mystery' returns a value but has no return annotation" in out
+    assert "self" not in out and "'dist'" not in out and "'norm'" not in out
+    assert "Annotations: 4 issue(s)" in out
+    assert not (tmp_path / "xlint_bad_p.f90").exists()
+
+    good = tmp_path / "xlint_good.py"
+    good.write_text(
+        "def f(x: int, y: 'float[:]') -> float:\n    return x + y[0]\n\n\n"
+        "def show(title: str):\n    print(title)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(good), "--require-annotations"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "fully annotated" in proc.stdout
+    assert not (tmp_path / "xlint_good_p.f90").exists()

@@ -42867,6 +42867,75 @@ class translator(ast.NodeVisitor):
 
         raise NotImplementedError(f"unsupported expr: {type(node).__name__}")
 
+    # A value of kind `have` may be passed to a parameter annotated with
+    # kind `want` without changing Python's result (PEP 484 numeric tower).
+    _ANNOTATION_COMPATIBLE_KINDS = {
+        ("int", "real"), ("int", "complex"), ("real", "complex"),
+        ("logical", "int"), ("logical", "real"),
+    }
+
+    def _check_annotation_contracts(self, nodes):
+        """Report calls whose argument contradicts the callee's parameter
+        annotation (e.g. `f(2.5)` for `def f(x: int)`, or a scalar for
+        `v: 'float[:]'`). Python ignores annotations, so translating such a
+        call would either convert the value (silently changing results) or
+        fail in the Fortran compiler. Only solid evidence is used: a known
+        kind, and a rank from a typed variable or a literal."""
+        def _walk_same_scope(stmt):
+            # Calls inside nested definitions belong to another scope, whose
+            # variable types this translator does not know.
+            stack = [stmt]
+            while stack:
+                x = stack.pop()
+                if x is not stmt and isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    continue
+                if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                yield x
+                stack.extend(ast.iter_child_nodes(x))
+
+        for stmt in nodes:
+            for node in _walk_same_scope(stmt):
+                contract = getattr(node, "_xp2f_annotation_contract", None)
+                if contract is None:
+                    continue
+                callee, idx, param, want_kind, want_rank, ann_text = contract
+                have_kind = self._expr_kind(node)
+                have_rank = None
+                if isinstance(node, ast.Name):
+                    if node.id in self.type_rebind_targets:
+                        # Rebound to another type/rank in this scope: the
+                        # final declaration need not be the binding in force
+                        # at this call (Burkardt r8col.py: `b = 5.0`, passed
+                        # on, later `b = <matrix>`). No reliable evidence.
+                        continue
+                    vk, vr = self._visible_kind_rank(node.id)
+                    if vk is not None:
+                        have_kind = vk
+                        have_rank = None if vr is None else int(vr)
+                elif isinstance(node, ast.Constant) and not isinstance(node.value, str):
+                    have_rank = 0
+                elif isinstance(node, (ast.List, ast.Tuple)):
+                    have_rank = int(self._rank_expr(node))
+                what = None
+                if have_rank is not None and have_rank != int(want_rank):
+                    what = "a scalar" if have_rank == 0 else f"a rank-{have_rank} array"
+                elif (
+                    have_kind in {"int", "real", "logical", "complex", "char"}
+                    and have_kind != want_kind
+                    and (have_kind, want_kind) not in self._ANNOTATION_COMPATIBLE_KINDS
+                ):
+                    kind_word = {"real": "float", "logical": "bool", "char": "str"}.get(have_kind, have_kind)
+                    _shown_rank = have_rank if have_rank is not None else int(self._rank_expr(node) or 0)
+                    what = f"a {kind_word} value" if _shown_rank == 0 else f"a {kind_word} array"
+                if what is None:
+                    continue
+                raise NotImplementedError(
+                    f"argument {idx + 1} ('{param}') of '{callee}' is annotated '{ann_text}' "
+                    f"but this call passes {what}; Python ignores annotations, so a translation "
+                    "would change or reject this call -- fix the annotation or the argument"
+                )
+
     def _prescan_nested_body(self, body):
         """prescan() of a compound statement's own body/orelse -- see the
         subtree-walk skip in prescan()."""
@@ -62385,6 +62454,7 @@ def _emit_local_function(
 
     tr.python_set_vars.update(getattr(fn, "_xp2f_set_args", set()))
     tr.prescan(fn.body)
+    tr._check_annotation_contracts(fn.body)
     _check_conditional_element_return(fn, tr)
     if fn.name in (local_df_return_info or {}):
         # tr.prescan above is scoped to just this function's own body, so
@@ -68823,6 +68893,85 @@ def _parse_base_type_and_rank(tok):
     return (base, rank, forced_in)
 
 
+def annotation_type_spec(ann):
+    """(kind, rank, text) for a scalar/array type annotation node such as
+    `x: int` or `v: 'float[:]'` (pyccel syntax), else None."""
+    if ann is None or not hasattr(ast, "unparse"):
+        return None
+    text = ast.unparse(ann).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        text = text[1:-1].strip()
+    parsed = _parse_base_type_and_rank(text)
+    if parsed is None:
+        return None
+    return parsed[0], parsed[1], text
+
+
+def annotation_lint_diagnostics(src_text, src_label):
+    """--require-annotations: (line, col, message) for every function
+    parameter without an annotation, every annotation xp2f does not
+    recognize, and every value-returning function without a return
+    annotation. Methods' `self`/`cls` are exempt. Nothing is translated."""
+    tree = ast.parse(src_text)
+    class_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+
+    def _recognized(ann):
+        if annotation_type_spec(ann) is not None:
+            return True
+        text = ast.unparse(ann).strip() if hasattr(ast, "unparse") else ""
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+            text = text[1:-1].strip()
+        if text in class_names or text == "None":
+            return True
+        return _parse_pyccel_proc_annotation(text) is not None
+
+    def _returns_value(fn):
+        stack = list(fn.body)
+        while stack:
+            x = stack.pop()
+            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(x, ast.Return) and x.value is not None and not is_none(x.value):
+                return True
+            stack.extend(ast.iter_child_nodes(x))
+        return False
+
+    diags = []
+
+    def _visit(body, in_class):
+        for n in body:
+            if isinstance(n, ast.ClassDef):
+                _visit(n.body, True)
+                continue
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            a = n.args
+            params = list(a.posonlyargs) + list(a.args)
+            if in_class and params and params[0].arg in {"self", "cls"}:
+                params = params[1:]
+            params += list(a.kwonlyargs)
+            params += [x for x in (a.vararg, a.kwarg) if x is not None]
+            for p in params:
+                if p.annotation is None:
+                    diags.append((p.lineno, p.col_offset,
+                                  f"parameter '{p.arg}' of '{n.name}' has no annotation"))
+                elif not _recognized(p.annotation):
+                    diags.append((p.lineno, p.col_offset,
+                                  f"parameter '{p.arg}' of '{n.name}' has an unrecognized annotation "
+                                  f"'{ast.unparse(p.annotation)}'"))
+            if n.returns is None:
+                if _returns_value(n):
+                    diags.append((n.lineno, n.col_offset,
+                                  f"'{n.name}' returns a value but has no return annotation"))
+            elif not _recognized(n.returns):
+                diags.append((n.lineno, n.col_offset,
+                              f"'{n.name}' has an unrecognized return annotation '{ast.unparse(n.returns)}'"))
+            _visit(n.body, False)
+
+    _visit(tree.body, False)
+    return sorted(diags)
+
+
 def _parse_pyccel_proc_annotation(ann_str):
     """Parse pyccel's function-pointer annotation, e.g.
     `'()(float, float[:], float[:])'` or `'(float)(Final[float[:]])'`,
@@ -74164,6 +74313,44 @@ def generate_flat(
                 break
             if not explicit_conversion:
                 comment_integer_guards[(fn.name, i)] = names[i]
+    # Annotated parameters are contracts: a call passing an argument the
+    # annotation contradicts is reported (translator._check_annotation_
+    # contracts) instead of being silently converted, since Python itself
+    # ignores annotations at run time.
+    annotation_contracts = {}
+    for fn in (local_funcs or []):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # A return annotation the body contradicts is only a warning: the
+        # translation follows what the body returns (as Python does), so
+        # results are unaffected, but the annotation is misleading.
+        _ret_spec = annotation_type_spec(fn.returns)
+        _inferred = (local_return_specs or {}).get(fn.name)
+        if (
+            _ret_spec is not None
+            and isinstance(_inferred, str)
+            and fn.name not in local_overload_specs
+            and fn.name not in tuple_return_funcs
+        ):
+            _ik = _inferred[len("alloc_"):] if _inferred.startswith("alloc_") else _inferred
+            _ik = {"log": "logical"}.get(_ik, _ik)
+            _ir = int((local_return_ranks or {}).get(fn.name, 0) or 0) if _inferred.startswith("alloc_") else 0
+            _ak, _ar, _atext = _ret_spec
+            if _ik in {"int", "real", "logical", "complex", "char"} and (
+                _ir != _ar
+                or (_ik != _ak and (_ik, _ak) not in translator._ANNOTATION_COMPATIBLE_KINDS)
+            ):
+                _kw = {"real": "float", "logical": "bool", "char": "str"}.get(_ik, _ik)
+                _desc = f"a {_kw} scalar" if _ir == 0 else f"a rank-{_ir} {_kw} array"
+                print(
+                    f"Warning: line {fn.lineno}: '{fn.name}' is annotated '-> {_atext}' "
+                    f"but returns {_desc}; the translation follows the returned value",
+                    file=sys.stderr,
+                )
+        for i, a in enumerate(list(fn.args.args) + list(fn.args.kwonlyargs)):
+            spec = annotation_type_spec(a.annotation)
+            if spec is not None:
+                annotation_contracts[(fn.name, i)] = (a.arg,) + spec
     # Check the actual's final type at emission, not a provisional return-kind
     # guess (e.g. an integer seed fed back from a local function in a loop).
     for root in [tree] + list(local_funcs or []):
@@ -74177,6 +74364,9 @@ def generate_flat(
                 parameter = comment_integer_guards.get((call.func.id, i))
                 if parameter is not None:
                     actual._xp2f_comment_integer_target = (call.func.id, parameter)
+                contract = annotation_contracts.get((call.func.id, i))
+                if contract is not None:
+                    actual._xp2f_annotation_contract = (call.func.id, i) + contract
 
     # A rank-0 observation for a numeric parameter the body itself indexes
     # (`q[0]`) is a provisional-inference artifact (e.g. Burkardt
@@ -75430,6 +75620,10 @@ def generate_flat(
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":
             tr.prescan(st.body)
+    tr._check_annotation_contracts(tree.body)
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef) and st.name == "main":
+            tr._check_annotation_contracts(st.body)
     tr.validate_unsafe_if_type_merges(tree.body)
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":
@@ -77812,6 +78006,7 @@ def main():
     ap.add_argument("--assume-float", action="store_true", help="with --module, explicitly assume real type for unresolved arguments (with a warning)")
     ap.add_argument("--assume-scalar", action="store_true", help="with --module, explicitly assume scalar rank for unresolved arguments (with a warning)")
     ap.add_argument("--strict", action="store_true", help="strict Python-source validation mode (no transpilation)")
+    ap.add_argument("--require-annotations", action="store_true", help="lint only (no transpilation): report function parameters without annotations, unrecognized annotations, and value-returning functions without return annotations -- e.g. for --module libraries or files shared with pyccel, which requires annotations; exits nonzero if any are found")
     ap.add_argument("--strict-fix", action="store_true", help="write a strict-friendly Python source (non-inplace by default)")
     ap.add_argument("--strict-fix-overloads", action="store_true", help="with --strict-fix, generate typed overload variants for eligible polymorphic local functions")
     ap.add_argument("--strict-fix-inplace", action="store_true", help="overwrite input file when used with --strict-fix")
@@ -78015,6 +78210,20 @@ def main():
     if args.strict:
         ok = _run_strict_check(src_text, args.input_py)
         return 0 if ok else 1
+
+    if args.require_annotations:
+        try:
+            _ann_diags = annotation_lint_diagnostics(src_text, str(src_path))
+        except SyntaxError as e:
+            print(f"{src_path}:{e.lineno}: SyntaxError: {e.msg}")
+            return 1
+        for _ln, _col, _msg in _ann_diags:
+            print(f"{src_path}:{_ln}:{_col + 1}: {_msg}")
+        if _ann_diags:
+            print(f"Annotations: {len(_ann_diags)} issue(s) in {src_path}")
+            return 1
+        print(f"Annotations: every function in {src_path} is fully annotated")
+        return 0
 
     try:
         reuse_diagnostics = _mark_nested_loop_target_reuse(ast.parse(src_text))
