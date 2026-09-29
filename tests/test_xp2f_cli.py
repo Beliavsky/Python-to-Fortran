@@ -23395,3 +23395,172 @@ _BURKARDT_AUDIT_20260928_CASES = {
 @pytest.mark.parametrize("case", sorted(_BURKARDT_AUDIT_20260928_CASES))
 def test_xp2f_burkardt_audit_20260928(tmp_path: Path, case: str) -> None:
     _run_xp2f_compile_diff(tmp_path, f"xbk0928_{case}.py", _BURKARDT_AUDIT_20260928_CASES[case])
+
+
+# Regression tests for the second round of Burkardt-audit fixes
+# (2026-09-29): each case must transpile, compile, run and match CPython.
+_BURKARDT_AUDIT_20260929_CASES = {
+    # file_name_sequence.py / brc_data.py: `'%s%d%s' % (prefix, i, suffix)`
+    # in an expression was rejected as a mixed-type array constructor, and
+    # the old expression lowering ignored widths/precisions (py_str for
+    # every conversion).
+    "percent_format_expression": [
+        "def names(prefix, n, suffix):",
+        "    for i in range(n):",
+        "        file_name = '%s%d%s' % (prefix, i, suffix)",
+        "        print(file_name)",
+        "",
+        "",
+        "def fields(x, n, name):",
+        "    a = '[%8.3f|%-8.2f|%e|%g|%.4g]' % (x, x, x, x, x)",
+        "    b = '[%5d|%-5d|%05d|%d|%i]' % (n, n, n, -n, n)",
+        "    c = '[%s|%8s|%-8s]' % (name, name, name)",
+        "    d = 'pct %d%% done' % n",
+        "    e = '%6.2f' % n",
+        "    f = '\"%s\",%6.2f' % (name, x)",
+        "    for s in (a, b, c, d, e, f):",
+        "        print(s)",
+        "",
+        "",
+        "names('file', 3, '.txt')",
+        "fields(3.14159265, 42, 'ab')",
+        "fields(-0.000123456, 7, 'xyz')",
+    ],
+    # r8ge.py / condition.py: an import of a module that isn't available,
+    # inside a function nothing ever calls, rejected the whole program --
+    # Python itself runs it fine (the import never executes).
+    "unreachable_missing_import": [
+        "def used(n):",
+        "    return 2 * n",
+        "",
+        "",
+        "def never_called_test():",
+        "    from xbk0929_no_such_module import helper",
+        "    helper(3)",
+        "",
+        "",
+        "def main():",
+        "    print(used(21))",
+        "",
+        "",
+        "main()",
+    ],
+    # The undefined-name check must not reject a name that another function
+    # creates with `global` (Burkardt triangle01_monte_carlo.py, tictoc.py),
+    # nor a NameError in a function nobody calls.
+    "undef_check_globals_dead_code": [
+        "def set_state():",
+        "    global counter",
+        "    counter = 5",
+        "",
+        "",
+        "def bump():",
+        "    return counter + 1",
+        "",
+        "",
+        "def broken_unused():",
+        "    info = undefined_thing",
+        "    return info",
+        "",
+        "",
+        "set_state()",
+        "print(bump())",
+    ],
+    # Nested-loop/branch bodies were re-processed once per enclosing level
+    # by two AST rewrite passes (exponential in depth). Deep nesting plus a
+    # tuple-return subscript and a constructor-call attribute access must
+    # still translate correctly (and quickly).
+    "deep_nesting_rewrites": [
+        "def mm(a, b):",
+        "    return a + b, a * b",
+        "",
+        "",
+        "class A:",
+        "    def __init__(self, x: float):",
+        "        self.x = x",
+        "",
+        "",
+        "def get_A():",
+        "    return A(4.0)",
+        "",
+        "",
+        "def deep(n):",
+        "    s = 0.0",
+        "    for i0 in range(n):",
+        "        for i1 in range(n):",
+        "            if i0 >= i1:",
+        "                for i2 in range(n):",
+        "                    if i2 != i1:",
+        "                        for i3 in range(n):",
+        "                            if i3 > 0:",
+        "                                for i4 in range(n):",
+        "                                    if i4 < 2:",
+        "                                        for i5 in range(n):",
+        "                                            if i5 == i4:",
+        "                                                s = s + mm(i0, i5)[1] + get_A().x",
+        "    return s",
+        "",
+        "",
+        "print(deep(3))",
+    ],
+}
+
+
+@pytest.mark.parametrize("case", sorted(_BURKARDT_AUDIT_20260929_CASES))
+def test_xp2f_burkardt_audit_20260929(tmp_path: Path, case: str) -> None:
+    _run_xp2f_compile_diff(tmp_path, f"xbk0929_{case}.py", _BURKARDT_AUDIT_20260929_CASES[case])
+
+
+@pytest.mark.parametrize(
+    "lines, name, function",
+    [
+        # r83_np.py / r83p.py `info = i`, rnglib.py `value = false`
+        (
+            [
+                "def fa(n, a):",
+                "    info = 0",
+                "    for j in range(n):",
+                "        if a[j] == 0.0:",
+                "            info = i",
+                "            return info",
+                "    return info",
+                "",
+                "",
+                "print(fa(2, [1.0, 2.0]))",
+            ],
+            "i",
+            "fa",
+        ),
+        (
+            [
+                "def memory(action):",
+                "    value = False",
+                "    if action == 0:",
+                "        value = false",
+                "    return value",
+                "",
+                "",
+                "print(memory(1))",
+            ],
+            "false",
+            "memory",
+        ),
+    ],
+)
+def test_xp2f_undefined_name_is_reported_not_translated(tmp_path: Path, lines: list, name: str, function: str) -> None:
+    # A name read but bound nowhere visible (a latent Python NameError) used
+    # to be translated into Fortran that gfortran rejected ("Symbol 'i' has
+    # no IMPLICIT type"); it must be reported at transpile time instead.
+    src = tmp_path / "xundefined_name.py"
+    src.write_text("\n".join(lines + [""]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    out = proc.stdout + proc.stderr
+    assert f"undefined name '{name}' in function '{function}'" in out, out
+    assert not (tmp_path / "xundefined_name_p.f90").exists()

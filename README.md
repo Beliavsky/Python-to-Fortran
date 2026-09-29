@@ -154,6 +154,20 @@ functions, and variadic or positional-only interfaces. Execution options and
 `--partial`, `--strict`, `--strict-fix`, and `--type` cannot be combined with
 `--module`. The batch runner still skips definition-only modules by default.
 
+### Sleeping
+
+Standalone `time.sleep(seconds)` calls support integer and fractional seconds,
+including aliases such as `from time import sleep as pause`. Negative, nonfinite,
+and excessively large durations stop with a runtime diagnostic. Sleep is impure;
+it is never omitted or implemented as a busy-wait or shell command.
+
+The build automatically selects `time_sleep_windows.f90` on Windows or
+`time_sleep_posix.f90` on POSIX LP64 systems (64-bit Linux/macOS). These provide
+the same module: when building manually, compile only the appropriate helper.
+The POSIX helper resumes an interrupted wait. Windows waits round up to
+milliseconds and check elapsed time; actual waits may be longer due to scheduling.
+Using sleep's `None` result in an expression is not supported.
+
 ### Batch translation
 
 Run a batch file list:

@@ -15363,10 +15363,15 @@ def detect_needed_helpers(tree):
                 tf = self.time_func_aliases[node.func.id]
                 if tf in {"time", "perf_counter"} and len(node.args) == 0:
                     needed.add("py_time")
+                elif tf == "sleep":
+                    needed.add("py_sleep")
                 elif tf == "ctime" and len(node.args) <= 1:
                     needed.add("py_ctime")
             if isinstance(node.func, ast.Name) and node.func.id in {"eye", "diag"}:
                 needed.add(node.func.id)
+            if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in self.time_aliases and node.func.attr == "sleep"):
+                needed.add("py_sleep")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -17446,7 +17451,7 @@ def collect_time_aliases(tree):
     """Collect aliases for time module and directly imported functions."""
     module_aliases = set()
     func_aliases = {}
-    supported = {"time", "perf_counter", "ctime"}
+    supported = {"time", "perf_counter", "ctime", "sleep"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for al in node.names:
@@ -42862,6 +42867,16 @@ class translator(ast.NodeVisitor):
 
         raise NotImplementedError(f"unsupported expr: {type(node).__name__}")
 
+    def _prescan_nested_body(self, body):
+        """prescan() of a compound statement's own body/orelse -- see the
+        subtree-walk skip in prescan()."""
+        prev = self.__dict__.get("_in_nested_body_prescan", False)
+        self._in_nested_body_prescan = True
+        try:
+            self.prescan(body)
+        finally:
+            self._in_nested_body_prescan = prev
+
     def prescan(self, nodes):
         if not getattr(self, "_range_liveness_scanned", False):
             annotate_loop_target_liveness(nodes)
@@ -43123,8 +43138,16 @@ class translator(ast.NodeVisitor):
 
         _ido_name_counts = None
         _ido_picked_lower = set()
+        # A nested body (For/If/While/With) was already covered by the
+        # enclosing prescan's walk of its whole subtree; re-walking it here
+        # once per nesting level made this loop O(depth x size) -- the top
+        # transpile hotspot for deeply nested Burkardt code (quad_rule.py).
+        _walk_subtree = not self.__dict__.get("_in_nested_body_prescan", False)
+        # Only THIS call skips: nested prescan([fake]) calls made while
+        # processing the body do new work and must walk.
+        self._in_nested_body_prescan = False
         for _n in nodes:
-            for _m in ast.walk(_n):
+            for _m in (ast.walk(_n) if _walk_subtree else ()):
                 _record_assigned_names(_m)
                 _nest_parts = nested_range_listcomp_parts(_m) if isinstance(_m, ast.ListComp) else None
                 if _nest_parts is not None:
@@ -47241,7 +47264,7 @@ class translator(ast.NodeVisitor):
                         self.uses_csv_split_line = True
                         if node.target.id != "_":
                             self._mark_alloc_char(tnm, rank=1)
-                        self.prescan(node.body)
+                        self._prescan_nested_body(node.body)
                         continue
                     if (
                         isinstance(node.iter, ast.Call)
@@ -47369,16 +47392,16 @@ class translator(ast.NodeVisitor):
                         else:
                             self._mark_int(t1.id)
                     self._mark_int(f"i_{node.iter.func.value.id}_{getattr(node, 'lineno', 0)}")
-                self.prescan(node.body)
+                self._prescan_nested_body(node.body)
 
             if isinstance(node, ast.If):
-                self.prescan(node.body)
-                self.prescan(node.orelse)
+                self._prescan_nested_body(node.body)
+                self._prescan_nested_body(node.orelse)
             if isinstance(node, ast.While):
-                self.prescan(node.body)
-                self.prescan(node.orelse)
+                self._prescan_nested_body(node.body)
+                self._prescan_nested_body(node.orelse)
             if isinstance(node, ast.With):
-                self.prescan(node.body)
+                self._prescan_nested_body(node.body)
 
                 if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
                     c = node.value
@@ -57093,6 +57116,22 @@ class translator(ast.NodeVisitor):
         if not isinstance(node.value, ast.Call):
             raise NotImplementedError("only call expressions supported")
         c = node.value
+
+        if ((isinstance(c.func, ast.Name) and self.time_func_aliases.get(c.func.id) == "sleep")
+                or (isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name)
+                    and c.func.value.id in self.time_aliases and c.func.attr == "sleep")):
+            if len(c.args) != 1 or c.keywords:
+                raise NotImplementedError("time.sleep requires one positional duration in seconds")
+            value = self.expr(c.args[0])
+            kind = self._expr_kind(c.args[0])
+            if kind not in {"int", "real", "logical"} or self._rank_expr(c.args[0]) > 0:
+                raise NotImplementedError("time.sleep requires a real scalar duration")
+            if kind == "logical":
+                value = f"merge(1.0_dp, 0.0_dp, {value})"
+            else:
+                value = f"real({value}, kind=dp)"
+            self.o.w(f"call py_sleep({value})")
+            return
 
         if hasattr(c, "_xp2f_leastsq"):
             x, ier, wrapper, residual, opts = c._xp2f_leastsq
@@ -68045,10 +68084,27 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
     # Iterate to a fixed point so return-shape inference can use callee
     # return metadata discovered earlier in the same local-function set.
     max_iter = max(1, len(local_funcs or [])) + 2
+    # A function's analysis reads other local functions' results only
+    # through the names it references, so after the first round only a
+    # function referencing something whose result changed (in the previous
+    # round, or earlier in this one) can change -- re-analyzing every
+    # function each round doubled this loop's cost for no effect (the
+    # usual last round is a pure confirmation pass; ~11 s per call on
+    # Burkardt quad_rule.py).
+    _referenced_names = {
+        fn.name: {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+        for fn in (local_funcs or [])
+    }
+    _changed_prev_round = None  # None: analyze every function
     for _ in range(max_iter):
         changed = False
+        _changed_this_round = set()
         for fn in (local_funcs or []):
             if fn.name in {"log_normal_pdf_1d", "normal_logpdf_1d"}:
+                continue
+            if _changed_prev_round is not None and not (
+                _referenced_names.get(fn.name, set()) & (_changed_prev_round | _changed_this_round)
+            ):
                 continue
             tr = translator(
                 emit(),
@@ -68509,6 +68565,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                             ranks.append(0)
                 if tuple_out.get(fn.name) != kinds or tuple_out_ranks.get(fn.name) != ranks:
                     changed = True
+                    _changed_this_round.add(fn.name)
                 tuple_out[fn.name] = kinds
                 tuple_out_ranks[fn.name] = ranks
                 continue
@@ -68538,6 +68595,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 ranks = list(tuple_out_ranks.get(r0.func.id, [0] * len(kinds)))
                 if tuple_out.get(fn.name) != kinds or tuple_out_ranks.get(fn.name) != ranks:
                     changed = True
+                    _changed_this_round.add(fn.name)
                 tuple_out[fn.name] = kinds
                 tuple_out_ranks[fn.name] = ranks
                 continue
@@ -68717,8 +68775,10 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 scalar_or_array[fn.name] = spec
                 scalar_or_array_ranks[fn.name] = int(rr_spec)
                 changed = True
+                _changed_this_round.add(fn.name)
         if not changed:
             break
+        _changed_prev_round = _changed_this_round
     return scalar_or_array, scalar_or_array_ranks, tuple_out, tuple_out_ranks
 
 
@@ -73027,6 +73087,34 @@ def generate_flat(
     local_overload_dispatch = {}
     local_overload_tuple_profiles = {}
     profile_scan_enabled = False
+    _observed_call_cache = {}
+
+    def _observed_call_cache_for(funcs):
+        """Callee-name -> calling local functions (in `funcs` order, so
+        iteration order is unchanged), plus the DataFrame-return scans,
+        computed once per distinct function set."""
+        key = tuple(id(_f) for _f in (funcs or []))
+        cached = _observed_call_cache.get(key)
+        if cached is None:
+            callers = {}
+            for _f in (funcs or []):
+                if not isinstance(_f, ast.FunctionDef):
+                    continue
+                called = {
+                    _c.func.id for _c in ast.walk(_f)
+                    if isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name)
+                }
+                for _nm in called:
+                    callers.setdefault(_nm, []).append(_f)
+            cached = {
+                "callers": callers,
+                "df_info": _scan_local_df_return_info(funcs),
+                "tuple_df": _all_tuple_df_return_positions(funcs),
+            }
+            _observed_call_cache.clear()
+            _observed_call_cache[key] = cached
+        return cached
+
     def _observed_local_call_specs(fn_name):
         arg_names = list(local_func_arg_names.get(fn_name, []))
         pair_lists = [set() for _ in arg_names]
@@ -73104,19 +73192,16 @@ def generate_flat(
         # per target made this quadratic in the number of functions --
         # about 60% of transpile time for Burkardt polygon.py (4973 lines,
         # ~70 functions), which then exceeded the audit's build timeout.
-        def _calls_target(_f):
-            return any(
-                isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name) and _c.func.id == fn_name
-                for _c in ast.walk(_f)
-            )
-        _caller_funcs = [
-            _f for _f in (local_funcs or [])
-            if isinstance(_f, ast.FunctionDef) and _calls_target(_f)
-        ]
+        # Both the callers index and the DataFrame-return scans depend only
+        # on the local functions, not on fn_name: build them once per
+        # function set instead of once per target (together ~60% of
+        # transpile time for Burkardt subset.py / prob.py, 600-800
+        # functions each).
+        _caller_funcs = _observed_call_cache_for(local_funcs)["callers"].get(fn_name, [])
         if not _caller_funcs:
             return pair_lists, triad_lists, joint_calls
-        _local_ret_df_info_scan2 = _scan_local_df_return_info(local_funcs)
-        _local_ret_tuple_df_info_scan2 = _all_tuple_df_return_positions(local_funcs)
+        _local_ret_df_info_scan2 = _observed_call_cache_for(local_funcs)["df_info"]
+        _local_ret_tuple_df_info_scan2 = _observed_call_cache_for(local_funcs)["tuple_df"]
         for _fn_scan in _caller_funcs:
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
@@ -75935,6 +76020,10 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
 
 def resolve_helper_uses(helper_paths, needed_helpers):
     """Map needed helper symbols to helper modules discovered from helper files."""
+    if "py_sleep" in needed_helpers:
+        uses, missing, pure = resolve_helper_uses(helper_paths, set(needed_helpers) - {"py_sleep"})
+        uses.setdefault("time_sleep_mod", []).append("py_sleep")
+        return uses, missing, pure
     if not helper_paths:
         # Default wiring: emit imports from python_mod for all detected helpers.
         # This keeps generated Fortran explicit about runtime dependencies.
@@ -76061,6 +76150,14 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
     auto_added = []
     for mod in needed:
         if mod in provided:
+            continue
+        if mod == "time_sleep_mod":
+            filename = "time_sleep_windows.f90" if os.name == "nt" else "time_sleep_posix.f90"
+            found, candidate = _ensure_helper_by_filename(filename)
+            if found:
+                provided.add(mod)
+            else:
+                missing_modules.append((mod, candidate))
             continue
         if mod.endswith("_module"):
             # Some vendored libraries (e.g. minpack_module) use the
