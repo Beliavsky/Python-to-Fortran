@@ -116,6 +116,46 @@ python xp2f.py path/to/program.py --int-kind int64     # declare integers with a
 python xp2f.py path/to/program.py --perf-hints          # print (never modify) a diagnostic for strided array-access patterns neither flag above can safely fix
 ```
 
+### Translating a library module
+
+Use `--module` for a Python file containing imports and function definitions,
+without a main program:
+
+```console
+python xp2f.py path/to/library.py --module --compile
+```
+
+This emits `<stem>_p.f90` containing `<stem>_proc_mod`. Compilation produces an
+object (`.o`) and a compiler module (`.mod`) file, not an executable. Helper
+modules are compiled as needed; their object files must also be linked when
+building a program that uses the library. Procedure names may be renamed to
+avoid Fortran/helper-name collisions; consult the generated `public` list.
+
+Arguments need known element types and ranks, from annotations (for example,
+`x: float` or `x: 'float[:]'`), typed calls within the module, or supported
+unambiguous body constraints such as an integer `range` bound. Ambiguous
+interfaces are rejected rather than silently defaulted to real scalars.
+Explicit fallback options are available, with warnings:
+
+```console
+python xp2f.py path/to/library.py --module --assume-float --assume-scalar --compile
+python xp2f.py examples/rndm.py --module --assume-float --elemental --compile
+```
+
+`--assume-float` alone does not imply scalar rank. With `--elemental`, unresolved
+rank is accepted only for simple arithmetic-return functions proven elementwise,
+such as `return 2.0*x`, and only if the generated procedure is eligible for
+`elemental`. Array-result or impure procedures remain ordinary procedures when
+their interfaces are already known. A reduction such as `np.sum(x)` is not an
+elementwise operation.
+
+This initial mode rejects top-level initialization/driver statements, decorated
+functions, and variadic or positional-only interfaces. Execution options and
+`--partial`, `--strict`, `--strict-fix`, and `--type` cannot be combined with
+`--module`. The batch runner still skips definition-only modules by default.
+
+### Batch translation
+
 Run a batch file list:
 
 ```console

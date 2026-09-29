@@ -4124,6 +4124,14 @@ def rewrite_tuple_call_subscript_to_temp(tree):
 
     if not tuple_return_arity:
         return tree
+    if not any(
+        isinstance(n, ast.Subscript)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Name)
+        and n.value.func.id in tuple_return_arity
+        for n in ast.walk(tree)
+    ):
+        return tree
 
     counter = [0]
     changed = [False]
@@ -4172,25 +4180,40 @@ def rewrite_tuple_call_subscript_to_temp(tree):
         return new_body
 
     class _BodyRewriter(ast.NodeTransformer):
+        # Statement lists are handled by _process_body only: calling
+        # generic_visit first as well re-processed every nested body once
+        # per enclosing level -- exponential in nesting depth (~25 s of
+        # transpile time on Burkardt polygon.py).
+        def _visit_non_body_fields(self, node, body_fields):
+            for field, value in ast.iter_fields(node):
+                if field in body_fields:
+                    continue
+                if isinstance(value, list):
+                    setattr(node, field, [
+                        self.visit(v) if isinstance(v, ast.AST) else v for v in value
+                    ])
+                elif isinstance(value, ast.AST):
+                    setattr(node, field, self.visit(value))
+
         def visit_FunctionDef(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body"})
             node.body = _process_body(node.body)
             return node
 
         def visit_If(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body", "orelse"})
             node.body = _process_body(node.body)
             node.orelse = _process_body(node.orelse)
             return node
 
         def visit_For(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body", "orelse"})
             node.body = _process_body(node.body)
             node.orelse = _process_body(node.orelse)
             return node
 
         def visit_While(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body", "orelse"})
             node.body = _process_body(node.body)
             node.orelse = _process_body(node.orelse)
             return node
@@ -4332,6 +4355,157 @@ def rewrite_tuple_literal_shape_name_to_literal(tree):
         return tree
     ast.fix_missing_locations(out)
     return out
+
+
+def _names_bound_in_scope(node):
+    """Names a function/class/module body binds itself (not descending into
+    nested function or class bodies, whose bindings are their own)."""
+    bound = set()
+    stack = list(ast.iter_child_nodes(node))
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        a = node.args
+        for arg in a.posonlyargs + a.args + a.kwonlyargs:
+            bound.add(arg.arg)
+        for arg in (a.vararg, a.kwarg):
+            if arg is not None:
+                bound.add(arg.arg)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(n.name)
+            # decorators/defaults are evaluated in this scope
+            stack.extend(getattr(n, "decorator_list", []))
+            if not isinstance(n, ast.ClassDef):
+                stack.extend(n.args.defaults)
+                stack.extend(d for d in n.args.kw_defaults if d is not None)
+            continue
+        if isinstance(n, ast.Lambda):
+            continue
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            bound.add(n.id)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for al in n.names:
+                bound.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            bound.update(n.names)
+        elif type(n).__name__ in {"MatchAs", "MatchStar"} and getattr(n, "name", None):
+            bound.add(n.name)
+        elif type(n).__name__ == "MatchMapping" and getattr(n, "rest", None):
+            bound.add(n.rest)
+        stack.extend(ast.iter_child_nodes(n))
+    return bound
+
+
+def reachable_top_level_defs(tree):
+    """(defs, reachable): `defs` maps each outermost function/class name
+    (including ones under a module-level `if`) to its definition nodes;
+    `reachable` is the set of those names referenced -- by any Load of the
+    name, so callbacks count -- from module-level code, transitively."""
+    defs = {}
+    top_code = []
+    stack = list(tree.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defs.setdefault(n.name, []).append(n)
+            continue
+        top_code.append(n)
+        stack.extend(c for c in ast.iter_child_nodes(n) if isinstance(c, ast.stmt))
+
+    def _loaded_names(node, skip_defs):
+        out = set()
+        st = [node]
+        while st:
+            x = st.pop()
+            if skip_defs and x is not node and isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load):
+                out.add(x.id)
+            st.extend(ast.iter_child_nodes(x))
+        return out
+
+    frontier = set()
+    for n in top_code:
+        frontier |= _loaded_names(n, True)
+    reachable = set()
+    while frontier:
+        nm = frontier.pop()
+        if nm in reachable or nm not in defs:
+            continue
+        reachable.add(nm)
+        for d in defs[nm]:
+            frontier |= _loaded_names(d, False)
+    if not reachable:
+        # A library file with no module-level driver: every definition is
+        # kept (and translated), so treat them all as reachable.
+        reachable = set(defs)
+    return defs, reachable
+
+
+def reject_undefined_names_in_functions(tree):
+    """A name read inside a function but bound nowhere visible to it (the
+    function itself, an enclosing function/class, the module, or builtins)
+    is a Python NameError waiting to happen -- e.g. Burkardt r83_np.py /
+    r83p.py `info = i` (no `i` in scope) and rnglib.py `value = false`.
+    Translating it anyway produced invalid Fortran ("Symbol 'i' has no
+    IMPLICIT type"); report it here, at its source line, instead. Skipped
+    entirely when the module uses `from x import *` (names unknowable)."""
+    import builtins as _builtins
+    if any(
+        isinstance(n, ast.ImportFrom) and any(al.name == "*" for al in n.names)
+        for n in ast.walk(tree)
+    ):
+        return
+    known = set(dir(_builtins)) | {"__file__", "__name__", "__doc__", "__builtins__", "__spec__", "__loader__", "__package__"}
+    module_bound = _names_bound_in_scope(tree)
+    # `global e` inside any function creates/binds the module-level `e`
+    # (Burkardt triangle01_monte_carlo.py, tictoc.py).
+    module_bound |= {g for n in ast.walk(tree) if isinstance(n, ast.Global) for g in n.names}
+
+    def _check(fn, visible):
+        names_here = visible | _names_bound_in_scope(fn)
+        stack = list(ast.iter_child_nodes(fn))
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                _check(node, names_here)
+                continue
+            if isinstance(node, ast.ClassDef):
+                _check(node, names_here)
+                continue
+            # A called name (`sqrt(x)` without the import) or an attribute
+            # base (`np.zeros` without `import numpy as np`) is left alone:
+            # xp2f maps many of those onto intrinsics/helpers regardless.
+            # Only plain VALUE uses (`info = i`, `value = false`) are
+            # reported.
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                stack.extend(node.args)
+                stack.extend(node.keywords)
+                continue
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                continue
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id not in names_here
+                and node.id not in known
+            ):
+                raise NotImplementedError(
+                    f"undefined name '{node.id}' in function "
+                    f"'{getattr(fn, 'name', '<lambda>')}': Python would raise NameError "
+                    "if this line ran; define it or fix the typo"
+                )
+            stack.extend(ast.iter_child_nodes(node))
+
+    # Only definitions reachable from module-level code are checked: a
+    # NameError in a test routine nobody calls never happens, and such
+    # programs translate fine today (the unreachable function is pruned).
+    defs, reachable = reachable_top_level_defs(tree)
+    for nm in sorted(reachable):
+        for d in defs[nm]:
+            _check(d, module_bound | known)
 
 
 def drop_unreachable_after_raise_or_return(tree):
@@ -4829,25 +5003,40 @@ def rewrite_call_attribute_access_to_temp(tree):
         return new_body
 
     class _BodyRewriter(ast.NodeTransformer):
+        # Statement lists are handled by _process_body only: calling
+        # generic_visit first as well re-processed every nested body once
+        # per enclosing level -- exponential in nesting depth (~25 s of
+        # transpile time on Burkardt polygon.py).
+        def _visit_non_body_fields(self, node, body_fields):
+            for field, value in ast.iter_fields(node):
+                if field in body_fields:
+                    continue
+                if isinstance(value, list):
+                    setattr(node, field, [
+                        self.visit(v) if isinstance(v, ast.AST) else v for v in value
+                    ])
+                elif isinstance(value, ast.AST):
+                    setattr(node, field, self.visit(value))
+
         def visit_FunctionDef(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body"})
             node.body = _process_body(node.body)
             return node
 
         def visit_If(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body", "orelse"})
             node.body = _process_body(node.body)
             node.orelse = _process_body(node.orelse)
             return node
 
         def visit_For(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body", "orelse"})
             node.body = _process_body(node.body)
             node.orelse = _process_body(node.orelse)
             return node
 
         def visit_While(self, node):
-            self.generic_visit(node)
+            self._visit_non_body_fields(node, {"body", "orelse"})
             node.body = _process_body(node.body)
             node.orelse = _process_body(node.orelse)
             return node
@@ -16061,6 +16250,8 @@ def detect_needed_helpers(tree):
                     needed.add("py_str_int")
                 if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[eEfFgG]", fmt_text):
                     needed.add("py_format_real")
+                # _percent_format_string_expr's padding helpers.
+                needed.update({"py_str_int", "str_ljust", "str_rjust", "str_zfill"})
                 # Old-style "%...spec..." % args formatting (the BinOp Mod
                 # codegen's own inline lowering, see expr()'s ast.Mod
                 # handling) wraps EVERY substituted argument in py_str(...)
@@ -17462,7 +17653,22 @@ def validate_imports_supported(tree, py_path):
             return None
         return f"unsupported imported module: {mod_name}"
 
+    # An import inside a definition no module-level code can reach never
+    # executes (Burkardt r8ge.py / condition.py: `from r8gb import
+    # r8gb_print` inside a test routine main() never calls -- Python runs
+    # the program fine without that module present), and such definitions
+    # are pruned before translation anyway.
+    defs, reachable = reachable_top_level_defs(tree)
+    unreachable_nodes = set()
+    for nm, nodes in defs.items():
+        if nm in reachable:
+            continue
+        for d in nodes:
+            unreachable_nodes.update(id(x) for x in ast.walk(d))
+
     for node in ast.walk(tree):
+        if id(node) in unreachable_nodes:
+            continue
         if isinstance(node, ast.Import):
             for al in node.names:
                 mod = (al.name or "").strip()
@@ -33142,6 +33348,91 @@ class translator(ast.NodeVisitor):
                     f"{self._wide_integer_arithmetic(node.right)})")
         return f"int({self.expr(node)}, kind=int64)"
 
+    def _percent_format_string_expr(self, node):
+        """`'fmt' % (a, b, ...)` (or a single `% a`) as a CHARACTER
+        expression, honoring each conversion's flags/width/precision like
+        Python does. Returns None for a shape it doesn't handle (the
+        caller's older lowering then applies). Handled before the operands
+        are evaluated: a mixed tuple `(name, i, suffix)` is only a list of
+        format arguments here, not an array (Burkardt file_name_sequence.py
+        `'%s%d%s' % (prefix, i, suffix)`, brc_data.py `'"%s",%6.2f' % ...`,
+        which were declined as mixed-type array constructors)."""
+        fmt_text = str(node.left.value)
+        if isinstance(node.right, (ast.Tuple, ast.List)):
+            arg_nodes = list(node.right.elts)
+        else:
+            if self._rank_expr(node.right) != 0:
+                return None
+            arg_nodes = [node.right]
+        if any(isinstance(a, ast.Starred) for a in arg_nodes):
+            return None
+        spec_re = re.compile(r"%([-+ #0]*)(\d+)?(?:\.(\d+))?([diouxXeEfFgGcrs%])")
+        parts = []
+        pos = 0
+        arg_i = 0
+        for m in spec_re.finditer(fmt_text):
+            if m.start() > pos:
+                parts.append(fstr(fmt_text[pos:m.start()]))
+            pos = m.end()
+            flags, width, prec, code = m.group(1), m.group(2), m.group(3), m.group(4)
+            if code == "%":
+                parts.append(fstr("%"))
+                continue
+            if arg_i >= len(arg_nodes):
+                return None
+            a = arg_nodes[arg_i]
+            arg_i += 1
+            if self._rank_expr(a) != 0:
+                return None
+            ak = self._expr_kind(a)
+            txt = self.expr(a)
+            w = int(width) if width else 0
+            if code in "eEfFgG":
+                if ak == "logical":
+                    txt = f"merge(1.0_dp, 0.0_dp, {txt})"
+                elif ak != "real":
+                    txt = f"real({txt}, kind=dp)"
+                p = int(prec) if prec is not None else 6
+                parts.append(f"py_format_real({txt}, {p}, {w}, '{flags}', '{code}')")
+                continue
+            if code in "diu":
+                if ak == "logical":
+                    txt = f"merge(1, 0, {txt})"
+                elif ak != "int":
+                    txt = f"int({txt})"
+                piece = f"py_str_int({txt})"
+                if prec is not None:
+                    return None
+                if "+" in flags or " " in flags:
+                    return None
+                if w:
+                    if "-" in flags:
+                        piece = f"str_ljust({piece}, {w})"
+                    elif "0" in flags:
+                        piece = f"str_zfill({piece}, {w})"
+                    else:
+                        piece = f"str_rjust({piece}, {w})"
+                parts.append(piece)
+                continue
+            if code in "sr":
+                if code == "r" and ak == "char":
+                    return None
+                piece = txt if ak == "char" else f"py_str({txt})"
+                if prec is not None:
+                    return None
+                if w:
+                    piece = f"str_ljust({piece}, {w})" if "-" in flags else f"str_rjust({piece}, {w})"
+                parts.append(piece)
+                continue
+            return None
+        if pos < len(fmt_text):
+            parts.append(fstr(fmt_text[pos:]))
+        if arg_i != len(arg_nodes):
+            return None
+        if not parts:
+            return fstr("")
+        return " // ".join(parts)
+
     def expr(self, node):
         validate_numpy_atleast_call(node)
         if self._where_tuple_index(node):
@@ -33732,6 +34023,10 @@ class translator(ast.NodeVisitor):
 
         if isinstance(node, ast.BinOp):
             op = type(node.op)
+            if op is ast.Mod and is_const_str(node.left):
+                _pct = self._percent_format_string_expr(node)
+                if _pct is not None:
+                    return _pct
             # DataFrame arithmetic: df +-*/ df (same kind, same columns) or
             # df +-*/ scalar (either order) -- routes through operator
             # overloads on the vendored DataFrame type (currently only
@@ -67998,8 +68293,13 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 ):
                     return True
                 return False
+            # An early `return None` error exit carries no type (Burkardt
+            # polygon.py polygon_triangulate: `return None` on a bad angle,
+            # `return triangles` otherwise); taking it as THE return value
+            # left callers with no spec, typing their result as real scalar.
             r0 = next(
-                (_r.value for _r in rets if not _is_empty_array_literal_expr_local(_r.value)),
+                (_r.value for _r in rets
+                 if not _is_empty_array_literal_expr_local(_r.value) and not is_none(_r.value)),
                 rets[0].value,
             )
             if isinstance(r0, ast.Tuple):
@@ -68744,7 +69044,7 @@ def _name_rebound_only_by_self_str_method(fn, nm):
 def generate_flat(
     tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
     structured_type_components=None, structured_array_types=None, structured_dtype_strings=None, user_class_types=None, rng_replay_path=None,
-    value_scalar_args=False, specialization_notes=None,
+    value_scalar_args=False, specialization_notes=None, module_only=False,
 ):
     _mark_nested_loop_target_reuse(tree)
     for fn in local_funcs or []:
@@ -72799,9 +73099,25 @@ def generate_flat(
                     joint_calls.append(_profile)
         for _st in _top_level_scan_nodes:
             _record(_st, tr_seed, None)
+        # Only functions that actually call fn_name can contribute (_record
+        # ignores every other call). Prescanning every local function once
+        # per target made this quadratic in the number of functions --
+        # about 60% of transpile time for Burkardt polygon.py (4973 lines,
+        # ~70 functions), which then exceeded the audit's build timeout.
+        def _calls_target(_f):
+            return any(
+                isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name) and _c.func.id == fn_name
+                for _c in ast.walk(_f)
+            )
+        _caller_funcs = [
+            _f for _f in (local_funcs or [])
+            if isinstance(_f, ast.FunctionDef) and _calls_target(_f)
+        ]
+        if not _caller_funcs:
+            return pair_lists, triad_lists, joint_calls
         _local_ret_df_info_scan2 = _scan_local_df_return_info(local_funcs)
         _local_ret_tuple_df_info_scan2 = _all_tuple_df_return_positions(local_funcs)
-        for _fn_scan in (local_funcs or []):
+        for _fn_scan in _caller_funcs:
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
             _owner_specs = local_overload_specs.get(_fn_scan.name, []) if profile_scan_enabled else []
@@ -73991,6 +74307,12 @@ def generate_flat(
     for gname in local_generic_overloads:
         elemental_targets.discard(gname)
 
+    if module_only:
+        for fn in local_funcs or []:
+            interface = getattr(fn, "_xp2f_module_interface", None)
+            if interface is not None:
+                local_func_arg_kinds[fn.name] = [kind for kind, rank in interface]
+                local_func_arg_ranks[fn.name] = [rank for kind, rank in interface]
     use_proc_module = bool(local_funcs)
     proc_mod_name = f"{fortran_safe_stem(stem)}_proc_mod"
     proc_public_syms = []
@@ -74789,6 +75111,9 @@ def generate_flat(
                 )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
+
+    if module_only:
+        return module_text
 
     prog_name = fortran_safe_stem(stem)
     prog_name_conflicts = set()
@@ -76254,6 +76579,161 @@ def prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=N
     return [fn for fn in local_funcs if not isinstance(fn, ast.FunctionDef) or fn.name in needed]
 
 
+def _prepare_module_interfaces(tree, assume_float=False, assume_scalar=False, elemental=False):
+    """Resolve public module arguments without the program-mode real-scalar fallback.
+
+    Deliberately narrow: module initialization and arbitrary annotation grammars
+    need their own semantics rather than silently dropping code or guessing ranks.
+    """
+    functions = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if not isinstance(node, ast.FunctionDef):
+            raise NotImplementedError("--module currently accepts imports and function definitions only; "
+                                      "move top-level initialization or driver statements to a separate program")
+        if node.decorator_list or node.args.posonlyargs or node.args.vararg or node.args.kwarg:
+            raise NotImplementedError(f"--module: unsupported decorated or variadic/positional-only interface: {node.name}")
+        functions[node.name] = node
+    if not functions:
+        raise NotImplementedError("--module requires at least one function definition")
+    signatures = {}
+    for name, fn in functions.items():
+        signatures[name] = {}
+        for arg in list(fn.args.args) + list(fn.args.kwonlyargs):
+            if arg.annotation is None:
+                signatures[name][arg.arg] = None
+                continue
+            annotation = (arg.annotation.value if isinstance(arg.annotation, ast.Constant)
+                          and isinstance(arg.annotation.value, str) else ast.unparse(arg.annotation))
+            parsed = _parse_base_type_and_rank(annotation)
+            if parsed is None:
+                raise NotImplementedError(f"--module: {name}.{arg.arg} needs an annotation specifying "
+                                          "element type and rank, such as float or 'float[:]' ")
+            signatures[name][arg.arg] = parsed[:2]
+
+    def record(fn, arg, signature):
+        if arg not in signatures[fn] or signature is None:
+            return False
+        previous = signatures[fn][arg]
+        if previous is not None and previous != signature:
+            raise NotImplementedError(f"--module: conflicting type/rank evidence for {fn}.{arg}: "
+                                      f"{previous} versus {signature}; provide a consistent interface")
+        signatures[fn][arg] = signature
+        return previous is None
+
+    def expression(node, env):
+        if isinstance(node, ast.Name):
+            return env.get(node.id)
+        if isinstance(node, ast.Constant):
+            kind = {bool: 'logical', int: 'int', float: 'real', complex: 'complex', str: 'char'}.get(type(node.value))
+            return (kind, 0) if kind else None
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            return expression(node.operand, env)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            left, right = expression(node.left, env), expression(node.right, env)
+            if left and right and left[0] in {'int', 'real', 'complex'} and right[0] in {'int', 'real', 'complex'}:
+                kind = 'complex' if 'complex' in (left[0], right[0]) else (
+                    'real' if 'real' in (left[0], right[0]) or isinstance(node.op, ast.Div) else 'int')
+                return kind, max(left[1], right[1])
+        return None
+
+    def scope_nodes(fn):
+        pending = list(fn.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+                                 ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                continue
+            yield node
+            pending.extend(ast.iter_child_nodes(node))
+
+    nodes_by_name = {name: list(scope_nodes(fn)) for name, fn in functions.items()}
+    rebound = {name: {node.id for node in nodes if isinstance(node, ast.Name)
+                     and isinstance(node.ctx, (ast.Store, ast.Del))}
+               for name, nodes in nodes_by_name.items()}
+    # Only unequivocal integer-scalar contexts are body evidence here.
+    # Arithmetic such as 2.0*x is not evidence that x itself is real/scalar.
+    for name, fn in functions.items():
+        for node in nodes_by_name[name]:
+            if not isinstance(node, ast.Call):
+                continue
+            integer_actuals = []
+            if isinstance(node.func, ast.Name) and node.func.id == 'range':
+                integer_actuals = node.args
+            elif ast.unparse(node.func) in {'np.random.normal', 'numpy.random.normal'}:
+                integer_actuals = [kw.value for kw in node.keywords if kw.arg == 'size']
+            for actual in integer_actuals:
+                if isinstance(actual, ast.Name) and actual.id not in rebound[name]:
+                    record(name, actual.id, ('int', 0))
+
+    # Resolve calls inside functions, including chains of typed forwarding.
+    changed = True
+    while changed:
+        changed = False
+        for name, fn in functions.items():
+            env = {arg: sig for arg, sig in signatures[name].items() if arg not in rebound[name]}
+            for node in nodes_by_name[name]:
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in functions:
+                    callee = node.func.id
+                    formal = list(functions[callee].args.args)
+                    actuals = [(arg.arg, value) for arg, value in zip(formal, node.args)]
+                    actuals += [(kw.arg, kw.value) for kw in node.keywords if kw.arg]
+                    for arg, value in actuals:
+                        changed |= record(callee, arg, expression(value, env))
+                        if isinstance(value, ast.Name) and value.id not in rebound[name]:
+                            changed |= record(name, value.id, signatures[callee].get(arg))
+
+    unresolved = []
+    def elementwise_body(fn):
+        # A scalar reduction can look elemental in emitted Fortran, but lifting
+        # it would change Python's array semantics (sum(x) is not elementwise).
+        body = [s for s in fn.body if not (isinstance(s, ast.Expr)
+                and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            return False
+        return all(isinstance(n, (ast.BinOp, ast.UnaryOp, ast.Name, ast.Constant,
+                                  ast.Load, ast.Add, ast.Sub, ast.Mult, ast.Div,
+                                  ast.Pow, ast.UAdd, ast.USub))
+                   for n in ast.walk(body[0].value)) if body[0].value is not None else False
+
+    for name, fn in functions.items():
+        interface = []
+        for arg in list(fn.args.args) + list(fn.args.kwonlyargs):
+            signature = signatures[name][arg.arg]
+            if signature is None:
+                indexed = any(isinstance(node, (ast.Subscript, ast.Attribute))
+                              and isinstance(node.value, ast.Name) and node.value.id == arg.arg
+                              for node in nodes_by_name[name])
+                if indexed:
+                    unresolved.append(f"{name}.{arg.arg} (indexed/attribute use needs an explicit interface)")
+                    continue
+                if not assume_float or not (assume_scalar or elemental):
+                    unresolved.append(f"{name}.{arg.arg}")
+                    continue
+                signature = ('real', 0)
+                fn._xp2f_module_needs_elemental = elemental and not assume_scalar
+                if fn._xp2f_module_needs_elemental and not elementwise_body(fn):
+                    raise NotImplementedError(
+                        f"--module: {name} is not eligible for ELEMENTAL rank inference; "
+                        "only simple arithmetic returns are currently proven elementwise; "
+                        "annotate its arguments or use --assume-scalar")
+                print(f"Warning: --module: assuming {name}.{arg.arg} is real "
+                      + ("with elemental application" if elemental and not assume_scalar else "scalar"), file=sys.stderr)
+            interface.append(signature)
+            if arg.annotation is None:
+                base = {'real': 'float', 'int': 'int', 'logical': 'bool', 'complex': 'complex', 'char': 'str'}[signature[0]]
+                annotation = base + ('[' + ','.join(':' for _ in range(signature[1])) + ']' if signature[1] else '')
+                arg.annotation = ast.Constant(value=annotation)
+        fn._xp2f_module_interface = interface
+    if unresolved:
+        raise NotImplementedError("--module: cannot infer argument type/rank for " + ', '.join(unresolved)
+                                  + "; add annotations or typed callers, or explicitly use "
+                                  "--assume-float with --assume-scalar or --elemental")
+
+
 def transpile_file(
     py_path,
     helper_paths,
@@ -76274,6 +76754,9 @@ def transpile_file(
     perf_hints=False,
     suppress_function_print=False,
     report_specializations=False,
+    module_only=False,
+    assume_float=False,
+    assume_scalar=False,
 ):
     specialization_notes = set() if report_specializations else None
     if src_override is not None:
@@ -76282,6 +76765,9 @@ def transpile_file(
         src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
     stem = Path(py_path).stem
     tree = ast.parse(src)
+    if module_only:
+        _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
+    reject_undefined_names_in_functions(tree)
     tree = rewrite_literal_string_sequence_lengths(tree)
     tree = rewrite_nullable_string_results(tree)
     nullable_string_results = getattr(tree, "_xp2f_nullable_string_results", False)
@@ -76486,7 +76972,7 @@ def transpile_file(
                     and not is_main_guard_if(s)
                 ]
 
-    if not exec_nodes:
+    if not exec_nodes and not module_only:
         raise NotImplementedError(
             "no transpilable executable statements found; "
             "supported guarded-main form is: if __name__ == '__main__': main()"
@@ -76512,9 +76998,10 @@ def transpile_file(
             and not is_main_guard_if(s)
         ]
 
-    local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
-    inline_simple_value_returning_local_functions(effective_tree.body, local_funcs)
-    local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
+    if not module_only:
+        local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
+        inline_simple_value_returning_local_functions(effective_tree.body, local_funcs)
+        local_funcs = prune_unreachable_local_functions(effective_tree, local_funcs, source_tree=tree)
     for line, name in normalize_integer_chr_rebinding(local_funcs, tree):
         print(
             f"{py_path}:{line}: Warning: variable '{name}' changes type from integer to character; "
@@ -76673,7 +77160,7 @@ def transpile_file(
     stem = Path(py_path).stem
     # Tagged string results require local tuple-return procedures. The narrow
     # structured driver generator does not carry their signatures or guards.
-    if flat or nullable_string_results:
+    if flat or nullable_string_results or module_only:
         f90 = generate_flat(
             effective_tree,
             stem,
@@ -76692,6 +77179,7 @@ def transpile_file(
             rng_replay_path=rng_replay_path,
             value_scalar_args=value_scalar_args,
             specialization_notes=specialization_notes,
+            module_only=module_only,
         )
         used_flat_fallback = False
     else:
@@ -77034,6 +77522,15 @@ def transpile_file(
     # so this only ever affects lines a later pass left too long.
     f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
+    if module_only:
+        for fn in local_funcs:
+            if getattr(fn, "_xp2f_module_needs_elemental", False):
+                if not re.search(r"(?im)^\s*[^!\n]*\belemental\b[^\n]*\b(?:function|subroutine)\s+"
+                                 + re.escape(fn.name) + r"\s*\(", f90):
+                    raise NotImplementedError(
+                        f"--module: {fn.name} has unresolved argument rank and is not eligible "
+                        "for ELEMENTAL; annotate its arguments or use --assume-scalar"
+                    )
     out_path = Path(out_path) if out_path else Path(py_path).with_name(f"{Path(py_path).stem}_p.f90")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     f90 = f"! transpiled by xp2f.py from {Path(py_path).name} on {stamp}\n" + f90
@@ -77214,6 +77711,9 @@ def main():
     ap.add_argument("input_py", help="input python source")
     ap.add_argument("helpers", nargs="*", help="zero or more helper .f90 module files")
     ap.add_argument("--out", help="output .f90 path (default: input basename with _p.f90)")
+    ap.add_argument("--module", action="store_true", help="emit a Fortran procedure module without a main program; --compile creates an object file")
+    ap.add_argument("--assume-float", action="store_true", help="with --module, explicitly assume real type for unresolved arguments (with a warning)")
+    ap.add_argument("--assume-scalar", action="store_true", help="with --module, explicitly assume scalar rank for unresolved arguments (with a warning)")
     ap.add_argument("--strict", action="store_true", help="strict Python-source validation mode (no transpilation)")
     ap.add_argument("--strict-fix", action="store_true", help="write a strict-friendly Python source (non-inplace by default)")
     ap.add_argument("--strict-fix-overloads", action="store_true", help="with --strict-fix, generate typed overload variants for eligible polymorphic local functions")
@@ -77348,6 +77848,13 @@ def main():
             args.compiler = default_timing_compiler_command()
     if args.compile_fast_fail:
         args.check_fortran = True
+
+    if args.module and (args.run or args.partial or args.strict or args.strict_fix or args.type):
+        print("Invalid options: --module cannot be combined with execution, --partial, --strict, --strict-fix, or --type")
+        return 1
+    if (args.assume_float or args.assume_scalar) and not args.module:
+        print("Invalid options: --assume-float and --assume-scalar require --module")
+        return 1
 
     if args.strict_fix_inplace and (not args.strict_fix):
         print("Strict-fix: FAIL (--strict-fix-inplace requires --strict-fix)")
@@ -77706,6 +78213,9 @@ def main():
             perf_hints=args.perf_hints,
             suppress_function_print=args.suppress_function_print,
             report_specializations=args.report_specializations,
+            module_only=args.module,
+            assume_float=args.assume_float,
+            assume_scalar=args.assume_scalar,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:
@@ -77818,7 +78328,9 @@ def main():
             return helper_cp.returncode
         exe = out.with_suffix(".exe")
         cmd = compiler_parts + [*(helper_link_inputs or []), str(out)]
-        if args.run or args.compile:
+        if args.module:
+            cmd = compiler_parts + ["-c", str(out), "-o", str(out.with_suffix(".o"))]
+        elif args.run or args.compile:
             cmd = cmd + ["-o", str(exe)]
         print("Build:", " ".join(cmd))
         cp = subprocess.run(cmd, capture_output=True, text=True)
