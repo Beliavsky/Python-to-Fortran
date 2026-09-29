@@ -4893,6 +4893,199 @@ def rewrite_math_const_from_import_to_attribute(tree):
     return out
 
 
+def mark_value_context_boolops(tree):
+    """Mark each `and`/`or` whose result is used as a value
+    (`_xp2f_value_ctx`), not only for its truth: Python returns an operand
+    there (`flag and n` is n, `0 or n` is n), whereas the Fortran lowering
+    gives a LOGICAL. Truth contexts are if/while/assert tests, IfExp tests,
+    comprehension filters, `not` operands and operands of an enclosing
+    and/or in a truth context. Unmarked nodes keep the LOGICAL lowering."""
+    truth_children = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            truth_children.add(id(n.test))
+        elif isinstance(n, ast.comprehension):
+            truth_children.update(id(c) for c in n.ifs)
+        elif isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            truth_children.add(id(n.operand))
+
+    def _visit(node, truth):
+        if isinstance(node, ast.BoolOp):
+            if not truth:
+                node._xp2f_value_ctx = True
+            for v in node.values:
+                _visit(v, truth)
+            return
+        for child in ast.iter_child_nodes(node):
+            _visit(child, id(child) in truth_children)
+
+    _visit(tree, False)
+    return tree
+
+
+def hoist_stdout_writing_calls_out_of_print(tree):
+    """`print(a, g(x))` where g (directly or through the functions it calls)
+    itself prints: the Fortran function reference runs inside the outer
+    write statement, and a nested write to the same unit stops with
+    "Fortran runtime error: Recursive I/O not allowed". Python evaluates
+    every argument before printing anything, so hoisting the call first
+    (`io_tmp_1 = g(x)`, then `print(a, io_tmp_1)`) keeps the output order.
+    Writes to another unit or to an internal file are allowed, so only
+    stdout (`print` without `file=`, `file=sys.stdout`, `sys.stdout.write`)
+    matters. Calls that Python evaluates conditionally (inside an `x if c
+    else y` branch, after the first operand of `and`/`or`, in a
+    comprehension or lambda) are left alone, as are functions that return
+    nothing or a tuple."""
+    def _is_sys_stdout(node):
+        return (isinstance(node, ast.Attribute) and node.attr == "stdout"
+                and isinstance(node.value, ast.Name) and node.value.id == "sys")
+
+    def _is_stdout_write(call):
+        if isinstance(call.func, ast.Name) and call.func.id == "print":
+            for kw in call.keywords:
+                if kw.arg == "file":
+                    return _is_sys_stdout(kw.value)
+            return True
+        return (isinstance(call.func, ast.Attribute) and call.func.attr == "write"
+                and _is_sys_stdout(call.func.value))
+
+    # sys.stdout.write(s) as a statement is print(s, end="") (it was
+    # silently dropped), and a bare sys.stdout.flush() has no effect here.
+    for owner in list(ast.walk(tree)):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(owner, field, None)
+            if not isinstance(stmts, list) or not stmts or not isinstance(stmts[0], ast.stmt):
+                continue
+            new_stmts = []
+            for st in stmts:
+                c = st.value if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) else None
+                if (c is not None and isinstance(c.func, ast.Attribute) and _is_sys_stdout(c.func.value)
+                        and not c.keywords):
+                    if c.func.attr == "flush" and not c.args:
+                        continue
+                    if c.func.attr == "write" and len(c.args) == 1:
+                        c.func = ast.copy_location(ast.Name(id="print", ctx=ast.Load()), c.func)
+                        c.keywords = [ast.keyword(arg="end", value=ast.Constant(value=""))]
+                new_stmts.append(st)
+            if not new_stmts:
+                new_stmts = [ast.copy_location(ast.Pass(), stmts[0])]
+            setattr(owner, field, new_stmts)
+
+    defs = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs.setdefault(fn.name, []).append(fn)
+    if not defs:
+        ast.fix_missing_locations(tree)
+        return tree
+    writes = set()
+    calls = {}
+    for name, fns in defs.items():
+        called = set()
+        for fn in fns:
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call):
+                    if _is_stdout_write(n):
+                        writes.add(name)
+                    if isinstance(n.func, ast.Name) and n.func.id in defs:
+                        called.add(n.func.id)
+        calls[name] = called
+    changed = True
+    while changed:
+        changed = False
+        for name, called in calls.items():
+            if name not in writes and called & writes:
+                writes.add(name)
+                changed = True
+    if not writes:
+        ast.fix_missing_locations(tree)
+        return tree
+
+    def _hoistable(name):
+        for fn in defs[name]:
+            rets = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+            if not any(r.value is not None for r in rets):
+                return False
+            if any(isinstance(r.value, ast.Tuple) for r in rets):
+                return False
+        return True
+
+    hoistable = {name for name in writes if _hoistable(name)}
+    if not hoistable:
+        ast.fix_missing_locations(tree)
+        return tree
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    counter = [0]
+
+    def _fresh():
+        while True:
+            counter[0] += 1
+            nm = f"io_tmp_{counter[0]}"
+            if nm not in used:
+                used.add(nm)
+                return nm
+
+    def _hoist(node, out):
+        # Replace unconditionally evaluated hoistable calls in `node`,
+        # appending `tmp = call` assignments to `out` in evaluation order.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in hoistable:
+            tmp = _fresh()
+            assign = ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=node)
+            ast.copy_location(assign, node)
+            out.append(assign)
+            return ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), node)
+        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            return node
+        if isinstance(node, ast.IfExp):
+            node.test = _hoist(node.test, out)
+            return node
+        if isinstance(node, ast.BoolOp):
+            node.values[0] = _hoist(node.values[0], out)
+            return node
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                setattr(node, field, _hoist(value, out))
+            elif isinstance(value, list):
+                setattr(node, field, [_hoist(v, out) if isinstance(v, ast.AST) else v for v in value])
+        return node
+
+    def _hoist_arg(arg, out):
+        # A top-level `g(x) if c else 0` argument is moved as a whole into
+        # an assignment, whose own lowering runs only the chosen branch;
+        # hoisting just the call would run it unconditionally. `c and g(x)`
+        # is left in place: its value lowering is not short-circuit, so an
+        # assignment would still call g when Python does not.
+        arg = _hoist(arg, out)
+        if isinstance(arg, ast.IfExp) and any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in hoistable
+                for n in ast.walk(arg)):
+            tmp = _fresh()
+            assign = ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=arg)
+            ast.copy_location(assign, arg)
+            out.append(assign)
+            return ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), arg)
+        return arg
+
+    for owner in list(ast.walk(tree)):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(owner, field, None)
+            if not isinstance(stmts, list) or not stmts or not isinstance(stmts[0], ast.stmt):
+                continue
+            new_stmts = []
+            for st in stmts:
+                if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and _is_stdout_write(st.value):
+                    hoisted = []
+                    call = st.value
+                    call.args = [_hoist_arg(a, hoisted) for a in call.args]
+                    for kw in call.keywords:
+                        kw.value = _hoist_arg(kw.value, hoisted)
+                    new_stmts.extend(hoisted)
+                new_stmts.append(st)
+            setattr(owner, field, new_stmts)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_call_attribute_access_to_temp(tree):
     """`get_A().x` (attribute/method access chained DIRECTLY off a call
     to a function that constructs and returns a user class instance, no
@@ -26471,6 +26664,30 @@ class translator(ast.NodeVisitor):
         scope |= new
         return new
 
+    def _boolop_value_kind(self, node):
+        """For an `and`/`or` used as a value (mark_value_context_boolops)
+        with non-LOGICAL operands: "int" or "real" when every operand is a
+        numeric scalar name or constant, so the Python result (an operand)
+        can be computed eagerly; raises for other operands, which the
+        LOGICAL lowering would print as T/F. None for a LOGICAL result."""
+        if not getattr(node, "_xp2f_value_ctx", False):
+            return None
+        kinds = [self._expr_kind(v) for v in node.values]
+        if all(k == "logical" for k in kinds):
+            return None
+        simple = all(
+            isinstance(v, (ast.Name, ast.Constant))
+            or (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub) and isinstance(v.operand, ast.Constant))
+            for v in node.values
+        )
+        if (simple and all(k in {"int", "real"} for k in kinds)
+                and all(int(self._rank_expr(v)) == 0 for v in node.values)):
+            return "real" if "real" in kinds else "int"
+        raise NotImplementedError(
+            "`and`/`or` used as a value with non-boolean operands (Python returns one of the operands) "
+            "is supported only for numeric names and constants; use an explicit if/else"
+        )
+
     def _expr_kind(self, node):
         if isinstance(node, ast.Name) and node.id in self.__dict__.get("_comp_int_scope", ()):
             return "int"
@@ -26940,7 +27157,7 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Compare):
             return "logical"
         if isinstance(node, ast.BoolOp):
-            return "logical"
+            return self._boolop_value_kind(node) or "logical"
         if isinstance(node, ast.Subscript):
             if self._expr_kind(node.value) == "char" and self._rank_expr(node.value) == 0:
                 return "char"
@@ -34734,6 +34951,26 @@ class translator(ast.NodeVisitor):
                 op = ".or."
             else:
                 raise NotImplementedError("unsupported boolean operator")
+            _value_kind = self._boolop_value_kind(node)
+            if _value_kind is not None:
+                # Python returns an operand: `a and b` is b when a is truthy,
+                # else a; `a or b` is a when a is truthy, else b. Operands
+                # are names or constants (see _boolop_value_kind), so
+                # evaluating them eagerly is safe.
+                def _val(v):
+                    txt = self.expr(v)
+                    if _value_kind == "real" and self._expr_kind(v) == "int":
+                        return f"real({txt}, kind=dp)"
+                    return txt
+                zero = "0.0_dp" if _value_kind == "real" else "0"
+                acc = _val(node.values[-1])
+                for v in reversed(node.values[:-1]):
+                    vt = _val(v)
+                    if isinstance(node.op, ast.And):
+                        acc = f"merge({acc}, {vt}, {vt} /= {zero})"
+                    else:
+                        acc = f"merge({vt}, {acc}, {vt} /= {zero})"
+                return acc
             parts = []
             for v in node.values:
                 t = self.expr(v)
@@ -76821,6 +77058,8 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = hoist_stdout_writing_calls_out_of_print(tree)
+    tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
@@ -77337,6 +77576,8 @@ def transpile_file(
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = hoist_stdout_writing_calls_out_of_print(tree)
+    tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     validate_imports_supported(tree, py_path)
     validate_no_duplicate_top_level_defs(tree)
@@ -77352,6 +77593,8 @@ def transpile_file(
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = hoist_stdout_writing_calls_out_of_print(tree)
+    tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     tree = normalize_scipy_submodule_attribute_calls(tree)
@@ -78115,6 +78358,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = hoist_stdout_writing_calls_out_of_print(tree)
+    tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     validate_imports_supported(tree, py_path)

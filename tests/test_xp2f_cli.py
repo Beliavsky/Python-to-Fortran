@@ -66,7 +66,9 @@ def test_xp2f_ambiguous_set_comparison_diagnosed() -> None:
 
 
 @pytest.mark.parametrize("source, message", [
-    ("def make():\n    print('called')\n    return {1}\na = {1, 2}\nprint(make() < a)\n",
+    # A call that prints is hoisted into a temporary instead (see
+    # test_xp2f_print_of_function_that_prints_does_not_recurse_io).
+    ("def make():\n    return {1}\na = {1, 2}\nprint(make() < a)\n",
      "assigning its result to a variable"),
     ("a = {1}\nb = [1]\nprint(a == b)\n", "two consistently set-valued operands"),
 ])
@@ -23886,3 +23888,116 @@ def test_xp2f_same_named_nested_functions_stay_distinct(tmp_path: Path) -> None:
         "callback(0.5, 1.0)",
         "callback(0.5, 2.0)",
     ])
+
+
+def test_xp2f_print_of_function_that_prints_does_not_recurse_io(tmp_path: Path) -> None:
+    # print(g(x)) where g (directly, through another function, or via
+    # sys.stdout.write) prints: the function ran inside the outer write
+    # and stopped with "Fortran runtime error: Recursive I/O not allowed".
+    # The call is hoisted into a temporary; a conditional-expression
+    # argument is hoisted whole so only the chosen branch runs.
+    _run_xp2f_compile_diff(tmp_path, "xprint_recursive_io.py", [
+        "import sys",
+        "import numpy as np",
+        "",
+        "",
+        "def g(x):",
+        "    print('in g', x)",
+        "    return 2 * x",
+        "",
+        "",
+        "def h(x):",
+        "    return g(x) + 1",
+        "",
+        "",
+        "def iterate(n):",
+        "    v = np.zeros(2)",
+        "    for k in range(n):",
+        "        print('step', k)",
+        "        v = v + k",
+        "    return v",
+        "",
+        "",
+        "def show(x):",
+        "    sys.stdout.write('show\\n')",
+        "    sys.stdout.flush()",
+        "    return x * 3",
+        "",
+        "",
+        "print('a', g(1), h(3))",
+        "r = iterate(3)",
+        "print(np.round(iterate(2), 6))",
+        "print('sw', show(2))",
+        "flag = False",
+        "print('cond', g(4) if flag else 0, g(5) if not flag else -1)",
+        "for i in range(2):",
+        "    if i > 0:",
+        "        print('loop', g(i))",
+        "sys.stdout.write('w=%d\\n' % g(7))",
+        "",
+        "",
+        "def make():",
+        "    print('called')",
+        "    return {1}",
+        "",
+        "",
+        "a = {1, 2}",
+        "print(int(make() < a), int(a < make()))",
+    ])
+
+
+def test_xp2f_sys_stdout_write_is_not_dropped(tmp_path: Path) -> None:
+    # sys.stdout.write(...) used to be silently dropped.
+    lines = [
+        "import sys",
+        "k = 7",
+        "sys.stdout.write('a\\nb')",
+        "sys.stdout.write('|w=%d\\n' % k)",
+        "sys.stdout.write('end\\n')",
+    ]
+    _run_xp2f_compile_diff(tmp_path, "xstdout_write.py", lines)
+    py = subprocess.run([sys.executable, str(tmp_path / "xstdout_write.py")],
+                        cwd=tmp_path, capture_output=True, text=True, check=True)
+    exe = tmp_path / ("xstdout_write_p.exe" if sys.platform == "win32" else "xstdout_write_p")
+    ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True)
+    assert ft.stdout == py.stdout
+
+
+def test_xp2f_and_or_used_as_value_returns_an_operand(tmp_path: Path) -> None:
+    # `z or n` is n and `n and x` is x in Python; the LOGICAL lowering
+    # printed T/F. Truth contexts (if/while tests, not) are unchanged.
+    _run_xp2f_compile_diff(tmp_path, "xandor_value.py", [
+        "n = 11",
+        "z = 0",
+        "x = 2.5",
+        "print('and', z and n, n and z, n and x)",
+        "y = z or n",
+        "print(y, 0 or x, n or 3, z or 0, -1 and n)",
+        "if n and z:",
+        "    print('never')",
+        "if n or z:",
+        "    print('yes')",
+        "while z and n:",
+        "    z = 0",
+        "print(int(not (z or n)))",
+    ])
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        ["s = 'a'", "print(s or 'b')"],
+        ["n = 11", "flag = True", "print(flag and n)"],
+        ["d = 0", "n = 5", "print(d and n // d)"],
+    ],
+)
+def test_xp2f_and_or_value_with_unsupported_operands_is_reported(tmp_path: Path, lines: list) -> None:
+    src = tmp_path / "xandor_reject.py"
+    src.write_text("\n".join(lines + [""]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "`and`/`or` used as a value with non-boolean operands" in out, out
