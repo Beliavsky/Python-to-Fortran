@@ -73784,8 +73784,11 @@ def generate_flat(
             # explicit-real marker in the body, so this filter emptied
             # out the one real (base=1.5) candidate observed at the
             # actual call site.
-            _pairs_wo_real = {(k, r) for (k, r) in pairs if k != "real"}
-            _triads_wo_real = {(k, r, is_list) for (k, r, is_list) in triads if k != "real"}
+            # Integer element assignments do not change an ndarray's dtype.
+            # Preserve real-array profiles, especially for mutable dummies:
+            # converting another caller's array would discard its mutations.
+            _pairs_wo_real = {(k, r) for (k, r) in pairs if k != "real" or r > 0}
+            _triads_wo_real = {(k, r, is_list) for (k, r, is_list) in triads if k != "real" or r > 0}
             if _pairs_wo_real:
                 pairs = _pairs_wo_real
                 triads = _triads_wo_real
@@ -73803,6 +73806,7 @@ def generate_flat(
         for k, r in sorted(pairs):
             if (
                 k == "real"
+                and r == 0
                 and fn.name in local_func_arg_kinds
                 and local_func_arg_kinds[fn.name]
                 and local_func_arg_kinds[fn.name][0] == "int"
@@ -73894,8 +73898,8 @@ def generate_flat(
                 # heuristic blind to call-site evidence must never erase
                 # the sole real candidate real call-site observations
                 # already established).
-                _prs_wo_real = {(k, r) for (k, r) in prs if k != "real"}
-                _trs_wo_real = {(k, r, is_list) for (k, r, is_list) in trs if k != "real"}
+                _prs_wo_real = {(k, r) for (k, r) in prs if k != "real" or r > 0}
+                _trs_wo_real = {(k, r, is_list) for (k, r, is_list) in trs if k != "real" or r > 0}
                 if _prs_wo_real:
                     prs = _prs_wo_real
                     trs = _trs_wo_real
@@ -73989,6 +73993,7 @@ def generate_flat(
         for k, r in pair_iter:
             if (
                 k == "real"
+                and r == 0
                 and iv < len(local_func_arg_kinds.get(fn.name, []))
                 and local_func_arg_kinds.get(fn.name, [])[iv] == "int"
             ):
