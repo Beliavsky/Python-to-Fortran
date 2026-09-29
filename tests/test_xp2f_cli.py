@@ -23803,3 +23803,86 @@ def test_xp2f_percent_conversion_without_python_value_is_reported(tmp_path: Path
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert expected in out, out
+
+
+def test_xp2f_listcomp_true_division_modulo_and_imported_constant(tmp_path: Path) -> None:
+    # Rosetta-style comprehensions: int/int `/` became Fortran integer
+    # division ([1.0 2.0 ...] for [1.5 2.5 ...]), `%` used mod (wrong sign
+    # for negative operands), and `pi` from `from math import pi` was
+    # rejected as "ListComp currently supports only single-generator form".
+    _run_xp2f_compile_diff(tmp_path, "xlistcomp_div.py", [
+        "from math import pi",
+        "import numpy as np",
+        "",
+        "",
+        "def f():",
+        "    b = np.array([(2 * i * pi + 1) / 2 for i in range(1, 7)])",
+        "    c = np.array([(2 * i + 1) / 2 for i in range(1, 7)])",
+        "    d = np.array([(i - 4) % 3 for i in range(1, 7)])",
+        "    e = np.array([i / 4 for i in range(-3, 3)])",
+        "    print(np.round(b, 6))",
+        "    print(c)",
+        "    print(d)",
+        "    print(e)",
+        "",
+        "",
+        "f()",
+    ])
+
+
+def test_xp2f_try_solve_except_linalg_error_with_any_handler(tmp_path: Path) -> None:
+    # try: step = np.linalg.solve(A, b) / except np.linalg.LinAlgError:
+    # break -- was "unsupported try/except pattern" (Rosetta find_fit).
+    _run_xp2f_compile_diff(tmp_path, "xtry_solve.py", [
+        "import numpy as np",
+        "",
+        "",
+        "def iterate(n):",
+        "    x = np.zeros(2)",
+        "    for k in range(n):",
+        "        a = np.array([[1.0, 2.0], [2.0, 4.0 + (2 - k)]])",
+        "        b = np.array([1.0, 2.0])",
+        "        try:",
+        "            x = np.linalg.solve(a, b)",
+        "        except np.linalg.LinAlgError:",
+        "            print('singular at', k)",
+        "            break",
+        "        print(k, np.round(x, 6))",
+        "    return x",
+        "",
+        "",
+        "r = iterate(5)",
+        "print(np.round(r, 6))",
+    ])
+
+
+def test_xp2f_same_named_nested_functions_stay_distinct(tmp_path: Path) -> None:
+    # Two nested `f`s in different functions were hoisted to one
+    # module-level `f`; the other f's int calls made it a generic
+    # interface, which gfortran rejects as an actual argument.
+    _run_xp2f_compile_diff(tmp_path, "xnested_same_name.py", [
+        "from math import sin",
+        "",
+        "",
+        "def poly(a, b, c):",
+        "    def f(x):",
+        "        return a * x ** 2 + b * x + c",
+        "",
+        "    print(f(1), f(2), f(3))",
+        "",
+        "",
+        "def simpson(f, a, b):",
+        "    return (b - a) / 6 * (f(a) + 4 * f((a + b) / 2) + f(b))",
+        "",
+        "",
+        "def callback(a, k):",
+        "    def f(x):",
+        "        return a * sin(k * x)",
+        "",
+        "    print(round(simpson(f, 0.0, 3.0), 10))",
+        "",
+        "",
+        "poly(1, 2, 1)",
+        "callback(0.5, 1.0)",
+        "callback(0.5, 2.0)",
+    ])

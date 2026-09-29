@@ -7074,6 +7074,15 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
         _scan(fn.body)
         return found
 
+    # A hoisted def keeps its name unless another def anywhere in the
+    # program shares it: two nested `f`s in different functions (Rosetta
+    # nested_polynomial / nested_callback_example) became one module-level
+    # name, so the other f's int calls made it a generic interface, which
+    # cannot be passed as an actual argument.
+    def_name_counts = Counter(
+        n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    toplevel_names = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
     new_body = []
     for stmt in tree.body:
         if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -7142,6 +7151,23 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
                 init_stmts.append(init_stmt)
 
         stmt.body = _rebuild_stmts(stmt.body, set(defs_by_name.keys()), defs_by_name, enclosing_name)
+
+        hoisted_renames = {}
+        for new_def in hoisted_defs:
+            if def_name_counts[new_def.name] > 1 or new_def.name in toplevel_names:
+                fresh = f"{enclosing_name}_{new_def.name}"
+                while fresh in toplevel_names or def_name_counts[fresh]:
+                    fresh += "_"
+                hoisted_renames[new_def.name] = fresh
+                toplevel_names.add(fresh)
+                new_def.name = fresh
+        if hoisted_renames:
+            # References in the enclosing function (calls, and the name
+            # passed as a callback) and inside the hoisted defs themselves.
+            for root in [stmt] + hoisted_defs:
+                for n in ast.walk(root):
+                    if isinstance(n, ast.Name) and n.id in hoisted_renames:
+                        n.id = hoisted_renames[n.id]
 
         new_body.extend(init_stmts)
         new_body.extend(hoisted_defs)
@@ -15080,6 +15106,11 @@ def detect_needed_helpers(tree):
                     and _scan_is_linalg_attr(h_st.value.value, "lstsq")
                 ):
                     needed.add("linalg_solve_safe")
+            if (not node.orelse and not node.finalbody and len(node.handlers) == 1 and len(node.body) == 1
+                    and isinstance(node.body[0], ast.Assign)
+                    and _scan_is_linalg_attr(node.body[0].value, "solve")):
+                # try: x = solve(A, b) / except LinAlgError: <any handler>
+                needed.add("linalg_solve_safe")
             self.generic_visit(node)
 
         def visit_ListComp(self, node):
@@ -36281,11 +36312,19 @@ class translator(ast.NodeVisitor):
                         elif isinstance(n.op, ast.Mult):
                             op_txt = "*"
                         elif isinstance(n.op, ast.Div):
+                            # Python's / is true division: an int/int
+                            # element ([(2 * i + 1) / 2 for i in ...]) must
+                            # not become Fortran integer division.
+                            if (_kind_with_loopvar(n.left) in {"int", "logical"}
+                                    and _kind_with_loopvar(n.right) in {"int", "logical"}):
+                                return f"(real({_map_expr(n.left)}, kind=dp) / {_map_expr(n.right)})"
                             op_txt = "/"
                         elif isinstance(n.op, ast.Pow):
                             op_txt = "**"
                         elif isinstance(n.op, ast.Mod):
-                            return f"mod({_map_expr(n.left)}, {_map_expr(n.right)})"
+                            # modulo, not mod: Python's % takes the sign of
+                            # the divisor (-3 % 2 is 1).
+                            return f"modulo({_map_expr(n.left)}, {_map_expr(n.right)})"
                         elif (
                             isinstance(n.op, (ast.BitXor, ast.BitAnd, ast.BitOr))
                             and _kind_with_loopvar(n.left) == "int"
@@ -36300,6 +36339,14 @@ class translator(ast.NodeVisitor):
                             return f"(-{_map_expr(n.operand)})"
                         if isinstance(n.op, ast.UAdd):
                             return f"(+{_map_expr(n.operand)})"
+                    if not any(
+                        isinstance(_n, ast.Name) and _n.id == loop_var and isinstance(_n.ctx, ast.Load)
+                        for _n in ast.walk(n)
+                    ) and self._rank_expr(n) == 0:
+                        # A loop-invariant scalar such as `pi` from `from
+                        # math import pi` (an attribute by now), which
+                        # broadcasts against the mapped loop variable.
+                        return self.expr(n)
                     raise NotImplementedError("ListComp element expression is unsupported")
 
                 def _map_pred(n):
@@ -36374,6 +36421,7 @@ class translator(ast.NodeVisitor):
                         return base
                     raise NotImplementedError("ListComp filter expression is unsupported")
 
+                _single_gen_error = None
                 try:
                     if _char_scalar_iter:
                         uses_loop_var_elt = any(
@@ -36404,8 +36452,8 @@ class translator(ast.NodeVisitor):
                             return f"pack({mapped}, {masks[0]})"
                         return f"pack({mapped}, ({' .and. '.join(masks)}))"
                     return mapped
-                except NotImplementedError:
-                    pass
+                except NotImplementedError as _exc:
+                    _single_gen_error = str(_exc)
 
                 # Print-oriented fallback: [f(v) for v in x.tolist()] -> x
                 if (
@@ -36415,6 +36463,10 @@ class translator(ast.NodeVisitor):
                     and len(it.args) == 0
                 ):
                     return self.expr(it.func.value)
+                # Report why the single generator was declined rather than
+                # claiming it had several.
+                if _single_gen_error:
+                    raise NotImplementedError(_single_gen_error)
             raise NotImplementedError("ListComp currently supports only single-generator form")
 
         if isinstance(node, ast.Call):
@@ -47712,28 +47764,69 @@ class translator(ast.NodeVisitor):
                 return None
             return tgt, solve_call.args[0], solve_call.args[1]
 
+        def _catches_linalg_error(handler_node):
+            # `except:`, `except Exception:` or `except np.linalg.LinAlgError:`
+            # -- the failure linalg_solve_safe reports.
+            typ = handler_node.type
+            if typ is None:
+                return True
+            if isinstance(typ, ast.Name):
+                return typ.id in {"Exception", "LinAlgError"}
+            return isinstance(typ, ast.Attribute) and typ.attr == "LinAlgError"
+
+        def _match_solve_body(body_st):
+            if not (
+                isinstance(body_st, ast.Assign)
+                and len(body_st.targets) == 1
+                and isinstance(body_st.targets[0], ast.Name)
+                and _is_linalg_attr_call(body_st.value, "solve")
+                and len(body_st.value.args) >= 2
+                and not body_st.value.keywords
+            ):
+                return None
+            return body_st.targets[0].id, body_st.value.args[0], body_st.value.args[1]
+
         self._emit_comments_for(node)
         if node.orelse or node.finalbody:
             raise NotImplementedError("unsupported try/except/else/finally pattern")
         if len(node.handlers) != 1:
             raise NotImplementedError("unsupported try with multiple except handlers")
         handler = node.handlers[0]
+        matched = None
         if len(node.body) == 1 and len(handler.body) == 1:
             matched = _match_solve_fallback(node.body[0], handler.body[0])
-            if matched is not None:
-                tgt, a_node, b_node = matched
-                self.o.w("block")
-                self.o.push()
-                self.o.w("logical :: solve_ok_try")
+        if matched is None and len(node.body) == 1 and handler.name is None and _catches_linalg_error(handler):
+            # try: x = np.linalg.solve(A, b) / except LinAlgError: <any
+            # statements, e.g. break or a fallback assignment>.
+            matched = _match_solve_body(node.body[0])
+            if matched is not None and self._rank_expr(matched[2]) != 1:
+                matched = None  # linalg_solve_safe takes a vector b only
+            general = matched is not None
+        else:
+            general = False
+        if matched is not None:
+            tgt, a_node, b_node = matched
+            self.o.w("block")
+            self.o.push()
+            self.o.w("logical :: solve_ok_try")
+            if general:
+                # Python leaves the target unchanged when solve raises; the
+                # intent(out) result would be deallocated, so solve into a
+                # temporary and assign it only on success.
+                self.o.w("real(kind=dp), allocatable :: solve_x_try(:)")
+                self.o.w(f"call linalg_solve_safe({self.expr(a_node)}, {self.expr(b_node)}, solve_x_try, solve_ok_try)")
+                self.o.w(f"if (solve_ok_try) {tgt} = solve_x_try")
+            else:
                 self.o.w(f"call linalg_solve_safe({self.expr(a_node)}, {self.expr(b_node)}, {tgt}, solve_ok_try)")
-                self.o.w("if (.not. solve_ok_try) then")
-                self.o.push()
-                self.visit(handler.body[0])
-                self.o.pop()
-                self.o.w("end if")
-                self.o.pop()
-                self.o.w("end block")
-                return
+            self.o.w("if (.not. solve_ok_try) then")
+            self.o.push()
+            for st in handler.body:
+                self.visit(st)
+            self.o.pop()
+            self.o.w("end if")
+            self.o.pop()
+            self.o.w("end block")
+            return
         if len(handler.body) == 1 and isinstance(handler.body[0], ast.Return):
             for st in node.body:
                 self.visit(st)
