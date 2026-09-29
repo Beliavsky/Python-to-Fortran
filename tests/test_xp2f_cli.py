@@ -3915,8 +3915,9 @@ def test_xp2f_old_style_percent_d_casts_real_args_for_write(tmp_path: Path) -> N
     # text rather than fixed-width Fortran I/F/G descriptors (which
     # overflow to asterisks).
     assert 'write(*,"(4(2x, a), 1x)")' in out_text
-    assert "py_format_int(int(vals(1)), 2, '')" in out_text
-    assert "py_format_real(0.0_dp, 4, 10, '', &" in out_text
+    assert "py_format_int(int(vals(1)), 2, '', 'd')" in out_text
+    joined = re.sub(r"&\s*\n\s*&\s*", "", out_text)
+    assert "py_format_real(0.0_dp, 4, 10, '', 'f')" in joined
     assert "py_format_real(1.0_dp, 6, 14, '', 'g')" in out_text
     assert "int(vals(2))" in out_text
 
@@ -23748,3 +23749,57 @@ def test_xp2f_print_percent_width_is_a_minimum_and_honors_flags(tmp_path: Path) 
     exe = tmp_path / ("xpercent_min_width_p.exe" if sys.platform == "win32" else "xpercent_min_width_p")
     ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True)
     assert ft.stdout == py.stdout
+
+
+def test_xp2f_percent_conversions_print_the_python_value(tmp_path: Path) -> None:
+    # Each case used to print a different value, not just a different
+    # layout: %o/%x/%X printed decimal, %c of an int variable and %r of an
+    # int wrote raw bytes, %r of a string lost its quotes, %.Ns did not
+    # truncate, and adjacent conversions ('%d%d') got a separating blank.
+    lines = [
+        "k = 255",
+        "m = -255",
+        "c = 66",
+        "word = 'abcdef'",
+        "print('%x %X %o %x' % (k, k, k, m))",
+        "print('%#x %#o %#X|%06x|%-6x|' % (k, k, k, k, k))",
+        "print('%c%c' % (c, 'z'))",
+        "print('%r %r %r' % (word, \"it's\", 3))",
+        "print('%.3s|%-4s|%5r' % (word, 'x', 'y'))",
+        "print('%d%d%s%x' % (1, 2, 'y', k))",
+        "print('val', '%x' % k, '%.2s' % word)",
+        "s = '%x/%o/%X' % (k, k, m)",
+        "print(s)",
+        "t = '%c|%.3s|%r|%r' % (c, word, word, 2)",
+        "print(t)",
+    ]
+    _run_xp2f_compile_diff(tmp_path, "xpercent_values.py", lines)
+    py = subprocess.run([sys.executable, str(tmp_path / "xpercent_values.py")],
+                        cwd=tmp_path, capture_output=True, text=True, check=True)
+    exe = tmp_path / ("xpercent_values_p.exe" if sys.platform == "win32" else "xpercent_values_p")
+    ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True)
+    # `print(s)` of a string variable is list-directed (a leading blank).
+    assert [line.strip() for line in ft.stdout.splitlines()] == py.stdout.splitlines()
+
+
+@pytest.mark.parametrize(
+    "lines, expected",
+    [
+        (["s = '%.3d' % 5", "print(s)"], "unsupported old-style string format '%.3d'"),
+        (["import numpy as np", "v = np.array([1, 2])", "print('%s' % v)"],
+         "unsupported old-style string format '%s' for an array argument"),
+        (["import numpy as np", "v = np.array([1, 2])", "s = 'v=%s' % v", "print(s)"],
+         "unsupported old-style string format '%s' for this argument"),
+        (["x = 2.5", "print('%c' % x)"], "the argument must be an int or a one-character string"),
+    ],
+)
+def test_xp2f_percent_conversion_without_python_value_is_reported(tmp_path: Path, lines: list, expected: str) -> None:
+    src = tmp_path / "xpercent_reject.py"
+    src.write_text("\n".join(lines + [""]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert expected in out, out

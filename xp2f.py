@@ -16256,8 +16256,10 @@ def detect_needed_helpers(tree):
                     needed.add("py_str_int")
                 if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[eEfFgG]", fmt_text):
                     needed.add("py_format_real")
-                if re.search(r"%[-+#0 ]*\d*[diu]", fmt_text):
+                if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[diuoxX]", fmt_text):
                     needed.add("py_format_int")
+                if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[rs]", fmt_text):
+                    needed.update({"py_repr_str", "str_head"})
                 # _percent_format_string_expr's padding helpers.
                 needed.update({"py_str_int", "str_ljust", "str_rjust", "str_zfill"})
                 # Old-style "%...spec..." % args formatting (the BinOp Mod
@@ -16275,8 +16277,7 @@ def detect_needed_helpers(tree):
                 if re.search(r"%(?:[-+#0 ]*\d*(?:\.\d+)?)?[diouxXeEfFgGcrs]", fmt_text):
                     needed.add("py_str")
                 # A WIDTH-bearing %s/%c/%r (e.g. "%10s") is expanded (see
-                # _fortran_write_for_percent_format's "desc_rjust" items)
-                # via this project's own str_rjust helper -- pads to
+                # _percent_text_piece) via this project's own str_rjust helper -- pads to
                 # max(width, actual length), matching Python's own %Ns
                 # (which pads a SHORTER value but never truncates a
                 # LONGER one, unlike a fixed-width Fortran `aW` edit
@@ -33373,6 +33374,43 @@ class translator(ast.NodeVisitor):
                     f"{self._wide_integer_arithmetic(node.right)})")
         return f"int({self.expr(node)}, kind=int64)"
 
+    def _percent_text_piece(self, a, code, flags, width, prec):
+        """A scalar `%c`, `%r` or `%s` conversion of `a` as a CHARACTER
+        expression. Raises for a combination that would otherwise print a
+        different value: `%c` needs an int or a one-character string, `%r`
+        of a string needs its quotes, and an array argument has no
+        NumPy-style text form here (an `a` descriptor wrote raw bytes)."""
+        if self._rank_expr(a) != 0:
+            raise NotImplementedError(
+                f"unsupported old-style string format '%{code}' for an array argument; "
+                "print the array as a separate print() argument"
+            )
+        ak = self._expr_kind(a)
+        txt = self.expr(a)
+        if code == "c":
+            if ak == "int":
+                piece = f"achar({txt})"
+            elif ak == "char":
+                piece = txt
+            else:
+                raise NotImplementedError("unsupported old-style string format '%c': the argument must be an int or a one-character string")
+        elif ak == "char":
+            piece = f"py_repr_str({txt})" if code == "r" else txt
+        elif ak == "logical":
+            piece = f"trim(merge('True ', 'False', {txt}))"
+        elif ak == "int":
+            piece = f"py_str_int({txt})"
+        else:
+            piece = f"py_str({txt})"
+        if prec is not None:
+            if code == "c":
+                raise NotImplementedError("unsupported old-style string format: precision with '%c'")
+            # '%.3s' % 'abcdef' is 'abc'.
+            piece = f"str_head({piece}, {int(prec)})"
+        if width:
+            piece = f"str_ljust({piece}, {int(width)})" if "-" in flags else f"str_rjust({piece}, {int(width)})"
+        return piece
+
     def _percent_format_string_expr(self, node):
         """`'fmt' % (a, b, ...)` (or a single `% a`) as a CHARACTER
         expression, honoring each conversion's flags/width/precision like
@@ -33420,34 +33458,21 @@ class translator(ast.NodeVisitor):
                 p = int(prec) if prec is not None else 6
                 parts.append(f"py_format_real({txt}, {p}, {w}, '{flags}', '{code}')")
                 continue
-            if code in "diu":
+            if code in "diuoxX":
                 if ak == "logical":
                     txt = f"merge(1, 0, {txt})"
                 elif ak != "int":
                     txt = f"int({txt})"
-                piece = f"py_str_int({txt})"
                 if prec is not None:
-                    return None
-                if "+" in flags or " " in flags:
-                    return None
-                if w:
-                    if "-" in flags:
-                        piece = f"str_ljust({piece}, {w})"
-                    elif "0" in flags:
-                        piece = f"str_zfill({piece}, {w})"
-                    else:
-                        piece = f"str_rjust({piece}, {w})"
-                parts.append(piece)
+                    # '%.3d' % 5 is '005'; the fallback lowering prints '5'.
+                    raise NotImplementedError(f"unsupported old-style string format '%.{prec}{code}'")
+                if code in "diu" and not flags and not w:
+                    parts.append(f"py_str_int({txt})")
+                else:
+                    parts.append(f"py_format_int({txt}, {w}, '{flags}', '{code}')")
                 continue
-            if code in "sr":
-                if code == "r" and ak == "char":
-                    return None
-                piece = txt if ak == "char" else f"py_str({txt})"
-                if prec is not None:
-                    return None
-                if w:
-                    piece = f"str_ljust({piece}, {w})" if "-" in flags else f"str_rjust({piece}, {w})"
-                parts.append(piece)
+            if code in "csr":
+                parts.append(self._percent_text_piece(a, code, flags, w, prec))
                 continue
             return None
         if pos < len(fmt_text):
@@ -34502,6 +34527,14 @@ class translator(ast.NodeVisitor):
                         if j >= nfmt or arg_i >= len(arg_nodes):
                             ok = False
                             break
+                        if (fmt_text[j] in "oxXcr" or ("." in fmt_text[i + 1:j] and fmt_text[j] in "diusr")
+                                or self._rank_expr(arg_nodes[arg_i]) != 0):
+                            # py_str would print a different value: '%x' %
+                            # 255 as '255', '%c' % 65 as '65', '%r' % 'a'
+                            # without quotes, '%.2s' % 'abc' untruncated.
+                            raise NotImplementedError(
+                                f"unsupported old-style string format '%{fmt_text[i + 1:j + 1]}' for this argument"
+                            )
                         parts.append(f"py_str({self.expr(arg_nodes[arg_i])})")
                         arg_i += 1
                         i = j + 1
@@ -59620,14 +59653,17 @@ class translator(ast.NodeVisitor):
                 an = arg_nodes[arg_i]
                 arg_i += 1
                 cl = code.lower()
-                if cl in {"d", "i", "u"} and self._rank_expr(an) == 0 and (width is not None or spec_body):
+                if cl in {"o", "x"} and self._rank_expr(an) != 0:
+                    # An iW descriptor would print the values in decimal.
+                    raise NotImplementedError(f"unsupported old-style print format '%{code}' for an array argument")
+                if (cl in {"o", "x"} or (cl in {"d", "i", "u"} and (width is not None or spec_body)))                         and self._rank_expr(an) == 0:
                     # An iW descriptor overflows to asterisks where Python's
                     # width is a minimum ('%3d' % 123456), and ignores the
                     # -, 0, + and space flags ('%05d' % 42 is '00042').
                     if prec is not None:
                         raise NotImplementedError(f"unsupported old-style print format '%{spec_body}{code}'")
                     flags = re.match(r"[-+#0 ]*", spec_body).group(0)
-                    items.append(("pyint", an, int(width) if width is not None else 0, flags))
+                    items.append(("pyint", an, int(width) if width is not None else 0, flags, code))
                 elif cl in {"d", "i", "o", "u", "x"}:
                     if width is not None:
                         _iw = int(width)
@@ -59689,10 +59725,9 @@ class translator(ast.NodeVisitor):
                     # ever pad, never truncate) with a bare, width-less
                     # `a` descriptor around its already-correctly-sized
                     # result.
-                    if width is not None:
-                        items.append(("desc_rjust", int(width), an))
-                    else:
-                        items.append(("desc", "a", an, False))
+                    flags = re.match(r"[-+#0 ]*", spec_body).group(0)
+                    items.append(("text", self._percent_text_piece(
+                        an, code, flags, int(width) if width is not None else 0, prec)))
                 else:
                     raise NotImplementedError(f"unsupported old-style print format code '%{code}'")
                 i = j + 1
@@ -59710,12 +59745,10 @@ class translator(ast.NodeVisitor):
 
             fmt_parts = []
             write_args = []
-            prev_desc = False
             for ent in items:
                 if ent[0] == "lit":
                     lit = ent[1].replace("'", "''")
                     fmt_parts.append(f"'{lit}'")
-                    prev_desc = False
                 elif ent[0] == "pyg_prec":
                     fmt_parts.append("a")
                     expr_txt = self.expr(ent[1])
@@ -59724,7 +59757,9 @@ class translator(ast.NodeVisitor):
                     else:
                         expr_txt = f"real({expr_txt}, kind=dp)"
                     write_args.append(f"py_format_real({expr_txt}, {ent[2]}, {ent[3]}, '{ent[4]}', '{ent[5]}')")
-                    prev_desc = True
+                elif ent[0] == "text":
+                    fmt_parts.append("a")
+                    write_args.append(ent[1])
                 elif ent[0] == "pyint":
                     fmt_parts.append("a")
                     expr_txt = self.expr(ent[1])
@@ -59733,8 +59768,7 @@ class translator(ast.NodeVisitor):
                         expr_txt = f"merge(1, 0, {expr_txt})"
                     elif arg_kind != "int":
                         expr_txt = f"int({expr_txt})"
-                    write_args.append(f"py_format_int({expr_txt}, {ent[2]}, '{ent[3]}')")
-                    prev_desc = True
+                    write_args.append(f"py_format_int({expr_txt}, {ent[2]}, '{ent[3]}', '{ent[4]}')")
                 elif ent[0] == "pyg":
                     fmt_parts.append("a")
                     arg_node = ent[1]
@@ -59750,25 +59784,7 @@ class translator(ast.NodeVisitor):
                         expr_txt = f"real({expr_txt}, kind=dp)"
                     expr_txt = f"py_format_real({expr_txt}, 6, 0, '', 'g')"
                     write_args.append(expr_txt)
-                    prev_desc = True
-                elif ent[0] == "desc_rjust":
-                    if prev_desc:
-                        fmt_parts.append("1x")
-                    fmt_parts.append("a")
-                    width_n, arg_node = ent[1], ent[2]
-                    expr_txt = self.expr(arg_node)
-                    # Mirror the plain-"a"-descriptor branch below: a
-                    # logical value isn't itself character-typed, so it
-                    # needs the same True/False text conversion before
-                    # str_rjust (which requires a character argument) can
-                    # see it.
-                    if self._rank_expr(arg_node) == 0 and self._expr_kind(arg_node) == "logical":
-                        expr_txt = f"trim(merge('True ', 'False', {expr_txt}))"
-                    write_args.append(f"str_rjust({expr_txt}, {width_n})")
-                    prev_desc = True
                 else:
-                    if prev_desc:
-                        fmt_parts.append("1x")
                     desc = ent[1]
                     fmt_parts.append(desc)
                     arg_node = ent[2]
@@ -59785,7 +59801,6 @@ class translator(ast.NodeVisitor):
                     if len(ent) >= 4 and bool(ent[3]):
                         expr_txt = f"real({expr_txt}, kind=dp)"
                     write_args.append(expr_txt)
-                    prev_desc = True
             if not fmt_parts:
                 fmt_parts = ["' '"]
             return fmt_parts, write_args

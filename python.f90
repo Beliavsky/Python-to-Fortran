@@ -162,6 +162,8 @@ public :: str_replace !@pyapi kind=function ret=character args=s:character:inten
 public :: str_reverse !@pyapi kind=function ret=character args=s:character:intent(in) desc="reverse a string (Python's s[::-1])"
 public :: str_to_chars !@pyapi kind=function ret=character args=s:character:intent(in) desc="split a string into a rank-1 array of its own 1-character substrings"
 public :: str_zfill !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with zeros to given width"
+public :: str_head !@pyapi kind=function ret=character args=s:character:intent(in),n:integer:intent(in) desc="first n characters of s (Python s[:n] for n >= 0)"
+public :: py_repr_str !@pyapi kind=function ret=character args=s:character:intent(in) desc="Python repr() of a string: quoted, with backslashes and quotes escaped"
 public :: str_ljust !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="right-pad string with spaces to given width"
 public :: str_rjust !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with spaces to given width"
 public :: str_split !@pyapi kind=function ret=type(strvec_t) args=s:character:intent(in),sep:character:intent(in):optional desc="split into string vector"
@@ -1399,19 +1401,38 @@ contains
          end if
       end function py_format_real
 
-      pure function py_format_int(x, width, flags) result(s)
-         ! Python "%<flags><width>d": the width is a minimum, never an
-         ! overflow boundary (a Fortran iW descriptor prints asterisks).
+      pure function py_format_int(x, width, flags, code) result(s)
+         ! Python "%<flags><width><code>" for code d, i, u, o, x or X: the
+         ! width is a minimum, never an overflow boundary (a Fortran iW
+         ! descriptor prints asterisks), and o/x/X are signed magnitudes
+         ! ('%x' % -255 is '-ff'), not Fortran's two's-complement O/Z output.
+         ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
+         use, intrinsic :: iso_fortran_env, only: int64
          integer, intent(in) :: x, width
-         character(len=*), intent(in) :: flags
+         character(len=*), intent(in) :: flags, code
          character(len=:), allocatable :: s, prefix
-         character(len=64) :: buf
-         integer :: n
-         ! Write x itself (abs(-huge(x)-1) would overflow), then split the sign.
-         write(buf, "(i0)") x
-         s = trim(buf)
+         character(len=*), parameter :: digits = '0123456789abcdef'
+         integer(kind=int64) :: v, base
+         integer :: n, d
+         base = 10
+         if (code == 'o') base = 8
+         if (code == 'x' .or. code == 'X') base = 16
+         ! Widen before abs: abs(-huge(x)-1) overflows a default integer.
+         v = abs(int(x, int64))
+         s = ''
+         do
+            d = int(mod(v, base))
+            s = digits(d+1:d+1) // s
+            v = v / base
+            if (v == 0) exit
+         end do
+         if (code == 'X') then
+            do n = 1, len(s)
+               d = index('abcdef', s(n:n))
+               if (d > 0) s(n:n) = 'ABCDEF'(d:d)
+            end do
+         end if
          if (x < 0) then
-            s = s(2:)
             prefix = '-'
          else if (index(flags, '+') > 0) then
             prefix = '+'
@@ -1419,6 +1440,13 @@ contains
             prefix = ' '
          else
             prefix = ''
+         end if
+         if (index(flags, '#') > 0 .and. base /= 10) then
+            if (code == 'o') then
+               prefix = prefix // '0o'
+            else
+               prefix = prefix // '0' // code
+            end if
          end if
          n = max(0, width - len(prefix) - len(s))
          if (index(flags, '-') > 0) then
@@ -4776,6 +4804,45 @@ contains
             out = repeat("0", w - n) // t
          end if
       end function str_zfill
+
+      pure function str_head(s, n) result(out)
+         character(len=*), intent(in) :: s
+         integer, intent(in) :: n
+         character(len=:), allocatable :: out
+         out = s(1:min(max(n, 0), len(s)))
+      end function str_head
+
+      pure function py_repr_str(s) result(out)
+         ! Python repr() of a str: single quotes unless the text contains a
+         ! single quote and no double quote; escape backslashes, the chosen
+         ! quote and the common control characters.
+         character(len=*), intent(in) :: s
+         character(len=:), allocatable :: out
+         character(len=1) :: q
+         integer :: i
+         q = "'"
+         if (index(s, "'") > 0 .and. index(s, '"') == 0) q = '"'
+         out = q
+         do i = 1, len(s)
+            select case (s(i:i))
+            case ('\')
+               out = out // '\\'
+            case (achar(10))
+               out = out // '\n'
+            case (achar(13))
+               out = out // '\r'
+            case (achar(9))
+               out = out // '\t'
+            case default
+               if (s(i:i) == q) then
+                  out = out // '\' // q
+               else
+                  out = out // s(i:i)
+               end if
+            end select
+         end do
+         out = out // q
+      end function py_repr_str
 
       pure function str_ljust(s, width) result(out)
          character(len=*), intent(in) :: s
