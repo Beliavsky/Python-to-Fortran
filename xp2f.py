@@ -3089,9 +3089,23 @@ def const_int_expr_to_fortran(node, allowed_names=None, values=None):
     return None
 
 
-def find_parameters(tree):
+def find_parameters(tree, local_funcs=None):
     # module-level integer constant expression assigned once => integer, parameter
     counts = count_assignments(tree)
+    # A module-level name that some function declares `global` and assigns
+    # is mutable state, not a constant (Burkardt rnglib.py: `g_save = 1`
+    # at top level, `global g_save; g_save = 1` in cgn_memory) -- making it
+    # a PARAMETER too declared the same name twice.
+    fn_nodes = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    fn_nodes += [f for f in (local_funcs or []) if all(f is not g for g in fn_nodes)]
+    mutated_globals = set()
+    for fn in fn_nodes:
+        declared = {g for n in ast.walk(fn) if isinstance(n, ast.Global) for g in n.names}
+        if not declared:
+            continue
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Name) and n.id in declared and isinstance(n.ctx, (ast.Store, ast.Del)):
+                mutated_globals.add(n.id)
     params = {}
     param_values = {}
     for node in tree.body:
@@ -3102,7 +3116,7 @@ def find_parameters(tree):
         ):
             continue
         k = node.targets[0].id
-        if counts.get(k, 0) != 1:
+        if counts.get(k, 0) != 1 or k in mutated_globals:
             continue
         expr_txt = const_int_expr_to_fortran(node.value, allowed_names=set(params.keys()), values=param_values)
         if expr_txt is not None:
@@ -4316,6 +4330,170 @@ def rewrite_tuple_literal_shape_name_to_literal(tree):
     out = _ShapeNameInliner().visit(tree)
     if not changed[0]:
         return tree
+    ast.fix_missing_locations(out)
+    return out
+
+
+def drop_unreachable_after_raise_or_return(tree):
+    """Statements after a `raise`/`return` in the same block never run
+    (Burkardt tetrahedron_exactness.py: `raise Exception(...)` followed by
+    `return []` in a function returning a matrix). Translating them only
+    adds type constraints -- there, a rank-1 empty result assigned to a
+    rank-2 function result, a compile error."""
+    for n in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(n, field, None)
+            if not isinstance(stmts, list) or not stmts or not isinstance(stmts[0], ast.stmt):
+                continue
+            for k, st in enumerate(stmts):
+                if isinstance(st, (ast.Raise, ast.Return)) and k + 1 < len(stmts):
+                    del stmts[k + 1:]
+                    break
+    return tree
+
+
+def rewrite_mixed_bool_int_literal_assigns(tree):
+    """Inside one function, a name assigned both bool literals and non-bool
+    int literals (Burkardt triangle.py lines_exp_int_2d: `ival = False`,
+    `ival = True`, and elsewhere `ival = -1` / an int returned by another
+    routine, later tested with `ival != 1`) is an int flag in Python's own
+    arithmetic (True == 1). Rewrite its bool literal assignments to 1/0 so
+    it gets one consistent INTEGER declaration instead of LOGICAL vs
+    INTEGER conflicts at call sites and returns."""
+
+    def _lit(v):
+        if isinstance(v, ast.UnaryOp) and isinstance(v.op, (ast.USub, ast.UAdd)):
+            v = v.operand
+            if isinstance(v, ast.Constant) and type(v.value) is int:
+                return "int"
+            return None
+        if isinstance(v, ast.Constant):
+            if isinstance(v.value, bool):
+                return "bool"
+            if type(v.value) is int:
+                return "int"
+        return None
+
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    fn_by_name = {f.name: f for f in fns}
+
+    def _int_literal_names(fn):
+        out = set()
+        for n in ast.walk(fn):
+            if (
+                isinstance(n, ast.Assign)
+                and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)
+                and _lit(n.value) == "int"
+            ):
+                out.add(n.targets[0].id)
+        return out
+
+    def _tuple_return_int_positions(fn):
+        """Positions of `return a, b, ...` that are int literals or names
+        assigned int literals in fn."""
+        int_names = _int_literal_names(fn)
+        pos = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Return) and isinstance(n.value, ast.Tuple):
+                for j, e in enumerate(n.value.elts):
+                    if _lit(e) == "int" or (isinstance(e, ast.Name) and e.id in int_names):
+                        pos.add(j)
+        return pos
+
+    for fn in fns:
+        seen = {}
+        for n in ast.walk(fn):
+            if (
+                isinstance(n, ast.Assign)
+                and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)
+            ):
+                k = _lit(n.value)
+                if k is not None:
+                    seen.setdefault(n.targets[0].id, set()).add(k)
+            elif (
+                isinstance(n, ast.Assign)
+                and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Tuple)
+                and isinstance(n.value, ast.Call)
+                and isinstance(n.value.func, ast.Name)
+                and n.value.func.id in fn_by_name
+                and n.value.func.id != fn.name
+            ):
+                int_pos = _tuple_return_int_positions(fn_by_name[n.value.func.id])
+                for j, e in enumerate(n.targets[0].elts):
+                    if isinstance(e, ast.Name) and j in int_pos:
+                        seen.setdefault(e.id, set()).add("int")
+        mixed = {nm for nm, ks in seen.items() if ks == {"bool", "int"}}
+        if not mixed:
+            continue
+        for n in ast.walk(fn):
+            if (
+                isinstance(n, ast.Assign)
+                and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id in mixed
+                and isinstance(n.value, ast.Constant)
+                and isinstance(n.value.value, bool)
+            ):
+                n.value = ast.copy_location(ast.Constant(value=int(n.value.value)), n.value)
+    return tree
+
+
+def rewrite_numpy_module_alias_to_np(tree):
+    """`import numpy` / `import numpy as npy` -> the `np` spelling nearly
+    every NumPy lowering recognizes (many check `func.value.id == "np"`
+    literally). Without this, e.g. Burkardt r8st.py's `import numpy; a =
+    numpy.zeros(n)` was typed as an INTEGER array. Skipped when `np` is
+    bound to something else, or the alias itself is ever rebound."""
+    aliases = set()
+    np_other = False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                bound = al.asname or al.name.split(".")[0]
+                if al.name == "numpy" and bound != "np":
+                    aliases.add(bound)
+                elif bound == "np" and al.name != "numpy":
+                    np_other = True
+        elif isinstance(n, ast.ImportFrom):
+            if any((al.asname or al.name) == "np" for al in n.names):
+                np_other = True
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "np":
+            np_other = True
+        elif isinstance(n, ast.arg) and n.arg == "np":
+            np_other = True
+        elif isinstance(n, ast.Name) and n.id == "np" and isinstance(n.ctx, (ast.Store, ast.Del)):
+            np_other = True
+    if not aliases or np_other:
+        return tree
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id in aliases and isinstance(n.ctx, (ast.Store, ast.Del)):
+            aliases.discard(n.id)
+        elif isinstance(n, ast.arg) and n.arg in aliases:
+            aliases.discard(n.arg)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in aliases:
+            aliases.discard(n.name)
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                aliases.discard(al.asname or al.name)
+    if not aliases:
+        return tree
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Import(self, node):
+            for al in node.names:
+                if al.name == "numpy" and (al.asname or "numpy") in aliases:
+                    al.asname = "np"
+            return node
+
+        def visit_Name(self, node):
+            if node.id in aliases and isinstance(node.ctx, ast.Load):
+                return ast.copy_location(ast.Name(id="np", ctx=ast.Load()), node)
+            return node
+
+    out = _Rewriter().visit(tree)
     ast.fix_missing_locations(out)
     return out
 
@@ -8119,9 +8297,44 @@ def rename_conflicting_identifiers(src_text):
     if not rename_map:
         return src_text
 
+    # Names declared (as variables) in each program unit: inside a unit
+    # that declares `mean`, `mean(j)` is an element of that array, never a
+    # call (the declaration shadows any procedure of the same name) --
+    # e.g. Burkardt r8col.py `mean = np.zeros(n); mean[j] = ...`.
+    scope_of_line = []
+    scope_decls = {}
+    _cur_scope = -1
+    for idx, ln in enumerate(lines):
+        if unit_start_re.match(ln) and not re.match(r"^\s*module\s+procedure\b", ln, flags=re.IGNORECASE):
+            _cur_scope = idx
+        scope_of_line.append(_cur_scope)
+        m = decl_re.match(ln)
+        if not m:
+            continue
+        # Only ARRAY declarations shadow a same-named procedure for `name(`
+        # references; a scalar `product` next to `product(x - a)` is still
+        # a call of the intrinsic.
+        _has_dim_attr = bool(re.search(r"\bdimension\s*\(", ln.split("::", 1)[0], flags=re.IGNORECASE))
+        _depth = 0
+        _parts = [""]
+        for _ch in m.group(1):
+            if _ch == "(":
+                _depth += 1
+            elif _ch == ")":
+                _depth -= 1
+            if _ch == "," and _depth == 0:
+                _parts.append("")
+            else:
+                _parts[-1] += _ch
+        for part in _parts:
+            mm = re.match(r"^\s*([A-Za-z_]\w*)\s*(\()?", part)
+            if mm and (mm.group(2) or _has_dim_attr):
+                scope_decls.setdefault(_cur_scope, set()).add(mm.group(1))
+
     # Rewrite all non-call identifier references; preserve intrinsic/procedure calls.
     out_lines = []
-    for ln in lines:
+    for _ln_idx, ln in enumerate(lines):
+        _scope_declared = scope_decls.get(scope_of_line[_ln_idx], set())
         if re.match(r"^\s*use\b", ln, flags=re.IGNORECASE):
             out_lines.append(ln)
             continue
@@ -8198,7 +8411,12 @@ def rename_conflicting_identifiers(src_text):
             # would otherwise wrongly be left unrenamed while every other
             # reference to the same declared array does get renamed.
             tail = code[m.end() :]
-            if not is_decl_line and re.match(r"^\s*\(", tail) and nm.lower() in callable_forbidden:
+            if (
+                not is_decl_line
+                and re.match(r"^\s*\(", tail)
+                and nm.lower() in callable_forbidden
+                and nm not in _scope_declared
+            ):
                 return nm
             return new
 
@@ -12045,6 +12263,44 @@ def combine_allocate_mold_with_scalar_source(lines):
     return out
 
 
+def _local_generic_purity_status(lines):
+    """{generic_name: all_specifics_pure} for each named `interface NAME`
+    block of `module procedure` specifics defined in `lines`."""
+    iface_start_re = re.compile(r"^\s*interface\s+([A-Za-z_]\w*)\s*$", re.IGNORECASE)
+    iface_end_re = re.compile(r"^\s*end\s+interface\b", re.IGNORECASE)
+    modproc_re = re.compile(r"^\s*module\s+procedure\s+(.+)$", re.IGNORECASE)
+    proc_re = re.compile(
+        r"^\s*(?P<prefix>(?:(?:pure|impure|elemental|recursive|module)\s+)*)"
+        r"(?:(?:integer|real|logical|complex|character|type)\b[^:]*?\s+)?"
+        r"(?:subroutine|function)\s+(?P<name>[A-Za-z_]\w*)\s*\(",
+        re.IGNORECASE,
+    )
+    generics = {}
+    cur = None
+    pure_procs = set()
+    for raw in lines:
+        code = raw.split("!", 1)[0]
+        m = iface_start_re.match(code)
+        if m:
+            cur = m.group(1).lower()
+            generics.setdefault(cur, set())
+            continue
+        if cur is not None:
+            if iface_end_re.match(code):
+                cur = None
+                continue
+            mp = modproc_re.match(code)
+            if mp:
+                generics[cur].update(
+                    nm.strip().lower() for nm in mp.group(1).replace("&", " ").split(",") if nm.strip()
+                )
+            continue
+        mp = proc_re.match(code)
+        if mp and re.search(r"\b(pure|elemental)\b", mp.group("prefix") or "", re.IGNORECASE):
+            pure_procs.add(mp.group("name").lower())
+    return {g: bool(specs) and specs <= pure_procs for g, specs in generics.items()}
+
+
 def mark_recursive_procedures(lines):
     """Add `recursive` to procedure headers when the body calls itself."""
     start_re = re.compile(
@@ -14323,6 +14579,15 @@ def detect_needed_helpers(tree):
         # duplicate that inference. Found mining TheAlgorithms/Python's
         # own strings/count_vowels.py.
         if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+            and any(kw.arg == "end" for kw in node.keywords)
+        ):
+            # print(x, end="") of a numeric scalar writes py_str(x) without
+            # advancing (see _emit_print_call_impl's fallback).
+            needed.add("py_str")
+        if (
             isinstance(node, (ast.ListComp, ast.GeneratorExp))
             and len(node.generators) == 1
         ):
@@ -16539,17 +16804,33 @@ def collect_module_global_decls(local_funcs, local_return_specs=None, local_retu
                 if n.func.value.id in {"np", "numpy"} and n.func.attr in {
                     "array", "asarray", "linspace", "arange", "zeros", "ones", "empty"
                 }:
+                    # dtype= decides the kind (Burkardt triangle01_monte_carlo.py:
+                    # `global e; e = np.zeros(m, dtype=np.int32)`).
+                    _dtype = next((kw.value for kw in n.keywords if kw.arg == "dtype"), None)
+                    _dtxt = ""
+                    if isinstance(_dtype, ast.Name):
+                        _dtxt = _dtype.id.lower()
+                    elif isinstance(_dtype, ast.Attribute):
+                        _dtxt = _dtype.attr.lower()
+                    elif isinstance(_dtype, ast.Constant) and isinstance(_dtype.value, str):
+                        _dtxt = _dtype.value.lower()
+                    _dkind = (
+                        "complex" if "complex" in _dtxt
+                        else "logical" if "bool" in _dtxt
+                        else "int" if "int" in _dtxt
+                        else "real"
+                    )
                     if n.func.attr in {"zeros", "ones", "empty"}:
                         shape = n.args[0] if n.args else next(
                             (kw.value for kw in n.keywords if kw.arg == "shape"), None
                         )
                         if isinstance(shape, (ast.Tuple, ast.List)):
-                            return "real", len(shape.elts)
+                            return _dkind, len(shape.elts)
                     elif n.func.attr in {"array", "asarray"} and n.args:
                         if isinstance(n.args[0], (ast.List, ast.Tuple)):
-                            _, rank = _infer_from_node(n.args[0])
-                            return "real", rank
-                    return "real", 1
+                            _ek, rank = _infer_from_node(n.args[0])
+                            return (_dkind if _dtxt else (_ek or "real")), rank
+                    return _dkind, 1
                 if n.func.value.id in {"np", "numpy"} and n.func.attr in {
                     "zeros_like", "ones_like", "empty_like"
                 }:
@@ -27294,6 +27575,14 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"insert", "delete"}
+                and len(node.args) >= 2
+                and self._expr_kind(node.args[0]) in {"int", "logical", "complex", "real"}
+            ):
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr == "append"
                 and len(node.args) >= 2
             ):
@@ -27579,6 +27868,17 @@ class translator(ast.NodeVisitor):
                     return "int"
                 if "float" in dtype_txt:
                     return "real"
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"flip", "flipud", "fliplr", "roll"}
+                and len(node.args) >= 1
+                and self._expr_kind(node.args[0]) in {"int", "logical", "complex", "char"}
+            ):
+                # Element reordering keeps the dtype (Burkardt graph_dist.py:
+                # `noder = np.flip(noder)` on an int index array).
                 return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -31581,11 +31881,13 @@ class translator(ast.NodeVisitor):
                 # its own argument, whether called as np.X(...) or via a
                 # bare `from numpy import X` import.
                 return self._rank_expr(node.args[0])
-            if np_attr in {"all", "any", "prod", "count_nonzero", "sum", "min", "max"} and len(node.args) >= 1:
+            if np_attr in {"all", "any", "prod", "count_nonzero", "sum", "min", "max", "amin", "amax"} and len(node.args) >= 1:
+                # np.amin/np.amax are aliases of the np.min/np.max reductions
+                # (Burkardt test_eigen.py: `lamda_min = np.amin(lamda)`).
                 r0 = self._rank_expr(node.args[0])
                 axis_node = None
                 keepdims = False
-                if np_attr in {"all", "any", "prod", "sum", "min", "max"} and len(node.args) >= 2:
+                if np_attr in {"all", "any", "prod", "sum", "min", "max", "amin", "amax"} and len(node.args) >= 2:
                     axis_node = node.args[1]
                 for kw in node.keywords:
                     if kw.arg == "axis":
@@ -37071,9 +37373,20 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 idx = f"int({self.expr(node.args[1])})"
-                _rtag = self._expr_real_kind_tag(node.args[0])
-                _kind = "sp" if _rtag == "real32" else "dp"
-                val = f"real({self.expr(node.args[2])}, kind={_kind})"
+                # NumPy casts the inserted value to the array's dtype
+                # (Burkardt test_partial_digest.py: np.insert of 0 into an
+                # int32 location array).
+                _ak = self._expr_kind(node.args[0])
+                if _ak == "int":
+                    val = f"int({self.expr(node.args[2])})"
+                elif _ak == "logical":
+                    val = self.expr(node.args[2])
+                elif _ak == "complex":
+                    val = f"cmplx({self.expr(node.args[2])}, kind=dp)"
+                else:
+                    _rtag = self._expr_real_kind_tag(node.args[0])
+                    _kind = "sp" if _rtag == "real32" else "dp"
+                    val = f"real({self.expr(node.args[2])}, kind={_kind})"
                 return f"[{a0}(:{idx}), {val}, {a0}(({idx}) + 1:)]"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -38060,6 +38373,18 @@ class translator(ast.NodeVisitor):
                     fn = "zeros_logical" if node.func.attr == "zeros_like" else "ones_logical"
                 else:
                     fn = "zeros_real" if node.func.attr == "zeros_like" else "ones_real"
+                _r0 = self._rank_expr(node.args[0])
+                if _r0 == 0:
+                    # np.zeros_like(scalar) is a scalar (Burkardt wdk.py
+                    # poly_eval: `p = np.zeros_like(z)` for scalar z).
+                    _one = node.func.attr == "ones_like"
+                    return {
+                        "int": "1" if _one else "0",
+                        "complex": "(1.0_dp, 0.0_dp)" if _one else "(0.0_dp, 0.0_dp)",
+                        "logical": ".true." if _one else ".false.",
+                    }.get(k0, "1.0_dp" if _one else "0.0_dp")
+                if _r0 >= 2:
+                    return f"reshape({fn}(size({a0})), shape({a0}))"
                 return f"{fn}(size({a0}))"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -41750,6 +42075,20 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"amax", "amin"}
                 and len(node.args) == 1
             ):
+                if node.keywords:
+                    # np.amax(a, axis=...) etc.: same as np.max/np.min, whose
+                    # lowering handles axis/keepdims (this branch used to drop
+                    # the axis silently and reduce over the whole array).
+                    _alias = copy.copy(node)
+                    _alias.func = ast.copy_location(
+                        ast.Attribute(
+                            value=node.func.value,
+                            attr="max" if node.func.attr == "amax" else "min",
+                            ctx=ast.Load(),
+                        ),
+                        node.func,
+                    )
+                    return self.expr(_alias)
                 a0 = self.expr(node.args[0])
                 if self._expr_kind(node.args[0]) == "complex":
                     # MAXVAL/MINVAL don't accept complex operands at all
@@ -45807,7 +46146,19 @@ class translator(ast.NodeVisitor):
                         rank_hint = max(1, self._shape_rank_hint(v.args[0]))
                     elif np_name in {"zeros_like", "ones_like"} and len(v.args) >= 1:
                         rank_hint = max(1, self._rank_expr(v.args[0]))
-                    if np_name in {"zeros_like", "ones_like"} and len(v.args) >= 1 and not dtype_txt:
+                    if (
+                        np_name in {"zeros_like", "ones_like"}
+                        and len(v.args) >= 1
+                        and not dtype_txt
+                        and self._rank_expr(v.args[0]) == 0
+                        and self._expr_kind(v.args[0]) in {"int", "real", "logical", "complex"}
+                    ):
+                        # np.zeros_like(scalar) is a scalar of the same kind.
+                        {
+                            "int": self._mark_int, "real": self._mark_real,
+                            "logical": self._mark_log, "complex": self._mark_complex,
+                        }[self._expr_kind(v.args[0])](t.id)
+                    elif np_name in {"zeros_like", "ones_like"} and len(v.args) >= 1 and not dtype_txt:
                         k0 = self._expr_kind(v.args[0])
                         if k0 == "int":
                             self._mark_alloc_int(t.id, rank=rank_hint)
@@ -47920,6 +48271,9 @@ class translator(ast.NodeVisitor):
                     and (cast_kind, cast_rank) != (visible_kind, visible_rank)
                     and (
                         (visible_rank is not None and visible_rank > 0 and cast_rank != visible_rank)
+                        # scalar -> array, e.g. Burkardt r8col.py
+                        # `a = -5.0; a = r8col_uniform_ab(m, n, a, b, rng)`
+                        or (visible_kind is not None and visible_rank == 0)
                         or (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
                             and v.func.attr == "astype")
                     )
@@ -51824,6 +52178,12 @@ class translator(ast.NodeVisitor):
                     fill_expr = ".true."
                 else:
                     fill_expr = "1"
+            if k0 == "complex":
+                fill_expr = "(1.0_dp, 0.0_dp)" if v.func.attr == "ones_like" else "(0.0_dp, 0.0_dp)"
+            if r0 == 0:
+                # np.zeros_like(scalar) is a scalar -- nothing to allocate.
+                self.o.w(f"{self._aliased_name(name)} = {fill_expr}")
+                return
             self.o.w(f"if (allocated({name})) deallocate({name})")
             if r0 <= 1:
                 self.o.w(f"allocate({name}(1:size({a0})))")
@@ -51846,6 +52206,12 @@ class translator(ast.NodeVisitor):
             name = t.id
             a0 = self.expr(v.args[0])
             r0 = self._rank_expr(v.args[0])
+            if r0 == 0:
+                # Scalar argument: np.copy(x) is x; np.empty_like(x) needs
+                # no storage.
+                if v.func.attr == "copy":
+                    self.o.w(f"{self._aliased_name(name)} = {a0}")
+                return
             self.o.w(f"if (allocated({name})) deallocate({name})")
             if r0 <= 1:
                 self.o.w(f"allocate({name}(1:size({a0})))")
@@ -58833,8 +59199,11 @@ class translator(ast.NodeVisitor):
                     ak = self._expr_kind(an)
                     ar = self._rank_expr(an)
                     int_scalar = (ak == "int" and ar == 0)
+                    # %.Pf (precision, no width) used to fall through to a
+                    # bare g0 below, dropping the format entirely -- e.g.
+                    # print('%.6f' % f(x)) printed all 17 digits.
                     if (ar == 0 and ((cl in {"g", "e"} and (spec_body or cl == "e"))
-                                     or (cl == "f" and prec is None))
+                                     or (cl == "f" and (prec is None or width is None)))
                             and not (int_scalar and PERCENT_FLOAT_INT_FORMAT)):
                         flags = re.match(r"[-+#0 ]*", spec_body).group(0)
                         items.append(("pyg_prec", an, int(prec) if prec is not None else 6,
@@ -58917,12 +59286,15 @@ class translator(ast.NodeVisitor):
                     arg_node = ent[1]
                     expr_txt = self.expr(arg_node)
                     arg_kind = self._expr_kind(arg_node)
-                    if arg_kind == "int":
-                        expr_txt = f"py_str_int({expr_txt})"
-                    elif arg_kind == "logical":
-                        expr_txt = f"py_str_int(merge(1, 0, {expr_txt}))"
-                    else:
-                        expr_txt = f"py_format_g_real({expr_txt})"
+                    # Bare %g: 6 significant digits, exponent form outside
+                    # [1e-4, 1e6) -- also for ints ('%g' % 1234567 is
+                    # '1.23457e+06'). py_format_g_real printed full g0
+                    # precision (Burkardt r8st.py: `'%g' % (r_norm)`).
+                    if arg_kind == "logical":
+                        expr_txt = f"merge(1.0_dp, 0.0_dp, {expr_txt})"
+                    elif arg_kind != "real":
+                        expr_txt = f"real({expr_txt}, kind=dp)"
+                    expr_txt = f"py_format_real({expr_txt}, 6, 0, '', 'g')"
                     write_args.append(expr_txt)
                     prev_desc = True
                 elif ent[0] == "desc_rjust":
@@ -59528,6 +59900,14 @@ class translator(ast.NodeVisitor):
             return
 
         # fallback
+        if advance_no and self._rank_expr(a) == 0 and self._expr_kind(a) in {"char", "int", "real", "logical"}:
+            # print(title, end="") -- list-directed output can't suppress
+            # the record terminator (and would add a leading blank), so
+            # write the Python text form without advancing. Burkardt
+            # quaternions.py q8_transpose_print: `print(title, end='')`.
+            _txt = self.expr(a) if self._expr_kind(a) == "char" else f"py_str({self.expr(a)})"
+            self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {_txt}")
+            return
         if unit_txt == "*":
             self.o.w(f"print *, {self.expr(a)}")
         else:
@@ -60556,7 +60936,14 @@ def _emit_local_function(
             # return work`). Falls back to the already-computed generic
             # func_res name in that case. Found mining TheAlgorithms/
             # Python's own physics/first_law_of_thermodynamics.py.
-            if cand not in args and cand != fn.name:
+            # Nor when the returned name is a module global this function
+            # declares `global`: a result variable of that name would
+            # shadow the module variable, so reads of it (`g = g + 1`)
+            # saw an undefined local (Burkardt rnglib.py-style counters).
+            _fn_globals_for_ret = {
+                _g for _n in ast.walk(fn) if isinstance(_n, ast.Global) for _g in _n.names
+            }
+            if cand not in args and cand != fn.name and cand not in _fn_globals_for_ret:
                 ret_name = cand
 
     if fn.name == "logsumexp" and len(args) >= 3:
@@ -60676,6 +61063,20 @@ def _emit_local_function(
         _reserved_local_names.add(fn.args.kwarg.arg)
     local_list_counts = build_list_count_map(local_tree, reserved_names=_reserved_local_names)
     module_global_names = set((module_global_decls or {}).keys())
+    # Python scoping: a name this function assigns without declaring it
+    # `global` is a LOCAL of this function, even if another function makes
+    # a same-named module global (Burkardt triangle01_monte_carlo.py:
+    # `global e` in one test, a local `e = rng.random(...)` in
+    # triangle01_sample). Leaving it out of the local declarations let
+    # Fortran host association silently read/write the module variable.
+    _fn_declared_globals = {
+        _g for _n in ast.walk(fn) if isinstance(_n, ast.Global) for _g in _n.names
+    }
+    _fn_bound_names = {
+        _n.id for _n in ast.walk(fn)
+        if isinstance(_n, ast.Name) and isinstance(_n.ctx, (ast.Store, ast.Del))
+    } | _reserved_local_names
+    module_global_names -= (_fn_bound_names - _fn_declared_globals)
     tr = translator(
         o,
         params={},
@@ -66926,6 +67327,36 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             rr_chain = _subscript_chain_base_rank(_n, arg_nm)
             if rr_chain is not None:
                 rr = max(rr, rr_chain)
+            # The RIGHT operand of `@` / np.dot / np.matmul is (at least) a
+            # vector (e.g. Burkardt quaternions.py q8_multiply2: `q3 =
+            # np.dot(qm, q2)`, q2 used nowhere else); without this the
+            # provisional return rank of such a function is scalar and a
+            # caller passing its result gets a bogus scalar specialization.
+            # The LEFT operand is usually the matrix, so "rank >= 1" there
+            # would under-rank it (np.matmul(a, x) with a documented
+            # A(N,N)) -- no evidence is recorded for it.
+            if (
+                isinstance(_n, ast.BinOp)
+                and isinstance(_n.op, ast.MatMult)
+                and isinstance(_n.right, ast.Name)
+                and _n.right.id == arg_nm
+            ):
+                rr = max(rr, 1)
+            if (
+                isinstance(_n, ast.Call)
+                and (
+                    (isinstance(_n.func, ast.Name) and _n.func.id == "matmul")
+                    or (
+                        isinstance(_n.func, ast.Attribute)
+                        and is_numpy_name_node(_n.func.value)
+                        and _n.func.attr in {"dot", "matmul"}
+                    )
+                )
+                and len(_n.args) >= 2
+                and isinstance(_n.args[1], ast.Name)
+                and _n.args[1].id == arg_nm
+            ):
+                rr = max(rr, 1)
         _infer_arg_rank_local_cache[cache_key] = rr
         return rr
 
@@ -69643,7 +70074,89 @@ def generate_flat(
                         kind = tr_ctx._expr_kind(stmt.value)
                         if kind in {"int", "real", "logical", "char", "complex"}:
                             cast_spec = (kind, int(tr_ctx._rank_expr(stmt.value)))
-                return cast_spec or _name_direct_assign_spec(fn_node, name, tr_ctx)
+                return cast_spec or _latest_rank_rebind_spec(name, call) or _name_direct_assign_spec(fn_node, name, tr_ctx)
+
+            def _latest_rank_rebind_spec(name, call):
+                # `p = p.flatten()` (or .ravel()/np.ravel(p)/.reshape(-1))
+                # immediately governs a later `f(p)` in the same statement
+                # list, whatever rank p had before (Burkardt tetrahedron.py:
+                # `p = tetrahedron_sample(t, 1, rng); p = p.flatten();
+                # xsi = tetrahedron_barycentric(t, p)` inside a loop). The
+                # max-over-all-assignments fallback would report rank 2 and
+                # create a bogus rank-2 specialization.
+                def _find(stmts):
+                    for k, st in enumerate(stmts):
+                        if not any(nd is call for nd in ast.walk(st)):
+                            continue
+                        for field in ("body", "orelse", "finalbody"):
+                            sub = getattr(st, field, None)
+                            if isinstance(sub, list) and sub and any(
+                                nd is call for s2 in sub for nd in ast.walk(s2)
+                            ):
+                                return _find(sub)
+                        return stmts, k
+                    return None
+                found = _find(fn_node.body) if fn_node is not None else None
+                if found is None:
+                    return None
+                stmts, k = found
+                for st in reversed(stmts[:k]):
+                    if not any(
+                        isinstance(nd, ast.Name) and nd.id == name and isinstance(nd.ctx, (ast.Store, ast.Del))
+                        for nd in ast.walk(st)
+                    ):
+                        continue
+                    v = getattr(st, "value", None)
+                    flat = (
+                        isinstance(st, ast.Assign)
+                        and len(st.targets) == 1
+                        and isinstance(st.targets[0], ast.Name)
+                        and st.targets[0].id == name
+                        and isinstance(v, ast.Call)
+                        and (
+                            (
+                                isinstance(v.func, ast.Attribute)
+                                and v.func.attr in {"flatten", "ravel"}
+                                and not v.args
+                            )
+                            or (
+                                isinstance(v.func, ast.Attribute)
+                                and v.func.attr == "reshape"
+                                and len(v.args) == 1
+                                and isinstance(v.args[0], ast.UnaryOp)
+                                and isinstance(v.args[0].op, ast.USub)
+                                and is_const_int(v.args[0].operand)
+                            )
+                            or (
+                                isinstance(v.func, ast.Attribute)
+                                and is_numpy_name_node(v.func.value)
+                                and v.func.attr == "ravel"
+                                and len(v.args) == 1
+                            )
+                        )
+                    )
+                    if not flat:
+                        # A plain numeric literal binding (`a = -5.0`) is a
+                        # scalar at this call even if `a` is later rebound to
+                        # an array -- including by this very call, e.g.
+                        # Burkardt r8col.py `a = -5.0; a = f(m, n, a, b)`.
+                        _lit = v.operand if (
+                            isinstance(v, ast.UnaryOp) and isinstance(v.op, (ast.USub, ast.UAdd))
+                        ) else v
+                        if (
+                            isinstance(st, ast.Assign)
+                            and len(st.targets) == 1
+                            and isinstance(st.targets[0], ast.Name)
+                            and isinstance(_lit, ast.Constant)
+                            and type(_lit.value) in (int, float)
+                        ):
+                            return ("int" if type(_lit.value) is int else "real", 0)
+                        return None
+                    kind = tr_ctx._expr_kind(v)
+                    if kind not in {"int", "real", "logical", "char", "complex"}:
+                        kind = "real"
+                    return (kind, 1)
+                return None
 
             for n in ast.walk(scan_node):
                 if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
@@ -69685,9 +70198,28 @@ def generate_flat(
                         if (direct_actual[1] == 0 and _comment_rank == 0
                                 and a.id not in {p.arg for p in fn_node.args.args}):
                             ar = 0
+                    if isinstance(a, ast.Name) and fn_node is not None:
+                        _rebind = _latest_rank_rebind_spec(a.id, n)
+                        if _rebind is not None:
+                            # The flattening rebind is the binding in force
+                            # at this call, whatever rank `a` had before.
+                            ar = _rebind[1]
                     rr[i] = max(rr[i], ar)
                     rrs[i].add(ar)
                     ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(a)
+                    if ak is None and isinstance(a, ast.Subscript) and fn_node is not None:
+                        # An element of the caller's own (not yet typed)
+                        # array has that array's kind (Burkardt
+                        # pwl_interp_2d.py: `r8vec_bracket5(nxd, xd, xi[k])`
+                        # with xi a real parameter of the caller; the
+                        # formal was otherwise guessed INTEGER).
+                        _root = a
+                        while isinstance(_root, ast.Subscript):
+                            _root = _root.value
+                        if isinstance(_root, ast.Name):
+                            _rk_root, _ = _actual_name_spec(_root.id, n)
+                            if _rk_root in {"int", "real", "logical", "complex"}:
+                                ak = _rk_root
                     if ak is not None:
                         krp[i].add((ak, ar))
                         krl[i].add((ak, ar, bool(tr_ctx._is_python_list_expr(a))))
@@ -69832,7 +70364,41 @@ def generate_flat(
             _record_piecewise_call_hints(st, tr_seed)
         _local_ret_df_info_scan = _scan_local_df_return_info(local_funcs)
         _local_ret_tuple_df_info_scan = _all_tuple_df_return_positions(local_funcs)
-        for _fn_scan in (local_funcs or []):
+        # Scan callers before callees: a function's scan is seeded with the
+        # kinds its callers observed (_seed_observed_argument_types below),
+        # so in plain source order `def interp(xi): bracket(xd, xi[k])`
+        # defined above its own caller saw an untyped xi and recorded no
+        # kind for bracket's formal, which then defaulted to INTEGER
+        # (Burkardt pwl_interp_2d.py-style call chains). Cycles keep
+        # source order.
+        _scan_funcs = [f for f in (local_funcs or []) if isinstance(f, ast.FunctionDef)]
+        _scan_names = {f.name for f in _scan_funcs}
+        _callees_of = {
+            f.name: {
+                _c.func.id for _c in ast.walk(f)
+                if isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name)
+                and _c.func.id in _scan_names and _c.func.id != f.name
+            }
+            for f in _scan_funcs
+        }
+        _n_callers = {f.name: 0 for f in _scan_funcs}
+        for _cs in _callees_of.values():
+            for _c in _cs:
+                _n_callers[_c] += 1
+        _scan_order = []
+        _ready = [f for f in _scan_funcs if _n_callers[f.name] == 0]
+        _done = set()
+        while _ready:
+            _f = _ready.pop(0)
+            _scan_order.append(_f)
+            _done.add(_f.name)
+            for _g in _scan_funcs:
+                if _g.name in _callees_of[_f.name] and _g.name not in _done:
+                    _n_callers[_g.name] -= 1
+                    if _n_callers[_g.name] == 0:
+                        _ready.append(_g)
+        _scan_order += [f for f in _scan_funcs if f.name not in _done]
+        for _fn_scan in _scan_order:
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
             tr_local_scan = translator(
@@ -73211,6 +73777,56 @@ def generate_flat(
                 if parameter is not None:
                     actual._xp2f_comment_integer_target = (call.func.id, parameter)
 
+    # A rank-0 observation for a numeric parameter the body itself indexes
+    # (`q[0]`) is a provisional-inference artifact (e.g. Burkardt
+    # quaternions.py: `w = rotation_mat_vector(a, v)` -- `np.dot(a, v)` of
+    # two not-yet-ranked parameters looks scalar -- then `r8vec_print(3, w,
+    # ...)`). The emitter declares that dummy with the body's rank anyway,
+    # so the "scalar" specific duplicates the array one and gfortran
+    # rejects the generic as ambiguous. Drop such duplicates.
+    _local_fn_by_name = {fn.name: fn for fn in (local_funcs or [])}
+    for _ov_name in list(local_overload_specs.keys()):
+        _ov_fn = _local_fn_by_name.get(_ov_name)
+        _ov_specs = local_overload_specs[_ov_name]
+        if _ov_fn is None or len(_ov_specs) < 2:
+            continue
+        _body_rank = {}
+        for _an in local_func_arg_names.get(_ov_name, []):
+            _br = 0
+            for _nd in ast.walk(_ov_fn):
+                _r = _subscript_chain_base_rank(_nd, _an)
+                if _r is not None:
+                    _br = max(_br, _r)
+            _body_rank[_an] = _br
+        _seen_sigs = {}
+        _bogus = set()
+        for _si, _spec in enumerate(_ov_specs):
+            _kinds, _ranks = _spec[1], _spec[2]
+            _upgraded = False
+            _sig = []
+            for _an in local_func_arg_names.get(_ov_name, []):
+                _k = _kinds.get(_an) if isinstance(_kinds, dict) else None
+                _r = _ranks.get(_an) if isinstance(_ranks, dict) else None
+                if (
+                    _r == 0
+                    and _k in {"int", "real", "logical", "complex"}
+                    and _body_rank.get(_an, 0) > 0
+                ):
+                    _r = _body_rank[_an]
+                    _upgraded = True
+                _sig.append((_an, _k, _r))
+            _sig = tuple(_sig)
+            if _upgraded:
+                _bogus.add(_si)
+            _seen_sigs.setdefault(_sig, []).append(_si)
+        _drop = set()
+        for _idxs in _seen_sigs.values():
+            if len(_idxs) > 1:
+                _keep = next((i for i in _idxs if i not in _bogus), _idxs[0])
+                _drop.update(i for i in _idxs if i != _keep)
+        if _drop:
+            local_overload_specs[_ov_name] = [s for i, s in enumerate(_ov_specs) if i not in _drop]
+
     # Resolve specific result profiles before emitting any caller, including
     # callers that precede their callee in source order.
     overload_return_maps = {}
@@ -75326,6 +75942,9 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
+    tree = drop_unreachable_after_raise_or_return(tree)
+    tree = rewrite_numpy_module_alias_to_np(tree)
+    tree = rewrite_mixed_bool_int_literal_assigns(tree)
     tree = rewrite_math_const_from_import_to_attribute(tree)
     tree = rewrite_builtin_divmod_tuple_assign(tree)
     tree = rewrite_reversed_value_to_negative_slice(tree)
@@ -75339,7 +75958,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_class_methods_to_toplevel(tree)
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
-    params = find_parameters(tree)
+    params = find_parameters(tree, local_funcs)
     list_counts = build_list_count_map(tree)
     try:
         scalar_specs, scalar_ranks, tuple_out, tuple_out_ranks = _local_return_maps(
@@ -75678,6 +76297,9 @@ def transpile_file(
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
+    tree = drop_unreachable_after_raise_or_return(tree)
+    tree = rewrite_numpy_module_alias_to_np(tree)
+    tree = rewrite_mixed_bool_int_literal_assigns(tree)
     tree = rewrite_math_const_from_import_to_attribute(tree)
     tree = rewrite_builtin_divmod_tuple_assign(tree)
     tree = rewrite_reversed_value_to_negative_slice(tree)
@@ -75944,7 +76566,7 @@ def transpile_file(
 
     infer_loadtxt_vector_context(effective_tree.body, local_funcs, comment_map)
 
-    params = find_parameters(effective_tree)
+    params = find_parameters(effective_tree, local_funcs)
     # A local function's own translator is deliberately constructed with
     # params={} (its own _mark_int/_mark_real/etc. guard the SAME name
     # against being re-declared when it's a module-level PARAMETER, and
@@ -76347,10 +76969,20 @@ def transpile_file(
     # (caught immediately by the very next compile in this same run, since
     # Fortran itself rejects a wrongly-promoted `pure` that calls something
     # actually impure), never a silently wrong build.
+    # A call through a local generic interface (rank/kind-specialized
+    # overloads) is only pure if every specific procedure is; the pass
+    # doesn't resolve generics itself, so register each generic's status
+    # explicitly (e.g. Burkardt tetrahedron.py: pure
+    # tetrahedron_contains_point calling generic tetrahedron_barycentric,
+    # whose specifics call the impure LAPACK-backed linalg_solve). Run
+    # twice so specifics promoted in the first run count in the second.
     try:
-        f90_lines = fpurity.mark_pure_where_provable(
-            f90_lines, external_name_status=_vendored_purity_registry()
-        )
+        for _purity_round in range(2):
+            _purity_status = dict(_vendored_purity_registry())
+            _purity_status.update(_local_generic_purity_status(f90_lines))
+            f90_lines = fpurity.mark_pure_where_provable(
+                f90_lines, external_name_status=_purity_status
+            )
     except Exception:
         pass
     # Unlike the always-on PURE pass just above, ELEMENTAL is opt-in
@@ -76432,6 +77064,9 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_listcomp_array_assign_calls_to_loop(tree)
     tree = rewrite_tuple_call_subscript_to_temp(tree)
     tree = rewrite_niladic_tuple_return_calls_to_literal(tree)
+    tree = drop_unreachable_after_raise_or_return(tree)
+    tree = rewrite_numpy_module_alias_to_np(tree)
+    tree = rewrite_mixed_bool_int_literal_assigns(tree)
     tree = rewrite_math_const_from_import_to_attribute(tree)
     tree = rewrite_builtin_divmod_tuple_assign(tree)
     tree = rewrite_reversed_value_to_negative_slice(tree)
