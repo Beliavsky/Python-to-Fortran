@@ -28161,7 +28161,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr == "allclose"
+                and node.func.attr in {"allclose", "array_equal", "array_equiv"}
                 and len(node.args) >= 2
             ):
                 return "logical"
@@ -31632,6 +31632,10 @@ class translator(ast.NodeVisitor):
         return self._coerce_expr_kind(node, value, "logical")
 
     def _rank_expr(self, node):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"array_equal", "array_equiv"}):
+            return 0
         if isinstance(node, ast.Name) and node.id in self.__dict__.get("_comp_int_scope", ()):
             return 0
         if isinstance(node, ast.ListComp):
@@ -38344,14 +38348,22 @@ class translator(ast.NodeVisitor):
                 if ra != rb:
                     return ".false."
                 if ra == 0:
-                    return f"({a0} == {b0})"
+                    op = ".eqv." if self._expr_kind(node.args[0]) == self._expr_kind(node.args[1]) == "logical" else "=="
+                    return f"({a0} {op} {b0})"
                 # No parens around each individual clause -- see the
                 # matching comment on np.array_equiv's codegen for why
                 # (avoids a pre-existing print-argument paren-stripping
                 # bug this shape triggers).
                 shape_checks = [f"size({a0},{d}) == size({b0},{d})" for d in range(1, ra + 1)]
                 shape_ok = " .and. ".join(shape_checks) if shape_checks else ".true."
-                return f"({shape_ok} .and. all({a0} == {b0}))"
+                # Fortran need not short-circuit .and. Make the operands
+                # conformable even when shapes differ; the shape check
+                # still makes that result false. RESHAPE may truncate,
+                # including to length zero, without requiring padding.
+                extent = f"min(size({a0}), size({b0}))"
+                op = ".eqv." if self._expr_kind(node.args[0]) == self._expr_kind(node.args[1]) == "logical" else "=="
+                return (f"({shape_ok} .and. all(reshape({a0}, [{extent}]) "
+                        f"{op} reshape({b0}, [{extent}])))")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
