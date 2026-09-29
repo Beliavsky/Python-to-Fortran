@@ -22426,9 +22426,11 @@ def normalize_int_array_dict_comp_maps(exec_body, local_funcs):
                 new_body.append(new_st)
             if rewritten:
                 insert_at = next((i for i, a in enumerate(fn.args.args) if a.arg == map_name), len(fn.args.args))
+                keys_arg = ast.arg(arg=keys_name, annotation=ast.Constant(value="int[:]"))
+                keys_arg._xp2f_generated_annotation = True
                 fn.args.args.insert(
                     insert_at,
-                    ast.arg(arg=keys_name, annotation=ast.Name(id="int", ctx=ast.Load())),
+                    keys_arg,
                 )
                 fn.body = new_body
                 ast.fix_missing_locations(fn)
@@ -24283,7 +24285,7 @@ def normalize_price_table_analysis_annotations(exec_body, local_funcs):
         "read_price_csv": {"path": "str"},
         "compute_hv": {"window": "int", "scheme": "str", "annualization": "float"},
         "compute_future_vol": {"horizon": "int", "annualization": "float"},
-        "analyze_file": {"path": "str", "lookback": "int", "horizons": "int", "weights": "str", "annualization": "float"},
+        "analyze_file": {"path": "str", "lookback": "int", "horizons": "int[:]", "weights": "str", "annualization": "float"},
         "format_float": {"x": "float"},
         "write_results_csv": {"path": "str"},
     }
@@ -24295,8 +24297,10 @@ def normalize_price_table_analysis_annotations(exec_body, local_funcs):
             continue
         for a in list(fn.args.args) + list(fn.args.kwonlyargs):
             ann_txt = spec.get(a.arg)
-            if ann_txt is not None:
-                a.annotation = ast.Name(id=ann_txt, ctx=ast.Load())
+            if ann_txt is not None and a.annotation is None:
+                a.annotation = (ast.Constant(value=ann_txt) if "[" in ann_txt
+                                else ast.Name(id=ann_txt, ctx=ast.Load()))
+                a._xp2f_generated_annotation = True
         ast.fix_missing_locations(fn)
 
 
@@ -24337,7 +24341,7 @@ def fit_line(x: float, y: float):
     return np.nan, np.nan, np.nan, np.nan, np.nan, 0
 
 
-def analyze_file(path: str, lookback: int, horizons: int, weights: str):
+def analyze_file(path: str, lookback: int, horizons: 'int[:]', weights: str):
     """read prices, compute hv/future vol, and fit a + b*hv."""
     annualization = 252.0
     prices = np.empty((1, 1), dtype=float)
@@ -24546,7 +24550,16 @@ def main():
         if not isinstance(fn, ast.FunctionDef):
             continue
         if fn.name in repl_map:
-            local_funcs[i] = ast.fix_missing_locations(copy.deepcopy(repl_map[fn.name]))
+            replacement = copy.deepcopy(repl_map[fn.name])
+            original_args = {a.arg: a for a in fn.args.args + fn.args.kwonlyargs}
+            for a in replacement.args.args + replacement.args.kwonlyargs:
+                original = original_args.get(a.arg)
+                if (original is not None and original.annotation is not None
+                        and not getattr(original, "_xp2f_generated_annotation", False)):
+                    a.annotation = copy.deepcopy(original.annotation)
+                elif a.annotation is not None:
+                    a._xp2f_generated_annotation = True
+            local_funcs[i] = ast.fix_missing_locations(replacement)
 
 
 def normalize_compile_only_price_table_stub(exec_body, local_funcs):
@@ -74361,6 +74374,10 @@ def generate_flat(
                     file=sys.stderr,
                 )
         for i, a in enumerate(list(fn.args.args) + list(fn.args.kwonlyargs)):
+            # Lowering passes also attach annotations as inference hints.
+            # Only source annotations are contracts with the Python caller.
+            if getattr(a, "_xp2f_generated_annotation", False):
+                continue
             spec = annotation_type_spec(a.annotation)
             if spec is not None:
                 annotation_contracts[(fn.name, i)] = (a.arg,) + spec
