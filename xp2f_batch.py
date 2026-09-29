@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import atexit
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
@@ -13,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -73,6 +75,27 @@ class CaseResult:
     fortran_source: str = ""
     output: str = ""
     strict_file_created: bool = False
+    skipped: bool = False
+
+
+def _is_module_only(path: Path) -> bool:
+    """Recognize definition-only modules, without executing their imports.
+
+    Assignments and control flow deliberately remain translation candidates.
+    Invalid or unreadable sources must go through normal error reporting.
+    """
+    try:
+        with tokenize.open(path) as source:
+            tree = ast.parse(source.read(), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError, ValueError):
+        return False
+    return all(
+        isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef,
+                          ast.AsyncFunctionDef, ast.ClassDef, ast.Pass))
+        or (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str))
+        for node in tree.body
+    )
 
 
 def _has_glob_meta(s: str) -> bool:
@@ -506,7 +529,7 @@ def main() -> int:
     )
     ap.add_argument("--maxfail", type=int, default=0, help="Stop after this many failures (0 = no limit).")
     ap.add_argument("--skip", type=int, default=0, help="Skip this many matched files from the start before applying --limit (0 = skip none).")
-    ap.add_argument("--limit", type=int, default=0, help="Process at most this many matched files (0 = no limit).")
+    ap.add_argument("--limit", type=int, default=0, help="Process at most this many files, excluding module-only skips (0 = no limit). Strict modes include modules.")
     ap.add_argument("--jobs", type=int, default=1, help="Run up to this many independent xp2f.py jobs concurrently (default: 1).")
     ap.add_argument("--timeout", type=float, default=0.0, help="Per-file timeout in seconds (0 = no timeout).")
     ap.add_argument("--status-interval", type=float, default=60.0, help="Seconds between parallel progress reports while waiting (0 = disabled).")
@@ -666,14 +689,24 @@ def main() -> int:
     if args.limit < 0:
         print("Invalid options: --limit must be >= 0.")
         return 1
-    if args.limit > 0:
-        py_files = py_files[: args.limit]
+    module_only = set()
+    selected = []
+    attempted = 0
+    for pyf in py_files:
+        if args.limit > 0 and attempted >= args.limit:
+            break
+        selected.append(pyf)
+        if not (args.strict or args.strict_fix) and _is_module_only(pyf):
+            module_only.add(pyf)
+        else:
+            attempted += 1
+    py_files = selected
 
     xp2f_path = Path(__file__).with_name("xp2f.py").resolve()
     if not xp2f_path.exists():
         print(f"Missing script: {xp2f_path}")
         return 1
-    if args.jobs > 1 and not (args.strict or args.strict_fix or args.no_compile):
+    if attempted and args.jobs > 1 and not (args.strict or args.strict_fix or args.no_compile):
         helper_rc = _ensure_parallel_helper_cache(args.compiler)
         if helper_rc != 0:
             return helper_rc
@@ -706,6 +739,12 @@ def main() -> int:
         source_abs = pyf.resolve()
         run_cwd = source_abs.parent
         python_loc = _count_file_lines(str(source_abs))
+        if pyf in module_only:
+            return CaseResult(
+                index=i, source=rel, ok=False, rc=0, status="SKIP",
+                outcome="module_only", python_loc=python_loc, skipped=True,
+                output="" if args.terse else "  SKIP (module-only: no executable entry point)",
+            )
         cmd = [sys.executable, str(xp2f_path), str(source_abs), *helper_args]
         if args.strict:
             cmd.append("--strict")
@@ -909,7 +948,7 @@ def main() -> int:
         results.append(r)
         if r.strict_file_created:
             strict_files_created += 1
-        if not r.ok:
+        if not r.ok and not r.skipped:
             failures += 1
         if not args.terse:
             print(f"[{r.index}/{total}] {r.source}")
@@ -965,7 +1004,7 @@ def main() -> int:
 
     print("")
     print("Summary:")
-    summary_rows = [r for r in results if (not args.terse or not r.ok)]
+    summary_rows = [r for r in results if (not args.terse or (not r.ok and not r.skipped))]
     if args.terse and not summary_rows:
         print("(no failures)")
     src_w = max(len("source"), *(len(r.source) for r in summary_rows)) if summary_rows else len("source")
@@ -1000,8 +1039,9 @@ def main() -> int:
                     f"{r.python_loc:>{py_w}}  {r.fortran_loc:>{f90loc_w}}  {(r.fortran_source or ''):<{f90src_w}}"
                 )
     n_pass = sum(1 for r in results if r.ok)
-    n_fail = len(results) - n_pass
-    print(f"Totals: {len(results)} files, {n_pass} pass, {n_fail} fail")
+    n_skip = sum(1 for r in results if r.skipped)
+    n_fail = len(results) - n_pass - n_skip
+    print(f"Totals: {len(results)} files, {n_pass} pass, {n_fail} fail, {n_skip} skip")
     out_counts = {
         "full_pass": sum(1 for r in results if r.outcome == "full_pass"),
         "transpile_fail": sum(1 for r in results if r.outcome == "transpile_fail"),
@@ -1015,7 +1055,7 @@ def main() -> int:
         f"transpile_fail={out_counts['transpile_fail']}  "
         f"compile_fail={out_counts['compile_fail']}  "
         f"run_fail={out_counts['run_fail']}  "
-        f"other_fail={out_counts['other_fail']}"
+        f"other_fail={out_counts['other_fail']}  module_only={n_skip}"
     )
     if any(timing_count[k] > 0 for k in timing_count):
         print("")

@@ -122,6 +122,13 @@ Run a batch file list:
 python xp2f_batch.py @python_file_list.txt --blockers --jobs 4
 ```
 
+The batch runner reports definition-only modules (imports, function/class definitions,
+docstrings, or `pass`, without a top-level driver) as `SKIP`, not failures.
+Skips are counted separately and do not consume `--limit`; `--skip` still counts
+matched files. Detection does not execute the Python source. Assignments, calls,
+and control flow remain translation candidates, and syntax errors remain failures.
+The `--strict` and `--strict-fix` modes still process modules.
+
 Compare two batch result files:
 
 ```console
