@@ -43,6 +43,7 @@ import fortran_print_suppress as fpsuppress
 import fortran_loop_reorder as floop
 import fortran_post as fpost
 import fortran_purity as fpurity
+import fortran_scan as fscan
 from python_size_specialization import specialize_singleton_returns
 from fortran_scan import (
     _is_wrapped_by_outer_parens,
@@ -76410,6 +76411,80 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
     return helper_files, auto_added, missing_modules
 
 
+def _order_helper_files(helper_files):
+    """Order supplied Fortran sources by USE dependencies, independently of caches.
+
+    External modules without a supplied source are left to the compiler (they
+    can legitimately be provided through -I). Sources containing several modules
+    are a single build unit; their internal USE edges need no file reordering.
+    """
+    suffixes = {".f90", ".f95", ".f03", ".f08", ".f", ".for"}
+    files = []
+    seen = set()
+    definitions, uses, providers = {}, {}, {}
+    object_names = {}
+    for raw in helper_files:
+        path = Path(raw)
+        if path.suffix.lower() not in suffixes:
+            files.append(str(path))
+            continue
+        identity = path.resolve()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        name = str(path)
+        object_name = path.stem.lower()
+        if object_name in object_names:
+            raise ValueError(f"helper object-name collision: {object_names[object_name]} and {name}")
+        object_names[object_name] = name
+        files.append(name)
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        definitions[name] = _modules_defined_in_source(source)
+        uses[name] = set()
+        for _, line in fscan.iter_fortran_statements(source.splitlines()):
+            if re.match(r"^\s*use\s*,\s*intrinsic\s*::", line, re.I):
+                continue
+            match = fscan.USE_RE.match(line)
+            if match:
+                uses[name].add(match.group(1).lower())
+        for module in definitions[name]:
+            if module in providers:
+                raise ValueError(f"multiple helpers provide module '{module}': {providers[module]} and {name}")
+            providers[module] = name
+    dependencies = {
+        name: {providers[module] for module in used
+               if module in providers and providers[module] != name}
+        for name, used in uses.items()
+    }
+    positions = {name: i for i, name in enumerate(files)}
+    ordered, active, done, prerequisites = [], [], set(), {}
+
+    def visit(name):
+        if name in done:
+            return
+        if name in active:
+            cycle = active[active.index(name):] + [name]
+            raise ValueError("helper module dependency cycle: " + " -> ".join(cycle))
+        active.append(name)
+        all_dependencies = set()
+        for dependency in sorted(dependencies.get(name, ()), key=positions.get):
+            visit(dependency)
+            all_dependencies.add(dependency)
+            all_dependencies.update(prerequisites[dependency])
+        active.pop()
+        done.add(name)
+        prerequisites[name] = all_dependencies
+        ordered.append(name)
+
+    for name in files:
+        if name in definitions:
+            visit(name)
+        else:
+            # Do not deduplicate/reorder repeated archives or other linker inputs.
+            ordered.append(name)
+    return ordered, prerequisites
+
+
 def _prepare_helper_link_inputs(helper_files, compiler_parts):
     """Return link inputs for helpers, compiling cached helper objects when needed.
 
@@ -76422,6 +76497,12 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
         repo_lapack = Path(__file__).resolve().with_name("lapack_d.f90")
         if repo_lapack.exists():
             helper_list.append(str(repo_lapack))
+
+    try:
+        helper_list, prerequisites = _order_helper_files(helper_list)
+    except (OSError, ValueError) as exc:
+        command = ["helper-dependencies"]
+        return None, subprocess.CompletedProcess(command, 1, "", str(exc)), command
 
     link_inputs = []
     for hf in helper_list:
@@ -76457,7 +76538,9 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
                 # comparing .mod mtime against the source would then
                 # treat a perfectly valid, up-to-date .mod as stale and
                 # force a full helper recompile on every single build.
-                return obj_path.stat().st_mtime >= src_path.stat().st_mtime
+                source_times = [src_path.stat().st_mtime]
+                source_times.extend(Path(dep).stat().st_mtime for dep in prerequisites.get(str(src_path), ()))
+                return obj_path.stat().st_mtime >= max(source_times)
             except OSError:
                 return False
 
