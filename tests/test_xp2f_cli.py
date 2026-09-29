@@ -3911,11 +3911,13 @@ def test_xp2f_old_style_percent_d_casts_real_args_for_write(tmp_path: Path) -> N
     # same output, confirmed by this test's own successful --compile
     # (and, more directly, by that pass's own dedicated regression
     # tests' run-diff checks).
-    # Python %g uses a minimum field width, so it is now formatted as
-    # text rather than a fixed-width Fortran G descriptor.
-    assert 'write(*,"(2(2x, i2), 2x, f10.4, 2x, a, 1x)")' in out_text
+    # Python widths are minimums, so %d, %f and %g are all formatted as
+    # text rather than fixed-width Fortran I/F/G descriptors (which
+    # overflow to asterisks).
+    assert 'write(*,"(4(2x, a), 1x)")' in out_text
+    assert "py_format_int(int(vals(1)), 2, '')" in out_text
+    assert "py_format_real(0.0_dp, 4, 10, '', &" in out_text
     assert "py_format_real(1.0_dp, 6, 14, '', 'g')" in out_text
-    assert "int(vals(1))" in out_text
     assert "int(vals(2))" in out_text
 
 
@@ -23713,3 +23715,36 @@ def test_xp2f_require_annotations_lint(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "fully annotated" in proc.stdout
     assert not (tmp_path / "xlint_good_p.f90").exists()
+
+
+def test_xp2f_print_percent_width_is_a_minimum_and_honors_flags(tmp_path: Path) -> None:
+    # print(fmt % args) used fixed iW / fW.P descriptors: a value wider than
+    # the field printed asterisks ('%8.0f' % 13549094 needs 9 characters in
+    # Fortran, which always writes the decimal point; '%3d' % 123456), and
+    # the -, 0, + and space flags were ignored ('%05d' % 42 printed '   42').
+    lines = [
+        "value = 13549094",
+        "x = 12345.678",
+        "n = 123456",
+        "k = -42",
+        "print('%8.0f' % value)",
+        "print('%8.0f' % 5.0)",
+        "print('%5.2f' % x)",
+        "print('%8f' % 2.5)",
+        "print('%-8.2f|' % 3.5)",
+        "print('%08.3f' % -3.14159)",
+        "print('%+7.2f' % 2.5)",
+        "print('%3d' % n)",
+        "print('%05d' % k)",
+        "print('%-5d|' % 42)",
+        "print('%+4d' % 42)",
+        "print('% d' % 42)",
+        "print('%d' % True)",
+        "print('a=%6.2f b=%3d c=%d' % (x, n, k))",
+    ]
+    _run_xp2f_compile_diff(tmp_path, "xpercent_min_width.py", lines)
+    py = subprocess.run([sys.executable, str(tmp_path / "xpercent_min_width.py")],
+                        cwd=tmp_path, capture_output=True, text=True, check=True)
+    exe = tmp_path / ("xpercent_min_width_p.exe" if sys.platform == "win32" else "xpercent_min_width_p")
+    ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True)
+    assert ft.stdout == py.stdout

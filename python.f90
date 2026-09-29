@@ -346,6 +346,7 @@ public :: py_time !@pyapi kind=function ret=real args= desc="wall-clock seconds 
 public :: py_ctime !@pyapi kind=function ret=character args=t:real(dp):intent(in):optional desc="string timestamp approximation for Python time.ctime"
 public :: py_format_g_real !@pyapi kind=function ret=character args=x:real(dp):intent(in) desc="Python-like %g formatting helper for real scalars"
 public :: py_format_real
+public :: py_format_int
 public :: cumsum
 public :: cumprod
 public :: eye
@@ -1397,6 +1398,37 @@ contains
             s = repeat(' ', n) // prefix // s
          end if
       end function py_format_real
+
+      pure function py_format_int(x, width, flags) result(s)
+         ! Python "%<flags><width>d": the width is a minimum, never an
+         ! overflow boundary (a Fortran iW descriptor prints asterisks).
+         integer, intent(in) :: x, width
+         character(len=*), intent(in) :: flags
+         character(len=:), allocatable :: s, prefix
+         character(len=64) :: buf
+         integer :: n
+         ! Write x itself (abs(-huge(x)-1) would overflow), then split the sign.
+         write(buf, "(i0)") x
+         s = trim(buf)
+         if (x < 0) then
+            s = s(2:)
+            prefix = '-'
+         else if (index(flags, '+') > 0) then
+            prefix = '+'
+         else if (index(flags, ' ') > 0) then
+            prefix = ' '
+         else
+            prefix = ''
+         end if
+         n = max(0, width - len(prefix) - len(s))
+         if (index(flags, '-') > 0) then
+            s = prefix // s // repeat(' ', n)
+         else if (index(flags, '0') > 0) then
+            s = prefix // repeat('0', n) // s
+         else
+            s = repeat(' ', n) // prefix // s
+         end if
+      end function py_format_int
 
       pure function str_format_real_fixed(x, prec) result(s)
          real(kind=dp), intent(in) :: x

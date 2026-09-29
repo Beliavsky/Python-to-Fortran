@@ -16256,6 +16256,8 @@ def detect_needed_helpers(tree):
                     needed.add("py_str_int")
                 if re.search(r"%[-+#0 ]*\d*(?:\.\d+)?[eEfFgG]", fmt_text):
                     needed.add("py_format_real")
+                if re.search(r"%[-+#0 ]*\d*[diu]", fmt_text):
+                    needed.add("py_format_int")
                 # _percent_format_string_expr's padding helpers.
                 needed.update({"py_str_int", "str_ljust", "str_rjust", "str_zfill"})
                 # Old-style "%...spec..." % args formatting (the BinOp Mod
@@ -59618,7 +59620,15 @@ class translator(ast.NodeVisitor):
                 an = arg_nodes[arg_i]
                 arg_i += 1
                 cl = code.lower()
-                if cl in {"d", "i", "o", "u", "x"}:
+                if cl in {"d", "i", "u"} and self._rank_expr(an) == 0 and (width is not None or spec_body):
+                    # An iW descriptor overflows to asterisks where Python's
+                    # width is a minimum ('%3d' % 123456), and ignores the
+                    # -, 0, + and space flags ('%05d' % 42 is '00042').
+                    if prec is not None:
+                        raise NotImplementedError(f"unsupported old-style print format '%{spec_body}{code}'")
+                    flags = re.match(r"[-+#0 ]*", spec_body).group(0)
+                    items.append(("pyint", an, int(width) if width is not None else 0, flags))
+                elif cl in {"d", "i", "o", "u", "x"}:
                     if width is not None:
                         _iw = int(width)
                         items.append(("desc", f"i{_iw}", an, False))
@@ -59631,8 +59641,13 @@ class translator(ast.NodeVisitor):
                     # %.Pf (precision, no width) used to fall through to a
                     # bare g0 below, dropping the format entirely -- e.g.
                     # print('%.6f' % f(x)) printed all 17 digits.
+                    # A scalar %W.Pf also goes to py_format_real: fW.P
+                    # overflows to asterisks where Python's width is a
+                    # minimum ('%8.0f' % 13549094 needs 9 characters in
+                    # Fortran, which always writes the decimal point), and
+                    # it ignores the -, 0, + and space flags.
                     if (ar == 0 and ((cl in {"g", "e"} and (spec_body or cl == "e"))
-                                     or (cl == "f" and (prec is None or width is None)))
+                                     or cl == "f")
                             and not (int_scalar and PERCENT_FLOAT_INT_FORMAT)):
                         flags = re.match(r"[-+#0 ]*", spec_body).group(0)
                         items.append(("pyg_prec", an, int(prec) if prec is not None else 6,
@@ -59709,6 +59724,16 @@ class translator(ast.NodeVisitor):
                     else:
                         expr_txt = f"real({expr_txt}, kind=dp)"
                     write_args.append(f"py_format_real({expr_txt}, {ent[2]}, {ent[3]}, '{ent[4]}', '{ent[5]}')")
+                    prev_desc = True
+                elif ent[0] == "pyint":
+                    fmt_parts.append("a")
+                    expr_txt = self.expr(ent[1])
+                    arg_kind = self._expr_kind(ent[1])
+                    if arg_kind == "logical":
+                        expr_txt = f"merge(1, 0, {expr_txt})"
+                    elif arg_kind != "int":
+                        expr_txt = f"int({expr_txt})"
+                    write_args.append(f"py_format_int({expr_txt}, {ent[2]}, '{ent[3]}')")
                     prev_desc = True
                 elif ent[0] == "pyg":
                     fmt_parts.append("a")
