@@ -178,6 +178,28 @@ Run a batch file list:
 python xp2f_batch.py @python_file_list.txt --blockers --jobs 4
 ```
 
+For this repository's CSV-backed examples, run from the repository root and
+explicitly use the root as the working directory:
+
+```console
+python xp2f_batch.py "examples/*.py" --work-dir .
+```
+
+This makes the tracked `asset_class_etf_prices.csv` and `prices_no_dates.csv`
+available both to translation-time schema inference and to Python/Fortran
+execution. The single-asset NAGARCH example selects SPY from the same asset-class
+fixture; a separate `spy.csv` is not required. To run an individual example from
+the root, for example, use `python xp2f.py examples/xfit_hv_no_dates.py --run-both`.
+
+Without `--work-dir`, each file still runs in its own source directory. The
+option requires an existing directory and does not copy data or change input,
+helper, or output-option path resolution relative to the invocation directory.
+Generated Fortran/executables remain beside the source by default; relative
+program outputs and compiler caches use the working directory. Use the default
+serial execution for examples sharing output filenames; `--work-dir` does not
+isolate outputs between parallel jobs. It does not fix unrelated translation or
+helper-build failures.
+
 The batch runner reports definition-only modules (imports, function/class definitions,
 docstrings, or `pass`, without a top-level driver) as `SKIP`, not failures.
 Skips are counted separately and do not consume `--limit`; `--skip` still counts

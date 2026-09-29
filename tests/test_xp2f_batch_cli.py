@@ -148,3 +148,75 @@ def test_skips_do_not_trigger_maxfail_or_hide_errors(tmp_path, monkeypatch, caps
     assert xp2f_batch.main() == 1
     assert called == ["broken.py"]
     assert "2 files, 0 pass, 1 fail, 1 skip" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('mode', ['--no-compile', '--time-summary', '--strict-fix'])
+@pytest.mark.parametrize('explicit', [False, True])
+def test_batch_work_dir_preserves_input_paths(tmp_path, monkeypatch, capsys, mode, explicit):
+    source_dir = tmp_path / 'examples'
+    source_dir.mkdir()
+    source = source_dir / 'case.py'
+    source.write_text('print(1)\n', encoding='utf-8')
+    data_dir = tmp_path / 'data space'
+    data_dir.mkdir()
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, Path(kwargs['cwd'])))
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(xp2f_batch.subprocess, 'run', run)
+    args = ['xp2f_batch.py', 'examples/case.py', mode, '--helpers', 'helper.f90']
+    if explicit:
+        args += ['--work-dir', 'data space']
+    if mode == '--strict-fix':
+        args += ['--out-python-dir', 'fixed']
+    monkeypatch.setattr(sys, 'argv', args)
+    assert xp2f_batch.main() == 0
+    assert Path.cwd() == tmp_path
+    assert calls
+    for cmd, cwd in calls:
+        assert cwd == (data_dir if explicit else source_dir)
+        assert str(source) in cmd
+        if str(xp2f_batch.Path(xp2f_batch.__file__).with_name('xp2f.py').resolve()) in cmd:
+            assert str(tmp_path / 'helper.f90') in cmd
+        if '--out-python' in cmd:
+            assert Path(cmd[cmd.index('--out-python') + 1]) == tmp_path / 'fixed/examples/case_strict.py'
+
+
+def test_batch_work_dir_must_exist(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'argv', ['xp2f_batch.py', 'unused.py', '--work-dir', str(tmp_path / 'missing')])
+    assert xp2f_batch.main() == 1
+    assert 'not an existing directory' in capsys.readouterr().out
+
+
+def test_parallel_prebuild_uses_work_dir(tmp_path, monkeypatch):
+    work = tmp_path / 'work'
+    work.mkdir()
+    (tmp_path / 'python.f90').write_text('module python_mod\nend module\n', encoding='utf-8')
+    (tmp_path / 'lapack_d.f90').write_text('! helper\n', encoding='utf-8')
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs['cwd']))
+        return subprocess.CompletedProcess(cmd, 0, '', '')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(xp2f_batch.subprocess, 'run', run)
+    assert xp2f_batch._ensure_parallel_helper_cache('gfortran', work) == 0
+    assert len(calls) == 2
+    assert all(cwd == work and Path(cmd[2]).is_absolute() for cmd, cwd in calls)
+
+
+def test_helper_cache_is_checked_in_selected_work_dir(tmp_path, monkeypatch):
+    source = tmp_path / 'helper.f90'
+    source.write_text('module helper_mod\nend module\n', encoding='utf-8')
+    work = tmp_path / 'work'
+    work.mkdir()
+    monkeypatch.chdir(tmp_path)
+    for name in ('helper.o', 'helper_mod.mod'):
+        (tmp_path / name).write_text('cached', encoding='utf-8')
+    assert xp2f_batch._helper_cache_ok(source)
+    assert not xp2f_batch._helper_cache_ok(source, work)
+    for name in ('helper.o', 'helper_mod.mod'):
+        (work / name).write_text('cached', encoding='utf-8')
+    assert xp2f_batch._helper_cache_ok(source, work)

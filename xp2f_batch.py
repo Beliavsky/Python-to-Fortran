@@ -201,8 +201,9 @@ def _modules_defined_in_source(src_text: str) -> list[str]:
     return sorted({m.group(1).lower() for m in _MODULE_DEF_RE.finditer(src_text or "")})
 
 
-def _helper_cache_ok(src: Path) -> bool:
-    obj = Path(src.name).with_suffix(".o")
+def _helper_cache_ok(src: Path, work_dir: Path | None = None) -> bool:
+    cache_dir = work_dir or Path.cwd()
+    obj = (cache_dir / src.name).with_suffix(".o")
     if not obj.exists():
         return False
     try:
@@ -211,7 +212,7 @@ def _helper_cache_ok(src: Path) -> bool:
             return False
         mods = _modules_defined_in_source(src.read_text(encoding="utf-8", errors="ignore"))
         for mod in mods:
-            mf = Path(f"{mod}.mod")
+            mf = cache_dir / f"{mod}.mod"
             if (not mf.exists()) or mf.stat().st_mtime < src_m:
                 return False
     except OSError:
@@ -219,19 +220,22 @@ def _helper_cache_ok(src: Path) -> bool:
     return True
 
 
-def _ensure_parallel_helper_cache(compiler: str) -> int:
+def _ensure_parallel_helper_cache(compiler: str, work_dir: Path | None = None) -> int:
     """Avoid parallel xp2f workers racing while creating shared helper objects."""
     compiler_parts = shlex.split(compiler)
     if not compiler_parts:
         return 0
     # Compile dependency first; python.f90 may reference lapack_d symbols.
-    for src in (Path("lapack_d.f90"), Path("python.f90")):
-        if not src.exists() or _helper_cache_ok(src):
+    for name in ("lapack_d.f90", "python.f90"):
+        src = Path(name).resolve()
+        if work_dir is not None and not src.exists():
+            src = Path(__file__).resolve().with_name(name)
+        if not src.exists() or _helper_cache_ok(src, work_dir):
             continue
         obj = Path(src.name).with_suffix(".o")
         cmd = compiler_parts + ["-c", str(src), "-o", str(obj)]
         print("Prebuild helper:", " ".join(cmd))
-        cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="ignore")
+        cp = subprocess.run(cmd, cwd=work_dir, text=True, capture_output=True, encoding="utf-8", errors="ignore")
         if cp.returncode != 0:
             print(f"Prebuild helper: FAIL (exit {cp.returncode})")
             if cp.stdout.strip():
@@ -529,6 +533,8 @@ def main() -> int:
     )
     ap.add_argument("--maxfail", type=int, default=0, help="Stop after this many failures (0 = no limit).")
     ap.add_argument("--skip", type=int, default=0, help="Skip this many matched files from the start before applying --limit (0 = skip none).")
+    ap.add_argument("--work-dir", type=Path,
+                    help="Existing working directory for Python, translation, and Fortran execution (default: each source's directory). Input/helper paths remain relative to the invocation directory.")
     ap.add_argument("--limit", type=int, default=0, help="Process at most this many files, excluding module-only skips (0 = no limit). Strict modes include modules.")
     ap.add_argument("--jobs", type=int, default=1, help="Run up to this many independent xp2f.py jobs concurrently (default: 1).")
     ap.add_argument("--timeout", type=float, default=0.0, help="Per-file timeout in seconds (0 = no timeout).")
@@ -638,6 +644,13 @@ def main() -> int:
         print("Invalid options: --jobs > 1 cannot be combined with --maxfail.")
         return 1
 
+    work_dir = args.work_dir.resolve() if args.work_dir is not None else None
+    if work_dir is not None:
+        if not work_dir.is_dir():
+            print(f"Invalid options: --work-dir is not an existing directory: {work_dir}")
+            return 1
+        print(f"Working directory: {work_dir}")
+
     try:
         py_files = _expand_inputs(args.inputs, exclude_generated_typed=args.type)
     except InputExpansionError as exc:
@@ -707,7 +720,7 @@ def main() -> int:
         print(f"Missing script: {xp2f_path}")
         return 1
     if attempted and args.jobs > 1 and not (args.strict or args.strict_fix or args.no_compile):
-        helper_rc = _ensure_parallel_helper_cache(args.compiler)
+        helper_rc = _ensure_parallel_helper_cache(args.compiler, work_dir)
         if helper_rc != 0:
             return helper_rc
 
@@ -718,7 +731,7 @@ def main() -> int:
     timing_sum = {"python run": 0.0, "transpile": 0.0, "compile": 0.0, "fortran run": 0.0, "total": 0.0}
     timing_count = {"python run": 0, "transpile": 0, "compile": 0, "fortran run": 0, "total": 0}
 
-    out_python_root = Path(args.out_python_dir) if args.out_python_dir else None
+    out_python_root = Path(args.out_python_dir).resolve() if args.out_python_dir else None
     if out_python_root is not None:
         out_python_root.mkdir(parents=True, exist_ok=True)
     cwd_resolved = Path.cwd().resolve()
@@ -737,7 +750,7 @@ def main() -> int:
     def _run_case(i: int, pyf: Path) -> CaseResult:
         rel = str(pyf)
         source_abs = pyf.resolve()
-        run_cwd = source_abs.parent
+        run_cwd = work_dir if work_dir is not None else source_abs.parent
         python_loc = _count_file_lines(str(source_abs))
         if pyf in module_only:
             return CaseResult(
