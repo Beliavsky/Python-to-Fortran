@@ -154,6 +154,31 @@ Pass changing state as arguments where practical. Global constants can be useful
 
 When only the kernel needs compilation, consider the supported function-extraction workflow with `xpfunc2f.py`. Its bridge has its own interface and result-shape limitations; standalone translation support does not automatically imply bridge support.
 
+## Keep translation units focused
+
+`xp2f.py` infers types and ranks for the whole program at once: a function's argument types come from its call sites, and its results feed its callers. Translation time therefore depends mainly on how many reachable functions a program has and how deeply its loops and branches nest, more than on its line count. As a rough guide, measured on one Windows workstation (translation only, without compiling):
+
+| Program | Lines | Functions | Translation time |
+|---|---:|---:|---:|
+| Burkardt `polygon.py` | 5,000 | 83 | about 25 s |
+| Burkardt `quad_rule.py` | 24,000 | 131 | about 80 s |
+| Burkardt `subset.py` | 41,000 | 627 | about 70 s |
+| Burkardt `prob.py` | 43,000 | 814 | about 70 s |
+
+On the same machine, programs of a few hundred lines take about 5 to 10 seconds, much of it fixed startup work, and programs of 1,500 to 3,000 lines with 20 to 50 functions take roughly 8 to 15 seconds. Compiling very large generated files also takes noticeable time.
+
+Functions that nothing reachable from the program's top-level code calls are pruned before this analysis, so they cost little. What costs time is everything the main program can reach. A common layout in large numerical libraries is one file holding the library routines, a test routine for each, and a `main()` that calls every test. That makes the whole library reachable, and one unsupported construct anywhere in it stops the entire translation, sometimes only after minutes of analysis.
+
+To keep translation fast and failures easy to locate:
+
+- Put library routines and the drivers that exercise them in separate files, and have each driver import only the routines it uses. Functions imported by name from a sibling `.py` file next to the driver are inlined into the translated program.
+- Translate a focused driver first, then widen its scope, rather than starting with a program that calls everything.
+- Prefer several files along natural boundaries, such as quadrature rules, samplers, and set routines, to one very large file. The generated Fortran is easier to read and compile as well.
+- Very deep nesting of loops and branches costs more to analyze. Moving a deeply nested inner block into a small helper function helps both translation and readability.
+- Consistent argument types help here too. Many translation failures in large programs are type conflicts discovered late in the analysis, such as a float passed to a routine documented as taking an integer. The advice in the sections above avoids both the failure and the wasted time.
+
+These are practical suggestions, not requirements: a large, well-typed single file will translate, just more slowly.
+
 ## Validate behavior, not just compilation
 
 Make intended output explicit. A bare expression such as `np.all(values > 0)`

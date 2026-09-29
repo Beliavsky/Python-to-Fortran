@@ -10,11 +10,11 @@ Fortran is a practical target for numerical Python: it combines native compilati
 
 The output is inspectable source that can be compiled, profiled, modified, and reused in a Fortran project. Standalone translated programs do not require a Python interpreter at execution time, although they may require the project's Fortran helpers and other linked libraries. For workflows that should remain in Python, `xpfunc2f.py` can build supported individual functions into Python-callable extensions through NumPy's `f2py`.
 
-Speedup is workload dependent, not guaranteed. NumPy and SciPy already perform much of their numerical work in compiled libraries; translating calls to those libraries may offer little benefit. Translation and compilation also have a cost. See [Timing Results](TIMING_RESULTS.md) for measurements and the [small example](#small-example) below for a loop-heavy case.
+Speedup is workload dependent, not guaranteed. NumPy and SciPy already perform much of their numerical work in compiled libraries; translating calls to those libraries may offer little benefit. Translation and compilation also have a cost. Translation time grows mainly with the number of functions reachable from the main program and with loop nesting depth, rather than with line count: small programs take seconds, while single files of 25,000 to 40,000 lines that exercise hundreds of functions can take a minute or more (see [Keep translation units focused](writing_python_for_fortran.md#keep-translation-units-focused)). See [Timing Results](TIMING_RESULTS.md) for runtime measurements and the [small example](#small-example) below for a loop-heavy case.
 
 For side-by-side examples and important semantic differences, see the [Python To Fortran Syntax Guide](python_to_fortran_syntax_guide.md). It distinguishes conceptual equivalents from the transpiler's supported subset.
 
-For practical source-code advice, see [Writing Python for Fortran Translation](writing_python_for_fortran.md): stable types and ranks, clear naming and interfaces, array ownership, and validation. These are recommendations for easier translation, not blanket restrictions on valid Python.
+For practical source-code advice, see [Writing Python for Fortran Translation](writing_python_for_fortran.md): stable types and ranks, clear naming and interfaces, array ownership, focused translation units, and validation. These are recommendations for easier translation, not blanket restrictions on valid Python.
 
 ## Status
 
