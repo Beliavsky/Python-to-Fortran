@@ -3163,7 +3163,7 @@ def test_xp2f_compiles_count_mapped_integer_outputs_as_allocatable(tmp_path: Pat
     )
 
     proc = subprocess.run(
-        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -3174,17 +3174,17 @@ def test_xp2f_compiles_count_mapped_integer_outputs_as_allocatable(tmp_path: Pat
     out_f90 = tmp_path / "xprime_factor_small_p.f90"
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
-    # factors and powers are both integer, allocatable, intent(out), so
-    # xp2f's declaration-coalescing pass may merge them onto one line.
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    # factors and powers are integer allocatable arrays; xp2f's
+    # declaration-coalescing pass may merge them onto one line. (The
+    # run/compute split that declared them intent(out) is opt-in with
+    # --structured, and printed wrong output for this program.)
     joined = _join_fortran_continuations(out_text)
-    assert any(
-        line.strip().startswith("integer, allocatable, intent(out) ::") and "factors(:)" in line
-        for line in joined.splitlines()
-    )
-    assert any(
-        line.strip().startswith("integer, allocatable, intent(out) ::") and "powers(:)" in line
-        for line in joined.splitlines()
-    )
+    for name in ("factors(:)", "powers(:)"):
+        assert any(
+            line.strip().startswith("integer, allocatable") and name in line
+            for line in joined.splitlines()
+        ), out_text
 
 
 def test_xp2f_compiles_fstring_listcomp_over_range(tmp_path: Path) -> None:

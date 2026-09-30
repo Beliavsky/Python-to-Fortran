@@ -26985,7 +26985,10 @@ class translator(ast.NodeVisitor):
         if not getattr(node, "_xp2f_value_ctx", False):
             return None
         kinds = [self._expr_kind(v) for v in node.values]
-        if all(k == "logical" for k in kinds):
+        # An operand of unknown kind (an early inference pass, before the
+        # arguments' kinds are known) is not evidence of a non-boolean
+        # value; keep the LOGICAL lowering rather than rejecting it.
+        if all(k in {"logical", None} for k in kinds):
             return None
         simple = all(
             isinstance(v, (ast.Name, ast.Constant))
