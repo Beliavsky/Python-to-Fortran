@@ -24334,3 +24334,53 @@ def test_xp2f_file_header_comments_are_carried_over(tmp_path: Path, layout: str)
     text = "\n".join(out)
     assert text.count("Author: someone") == 1 and "middle comment" in text
     assert "/usr/bin/env" not in text
+
+
+def test_xp2f_source_comments_are_all_carried_over_once(tmp_path: Path) -> None:
+    # Dropped before: comments just before a `return` (the function's final
+    # statement is emitted without the visitor), before a later def,
+    # between the last def and the main code, and after the last statement.
+    # A specialized function (k_int_s, k_real_s) gets its comment once.
+    # (f is called in a loop: a function inlined into a constant has no
+    # Fortran procedure to carry its comments.)
+    lines = [
+        "# header",
+        "",
+        "def f(x):",
+        '    """Add one."""',
+        "    # c1 before assign",
+        "    y = x + 1",
+        "    # c2 before return",
+        "    return y",
+        "",
+        "",
+        "# before g",
+        "def g(n):",
+        "    # c3 only return",
+        "    return n * 2",
+        "",
+        "",
+        "# before k",
+        "def k(a):",
+        "    return a * 3",
+        "",
+        "",
+        "# before main",
+        "a = 0",
+        "for i in range(3):",
+        "    a += f(i)",
+        "# c4 main",
+        "print(a, g(a), k(2), k(2.5))",
+        "# trailing comment",
+    ]
+    _run_xp2f_compile_diff(tmp_path, "xall_comments.py", lines)
+    out = (tmp_path / "xall_comments_p.f90").read_text(encoding="utf-8")
+    comments = [ln.strip()[2:] for ln in out.splitlines() if ln.strip().startswith("! ") and "transpiled" not in ln]
+    want = [ln.strip()[2:] for ln in lines if ln.strip().startswith("# ")] + ["Add one."]
+    for c in want:
+        assert comments.count(c) == 1, (c, out)
+    # Each leading comment sits directly above its procedure.
+    out_lines = [ln.strip() for ln in out.splitlines()]
+    i = out_lines.index("! before g")
+    assert re.match(r"^(pure )?(elemental )?function g\b", out_lines[i + 1]), out
+    assert out.index("! before main") < out.index("! c4 main") < out.index("! trailing comment")

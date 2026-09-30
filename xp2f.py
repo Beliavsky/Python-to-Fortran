@@ -2195,76 +2195,6 @@ def combine_consecutive_simple_allocates(lines):
     return out
 
 
-def enforce_comment_array_dummy_decls(lines):
-    """Promote scalar intent(in) dummies documented as arrays in comments."""
-
-    comment_re = re.compile(
-        r"^\s*!\s*(?:integer|int|real|float|logical|bool|complex|character|string|str)\s+(.+)$",
-        re.IGNORECASE,
-    )
-    decl_re = re.compile(
-        r"^(\s*)((?:real\s*\(kind=dp\)|integer|logical|complex\s*\(kind=dp\)|character\s*\(len=:\))\s*,\s*[^:]*\bintent\s*\(\s*in\s*\)[^:]*)::\s*([A-Za-z]\w*)\s*$",
-        re.IGNORECASE,
-    )
-    proc_start_re = re.compile(
-        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(function|subroutine)\b",
-        re.IGNORECASE,
-    )
-    proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
-
-    def _apply_block(block):
-        hinted_ranks = {}
-        for line in block:
-            m = comment_re.match(line)
-            if not m:
-                continue
-            # Only the type-spec side is structured; prose after ":" may contain
-            # mathematical notation such as f(z), which is not a dummy rank hint.
-            spec = m.group(1).split(":", 1)[0]
-            for nm, dims in re.findall(r"\b([A-Za-z]\w*)\s*[\(\[]\s*([^\)\]]*)\s*[\)\]]", spec):
-                rank = len([part.strip() for part in dims.split(",") if part.strip()])
-                if rank > 0:
-                    hinted_ranks[nm.lower()] = max(hinted_ranks.get(nm.lower(), 0), rank)
-        if not hinted_ranks:
-            return block
-        out = []
-        for line in block:
-            raw = line.rstrip("\r\n")
-            eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
-            m = decl_re.match(raw)
-            if not m:
-                out.append(line)
-                continue
-            name = m.group(3)
-            rank = hinted_ranks.get(name.lower(), 0)
-            if rank <= 0:
-                out.append(line)
-                continue
-            dims = ",".join(":" for _ in range(rank))
-            out.append(f"{m.group(1)}{m.group(2).rstrip()} :: {name}({dims}){eol}")
-        return out
-
-    out = []
-    block = []
-    in_proc = False
-    for line in lines:
-        if not in_proc and proc_start_re.match(line):
-            in_proc = True
-            block = [line]
-            continue
-        if not in_proc:
-            out.append(line)
-            continue
-        block.append(line)
-        if proc_end_re.match(line):
-            out.extend(_apply_block(block))
-            block = []
-            in_proc = False
-    if block:
-        out.extend(_apply_block(block))
-    return out
-
-
 def _source_comment_inference_hints(tree, comment_map):
     """Return comment-derived argument hints keyed by procedure and argument."""
     hints = {}
@@ -8248,6 +8178,36 @@ def python_header_comment_lines(src_text):
     return [f"! {txt}".rstrip() for _ln, _i, txt in items]
 
 
+# Top-level statements of the source being translated, before any rewrite
+# (functions are inlined, hoisted or specialized later): dicts with the
+# start line (decorators included), end line, and the def line of a def.
+_SOURCE_TOPLEVEL_LAYOUT = None
+
+
+def source_toplevel_layout(src_text):
+    try:
+        mod = ast.parse(src_text)
+    except SyntaxError:
+        return None
+    body = list(mod.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]  # the module docstring belongs to the header
+    out = []
+    for n in body:
+        start = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", []) if hasattr(d, "lineno")])
+        is_def = isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        out.append({"start": start, "end": getattr(n, "end_lineno", None) or n.lineno,
+                    "def_line": n.lineno if is_def else None,
+                    "is_func": isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))})
+    return out
+
+
+# Leading comments already written, keyed by the def's line and text:
+# specialized copies of a function (k_int_s, k_real_s) share them.
+_LEADING_COMMENTS_EMITTED = set()
+
+
 def _comment_map_for_top_level(tree, comment_map, extra_def_nodes=None):
     """Keep only comments that are not inside nested def/class bodies.
 
@@ -8259,18 +8219,44 @@ def _comment_map_for_top_level(tree, comment_map, extra_def_nodes=None):
     down), letting every comment inside those function bodies leak through
     as if it were top-level.
     """
+    _LEADING_COMMENTS_EMITTED.clear()
     if not comment_map:
         return {}
     blocked = set()
     def_nodes = list(getattr(tree, "body", []))
     if extra_def_nodes:
         def_nodes = def_nodes + list(extra_def_nodes)
+    if _SOURCE_TOPLEVEL_LAYOUT:
+        return _comment_map_from_source_layout(_SOURCE_TOPLEVEL_LAYOUT, comment_map, def_nodes)
     for n in def_nodes:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             start = getattr(n, "lineno", None)
             end = getattr(n, "end_lineno", None)
             if isinstance(start, int) and isinstance(end, int) and end >= start:
                 blocked.update(range(start, end + 1))
+    # Comments between the previous top-level node and a function belong to
+    # that function: they are attached to it (_xp2f_leading_comments, written
+    # before its Fortran procedure) and kept out of the main program. The
+    # first node's are part of the file header instead.
+    def _node_start(n):
+        return min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", []) if hasattr(d, "lineno")])
+
+    ordered = sorted(
+        [n for n in def_nodes if isinstance(getattr(n, "lineno", None), int)],
+        key=_node_start,
+    )
+    ordered = list({id(n): n for n in ordered}.values())
+    if (ordered and isinstance(ordered[0], ast.Expr) and isinstance(ordered[0].value, ast.Constant)
+            and isinstance(ordered[0].value.value, str)):
+        ordered = ordered[1:]
+    for k, n in enumerate(ordered):
+        if k == 0 or not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        prev_end = getattr(ordered[k - 1], "end_lineno", None) or ordered[k - 1].lineno
+        lead = sorted(ln for ln in comment_map if prev_end < ln < _node_start(n))
+        if lead:
+            n._xp2f_leading_comments = [c for ln in lead for c in comment_map[ln]]
+            blocked.update(lead)
     filtered = {ln: vals for ln, vals in comment_map.items() if ln not in blocked}
     body_nodes = list(getattr(tree, "body", []))
     if (body_nodes and isinstance(body_nodes[0], ast.Expr) and isinstance(body_nodes[0].value, ast.Constant)
@@ -8286,14 +8272,59 @@ def _comment_map_for_top_level(tree, comment_map, extra_def_nodes=None):
     if not body_lines:
         return filtered
     lo = min(body_lines)
-    hi = max(
-        [
-            getattr(n, "end_lineno", getattr(n, "lineno", lo))
-            for n in getattr(tree, "body", [])
-            if isinstance(getattr(n, "lineno", None), int)
-        ]
-    )
-    return {ln: vals for ln, vals in filtered.items() if lo <= ln <= hi}
+    # Comments after a function that directly precedes the first executable
+    # statement introduce the main code (`# main program` after the last def).
+    preceding = [n for n in ordered if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                 and (getattr(n, "end_lineno", None) or n.lineno) < lo]
+    if preceding:
+        lo = max(getattr(n, "end_lineno", None) or n.lineno for n in preceding) + 1
+    # No upper bound: comments inside or just before a later function are
+    # blocked above, so what remains after the last statement is a trailing
+    # comment of the main code (written by _emit_trailing_comments).
+    return {ln: vals for ln, vals in filtered.items() if lo <= ln}
+
+
+def _comment_map_from_source_layout(layout, comment_map, def_nodes):
+    """_comment_map_for_top_level from the original source's statements:
+    comments inside a def, or between the previous statement and a def (its
+    leading comments, attached to the def node by its line), stay out of the
+    main program; the main program's comments start at its first statement,
+    or right after a def that precedes it. Working from the source keeps
+    comments of a function that was inlined away (a = f(3) folded to a
+    constant) out of the main program, and keeps its statements' copied
+    line numbers from being read as top-level positions."""
+    blocked = set()
+    leading = {}
+    # A function with no procedure of its own (inlined into the main code,
+    # `result = helper(3)` folded to constants) keeps its comments in the
+    # main program, next to the code that replaced its calls.
+    present = {getattr(n, "lineno", None) for n in def_nodes
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    inlined = set()
+    for k, it in enumerate(layout):
+        if it["def_line"] is None:
+            continue
+        if it["is_func"] and it["def_line"] not in present:
+            prev_end = layout[k - 1]["end"] if k > 0 else it["start"] - 1
+            inlined.update(range(prev_end + 1, it["end"] + 1))
+            continue
+        blocked.update(range(it["start"], it["end"] + 1))
+        if k > 0 and it["is_func"]:
+            lead = [ln for ln in comment_map if layout[k - 1]["end"] < ln < it["start"]]
+            if lead:
+                leading[it["def_line"]] = [c for ln in sorted(lead) for c in comment_map[ln]]
+                blocked.update(lead)
+    for n in def_nodes:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and getattr(n, "lineno", None) in leading:
+            n._xp2f_leading_comments = leading[n.lineno]
+    first_exec = next((k for k, it in enumerate(layout) if it["def_line"] is None), None)
+    if first_exec is None:
+        return {}
+    lo = layout[first_exec]["start"]
+    if first_exec > 0:
+        lo = layout[first_exec - 1]["end"] + 1
+    return {ln: vals for ln, vals in comment_map.items()
+            if ln not in blocked and (ln >= lo or ln in inlined)}
 
 
 def _tuple_subscript_base_rank(elts):
@@ -26893,6 +26924,13 @@ class translator(ast.NodeVisitor):
         self.alloc_complex_rank.pop(name, None)
         self.alloc_logs.discard(name)
         self.alloc_log_rank.pop(name, None)
+
+    def _emit_trailing_comments(self):
+        """Comments after the last statement, which no statement emits."""
+        for ln in sorted(ln for ln in self.comment_map if ln > self._last_comment_line):
+            for c in self.comment_map[ln]:
+                self.o.w(f"! {c}")
+            self._last_comment_line = ln
 
     def _emit_comments_for(self, node):
         ln = getattr(node, "lineno", None)
@@ -65393,6 +65431,14 @@ def _emit_local_function(
         pure_prefix = "pure elemental " if is_pure_fn else "impure elemental "
     else:
         pure_prefix = "pure " if is_pure_fn else ""
+    _leads = getattr(fn, "_xp2f_leading_comments", None) or []
+    _lead_key = (getattr(fn, "lineno", None), tuple(_leads))
+    if _leads and _lead_key not in _LEADING_COMMENTS_EMITTED:
+        # Comments written just before the Python def (see
+        # _comment_map_for_top_level); once, not for every specialization.
+        _LEADING_COMMENTS_EMITTED.add(_lead_key)
+        for _lead in _leads:
+            o.w(f"! {_lead}")
     if tuple_return or void_return:
         sig = [arg_emit_map.get(a, a) for a in args] + out_names
         o.w(f"{pure_prefix}subroutine {proc_name}(" + ", ".join(sig) + ")")
@@ -68015,6 +68061,11 @@ def _emit_local_function(
     for i, s in enumerate(fn.body):
         if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
+        # This loop emits some statements itself (the final `return`, dict
+        # returns) without the visitor, which emits the comments before a
+        # statement; emitting them here first drops none (the translator
+        # remembers the last line it emitted, so none repeat).
+        tr._emit_comments_for(s)
         if (
             dict_return
             and isinstance(s, ast.Assign)
@@ -76721,6 +76772,7 @@ def generate_flat(
                 o.w(f"{_gnm} = -1" if _gkr[0] == "int" else f"{_gnm} = -1.0_dp")
                 continue
         tr.visit(stmt)
+    tr._emit_trailing_comments()
     if (
         use_proc_module
         and any(isinstance(_fn, ast.FunctionDef) and _fn.name == "main" for _fn in (local_funcs or []))
@@ -78056,6 +78108,8 @@ def transpile_file(
     else:
         src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
     stem = Path(py_path).stem
+    global _SOURCE_TOPLEVEL_LAYOUT
+    _SOURCE_TOPLEVEL_LAYOUT = source_toplevel_layout(src)
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
     if module_only:
@@ -78731,7 +78785,9 @@ def transpile_file(
         f90_lines = rewrite_to_list_directed_io(f90_lines)
     f90_lines = remove_allocatable_shadow_decls(f90_lines)
     f90_lines = combine_consecutive_simple_allocates(f90_lines)
-    f90_lines = enforce_comment_array_dummy_decls(f90_lines)
+    # (A former text pass promoted a dummy to an array from any declaration-
+    # style comment in its procedure, overriding a scalar call; those hints
+    # are applied against the call evidence by _source_comment_inference_hints.)
     f90_lines = reconcile_allocatable_decl_ranks(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
@@ -78856,6 +78912,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     """
     src_path = Path(py_path)
     src = src_override if src_override is not None else src_path.read_text(encoding="utf-8-sig")
+    global _SOURCE_TOPLEVEL_LAYOUT
+    _SOURCE_TOPLEVEL_LAYOUT = source_toplevel_layout(src)
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)

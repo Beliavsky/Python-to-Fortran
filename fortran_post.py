@@ -180,7 +180,17 @@ def ensure_blank_lines_around_units_and_procedures(lines: List[str]) -> List[str
         if entering_outer_interface or (
             interface_depth == 0 and code and (unit_start_re.match(code) or proc_start_re.match(code))
         ):
-            _append_blank_if_needed()
+            # Comment lines directly above the header describe it (the
+            # comments written before a Python def): put the blank line
+            # before them, not between them and the header.
+            k = len(out)
+            while k > 0 and out[k - 1].strip().startswith("!") and not _code(out[k - 1]):
+                k -= 1
+            if k < len(out):
+                if k > 0 and not _is_blank(out[k - 1]):
+                    out.insert(k, "")
+            else:
+                _append_blank_if_needed()
 
         out.append(ln)
 
