@@ -26558,6 +26558,9 @@ class translator(ast.NodeVisitor):
 
     def _expr_real_kind_tag(self, node):
         """Best-effort real kind tag for stability checks: 'real64' or 'real32'."""
+        precision = getattr(node, "_xp2f_real_precision", None)
+        if precision is not None:
+            return precision
         if isinstance(node, ast.Constant) and isinstance(node.value, float):
             return "real64"
         if isinstance(node, ast.Name):
@@ -34855,6 +34858,20 @@ class translator(ast.NodeVisitor):
             b0 = self.expr(node.right)
             lk0 = self._expr_kind(node.left)
             rk0 = self._expr_kind(node.right)
+            if getattr(node, "_xp2f_real_precision", None) == "real32":
+                # NumPy's weak Python float operands are converted before
+                # the operation, not just when its result is assigned.
+                if getattr(node.left, "_xp2f_weak_real", False):
+                    a0 = f"real({a0}, kind=sp)"
+                if getattr(node.right, "_xp2f_weak_real", False):
+                    b0 = f"real({b0}, kind=sp)"
+            elif getattr(node, "_xp2f_real_precision", None) == "real64":
+                # NumPy float32 + int32/int64 promotes to float64; Fortran
+                # otherwise retains the real operand's single precision.
+                if self._expr_real_kind_tag(node.left) == "real32":
+                    a0 = f"real({a0}, kind=dp)"
+                if self._expr_real_kind_tag(node.right) == "real32":
+                    b0 = f"real({b0}, kind=dp)"
             # Python string repetition semantics: n * "a" or "a" * n.
             if op is ast.Mult:
                 lk = lk0
@@ -35173,13 +35190,14 @@ class translator(ast.NodeVisitor):
                 if self._is_col2_expr(node.right):
                     b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
             if op is ast.Div:
+                div_kind = "sp" if getattr(node, "_xp2f_real_precision", None) == "real32" else "dp"
                 if lk0 in {"int", "logical"} and rk0 in {"int", "logical"}:
-                    a = f"real({a}, kind=dp)"
-                    b = f"real({b}, kind=dp)"
+                    a = f"real({a}, kind={div_kind})"
+                    b = f"real({b}, kind={div_kind})"
                 elif lk0 in {"int", "logical"} and rk0 == "real":
-                    a = f"real({a}, kind=dp)"
+                    a = f"real({a}, kind={div_kind})"
                 elif lk0 == "real" and rk0 in {"int", "logical"}:
-                    b = f"real({b}, kind=dp)"
+                    b = f"real({b}, kind={div_kind})"
             if op is ast.Mod:
                 # Python old-style string formatting: "x=%g" % (v,)
                 if self._expr_kind(node.left) == "char" and self._rank_expr(node.left) == 0 and is_const_str(node.left):
@@ -62429,6 +62447,7 @@ def _emit_local_function(
         current_function_name=fn.name,
         structured_type_components=structured_type_components,
     )
+    tr.real_kind_map.update(getattr(fn, "_xp2f_arg_real_precision", {}))
     # A local variable inside a function whose name happens to match the
     # ENCLOSING function's own name (e.g. `def work(...): work = ...;
     # return round(work, 1)`) is a genuine Fortran restriction, not just
@@ -66733,16 +66752,17 @@ def _emit_local_function(
                 arg_decl = f"{arg_kind}, intent({intent_txt}) :: {arg_emit}({dims})"
             decl_kind = arg_kind
         elif arg in tr.alloc_reals:
+            real_decl = tr._real_decl_type(arg)
             if arr_rank <= 0:
-                arg_decl = f"real(kind=dp), intent({intent_txt}) :: {arg_emit}"
+                arg_decl = f"{real_decl}, intent({intent_txt}) :: {arg_emit}"
             else:
                 rr = max(1, tr.alloc_real_rank.get(arg, 1), int(arr_rank))
                 dims = ",".join(":" for _ in range(rr))
                 if is_count_mapped_output_array or is_alloc_rebind_output_array:
-                    arg_decl = f"real(kind=dp), allocatable, intent({intent_txt}) :: {arg_emit}({dims})"
+                    arg_decl = f"{real_decl}, allocatable, intent({intent_txt}) :: {arg_emit}({dims})"
                 else:
-                    arg_decl = f"real(kind=dp), intent({intent_txt}) :: {arg_emit}({dims})"
-            decl_kind = "real(kind=dp)"
+                    arg_decl = f"{real_decl}, intent({intent_txt}) :: {arg_emit}({dims})"
+            decl_kind = real_decl
         else:
             if hint_kind == "char":
                 arg_kind = "character(len=*)"
@@ -66761,7 +66781,7 @@ def _emit_local_function(
                 or (isinstance(dflt, ast.Constant) and isinstance(dflt.value, float))
                 or _arg_real_context(arg)
             ):
-                arg_kind = "real(kind=dp)"
+                arg_kind = tr._real_decl_type(arg)
             else:
                 if prefer_real_unknown_args and _arg_arith_context(arg):
                     arg_kind = "real(kind=dp)"
@@ -67946,6 +67966,8 @@ def _emit_local_function(
                 ret_decl = "logical"
             else:
                 ret_decl = "integer"
+        if getattr(fn, "_xp2f_result_real_precision", None) == "real32":
+            ret_decl = ret_decl.replace("real(kind=dp)", "real(kind=sp)")
         if ret_decl_full:
             o.w(ret_decl)
         else:
@@ -70177,6 +70199,163 @@ def _name_rebound_only_by_self_str_method(fn, nm):
     # Any other binding form (augmented/tuple assignment, a loop target,
     # `with ... as nm`, ...) leaves stores > self_str_assigns.
     return stores == self_str_assigns
+
+
+def annotate_local_real_precision(tree, local_funcs):
+    """Propagate explicit NumPy float precision through local call interfaces.
+
+    This supplements type/rank inference; it does not merge incompatible
+    float32/float64 call signatures into a silently widened procedure.
+    """
+    funcs = {fn.name: fn for fn in local_funcs or []}
+    scopes = [(None, tree.body)] + [(fn.name, fn.body) for fn in funcs.values()]
+    observed = {name: {a.arg: set() for a in fn.args.args} for name, fn in funcs.items()}
+    results = {}
+    numpy_names = {"np", "numpy"}
+    casts = {}
+    for root in [tree, *funcs.values()]:
+        for node in ast.walk(root):
+            if isinstance(node, ast.Import):
+                numpy_names.update(a.asname or a.name for a in node.names if a.name == "numpy")
+            elif isinstance(node, ast.ImportFrom) and node.module == "numpy":
+                casts.update({a.asname or a.name: a.name for a in node.names})
+
+    def numpy_attr(node):
+        if isinstance(node, ast.Name):
+            return casts.get(node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in numpy_names:
+            return node.attr
+        return None
+
+    def combine(tags):
+        tags = set(tags)
+        if None in tags:
+            return None  # unknown is not evidence for single precision
+        if "real64" in tags or ("wide_numpy_int" in tags and tags & {"real32", "weak64"}):
+            return "real64"
+        if "real32" in tags:
+            return "real32"
+        if "weak64" in tags:
+            return "weak64"
+        if "wide_numpy_int" in tags:
+            return "wide_numpy_int"
+        return "weak_int" if "weak_int" in tags else None
+
+    # Leave the established double-precision path untouched unless explicit
+    # float32 values are present in this translation unit.
+    if not any(numpy_attr(n) == "float32" or
+               (isinstance(n, ast.Constant) and n.value == "float32")
+               for root in [tree, *funcs.values()] for n in ast.walk(root)):
+        return
+
+    def infer(node, env):
+        if node is None:
+            return None
+        for attr_name in ("_xp2f_real_precision", "_xp2f_weak_real"):
+            if hasattr(node, attr_name):
+                delattr(node, attr_name)
+        tag = None
+        if isinstance(node, ast.Constant) and isinstance(node.value, float):
+            tag = "weak64"  # NumPy 2 scalar promotion keeps Python floats weak.
+        elif isinstance(node, ast.Constant) and isinstance(node.value, int):
+            tag = "weak_int"
+        elif isinstance(node, ast.Name):
+            tag = env.get(node.id)
+        elif isinstance(node, ast.UnaryOp):
+            tag = infer(node.operand, env)
+        elif isinstance(node, ast.BinOp):
+            tag = combine([infer(node.left, env), infer(node.right, env)])
+            if tag in {"weak_int", "wide_numpy_int"} and (
+                    isinstance(node.op, ast.Div) or
+                    (isinstance(node.op, ast.Pow) and is_const_negative_int(node.right))):
+                tag = "real64" if tag == "wide_numpy_int" else "weak64"
+        elif isinstance(node, ast.Subscript):
+            tag = infer(node.value, env)
+        elif isinstance(node, ast.Call):
+            attr = numpy_attr(node.func)
+            args = [infer(a, env) for a in node.args]
+            keywords = {kw.arg: infer(kw.value, env) for kw in node.keywords}
+            if attr in {"float32", "float64", "double"}:
+                tag = "real32" if attr == "float32" else "real64"
+            elif attr in {"int32", "int64"}:
+                tag = "wide_numpy_int"
+            elif isinstance(node.func, ast.Name) and node.func.id == "float":
+                tag = "weak64"
+            elif isinstance(node.func, ast.Name) and node.func.id in funcs:
+                name = node.func.id
+                fn = funcs[name]
+                for i, arg in enumerate(fn.args.args):
+                    actual = args[i] if i < len(args) else keywords.get(arg.arg)
+                    default_index = i - (len(fn.args.args) - len(fn.args.defaults))
+                    if i >= len(args) and arg.arg not in keywords and default_index >= 0:
+                        actual = infer(fn.args.defaults[default_index], env)
+                    if actual:
+                        next_observed[name][arg.arg].add(actual)
+                tag = results.get(name)
+            elif attr in {"array", "asarray", "zeros", "ones", "empty", "full"}:
+                dtype = next((kw.value for kw in node.keywords if kw.arg == "dtype"), None)
+                dtype_name = dtype.value if isinstance(dtype, ast.Constant) else numpy_attr(dtype)
+                if dtype_name in {"float32", "float64"}:
+                    tag = "real32" if dtype_name == "float32" else "real64"
+        else:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.expr):
+                    infer(child, env)
+        if tag in {"real32", "real64", "weak64"}:
+            node._xp2f_real_precision = "real64" if tag == "weak64" else tag
+            node._xp2f_weak_real = tag == "weak64"
+        return tag
+
+    previous = None
+    for _ in range(4 * len(funcs) + 8):
+        # Recompute observations: a provisional result precision must not
+        # survive as a spurious second call signature after convergence.
+        next_observed = {name: {a.arg: set() for a in fn.args.args} for name, fn in funcs.items()}
+        for name, body in scopes:
+            env = {a: next(iter(tags)) for a, tags in observed.get(name, {}).items() if len(tags) == 1}
+            returns = []
+            def visit(statements):
+                for st in statements:
+                    if isinstance(st, (ast.FunctionDef, ast.ClassDef)):
+                        continue
+                    if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                        tag = infer(st.value, env)
+                        targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                        for target in targets:
+                            if isinstance(target, ast.Name):
+                                env[target.id] = tag
+                    elif isinstance(st, ast.Return):
+                        returns.append(infer(st.value, env))
+                    else:
+                        for child in ast.iter_child_nodes(st):
+                            if isinstance(child, ast.expr):
+                                infer(child, env)
+                        visit(getattr(st, "body", []))
+                        visit(getattr(st, "orelse", []))
+            visit(body)
+            if name:
+                results[name] = combine(returns)
+        observed = next_observed
+        state = repr((observed, results))
+        if state == previous:
+            break
+        previous = state
+    else:
+        raise NotImplementedError("float32 call precision inference did not converge")
+    for name, fn in funcs.items():
+        fn._xp2f_arg_real_precision = {}
+        for arg, tags in observed[name].items():
+            if "real32" in tags and tags & {"real64", "weak64"}:
+                raise NotImplementedError(
+                    f"mixed float32/float64 calls to '{name}', argument '{arg}': "
+                    "precision specialization is not yet supported; use separate functions")
+            if tags >= {"weak64", "real64"} and any("real32" in ts for ts in observed[name].values()):
+                raise NotImplementedError(
+                    f"mixed Python float/NumPy float64 calls to '{name}', argument '{arg}': "
+                    "float32 promotion differs; use separate functions")
+            if tags == {"real32"}:
+                fn._xp2f_arg_real_precision[arg] = "real32"
+        fn._xp2f_result_real_precision = results.get(name)
 
 
 def generate_flat(
@@ -75957,6 +76136,7 @@ def generate_flat(
 
     _force_rng_param_kinds()
 
+    annotate_local_real_precision(tree, local_funcs)
     module_text = ""
     module_global_decls = collect_module_global_decls(
         local_funcs, local_return_specs, local_return_ranks)
@@ -76585,8 +76765,10 @@ def generate_flat(
     # program/module unit, exactly like it already does for the module.
     o.w("use, intrinsic :: iso_fortran_env, only: real32, real64, int8, int16, int32, int64")
     o.w("implicit none")
+    # The proc module exports dp, but may not use/export sp itself.
+    # Main-program float32 temporaries still need their own kind parameter.
+    o.w("integer, parameter :: sp = real32")
     if not use_proc_module:
-        o.w("integer, parameter :: sp = real32")
         o.w("integer, parameter :: dp = real64")
     if not use_proc_module:
         _emit_type_defs(o)

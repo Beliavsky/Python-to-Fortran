@@ -64,6 +64,57 @@ def test_xp2f_signed_right_shift(tmp_path: Path, int_kind: str | None) -> None:
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
 
+def test_xp2f_float32_local_calls_preserve_precision(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xfloat32_calls.py", [
+        "import numpy as np",
+        "def add(a, b):", "    return a + b",
+        "def forward(a, b):", "    c = add(a, b) + 0.0", "    return c",
+        "x = np.float32(16777216)", "y = np.float32(1)",
+        "z = forward(x, y)", "print(int(z - x))",
+        "print(int(add(np.float32(16777216), np.float32(1)) - x))",
+    ])
+    text = (tmp_path / "xfloat32_calls_p.f90").read_text(encoding="utf-8")
+    assert "sp = real32" in text
+    assert "real(kind=sp), intent(in) :: a, b" in text
+
+
+def test_xp2f_float32_weak_and_explicit_float64_operands(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xfloat32_promotion.py", [
+        "import numpy as np",
+        "from numpy import float32 as single",
+        "def weak(a):", "    return (a + 1.0) - a",
+        "def mixed(a, b):", "    return (a + b) - a",
+        "def divided(a):", "    return (a / 1 + np.float32(1)) - a",
+        "def defaulted(a, b=1.0):", "    return (a + b) - a",
+        "x = single(16777216)",
+        "print(int(weak(x)))",
+        "print(int(mixed(x, np.float64(1))))",
+        "print(int((x + 1.0) - x))",
+        "print(int((x + np.float64(1)) - x))",
+        "print(int(divided(x)))", "print(int(defaulted(x)))",
+        "print(int((x + np.int64(1)) - x))",
+    ])
+
+
+def test_xp2f_float32_array_call_precision(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xfloat32_array.py", [
+        "import numpy as np",
+        "def add(a, b):", "    return a + b",
+        "a = np.array([16777216.0, -16777216.0], dtype=np.float32)",
+        "b = np.array([1.0, -1.0], dtype=np.float32)",
+        "c = add(a, b)",
+        "for i in range(2):", "    print(int(c[i] - a[i]))",
+    ])
+
+
+def test_xp2f_float32_mixed_call_precisions_diagnosed() -> None:
+    tree = ast.parse("import numpy as np\ndef f(x):\n    return x + x\n"
+                     "print(f(np.float32(1)))\nprint(f(np.float64(1)))\n")
+    funcs = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    with pytest.raises(NotImplementedError, match="mixed float32/float64 calls"):
+        xp2f.annotate_local_real_precision(tree, funcs)
+
+
 @pytest.mark.parametrize("int_kind", [None, "int32", "int64"])
 def test_xp2f_round_integer_result_kind(tmp_path: Path, int_kind: str | None) -> None:
     values = [-3.5, -2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5, 3.5,
