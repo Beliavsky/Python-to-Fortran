@@ -219,6 +219,54 @@ Summarize historical batch progress files:
 python xsummarize_xp2f_progress.py
 ```
 
+## Interfaces for manually implemented Fortran procedures
+
+`xp2f_interface.py` generates a Fortran procedure contract without executing the
+Python source or attempting to translate its body. This is useful when a human
+or an LLM will implement a function that the transpiler cannot handle. It does
+not require FPM. For example:
+
+```console
+python xp2f_interface.py examples/nagarch_t_model.py neg_loglik --arg "params=float[:]" --arg "r=float[:]" --intent params=in --intent r=in --result float --out-dir nagarch_interface
+```
+
+The output directory must be new. It contains:
+
+- `interface.f90`: a parent module declaring the procedure's arguments and result.
+- `implementation.f90`: an implementation submodule; edit its procedure body.
+  Until implemented, it deliberately stops with an error when called.
+- `contract.json`: Python/Fortran name mappings, types, ranks, intents, kind
+  choices, source-function hash, and limitations.
+
+The [separate module procedure](https://www.intel.com/content/www/us/en/docs/fortran-compiler/developer-guide-reference/2024-2/separate-module-procedures.html)
+inherits its signature from the interface; there is no second set of declarations
+to keep synchronized. Compile the interface before the implementation, for example
+with `gfortran -c interface.f90 implementation.f90` from the generated directory.
+A Fortran caller imports the procedure from the module named in `contract.json`.
+Existing output directories are never overwritten, protecting manual work.
+
+The initial version accepts scalar `float`, `int`, `bool`, and `complex`, and
+fixed-rank numeric/logical arrays using quoted annotations such as `'float[:,:]'`.
+Annotations provide types, or repeated `--arg NAME=TYPE` and `--result TYPE`
+explicitly override them. Caller-based inference is not performed. Reals and
+complex values use `real64`; integers use `int32`, or `--int-kind int64`.
+Scalar arguments are `intent(in)`. Every array requires an explicit
+`--intent NAME=in`, `out`, or `inout`; these are user assertions, not inferred
+mutation guarantees. Array arguments have assumed shape and cannot be resized.
+An array result requires `--result-storage allocatable`; the implementation is
+responsible for allocating it with the correct extents. A `None` result generates
+a subroutine.
+
+Default arguments, decorators, variadic/keyword-only/positional-only parameters,
+strings, objects, and tuple results are not supported yet. Missing signature
+information is an error, not an assumed type. Fortran names are made legal and
+distinct ignoring case; consult the JSON mapping. No `pure` or `elemental`
+promise is made. The contract specifies a calling interface, not a proof of
+equivalent behavior: indexing, fixed-width integer limits, aliasing, global state,
+and error behavior still need review. Automatic integration of these implementations
+into transpiled callers, stale-contract checks, and Python extension wrappers are
+separate future work.
+
 ## Optional FPM projects
 
 `xp2f_fpm.py` can package several drivers with a shared stateless Python module
