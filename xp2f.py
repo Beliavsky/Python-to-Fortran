@@ -19752,16 +19752,44 @@ end interface gather_where2d"""
     py_round_int_pub = (
         "public :: py_round_int !@pyapi kind=function ret=integer "
         "args=x:real(dp):intent(in) "
-        "desc=\"Python 3 round(x) with no ndigits: banker's rounding to the nearest integer\""
+        "desc=\"Python 3 round(x) with no ndigits: banker's rounding to the nearest integer\"\n"
+        "interface py_round_int\n"
+        "   module procedure py_round_int32, py_round_int64\n"
+        "end interface py_round_int"
     )
 
-    py_round_int_blk = """      elemental integer function py_round_int(x) result(r)
-         ! round(x) with no ndigits argument returns an int in Python
-         ! (round(x, n) returns a float even for n == 0); this wrapper
-         ! keeps that same banker's-rounding rule via py_round_ndigits.
+    py_round_int_blk = """      pure elemental integer function py_round_int32(x, mold) result(r)
          real(kind=dp), intent(in) :: x
-         r = nint(py_round_ndigits(x, 0))
-      end function py_round_int"""
+         integer, intent(in), optional :: mold
+         integer(kind=int64) :: wide
+         wide = py_round_int64(x, 0_int64)
+         if (wide > int(huge(r), int64) .or. wide < -int(huge(r), int64)-1_int64) then
+            error stop 'round(): result exceeds default integer range; use --int-kind int64'
+         end if
+         r = int(wide)
+      end function py_round_int32
+
+      pure elemental function py_round_int64(x, mold) result(r)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+         real(kind=dp), intent(in) :: x
+         integer(kind=int64), intent(in) :: mold
+         integer(kind=int64) :: r
+         ! REAL(HUGE(int64)) rounds up to 2**63, an exclusive upper bound.
+         if (.not. ieee_is_finite(x)) error stop 'round(): non-finite input'
+         if (x >= real(huge(r), dp) .or. x < -real(huge(r), dp)) then
+            error stop 'round(): result exceeds int64 range'
+         end if
+         ! Beyond 2**52 every representable double is already integral.
+         ! INT also handles -2**63 without a rounding intermediate overflow.
+         if (abs(x) >= 4503599627370496.0_dp) then
+            r = int(x, kind=int64)
+         else
+            r = nint(x, kind=int64)
+            if (abs(x-real(r, dp)) == 0.5_dp .and. modulo(r, 2_int64) /= 0_int64) then
+               r = r - sign(1_int64, r)
+            end if
+         end if
+      end function py_round_int64"""
 
     csign_complex_pub = (
         "public :: csign_complex !@pyapi kind=function ret=complex(dp) "
@@ -21051,7 +21079,6 @@ def ensure_runtime_helpers(runtime_path, needed_helpers):
         "statistics_quantiles_real": ["sort_real_vec"],
         "nanstd": ["nanvar", "nanmean"],
         "nanvar": ["nanmean"],
-        "py_round_int": ["py_round_ndigits"],
         "expm1_complex": ["expm1"],
     }
 
@@ -38189,7 +38216,9 @@ class translator(ast.NodeVisitor):
                         # round(bool) returns 0/1 as an int in Python, not
                         # the bool itself.
                         return f"merge(1, 0, {a0})"
-                    return f"py_round_int({a0})"
+                    # A mold lets --int-kind select a matching runtime
+                    # result kind via generic resolution (0 -> 0_ikind).
+                    return f"py_round_int({a0}, 0)"
                 def _const_int_ndigits(n):
                     # A negative literal parses as UnaryOp(USub, Constant),
                     # not a bare Constant -- handle both shapes.

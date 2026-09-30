@@ -64,6 +64,50 @@ def test_xp2f_signed_right_shift(tmp_path: Path, int_kind: str | None) -> None:
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("int_kind", [None, "int32", "int64"])
+def test_xp2f_round_integer_result_kind(tmp_path: Path, int_kind: str | None) -> None:
+    values = [-3.5, -2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5, 3.5,
+              2147483646.5, -2147483648.5]
+    if int_kind == "int64":
+        values += [3000000000.25, 3000000000.5, 3000000001.5, -3000000000.5,
+                   -3000000001.5, 4503599627370495.5, 4503599627370496.0,
+                   9223372036854774784.0, -9223372036854775808.0]
+    src = tmp_path / "xround_kind.py"
+    src.write_text("\n".join([
+        "def rounded(x):", "    return round(x)",
+        "def identity(n):", "    return n",
+        f"for value in {values!r}:",
+        "    print(rounded(value))", "    print(identity(round(value)))", "",
+    ]), encoding="utf-8")
+    command = [sys.executable, str(XP2F_PATH), str(src), "--compile"]
+    if int_kind:
+        command += ["--int-kind", int_kind]
+    proc = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run = subprocess.run([str(src.with_name(src.stem + "_p.exe"))],
+                         cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert [int(s) for s in run.stdout.split()] == [round(v) for v in values for _ in range(2)]
+
+
+@pytest.mark.parametrize("int_kind, value, diagnostic", [
+    (None, "3000000000.5", "use --int-kind int64"),
+    ("int64", "9223372036854775808.0", "result exceeds int64 range"),
+])
+def test_xp2f_round_integer_overflow_diagnostic(tmp_path: Path, int_kind, value, diagnostic) -> None:
+    src = tmp_path / "xround_overflow.py"
+    src.write_text(f"x = {value}\nprint(round(x))\n", encoding="utf-8")
+    command = [sys.executable, str(XP2F_PATH), str(src), "--compile"]
+    if int_kind:
+        command += ["--int-kind", int_kind]
+    proc = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run = subprocess.run([str(src.with_name(src.stem + "_p.exe"))],
+                         cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode != 0
+    assert diagnostic in run.stdout + run.stderr
+
+
 @pytest.mark.parametrize("operator", [">>", ">>="])
 def test_xp2f_negative_right_shift_count(tmp_path: Path, operator: str) -> None:
     src = tmp_path / "xnegative_shift.py"
@@ -81,6 +125,37 @@ def test_xp2f_negative_right_shift_count(tmp_path: Path, operator: str) -> None:
     run = subprocess.run([str(executable)], cwd=tmp_path, capture_output=True, text=True)
     assert run.returncode != 0
     assert "negative shift count" in run.stdout + run.stderr
+
+
+def test_round_integer_template_bounds_and_nonfinite(tmp_path: Path) -> None:
+    public, body = xp2f.runtime_helper_templates()["py_round_int"]
+    source = "\n".join([
+        "module rounding", "use, intrinsic :: iso_fortran_env, only: real64, int64",
+        "implicit none", "integer, parameter :: dp=real64", public, "contains", body,
+        "end module rounding", "program check_round", "use rounding", "implicit none",
+        "character(len=100) :: arg", "real(kind=dp) :: x",
+        "integer(kind=int64) :: answer", "call get_command_argument(1, arg)",
+        "read(arg, *) x", "answer = py_round_int(x, 0_int64)", "print *, answer",
+        "end program check_round", "",
+    ])
+    src = tmp_path / "round_template.f90"
+    src.write_text(source, encoding="utf-8")
+    exe = tmp_path / "round_template.exe"
+    build = subprocess.run(["gfortran", "-fcheck=all", "-ffpe-trap=invalid,zero,overflow",
+                            str(src), "-o", str(exe)],
+                           cwd=tmp_path, capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    for value in ["3000000000.5", "3000000001.5", "-3000000001.5",
+                  "-9223372036854775808.0", "9223372036854774784.0"]:
+        run = subprocess.run([str(exe), value], cwd=tmp_path, capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert int(run.stdout.strip()) == round(float(value))
+    for value, diagnostic in [("NaN", "non-finite"), ("Infinity", "non-finite"),
+                              ("9223372036854775808.0", "exceeds int64 range"),
+                              ("-9223372036854777856.0", "exceeds int64 range")]:
+        run = subprocess.run([str(exe), value], cwd=tmp_path, capture_output=True, text=True)
+        assert run.returncode != 0
+        assert diagnostic in run.stdout + run.stderr
 
 
 def test_xp2f_int64_large_integer_literals(tmp_path: Path) -> None:

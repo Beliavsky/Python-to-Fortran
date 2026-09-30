@@ -695,6 +695,44 @@ end program check_quantiles
     assert run.returncode == 0, run.stdout + run.stderr
 
 
+def test_inline_python_mod_round_integer_kinds(tmp_path: Path) -> None:
+    source = """module rounding
+use, intrinsic :: iso_fortran_env, only: real64, int64
+use python_mod, only: py_round_int
+implicit none
+integer, parameter :: dp=real64
+contains
+pure function rounded(x) result(r)
+real(dp), intent(in) :: x
+integer(int64) :: r
+r = py_round_int(x, 0_int64)
+end function rounded
+pure integer function rounded_default(x) result(r)
+real(dp), intent(in) :: x
+r = py_round_int(x)
+end function rounded_default
+end module rounding
+"""
+    inlined, unresolved = xpfunc2f.inline_python_mod_helpers(source)
+    assert unresolved == []
+    assert "use python_mod" not in inlined.lower()
+    src = tmp_path / "rounding.f90"
+    src.write_text(inlined + """
+program check_rounding
+use rounding
+implicit none
+if (rounded(3000000001.5_dp) /= 3000000002_int64) stop 1
+if (rounded_default(-2.5_dp) /= -2) stop 2
+end program check_rounding
+""", encoding="utf-8")
+    exe = tmp_path / "rounding.exe"
+    build = subprocess.run(["gfortran", "-fcheck=all", str(src), "-o", str(exe)],
+                           cwd=tmp_path, capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
 def test_inline_python_mod_helpers_resolves_generic_interface() -> None:
     # Regression test for examples/xbs.py's own `black_scholes` (and 3
     # other files sharing this shape): python.f90's own `optval` is a

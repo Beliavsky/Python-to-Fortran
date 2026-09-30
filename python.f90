@@ -517,6 +517,11 @@ interface narrow_int
    module procedure narrow_int_i32, narrow_int_i64
 end interface narrow_int
 
+! The mold selects the integer result kind, not the value to round.
+interface py_round_int
+   module procedure py_round_int32, py_round_int64
+end interface py_round_int
+
 interface str_concat
    module procedure str_concat_ss, str_concat_sv, str_concat_vs, str_concat_vv
 end interface str_concat
@@ -8784,13 +8789,38 @@ contains
          q = real(floor(x / y, kind=int64), kind=dp)
       end function floor_div_real
 
-      elemental integer function py_round_int(x) result(r)
-         ! round(x) with no ndigits argument returns an int in Python
-         ! (round(x, n) returns a float even for n == 0); this wrapper
-         ! keeps that same banker's-rounding rule via py_round_ndigits.
+      pure elemental integer function py_round_int32(x, mold) result(r)
          real(kind=dp), intent(in) :: x
-         r = nint(py_round_ndigits(x, 0))
-      end function py_round_int
+         integer, intent(in), optional :: mold
+         integer(kind=int64) :: wide
+         wide = py_round_int64(x, 0_int64)
+         if (wide > int(huge(r), int64) .or. wide < -int(huge(r), int64)-1_int64) then
+            error stop 'round(): result exceeds default integer range; use --int-kind int64'
+         end if
+         r = int(wide)
+      end function py_round_int32
+
+      pure elemental function py_round_int64(x, mold) result(r)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+         real(kind=dp), intent(in) :: x
+         integer(kind=int64), intent(in) :: mold
+         integer(kind=int64) :: r
+         ! REAL(HUGE(int64)) rounds up to 2**63, an exclusive upper bound.
+         if (.not. ieee_is_finite(x)) error stop 'round(): non-finite input'
+         if (x >= real(huge(r), dp) .or. x < -real(huge(r), dp)) then
+            error stop 'round(): result exceeds int64 range'
+         end if
+         ! Beyond 2**52 every representable double is already integral.
+         ! INT also handles -2**63 without a rounding intermediate overflow.
+         if (abs(x) >= 4503599627370496.0_dp) then
+            r = int(x, kind=int64)
+         else
+            r = nint(x, kind=int64)
+            if (abs(x-real(r, dp)) == 0.5_dp .and. modulo(r, 2_int64) /= 0_int64) then
+               r = r - sign(1_int64, r)
+            end if
+         end if
+      end function py_round_int64
 
       elemental function csign_complex(x) result(s)
          ! Fortran's SIGN intrinsic doesn't accept complex operands at
