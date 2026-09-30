@@ -24215,3 +24215,13 @@ def test_xp2f_appended_list_product_and_padding_sentinels(tmp_path: Path) -> Non
     assert "ieee_value(0.0_dp, ieee_quiet_nan)" in out_f90, out_f90
     assert "spread(-huge(0), 1, xp2f_cap_ints" in out_f90, out_f90
     assert "xp2f_cap_v" not in out_f90.replace("xp2f_cap_v = 0", ""), out_f90
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_xp2f_structured_option_warns(tmp_path: Path, structured: bool) -> None:
+    src = tmp_path / "xstructured_warn.py"
+    src.write_text("x = 5\nif x > 3:\n    print('big')\n", encoding="utf-8")
+    cmd = [sys.executable, str(XP2F_PATH), str(src)] + (["--structured"] if structured else [])
+    proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert ("Warning: --structured" in proc.stderr) is structured, proc.stderr

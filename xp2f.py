@@ -78976,7 +78976,8 @@ def main():
     )
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
     ap.add_argument("--structured", action="store_true",
-                    help="use the run/compute generator for a program with a top-level if (narrow; experimental)")
+                    help="use the run/compute generator for a program with a top-level if "
+                         "(narrow and unreliable: can mistranslate; prints a warning)")
     ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
     ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
     ap.add_argument("--optimize-loops", action="store_true", help="swap the nesting order of immediately-nested do loops that fill a 2D array in (outer,inner) subscript order, when provably safe -- see fortran_loop_reorder.py")
@@ -79057,6 +79058,13 @@ def main():
     PERCENT_FLOAT_INT_FORMAT = bool(args.percent_float_int_format)
     global STRUCTURED_MODE
     STRUCTURED_MODE = bool(args.structured)
+    if STRUCTURED_MODE:
+        print(
+            "Warning: --structured uses a narrow run/compute generator for programs with a "
+            "top-level if; it has dropped statements and printed wrong output for programs "
+            "outside its pattern. Check the result with --run-diff, or omit --structured.",
+            file=sys.stderr,
+        )
     global NAN_SAFE_COMPARISONS
     NAN_SAFE_COMPARISONS = not bool(args.no_nan_safe_compare)
     if any(ch in args.input_py for ch in "*?[]"):
