@@ -24305,3 +24305,32 @@ def test_xp2f_int_kind_int64_helper_boundaries(tmp_path: Path) -> None:
 ])
 def test_xp2f_callback_kinds_follow_the_callback_call(tmp_path: Path, lines: list) -> None:
     _run_xp2f_compile_diff(tmp_path, "xcallback_kinds.py", lines)
+
+
+@pytest.mark.parametrize("layout", ["program", "procedures"])
+def test_xp2f_file_header_comments_are_carried_over(tmp_path: Path, layout: str) -> None:
+    # The module docstring and the comments before the first statement were
+    # dropped: top-level comments were kept only between statements.
+    lines = [
+        "#!/usr/bin/env python",
+        '"""Count primes up to n.',
+        "",
+        "Second docstring line.",
+        '"""',
+        "# Author: someone",
+        "",
+    ]
+    if layout == "procedures":
+        lines += ["def f(x):", "    return x + 1", "", ""]
+    lines += ["n = 5", "# middle comment", "print(n, f(n))" if layout == "procedures" else "print(n)"]
+    src = tmp_path / "xheader_comments.py"
+    src.write_text("\n".join(lines + [""]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = (tmp_path / "xheader_comments_p.f90").read_text(encoding="utf-8").splitlines()
+    assert out[0].startswith("! transpiled by xp2f.py from xheader_comments.py")
+    assert out[1:5] == ["! Count primes up to n.", "!", "! Second docstring line.", "! Author: someone"]
+    text = "\n".join(out)
+    assert text.count("Author: someone") == 1 and "middle comment" in text
+    assert "/usr/bin/env" not in text

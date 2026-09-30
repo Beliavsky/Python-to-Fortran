@@ -8213,6 +8213,41 @@ def extract_python_comments(src_text):
     return out
 
 
+def python_header_comment_lines(src_text):
+    """The file's header as Fortran comment lines: the module docstring and
+    the `#` comments before the first statement, in source order. Top-level
+    comments are otherwise kept only between top-level statements, so a
+    header such as `\"\"\"Count primes up to n\"\"\"` was dropped. A shebang
+    or encoding line is skipped."""
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError:
+        return []
+    body = list(tree.body)
+    doc_node = None
+    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        doc_node = body.pop(0)
+    first_line = float("inf")
+    if body:
+        first = body[0]
+        first_line = min([first.lineno] + [d.lineno for d in getattr(first, "decorator_list", [])])
+    items = []
+    for ln, texts in extract_python_comments(src_text).items():
+        if ln >= first_line:
+            continue
+        for txt in texts:
+            if ln <= 2 and (txt.startswith("!") or re.search(r"coding[:=]\s*[-\w.]+", txt)):
+                continue
+            items.append((ln, 0, txt))
+    if doc_node is not None:
+        doc = ast.get_docstring(tree, clean=True) or ""
+        for i, line in enumerate(doc.splitlines()):
+            items.append((doc_node.lineno, i, line))
+    items.sort(key=lambda it: (it[0], it[1]))
+    return [f"! {txt}".rstrip() for _ln, _i, txt in items]
+
+
 def _comment_map_for_top_level(tree, comment_map, extra_def_nodes=None):
     """Keep only comments that are not inside nested def/class bodies.
 
@@ -8237,7 +8272,16 @@ def _comment_map_for_top_level(tree, comment_map, extra_def_nodes=None):
             if isinstance(start, int) and isinstance(end, int) and end >= start:
                 blocked.update(range(start, end + 1))
     filtered = {ln: vals for ln, vals in comment_map.items() if ln not in blocked}
-    body_lines = [getattr(n, "lineno", None) for n in getattr(tree, "body", [])]
+    body_nodes = list(getattr(tree, "body", []))
+    if (body_nodes and isinstance(body_nodes[0], ast.Expr) and isinstance(body_nodes[0].value, ast.Constant)
+            and isinstance(body_nodes[0].value.value, str)):
+        # A module docstring does not open the window: comments between it
+        # and the first statement are part of the file header, which
+        # python_header_comment_lines already emits.
+        body_nodes = body_nodes[1:]
+        if not body_nodes:
+            return {}
+    body_lines = [getattr(n, "lineno", None) for n in body_nodes]
     body_lines = [ln for ln in body_lines if isinstance(ln, int)]
     if not body_lines:
         return filtered
@@ -78794,7 +78838,10 @@ def transpile_file(
                     )
     out_path = Path(out_path) if out_path else Path(py_path).with_name(f"{Path(py_path).stem}_p.f90")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    f90 = f"! transpiled by xp2f.py from {Path(py_path).name} on {stamp}\n" + f90
+    # Source comments are always carried over (--comment only adds the
+    # generated procedure/argument comments).
+    header = "".join(ln + "\n" for ln in python_header_comment_lines(src))
+    f90 = f"! transpiled by xp2f.py from {Path(py_path).name} on {stamp}\n" + header + f90
     out_path.write_text(f90, encoding="utf-8")
     for note in sorted(specialization_notes or ()):
         print(note, file=sys.stderr)
@@ -79536,6 +79583,10 @@ def main():
             _emit_autofix_report()
             return 1
     timings["transpile"] = time.perf_counter() - t0_transpile
+    if args.run_both or args.time_both:
+        # Separate the Python program's output, printed above, from the
+        # translation and Fortran run that follow.
+        print()
     print(f"wrote {out}")
     if partial_report is not None:
         kept = partial_report.get("kept", [])
