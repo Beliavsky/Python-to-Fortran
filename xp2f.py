@@ -16969,6 +16969,54 @@ def collect_vectorize_aliases(tree, local_funcs=None):
     return aliases
 
 
+def normalize_cholesky_calls(tree):
+    """Retain NumPy/SciPy provenance before generic linalg lowering."""
+    class Rewriter(ast.NodeTransformer):
+        def __init__(self):
+            self.aliases = {"np": "numpy"}
+
+        def scope(self, node):
+            previous = self.aliases
+            self.aliases = dict(previous)
+            # Imports in a function must not affect another function's aliases.
+            for st in node.body:
+                if isinstance(st, ast.Import):
+                    for a in st.names:
+                        self.aliases[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+                elif isinstance(st, ast.ImportFrom):
+                    for a in st.names:
+                        if a.name != "*":
+                            self.aliases[a.asname or a.name] = f"{st.module}.{a.name}"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                    self.aliases.pop(a.arg, None)
+            self.generic_visit(node)
+            self.aliases = previous
+            return node
+
+        visit_Module = scope
+        visit_FunctionDef = scope
+        visit_AsyncFunctionDef = scope
+
+        def qualified(self, node):
+            if isinstance(node, ast.Name):
+                return self.aliases.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                return self.qualified(node.value) + "." + node.attr
+            return ""
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            qualified = self.qualified(node.func)
+            if qualified in {"numpy.linalg.cholesky", "scipy.linalg.cholesky"}:
+                node._xp2f_cholesky_library = qualified.split(".")[0]
+                node.func = ast.copy_location(ast.Attribute(
+                    value=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="linalg", ctx=ast.Load()),
+                    attr="cholesky", ctx=ast.Load()), node.func)
+            return node
+    return ast.fix_missing_locations(Rewriter().visit(tree))
+
+
 def collect_linalg_aliases(tree):
     """Collect aliases to numpy/scipy linalg modules (e.g. `import scipy.linalg as la`)."""
     aliases = set()
@@ -39320,6 +39368,26 @@ class translator(ast.NodeVisitor):
                     if kw.arg == "axis" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, int):
                         axis = int(kw.value.value)
                 r0 = self._rank_expr(seq.elts[0])
+                if node.func.attr == "concatenate":
+                    axis_keywords = [kw.value for kw in node.keywords if kw.arg == "axis"]
+                    if len(node.args) > 2:
+                        raise NotImplementedError("np.concatenate positional out argument is not supported")
+                    if len(axis_keywords) > 1 or (len(node.args) == 2 and axis_keywords):
+                        raise NotImplementedError("np.concatenate axis specified more than once")
+                    axis_node = node.args[1] if len(node.args) == 2 else (axis_keywords[0] if axis_keywords else ast.Constant(value=0))
+                    try:
+                        axis_value = ast.literal_eval(axis_node)
+                    except (ValueError, TypeError, SyntaxError):
+                        axis_value = None
+                    if type(axis_value) is not int:
+                        raise NotImplementedError("np.concatenate axis must be a literal integer; dynamic axes and axis=None are not supported")
+                    if r0 not in {1, 2}:
+                        raise NotImplementedError("np.concatenate currently supports rank-1 and rank-2 arrays")
+                    if any(self._rank_expr(e) != r0 for e in seq.elts):
+                        raise NotImplementedError("np.concatenate inputs must have the same rank")
+                    if not -r0 <= axis_value < r0:
+                        raise NotImplementedError(f"np.concatenate axis {axis_value} is out of bounds for rank {r0}")
+                    axis = axis_value % r0
                 vals_parts = []
                 seq_kinds = [self._expr_kind(e) for e in seq.elts]
                 promote_to_real = ("complex" not in seq_kinds) and ("real" in seq_kinds) and all((k in {"int", "real"}) for k in seq_kinds if k is not None)
@@ -39497,9 +39565,42 @@ class translator(ast.NodeVisitor):
                         _a1 = f"cmplx({_a1}, kind=dp)"
                 return f"linalg_solve({_a0}, {_a1})"
             if self._is_linalg_call(node.func, {"cholesky"}) and len(node.args) >= 1:
+                scipy_call = getattr(node, "_xp2f_cholesky_library", "numpy") == "scipy"
+                names = ["a", "lower", "overwrite_a", "check_finite"] if scipy_call else ["a"]
+                if len(node.args) > len(names):
+                    raise NotImplementedError("cholesky: too many positional arguments")
+                options = dict(zip(names[1:], node.args[1:]))
+                for kw in node.keywords:
+                    allowed = {"lower", "overwrite_a", "check_finite"} if scipy_call else {"upper"}
+                    if kw.arg not in allowed or kw.arg in options:
+                        raise NotImplementedError("cholesky: unsupported or duplicate keyword argument")
+                    options[kw.arg] = kw.value
+                orientation = options.get("lower" if scipy_call else "upper", ast.Constant(value=False))
+                if not isinstance(orientation, ast.Constant) or type(orientation.value) is not bool:
+                    raise NotImplementedError("cholesky lower/upper must be a literal Boolean")
+                for option in ("overwrite_a", "check_finite"):
+                    value = options.get(option)
+                    if value is not None and (not isinstance(value, ast.Constant) or type(value.value) is not bool):
+                        raise NotImplementedError(f"cholesky {option} must be a literal Boolean")
+                upper = not orientation.value if scipy_call else orientation.value
+                cholesky_arg = node.args[0]
+                complex_cast = (
+                    isinstance(cholesky_arg, ast.Call)
+                    and isinstance(cholesky_arg.func, ast.Attribute)
+                    and cholesky_arg.func.attr == "astype"
+                    and any("complex" in ast.unparse(value).lower() for value in
+                            (list(cholesky_arg.args[:1]) + [kw.value for kw in cholesky_arg.keywords if kw.arg == "dtype"]))
+                )
+                if self._expr_kind(cholesky_arg) == "complex" or complex_cast:
+                    raise NotImplementedError("complex Cholesky is not supported by the real-valued helper")
                 _a0 = self.expr(node.args[0])
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
+                if upper:
+                    # DPOTRF('L') reads only the lower triangle. Transpose
+                    # the input too, so unused lower-triangle data in the
+                    # original array cannot affect an upper factorization.
+                    return f"transpose(linalg_cholesky(transpose({_a0})))"
                 return f"linalg_cholesky({_a0})"
             if self._is_linalg_call(node.func, {"det"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
@@ -77831,6 +77932,7 @@ def transpile_file(
     tree = rewrite_bare_numpy_imports_to_attribute_calls(tree)
     tree = normalize_scipy_submodule_attribute_calls(tree)
     tree = normalize_scipy_signal_submodule_access(tree)
+    tree = normalize_cholesky_calls(tree)
     # Check before tuple lowering and result-kind/rank inference: multi-input
     # calls return multiple arrays, not the first input's kind and rank.
     for node in ast.walk(tree):
