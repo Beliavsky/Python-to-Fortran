@@ -72212,7 +72212,11 @@ def generate_flat(
         cb_scan_cache = {}
 
         def _callback_scan_tr(_fn_node):
-            _key = id(_fn_node)
+            # Callback propagation can refine a procedure's arguments after
+            # its first scan. Do not reuse a scan of the provisional signature.
+            _ranks = tuple(local_func_arg_ranks.get(_fn_node.name, []))
+            _kinds = tuple(local_func_arg_kinds.get(_fn_node.name, []))
+            _key = (id(_fn_node), _ranks, _kinds)
             if _key in cb_scan_cache:
                 return cb_scan_cache[_key]
             _tr = translator(
@@ -72251,6 +72255,17 @@ def generate_flat(
                     _tr.chars.add(_gnm)
                 elif _gk == "complex":
                     _tr.complexes.add(_gnm)
+            # Prescanning a body alone misses ranks supplied by callers (and
+            # shape-preserving expressions such as np.array(data_x)). These
+            # ranks also determine the result of elementwise actual callbacks.
+            for _i, _arg_name in enumerate(local_func_arg_names.get(_fn_node.name, [])):
+                _rank = int(_ranks[_i]) if _i < len(_ranks) else 0
+                if _rank > 0:
+                    _kind = _kinds[_i] if _i < len(_kinds) else None
+                    _mark = {"int": _tr._mark_alloc_int, "logical": _tr._mark_alloc_log,
+                             "complex": _tr._mark_alloc_complex, "char": _tr._mark_alloc_char}.get(
+                                 _kind, _tr._mark_alloc_real)
+                    _mark(_arg_name, rank=_rank)
             _seed_struct_param_types(_tr, _fn_node)
             _tr.prescan(_fn_node.body)
             cb_scan_cache[_key] = _tr
@@ -72932,6 +72947,46 @@ def generate_flat(
                 for _arg_node, _dflt in zip(_pos_args[len(_pos_args) - len(_defaults):], _defaults):
                     if _arg_node.arg in _cb_params and isinstance(_dflt, ast.Name):
                         _merge_actual_cb_spec(_callee_name, _arg_node.arg, _dflt.id)
+
+        # Carry concrete procedure signatures through callback forwarding, not
+        # just direct calls with a named local function. A wrapper may pass its
+        # callback to several consumers, each of which needs the same result
+        # rank (including rank zero for reductions). Iterate to handle chains
+        # in either source order, and cycles, without guessing from input rank.
+        _callback_edges = set()
+        for _fn_node in local_funcs or []:
+            _own_callbacks = set(local_func_callback_params.get(_fn_node.name, set()))
+            if not _own_callbacks:
+                continue
+            for _call in ast.walk(_fn_node):
+                if not (isinstance(_call, ast.Call) and isinstance(_call.func, ast.Name)):
+                    continue
+                _target = _call.func.id
+                _target_callbacks = set(local_func_callback_params.get(_target, set()))
+                _bindings = list(zip(local_func_arg_names.get(_target, []), _call.args))
+                _bindings.extend((_kw.arg, _kw.value) for _kw in _call.keywords)
+                for _formal, _actual in _bindings:
+                    if (_formal in _target_callbacks and isinstance(_actual, ast.Name)
+                            and _actual.id in _own_callbacks):
+                        _callback_edges.add(((_fn_node.name, _actual.id), (_target, _formal)))
+        _changed = True
+        while _changed:
+            _changed = False
+            for _source, _target in sorted(_callback_edges):
+                _source_spec = local_callback_actual_specs.get(_source)
+                if not _source_spec:
+                    continue
+                _dest = local_callback_actual_specs.setdefault(
+                    _target, {"ret_kind": None, "ret_rank": 0, "arg_kinds": {}, "arg_ranks": {}, "nargs": 0})
+                _before = copy.deepcopy(_dest)
+                _dest["ret_kind"] = _promote_kind_hint(_dest["ret_kind"], _source_spec["ret_kind"])
+                for _field in ("ret_rank", "nargs"):
+                    _dest[_field] = max(_dest[_field], _source_spec[_field])
+                for _index, _rank in _source_spec["arg_ranks"].items():
+                    _dest["arg_ranks"][_index] = max(_dest["arg_ranks"].get(_index, 0), _rank)
+                for _index, _kind in _source_spec["arg_kinds"].items():
+                    _dest["arg_kinds"][_index] = _promote_kind_hint(_dest["arg_kinds"].get(_index), _kind)
+                _changed = _changed or _dest != _before
 
         for _fn_node in local_funcs or []:
             if not isinstance(_fn_node, ast.FunctionDef):

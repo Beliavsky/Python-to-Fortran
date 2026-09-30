@@ -18430,6 +18430,58 @@ def test_xp2f_callback_later_matrix_and_vector_arguments(
     ])
 
 
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.parametrize("reduction", [False, True])
+def test_xp2f_forwarded_callback_keeps_caller_inferred_ranks(tmp_path: Path, reverse_order: bool, reduction: bool) -> None:
+    # No direct call to expression and no rank comments/annotations. The
+    # wrapper's np.array(x) preserves the input's rank, and callback metadata
+    # must reach consumers through both keyword and positional forwarding.
+    result = "float(np.sum(pars[0] * x + pars[1]))" if reduction else "pars[0] * x + pars[1]"
+    definitions = [
+        ["def expression(x, pars):", f"    return {result}"],
+        ["def consume(x, y, expr, pars):", "    return y - expr(x, pars)"],
+        ["def forward(x, y, expr, pars):", "    return consume(x, y, expr, pars)"],
+        ["def evaluate(x, y, expr, pars):", "    x = np.array(x, dtype=float)",
+         "    y = np.array(y, dtype=float)", "    prediction = expr(x, pars)",
+         "    delta = forward(x=x, y=y, expr=expr, pars=pars)",
+         "    print(prediction)" if reduction else "    print(float(np.sum(prediction)))",
+         "    return delta"],
+    ]
+    if reverse_order:
+        definitions.reverse()
+    _run_xp2f_compile_diff(tmp_path, "xforwarded_callback_ranks.py", [
+        "import numpy as np",
+        *[line for definition in definitions for line in definition],
+        "def driver():",
+        "    x = [1.0, 2.0, 3.0]",
+        "    y = [4.0, 8.0, 12.0]",
+        "    r = evaluate(x, y, expression, np.array([2.0, 1.0]))",
+        "    for i in range(3):",
+        "        print(r[i])",
+        "driver()",
+    ])
+
+
+def test_xp2f_xrosetta_least_squares_callback_results(tmp_path: Path) -> None:
+    # Exercise the unmodified whole example, including numerical_jacobian,
+    # residuals, and sse all receiving the same vector-valued callback.
+    src = tmp_path / "xrosetta.py"
+    shutil.copy2(EXAMPLES_DIR / "xrosetta.py", src)
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path,
+                        capture_output=True, text=True, check=False)
+    ft = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run"],
+                        cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert py.returncode == 0, py.stdout + py.stderr
+    assert ft.returncode == 0, ft.stdout + ft.stderr
+    # The whole example intentionally exercises array/tuple/formatting output;
+    # compare numerical fitting results independently of presentation differences.
+    for label in ("pars", "sse"):
+        def values(output):
+            line = next(line for line in output.splitlines() if re.match(rf"\s*{label}\s*=", line))
+            return [float(value) for value in line.split("=", 1)[1].replace("[", "").replace("]", "").split()]
+        assert values(ft.stdout) == pytest.approx(values(py.stdout), rel=1e-7, abs=1e-9)
+
+
 def test_xp2f_chebyshev_vector_callback_ranks(tmp_path: Path) -> None:
     # Adapted from Burkardt's MIT-licensed chebyshev.py. The callbacks
     # are elementwise but must have array interfaces when passed to coeff.
