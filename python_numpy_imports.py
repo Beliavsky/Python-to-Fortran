@@ -1,32 +1,59 @@
-"""Resolve NumPy star imports without executing the input program."""
+"""Resolve scientific-library star imports without executing the input program."""
 
 import ast
+import importlib
+
+
+# Start with operations whose SciPy defaults match the existing lowering
+# (Cholesky has its own NumPy/SciPy orientation normalizer). Other exports
+# remain legal to import, but are diagnosed when referenced.
+SCIPY_LINALG_WILDCARD_SUPPORTED = {"solve", "cholesky", "det", "inv", "norm"}
 
 
 def normalize_numpy_wildcard_imports(tree):
     """Qualify statically resolved exports before type/rank inference.
 
     Ordinary module statements are resolved in order; functions use lexical
-    locals and conservative late-bound globals/closures. NumPy is imported
-    only to read its installed export list, never to execute user code.
-    Mixed star imports, conditional rebinding, classes, and lazy generators
-    are deliberately diagnosed rather than approximated. Use explicit NumPy
-    imports for those cases. Trees without NumPy star imports are unchanged.
+    locals and conservative late-bound globals/closures. Libraries are imported
+    only to read their installed export lists, never to execute user code.
+    NumPy and scipy.linalg imports share import-order tracking. Other mixed
+    star imports, conditional rebinding, classes, and lazy generators are
+    diagnosed rather than approximated. Use explicit imports for those cases.
+    The historical function name is retained for existing callers.
     """
     stars = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
-             and n.module == "numpy" and not n.level and any(a.name == "*" for a in n.names)]
+             and (n.module == "numpy" or (n.module or "").split('.')[0] == "scipy")
+             and not n.level and any(a.name == "*" for a in n.names)]
     if not stars:
         return tree
+    supported_modules = {"numpy", "scipy.linalg"}
+    for node in stars:
+        if node.module not in supported_modules:
+            raise NotImplementedError(f"Unsupported SciPy wildcard import: {node.module}; currently supported: scipy.linalg (use explicit imports for other submodules)")
     if any(n not in tree.body for n in stars):
-        raise NotImplementedError("NumPy wildcard imports must be unconditional module-level imports")
-    if any(isinstance(n, ast.ImportFrom) and (n.module != "numpy" or n.level)
+        raise NotImplementedError("NumPy/SciPy wildcard imports must be unconditional module-level imports")
+    if any(isinstance(n, ast.ImportFrom) and (n.module not in supported_modules or n.level)
            and any(a.name == "*" for a in n.names) for n in ast.walk(tree)):
-        raise NotImplementedError("NumPy wildcard import mixed with another wildcard import is ambiguous; use explicit imports")
-    try:
-        import numpy
-    except ImportError as exc:
-        raise NotImplementedError("NumPy must be installed to resolve its wildcard exports") from exc
-    exports = set(numpy.__all__)
+        raise NotImplementedError("NumPy/SciPy wildcard import mixed with another wildcard import is ambiguous; use explicit imports")
+    module_exports = {}
+    for module in {node.module for node in stars}:
+        try:
+            library = importlib.import_module(module)
+        except ImportError as exc:
+            raise NotImplementedError(f"{module} must be installed to resolve its wildcard exports") from exc
+        module_exports[module] = set(getattr(library, "__all__", [n for n in vars(library) if not n.startswith('_')]))
+    exports = set().union(*module_exports.values())
+    # Include explicit imports in a wildcard-using script in the same scope
+    # analysis, so a later NumPy Cholesky import can override SciPy's binding.
+    resolved_modules = supported_modules | {"numpy.linalg"}
+    used_names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    used_names |= {n.arg for n in ast.walk(tree) if isinstance(n, ast.arg)}
+    used_names |= {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    used_names |= {n.asname or n.name.split('.')[0] for n in ast.walk(tree) if isinstance(n, ast.alias)}
+    scipy_alias = "xp2f_scipy_linalg"
+    while scipy_alias in used_names:
+        scipy_alias += "_"
+    uses_scipy = False
 
     # The downstream compiler uses np as its canonical NumPy namespace.
     # Move a conflicting user identifier out of that namespace first.
@@ -92,7 +119,7 @@ def normalize_numpy_wildcard_imports(tree):
 
     numpy_bindings = exports | {
         a.asname or a.name for n in ast.walk(tree)
-        if isinstance(n, ast.ImportFrom) and n.module == "numpy" and not n.level
+        if isinstance(n, ast.ImportFrom) and n.module in resolved_modules and not n.level
         for a in n.names if a.name != "*"
     }
 
@@ -157,22 +184,41 @@ def normalize_numpy_wildcard_imports(tree):
             self.history.setdefault(name, set()).add(value)
 
         def visit_Name(self, node):
+            nonlocal uses_scipy
             value = self.env.get(node.id)
             if isinstance(node.ctx, ast.Load):
                 if value is unknown:
-                    raise NotImplementedError(f"NumPy wildcard binding for {node.id!r} is ambiguous at line {node.lineno}; use explicit imports or distinct names")
+                    raise NotImplementedError(f"NumPy/SciPy wildcard binding for {node.id!r} is ambiguous at line {node.lineno}; use explicit imports or distinct names")
                 if isinstance(value, str):
-                    return ast.copy_location(ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=value, ctx=ast.Load()), node)
+                    if value.startswith("scipy.linalg."):
+                        name = value.rsplit('.', 1)[1]
+                        if name not in SCIPY_LINALG_WILDCARD_SUPPORTED:
+                            raise NotImplementedError(f"Unsupported SciPy operation: {value} (wildcard normalization, line {node.lineno})")
+                        uses_scipy = True
+                        return ast.copy_location(ast.Attribute(value=ast.Name(id=scipy_alias, ctx=ast.Load()), attr=name, ctx=ast.Load()), node)
+                    return ast.copy_location(ast.parse("np." + value, mode="eval").body, node)
+            return node
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == scipy_alias and node.func.attr != "cholesky"):
+                nargs = {"solve": 2, "det": 1, "inv": 1, "norm": 1}[node.func.attr]
+                if len(node.args) != nargs or node.keywords:
+                    raise NotImplementedError(f"Unsupported SciPy call options: scipy.linalg.{node.func.attr}; wildcard support currently requires {nargs} positional argument(s) and default options")
             return node
 
         def visit_ImportFrom(self, node):
-            if node.module == "numpy" and not node.level:
+            if node.module in resolved_modules and not node.level:
+                prefix = {"numpy": "", "numpy.linalg": "linalg.", "scipy.linalg": "scipy.linalg."}[node.module]
                 for a in node.names:
                     if a.name == "*":
-                        for name in exports:
-                            self.bind(name, name)
+                        if node.module not in module_exports:
+                            raise NotImplementedError(f"Unsupported wildcard import mixed with NumPy/SciPy: {node.module}")
+                        for name in module_exports[node.module]:
+                            self.bind(name, prefix + name)
                     else:
-                        self.bind(a.asname or a.name, a.name)
+                        self.bind(a.asname or a.name, prefix + a.name)
                 return ast.copy_location(ast.Pass(), node)
             for a in node.names:
                 self.bind(a.asname or a.name, None)
@@ -209,7 +255,7 @@ def normalize_numpy_wildcard_imports(tree):
 
         def visit_AugAssign(self, node):
             if isinstance(node.target, ast.Name) and self.env.get(node.target.id) is not None:
-                raise NotImplementedError("Augmented assignment to a NumPy wildcard binding requires an explicit local variable")
+                raise NotImplementedError("Augmented assignment to a NumPy/SciPy wildcard binding requires an explicit local variable")
             return self.generic_visit(node)
 
         def visit_Delete(self, node):
@@ -220,7 +266,7 @@ def normalize_numpy_wildcard_imports(tree):
 
         def visit_Global(self, node):
             if any(name in numpy_bindings for name in node.names):
-                raise NotImplementedError("global/nonlocal NumPy wildcard bindings require explicit imports or distinct names")
+                raise NotImplementedError("global/nonlocal NumPy/SciPy wildcard bindings require explicit imports or distinct names")
             return node
 
         visit_Nonlocal = visit_Global
@@ -266,7 +312,7 @@ def normalize_numpy_wildcard_imports(tree):
 
         def visit_ListComp(self, node):
             if any(isinstance(n, ast.NamedExpr) for n in ast.walk(node)):
-                raise NotImplementedError("Assignment expressions in comprehensions with NumPy wildcard imports require explicit imports")
+                raise NotImplementedError("Assignment expressions in comprehensions with NumPy/SciPy wildcard imports require explicit imports")
             saved = self.env
             self.env = dict(saved)
             for gen in node.generators:
@@ -286,15 +332,15 @@ def normalize_numpy_wildcard_imports(tree):
         visit_DictComp = visit_ListComp
 
         def visit_GeneratorExp(self, node):
-            raise NotImplementedError("Lazy generator expressions with NumPy wildcard imports require explicit imports")
+            raise NotImplementedError("Lazy generator expressions with NumPy/SciPy wildcard imports require explicit imports")
 
         def control(self, node):
-            if any(isinstance(n, ast.ImportFrom) and n.module == "numpy" for n in ast.walk(node)):
-                raise NotImplementedError("Conditional NumPy imports with wildcard bindings require explicit unconditional imports")
+            if any(isinstance(n, ast.ImportFrom) and n.module in resolved_modules for n in ast.walk(node)):
+                raise NotImplementedError("Conditional NumPy/SciPy imports with wildcard bindings require explicit unconditional imports")
             bindings = Bindings()
             bindings.visit(node)
             if any(self.env.get(name) is not None for name in bindings.names):
-                raise NotImplementedError("Conditional/loop rebinding of a NumPy wildcard name is ambiguous; use distinct names or explicit imports")
+                raise NotImplementedError("Conditional/loop rebinding of a NumPy/SciPy wildcard name is ambiguous; use distinct names or explicit imports")
             return self.generic_visit(node)
 
         visit_If = control
@@ -305,7 +351,7 @@ def normalize_numpy_wildcard_imports(tree):
         visit_Match = control
 
         def visit_ClassDef(self, node):
-            raise NotImplementedError("NumPy wildcard imports with class definitions require explicit NumPy imports")
+            raise NotImplementedError("NumPy/SciPy wildcard imports with class definitions require explicit imports")
 
     resolver = Resolver()
     tree = resolver.visit(tree)
@@ -328,4 +374,6 @@ def normalize_numpy_wildcard_imports(tree):
     while index < len(tree.body) and isinstance(tree.body[index], ast.ImportFrom) and tree.body[index].module == "__future__":
         index += 1
     tree.body.insert(index, ast.Import(names=[ast.alias(name="numpy", asname="np")]))
+    if uses_scipy:
+        tree.body.insert(index + 1, ast.Import(names=[ast.alias(name="scipy.linalg", asname=scipy_alias)]))
     return ast.fix_missing_locations(tree)
