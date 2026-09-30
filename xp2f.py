@@ -72704,6 +72704,18 @@ def generate_flat(
             _cb_sig_pre = cb_sig.get((_callee_name, _cbp))
             _wrapper_arg_kinds_pre = dict(_cb_sig_pre[4]) if _cb_sig_pre is not None and len(_cb_sig_pre) > 4 else {}
             _actual_arg_names_pre = list(local_func_arg_names.get(_actual_name, []))
+            # The callback call supplies the actual's arguments: where the
+            # actual's own argument kind is still unknown, take the kind the
+            # wrapper passes (`apply(f, n): return f(n)` with an integer n
+            # makes `half(k)`'s k an integer, matching the interface; it was
+            # left to default to real). Known kinds are not overridden.
+            if _actual_arg_names_pre:
+                _actual_kinds_now = local_func_arg_kinds.setdefault(
+                    _actual_name, [None for _ in _actual_arg_names_pre])
+                for _ia, _wk in _wrapper_arg_kinds_pre.items():
+                    if (_wk in {"int", "real", "complex", "logical", "char"}
+                            and int(_ia) < len(_actual_kinds_now) and _actual_kinds_now[int(_ia)] is None):
+                        _actual_kinds_now[int(_ia)] = _wk
             def _return_uses_arg_with_wrapper_kind(*wanted_kinds):
                 if _fn_actual is None:
                     return None
@@ -72721,6 +72733,13 @@ def generate_flat(
             _callee_has_real_evidence = _fn_has_real_evidence(fn_map.get(_callee_name))
             _has_logical_evidence = _fn_has_logical_evidence(_fn_actual)
             _arg_real_kind = _return_uses_arg_with_wrapper_kind("real", "complex")
+            if _ret_kind is None and _fn_actual is not None:
+                # The actual's return kind is not known yet when it depends
+                # on the arguments the callback call supplies (`def sq(k):
+                # return k * k` passed to `apply(f, n): return f(n)`); infer
+                # it from the body below as for a provisional real, instead
+                # of recording nothing, which left the interface real.
+                _ret_kind = "real"
             if _ret_kind == "real":
                 if _arg_real_kind in {"real", "complex"}:
                     _ret_kind = _arg_real_kind

@@ -8,7 +8,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PURE_HELPERS = """
-    grow_and_set_char insert_char py_str_int py_str_real
+    grow_and_set_char insert_char py_str_int32 py_str_int64 py_str_real
     str_format_real_fixed py_str_logical py_str_char vm_integral
     np_insert_real_1d bincount_int searchsorted_left_int searchsorted_right_int
     searchsorted_left_int_scalar searchsorted_right_int_scalar setdiff1d_int lexsort2_int
@@ -40,7 +40,8 @@ PURE_HELPERS = """
 
 def test_runtime_purity_declarations():
     source = (ROOT / "python.f90").read_text(encoding="utf-8")
-    assert len(PURE_HELPERS) == 107
+    # py_str_int is a generic over py_str_int32 and py_str_int64.
+    assert len(PURE_HELPERS) == 108
     for name in PURE_HELPERS:
         assert re.search(
             rf"^\s*pure\s+[^\n]*\b(?:function|subroutine)\s+{name}\s*\(",
