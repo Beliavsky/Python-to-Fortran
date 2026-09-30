@@ -45,6 +45,7 @@ import fortran_post as fpost
 import fortran_purity as fpurity
 import fortran_scan as fscan
 from python_size_specialization import specialize_singleton_returns
+from python_numpy_imports import normalize_numpy_wildcard_imports
 from fortran_scan import (
     _is_wrapped_by_outer_parens,
     coalesce_simple_declarations,
@@ -7584,6 +7585,7 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     reporting np.X(...) already gets today, just with an accurate
     np.-qualified name in the message instead of a bare one.
     """
+    tree = normalize_numpy_wildcard_imports(tree)
     numpy_names = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "numpy":
@@ -77363,6 +77365,7 @@ def _tree_uses_replayable_rng(tree):
 
 def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = ast.parse(src_text, filename=source_name)
+    tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
@@ -77876,6 +77879,7 @@ def transpile_file(
         src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
     stem = Path(py_path).stem
     tree = ast.parse(src)
+    tree = normalize_numpy_wildcard_imports(tree)
     if module_only:
         _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
     reject_undefined_names_in_functions(tree)
@@ -78671,6 +78675,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     src_path = Path(py_path)
     src = src_override if src_override is not None else src_path.read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
+    tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)

@@ -62,7 +62,8 @@ def test_reject_unsupported_axes(tmp_path, axis, message):
     assert message in result.stdout + result.stderr
 
 
-def test_prometeo_riccati(tmp_path):
+@pytest.mark.parametrize("wildcard", [False, True])
+def test_prometeo_riccati(tmp_path, wildcard):
     # Prometeo Riccati example, with explicit NumPy qualification.
     # Embed the small fixture so the tests do not require untracked reports.
     source = r"""
@@ -104,6 +105,8 @@ for i in range(N):
 
     print('P:\n', P)
 """
+    if wildcard:
+        source = source.replace("import numpy as np", "from numpy import *").replace("np.", "")
     # Print full-precision scalars to avoid unrelated matrix layout and
     # NumPy display-precision differences in the run-diff comparator.
     for name in ("L", "P"):
