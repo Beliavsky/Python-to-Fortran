@@ -24225,3 +24225,59 @@ def test_xp2f_structured_option_warns(tmp_path: Path, structured: bool) -> None:
     proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert ("Warning: --structured" in proc.stderr) is structured, proc.stderr
+
+
+
+def test_xp2f_int_kind_int64_helper_boundaries(tmp_path: Path) -> None:
+    # --int-kind int64 used to fail to compile: widened values passed to
+    # default-integer helpers, default-kind values passed to widened local
+    # dummies, [size(x), 3_ikind]. The
+    # int64 build must match Python, including a sum past 2**31.
+    src = tmp_path / "xint64_boundaries.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "",
+        "",
+        "def fit(x, max_iter=1000, rng=0):",
+        "    total = 0",
+        "    for i in range(max_iter):",
+        "        total += i",
+        "    return total + rng + len(x)",
+        "",
+        "",
+        "def simulate(n, rng):",
+        "    return n + rng",
+        "",
+        "",
+        "big = 0",
+        "for i in range(100000):",
+        "    big += i * i",
+        "print(big)",
+        "print('%8d|%-6d|' % (big, 42))",
+        "x = np.zeros(5)",
+        "rng = 3",
+        "print(fit(x), fit(x, max_iter=5), fit(x, rng=rng), simulate(4, rng))",
+        "for i in range(2):",
+        "    np.random.seed(12345 + i)",
+        "w = np.ones(4)",
+        "m = np.zeros((len(w), 3))",
+        "print(m.shape[0], m.shape[1])",
+        "active = np.zeros(3, dtype=bool)",
+        "active[1] = True",
+        "print(int(active.sum()))",
+        "print('together -> relative weights drift less -> less rebalancing trade needed) and more words here')",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--int-kind", "int64", "--compile", "--run-diff"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True)
+    exe = tmp_path / ("xint64_boundaries_p.exe" if sys.platform == "win32" else "xint64_boundaries_p")
+    ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True)
+    # The long string survives line wrapping unchanged.
+    assert py.stdout.splitlines()[-1] in ft.stdout, ft.stdout
+    assert "333328333350000" in ft.stdout
+

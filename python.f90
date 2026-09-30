@@ -349,6 +349,7 @@ public :: py_ctime !@pyapi kind=function ret=character args=t:real(dp):intent(in
 public :: py_format_g_real !@pyapi kind=function ret=character args=x:real(dp):intent(in) desc="Python-like %g formatting helper for real scalars"
 public :: py_format_real
 public :: py_format_int
+public :: narrow_int
 public :: cumsum
 public :: cumprod
 public :: eye
@@ -495,9 +496,25 @@ interface allclose
 end interface allclose
 
 interface py_str
-   module procedure py_str_int, py_str_real, py_str_logical, py_str_char
-   module procedure py_str_int_vec, py_str_real_vec, py_str_logical_vec, py_str_char_vec
+   module procedure py_str_int32, py_str_int64, py_str_real, py_str_logical, py_str_char
+   module procedure py_str_int_vec, py_str_int64_vec, py_str_real_vec, py_str_logical_vec, py_str_char_vec
 end interface py_str
+
+! Integer text for default and 64-bit integers (--int-kind int64 keeps a
+! value beyond 2**31 intact instead of narrowing it first).
+interface py_str_int
+   module procedure py_str_int32, py_str_int64
+end interface py_str_int
+
+interface py_format_int
+   module procedure py_format_int32, py_format_int64
+end interface py_format_int
+
+! Default-kind value of a 64-bit integer, stopping if it does not fit
+! (used by --int-kind int64 where a helper takes a default integer).
+interface narrow_int
+   module procedure narrow_int_i32, narrow_int_i64
+end interface narrow_int
 
 interface str_concat
    module procedure str_concat_ss, str_concat_sv, str_concat_vs, str_concat_vv
@@ -1258,13 +1275,39 @@ contains
          call print_matrix_int_2d(a)
       end subroutine print_matrix_label_int_2d
 
-      pure function py_str_int(x) result(s)
+      pure function py_str_int32(x) result(s)
          integer, intent(in) :: x
          character(len=:), allocatable :: s
          character(len=64) :: buf
          write(buf, "(i0)") x
          s = trim(adjustl(buf))
-      end function py_str_int
+      end function py_str_int32
+
+      pure function py_str_int64(x) result(s)
+         ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x
+         character(len=:), allocatable :: s
+         character(len=64) :: buf
+         write(buf, "(i0)") x
+         s = trim(adjustl(buf))
+      end function py_str_int64
+
+      elemental function narrow_int_i32(x) result(y)
+         integer, intent(in) :: x
+         integer :: y
+         y = x
+      end function narrow_int_i32
+
+      elemental function narrow_int_i64(x) result(y)
+         ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x
+         integer :: y
+         if (x > int(huge(y), int64) .or. x < -int(huge(y), int64) - 1_int64) &
+            error stop "narrow_int: integer value out of the default integer range"
+         y = int(x)
+      end function narrow_int_i64
 
       pure function py_str_real(x) result(s)
          real(kind=dp), intent(in) :: x
@@ -1401,14 +1444,24 @@ contains
          end if
       end function py_format_real
 
-      pure function py_format_int(x, width, flags, code) result(s)
+      pure function py_format_int32(x, width, flags, code) result(s)
+         ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer, intent(in) :: x, width
+         character(len=*), intent(in) :: flags, code
+         character(len=:), allocatable :: s
+         s = py_format_int64(int(x, int64), width, flags, code)
+      end function py_format_int32
+
+      pure function py_format_int64(x, width, flags, code) result(s)
          ! Python "%<flags><width><code>" for code d, i, u, o, x or X: the
          ! width is a minimum, never an overflow boundary (a Fortran iW
          ! descriptor prints asterisks), and o/x/X are signed magnitudes
          ! ('%x' % -255 is '-ff'), not Fortran's two's-complement O/Z output.
          ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
          use, intrinsic :: iso_fortran_env, only: int64
-         integer, intent(in) :: x, width
+         integer(kind=int64), intent(in) :: x
+         integer, intent(in) :: width
          character(len=*), intent(in) :: flags, code
          character(len=:), allocatable :: s, prefix
          character(len=*), parameter :: digits = '0123456789abcdef'
@@ -1417,11 +1470,11 @@ contains
          base = 10
          if (code == 'o') base = 8
          if (code == 'x' .or. code == 'X') base = 16
-         ! Widen before abs: abs(-huge(x)-1) overflows a default integer.
-         v = abs(int(x, int64))
+         ! abs(-huge(x)-1) overflows; take the magnitude digit by digit.
+         v = x
          s = ''
          do
-            d = int(mod(v, base))
+            d = abs(int(mod(v, base)))  ! mod keeps the sign of a negative v
             s = digits(d+1:d+1) // s
             v = v / base
             if (v == 0) exit
@@ -1456,7 +1509,7 @@ contains
          else
             s = repeat(' ', n) // prefix // s
          end if
-      end function py_format_int
+      end function py_format_int64
 
       pure function str_format_real_fixed(x, prec) result(s)
          real(kind=dp), intent(in) :: x
@@ -1539,6 +1592,18 @@ contains
             s(i) = py_str_int(x(i))
          end do
       end function py_str_int_vec
+
+      function py_str_int64_vec(x) result(s)
+         ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:)
+         character(len=:), allocatable :: s(:)
+         integer :: i
+         allocate(character(len=64) :: s(size(x)))
+         do i = 1, size(x)
+            s(i) = py_str_int(x(i))
+         end do
+      end function py_str_int64_vec
 
       function py_str_real_vec(x) result(s)
          real(kind=dp), intent(in) :: x(:)

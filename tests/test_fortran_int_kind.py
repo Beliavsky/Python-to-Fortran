@@ -113,3 +113,109 @@ end program test
     run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
     assert run.stdout.strip() == ("10000000000" if kind == "int64" else "1000000000")
+
+
+
+@pytest.mark.parametrize("lines, expected", [
+    # Inside a string the text resumes right after the second `&`.
+    (['   write(*,"(a)") "trade nee&', '      &ded)"'], 'write(*,"(a)") "trade needed)"'),
+    (['   x = "ab  &', '      &  cd" ! note'], 'x = "ab    cd"'),
+    (["   s = 'it''s &", "   &a ! not a comment'"], "s = 'it''s a ! not a comment'"),
+    # Between tokens: one space; comment lines may sit between continuations.
+    (['   call f(1, &', '   ! comment', '', '      & 2)'], 'call f(1, 2)'),
+])
+def test_join_continued_lines_inside_strings(lines, expected):
+    assert fscan.join_continued_lines(lines)[0][1] == expected
+
+
+def test_helper_arguments_are_converted_per_call():
+    text = """module demo
+implicit none
+contains
+subroutine run(n, k)
+integer, intent(in) :: n
+integer, intent(in), optional :: k
+integer :: z(3), m
+character(len=:), allocatable :: s
+logical :: active(3)
+s = py_format_int(n + 1, 5, '', 'd')
+m = optval(k, 7)
+call seed_rng(12345 + n)
+call random_choice_prob([0.5d0, 0.5d0], 3, z)
+active(2) = .true.
+end subroutine run
+end module demo
+"""
+    out = "".join(fikind.add_integer_kind(text.splitlines(keepends=True), "int64"))
+    # py_format_int has an int64 specific: no conversion. A helper with a
+    # default-integer intent(in) dummy gets a checked narrow_int.
+    assert "py_format_int(n + 1_ikind, 5, '', 'd')" in out, out
+    assert "use python_mod, only: narrow_int" in out, out
+    # An optional dummy: a plain name stays default kind, an expression is converted.
+    assert "optval(k, 7)" in out and "integer, intent(in), optional :: k" in out, out
+    assert "seed_rng(narrow_int(12345_ikind + n))" in out, out
+    # An intent(out) actual stays default kind; others are widened.
+    assert "integer :: z(3_ikind)" in out and "integer(kind=ikind) :: m" in out, out
+    # `active` is this file's array, not lbfgsb.f90's routine.
+    assert "active(2_ikind) = .true." in out, out
+
+
+
+def test_interface_bodies_import_ikind():
+    text = """module demo
+implicit none
+contains
+function apply(f, n) result(r)
+interface
+function f_cb(x) result(y)
+import dp
+integer :: x
+real :: y
+end function f_cb
+function g_cb(x) result(y)
+integer :: x
+integer :: y
+end function g_cb
+end interface
+procedure(f_cb) :: f
+integer :: n
+real :: r
+r = f(n)
+end function apply
+end module demo
+"""
+    out = "".join(fikind.add_integer_kind(text.splitlines(keepends=True), "int64"))
+    assert "import dp, ikind" in out, out
+    assert out.count("import :: ikind") == 1, out
+
+
+@pytest.mark.parametrize("value, ok", [("2147483647_int64", True), ("3000000000_int64", False)])
+def test_narrow_int_stops_outside_default_range(tmp_path, value, ok):
+    compiler = shutil.which("gfortran")
+    if not compiler:
+        pytest.skip("gfortran required")
+    prog = tmp_path / "narrow.f90"
+    prog.write_text(
+        "program p\n"
+        "use, intrinsic :: iso_fortran_env, only: int64\n"
+        "use python_mod, only: narrow_int\n"
+        "implicit none\n"
+        f"print *, narrow_int({value})\n"
+        "end program p\n", encoding="utf-8")
+    exe = tmp_path / "narrow.exe"
+    build = subprocess.run([compiler, str(ROOT / "python.f90"), str(ROOT / "lapack_d.f90"), str(prog), "-o", str(exe)],
+                           cwd=tmp_path, capture_output=True, text=True)
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
+    assert (run.returncode == 0) is ok, run.stdout + run.stderr
+    if not ok:
+        assert "out of the default integer range" in run.stdout + run.stderr
+
+
+def test_narrow_int_use_is_added_per_unit_without_losing_lines():
+    text = ("program p\nimplicit none\ninteger :: n\nn = 3\ncall seed_rng(n + 1)\nend program p\n"
+            "module m\nimplicit none\ncontains\nsubroutine s(k)\ninteger, intent(in) :: k\n"
+            "call seed_rng(k + 2)\nend subroutine s\nend module m\n")
+    out = "".join(fikind.add_integer_kind(text.splitlines(keepends=True), "int64"))
+    assert out.count("use python_mod, only: narrow_int") == 2, out
+    assert "end program p" in out and "end module m" in out, out

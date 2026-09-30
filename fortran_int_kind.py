@@ -15,27 +15,39 @@ bare `integer` declarations in an already-generated `.f90` file to
 `int64`) plus the matching `use, intrinsic :: iso_fortran_env, only: ...`
 import once per module/program unit.
 
-Safety: a small, fixed set of external boundary procedures (LAPACK
-routines and this project's own scipy.optimize-style bridge wrappers --
-`lapack_d.f90`, `fsolve_bridge.f90`, `curvefit_bridge.f90`,
-`lbfgsb_bridge.f90`, `bfgs_bridge.f90`, `powell_bridge.f90`) are static,
-unmodified external Fortran that declare every size/leading-dimension/info
-argument as plain default-kind INTEGER. A generated local variable that's
-passed as an actual argument to one of these calls is left as plain
-`integer` -- never upgraded -- since widening it would be a genuine
-dummy-argument kind mismatch against that external procedure's own
-explicit interface (a real compile-time failure, not a style choice).
+Helper boundaries: the vendored helper sources (python.f90, lapack_d.f90,
+minpack.f90, the optimizer bridges, the DataFrame modules, ...) are static
+Fortran with default-kind INTEGER dummies. Their signatures are scanned
+(dummy position, name, intent, optional/allocatable/pointer, and whether
+the dummy is a default integer), including generic interfaces and
+type-bound bindings. Every generated integer is widened, and each helper
+call is converted argument by argument:
+
+- a literal, or an array constructor of literals, keeps the default kind;
+- any other value for an intent(in) default-integer dummy is converted --
+  with the checked `narrow_int` from python.f90 for int64, which stops the
+  program rather than pass a truncated value, and with `int` for int32;
+- a variable passed to an out/inout, allocatable or pointer dummy, or as a
+  plain name to an optional one (it may be an absent optional argument,
+  which can be passed on but not converted), stays default kind. A local
+  procedure whose dummy stays default kind that way is itself a boundary
+  for its callers, and a default-kind variable passed to a widened
+  intent(in) dummy is converted with `int(..., kind=ikind)`;
+- a generic with a specific for other integer kinds (py_str_int64,
+  py_format_int64) is left to resolve by itself, keeping the full value.
+
+Integer-result intrinsics without a KIND argument (size, len, nint, ...)
+get `kind=ikind`, and interface bodies import `ikind`.
 
 Every bare integer LITERAL constant also gets an `_ikind` suffix (skipping
-string/comment content and anything inside a boundary call's own argument
-list) -- this mirrors xp2f.py's own existing, proven approach for REAL
-literals (every real constant it emits already gets a `_dp` suffix, e.g.
-`0.5` -> `0.5_dp`): Fortran requires an actual argument passed to a
-procedure under an explicit interface to match its dummy's kind EXACTLY
-(unlike assignment or arithmetic, which freely widen) -- so a literal like
-`foo(3, 4)` fails to compile once `foo`'s own parameters become
-`integer(kind=ikind)`, the same way an unsuffixed real literal would fail
-against a `real(kind=dp)` parameter.
+string/comment content) -- this mirrors xp2f.py's own existing, proven
+approach for REAL literals (every real constant it emits already gets a
+`_dp` suffix, e.g. `0.5` -> `0.5_dp`): Fortran requires an actual argument
+passed to a procedure under an explicit interface to match its dummy's kind
+EXACTLY (unlike assignment or arithmetic, which freely widen) -- so a
+literal like `foo(3, 4)` fails to compile once `foo`'s own parameters
+become `integer(kind=ikind)`, the same way an unsuffixed real literal would
+fail against a `real(kind=dp)` parameter.
 
 Tailored to xp2f.py's own emission style, but unlike fortran_loop_reorder.py
 (which declines a `do`-loop nest whose header spans more than one physical
@@ -71,76 +83,153 @@ import fortran_scan as fscan
 # get added to python.f90 over time) to hand-maintain a fixed name list --
 # instead this scans the actual vendored source files directly, once, the
 # first time it's needed, and caches the result.
-_BOUNDARY_SOURCE_FILES = ("python.f90", "lapack_d.f90", "minpack.f90")
+_BOUNDARY_SOURCE_FILES = (
+    "python.f90", "lapack_d.f90", "minpack.f90", "bfgs.f90", "lbfgsb.f90", "fmin.f90", "root.f90",
+)
 _BOUNDARY_SOURCE_GLOB = "*_bridge.f90"
+_BOUNDARY_SOURCE_GLOBS = (_BOUNDARY_SOURCE_GLOB, "dataframe_*.f90", "time_sleep_*.f90")
 
 _boundary_calls_cache: Optional[frozenset] = None
+_boundary_sigs_cache = None
+
+_INTENT_RE = re.compile(r"\bintent\s*\(\s*(in\s*out|inout|out|in)\s*\)", re.IGNORECASE)
+_TYPE_DECL_RE = re.compile(
+    r"^\s*(?P<type>integer|real|complex|logical|character|type\s*\(|class\s*\(|double\s+precision)"
+    r"(?P<sel>\s*\([^:]*?\))?(?P<attrs>[^:]*)::(?P<names>.*)$",
+    re.IGNORECASE,
+)
 
 
-def _scan_external_boundary_calls() -> frozenset:
-    """Every subroutine/function name defined in the vendored runtime
-    helper library or a *_bridge.f90 file that has at least one bare
-    (not already `integer(kind=...)`) INTEGER dummy argument."""
-    global _boundary_calls_cache
-    if _boundary_calls_cache is not None:
-        return _boundary_calls_cache
-
-    names: Set[str] = set()
+def _boundary_source_paths() -> List[Path]:
     base_dir = Path(__file__).resolve().parent
-    candidates = [base_dir / f for f in _BOUNDARY_SOURCE_FILES]
-    candidates.extend(sorted(base_dir.glob(_BOUNDARY_SOURCE_GLOB)))
-    for path in candidates:
-        if not path.exists():
+    paths = [base_dir / f for f in _BOUNDARY_SOURCE_FILES]
+    for pattern in _BOUNDARY_SOURCE_GLOBS:
+        paths.extend(sorted(base_dir.glob(pattern)))
+    return [p for p in dict.fromkeys(paths) if p.exists()]
+
+
+def _unit_dummies(unit) -> List[dict]:
+    """Per dummy argument of a scanned unit, in order: whether it is a
+    default-kind INTEGER, its intent, and whether it is allocatable/pointer
+    or a derived-type object (a type-bound procedure's passed object)."""
+    info = {a.lower(): {"name": a.lower(), "int": False, "intent": None, "alloc": False, "opt": False,
+                        "kinded_int": False, "obj": False}
+            for a in unit["args"]}
+    for _ln, stmt in fscan.iter_fortran_statements(unit["body_lines"]):
+        m = _TYPE_DECL_RE.match(stmt)
+        if m is None:
             continue
+        typ = m.group("type").lower().replace(" ", "")
+        default_int = typ == "integer" and not m.group("sel")
+        attrs = m.group("attrs")
+        im = _INTENT_RE.search(attrs)
+        intent = re.sub(r"\s+", "", im.group(1).lower()) if im else None
+        if intent is None and re.search(r"\bvalue\b", attrs, re.IGNORECASE):
+            intent = "in"
+        alloc = bool(re.search(r"\b(allocatable|pointer)\b", attrs, re.IGNORECASE))
+        # A variable passed to an optional dummy may be an absent optional
+        # argument of the caller, which can be passed on but not converted
+        # (`optval(int(max_iter), 1000)` read a missing argument).
+        opt = bool(re.search(r"\boptional\b", attrs, re.IGNORECASE))
+        for chunk in fscan._split_top_level_commas(m.group("names")):
+            nm = re.match(r"^\s*([A-Za-z_]\w*)", chunk)
+            if nm and nm.group(1).lower() in info:
+                d = info[nm.group(1).lower()]
+                d.update(int=default_int, intent=intent, alloc=alloc, opt=opt, obj=typ in ("type(", "class("),
+                         kinded_int=typ == "integer" and bool(m.group("sel")))
+    return [info[a.lower()] for a in unit["args"]]
+
+
+_INT_RESULT_HELPERS: Set[str] = set()
+
+
+def _function_returns_default_int(unit) -> bool:
+    header_type = unit.get("header_type") if isinstance(unit, dict) else None
+    res = (unit.get("result") or unit["name"]).lower()
+    for _ln, stmt in fscan.iter_fortran_statements(unit["body_lines"]):
+        m = _TYPE_DECL_RE.match(stmt)
+        if m is None:
+            continue
+        for chunk in fscan._split_top_level_commas(m.group("names")):
+            nm = re.match(r"^\s*([A-Za-z_]\w*)", chunk)
+            if nm and nm.group(1).lower() == res:
+                return m.group("type").lower() == "integer" and not m.group("sel")
+    return bool(header_type) and header_type.lower() == "integer"
+
+
+def _scan_boundary_signatures():
+    """Signatures of the vendored helper procedures (python.f90, LAPACK,
+    MINPACK, the optimizer bridges, the DataFrame modules, ...): name ->
+    list of dummy lists (several for a generic interface), plus type-bound
+    binding names -> implementation names. Cached."""
+    global _boundary_sigs_cache
+    if _boundary_sigs_cache is not None:
+        return _boundary_sigs_cache
+    sigs = {}
+    bindings = {}
+    int_results = set()
+    generics = {}
+    for path in _boundary_source_paths():
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        src_lines = text.splitlines()
         for unit in fscan.split_fortran_units_simple(text):
-            if unit["kind"] not in ("subroutine", "function"):
-                continue
-            arg_names = {a.lower() for a in unit["args"]}
-            if not arg_names:
-                continue
-            for body_line in unit["body_lines"]:
-                m = _DECL_RE.match(body_line)
-                if m is None or "::" not in m.group("rest"):
-                    continue
-                _attrs, decl_names_part = m.group("rest").split("::", 1)
-                for chunk in fscan._split_top_level_commas(decl_names_part):
-                    nm_m = re.match(r"^\s*([A-Za-z_]\w*)", chunk)
-                    if nm_m and nm_m.group(1).lower() in arg_names:
-                        names.add(unit["name"].lower())
-                        break
-        # A call site never spells out argsort_int/argsort_real (the
-        # concrete procedures just found above) -- it calls the GENERIC
-        # interface name (`call argsort(...)`, resolved to whichever
-        # concrete procedure matches at compile time), which is a
-        # different name entirely and was invisible to the scan above
-        # (an `interface NAME ... end interface` block is neither a
-        # `subroutine` nor a `function` unit). If any of an interface's
-        # own module procedures already has a bare-integer dummy (i.e.
-        # is already in `names`), the interface's own name is just as
-        # much an external boundary call as they are.
+            if unit["kind"] in ("subroutine", "function"):
+                sigs.setdefault(unit["name"].lower(), []).append(_unit_dummies(unit))
+            if unit["kind"] == "function" and _function_returns_default_int(unit):
+                int_results.add(unit["name"].lower())
         for m_if in re.finditer(
             r"^\s*interface\s+([A-Za-z_]\w*)\s*$(.*?)^\s*end\s+interface\b",
-            text,
-            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+            text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
         ):
-            iface_name = m_if.group(1).lower()
-            body = m_if.group(2)
-            concrete = set()
-            for m_mp in re.finditer(r"^\s*module\s+procedure\s+(.+)$", body, flags=re.IGNORECASE | re.MULTILINE):
+            for m_mp in re.finditer(r"^\s*module\s+procedure\s+(.+)$", m_if.group(2), flags=re.IGNORECASE | re.MULTILINE):
                 for nm in m_mp.group(1).split(","):
-                    nm = nm.strip().lower()
-                    if nm:
-                        concrete.add(nm)
-            if concrete & names:
-                names.add(iface_name)
-        del src_lines
+                    if nm.strip():
+                        sigs.setdefault(m_if.group(1).lower(), []).append(("generic", nm.strip().lower()))
+                        generics.setdefault(m_if.group(1).lower(), []).append(nm.strip().lower())
+        # Type-bound bindings: `procedure :: a, b=>impl_b` in a type definition.
+        for _ln, stmt in fscan.iter_fortran_statements(text.splitlines()):
+            m_b = re.match(r"^\s*(procedure|generic)\b[^:]*::(.*)$", stmt, re.IGNORECASE)
+            if m_b is None:
+                continue
+            for part in m_b.group(2).split(","):
+                if "=>" in part:
+                    bname, impls = part.split("=>", 1)
+                    targets = [impls.strip().lower()]
+                else:
+                    bname, targets = part, [part.strip().lower()]
+                if bname.strip():
+                    bindings.setdefault(bname.strip().lower(), []).extend(x for x in targets if x)
+    # Resolve generic entries to the specifics' dummy lists.
+    resolved = {}
+    for name, entries in sigs.items():
+        out = []
+        for e in entries:
+            if isinstance(e, tuple):
+                out.extend(x for x in sigs.get(e[1], []) if not isinstance(x, tuple))
+            else:
+                out.append(e)
+        resolved[name] = out
+    # A generic whose specifics all return a default integer does too.
+    for name, specifics in generics.items():
+        if specifics and all(s in int_results for s in specifics):
+            int_results.add(name)
+    _INT_RESULT_HELPERS.clear()
+    _INT_RESULT_HELPERS.update(int_results)
+    _boundary_sigs_cache = (resolved, bindings)
+    return _boundary_sigs_cache
 
-    _boundary_calls_cache = frozenset(names)
+
+def _scan_external_boundary_calls() -> frozenset:
+    """Names of helper procedures with at least one default-kind INTEGER
+    dummy (kept for callers of the older name-only interface)."""
+    global _boundary_calls_cache
+    if _boundary_calls_cache is not None:
+        return _boundary_calls_cache
+    sigs, _bindings = _scan_boundary_signatures()
+    _boundary_calls_cache = frozenset(
+        nm for nm, lists in sigs.items() if any(d["int"] for dl in lists for d in dl))
     return _boundary_calls_cache
 
 _DECL_RE = re.compile(r"^(?P<indent>\s*)integer\b(?!\s*\()(?P<rest>.*)$", re.IGNORECASE)
@@ -297,97 +386,232 @@ def _line_eol(raw: str) -> Tuple[str, str]:
     return raw, ""
 
 
-def _find_calls_to(text: str, names: frozenset) -> List[Tuple[str, str]]:
-    """Every `NAME(...)` occurrence in `text` where `NAME` (case-
-    insensitive) is in `names`, anywhere in the statement -- not just a
-    whole `call NAME(...)` statement, since a boundary FUNCTION (like
-    python.f90's own `linspace`) is invoked as an ordinary expression
-    (`x = linspace(...)`), not a `call` statement. Uses balanced-paren
-    matching (not a lazy/greedy regex) so a nested call in an argument
-    doesn't truncate the match early. Returns (name, arg_list_text)
-    pairs."""
-    out: List[Tuple[str, str]] = []
-    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", text):
-        nm = m.group(1).lower()
-        if nm not in names:
+_LITERAL_ARG_RE = re.compile(r"^\s*[+-]?\s*\d+(?:_ikind)?\s*$", re.IGNORECASE)
+_LITERAL_CTOR_RE = re.compile(
+    r"^\s*\[\s*[+-]?\s*\d+(?:_ikind)?(?:\s*,\s*[+-]?\s*\d+(?:_ikind)?)*\s*\]\s*$", re.IGNORECASE)
+_VAR_ARG_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?:\(.*\))?\s*$", re.DOTALL)
+_WIDE_INT_CAST_RE = re.compile(r"^\s*int\s*\((.*),\s*kind\s*=\s*ikind\s*\)\s*$", re.IGNORECASE | re.DOTALL)
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_HEADER_RE = re.compile(
+    r"^\s*(?:(?:pure|impure|elemental|recursive|module)\s+)*"
+    r"(?:(?:integer|real|complex|logical|character|type)\s*(?:\([^)]*\))?\s+)?(?:function|subroutine)\s+\w+",
+    re.IGNORECASE)
+_KEYWORD_ARG_RE = re.compile(r"^(\s*[A-Za-z_]\w*\s*=)(?!=)(.*)$", re.DOTALL)
+
+
+def _match_paren(code: str, open_idx: int) -> Optional[int]:
+    depth = 0
+    quote = None
+    for i in range(open_idx, len(code)):
+        ch = code[i]
+        if quote:
+            if ch == quote:
+                quote = None
             continue
-        depth = 1
-        i = m.end()
-        while i < len(text) and depth > 0:
-            if text[i] == "(":
-                depth += 1
-            elif text[i] == ")":
-                depth -= 1
-            i += 1
-        if depth == 0:
-            out.append((nm, text[m.end() : i - 1]))
-    return out
+        if ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
 
 
-_SIMPLE_OFFSET_ARG_RE = re.compile(
-    r"^([A-Za-z_]\w*)\s*(?:[+\-]\s*\d+\s*)*$"
-)
+_INT_INTRINSICS = frozenset({
+    "int", "nint", "floor", "ceiling", "size", "len", "len_trim", "index", "scan", "verify",
+    "count", "lbound", "ubound", "iachar", "ichar", "mod", "modulo", "abs", "max", "min",
+    "sum", "product", "maxval", "minval", "merge", "huge", "kind", "ishft", "iand", "ior", "ieor",
+    # Type-preserving: integer exactly when their arguments are, which the
+    # check requires anyway (print_matrix(matmul(a, b)) with int64 a, b).
+    "matmul", "transpose", "reshape", "spread", "pack", "unpack", "cshift", "eoshift",
+    "dot_product", "sign", "dim",
+})
 
 
-def _collect_excluded_names(stmts: Sequence[Tuple[int, str]], boundary: frozenset) -> Set[str]:
-    """Every bare-Name (or simple `name +/- literal` offset, e.g. `n + 1`
-    -- extremely common as a "point count" passed to something like
-    `linspace`) actual argument passed to a known external-boundary call,
-    anywhere in the file. A more complex expression is left alone -- this
-    is deliberately the same conservative, name-level (not expression-
-    rewriting) exclusion used everywhere else in this tool."""
-    excluded: Set[str] = set()
-    for _lineno, text in stmts:
-        for _nm, arglist in _find_calls_to(text, boundary):
-            for arg in fscan._split_top_level_commas(arglist):
-                arg = arg.strip()
-                # Keyword actual (`kw=expr`): only the expr side can be a
-                # bare name reference, not the keyword itself.
-                if "=" in arg and "=>" not in arg:
-                    arg = arg.split("=", 1)[1].strip()
-                m = _SIMPLE_OFFSET_ARG_RE.match(arg)
-                if m:
-                    excluded.add(m.group(1).lower())
-    return excluded
+def _is_integer_expr(body: str, int_names: Set[str]) -> bool:
+    """True when `body` is clearly integer-valued: every variable in it is
+    declared integer, every function returns an integer, and it has no real
+    literal, string or `.` operator. False when unsure."""
+    if re.search(r"['\"]|\d\.|\.\d|\.[a-z]+\.|_dp\b|\*\*", body, re.IGNORECASE):
+        return False
+    for m in re.finditer(r"(?<![\w%])([A-Za-z_]\w*)(\s*\()?", body):
+        name = m.group(1).lower()
+        if name in ("ikind", "kind"):
+            continue
+        if m.group(2):
+            if name not in _INT_INTRINSICS and name not in _INT_RESULT_HELPERS:
+                return False
+        elif name not in int_names:
+            return False
+    return True
 
 
-def _expand_boundary_with_local_functions(lines: List[str], boundary: frozenset) -> frozenset:
-    """A locally-defined function/subroutine (in THIS file, not the
-    vendored runtime library) whose own body transitively calls something
-    in `boundary` is itself added to the boundary set. Otherwise it would
-    end up with a MIX of upgraded and un-upgradeable parameters (e.g.
-    `laplace_2d`'s `nx`/`ny` must stay default-kind because they flow
-    into `linspace` internally, but `laplace_2d` itself is then called
-    elsewhere with literal arguments for nx/ny that would otherwise get
-    wrongly `_ikind`-suffixed against those still-default-kind dummies).
-    Excluding the WHOLE function this way is more conservative than
-    strictly necessary (parameters of `laplace_2d` that never reach a
-    boundary call, like `rtol`, also stay default-kind) but is simple and
-    provably safe -- never a kind mismatch -- matching this tool's
-    decline-rather-than-guess approach elsewhere."""
-    # `lines` may or may not already carry their own trailing newline
-    # (xp2f.py's own f90_lines pipeline does not; a file read via
-    # `splitlines(keepends=True)` does) -- join on a guaranteed newline
-    # per line rather than "".join, which would silently collapse
-    # newline-free input into one unparseable blob.
-    text = "\n".join(_line_eol(ln)[0] for ln in lines)
-    units = {
-        u["name"].lower(): u
-        for u in fscan.split_fortran_units_simple(text)
-        if u["kind"] in ("subroutine", "function")
-    }
-    current = set(boundary)
-    changed = True
-    while changed:
-        changed = False
-        for name, unit in units.items():
-            if name in current:
+class _Boundary:
+    """Calls whose integer arguments must keep the default kind: the
+    vendored helpers (by signature), local procedures with dummies that had
+    to stay default kind, and bare names with no known signature (every
+    argument then gets the older treatment).
+
+    For each such argument, per call: a literal, or an array constructor of
+    literals, loses its `_ikind` suffix; an intent(in) value is converted
+    with `int(...)`; a variable passed to an out/inout, allocatable or
+    pointer dummy is reported so that its declaration stays default kind."""
+
+    def __init__(self, sigs=None, bindings=None, legacy_names=frozenset()):
+        self.sigs = dict(sigs or {})
+        self.bindings = dict(bindings or {})
+        self.legacy = frozenset(n.lower() for n in legacy_names)
+        # How an integer(kind=ikind) value is brought to the default kind.
+        self.narrow = "int"
+        # Variables of the file being rewritten: `active(i)` is an array
+        # element there even though lbfgsb.f90 has a routine `active`.
+        self.shadowed: Set[str] = set()
+
+    @classmethod
+    def coerce(cls, boundary):
+        if isinstance(boundary, cls):
+            return boundary
+        return cls(legacy_names=frozenset(boundary))
+
+    def names(self) -> frozenset:
+        return frozenset(self.sigs) | self.legacy
+
+    def candidates(self, name: str, typebound: bool):
+        """Dummy lists for a call, None if it is not a boundary call, or []
+        for a name with no known signature."""
+        if typebound:
+            out = []
+            for impl in self.bindings.get(name, []):
+                for dl in self.sigs.get(impl, []):
+                    out.append(dl[1:] if dl and dl[0]["obj"] else dl)
+            return out or None
+        if name in self.sigs:
+            return self.sigs[name]
+        if name in self.legacy:
+            return []
+        return None
+
+    def calls(self, code: str):
+        """(name, typebound, open_idx, close_idx) of boundary calls in
+        `code`, left to right, outer calls before those nested in them."""
+        i, n = 0, len(code)
+        quote = None
+        while i < n:
+            ch = code[i]
+            if quote:
+                if ch == quote:
+                    quote = None
+                i += 1
                 continue
-            body_text = " ; ".join(unit["body_lines"])
-            if _find_calls_to(body_text, frozenset(current)):
-                current.add(name)
-                changed = True
-    return frozenset(current)
+            if ch in "'\"":
+                quote = ch
+                i += 1
+                continue
+            m = _IDENT_RE.match(code, i)
+            if m and (i == 0 or not (code[i - 1].isalnum() or code[i - 1] == "_")):
+                k = m.end()
+                while k < n and code[k] == " ":
+                    k += 1
+                if k < n and code[k] == "(":
+                    typebound = i > 0 and code[i - 1] == "%"
+                    name = m.group(0).lower()
+                    close = _match_paren(code, k)
+                    if (close is not None and (typebound or name not in self.shadowed)
+                            and self.candidates(name, typebound) is not None):
+                        yield name, typebound, k, close
+                i = m.end()
+                continue
+            i += 1
+
+    def arg_roles(self, name: str, typebound: bool, args: List[str]) -> List[Optional[str]]:
+        """Per actual argument: None (no default-integer dummy), "in" (an
+        intent(in) default integer in every matching specific), "maybe_in"
+        (in some), "out" (out/inout/allocatable/pointer/no intent), or
+        "legacy" (no known signature)."""
+        cands = self.candidates(name, typebound)
+        roles: List[Optional[str]] = []
+        for pos, arg in enumerate(args):
+            if not cands:
+                roles.append("legacy")
+                continue
+            kw = _KEYWORD_ARG_RE.match(arg)
+            found = []
+            for dl in cands:
+                d = None
+                if kw:
+                    kwname = kw.group(1).strip().rstrip("=").strip().lower()
+                    d = next((x for x in dl if x["name"] == kwname), None)
+                elif pos < len(dl):
+                    d = dl[pos]
+                if d is not None:
+                    found.append(d)
+            ints = [d for d in found if d["int"]]
+            value = kw.group(2) if kw else arg
+            if not ints or any(d.get("kinded_int") for d in found):
+                # No default-integer dummy here, or a generic with a specific
+                # for other integer kinds (py_str_int64), which then resolves.
+                roles.append(None)
+            elif any(d["alloc"] or d["intent"] != "in" for d in ints) or (
+                    any(d.get("opt") for d in ints) and re.fullmatch(r"\s*[A-Za-z_]\w*\s*", value)):
+                roles.append("out")
+            else:
+                roles.append("in" if len(ints) == len(found) else "maybe_in")
+        return roles
+
+    def excluded_actuals(self, text: str) -> Set[str]:
+        """Variables that must stay default kind because of this statement."""
+        names: Set[str] = set()
+        for name, typebound, op, cl in self.calls(text):
+            args = fscan._split_top_level_commas(text[op + 1:cl])
+            for arg, role in zip(args, self.arg_roles(name, typebound, args)):
+                kw = _KEYWORD_ARG_RE.match(arg)
+                value = kw.group(2) if kw else arg
+                if role == "out":
+                    m = _VAR_ARG_RE.match(value)
+                    if m:
+                        names.add(m.group(1).lower())
+                elif role == "legacy":
+                    v = re.sub(r"'([^']|'')*'|\"([^\"]|\"\")*\"", " ", value)
+                    names.update(re.findall(r"\b[a-z_]\w*\b", v.lower()))
+        return names
+
+    def rewrite(self, code: str, int_names: Set[str]) -> str:
+        """Apply the per-argument conversions to one statement whose
+        literals are already suffixed."""
+        out: List[str] = []
+        pos = 0
+        for name, typebound, op, cl in self.calls(code):
+            if op < pos:
+                continue  # nested in a call already rewritten
+            out.append(code[pos:op + 1])
+            args = fscan._split_top_level_commas(code[op + 1:cl])
+            roles = self.arg_roles(name, typebound, args)
+            new_args = []
+            for arg, role in zip(args, roles):
+                kw = _KEYWORD_ARG_RE.match(arg)
+                prefix, value = (kw.group(1).strip(), kw.group(2)) if kw else ("", arg)
+                body = self.rewrite(value, int_names).strip()
+                if role == "legacy":
+                    body = re.sub(r"(?<![\w.])(\d+)_ikind\b", r"\1", body)
+                elif role in ("in", "maybe_in", "out"):
+                    var = _VAR_ARG_RE.match(body)
+                    if _LITERAL_ARG_RE.match(body) or _LITERAL_CTOR_RE.match(body):
+                        body = re.sub(r"(\d+)_ikind\b", r"\1", body)
+                    elif role == "in" or (role == "maybe_in" and (
+                            (var and var.group(1).lower() in int_names) or _is_integer_expr(body, int_names))):
+                        wide = _WIDE_INT_CAST_RE.match(body)
+                        if self.narrow == "int":
+                            body = f"int({wide.group(1).strip()})" if wide else f"int({body})"
+                        else:
+                            body = f"{self.narrow}({body})"
+                new_args.append(prefix + body)
+            out.append(", ".join(new_args))
+            out.append(")")
+            pos = cl + 1
+        out.append(code[pos:])
+        return "".join(out)
 
 
 def _rewrite_decl_line(raw: str, excluded: Set[str]) -> List[str]:
@@ -435,11 +659,15 @@ def _rewrite_decl_line(raw: str, excluded: Set[str]) -> List[str]:
 def _scoped_exclusions(stmts, boundary):
     """Resolve boundary actual names to declarations, respecting local shadows.
 
+    `boundary` is a _Boundary, or a set of procedure names whose every
+    argument is treated as a default-kind integer (the older policy).
+
     A real LAPACK argument named `r` must not prevent an unrelated integer
     accumulator `r` in another procedure from being widened. Host-associated
     integers, however, must remain default-kind when a contained routine uses
     them at an external boundary.
     """
+    boundary = _Boundary.coerce(boundary)
     scopes = [{"parent": None, "names": set(), "excluded": set()}]
     stack = [0]
     owners = {}
@@ -458,7 +686,7 @@ def _scoped_exclusions(stmts, boundary):
             # Its dummy declarations must agree even for dummies that are not
             # themselves forwarded to the external helper.
             procedure = re.search(r"\b(?:function|subroutine)\s+(\w+)\s*\(([^)]*)\)", text, re.IGNORECASE)
-            if procedure and procedure.group(1).lower() in boundary:
+            if procedure and procedure.group(1).lower() in boundary.legacy:
                 scopes[stack[-1]]["excluded"].update(
                     arg.strip().lower() for arg in procedure.group(2).split(",") if arg.strip())
         owners[lineno] = stack[-1]
@@ -470,12 +698,9 @@ def _scoped_exclusions(stmts, boundary):
         if closing.match(text) and len(stack) > 1:
             stack.pop()
     for lineno, text in stmts:
-        names = _collect_excluded_names([(lineno, text)], boundary)
-        # A compound integer actual such as print_matrix(a*b) must remain
-        # default-kind too. Conservatively protect its declared operands.
-        for _, actuals in _find_calls_to(text, boundary):
-            actuals = re.sub(r"'([^']|'')*'|\"([^\"]|\"\")*\"", " ", actuals)
-            names.update(re.findall(r"\b[a-z_]\w*\b", actuals.lower()))
+        if _HEADER_RE.match(text):
+            continue
+        names = boundary.excluded_actuals(text)
         for name in names:
             scope = owners[lineno]
             while scope is not None and name not in scopes[scope]["names"]:
@@ -558,6 +783,249 @@ def _ensure_unit_has_ikind(unit_lines: List[str], kind_name: str) -> List[str]:
     return out
 
 
+def _widen_default_actuals(code: str, widened_sigs, excluded: Set[str]) -> str:
+    """A variable kept at the default kind (it reaches a helper's out,
+    inout or optional argument) passed to a local procedure's widened
+    intent(in) dummy is converted with `int(..., kind=ikind)`."""
+    if not widened_sigs or not excluded:
+        return code
+    conv = _Boundary(sigs={nm: [dl] for nm, dl in widened_sigs.items()})
+    out: List[str] = []
+    pos = 0
+    for name, typebound, op, cl in conv.calls(code):
+        if op < pos or typebound:
+            continue
+        args = fscan._split_top_level_commas(code[op + 1:cl])
+        roles = conv.arg_roles(name, typebound, args)
+        new_args = []
+        for arg, role in zip(args, roles):
+            kw = _KEYWORD_ARG_RE.match(arg)
+            prefix, value = (kw.group(1).strip(), kw.group(2).strip()) if kw else ("", arg.strip())
+            if role == "in" and re.fullmatch(r"[A-Za-z_]\w*", value) and value.lower() in excluded:
+                value = f"int({value}, kind=ikind)"
+            new_args.append(prefix + value)
+        out.append(code[pos:op + 1])
+        out.append(", ".join(new_args))
+        out.append(")")
+        pos = cl + 1
+    out.append(code[pos:])
+    return "".join(out)
+
+
+def _names_defined_in(stmts) -> Set[str]:
+    """Procedure and variable names defined in the file (an intrinsic of the
+    same name is then not an intrinsic there)."""
+    names: Set[str] = set()
+    for _ln, text in stmts:
+        m = re.search(r"\b(?:function|subroutine)\s+([A-Za-z_]\w*)", text, re.IGNORECASE)
+        if m and _HEADER_RE.match(text):
+            names.add(m.group(1).lower())
+        m = _TYPE_DECL_RE.match(text)
+        if m:
+            for chunk in fscan._split_top_level_commas(m.group("names")):
+                nm = re.match(r"^\s*([A-Za-z_]\w*)", chunk)
+                if nm:
+                    names.add(nm.group(1).lower())
+    return names
+
+
+def _variable_names_in(stmts) -> Set[str]:
+    """Names declared as variables (not procedures) in the file."""
+    names: Set[str] = set()
+    for _ln, text in stmts:
+        m = _TYPE_DECL_RE.match(text)
+        if m and not re.search(r"\bexternal\b", m.group("attrs"), re.IGNORECASE):
+            for chunk in fscan._split_top_level_commas(m.group("names")):
+                nm = re.match(r"^\s*([A-Za-z_]\w*)", chunk)
+                if nm:
+                    names.add(nm.group(1).lower())
+    return names
+
+
+def _integer_names_in(stmts) -> Set[str]:
+    names: Set[str] = set()
+    for _ln, text in stmts:
+        m = _TYPE_DECL_RE.match(text)
+        if m and m.group("type").lower() == "integer":
+            for chunk in fscan._split_top_level_commas(m.group("names")):
+                nm = re.match(r"^\s*([A-Za-z_]\w*)", chunk)
+                if nm:
+                    names.add(nm.group(1).lower())
+    return names
+
+
+def _propagate_local_boundaries(lines, stmts, boundary: "_Boundary"):
+    """Scoped exclusions, extended to local procedures: a dummy that must
+    stay default kind (it reaches a helper's out/inout argument) makes calls
+    to its procedure a boundary for that argument, and so on until nothing
+    changes. Returns the per-line exclusions."""
+    text = "\n".join(_line_eol(ln)[0] for ln in lines)
+    units = {u["name"].lower(): u for u in fscan.split_fortran_units_simple(text)
+             if u["kind"] in ("subroutine", "function")}
+    headers = {}
+    for lineno, stmt in stmts:
+        m = re.search(r"\b(?:function|subroutine)\s+([A-Za-z_]\w*)", stmt, re.IGNORECASE)
+        if m and _HEADER_RE.match(stmt) and m.group(1).lower() in units:
+            headers.setdefault(m.group(1).lower(), lineno)
+    widened = boundary.__dict__.setdefault("_widened", {})
+    for _round in range(20):
+        excluded_by_line = _scoped_exclusions(stmts, boundary)
+        changed = False
+        for name, unit in units.items():
+            lineno = headers.get(name)
+            if lineno is None:
+                continue
+            if name in boundary.sigs and name not in boundary.__dict__.get("_local", {}):
+                continue  # a helper of the same name
+            dummies = _unit_dummies(unit)
+            kept = excluded_by_line.get(lineno, set())
+            # Dummies that are widened, for converting default-kind actuals.
+            widened[name] = [dict(d, int=d["int"] and d["name"] not in kept) for d in dummies]
+            sig = [dict(d, int=d["int"] and d["name"] in kept) for d in dummies]
+            if not any(d["int"] for d in sig):
+                continue
+            local = boundary.__dict__.setdefault("_local", {})
+            if local.get(name) != sig:
+                local[name] = sig
+                boundary.sigs[name] = [sig]
+                changed = True
+        if not changed:
+            return excluded_by_line
+    return excluded_by_line
+
+
+# Integer-result intrinsics that take an optional KIND argument. Without one
+# they return a default integer, which then mismatches widened integers in
+# array constructors and actual arguments ([size(w), 3_ikind]).
+_KIND_INTRINSICS = (
+    "size", "len", "len_trim", "index", "scan", "verify", "count", "lbound", "ubound", "shape",
+    "minloc", "maxloc", "findloc", "iachar", "ichar", "nint", "floor", "ceiling",
+)
+_KIND_INTRINSIC_RE = re.compile(r"\b(" + "|".join(_KIND_INTRINSICS) + r")\s*\(", re.IGNORECASE)
+
+
+def _widen_kind_intrinsics_in_code(code: str, defined: Set[str]) -> str:
+    """Add `kind=ikind` to calls of _KIND_INTRINSICS that have no kind
+    argument, unless the file defines a procedure or variable of that name.
+    Helper-call arguments are converted back afterward where needed."""
+    out: List[str] = []
+    pos = 0
+    for m in _KIND_INTRINSIC_RE.finditer(code):
+        if m.start() < pos:
+            continue
+        if m.start() > 0 and (code[m.start() - 1].isalnum() or code[m.start() - 1] in "_%"):
+            continue
+        if m.group(1).lower() in defined:
+            continue
+        before = code[:m.start()]
+        if before.count("'") % 2 or before.count('"') % 2:
+            continue
+        close = _match_paren(code, m.end() - 1)
+        if close is None:
+            continue
+        inner = code[m.end():close]
+        args = fscan._split_top_level_commas(inner)
+        if not args or any(re.match(r"^\s*kind\s*=", a, re.IGNORECASE) for a in args):
+            continue
+        out.append(code[pos:close])
+        out.append(", kind=ikind")
+        pos = close
+    out.append(code[pos:])
+    return "".join(out)
+
+
+def _use_narrow_int(lines: List[str]) -> List[str]:
+    """Make python_mod's narrow_int visible in each module/program unit that
+    calls it: add it to the unit's `use python_mod, only:` list, or add
+    that use statement after the unit's first line."""
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        m = _UNIT_OPEN_RE.match(_split_code_comment(out[i])[0])
+        if m is None:
+            i += 1
+            continue
+        j = i + 1
+        depth = 1
+        while j < len(out):
+            code_j = _split_code_comment(out[j])[0]
+            if _UNIT_OPEN_RE.match(code_j):
+                depth += 1
+            elif _UNIT_CLOSE_RE.match(code_j):
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        unit = out[i:j]
+        if any(re.search(r"\bnarrow_int\s*\(", _split_code_comment(ln)[0], re.IGNORECASE) for ln in unit):
+            spec_end = next((k for k, ln in enumerate(unit)
+                             if re.match(r"^\s*contains\b", _split_code_comment(ln)[0], re.IGNORECASE)), len(unit))
+            use_k = next((k for k in range(1, spec_end)
+                          if re.match(r"^\s*use\s+python_mod\s*,\s*only\s*:", _split_code_comment(unit[k])[0],
+                                      re.IGNORECASE)), None)
+            eol = "\n" if out[i].endswith("\n") else ""
+            if use_k is not None:
+                # Continued `use` lists end on the last physical line.
+                last = use_k
+                while _split_code_comment(_line_eol(unit[last])[0])[0].rstrip().endswith("&") and last + 1 < spec_end:
+                    last += 1
+                body, e = _line_eol(unit[last])
+                code, comment = _split_code_comment(body)
+                if not re.search(r"\bnarrow_int\b", " ".join(unit[use_k:last + 1]), re.IGNORECASE):
+                    unit[last] = code.rstrip() + ", narrow_int" + comment + e
+            else:
+                indent = "   "
+                unit.insert(1, f"{indent}use python_mod, only: narrow_int{eol}")
+            out[i:j] = unit  # the unit's `end` line (at j) is not in `unit`
+            j = i + len(unit)
+        i = j + 1
+    return out
+
+
+def _import_ikind_in_interfaces(lines: List[str]) -> List[str]:
+    """An interface body does not see its host's `ikind`: add it to the
+    body's `import` statement, or add `import :: ikind`, where it is used."""
+    out = list(lines)
+    i = 0
+    n = len(out)
+    while i < n:
+        if re.match(r"^\s*(?:abstract\s+)?interface\b", _split_code_comment(out[i])[0], re.IGNORECASE):
+            j = i + 1
+            body_start = None
+            while j < n and not re.match(r"^\s*end\s+interface\b", _split_code_comment(out[j])[0], re.IGNORECASE):
+                code = _split_code_comment(out[j])[0]
+                if _HEADER_RE.match(code) and not re.match(r"^\s*module\s+procedure\b", code, re.IGNORECASE):
+                    body_start = j
+                elif re.match(r"^\s*end\s+(?:function|subroutine)\b", code, re.IGNORECASE) and body_start is not None:
+                    body = out[body_start:j]
+                    if any(re.search(r"\bikind\b", _split_code_comment(b)[0], re.IGNORECASE) for b in body[1:]):
+                        imp = next((k for k in range(body_start + 1, j)
+                                    if re.match(r"^\s*import\b", _split_code_comment(out[k])[0], re.IGNORECASE)), None)
+                        if imp is not None:
+                            code_k, comment_k = _split_code_comment(_line_eol(out[imp])[0])
+                            _b, eol_k = _line_eol(out[imp])
+                            if not re.search(r"\bikind\b", code_k, re.IGNORECASE):
+                                if re.match(r"^\s*import\s*$", code_k, re.IGNORECASE):
+                                    pass  # a bare `import` already imports everything
+                                else:
+                                    out[imp] = code_k.rstrip() + ", ikind" + comment_k + eol_k
+                        else:
+                            hdr = body_start
+                            while _split_code_comment(_line_eol(out[hdr])[0])[0].rstrip().endswith("&") and hdr + 1 < j:
+                                hdr += 1
+                            indent = re.match(r"^(\s*)", out[body_start + 1] if body_start + 1 < j else out[body_start]).group(1)
+                            eol = _line_eol(out[hdr])[1] or ("\n" if out[hdr].endswith("\n") else "")
+                            out.insert(hdr + 1, f"{indent}import :: ikind{eol}")
+                            n += 1
+                            j += 1
+                    body_start = None
+                j += 1
+            i = j + 1
+            continue
+        i += 1
+    return out
+
+
 def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
     """Rewrite bare `integer` declarations to `integer(kind={kind_name})`
     throughout `lines`, excluding anything passed as an actual argument to
@@ -566,8 +1034,18 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
     assert kind_name in ("int32", "int64"), kind_name
 
     stmts = fscan.iter_fortran_statements(lines)
-    boundary = _expand_boundary_with_local_functions(lines, _scan_external_boundary_calls())
-    excluded_by_line = _scoped_exclusions(stmts, boundary)
+    sigs, bindings = _scan_boundary_signatures()
+    # Names without a scanned signature (a test can set the name cache).
+    legacy = _scan_external_boundary_calls() - frozenset(sigs)
+    boundary = _Boundary(sigs, bindings, legacy)
+    if kind_name == "int64":
+        # Checked: a value beyond the default range stops the program
+        # instead of reaching the helper truncated.
+        boundary.narrow = "narrow_int"
+    boundary.shadowed = _variable_names_in(stmts)
+    excluded_by_line = _propagate_local_boundaries(lines, stmts, boundary)
+    file_names = _names_defined_in(stmts)
+    int_names = _integer_names_in(stmts)
 
     def stmt_last_line(k: int) -> int:
         """1-based index of the LAST physical line of statement k,
@@ -584,27 +1062,6 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
                 break
             idx += 1
         return idx + 1
-
-    def stmt_span(k: int) -> Tuple[int, int]:
-        # A "generous" span (through the line before the NEXT statement,
-        # rather than stmt_last_line's precise end) for boundary-line
-        # marking below -- including a trailing blank/comment line is
-        # harmless there, since those lines have no literals to protect.
-        start = stmts[k][0]
-        end = stmts[k + 1][0] - 1 if k + 1 < len(stmts) else len(lines)
-        return start, end
-
-    # Every physical line belonging to a boundary-call statement is left
-    # out of integer-literal suffixing -- a literal actual argument to one
-    # of these external, default-kind-INTEGER procedures (or a local
-    # function that transitively reaches one -- `boundary` from above
-    # already covers both) must stay unsuffixed, the same reason its
-    # variable counterparts are excluded above.
-    boundary_lines: Set[int] = set()
-    for k, (_lineno, text) in enumerate(stmts):
-        if _find_calls_to(text, boundary):
-            start, end = stmt_span(k)
-            boundary_lines.update(range(start, end + 1))
 
     # One unified pass over STATEMENTS (not raw physical lines): a
     # statement spanning more than one physical line via `&` continuation
@@ -623,11 +1080,6 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
         out.extend(lines[consumed_through:start_idx])
         end_idx = stmt_last_line(k) - 1
 
-        if lineno in boundary_lines:
-            out.extend(lines[start_idx : end_idx + 1])
-            consumed_through = end_idx + 1
-            continue
-
         first_code = _split_code_comment(_line_eol(lines[start_idx])[0])[0]
         indent_m = re.match(r"^(\s*)", first_code)
         indent = indent_m.group(1) if indent_m else ""
@@ -635,7 +1087,13 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
         _, comment = _split_code_comment(last_body)
 
         code_line = _widen_bare_int_casts_in_code(f"{indent}{text}")
+        code_line = _widen_kind_intrinsics_in_code(code_line, file_names)
         code_line = _suffix_bare_int_literals_in_code(code_line)
+        # Arguments of helper calls (and of local procedures whose dummies
+        # stayed default kind) are converted back per call.
+        if not _HEADER_RE.match(text) and not _TYPE_DECL_RE.match(text):
+            code_line = boundary.rewrite(code_line, int_names)
+            code_line = _widen_default_actuals(code_line, boundary.__dict__.get("_widened", {}), excluded)
         # ALLOCATE's SOURCE must match the object's kind exactly, unlike
         # ordinary assignment. An excluded integer array still needs its
         # default-kind zero/one initializer, even when extents are widened.
@@ -694,6 +1152,9 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
         final.extend(unit_body)
         i = j
 
+    final = _import_ikind_in_interfaces(final)
+    if kind_name == "int64":
+        final = _use_narrow_int(final)
     return final
 
 

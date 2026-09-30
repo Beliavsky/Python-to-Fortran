@@ -2729,36 +2729,88 @@ def split_fortran_statements(code: str) -> List[str]:
     return out
 
 
+def _continued_string_scan(text: str, quote: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
+    """Scan `text`, starting inside the string delimited by `quote` (or
+    outside any string when None). Return the quote still open at the end
+    (or None) and the index of a comment's `!` outside strings (or None)."""
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                if i + 1 < n and text[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "!":
+            return None, i
+        i += 1
+    return quote, None
+
+
 def join_continued_lines(lines: Iterable[str]) -> List[Tuple[int, str]]:
-    """Join free-form continuation lines and keep the originating start line."""
+    """Join free-form continuation lines and keep the originating start line.
+
+    Between tokens, pieces are joined with one space. A continuation inside
+    a character literal (`"abc&` then `&def"`) resumes directly after the
+    second `&`, as Fortran reads it, so nothing is added or removed there
+    (joining with a space turned "abcdef" into "abc def")."""
     out: List[Tuple[int, str]] = []
     cur_parts: List[str] = []
     cur_start: Optional[int] = None
     need_more = False
+    open_quote: Optional[str] = None  # string still open at the previous line's `&`
+    glue_next = False  # the next piece continues a string: no separator
 
     for lineno, raw in enumerate(lines, start=1):
-        code = strip_comment(raw).rstrip("\r\n")
-        seg = code.rstrip()
-        if not seg and not need_more:
-            continue
+        line = raw.rstrip("\r\n")
+        if open_quote and need_more:
+            # Resume inside the string: the text after a leading `&`, verbatim.
+            lead = line.lstrip()
+            body = lead[1:] if lead.startswith("&") else line
+            quote, bang = _continued_string_scan(body, open_quote)
+            if bang is not None:
+                body = body[:bang]
+            seg = body
+        else:
+            code = strip_comment(raw).rstrip("\r\n")
+            seg = code.rstrip()
+            if not seg:
+                # A blank or comment-only line, which may also sit between
+                # continuation lines without ending the statement.
+                continue
+            if cur_parts:
+                lead = seg.lstrip()
+                if lead.startswith("&"):
+                    seg = lead[1:].lstrip()
+            quote, _bang = _continued_string_scan(seg, None)
 
         if cur_start is None:
             cur_start = lineno
 
-        if cur_parts:
-            lead = seg.lstrip()
-            if lead.startswith("&"):
-                seg = lead[1:].lstrip()
-
-        seg = seg.rstrip()
-        has_trailing_cont = seg.endswith("&")
+        stripped = seg.rstrip()
+        has_trailing_cont = stripped.endswith("&")
         if has_trailing_cont:
-            seg = seg[:-1].rstrip()
+            if quote:
+                # Content before the `&` inside a string is kept as is.
+                seg = stripped[:-1]
+            else:
+                seg = stripped[:-1].rstrip()
+        elif not quote:
+            seg = seg.rstrip()
 
-        if seg:
-            cur_parts.append(seg)
+        if seg or glue_next:
+            if glue_next and cur_parts:
+                cur_parts[-1] += seg
+            elif seg:
+                cur_parts.append(seg)
 
         need_more = has_trailing_cont
+        open_quote = quote if has_trailing_cont else None
+        glue_next = bool(has_trailing_cont and quote)
         if need_more:
             continue
 
