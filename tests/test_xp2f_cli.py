@@ -24001,3 +24001,157 @@ def test_xp2f_and_or_value_with_unsupported_operands_is_reported(tmp_path: Path,
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert "`and`/`or` used as a value with non-boolean operands" in out, out
+
+
+
+def test_xp2f_comprehension_calling_local_function_uses_a_loop(tmp_path: Path) -> None:
+    # [f(j) for j in ...], sum(f(j) for ...) and friends were rejected
+    # ("ListComp element expression is unsupported"). The loop variable
+    # must not leak (j stays 99), filters and nested generators follow
+    # Python's order, and a printing g runs once per element.
+    _run_xp2f_compile_diff(tmp_path, "xcomp_local_call.py", [
+        "import numpy as np",
+        "",
+        "",
+        "def f(x):",
+        "    return x * x + 1.5",
+        "",
+        "",
+        "def g(x):",
+        "    print('g', x)",
+        "    return 2 * x",
+        "",
+        "",
+        "j = 99",
+        "print(sum(f(j) for j in range(4)))",
+        "v = [f(j) for j in range(4)]",
+        "print(len(v), v[3], j)",
+        "w = [f(j) for j in range(3) if f(j) > 2]",
+        "print(len(w), w[0], w[1])",
+        "print(max(f(k) for k in range(5)), min([f(k) for k in range(5)]))",
+        "a = np.array([f(j) for j in range(3)])",
+        "print(a)",
+        "print(sum(f(i) * f(j) for i in range(3) for j in range(i)))",
+        "print(sum(g(i) for i in range(3)))",
+        "q = [sum(f(k) for k in range(m)) for m in range(4)]",
+        "print(q[0], q[1], q[2], q[3])",
+    ])
+
+
+def test_xp2f_appended_list_reductions_exclude_spare_capacity(tmp_path: Path) -> None:
+    # Appends grow a list's storage past its length; whole-array reads
+    # included the padding (`v = []; v.append(3.0); sum(v)` printed 6.0).
+    _run_xp2f_compile_diff(tmp_path, "xlist_capacity.py", [
+        "import numpy as np",
+        "",
+        "",
+        "def f(x):",
+        "    return x * x + 1.5",
+        "",
+        "",
+        "v = []",
+        "v.append(3.0)",
+        "print(sum(v), len(v), max(v), np.sum(v))",
+        "u = []",
+        "for i in range(5):",
+        "    u.append(f(i))",
+        "    print(sum(u), min(u))",
+        "fast = []",
+        "for i in range(40):",
+        "    fast.append(i * 0.5)",
+        "tot = 0.0",
+        "for x in fast:",
+        "    tot += x",
+        "print(tot, len(fast), fast[39], np.array(fast).sum())",
+        "fast2 = fast",
+        "print(len(fast2), sum(fast2))",
+    ])
+
+
+def test_xp2f_top_level_if_else_assignments_translate_by_default(tmp_path: Path) -> None:
+    # A top-level `if` sent the program to the narrow structured
+    # generator, which dropped the `y = 1.0` branch and left y undeclared.
+    # It is now opt-in (--structured).
+    _run_xp2f_compile_diff(tmp_path, "xtop_if_else.py", [
+        "x = 5",
+        "if x > 3:",
+        "    y = 1.0",
+        "else:",
+        "    y = 2.0",
+        "z = 3.0",
+        "print(y, z)",
+    ])
+
+
+def test_xp2f_top_level_print_of_conditional_call(tmp_path: Path) -> None:
+    # print(f(2) if n > 3 else 0) at top level was "IfExp requires
+    # statement-level lowering"; only the chosen branch may run.
+    _run_xp2f_compile_diff(tmp_path, "xtop_ternary_print.py", [
+        "def f(x):",
+        "    return x * x + 1.5",
+        "",
+        "",
+        "def g(x):",
+        "    print('g', x)",
+        "    return 2 * x",
+        "",
+        "",
+        "n = 5",
+        "print(f(2) if n > 3 else 0)",
+        "print('a', g(1) if n < 3 else g(2), f(n) if n else -1.0)",
+    ])
+
+
+def test_xp2f_comprehension_filter_truthiness(tmp_path: Path) -> None:
+    # `if j and n`, `if j`, `if not j or z` filters, and a constant
+    # element with a filter (pack needed an array).
+    _run_xp2f_compile_diff(tmp_path, "xcomp_filter_truth.py", [
+        "import numpy as np",
+        "n = 5",
+        "z = 0",
+        "print(sum(j * j for j in range(4) if j and n))",
+        "print(sum(j for j in range(-2, 3) if j), len([j for j in range(-2, 3) if j]))",
+        "print(len([j for j in range(4) if not j or z]))",
+        "a = np.array([0.0, 1.5, 0.0, 2.5])",
+        "print(sum(x for x in a if x))",
+        "flags = np.array([True, False, True])",
+        "print(sum(1 for fl in flags if fl))",
+    ])
+
+
+
+def test_xp2f_appended_list_product_and_padding_sentinels(tmp_path: Path) -> None:
+    # A list read as a whole (product, np.prod, min, max) grows exactly, so
+    # no padding enters the result. Lists that keep spare capacity (read
+    # only by index, len, iteration or np.array) pad with a quiet NaN or
+    # -huge(0), so a translator bug that reads a padded slot is visible.
+    _run_xp2f_compile_diff(tmp_path, "xlist_product.py", [
+        "import math",
+        "import numpy as np",
+        "",
+        "",
+        "def build(n):",
+        "    fast = []",
+        "    for i in range(n):",
+        "        fast.append(i * 0.5)",
+        "    ints = []",
+        "    for i in range(n):",
+        "        ints.append(3 * i)",
+        "    return np.array(fast), np.array(ints)",
+        "",
+        "",
+        "v = []",
+        "for i in range(1, 6):",
+        "    v.append(i * 1.5)",
+        "print(math.prod(v), np.prod(v), min(v), max(v))",
+        "w = []",
+        "for i in range(1, 4):",
+        "    w.append(i + 1)",
+        "print(np.prod(w), min(w), max(w))",
+        "a, b = build(40)",
+        "print(a.sum(), b.sum(), len(a), len(b))",
+    ])
+    out_f90 = (tmp_path / "xlist_product_p.f90").read_text(encoding="utf-8")
+    assert "ieee_value(0.0_dp, ieee_quiet_nan)" in out_f90, out_f90
+    assert "spread(-huge(0), 1, xp2f_cap_ints" in out_f90, out_f90
+    assert "xp2f_cap_v" not in out_f90.replace("xp2f_cap_v = 0", ""), out_f90

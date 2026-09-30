@@ -60,6 +60,9 @@ SHOW_TRANSLATION_NOTES = False
 AUTO_ELEMENTAL = False
 SHOW_NOOP_NOTES = False
 PERCENT_FLOAT_INT_FORMAT = False
+# --structured: opt into the run/compute generator for a top-level `if`
+# (see generate_structured); off by default.
+STRUCTURED_MODE = False
 # When True (the default), a real-valued comparison (<, <=, >, >=, ==, /=)
 # is wrapped in a merge()/ieee_is_nan() guard so a NaN operand quietly
 # evaluates the way Python/pandas would (False, or True for !=) instead of
@@ -4893,6 +4896,179 @@ def rewrite_math_const_from_import_to_attribute(tree):
     return out
 
 
+def list_names_read_as_whole(tree):
+    """Names of lists that some statement reads as a whole array. An
+    appended-to list keeps spare capacity past its count (fast appends),
+    so such a read (sum(v), max(v), np.sum(v), v[i:], v.sort(), passing v
+    to a function, ...) would include the padding: `v = []; v.append(3.0);
+    sum(v)` gave 6.0. Those lists grow exactly instead. Reads that stay
+    within the count are safe: v[i], len(v), v.append/extend/pop,
+    np.array(v)/np.asarray(v), `for x in v`, print(v) and `w = v` when w
+    is also appended to."""
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    appended = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"append", "extend"} and isinstance(node.func.value, ast.Name)):
+            appended.add(node.func.value.id)
+    whole = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in appended):
+            continue
+        par = parents.get(id(node))
+        if isinstance(par, ast.Subscript) and par.value is node:
+            sl = par.slice
+            if not isinstance(sl, ast.Slice) or (sl.upper is not None and sl.step is None):
+                continue
+        elif isinstance(par, ast.Attribute) and par.value is node and par.attr in {"append", "extend", "pop"}:
+            continue
+        elif isinstance(par, ast.Call) and node in par.args and len(par.args) == 1 and (
+                (isinstance(par.func, ast.Name) and par.func.id in {"len", "print"})
+                or (isinstance(par.func, ast.Attribute) and par.func.attr in {"array", "asarray"}
+                    and isinstance(par.func.value, ast.Name) and par.func.value.id in {"np", "numpy"})):
+            continue
+        elif isinstance(par, ast.For) and par.iter is node:
+            continue
+        elif (isinstance(par, ast.Assign) and par.value is node
+              and all(isinstance(tg, ast.Name) and tg.id in appended for tg in par.targets)):
+            # Both count-mapped: the copy takes elements 1:count.
+            continue
+        whole.add(node.id)
+    return whole
+
+
+def rewrite_comprehensions_calling_local_functions_to_loops(tree):
+    """A list comprehension or generator expression whose element or filter
+    calls a function defined in the program (`[f(j) for j in range(n)]`,
+    `sum(g(x) for x in xs if x > 0)`) has no vectorized lowering, which
+    handles only intrinsics and a few builtins. Build the values with an
+    explicit loop instead:
+
+        lc_list_1 = []
+        for lc_v_1 in ITER:
+            if COND:
+                lc_list_1.append(ELT)
+
+    and use `lc_list_1` in place of the comprehension. The loop variables
+    are renamed because a comprehension's own variables do not leak in
+    Python. Only a comprehension Python always evaluates is moved: not one
+    in a while test, an IfExp branch, a later and/or operand, a lambda or
+    another comprehension's element (that one is handled once the outer
+    loop exists)."""
+    user_fns = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    if not user_fns:
+        return tree
+
+    def _calls_user_fn(comp):
+        parts = [comp.elt] + [c for g in comp.generators for c in g.ifs]
+        for part in parts:
+            for n in ast.walk(part):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in user_fns:
+                    return True
+        return False
+
+    used = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            used.add(n.id)
+        elif isinstance(n, ast.arg):
+            used.add(n.arg)
+    used |= user_fns
+    counters = {}
+
+    def _fresh(prefix):
+        while True:
+            counters[prefix] = counters.get(prefix, 0) + 1
+            nm = f"{prefix}_{counters[prefix]}"
+            if nm not in used:
+                used.add(nm)
+                return nm
+
+    def _rename(node, mapping):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id in mapping:
+                n.id = mapping[n.id]
+        return node
+
+    def _loop_for(comp, out):
+        # Statements that build the comprehension's values; returns the list name.
+        if any(g.is_async for g in comp.generators):
+            return None
+        tmp = _fresh("lc_list")
+        mapping = {}
+        gens = []
+        for g in comp.generators:
+            it = _rename(g.iter, dict(mapping))  # earlier targets only
+            for n in ast.walk(g.target):
+                if isinstance(n, ast.Name):
+                    mapping[n.id] = _fresh("lc_v")
+            target = _rename(g.target, dict(mapping))
+            gens.append((target, it, [_rename(c, dict(mapping)) for c in g.ifs]))
+        elt = _rename(comp.elt, mapping)
+        body = [ast.Expr(value=ast.Call(
+            func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()), attr="append", ctx=ast.Load()),
+            args=[elt], keywords=[]))]
+        for target, it, ifs in reversed(gens):
+            for cond in reversed(ifs):
+                body = [ast.If(test=cond, body=body, orelse=[])]
+            body = [ast.For(target=target, iter=it, body=body, orelse=[])]
+        init = ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=ast.List(elts=[], ctx=ast.Load()))
+        for st in [init] + body:
+            ast.copy_location(st, comp)
+        out.append(init)
+        out.extend(body)
+        return tmp
+
+    def _hoist(node, out):
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp)) and _calls_user_fn(node):
+            tmp = _loop_for(node, out)
+            if tmp is not None:
+                return ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), node)
+            return node
+        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            return node
+        if isinstance(node, ast.IfExp):
+            node.test = _hoist(node.test, out)
+            return node
+        if isinstance(node, ast.BoolOp):
+            node.values[0] = _hoist(node.values[0], out)
+            return node
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                setattr(node, field, _hoist(value, out))
+            elif isinstance(value, list):
+                setattr(node, field, [_hoist(v, out) if isinstance(v, ast.AST) else v for v in value])
+        return node
+
+    def _process(stmts):
+        new_stmts = []
+        for st in stmts:
+            pre = []
+            if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Return)):
+                if getattr(st, "value", None) is not None:
+                    st.value = _hoist(st.value, pre)
+            elif isinstance(st, ast.If):
+                st.test = _hoist(st.test, pre)
+            elif isinstance(st, ast.For):
+                st.iter = _hoist(st.iter, pre)
+            if pre:
+                # The generated loops may hold further comprehensions.
+                new_stmts.extend(_process(pre))
+            new_stmts.append(st)
+        return new_stmts
+
+    for owner in list(ast.walk(tree)):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(owner, field, None)
+            if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.stmt):
+                setattr(owner, field, _process(stmts))
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def mark_value_context_boolops(tree):
     """Mark each `and`/`or` whose result is used as a value
     (`_xp2f_value_ctx`), not only for its truth: Python returns an operand
@@ -6077,7 +6253,10 @@ def rewrite_nonatomic_ternary_to_temp(tree):
                     continue
                 stmts_to_add = st if isinstance(st, list) else [st]
                 for one in stmts_to_add:
-                    if not self._in_func:
+                    if not self._in_func and not isinstance(one, ast.Expr):
+                        # At top level only for an expression statement such
+                        # as print(f(x) if c else 0): assignments there keep
+                        # the older declaration caution described above.
                         out.append(one)
                         continue
                     if isinstance(one, ast.Return) and one.value is not None and _is_problematic_ifexp(one.value):
@@ -24836,6 +25015,8 @@ class translator(ast.NodeVisitor):
     global_synthetic_slice_meta = {}
     global_rng_vars = set()
     global_vectorize_aliases = {}
+    # Lists grown exactly (see list_names_read_as_whole); None: all of them.
+    global_whole_read_lists = None
     global_linalg_aliases = set()
     global_scipy_special_aliases = set()
     global_scipy_special_func_aliases = {}
@@ -25166,6 +25347,30 @@ class translator(ast.NodeVisitor):
         self.argparse_parsers = set()
         self.argparse_specs = {}
         self.argparse_namespaces = {}
+
+    def _list_grows_exactly(self, name):
+        whole = translator.global_whole_read_lists
+        if whole is None:
+            return True
+        root = self._resolve_list_alias(name)
+        return name in whole or root in whole or any(
+            alias == name and src in whole for src, alias in self.name_aliases.items())
+
+    def _list_fill_value(self, name, val_ctor):
+        """Placeholder for list slots past the count, of the list's type.
+        Correct code never reads these slots (see list_names_read_as_whole),
+        so the fill is chosen to make a translator bug visible: a quiet NaN
+        for reals and complexes (a signaling NaN could trap merely when
+        copied under -ffpe-trap=invalid) and -huge(0) for integers."""
+        if name in self.alloc_reals:
+            return "ieee_value(0.0_dp, ieee_quiet_nan)"
+        if name in self.alloc_ints:
+            return "-huge(0)"
+        if name in self.alloc_logs:
+            return ".false."
+        if name in self.alloc_complexes:
+            return "cmplx(ieee_value(0.0_dp, ieee_quiet_nan), ieee_value(0.0_dp, ieee_quiet_nan), kind=dp)"
+        return val_ctor
 
     def _list_capacity_var(self, name):
         return f"xp2f_cap_{self._aliased_name(self._resolve_list_alias(name))}"
@@ -36653,9 +36858,17 @@ class translator(ast.NodeVisitor):
                         return "(" + f" {bop} ".join(parts) + ")"
                     if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
                         return f"(.not. {_map_pred(n.operand)})"
-                    # Allow truthy element variables: if x
-                    if isinstance(n, ast.Name) and n.id == loop_var:
-                        return base
+                    # Python truthiness of any other operand (`if x`, `if j and
+                    # n`): a mask needs LOGICAL, so compare numbers with zero
+                    # and test strings for nonblank.
+                    _pk = _kind_with_loopvar(n)
+                    if _pk in {"logical", "int", "real", "complex", "char"}:
+                        _ptxt = _map_expr(n)
+                        if _pk == "logical":
+                            return _ptxt
+                        if _pk == "char":
+                            return f"(len_trim({_ptxt}) > 0)"
+                        return f"({_ptxt} /= 0)"
                     raise NotImplementedError("ListComp filter expression is unsupported")
 
                 _single_gen_error = None
@@ -36684,6 +36897,13 @@ class translator(ast.NodeVisitor):
                     mapped = _map_expr(node.elt)
                     if gen.ifs:
                         mapped = strip_redundant_outer_parens_expr(mapped)
+                        if not any(
+                            isinstance(_n, ast.Name) and _n.id == loop_var and isinstance(_n.ctx, ast.Load)
+                            for _n in ast.walk(node.elt)
+                        ):
+                            # A constant element (`sum(1 for v in a if v)`)
+                            # must match the mask's shape for pack.
+                            mapped = f"spread({mapped}, dim=1, ncopies=size({base}))"
                         masks = [strip_redundant_outer_parens_expr(_map_pred(cond)) for cond in gen.ifs]
                         if len(masks) == 1:
                             return f"pack({mapped}, {masks[0]})"
@@ -58817,6 +59037,10 @@ class translator(ast.NodeVisitor):
                         # placeholder first; see the subroutine itself).
                         self.o.w(f"call grow_and_set_char({name}, {cnt}, {val_ctor})")
                         return
+                    elif self._list_grows_exactly(name):
+                        # Read as a whole somewhere: keep size == count.
+                        self.o.w(f"if (.not. allocated({name})) allocate({name}(0))")
+                        self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {self._list_fill_value(name, val_ctor)}]")
                     else:
                         cap = self._list_capacity_var(name)
                         self.o.w(f"if (.not. allocated({name})) then")
@@ -58828,7 +59052,9 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"if ({cnt} > {cap}) then")
                         self.o.push()
                         self.o.w(f"{cap} = max({cnt}, 2 * max(1, {cap}))")
-                        self.o.w(f"{name} = [{name}, spread({val_ctor}, 1, {cap} - size({name}))]")
+                        # Fill with a constant: spreading the appended value
+                        # evaluated it (and any function call in it) twice.
+                        self.o.w(f"{name} = [{name}, spread({self._list_fill_value(name, val_ctor)}, 1, {cap} - size({name}))]")
                         self.o.pop()
                         self.o.w("end if")
                 self.o.w(f"{name}({cnt}) = {val}")
@@ -58925,7 +59151,10 @@ class translator(ast.NodeVisitor):
                 if name_is_alloc and name in self.alloc_chars:
                     self.o.w(f"call grow_and_set_char({name}, {cnt}, {vals}(i_ext))")
                 else:
-                    if name_is_alloc:
+                    if name_is_alloc and self._list_grows_exactly(name):
+                        self.o.w(f"if (.not. allocated({name})) allocate({name}(0))")
+                        self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {vals}(i_ext)]")
+                    elif name_is_alloc:
                         cap = self._list_capacity_var(name)
                         self.o.w(f"if (.not. allocated({name})) then")
                         self.o.push()
@@ -58936,7 +59165,7 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"if ({cnt} > {cap}) then")
                         self.o.push()
                         self.o.w(f"{cap} = max({cnt}, 2 * max(1, {cap}))")
-                        self.o.w(f"{name} = [{name}, spread({vals}(i_ext), 1, {cap} - size({name}))]")
+                        self.o.w(f"{name} = [{name}, spread({self._list_fill_value(name, f'{vals}(i_ext)')}, 1, {cap} - size({name}))]")
                         self.o.pop()
                         self.o.w("end if")
                     self.o.w(f"{name}({cnt}) = {vals}(i_ext)")
@@ -77058,6 +77287,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = rewrite_comprehensions_calling_local_functions_to_loops(tree)
     tree = hoist_stdout_writing_calls_out_of_print(tree)
     tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
@@ -77576,6 +77806,7 @@ def transpile_file(
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = rewrite_comprehensions_calling_local_functions_to_loops(tree)
     tree = hoist_stdout_writing_calls_out_of_print(tree)
     tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
@@ -77593,6 +77824,7 @@ def transpile_file(
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = rewrite_comprehensions_calling_local_functions_to_loops(tree)
     tree = hoist_stdout_writing_calls_out_of_print(tree)
     tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
@@ -77604,6 +77836,7 @@ def transpile_file(
     for node in ast.walk(tree):
         validate_numpy_atleast_call(node)
     tree = specialize_singleton_returns(tree)
+    translator.global_whole_read_lists = list_names_read_as_whole(tree)
     translator.global_synthetic_slices = {}
     translator.global_synthetic_slice_meta = {}
     translator.global_rng_vars = set()
@@ -77944,7 +78177,10 @@ def transpile_file(
     stem = Path(py_path).stem
     # Tagged string results require local tuple-return procedures. The narrow
     # structured driver generator does not carry their signatures or guards.
-    if flat or nullable_string_results or module_only:
+    # The structured generator targets one narrow top-level-`if` pattern and
+    # mistranslated others (`if c: y = 1.0 / else: y = 2.0` lost its first
+    # branch and left y undeclared), so it runs only when asked for.
+    if flat or nullable_string_results or module_only or not STRUCTURED_MODE:
         f90 = generate_flat(
             effective_tree,
             stem,
@@ -78358,6 +78594,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = hoist_class_constructors_with_side_effects(tree)
     tree = rewrite_case_colliding_class_fields(tree)
     tree = rewrite_call_attribute_access_to_temp(tree)
+    tree = rewrite_comprehensions_calling_local_functions_to_loops(tree)
     tree = hoist_stdout_writing_calls_out_of_print(tree)
     tree = mark_value_context_boolops(tree)
     tree = rewrite_class_methods_to_toplevel(tree)
@@ -78515,6 +78752,8 @@ def main():
         help="write Python source annotated with xp2f inference comments to PATH",
     )
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
+    ap.add_argument("--structured", action="store_true",
+                    help="use the run/compute generator for a program with a top-level if (narrow; experimental)")
     ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
     ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
     ap.add_argument("--optimize-loops", action="store_true", help="swap the nesting order of immediately-nested do loops that fill a 2D array in (outer,inner) subscript order, when provably safe -- see fortran_loop_reorder.py")
@@ -78593,6 +78832,8 @@ def main():
         return 1
     global PERCENT_FLOAT_INT_FORMAT
     PERCENT_FLOAT_INT_FORMAT = bool(args.percent_float_int_format)
+    global STRUCTURED_MODE
+    STRUCTURED_MODE = bool(args.structured)
     global NAN_SAFE_COMPARISONS
     NAN_SAFE_COMPARISONS = not bool(args.no_nan_safe_compare)
     if any(ch in args.input_py for ch in "*?[]"):
@@ -79055,7 +79296,7 @@ def main():
             print(f"  - {nm}: {why}")
         if len(skipped) > 10:
             print(f"  ... and {len(skipped) - 10} more")
-    if SHOW_TRANSLATION_NOTES and used_flat_fallback and not args.flat:
+    if SHOW_TRANSLATION_NOTES and used_flat_fallback and not args.flat and args.structured:
         print("note: structured mode not applicable; used flat mode fallback")
     if SHOW_TRANSLATION_NOTES and used_main_unwrap:
         print("note: unwrapped guarded main() body for transpilation")
