@@ -7551,6 +7551,63 @@ def rewrite_nested_callback_functions_to_toplevel(tree):
     return tree
 
 
+def preserve_discarded_main_result(tree):
+    """Keep a value-returning main as a procedure, not an unwrapped body.
+
+    A Python expression statement discards main's value, not its evaluation.
+    Assigning to a private temporary lets normal function emission preserve
+    early returns, local scope, and side effects in the return expression.
+    In particular, a returned integer is not a process exit status.
+    """
+    main = next((s for s in tree.body if isinstance(s, ast.FunctionDef) and s.name == "main"), None)
+    if main is None:
+        return tree
+
+    class Returns(ast.NodeVisitor):
+        has_value = False
+
+        def visit_Return(self, node):
+            if node.value is not None and not is_none(node.value):
+                self.has_value = True
+
+        def visit_FunctionDef(self, node):
+            pass
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+        visit_Lambda = visit_FunctionDef
+
+    returns = Returns()
+    for stmt in main.body:
+        returns.visit(stmt)
+    if not returns.has_value:
+        return tree
+    names = {n.id.lower() for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {n.arg.lower() for n in ast.walk(tree) if isinstance(n, ast.arg)}
+    names |= {n.name.lower() for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    names |= {(n.asname or n.name.split('.')[0]).lower() for n in ast.walk(tree) if isinstance(n, ast.alias)}
+    temporary = "xp2f_discarded_main_result"
+    while temporary.lower() in names:
+        temporary += "_"
+
+    class Rewrite(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            return node
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+        visit_Lambda = visit_FunctionDef
+
+        def visit_Expr(self, node):
+            call = node.value
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "main":
+                return ast.copy_location(ast.Assign(
+                    targets=[ast.Name(id=temporary, ctx=ast.Store())], value=call), node)
+            return node
+
+    return ast.fix_missing_locations(Rewrite().visit(tree))
+
+
 def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     """Rewrite `from numpy import X; X(...)` to `X(...)` shaped as
     `np.X(...)` (a synthetic `np.` attribute access), so every one of
@@ -77969,6 +78026,7 @@ def transpile_file(
     translator.global_numpy_const_aliases = {}
     comment_map = {} if ignore_comments else extract_python_comments(src)
 
+    tree = preserve_discarded_main_result(tree)
     exec_nodes = [
         s
         for s in tree.body
