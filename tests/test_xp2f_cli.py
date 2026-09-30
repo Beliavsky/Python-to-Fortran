@@ -32,6 +32,60 @@ SUPPORTED_PY_COMPILE_CASES = [
 ]
 
 
+@pytest.mark.parametrize("int_kind", [None, "int32", "int64"])
+def test_xp2f_signed_right_shift(tmp_path: Path, int_kind: str | None) -> None:
+    src = tmp_path / "xsigned_right_shift.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "def shifted(x, count):",
+        "    return x >> count",
+        "def augmented(x, count):",
+        "    x >>= count",
+        "    return x",
+        "for x in [-2147483647, -15, -2, -1, 0, 1, 15, 2147483647]:",
+        "    for count in [0, 1, 7, 31, 32, 63, 64, 1000]:",
+        "        print(shifted(x, count), augmented(x, count))",
+        "a = np.array([-15, -2, -1, 0, 1, 15], dtype=int)",
+        "b = a >> 1",
+        "a >>= 2",
+        "for i in range(a.size):",
+        "    print(a[i], b[i])",
+    ] + ([
+        # Construct wide values without relying on large-literal kind lowering.
+        "x = -2147483647",
+        "x = x * 2147483647 * 2",
+        "print(shifted(x, 1), augmented(x, 63))",
+        "count = 65536",
+        "count = count * count",
+        "print(shifted(x, count), augmented(15, count))",
+    ] if int_kind == "int64" else []) + [""]), encoding="utf-8")
+    command = [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"]
+    if int_kind:
+        command += ["--int-kind", int_kind]
+    proc = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("operator", [">>", ">>="])
+def test_xp2f_negative_right_shift_count(tmp_path: Path, operator: str) -> None:
+    src = tmp_path / "xnegative_shift.py"
+    operation = "x >>= count" if operator == ">>=" else "x = x >> count"
+    src.write_text("\n".join([
+        "def shifted(x, count):", f"    {operation}", "    return x",
+        "print(shifted(-15, -1))", "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    executable = src.with_name(src.stem + "_p.exe")
+    run = subprocess.run([str(executable)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode != 0
+    assert "negative shift count" in run.stdout + run.stderr
+
+
 @pytest.mark.parametrize("values", [[1, 2, 3], ["a", "b", "c"]])
 def test_xp2f_set_comparisons_are_scalar(tmp_path: Path, values: list) -> None:
     lines = [

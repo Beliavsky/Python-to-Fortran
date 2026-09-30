@@ -16773,6 +16773,8 @@ def detect_needed_helpers(tree):
                 # sits idle in python_mod; see floor_div_int/floor_div_real.
                 needed.add("floor_div_int")
                 needed.add("floor_div_real")
+            if isinstance(node.op, ast.RShift):
+                needed.add("py_rshift")
             if isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)):
                 needed.add("unique_int")
                 needed.add("unique_char")
@@ -16836,6 +16838,8 @@ def detect_needed_helpers(tree):
             # x //= y -- an AugAssign's own .op is never visited by
             # visit_BinOp (it isn't a BinOp node), so floor-division
             # augmented assignment needs its own detection here.
+            if isinstance(node.op, ast.RShift):
+                needed.add("py_rshift")
             if isinstance(node.op, ast.FloorDiv):
                 needed.add("floor_div_int")
                 needed.add("floor_div_real")
@@ -19675,6 +19679,16 @@ end interface gather_where2d"""
          mod_pow_int = int(res)
       end function mod_pow_int"""
 
+    rshift_blk = """      pure elemental function py_rshift(x, shift) result(r)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x, shift
+         integer(kind=int64) :: r
+         ! Python right shifts sign-extend; counts beyond the word width
+         ! yield 0 or -1. Clamp before narrowing the count to default kind.
+         if (shift < 0_int64) error stop 'ValueError: negative shift count'
+         r = shifta(x, int(min(shift, 63_int64)))
+      end function py_rshift"""
+
     floor_div_int_pub = (
         "public :: floor_div_int !@pyapi kind=function ret=integer "
         "args=x:integer:intent(in),y:integer:intent(in) "
@@ -20966,6 +20980,7 @@ end interface gather_where2d"""
         "gather_where2d": (gather_where_pub, gather_where_blk),
         "mod_pow_int": (mod_pow_pub, mod_pow_blk),
         "floor_div_int": (floor_div_int_pub, floor_div_int_blk),
+        "py_rshift": ("public :: py_rshift", rshift_blk),
         "floor_div_real": (floor_div_real_pub, floor_div_real_blk),
         "py_round_ndigits": (py_round_ndigits_pub, py_round_ndigits_blk),
         "py_round_int": (py_round_int_pub, py_round_int_blk),
@@ -35233,7 +35248,8 @@ class translator(ast.NodeVisitor):
             if op is ast.LShift:
                 return f"ishft({a}, int({b}))"
             if op is ast.RShift:
-                return f"ishft({a}, -int({b}))"
+                return (f"int(py_rshift(int({a}, kind=int64), "
+                        f"int({b}, kind=int64)), kind=kind({a}))")
             if op in (ast.BitAnd, ast.BitOr, ast.BitXor):
                 # Fortran's .and./.or. are LOGICAL-only operators -- unlike
                 # Python's &/|/^, which work equally on int and bool
@@ -56187,7 +56203,8 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{lhs} = ishft({lhs}, int({rhs}))")
             return
         if isinstance(node.op, ast.RShift):
-            self.o.w(f"{lhs} = ishft({lhs}, -int({rhs}))")
+            self.o.w(f"{lhs} = int(py_rshift(int({lhs}, kind=int64), "
+                     f"int({rhs}, kind=int64)), kind=kind({lhs}))")
             return
         if isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
             # Same kind-aware dispatch as the non-augmented BinOp case

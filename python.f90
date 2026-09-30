@@ -181,6 +181,7 @@ public :: index1
 public :: index2
 public :: slice1
 public :: py_slice_bound
+public :: py_rshift
 
 public :: rank_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='min') for a plain 1D real vector"
 public :: rank_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='max') for a plain 1D real vector"
@@ -8807,6 +8808,16 @@ contains
             s = x / m
          end if
       end function csign_complex
+
+      pure elemental function py_rshift(x, shift) result(r)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x, shift
+         integer(kind=int64) :: r
+         ! Python right shifts sign-extend; counts beyond the word width
+         ! yield 0 or -1. Clamp before narrowing the count to default kind.
+         if (shift < 0_int64) error stop 'ValueError: negative shift count'
+         r = shifta(x, int(min(shift, 63_int64)))
+      end function py_rshift
 
       elemental integer function floor_div_int(x, y) result(q)
          ! Python // floors toward negative infinity; Fortran's own
