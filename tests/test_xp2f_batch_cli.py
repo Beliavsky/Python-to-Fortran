@@ -14,6 +14,56 @@ if str(REPO_ROOT) not in sys.path:
 import xp2f_batch
 
 
+@pytest.mark.parametrize("kind", [None, "int32", "int64"])
+@pytest.mark.parametrize("mode", [[], ["--no-compile"], ["--no-run"], ["--run-both"], ["--strict"], ["--strict-fix"]])
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_batch_forwards_integer_kind(tmp_path, monkeypatch, capsys, kind, mode, jobs):
+    paths = [tmp_path / "first.py", tmp_path / "second.py"]
+    for path in paths:
+        path.write_text("print(1)\n", encoding="utf-8")
+    called = []
+
+    def run(cmd, **kwargs):
+        called.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(xp2f_batch.subprocess, "run", run)
+    monkeypatch.setattr(xp2f_batch, "_ensure_parallel_helper_cache", lambda *args: 0)
+    monkeypatch.setattr(sys, "argv", ["xp2f_batch.py", *map(str, paths), "--jobs", str(jobs), *mode]
+                        + (["--int-kind", kind] if kind else []))
+    assert xp2f_batch.main() == 0
+    assert len(called) == 2
+    for cmd in called:
+        if kind:
+            assert cmd.count("--int-kind") == 1
+            assert cmd[cmd.index("--int-kind") + 1] == kind
+        else:
+            assert "--int-kind" not in cmd
+    assert f"Integer kind: {kind or 'compiler default (no --int-kind)'}" in capsys.readouterr().out
+
+
+def test_batch_rejects_invalid_integer_kind(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["xp2f_batch.py", "unused.py", "--int-kind", "int16"])
+    with pytest.raises(SystemExit) as exc:
+        xp2f_batch.main()
+    assert exc.value.code == 2
+
+
+def test_batch_integer_kind_real_translation_and_tee(tmp_path):
+    src = tmp_path / "xinteger.py"
+    src.write_text("n = 3\nprint(n)\n", encoding="utf-8")
+    log = tmp_path / "batch.txt"
+    proc = subprocess.run([sys.executable, str(REPO_ROOT / "xp2f_batch.py"), str(src),
+                           "--no-compile", "--int-kind", "int64", "--terse", "--tee", str(log)],
+                          cwd=tmp_path, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Integer kind: int64" in proc.stdout
+    assert "Integer kind: int64" in log.read_text(encoding="utf-8")
+    generated = (tmp_path / "xinteger_p.f90").read_text(encoding="utf-8")
+    assert "ikind = int64" in generated
+    assert "integer(kind=ikind)" in generated
+
+
 def test_expand_inputs_supports_at_list_files(tmp_path: Path, monkeypatch) -> None:
     src_dir = tmp_path / "src"
     src_dir.mkdir()

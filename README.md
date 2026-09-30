@@ -207,6 +207,18 @@ matched files. Detection does not execute the Python source. Assignments, calls,
 and control flow remain translation candidates, and syntax errors remain failures.
 The `--strict` and `--strict-fix` modes still process modules.
 
+To test explicit integer widening across examples, use:
+
+```console
+python xp2f_batch.py "examples/*.py" --work-dir . --int-kind int64
+```
+
+`--int-kind int32` is also accepted. The option is forwarded to each `xp2f.py`
+invocation, and the batch report records the selected kind (including in `--tee`
+logs). When omitted, no integer-kind option is forwarded. Keep a separate
+default-kind run as a baseline; external helpers still require their declared
+integer kinds.
+
 Compare two batch result files:
 
 ```console

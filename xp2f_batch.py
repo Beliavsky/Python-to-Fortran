@@ -488,6 +488,8 @@ def main() -> int:
         help='Compiler command forwarded to xp2f.py --compiler.',
     )
     ap.add_argument("--flat", action="store_true", help="Forward --flat to xp2f.py.")
+    ap.add_argument("--int-kind", choices=["int32", "int64"], default=None,
+                    help="Forward --int-kind to xp2f.py; omitted uses the compiler's default integer kind.")
     ap.add_argument("--type", action="store_true", help="Forward --type to xp2f.py.")
     ap.add_argument("--comment", action="store_true", help="Forward --comment to xp2f.py.")
     ap.add_argument("--ignore-comments", action="store_true", help="Forward --ignore-comments to xp2f.py.")
@@ -651,6 +653,8 @@ def main() -> int:
             return 1
         print(f"Working directory: {work_dir}")
 
+    print(f"Integer kind: {args.int_kind or 'compiler default (no --int-kind)'}")
+
     try:
         py_files = _expand_inputs(args.inputs, exclude_generated_typed=args.type)
     except InputExpansionError as exc:
@@ -759,6 +763,8 @@ def main() -> int:
                 output="" if args.terse else "  SKIP (module-only: no executable entry point)",
             )
         cmd = [sys.executable, str(xp2f_path), str(source_abs), *helper_args]
+        if args.int_kind is not None:
+            cmd.extend(["--int-kind", args.int_kind])
         if args.strict:
             cmd.append("--strict")
         elif args.strict_fix:
