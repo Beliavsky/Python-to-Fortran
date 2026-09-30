@@ -8143,6 +8143,121 @@ def extract_python_comments(src_text):
     return out
 
 
+_OMP_DIRECTIVE_RE = re.compile(r"^\$\s*omp\b\s*(.*?)\s*$", re.IGNORECASE)
+
+
+def fortran_comment_lines(text, width=80):
+    """Fortran lines for one Python source comment (text after `#`).
+
+    An OpenMP directive written pyccel-style as `#$ omp ...` (formatters
+    often insert spaces: `# $ omp ...`) becomes the directive `!$omp ...`;
+    gfortran ignores it unless compiling with -fopenmp. A trailing `\\`
+    continues the directive on the next comment line (`&` in Fortran), and
+    long directives are wrapped with `!$omp&` continuation lines, since
+    free-form lines are limited to 132 characters and comments are not
+    wrapped. Any other comment becomes `! text`."""
+    m = _OMP_DIRECTIVE_RE.match(text.strip())
+    if not m:
+        return [f"! {text}".rstrip()]
+    body = m.group(1)
+    cont = body.endswith("\\")
+    if cont:
+        body = body[:-1].rstrip()
+    # The C spelling `for` (as in pyccel's Python sources) is `do` in Fortran:
+    # for, parallel for, for simd, end for, end parallel for.
+    body = re.sub(r"^(end\s+)?(parallel\s+)?for\b", lambda mm: f"{mm.group(1) or ''}{mm.group(2) or ''}do",
+                  body, flags=re.IGNORECASE)
+    lines = []
+    prefix = "!$omp "
+    while len(prefix) + len(body) > width:
+        cut = max(body.rfind(", ", 0, width - len(prefix) - 2), body.rfind(" ", 0, width - len(prefix) - 2))
+        if cut <= 0:
+            break
+        head = body[:cut + (1 if body[cut] == "," else 0)].rstrip()
+        lines.append(f"{prefix}{head} &")
+        body = body[cut + 1:].lstrip()
+        prefix = "!$omp& "
+    lines.append(f"{prefix}{body}" + (" &" if cont else ""))
+    return lines
+
+
+_PROC_HEADER_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<prefix>(?:(?:pure|impure|elemental|recursive|module)\s+)*)"
+    r"(?P<rest>(?:[a-z][\w()=,*\s]*?\s+)?(?:function|subroutine)\s+(?P<name>[a-z_]\w*)\b.*)$",
+    re.IGNORECASE,
+)
+
+
+def demote_purity_for_openmp(lines):
+    """A procedure containing an `!$omp` directive may not be PURE (gfortran:
+    "OpenMP directive ... is not pure and thus may not appear in a PURE
+    procedure"), so remove PURE from it, and from every procedure that calls
+    it directly or through a generic name, until nothing changes. ELEMENTAL
+    becomes IMPURE ELEMENTAL. Interface bodies are left alone. A no-op
+    without directives."""
+    if not any(re.match(r"^\s*!\$omp\b", ln, re.IGNORECASE) for ln in lines):
+        return lines
+    procs = []  # [header_index, end_index, name]
+    stack = []
+    in_iface = 0
+    for i, ln in enumerate(lines):
+        code = ln.split("!", 1)[0].strip().lower() if not re.match(r"^\s*!\$omp", ln, re.IGNORECASE) else ""
+        if re.match(r"^(?:abstract\s+)?interface\b", code):
+            in_iface += 1
+            continue
+        if re.match(r"^end\s+interface\b", code):
+            in_iface = max(0, in_iface - 1)
+            continue
+        if in_iface:
+            continue
+        m = _PROC_HEADER_RE.match(ln)
+        if m and not code.startswith("end") and not code.startswith("module procedure"):
+            stack.append([i, None, m.group("name").lower()])
+            continue
+        if re.match(r"^end\s+(?:function|subroutine)\b", code) and stack:
+            proc = stack.pop()
+            proc[1] = i
+            procs.append(proc)
+    generics = {}
+    for m in re.finditer(r"^\s*interface\s+([a-z_]\w*)\s*$(.*?)^\s*end\s+interface",
+                         "\n".join(lines), re.IGNORECASE | re.MULTILINE | re.DOTALL):
+        for mp in re.finditer(r"module\s+procedure\s+(.+)", m.group(2), re.IGNORECASE):
+            for nm in mp.group(1).split(","):
+                generics.setdefault(nm.strip().lower(), set()).add(m.group(1).lower())
+    impure = {name for h, e, name in procs
+              if any(re.match(r"^\s*!\$omp\b", lines[k], re.IGNORECASE) for k in range(h + 1, e))}
+    changed = True
+    while changed:
+        changed = False
+        names = set(impure)
+        for nm in list(impure):
+            names |= generics.get(nm, set())
+        if not names:
+            break
+        call_re = re.compile(r"\b(" + "|".join(sorted(map(re.escape, names))) + r")\s*\(", re.IGNORECASE)
+        for h, e, name in procs:
+            if name in impure:
+                continue
+            if any(call_re.search(lines[k].split("!", 1)[0]) for k in range(h + 1, e)):
+                impure.add(name)
+                changed = True
+    out = list(lines)
+    for h, _e, name in procs:
+        if name not in impure:
+            continue
+        m = _PROC_HEADER_RE.match(out[h])
+        words = m.group("prefix").split()
+        low = [w.lower() for w in words]
+        if "elemental" in low:
+            words = [w for w in words if w.lower() not in {"pure", "impure"}]
+            words.insert(0, "impure")
+        else:
+            words = [w for w in words if w.lower() != "pure"]
+        prefix = (" ".join(words) + " ") if words else ""
+        out[h] = f"{m.group('indent')}{prefix}{m.group('rest')}"
+    return out
+
+
 def python_header_comment_lines(src_text):
     """The file's header as Fortran comment lines: the module docstring and
     the `#` comments before the first statement, in source order. Top-level
@@ -8175,7 +8290,7 @@ def python_header_comment_lines(src_text):
         for i, line in enumerate(doc.splitlines()):
             items.append((doc_node.lineno, i, line))
     items.sort(key=lambda it: (it[0], it[1]))
-    return [f"! {txt}".rstrip() for _ln, _i, txt in items]
+    return [ln for _ln, _i, txt in items for ln in fortran_comment_lines(txt)]
 
 
 # Top-level statements of the source being translated, before any rewrite
@@ -26974,7 +27089,8 @@ class translator(ast.NodeVisitor):
         """Comments after the last statement, which no statement emits."""
         for ln in sorted(ln for ln in self.comment_map if ln > self._last_comment_line):
             for c in self.comment_map[ln]:
-                self.o.w(f"! {c}")
+                for line in fortran_comment_lines(c):
+                    self.o.w(line)
             self._last_comment_line = ln
 
     def _emit_comments_for(self, node):
@@ -26983,7 +27099,8 @@ class translator(ast.NodeVisitor):
             return
         for i in range(self._last_comment_line + 1, ln + 1):
             for c in self.comment_map.get(i, []):
-                self.o.w(f"! {c}")
+                for line in fortran_comment_lines(c):
+                    self.o.w(line)
         if ln > self._last_comment_line:
             self._last_comment_line = ln
 
@@ -65503,7 +65620,8 @@ def _emit_local_function(
         # _comment_map_for_top_level); once, not for every specialization.
         _LEADING_COMMENTS_EMITTED.add(_lead_key)
         for _lead in _leads:
-            o.w(f"! {_lead}")
+            for _line in fortran_comment_lines(_lead):
+                o.w(_line)
     if tuple_return or void_return:
         sig = [arg_emit_map.get(a, a) for a in args] + out_names
         o.w(f"{pure_prefix}subroutine {proc_name}(" + ", ".join(sig) + ")")
@@ -79083,6 +79201,8 @@ def transpile_file(
             f90_lines = vectorize_rank1_elemental_call_loops(f90_lines)
         except Exception:
             pass
+    # OpenMP directives may not appear in a PURE (or ELEMENTAL) procedure.
+    f90_lines = demote_purity_for_openmp(f90_lines)
     # Apply final structural whitespace consistently for default and
     # postprocessed output.
     f90_lines = fpost.ensure_blank_lines_around_units_and_procedures(f90_lines)

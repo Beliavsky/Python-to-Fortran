@@ -24593,3 +24593,56 @@ def test_xp2f_source_comments_are_all_carried_over_once(tmp_path: Path) -> None:
     i = out_lines.index("! before g")
     assert re.match(r"^(pure )?(elemental )?function g\b", out_lines[i + 1]), out
     assert out.index("! before main") < out.index("! c4 main") < out.index("! trailing comment")
+
+
+@pytest.mark.parametrize("comment, expected", [
+    ("$ omp parallel", ["!$omp parallel"]),
+    ("$omp for reduction(+:s)", ["!$omp do reduction(+:s)"]),
+    ("$ omp parallel for simd", ["!$omp parallel do simd"]),
+    ("$ omp end for", ["!$omp end do"]),
+    ("$ omp parallel private(i1, i2) \\", ["!$omp parallel private(i1, i2) &"]),
+    ("$ omp shared(aaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccccc, dddddddd)",
+     ["!$omp shared(aaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbb, &", "!$omp& cccccccccccccccccccccc, dddddddd)"]),
+    ("$ omphalos is not a directive", ["! $ omphalos is not a directive"]),
+    ("plain comment", ["! plain comment"]),
+])
+def test_xp2f_openmp_directive_comments(comment: str, expected: list) -> None:
+    # pyccel-style `#$ omp ...` comments (formatters insert `# $ omp`) become
+    # Fortran directives; C's `for` is `do` in Fortran.
+    import xp2f
+    assert xp2f.fortran_comment_lines(comment) == expected
+
+
+@pytest.mark.parametrize("openmp", [False, True])
+def test_xp2f_openmp_directive_passthrough_builds(tmp_path: Path, openmp: bool) -> None:
+    # The directive is emitted as !$omp; the procedure holding it, and its
+    # caller, drop PURE (OpenMP directives may not appear in a PURE
+    # procedure). Without -fopenmp the directive is an ordinary comment.
+    src = tmp_path / "xomp_pi.py"
+    src.write_text("\n".join([
+        "def integrate(n: int) -> float:",
+        "    h = 1.0 / n",
+        "    s = 0.0",
+        "    #$ omp parallel for private(x) reduction(+:s)",
+        "    for i in range(n):",
+        "        x = (i + 0.5) * h",
+        "        s += 4.0 / (1.0 + x * x)",
+        "    return s * h",
+        "",
+        "",
+        "def estimate(n: int) -> float:",
+        "    return integrate(n)",
+        "",
+        "",
+        "print(round(estimate(2000000), 10))",
+        "",
+    ]), encoding="utf-8")
+    cmd = [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"]
+    if openmp:
+        cmd += ["--compiler", "gfortran -O2 -fopenmp"]
+    proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xomp_pi_p.f90").read_text(encoding="utf-8")
+    assert "!$omp parallel do private(x) reduction(+:s)" in out, out
+    assert not re.search(r"(?im)^\s*pure\s+[^\n]*function\s+(integrate|estimate)\b", out), out
