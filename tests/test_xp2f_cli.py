@@ -18462,14 +18462,16 @@ def test_xp2f_forwarded_callback_keeps_caller_inferred_ranks(tmp_path: Path, rev
     ])
 
 
-def test_xp2f_xrosetta_least_squares_callback_results(tmp_path: Path) -> None:
+@pytest.mark.parametrize("int_kind", [None, "int64"])
+def test_xp2f_xrosetta_least_squares_callback_results(tmp_path: Path, int_kind: str | None) -> None:
     # Exercise the unmodified whole example, including numerical_jacobian,
     # residuals, and sse all receiving the same vector-valued callback.
     src = tmp_path / "xrosetta.py"
     shutil.copy2(EXAMPLES_DIR / "xrosetta.py", src)
     py = subprocess.run([sys.executable, str(src)], cwd=tmp_path,
                         capture_output=True, text=True, check=False)
-    ft = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run"],
+    options = ["--int-kind", int_kind] if int_kind else []
+    ft = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run", *options],
                         cwd=tmp_path, capture_output=True, text=True, check=False)
     assert py.returncode == 0, py.stdout + py.stderr
     assert ft.returncode == 0, ft.stdout + ft.stderr
@@ -18480,6 +18482,12 @@ def test_xp2f_xrosetta_least_squares_callback_results(tmp_path: Path) -> None:
             line = next(line for line in output.splitlines() if re.match(rf"\s*{label}\s*=", line))
             return [float(value) for value in line.split("=", 1)[1].replace("[", "").replace("]", "").split()]
         assert values(ft.stdout) == pytest.approx(values(py.stdout), rel=1e-7, abs=1e-9)
+    if int_kind == "int64":
+        for label in ("product over whole array", "product for k in range(3, 8)"):
+            def product(output):
+                line = next(line for line in output.splitlines() if line.strip().startswith(label + " ="))
+                return int(line.split("=", 1)[1])
+            assert product(ft.stdout) == product(py.stdout)
 
 
 def test_xp2f_chebyshev_vector_callback_ranks(tmp_path: Path) -> None:

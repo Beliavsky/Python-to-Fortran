@@ -2857,6 +2857,7 @@ def split_statements_to_lines(lines: Iterable[str]) -> List[str]:
 
 
 def _split_top_level_commas(text: str) -> List[str]:
+    """Split a Fortran list, preserving parenthesized and bracketed expressions."""
     out: List[str] = []
     cur: List[str] = []
     depth = 0
@@ -2884,9 +2885,9 @@ def _split_top_level_commas(text: str) -> List[str]:
             i += 1
             continue
         if not in_single and not in_double:
-            if ch == "(":
+            if ch in "([":
                 depth += 1
-            elif ch == ")" and depth > 0:
+            elif ch in ")]" and depth > 0:
                 depth -= 1
             elif ch == "," and depth == 0:
                 out.append("".join(cur).strip())

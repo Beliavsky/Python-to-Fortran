@@ -432,6 +432,69 @@ def _rewrite_decl_line(raw: str, excluded: Set[str]) -> List[str]:
     return out
 
 
+def _scoped_exclusions(stmts, boundary):
+    """Resolve boundary actual names to declarations, respecting local shadows.
+
+    A real LAPACK argument named `r` must not prevent an unrelated integer
+    accumulator `r` in another procedure from being widened. Host-associated
+    integers, however, must remain default-kind when a contained routine uses
+    them at an external boundary.
+    """
+    scopes = [{"parent": None, "names": set(), "excluded": set()}]
+    stack = [0]
+    owners = {}
+    opening = re.compile(
+        r"^(?:(?:pure|impure|elemental|recursive|module)\s+)*"
+        r"(?:(?:integer|real|complex|logical|character)(?:\s*\([^)]*\))?\s+|double\s+precision\s+)?"
+        r"(?:function|subroutine)\s+\w+\s*\(|^(?:module|program)\s+\w+\s*$|^block\s*$",
+        re.IGNORECASE)
+    closing = re.compile(r"^end\s*(?:function|subroutine|module|program|block)\b|^end$", re.IGNORECASE)
+    for lineno, text in stmts:
+        if opening.match(text) and not re.match(r"^module\s+procedure\b", text, re.IGNORECASE):
+            scopes.append({"parent": stack[-1], "names": set(), "excluded": set()})
+            stack.append(len(scopes) - 1)
+            # Calls to a local routine that reaches an external boundary are
+            # kept default-kind as a whole by the existing boundary policy.
+            # Its dummy declarations must agree even for dummies that are not
+            # themselves forwarded to the external helper.
+            procedure = re.search(r"\b(?:function|subroutine)\s+(\w+)\s*\(([^)]*)\)", text, re.IGNORECASE)
+            if procedure and procedure.group(1).lower() in boundary:
+                scopes[stack[-1]]["excluded"].update(
+                    arg.strip().lower() for arg in procedure.group(2).split(",") if arg.strip())
+        owners[lineno] = stack[-1]
+        if re.match(r"^(?:integer|real|complex|logical|character|type\s*\(|class\s*\()", text, re.IGNORECASE) and "::" in text:
+            for part in fscan._split_top_level_commas(text.split("::", 1)[1]):
+                name = re.match(r"\s*([A-Za-z_]\w*)", part)
+                if name:
+                    scopes[stack[-1]]["names"].add(name.group(1).lower())
+        if closing.match(text) and len(stack) > 1:
+            stack.pop()
+    for lineno, text in stmts:
+        names = _collect_excluded_names([(lineno, text)], boundary)
+        # A compound integer actual such as print_matrix(a*b) must remain
+        # default-kind too. Conservatively protect its declared operands.
+        for _, actuals in _find_calls_to(text, boundary):
+            actuals = re.sub(r"'([^']|'')*'|\"([^\"]|\"\")*\"", " ", actuals)
+            names.update(re.findall(r"\b[a-z_]\w*\b", actuals.lower()))
+        for name in names:
+            scope = owners[lineno]
+            while scope is not None and name not in scopes[scope]["names"]:
+                scope = scopes[scope]["parent"]
+            if scope is not None:
+                scopes[scope]["excluded"].add(name)
+    result = {}
+    for lineno, own in owners.items():
+        excluded, shadowed = set(), set()
+        scope = own
+        while scope is not None:
+            excluded.update(scopes[scope]["excluded"] - shadowed)
+            shadowed.update(scopes[scope]["names"])
+            scope = scopes[scope]["parent"]
+        # Kind selectors are compile-time kind numbers, not runtime integers.
+        result[lineno] = excluded | {"dp", "sp", "ikind"}
+    return result
+
+
 def _ensure_unit_has_ikind(unit_lines: List[str], kind_name: str) -> List[str]:
     """Given the physical lines of one module/program unit (open line
     through, but not including, its matching end line), return a modified
@@ -504,14 +567,7 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
 
     stmts = fscan.iter_fortran_statements(lines)
     boundary = _expand_boundary_with_local_functions(lines, _scan_external_boundary_calls())
-    excluded = _collect_excluded_names(stmts, boundary)
-    # A kind-selector constant (dp/sp -- this codebase's own real32/real64
-    # selectors -- and ikind, this pass's own) is used purely as a
-    # compile-time KIND number, never as a runtime value; widening its own
-    # declared integer kind would be pointless and confusing, so it's
-    # always left as plain `integer`, regardless of the external-boundary
-    # scan above.
-    excluded = excluded | {"dp", "sp", "ikind"}
+    excluded_by_line = _scoped_exclusions(stmts, boundary)
 
     def stmt_last_line(k: int) -> int:
         """1-based index of the LAST physical line of statement k,
@@ -560,6 +616,7 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
     out: List[str] = []
     consumed_through = 0
     for k, (lineno, text) in enumerate(stmts):
+        excluded = excluded_by_line[lineno]
         start_idx = lineno - 1
         if start_idx < consumed_through:
             continue
@@ -579,6 +636,17 @@ def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
 
         code_line = _widen_bare_int_casts_in_code(f"{indent}{text}")
         code_line = _suffix_bare_int_literals_in_code(code_line)
+        # ALLOCATE's SOURCE must match the object's kind exactly, unlike
+        # ordinary assignment. An excluded integer array still needs its
+        # default-kind zero/one initializer, even when extents are widened.
+        allocation = re.match(r"^\s*allocate\s*\((.*)\)\s*$", code_line, re.IGNORECASE)
+        if allocation:
+            parts = fscan._split_top_level_commas(allocation.group(1))
+            objects = [p for p in parts if not re.match(r"\w+\s*=", p)]
+            if len(objects) == 1:
+                obj = re.match(r"([A-Za-z_]\w*)\s*\(", objects[0])
+                if obj and obj.group(1).lower() in excluded:
+                    code_line = re.sub(r"(\bsource\s*=\s*[+-]?\d+)_ikind\b(?=\s*[,\)])", r"\1", code_line, flags=re.IGNORECASE)
         full_line = f"{code_line}{comment}{eol}"
 
         if _DECL_RE.match(code_line):
