@@ -219,6 +219,36 @@ Summarize historical batch progress files:
 python xsummarize_xp2f_progress.py
 ```
 
+## Optional FPM projects
+
+`xp2f_fpm.py` can package several drivers with a shared stateless Python module
+into an [FPM project](https://fpm.fortran-lang.org/spec/manifest.html). The normal
+`xp2f.py --compile` workflow is unchanged. For example, from the repository root:
+
+```console
+python xp2f_fpm.py examples/xsim_fit_nagarch_t.py examples/xfit_nagarch_t.py --shared examples/nagarch_t_model.py --data asset_class_etf_prices.csv --out-dir nagarch_fpm --build
+cd nagarch_fpm
+fpm run --target xfit_nagarch_t --flag "-ffree-line-length-none"
+```
+
+Omit `--build` to generate without invoking FPM. The initial build backend uses
+gfortran. Output must be a new directory; existing projects are never overwritten.
+Repeat `--data` for additional files. Data is copied both for translation-time
+schema inference and for execution from the project root.
+
+Each driver is translated using existing caller-based inference. Shared routines
+must have identical generated implementations across drivers, allowing only
+comments, formatting, and dummy/result-name differences. One copy goes in `src/`;
+each driver in `app/` imports it. Helpers are copied once into `src/helpers/`.
+Translation logs and standalone baseline sources remain under `translation/`.
+
+This is a conservative first version, not general Python package translation:
+shared modules must contain imports and functions only, imports must be explicit
+and unaliased, and every shared function must have an inferred callable
+implementation. Conflicting specializations are rejected rather than merged.
+The six `nagarch_t_model` drivers have been built together; the initial simulation
+and fitting drivers also matched direct-compiler output after excluding timing.
+
 ## Small Example
 
 The file [examples/xprime.py](examples/xprime.py) counts primes up to one million. Running:
