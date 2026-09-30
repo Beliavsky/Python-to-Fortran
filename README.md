@@ -34,6 +34,8 @@ See [Timing Results](TIMING_RESULTS.md) for runtime measurements on fully passin
 
 See [Comparison with Pyccel](PYCCEL_COMPARISON.md) for how this project differs from Pyccel.
 
+Another related project is [Numeta](https://gitlab.com/andrea_bianchi/numeta), which generates compiled numerical kernels using tracing and an explicit Python API, with Fortran and C backends. In contrast, `xp2f.py` analyzes ordinary Python source and aims to translate existing numerical programs with fewer source changes.
+
 ### Class support
 
 A user-defined class is lowered to a Fortran derived type with plain `allocatable` (copied, not pointer-aliased) fields; each method is hoisted to a free top-level function taking `self` as an explicit first argument rather than a type-bound procedure. See [Comparison with Pyccel](PYCCEL_COMPARISON.md) for how this compares to pyccel's own pointer-based, type-bound-procedure translation.
