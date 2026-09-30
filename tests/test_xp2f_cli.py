@@ -24231,11 +24231,19 @@ def test_xp2f_structured_option_warns(tmp_path: Path, structured: bool) -> None:
 def test_xp2f_int_kind_int64_helper_boundaries(tmp_path: Path) -> None:
     # --int-kind int64 used to fail to compile: widened values passed to
     # default-integer helpers, default-kind values passed to widened local
-    # dummies, [size(x), 3_ikind]. The
+    # dummies, [size(x), 3_ikind], callback interfaces without ikind. The
     # int64 build must match Python, including a sum past 2**31.
     src = tmp_path / "xint64_boundaries.py"
     src.write_text("\n".join([
         "import numpy as np",
+        "",
+        "",
+        "def apply(f, n):",
+        "    return f(n)",
+        "",
+        "",
+        "def half(k):",
+        "    return k / 2.0",
         "",
         "",
         "def fit(x, max_iter=1000, rng=0):",
@@ -24257,6 +24265,7 @@ def test_xp2f_int_kind_int64_helper_boundaries(tmp_path: Path) -> None:
         "x = np.zeros(5)",
         "rng = 3",
         "print(fit(x), fit(x, max_iter=5), fit(x, rng=rng), simulate(4, rng))",
+        "print(apply(half, 12))",
         "for i in range(2):",
         "    np.random.seed(12345 + i)",
         "w = np.ones(4)",
@@ -24281,3 +24290,18 @@ def test_xp2f_int_kind_int64_helper_boundaries(tmp_path: Path) -> None:
     assert py.stdout.splitlines()[-1] in ft.stdout, ft.stdout
     assert "333328333350000" in ft.stdout
 
+
+
+
+@pytest.mark.parametrize("lines", [
+    # An integer-returning callback got a real result in its interface.
+    ["def apply(f, n):", "    return f(n)", "", "", "def sq(k):", "    return k * k", "", "",
+     "print(apply(sq, 12))"],
+    # The callback's argument kind comes from the call inside apply.
+    ["def apply(f, n):", "    return f(n)", "", "", "def half(k):", "    return k / 2.0", "", "",
+     "print(apply(half, 12))"],
+    ["def apply(f, x):", "    return f(x)", "", "", "def half(k):", "    return k / 2.0", "", "",
+     "print(apply(half, 3.5))"],
+])
+def test_xp2f_callback_kinds_follow_the_callback_call(tmp_path: Path, lines: list) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xcallback_kinds.py", lines)
