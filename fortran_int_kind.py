@@ -260,6 +260,12 @@ _LEADING_KIND_SELECTOR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Consume an entire numeric token, including signed real exponents, before
+# deciding whether it is a bare integer. Otherwise the 3 in 1e-3 is rewritten.
+_NUMERIC_TOKEN_RE = re.compile(
+    r"\d+(?:\.\d*)?(?:[eEdDqQ][+-]?\d+)?(?:_[A-Za-z0-9_]+)?"
+)
+
 
 def _suffix_bare_int_literals_in_code(code: str) -> str:
     """Append `_ikind` to every bare integer literal TOKEN in `code`
@@ -302,16 +308,18 @@ def _suffix_bare_int_literals_in_code(code: str) -> str:
             i += 1
             continue
         if ch.isdigit():
-            j = i
-            while j < n and code[j].isdigit():
-                j += 1
+            token_match = _NUMERIC_TOKEN_RE.match(code, i)
+            j = token_match.end()
             prev_ch = code[i - 1] if i > 0 else ""
             next_ch = code[j] if j < n else ""
-            is_ident_or_real_prefix = prev_ch.isalnum() or prev_ch in "_."
-            is_real_or_suffixed_or_ident = next_ch in "._" or next_ch.isalpha()
+            # Empty strings compare as members of every Python string; they
+            # are token boundaries, not identifier/real/suffix characters.
+            is_ident_or_real_prefix = bool(prev_ch) and (prev_ch.isalnum() or prev_ch in "_.")
+            is_real_or_suffixed_or_ident = bool(next_ch) and (next_ch in "._" or next_ch.isalpha())
             is_leading_kind_selector = protected_span == (i, j)
             token = code[i:j]
-            if is_ident_or_real_prefix or is_real_or_suffixed_or_ident or is_leading_kind_selector:
+            if (not token.isdigit() or is_ident_or_real_prefix
+                    or is_real_or_suffixed_or_ident or is_leading_kind_selector):
                 out.append(token)
             else:
                 out.append(token + "_ikind")

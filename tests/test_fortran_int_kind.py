@@ -12,6 +12,26 @@ import fortran_int_kind as fikind
 import fortran_scan as fscan
 
 
+@pytest.mark.parametrize("code, expected", [
+    ("42", "42_ikind"),
+    ("x = 1", "x = 1_ikind"),
+    ("x = 4294967296", "x = 4294967296_ikind"),
+    ("x = -9223372036854775807", "x = -9223372036854775807_ikind"),
+    ("x = 1 + 2", "x = 1_ikind + 2_ikind"),
+    ("x = 1e-3 + 2", "x = 1e-3 + 2_ikind"),
+    ("x = 1e+3", "x = 1e+3"),
+    ("x = .5d-2 + 3", "x = .5d-2 + 3_ikind"),
+    ("x = 1.0E-10_dp + 3", "x = 1.0E-10_dp + 3_ikind"),
+    ("x = 1.d+5", "x = 1.d+5"),
+    ("x = 42_int64 + 3_8", "x = 42_int64 + 3_8"),
+    ("real(8) :: x", "real(8) :: x"),
+    ("real(kind=real64) :: x", "real(kind=real64) :: x"),
+    ("print *, '42', \"1e-3\", 42", "print *, '42', \"1e-3\", 42_ikind"),
+])
+def test_integer_literal_token_boundaries(code, expected):
+    assert fikind._suffix_bare_int_literals_in_code(code) == expected
+
+
 @pytest.mark.parametrize("text,expected", [
     ("a(*) = [1, 2, 3], b = 4", ["a(*) = [1, 2, 3]", "b = 4"]),
     ("a = reshape([1,2,3,4], [2,2]), b", ["a = reshape([1,2,3,4], [2,2])", "b"]),

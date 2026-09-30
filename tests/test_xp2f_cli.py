@@ -51,12 +51,9 @@ def test_xp2f_signed_right_shift(tmp_path: Path, int_kind: str | None) -> None:
         "for i in range(a.size):",
         "    print(a[i], b[i])",
     ] + ([
-        # Construct wide values without relying on large-literal kind lowering.
-        "x = -2147483647",
-        "x = x * 2147483647 * 2",
+        "x = -9223372036854775807",
         "print(shifted(x, 1), augmented(x, 63))",
-        "count = 65536",
-        "count = count * count",
+        "count = 4294967296",
         "print(shifted(x, count), augmented(15, count))",
     ] if int_kind == "int64" else []) + [""]), encoding="utf-8")
     command = [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"]
@@ -84,6 +81,38 @@ def test_xp2f_negative_right_shift_count(tmp_path: Path, operator: str) -> None:
     run = subprocess.run([str(executable)], cwd=tmp_path, capture_output=True, text=True)
     assert run.returncode != 0
     assert "negative shift count" in run.stdout + run.stderr
+
+
+def test_xp2f_int64_large_integer_literals(tmp_path: Path) -> None:
+    src = tmp_path / "xlarge_literals.py"
+    src.write_text("\n".join([
+        "def positive():",
+        "    return 9223372036854775807",
+        "def negative():",
+        "    return -9223372036854775807",
+        "a = 4294967296",
+        "b = -4294967296",
+        "c = 9223372036854775807",
+        "d = -9223372036854775807",
+        "print(a)", "print(b)", "print(c)", "print(d)",
+        "print(positive())", "print(negative())", "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--int-kind", "int64"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    generated = src.with_name(src.stem + "_p.f90").read_text(encoding="utf-8")
+    assert "4294967296_ikind" in generated
+    assert "9223372036854775807_ikind" in generated
+    executable = src.with_name(src.stem + "_p.exe")
+    run = subprocess.run([str(executable)], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    # Exact integer comparison, not a float-tolerant run-diff comparison.
+    assert [int(s) for s in run.stdout.split()] == [
+        4294967296, -4294967296, 9223372036854775807, -9223372036854775807,
+        9223372036854775807, -9223372036854775807,
+    ]
 
 
 @pytest.mark.parametrize("values", [[1, 2, 3], ["a", "b", "c"]])
