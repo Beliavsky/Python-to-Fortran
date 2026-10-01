@@ -15550,6 +15550,9 @@ def detect_needed_helpers(tree):
         "gradient": {"gradient_1d"},
         "eye": {"eye"},
         "identity": {"eye"},
+        "round": {"np_rint"},
+        "around": {"np_rint"},
+        "rint": {"np_rint"},
         "diag": {"diag"},
         "diagonal": {"diagonal"},
         "repeat": {
@@ -15828,6 +15831,11 @@ def detect_needed_helpers(tree):
             self.generic_visit(node)
 
         def visit_Call(self, node):
+            # np.floor_divide / np.mod are translated as `//` and `%`.
+            if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                    and node.func.attr in {"floor_divide", "mod", "remainder"}):
+                needed.add("floor_div_int")
+                needed.add("floor_div_real")
             def _attr_chain_parts(n):
                 parts = []
                 cur = n
@@ -27744,6 +27752,23 @@ class translator(ast.NodeVisitor):
         if ln > self._last_comment_line:
             self._last_comment_line = ln
 
+    _FLOAT_DTYPE_REDUCTIONS = {"sum", "prod", "cumsum", "cumprod"}
+
+    def _float_dtype_reduction(self, node):
+        """For np.sum(x, dtype=float) / x.sum(dtype=np.float64) and the
+        same for prod, cumsum, cumprod: the call without its dtype keyword
+        (whose real-converted value is the result), else None."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in self._FLOAT_DTYPE_REDUCTIONS):
+            return None
+        if not any(kw.arg == "dtype" for kw in node.keywords):
+            return None
+        if "float" not in self._np_dtype_text(node):
+            return None
+        bare = copy.copy(node)
+        bare.keywords = [kw for kw in node.keywords if kw.arg != "dtype"]
+        return bare
+
     def _np_dtype_text(self, call_node):
         dtype_txt = ""
         # numpy accepts dtype as a plain positional argument too (e.g.
@@ -27888,6 +27913,8 @@ class translator(ast.NodeVisitor):
         )
 
     def _expr_kind(self, node):
+        if self._float_dtype_reduction(node) is not None:
+            return "real"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS:
             return OMP_RUNTIME_HELPERS[node.func.id]
         if isinstance(node, ast.Name) and node.id in self.__dict__.get("_comp_int_scope", ()):
@@ -29908,9 +29935,16 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray"}
+                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray", "ravel"}
                 and len(node.args) >= 1
             ):
+                if node.func.attr in {"dot", "matmul"} and len(node.args) >= 2:
+                    # The wider of the two operand kinds: np.matmul(int, float) is float.
+                    order = ["logical", "int", "real", "complex"]
+                    ks = [self._expr_kind(a) for a in node.args[:2]]
+                    if all(k in order for k in ks):
+                        k = max(ks, key=order.index)
+                        return "int" if k == "logical" else k
                 return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -33099,6 +33133,19 @@ class translator(ast.NodeVisitor):
             return f"({value}) /= (0.0_dp, 0.0_dp)"
         return self._coerce_expr_kind(node, value, "logical")
 
+    def _c_order_flat(self, x, rank):
+        """The elements of array expression x in NumPy's (row-major) order,
+        as a rank-1 array: what ravel()/flatten() give."""
+        if rank <= 1:
+            return f"reshape({x}, [size({x})])"
+        if rank == 2:
+            return f"reshape(transpose({x}), [size({x})])"
+        if rank == 3:
+            # Reverse the axes, then flatten column-major.
+            return (f"reshape(reshape({x}, [size({x},3), size({x},2), size({x},1)], order=[3,2,1]), "
+                    f"[size({x})])")
+        raise NotImplementedError("ravel()/flatten() supports arrays of rank up to 3")
+
     def _rank_expr(self, node):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS:
             return 0
@@ -34942,6 +34989,9 @@ class translator(ast.NodeVisitor):
 
     def expr(self, node):
         validate_numpy_atleast_call(node)
+        _bare = self._float_dtype_reduction(node)
+        if _bare is not None:
+            return f"real({self.expr(_bare)}, kind=dp)"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS and OMP_RUNTIME_HELPERS[node.func.id] is not None:
             # An OpenMP runtime query (see rewrite_pyccel_openmp_imports).
             if node.args or node.keywords:
@@ -38693,7 +38743,8 @@ class translator(ast.NodeVisitor):
                             axis_node = kw.value
                             break
                     if axis_node is None:
-                        return f"(minloc({base_expr}, dim=1) - 1)"
+                        flat = self._c_order_flat(base_expr, self._rank_expr(node.func.value))
+                        return f"(minloc({flat}, dim=1) - 1)"
                     return f"(minloc({base_expr}, dim=({self.expr(axis_node)} + 1)) - 1)"
                 if attr == "argmax":
                     axis_node = None
@@ -38702,12 +38753,11 @@ class translator(ast.NodeVisitor):
                             axis_node = kw.value
                             break
                     if axis_node is None:
-                        return f"(maxloc({base_expr}, dim=1) - 1)"
+                        flat = self._c_order_flat(base_expr, self._rank_expr(node.func.value))
+                        return f"(maxloc({flat}, dim=1) - 1)"
                     return f"(maxloc({base_expr}, dim=({self.expr(axis_node)} + 1)) - 1)"
-                if attr == "ravel":
-                    return f"reshape({base_expr}, [size({base_expr})])"
-                if attr == "flatten":
-                    return f"reshape({base_expr}, [size({base_expr})])"
+                if attr in {"ravel", "flatten"}:
+                    return self._c_order_flat(base_expr, self._rank_expr(node.func.value))
                 if attr == "transpose":
                     rank0 = self._rank_expr(node.func.value)
                     if len(node.args) == 0:
@@ -41150,10 +41200,11 @@ class translator(ast.NodeVisitor):
                         break
                 return f"merge({nan_fill}, {a0}, ieee_is_nan({a0}))"
             np_attr = self._numpy_call_attr(node.func)
-            if np_attr == "mod" and len(node.args) >= 2:
-                return f"mod({self.expr(node.args[0])}, {self.expr(node.args[1])})"
-            if np_attr == "floor_divide" and len(node.args) >= 2:
-                return f"({self.expr(node.args[0])} / {self.expr(node.args[1])})"
+            if np_attr in {"mod", "remainder", "floor_divide"} and len(node.args) == 2 and not node.keywords:
+                # Python's floored division and modulo, same as `a // b` and
+                # `a % b` (np.mod(-1, 3) == 2; np.floor_divide(-1.25, 2) == -1.0).
+                op = ast.FloorDiv() if np_attr == "floor_divide" else ast.Mod()
+                return self.expr(ast.copy_location(ast.BinOp(left=node.args[0], op=op, right=node.args[1]), node))
             if np_attr in {"bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 2:
                 fn = {"bitwise_and": "iand", "bitwise_or": "ior", "bitwise_xor": "ieor"}[np_attr]
                 return f"{fn}({self.expr(node.args[0])}, {self.expr(node.args[1])})"
@@ -41296,7 +41347,8 @@ class translator(ast.NodeVisitor):
                         break
                 fn = "maxloc" if node.func.attr == "argmax" else "minloc"
                 if axis_node is None:
-                    return f"({fn}(reshape({a0}, [size({a0})]), dim=1) - 1)"
+                    # numpy's flat index counts in row-major order.
+                    return f"({fn}({self._c_order_flat(a0, self._rank_expr(node.args[0]))}, dim=1) - 1)"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 return f"({fn}({a0}, dim={dim_expr}) - 1)"
             if (
@@ -41313,9 +41365,8 @@ class translator(ast.NodeVisitor):
                         axis_node = kw.value
                         break
                 if axis_node is None:
-                    if node.func.attr == "nanargmax":
-                        return f"nanargmax(reshape({a0}, [size({a0})]))"
-                    return f"nanargmin(reshape({a0}, [size({a0})]))"
+                    flat = self._c_order_flat(a0, self._rank_expr(node.args[0]))
+                    return f"{node.func.attr}({flat})"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 if node.func.attr == "nanargmax":
                     return f"(maxloc(merge({a0}, (-huge(1.0_dp)), (.not. ieee_is_nan({a0}))), dim={dim_expr}) - 1)"
@@ -41425,15 +41476,15 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"fix", "trunc"}:
                     return f"aint({a0})"
                 if node.func.attr == "rint":
-                    return f"anint({a0})"
+                    return f"np_rint({a0})"
                 if node.func.attr == "floor":
                     return f"real(floor({a0}), kind=dp)"
                 if node.func.attr == "ceil":
                     return f"real(ceiling({a0}), kind=dp)"
                 if len(node.args) >= 2:
                     d = self.expr(node.args[1])
-                    return f"(anint({a0} * (10.0_dp**{d})) / (10.0_dp**{d}))"
-                return f"anint({a0})"
+                    return f"(np_rint({a0} * (10.0_dp**{d})) / (10.0_dp**{d}))"
+                return f"np_rint({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -41496,6 +41547,21 @@ class translator(ast.NodeVisitor):
                         a0 = f"real({a0}, kind=dp)"
                     if self._expr_kind(stop_node) != "real":
                         a1 = f"real({a1}, kind=dp)"
+                    endpoint_node = node.args[3] if len(node.args) >= 4 else None
+                    for kw in node.keywords:
+                        if kw.arg == "endpoint":
+                            endpoint_node = kw.value
+                    if endpoint_node is not None and not (
+                        isinstance(endpoint_node, ast.Constant) and endpoint_node.value is True
+                    ):
+                        # endpoint=False: num points spaced (stop - start)/num
+                        # apart, i.e. the endpoint=True grid ending one step
+                        # before stop.
+                        short = f"{a1} - ({a1} - {a0}) / real(max(1, {num_i}), kind=dp)"
+                        if isinstance(endpoint_node, ast.Constant) and endpoint_node.value is False:
+                            a1 = short
+                        else:
+                            a1 = f"merge({a1}, {short}, logical({self.expr(endpoint_node)}))"
                     return f"linspace({a0}, {a1}, {num_i})"
                 if node.func.attr == "logspace" and len(node.args) >= 2:
                     start_node = node.args[0]
@@ -41552,10 +41618,39 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"diff", "ediff1d"}:
                     a0 = self.expr(node.args[0])
                     axis = -1
+                    n_node = node.args[1] if node.func.attr == "diff" and len(node.args) >= 2 else None
                     for kw in node.keywords:
                         if kw.arg == "axis" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, int):
                             axis = int(kw.value.value)
+                        elif kw.arg == "n" and node.func.attr == "diff":
+                            n_node = kw.value
                     r0 = self._rank_expr(node.args[0])
+                    n_diff = 1
+                    if n_node is not None:
+                        if not (isinstance(n_node, ast.Constant) and isinstance(n_node.value, int)
+                                and n_node.value >= 0):
+                            raise NotImplementedError("np.diff supports only a constant integer n >= 0")
+                        n_diff = int(n_node.value)
+                    if n_diff == 0:
+                        return a0
+                    if n_diff > 1:
+                        # n-th difference: sum over j of (-1)**(n-j) * C(n,j) * x[j : len-n+j].
+                        if isinstance(node.args[0], ast.Call) or r0 > 2:
+                            raise NotImplementedError("np.diff with n > 1 needs a named array of rank 1 or 2")
+                        d = 0 if r0 <= 1 else (0 if axis == 0 else 1)
+                        terms = []
+                        for j in range(n_diff + 1):
+                            c = math.comb(n_diff, j) * (-1) ** (n_diff - j)
+                            lo = f"{1 + j}"
+                            hi = f"size({a0}{'' if r0 <= 1 else f', {d + 1}'})-{n_diff - j}" if n_diff - j else ""
+                            sl = f"{lo}:{hi}"
+                            idx = sl if r0 <= 1 else (f"{sl},:" if d == 0 else f":,{sl}")
+                            terms.append((c, f"{a0}({idx})"))
+                        out = ""
+                        for c, term in terms:
+                            mag = "" if abs(c) == 1 else f"{abs(c)}*"
+                            out += (" - " if c < 0 else (" + " if out else "")) + mag + term
+                        return f"({out.strip()})"
                     if r0 <= 1:
                         return f"({a0}(2:) - {a0}(:size({a0})-1))"
                     if isinstance(node.args[0], ast.Call):
@@ -41638,14 +41733,19 @@ class translator(ast.NodeVisitor):
                 m_node = n_node
                 if len(node.args) >= 2:
                     m_node = node.args[1]
+                k_node = node.args[2] if len(node.args) >= 3 else None
                 for kw in node.keywords:
                     if kw.arg in {"M", "m"}:
                         m_node = kw.value
-                        break
+                    elif kw.arg == "k":
+                        k_node = kw.value
+                if isinstance(m_node, ast.Constant) and m_node.value is None:
+                    m_node = n_node
                 def _int_arg_expr(n):
                     txt = self.expr(n)
                     return txt if self._expr_kind(n) == "int" else f"int({txt})"
-                _eye_call = f"eye({_int_arg_expr(n_node)}, {_int_arg_expr(m_node)})"
+                _k_txt = "" if k_node is None else f", k={_int_arg_expr(k_node)}"
+                _eye_call = f"eye({_int_arg_expr(n_node)}, {_int_arg_expr(m_node)}{_k_txt})"
                 if "bool" in self._np_dtype_text(node):
                     # eye() always returns real (see _expr_kind's own
                     # matching comment) -- dtype=bool needs an explicit
@@ -42888,8 +42988,7 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"ravel", "flatten"}
                 and len(node.args) >= 1
             ):
-                a0 = self.expr(node.args[0])
-                return f"reshape({a0}, [size({a0})])"
+                return self._c_order_flat(self.expr(node.args[0]), self._rank_expr(node.args[0]))
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
@@ -43844,7 +43943,7 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"fix", "trunc"}:
                     return f"aint({a0})"
                 if node.func.attr == "rint":
-                    return f"anint({a0})"
+                    return f"np_rint({a0})"
                 if node.func.attr in {"floor", "ceil"}:
                     op = "floor" if node.func.attr == "floor" else "ceiling"
                     return f"real({op}({a0}), kind=dp)"
@@ -43856,9 +43955,9 @@ class translator(ast.NodeVisitor):
                         decimals = self.expr(kw.value)
                         break
                 if decimals is None:
-                    return f"anint({a0})"
+                    return f"np_rint({a0})"
                 return (
-                    f"(anint(({a0}) * (10.0_dp ** int({decimals}))) / "
+                    f"(np_rint(({a0}) * (10.0_dp ** int({decimals}))) / "
                     f"(10.0_dp ** int({decimals})))"
                 )
             if (
@@ -61685,7 +61784,9 @@ class translator(ast.NodeVisitor):
                         else:
                             self.o.w(f"write({unit_txt},*) " + ", ".join(pair_parts))
                     return
-            if self._rank_expr(a0) == 2 and self._expr_kind(a0) in {"real", "int", "alloc_real", "alloc_int"}:
+            if self._rank_expr(a0) == 2 and self._expr_kind(a0) in {
+                "real", "int", "alloc_real", "alloc_int", "logical", "alloc_log"
+            }:
                 self.o.w(f"call print_matrix({self.expr(a0)})")
                 return
             if self._rank_expr(a0) == 3 and self._expr_kind(a0) in {"real", "int", "alloc_real", "alloc_int"}:
@@ -61833,8 +61934,13 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("f-string in multi-argument print not supported")
                 else:
                     expr_txt = self.expr(a)
-                    if sep_txt != " " and self._rank_expr(a) == 0 and self._expr_kind(a) not in {"char", "str"}:
+                    _rank_a = self._rank_expr(a)
+                    if sep_txt != " " and _rank_a == 0 and self._expr_kind(a) not in {"char", "str"}:
                         expr_txt = f"py_str({expr_txt})"
+                    elif _rank_a in (2, 3):
+                        # List-directed output walks an array in column-major
+                        # order; numpy prints it row by row.
+                        expr_txt = self._c_order_flat(expr_txt, _rank_a)
                     parts.append(expr_txt)
             if unit_txt == "*":
                 self.o.w("print *, " + ", ".join(parts))

@@ -219,7 +219,7 @@ public :: repeat_logical_axis1_2d !@pyapi kind=function ret=logical(:,:) args=x:
 public :: diag_from_mat_int !@pyapi kind=function ret=integer(:) args=a:integer(:,:):intent(in) desc="return main diagonal of integer matrix"
 public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="tile real vector reps times"
 public :: tile_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile real matrix reps0 x reps1 times"
-public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional desc="return n x m identity-like matrix (default m=n)"
+public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional,k:integer:intent(in):optional desc="return n x m matrix with ones on diagonal k (default m=n, k=0)"
 public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="sorted unique values of real vector"
 public :: bincount_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),minlength:integer:intent(in):optional desc="count occurrences of nonnegative integers"
 public :: searchsorted_left_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted left indices for integer vectors"
@@ -389,6 +389,7 @@ public :: shift_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):inte
 
 public :: py_round_ndigits !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),ndigits:integer:intent(in) desc="Python 3 round(x, ndigits): ties round to even (banker's rounding)"
 public :: floor_div_real !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) desc="Python-style real floor division (x // y, floor of the quotient, result stays real)"
+public :: np_rint !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="numpy rint/round: nearest integer, ties to even"
 public :: py_round_int !@pyapi kind=function ret=integer args=x:real(dp):intent(in) desc="Python 3 round(x) with no ndigits: banker's rounding to the nearest integer"
 public :: csign_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.sign() for complex input: x / abs(x), 0 at the origin"
 public :: floor_div_int !@pyapi kind=function ret=integer args=x:integer:intent(in),y:integer:intent(in) desc="Python-style integer floor division (x // y, floors toward negative infinity)"
@@ -580,6 +581,7 @@ interface print_matrix
    module procedure print_matrix_label_real_2d
    module procedure print_matrix_int_2d
    module procedure print_matrix_label_int_2d
+   module procedure print_matrix_logical_2d
 end interface print_matrix
 
 interface print_array_3d
@@ -1031,6 +1033,39 @@ contains
             end if
          end do
       end subroutine print_matrix_int_2d
+
+      subroutine print_matrix_logical_2d(a)
+         ! A 2-D logical array in NumPy's layout: rows in order, each
+         ! element right-justified in 5 columns (`[[ True False  True]`).
+         logical, intent(in) :: a(:,:)
+         integer :: i, j
+
+         if (size(a,1) <= 0 .or. size(a,2) <= 0) then
+            write(*, "(a)") "[]"
+            return
+         end if
+         do i = 1, size(a,1)
+            if (i == 1) then
+               write(*, "(a)", advance="no") "["
+            else
+               write(*, "(a)", advance="no") " "
+            end if
+            write(*, "(a)", advance="no") "["
+            do j = 1, size(a,2)
+               if (j > 1) write(*, "(a)", advance="no") " "
+               if (a(i, j)) then
+                  write(*, "(a)", advance="no") " True"
+               else
+                  write(*, "(a)", advance="no") "False"
+               end if
+            end do
+            if (i == size(a,1)) then
+               write(*, "(a)") "]]"
+            else
+               write(*, "(a)") "]"
+            end if
+         end do
+      end subroutine print_matrix_logical_2d
 
       subroutine print_array_3d_real(a)
          real(kind=dp), intent(in) :: a(:,:,:)
@@ -5936,18 +5971,20 @@ contains
          end do
       end function tile_real_2d
 
-      pure function eye_real(n, m) result(x)
+      pure function eye_real(n, m, k) result(x)
+         ! np.eye(n, m, k): ones on diagonal k (above the main one for k > 0).
          integer, intent(in) :: n
-         integer, intent(in), optional :: m
+         integer, intent(in), optional :: m, k
          real(kind=dp), allocatable :: x(:,:)
-         integer :: mm, i, k
+         integer :: mm, kk, i
          mm = n
          if (present(m)) mm = m
+         kk = 0
+         if (present(k)) kk = k
          if (n < 0 .or. mm < 0) error stop "eye_real: dimensions must be >= 0"
          allocate(x(1:n,1:mm), source=0.0_dp)
-         k = min(n, mm)
-         do i = 1, k
-            x(i,i) = 1.0_dp
+         do i = max(1, 1 - kk), min(n, mm - kk)
+            x(i,i+kk) = 1.0_dp
          end do
       end function eye_real
 
@@ -8794,6 +8831,16 @@ contains
             if (k < n) y(1:n - k) = x(k + 1:n)
          end if
       end function shift_1d
+
+      elemental function np_rint(x) result(r)
+         ! numpy rint/round/around: the nearest integer, ties to even
+         ! (np.round(2.5) == 2.0, np.round(-0.5) == -0.0); ANINT rounds
+         ! ties away from zero. np.round(x, d) is np_rint(x*10**d)/10**d.
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: r
+         r = anint(x)
+         if (abs(x - aint(x)) == 0.5_dp) r = 2.0_dp * anint(0.5_dp * x)
+      end function np_rint
 
       elemental function py_round_ndigits(x, ndigits) result(rnd)
          ! Python 3's round() rounds ties to even ("banker's rounding");

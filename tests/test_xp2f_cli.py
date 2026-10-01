@@ -2272,7 +2272,8 @@ def test_xp2f_runs_direct_numpy_mod_import(tmp_path: Path) -> None:
     assert "Build: PASS" in proc.stdout
     assert "Run: PASS" in proc.stdout
     out_text = (tmp_path / "xmod_direct_import_p.f90").read_text(encoding="utf-8")
-    assert "res = mod(arr, arr)" in out_text
+    # np.mod is Python's floored modulo (MODULO), not Fortran's MOD.
+    assert "res = modulo(arr, arr)" in out_text
 
 
 def test_xp2f_runs_direct_numpy_empty_import(tmp_path: Path) -> None:
@@ -4307,7 +4308,8 @@ def test_xp2f_compiles_numpy_rounding_family_calls(tmp_path: Path) -> None:
     assert out_f90.exists()
     out_text = out_f90.read_text(encoding="utf-8")
     assert "aint(" in out_text
-    assert "anint(" in out_text
+    # np.round/np.rint round ties to even (np_rint), unlike ANINT.
+    assert "np_rint(" in out_text
     assert "real(floor(" in out_text
     assert "real(ceiling(" in out_text
 
@@ -25263,3 +25265,64 @@ def test_xp2f_numba_vectorize_is_elemental(tmp_path: Path) -> None:
     for name in ("hypot2", "relu", "gcd"):
         assert re.search(rf"(?im)^\s*(?:pure\s+)?elemental\s+function\s+{name}\(", out), out
     assert "impure" not in out.lower(), out
+
+
+def test_xp2f_numpy_conformance_silent_wrong_results(tmp_path: Path) -> None:
+    # Cases numpy_conformance/ found giving wrong values with no error:
+    # ravel/flatten and argmin/argmax of 2-D/3-D arrays used column-major
+    # order; linspace endpoint=False, eye k=, diff n= and sum dtype=float
+    # were ignored; np.round rounded ties away from zero (numpy: to even);
+    # np.mod/np.floor_divide used Fortran's truncating rules; matmul of
+    # int and float arrays was declared integer; 2-D bool arrays printed
+    # column by column.
+    src = tmp_path / "xnp_silent.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+        "f2 = np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
+        "b2 = np.array([[True, False, True], [True, False, False]])",
+        "i1 = np.array([3, -1, 4, 1, -5, 9])",
+        "print(i2.ravel(), np.ravel(f2), i2.flatten())",
+        "print(np.arange(24.0).reshape(2, 3, 4).ravel())",
+        "print(np.argmin(i2), np.argmax(f2), f2.argmin())",
+        "print(np.linspace(0.0, 1.0, 4, endpoint=False))",
+        "print(np.eye(3, k=1))",
+        "print(np.eye(3, 4, k=-1))",
+        "print(np.diff(i1, n=2))",
+        "print(np.diff(f2, n=2, axis=1))",
+        "s = np.sum(i1, dtype=float) / 4",
+        "print(s)",
+        "print(np.round(np.array([0.5, 1.5, 2.5, -0.5, -1.25])))",
+        "print(np.round(f2, 1))",
+        "print(np.rint(np.array([0.5, 1.5, -2.5])))",
+        "print(np.mod(i1, 3), np.floor_divide(i1, 2))",
+        "print(np.floor_divide(f2, 2))",
+        "print(np.mod(f2, 0.75))",
+        "print(np.matmul(i2, f2.T))",
+        "print(b2)",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_print_2d_array_among_other_items_in_row_order(tmp_path: Path) -> None:
+    # print(a, 7) with a 2-D a: list-directed output walks a column by
+    # column; numpy prints it row by row.
+    src = tmp_path / "xprint2d.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+        "b2 = i2 > 0",
+        "print(i2, 7)",
+        "print(b2, 8)",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = [ln.split() for ln in proc.stdout.splitlines()]
+    assert ["3", "-1", "4", "1", "-5", "9", "7"] in lines, proc.stdout
+    assert ["T", "F", "T", "T", "F", "T", "8"] in lines, proc.stdout
