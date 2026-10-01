@@ -25326,3 +25326,41 @@ def test_xp2f_print_2d_array_among_other_items_in_row_order(tmp_path: Path) -> N
     lines = [ln.split() for ln in proc.stdout.splitlines()]
     assert ["3", "-1", "4", "1", "-5", "9", "7"] in lines, proc.stdout
     assert ["T", "F", "T", "T", "F", "T", "8"] in lines, proc.stdout
+
+
+def test_xp2f_numpy_result_kinds_match_numpy2(tmp_path: Path) -> None:
+    # numpy_conformance/ found these declared with the wrong kind (values
+    # right, type wrong): in NumPy 2, floor/ceil/trunc/fix/round of ints,
+    # amin/amax, square/negative, minimum, inner and index arrays such as
+    # np.where(c)[0] and np.argsort(x)[::-1] are integer; fabs and rint of
+    # ints, and outer with a float operand, are float.
+    cases = [
+        ("np.floor(i1)", "int"), ("np.ceil(i2)", "int"), ("np.trunc(i1)", "int"), ("np.fix(i1)", "int"),
+        ("np.round(i1)", "int"), ("np.round(i1, -1)", "int"), ("np.amax(i1)", "int"), ("np.amin(i2)", "int"),
+        ("np.square(i1)", "int"), ("np.negative(i1)", "int"), ("np.minimum(i1, 2)", "int"),
+        ("np.inner(i1, i1)", "int"), ("np.where(i2 > 0)[1]", "int"), ("np.argsort(f1)[::-1]", "int"),
+        ("np.fabs(i1)", "float"), ("np.rint(i1)", "float"), ("np.outer(i1, np.array([0.5]))", "float"),
+    ]
+    lines = ["import numpy as np",
+             "i1 = np.array([3, -7, 12, 25])",
+             "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+             "f1 = np.array([0.5, -1.25, 2.0, 3.75])"]
+    for k, (e, _) in enumerate(cases):
+        lines += [f"r{k} = {e}", f"print('case {k}')", f"print(r{k})"]
+    src = tmp_path / "xnp_kinds.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    exe = tmp_path / "xnp_kinds_p.exe"
+    if not exe.exists():
+        exe = tmp_path / "xnp_kinds_p"
+    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
+    blocks = re.split(r"^\s*case (\d+)\s*$", out, flags=re.M)[1:]
+    got = {int(blocks[i]): blocks[i + 1] for i in range(0, len(blocks), 2)}
+    for k, (e, kind) in enumerate(cases):
+        nums = re.findall(r"[-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?", got[k])
+        assert nums, (e, got[k])
+        is_float = ["." in x or "e" in x.lower() for x in nums]
+        assert all(is_float) if kind == "float" else not any(is_float), (e, kind, got[k])

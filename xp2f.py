@@ -27912,9 +27912,29 @@ class translator(ast.NodeVisitor):
             "is supported only for numeric names and constants; use an explicit if/else"
         )
 
+    _KIND_ORDER = ("logical", "int", "real", "complex")
+
+    def _promoted_kind(self, nodes):
+        """numpy's result kind for an operation on nodes: the widest of
+        their kinds (bool < int < float < complex), or None if unknown."""
+        ks = [self._expr_kind(n) for n in nodes]
+        if not ks or not all(k in self._KIND_ORDER for k in ks):
+            return None
+        return max(ks, key=self._KIND_ORDER.index)
+
     def _expr_kind(self, node):
         if self._float_dtype_reduction(node) is not None:
             return "real"
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and is_numpy_name_node(node.value.func.value)
+            and (node.value.func.attr in {"argsort", "nonzero", "argwhere", "flatnonzero"}
+                 or (node.value.func.attr == "where" and len(node.value.args) == 1))
+        ):
+            # Index arrays: np.where(c)[0], np.argsort(x)[::-1], ...
+            return "int"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS:
             return OMP_RUNTIME_HELPERS[node.func.id]
         if isinstance(node, ast.Name) and node.id in self.__dict__.get("_comp_int_scope", ()):
@@ -28702,6 +28722,9 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"fix", "trunc", "rint", "round", "around", "floor", "ceil", "nanprod"}
                 and len(node.args) >= 1
             ):
+                if node.func.attr not in {"rint", "nanprod"} and self._expr_kind(node.args[0]) == "int":
+                    # numpy 2 keeps integer input integer (np.floor(i) is int).
+                    return "int"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -28810,7 +28833,9 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"amax", "amin", "fmax", "fmin"}
                 and len(node.args) >= 1
             ):
-                return "real"
+                # amax/amin keep the array's kind; fmax/fmin promote.
+                k = self._promoted_kind(node.args[:1] if node.func.attr in {"amax", "amin"} else node.args[:2])
+                return k if k is not None else "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -29412,6 +29437,8 @@ class translator(ast.NodeVisitor):
             ):
                 if node.func.attr in {"exp2", "square", "reciprocal", "positive", "negative"} and self._expr_kind(node.args[0]) == "complex":
                     return "complex"
+                if node.func.attr in {"square", "positive", "negative"} and self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    return "int"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -29621,14 +29648,14 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"add", "multiply", "maximum", "power"}
+                and node.func.attr in {"add", "multiply", "maximum", "minimum", "power"}
                 and len(node.args) >= 2
             ):
                 k0 = self._expr_kind(node.args[0])
                 k1 = self._expr_kind(node.args[1])
                 if "real" in {k0, k1}:
                     return "real"
-                if k0 == "logical" and k1 == "logical" and node.func.attr == "maximum":
+                if k0 == "logical" and k1 == "logical" and node.func.attr in {"maximum", "minimum"}:
                     return "logical"
                 if k0 == "int" and k1 == "int":
                     return "int"
@@ -29933,6 +29960,15 @@ class translator(ast.NodeVisitor):
                 return "int"
             if (
                 isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"inner", "outer"}
+                and len(node.args) >= 2
+            ):
+                k = self._promoted_kind(node.args[:2])
+                if k is not None:
+                    return "int" if k == "logical" else k
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray", "ravel"}
@@ -29940,11 +29976,11 @@ class translator(ast.NodeVisitor):
             ):
                 if node.func.attr in {"dot", "matmul"} and len(node.args) >= 2:
                     # The wider of the two operand kinds: np.matmul(int, float) is float.
-                    order = ["logical", "int", "real", "complex"]
-                    ks = [self._expr_kind(a) for a in node.args[:2]]
-                    if all(k in order for k in ks):
-                        k = max(ks, key=order.index)
+                    k = self._promoted_kind(node.args[:2])
+                    if k is not None:
                         return "int" if k == "logical" else k
+                if node.func.attr == "fabs":
+                    return "real"
                 return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -33133,6 +33169,24 @@ class translator(ast.NodeVisitor):
             return f"({value}) /= (0.0_dp, 0.0_dp)"
         return self._coerce_expr_kind(node, value, "logical")
 
+    def _np_integer_rounding(self, node, a0, k0):
+        """np.floor/ceil/trunc/fix/round/around of an integer array is that
+        integer array in numpy 2 (np.round(i, d) with d < 0 rounds to a
+        multiple of 10**-d, ties to even); None for other calls."""
+        if k0 != "int" or node.func.attr not in {"floor", "ceil", "trunc", "fix", "round", "around"}:
+            return None
+        if node.func.attr not in {"round", "around"}:
+            return a0
+        d_node = node.args[1] if len(node.args) >= 2 else None
+        for kw in node.keywords:
+            if kw.arg == "decimals":
+                d_node = kw.value
+        if d_node is None or (isinstance(d_node, ast.Constant) and isinstance(d_node.value, int) and d_node.value >= 0):
+            return a0
+        d = self.expr(d_node)
+        return (f"merge({a0}, nint(np_rint(real({a0}, kind=dp) * 10.0_dp**int({d})) / 10.0_dp**int({d})), "
+                f"int({d}) >= 0)")
+
     def _c_order_flat(self, x, rank):
         """The elements of array expression x in NumPy's (row-major) order,
         as a rank-1 array: what ravel()/flatten() give."""
@@ -33147,6 +33201,18 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError("ravel()/flatten() supports arrays of rank up to 3")
 
     def _rank_expr(self, node):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, int)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and is_numpy_name_node(node.value.func.value)
+            and (node.value.func.attr == "nonzero"
+                 or (node.value.func.attr == "where" and len(node.value.args) == 1))
+        ):
+            # np.nonzero(x)[k] / np.where(x)[k]: one index vector.
+            return 1
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS:
             return 0
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -34069,7 +34135,7 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient", "ascontiguousarray", "asfortranarray", "diff"} and len(node.args) >= 1:
+                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "around", "rint", "trunc", "fix", "isfinite", "isinf", "isnan", "gradient", "ascontiguousarray", "asfortranarray", "diff"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "atleast_1d" and len(node.args) >= 1:
                     return max(1, self._rank_expr(node.args[0]))
@@ -41424,7 +41490,10 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
-                if k0 in {"int", "logical"} and node.func.attr not in {"abs", "fabs", "sign"}:
+                _int_kept = self._np_integer_rounding(node, a0, k0)
+                if _int_kept is not None:
+                    return _int_kept
+                if k0 in {"int", "logical"} and node.func.attr not in {"abs", "sign"}:
                     a0 = f"real({a0}, kind=dp)"
                 if node.func.attr in {"abs", "fabs"}:
                     return f"abs({a0})"
@@ -43938,6 +44007,9 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
+                _int_kept = self._np_integer_rounding(node, a0, k0)
+                if _int_kept is not None:
+                    return _int_kept
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 if node.func.attr in {"fix", "trunc"}:
