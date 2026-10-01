@@ -8167,6 +8167,10 @@ def fortran_comment_lines(text, width=80):
     # for, parallel for, for simd, end for, end parallel for.
     body = re.sub(r"^(end\s+)?(parallel\s+)?for\b", lambda mm: f"{mm.group(1) or ''}{mm.group(2) or ''}do",
                   body, flags=re.IGNORECASE)
+    if re.fullmatch(r"end\s+section", body, flags=re.IGNORECASE):
+        # Fortran has no END SECTION (each SECTION directive starts the next
+        # one; END SECTIONS closes the construct): keep it as a comment.
+        return [f"! omp {body}"]
     lines = []
     prefix = "!$omp "
     while len(prefix) + len(body) > width:
@@ -8318,6 +8322,29 @@ def source_toplevel_layout(src_text):
     return out
 
 
+# For the source being translated: {comment-only line: column}, the set of
+# lines holding code, and the number of lines.
+_SOURCE_LINE_INFO = None
+
+
+def source_line_info(src_text):
+    comment_cols = {}
+    code_lines = set()
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src_text).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    skip = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+            tokenize.ENDMARKER}
+    for tok in toks:
+        if tok.type == tokenize.COMMENT:
+            comment_cols.setdefault(tok.start[0], tok.start[1])
+        elif tok.type not in skip:
+            code_lines.update(range(tok.start[0], tok.end[0] + 1))
+    comment_cols = {ln: col for ln, col in comment_cols.items() if ln not in code_lines}
+    return comment_cols, code_lines, src_text.count("\n") + 1
+
+
 # Leading comments already written, keyed by the def's line and text:
 # specialized copies of a function (k_int_s, k_real_s) share them.
 _LEADING_COMMENTS_EMITTED = set()
@@ -8416,6 +8443,22 @@ def _comment_map_from_source_layout(layout, comment_map, def_nodes):
     present = {getattr(n, "lineno", None) for n in def_nodes
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     inlined = set()
+    # A def's last statement ends its AST node, but comment lines after it
+    # that are indented deeper than the def (`# $ omp end parallel` closing
+    # a region at the end of the body) still belong to it.
+    if _SOURCE_LINE_INFO:
+        comment_cols, code_lines, nlines = _SOURCE_LINE_INFO
+        for it in layout:
+            if it["def_line"] is None:
+                continue
+            def_col = 0  # the layout holds top-level statements only
+            ln = it["end"] + 1
+            while ln <= nlines and ln not in code_lines:
+                if ln in comment_cols:
+                    if comment_cols[ln] <= def_col:
+                        break
+                    it["end"] = ln
+                ln += 1
     for k, it in enumerate(layout):
         if it["def_line"] is None:
             continue
@@ -9174,6 +9217,15 @@ def rename_conflicting_identifiers(src_text):
         _scope_declared = scope_decls.get(scope_of_line[_ln_idx], set())
         if re.match(r"^\s*use\b", ln, flags=re.IGNORECASE):
             out_lines.append(ln)
+            continue
+        m_omp = re.match(r"^(\s*!\$omp&?\s*)(.*)$", ln, flags=re.IGNORECASE)
+        if m_omp:
+            # An OpenMP directive names variables in its clause lists
+            # (`shared(A, x, out)`); rename them with the code. Directive
+            # and clause keywords (do, if, ...) are outside the parentheses.
+            def _omp_lists(m):
+                return "(" + name_tok_re.sub(lambda t: rename_map.get(t.group(1), t.group(1)), m.group(1)) + ")"
+            out_lines.append(m_omp.group(1) + re.sub(r"\(([^()]*)\)", _omp_lists, m_omp.group(2)))
             continue
         code, bang, comment = ln.partition("!")
 
@@ -25328,11 +25380,27 @@ def normalize_compile_only_price_table_stub(exec_body, local_funcs):
     local_funcs[:] = [main_fn]
 
 class emit:
+    # Lines that close a block or branch: comments indented inside the block
+    # after its last statement are written before them (see
+    # translator._flush_block_end_comments).
+    _CLOSE_RE = re.compile(
+        r"^\s*(?:end\s*(?:do|if|select|block|where|associate|forall|critical)\b|else\b|case\b)",
+        re.IGNORECASE,
+    )
+
     def __init__(self):
         self.lines = []
         self.ind = 0
+        self._close_hook = None
+        self._in_close_hook = False
 
     def w(self, s=""):
+        if self._close_hook is not None and not self._in_close_hook and self._CLOSE_RE.match(s):
+            self._in_close_hook = True
+            try:
+                self._close_hook()
+            finally:
+                self._in_close_hook = False
         self.lines.append(" " * self.ind + s)
 
     def push(self):
@@ -27085,11 +27153,74 @@ class translator(ast.NodeVisitor):
         self.alloc_logs.discard(name)
         self.alloc_log_rank.pop(name, None)
 
+    _BLOCK_STMTS = (ast.For, ast.AsyncFor, ast.While, ast.If, ast.With, ast.AsyncWith, ast.Try)
+
+    def visit(self, node):
+        # Track the compound statement being translated and its latest
+        # direct child, for comments at the end of a block.
+        stack = self.__dict__.setdefault("_block_stack", [])
+        if isinstance(node, ast.stmt):
+            if stack:
+                stack[-1][1] = node
+            self.o._close_hook = self._flush_block_end_comments
+        if isinstance(node, self._BLOCK_STMTS):
+            stack.append([node, None])
+            try:
+                return super().visit(node)
+            finally:
+                stack.pop()
+        return super().visit(node)
+
+    def _flush_block_end_comments(self):
+        """Before a line closing a block (`end do`, `else`, `end if`, ...):
+        write the comments after the block's last statement that Python's
+        indentation puts inside the block (`# $ omp end parallel` at the end
+        of an `else:` body). Otherwise they were written before the next
+        statement, after the block's end."""
+        stack = self.__dict__.get("_block_stack")
+        if stack:
+            self._flush_comments_after(stack[-1][1])
+
+    def _flush_comments_after(self, last):
+        """Write the comment-only lines after statement `last` indented at
+        least as far as it, up to the next code line."""
+        if last is None or not _SOURCE_LINE_INFO or not self.comment_map:
+            return
+        end_ln = getattr(last, "end_lineno", None)
+        col = getattr(last, "col_offset", None)
+        if end_ln is None or col is None:
+            return
+        comment_cols, code_lines, nlines = _SOURCE_LINE_INFO
+        ln = end_ln + 1
+        while ln <= nlines and ln not in code_lines:
+            if ln in comment_cols:
+                if comment_cols[ln] < col:
+                    break
+                if ln > self._last_comment_line and ln in self.comment_map:
+                    for c in self.comment_map[ln]:
+                        for line in fortran_comment_lines(self._map_omp_names(c)):
+                            self.o.w(line)
+                    self._last_comment_line = ln
+            ln += 1
+
+    def _map_omp_names(self, text):
+        """In an OpenMP directive comment, spell the variables in clause
+        lists as the Fortran code does (`shared(A, x, out)` with `out`
+        renamed `out_`)."""
+        if not _OMP_DIRECTIVE_RE.match(text.strip()):
+            return text
+
+        def _sub(m):
+            inner = re.sub(r"\b[A-Za-z_]\w*\b", lambda t: self._aliased_name(t.group(0)), m.group(1))
+            return f"({inner})"
+
+        return re.sub(r"\(([^()]*)\)", _sub, text)
+
     def _emit_trailing_comments(self):
         """Comments after the last statement, which no statement emits."""
         for ln in sorted(ln for ln in self.comment_map if ln > self._last_comment_line):
             for c in self.comment_map[ln]:
-                for line in fortran_comment_lines(c):
+                for line in fortran_comment_lines(self._map_omp_names(c)):
                     self.o.w(line)
             self._last_comment_line = ln
 
@@ -27099,7 +27230,7 @@ class translator(ast.NodeVisitor):
             return
         for i in range(self._last_comment_line + 1, ln + 1):
             for c in self.comment_map.get(i, []):
-                for line in fortran_comment_lines(c):
+                for line in fortran_comment_lines(self._map_omp_names(c)):
                     self.o.w(line)
         if ln > self._last_comment_line:
             self._last_comment_line = ln
@@ -68449,6 +68580,11 @@ def _emit_local_function(
                 o.w("return")
             continue
         tr.visit(s)
+    # Comments after the body's last statement, still indented inside the
+    # function (`# $ omp end parallel` closing a region at its end).
+    _body_stmts = [s for s in fn.body if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if _body_stmts:
+        tr._flush_comments_after(_body_stmts[-1])
     for arg, alias in optional_none_copyback:
         o.w(f"if (present({arg})) {arg} = {alias}")
     tr.close_type_rebind_blocks()
@@ -78454,8 +78590,9 @@ def transpile_file(
     else:
         src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
     stem = Path(py_path).stem
-    global _SOURCE_TOPLEVEL_LAYOUT
+    global _SOURCE_TOPLEVEL_LAYOUT, _SOURCE_LINE_INFO
     _SOURCE_TOPLEVEL_LAYOUT = source_toplevel_layout(src)
+    _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
     if module_only:
@@ -79260,8 +79397,9 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     """
     src_path = Path(py_path)
     src = src_override if src_override is not None else src_path.read_text(encoding="utf-8-sig")
-    global _SOURCE_TOPLEVEL_LAYOUT
+    global _SOURCE_TOPLEVEL_LAYOUT, _SOURCE_LINE_INFO
     _SOURCE_TOPLEVEL_LAYOUT = source_toplevel_layout(src)
+    _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)

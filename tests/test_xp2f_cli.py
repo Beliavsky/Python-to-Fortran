@@ -24605,6 +24605,8 @@ def test_xp2f_source_comments_are_all_carried_over_once(tmp_path: Path) -> None:
      ["!$omp shared(aaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbb, &", "!$omp& cccccccccccccccccccccc, dddddddd)"]),
     ("$ omphalos is not a directive", ["! $ omphalos is not a directive"]),
     ("plain comment", ["! plain comment"]),
+    ("$ omp end section", ["! omp end section"]),
+    ("$ omp end sections", ["!$omp end sections"]),
 ])
 def test_xp2f_openmp_directive_comments(comment: str, expected: list) -> None:
     # pyccel-style `#$ omp ...` comments (formatters insert `# $ omp`) become
@@ -24646,3 +24648,85 @@ def test_xp2f_openmp_directive_passthrough_builds(tmp_path: Path, openmp: bool) 
     out = (tmp_path / "xomp_pi_p.f90").read_text(encoding="utf-8")
     assert "!$omp parallel do private(x) reduction(+:s)" in out, out
     assert not re.search(r"(?im)^\s*pure\s+[^\n]*function\s+(integrate|estimate)\b", out), out
+
+
+def test_xp2f_openmp_directives_inside_blocks_and_renamed_names(tmp_path: Path) -> None:
+    # Adapted from pyccel's tests/epyccel/modules/openmp.py (MIT license).
+    # `# $ omp end parallel` at the end of an `else:` body was written
+    # after `end if`; `shared(A, x, out)` kept `out`, which the code
+    # renames `out_`; `end section` is not a Fortran directive.
+    src = tmp_path / "xomp_blocks.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "",
+        "",
+        "def directive_in_else(x: int):",
+        "    func_result = 0",
+        "    if x < 30:",
+        "        return x",
+        "    else:",
+        "        # $ omp parallel",
+        "        # $ omp for reduction(+:func_result)",
+        "        for i in range(x):",
+        "            func_result = func_result + i",
+        "        # $ omp end parallel",
+        "    return func_result",
+        "",
+        "",
+        'def omp_matmul(A: "float[:,:]", x: "float[:,:]", out: "float[:,:]"):',
+        "    # $ omp parallel shared(A,x,out) private(i,j,k)",
+        "    # $ omp for",
+        "    for i in range(len(A)):",
+        "        for j in range(len(x[0])):",
+        "            for k in range(len(x)):",
+        "                out[i][j] += A[i][k] * x[k][j]",
+        "    # $ omp end parallel",
+        "",
+        "",
+        "def omp_sections():",
+        "    n = 8",
+        "    sum1 = 0",
+        "    sum2 = 0",
+        "    # $ omp parallel num_threads(2)",
+        "    # $ omp sections",
+        "    # $ omp section",
+        "    for i in range(0, n // 2):",
+        "        sum1 = sum1 + i",
+        "    # $ omp end section",
+        "    # $ omp section",
+        "    for i in range(n // 2, n):",
+        "        sum2 = sum2 + i",
+        "    # $ omp end section",
+        "    # $ omp end sections",
+        "    # $ omp end parallel",
+        "    return sum1 + sum2",
+        "",
+        "",
+        "def total(v: 'int[:]'):",
+        "    s = 0",
+        "    # $ omp parallel for reduction(+:s)",
+        "    for i in range(v.shape[0]):",
+        "        s += v[i]",
+        "    return s",
+        "",
+        "",
+        "a = np.ones((3, 2))",
+        "a[1, 0] = 2.0",
+        "xm = np.ones((2, 3))",
+        "y = np.zeros((3, 3))",
+        "omp_matmul(a, xm, y)",
+        "print(directive_in_else(10), directive_in_else(100), y.sum(), y[1, 0])",
+        "print(omp_sections(), total(np.arange(1, 101)))",
+        "",
+    ]), encoding="utf-8")
+    for compiler in ("gfortran -O0 -g -fcheck=all", "gfortran -O2 -fopenmp"):
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff",
+                               "--compiler", compiler], cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xomp_blocks_p.f90").read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in out.splitlines()]
+    i_end = lines.index("!$omp end parallel")
+    assert lines[i_end + 1] == "end if", out
+    assert "!$omp parallel shared(A,x,out_) private(i,j,k)" in lines, out
+    assert "!$omp end section" not in lines and "!$omp end sections" in lines, out
