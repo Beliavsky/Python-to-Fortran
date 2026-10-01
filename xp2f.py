@@ -7574,6 +7574,7 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     """
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
+    tree = rewrite_numba(tree)
     numpy_names = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "numpy":
@@ -11742,9 +11743,10 @@ def propagate_call_arg_intent_to_caller_dummy(lines):
       callee defined in this file, its dummy at that position resolvable,
       its intent written explicitly (an unresolved callee, e.g. a
       python_mod helper, is left alone, matching _callee_dummy_intent_is_in);
-    - only a bare-name actual argument counts (`foo(x)` or `foo(x(:))`),
-      never `x` inside a larger expression or a single element `x(i)` --
-      Fortran can't bind those to an out/inout dummy anyway;
+    - only an actual argument that is the dummy itself or an element or
+      section of it counts (`foo(x)`, `foo(x(:))`, `foo(x(i + 1, :))`, as
+      for `fill(a[i], v)` in Python), never `x` inside a larger expression,
+      which Fortran can't bind to an out/inout dummy anyway;
     - only a dummy whose declaration is a single-entity `intent(in)` line
       (always true here: split_declarations_to_single_names runs first).
     """
@@ -11852,7 +11854,13 @@ def propagate_call_arg_intent_to_caller_dummy(lines):
                         if ci < 0:
                             continue
                         for ai, a in enumerate(_split_top_level_commas_simple(stmt[oi + 1 : ci])):
-                            ma = bare_arg_re.match(a.strip())
+                            a_s = a.strip()
+                            ma = bare_arg_re.match(a_s)
+                            if ma is None:
+                                # An element or section: name(...) and nothing after.
+                                ms = re.match(r"^([A-Za-z_]\w*)\s*\(", a_s)
+                                if ms and _find_matching_rparen_simple(a_s, ms.end() - 1) == len(a_s) - 1:
+                                    ma = ms
                             if ma and ma.group(1).lower() == d.lower() and _callee_slot_is_out_or_inout(callee, ai):
                                 promote = True
                                 break
@@ -18453,6 +18461,451 @@ def rewrite_pyccel_openmp_imports(tree):
             return node
 
     tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+# numba names rewrite_numba accepts: the jit decorators, prange, and the
+# type names used in signatures such as @njit(float64(int64)). The
+# signatures are not used (xp2f infers the types).
+_NUMBA_JIT_DECORATORS = {"jit", "njit"}
+_NUMBA_JIT_OPTIONS = {"nopython", "nogil", "cache", "fastmath", "parallel", "boundscheck", "error_model", "inline"}
+_NUMBA_TYPE_NAMES = {
+    "void", "boolean", "b1", "intp", "uintp", "double", "float_",
+    "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+    "float32", "float64", "complex64", "complex128",
+    "i1", "i2", "i4", "i8", "u1", "u2", "u4", "u8", "f4", "f8", "c8", "c16",
+    "bool_", "int_",
+}
+_NUMBA_SUPPORTED_NAMES = _NUMBA_JIT_DECORATORS | {"prange", "vectorize"} | _NUMBA_TYPE_NAMES
+_NUMBA_VECTORIZE_OPTIONS = {"target", "cache", "nopython", "identity", "fastmath"}
+# numba type names in signatures -> xp2f (pyccel-style) annotation base
+# types. Types xp2f has no annotation for (float32, unsigned) are left out:
+# a signature using one is ignored and the types are inferred as usual.
+_NUMBA_SIG_BASE = {
+    **dict.fromkeys(("float64", "double", "f8", "float_"), "float"),
+    **dict.fromkeys(("int64", "int32", "int16", "int8", "intp", "int_", "i8", "i4", "i2", "i1"), "int"),
+    **dict.fromkeys(("boolean", "b1", "bool_"), "bool"),
+    **dict.fromkeys(("complex128", "c16"), "complex"),
+}
+
+
+def _numba_signature_annotations(sig, type_name):
+    """(argument annotations, return annotation or None) for a numba
+    signature such as `float64(int64, float64[:])` (an AST Call, from the
+    object form or a parsed string), or None if any type is unsupported.
+    type_name(node) gives the numba type name of a Name/Attribute node."""
+    def ann(node):
+        rank = 0
+        if isinstance(node, ast.Subscript):
+            sl = node.slice
+            dims = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+            if not all(isinstance(d, ast.Slice) for d in dims):
+                return None
+            rank, node = len(dims), node.value
+        base = _NUMBA_SIG_BASE.get(type_name(node) or "")
+        if base is None:
+            return None
+        return base + ("[" + ",".join(":" * 1 for _ in range(rank)) + "]" if rank else "")
+
+    if not isinstance(sig, ast.Call) or sig.keywords:
+        return None
+    args = [ann(a) for a in sig.args]
+    if any(a is None for a in args):
+        return None
+    if type_name(sig.func) == "void":
+        return args, None
+    ret = ann(sig.func)
+    if ret is None:
+        return None
+    return args, ret
+
+
+_NUMBA_WARNED = set()
+# Names of the numba @vectorize functions of the file being translated
+# (set by rewrite_numba): a call's rank is its arguments' largest rank.
+NUMBA_VECTORIZE_FUNCS = set()
+
+
+def numba_warning(line, msg):
+    if (line, msg) not in _NUMBA_WARNED:
+        _NUMBA_WARNED.add((line, msg))
+        print(f"line {line}: Warning: {msg}", file=sys.stderr)
+
+
+def _ast_names(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _prange_reduction(stmt):
+    """(name, op) when stmt is a reduction update numba recognizes in a
+    prange loop: x += e, x -= e, x *= e, x = x + e, x = x * e, x = min(x, e),
+    x = max(x, e), with x not otherwise in e. op is the OpenMP operator."""
+    if isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+        op = {ast.Add: "+", ast.Sub: "+", ast.Mult: "*"}.get(type(stmt.op))
+        if op is not None and stmt.target.id not in _ast_names(stmt.value):
+            return stmt.target.id, op
+        return None
+    if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)):
+        return None
+    x, v = stmt.targets[0].id, stmt.value
+
+    def is_x(e):
+        return isinstance(e, ast.Name) and e.id == x
+
+    if isinstance(v, ast.BinOp) and isinstance(v.op, (ast.Add, ast.Sub, ast.Mult)):
+        op = "*" if isinstance(v.op, ast.Mult) else "+"
+        if is_x(v.left) and x not in _ast_names(v.right):
+            return x, op
+        if not isinstance(v.op, ast.Sub) and is_x(v.right) and x not in _ast_names(v.left):
+            return x, op
+    if (
+        isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id in {"min", "max"}
+        and len(v.args) == 2 and not v.keywords
+    ):
+        a, b = v.args
+        if (is_x(a) and x not in _ast_names(b)) or (is_x(b) and x not in _ast_names(a)):
+            return x, v.func.id
+    return None
+
+
+def _stored_names(stmts):
+    """Names bound by assignment statements and for targets in stmts
+    (not comprehension variables)."""
+    out = set()
+    for s in stmts:
+        for n in ast.walk(s):
+            if isinstance(n, ast.Assign):
+                targets = n.targets
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign, ast.For)):
+                targets = [n.target]
+            else:
+                continue
+            for tg in targets:
+                for e in ast.walk(tg):
+                    if isinstance(e, ast.Name) and isinstance(e.ctx, ast.Store):
+                        out.add(e.id)
+    return out
+
+
+def _first_ref_in_iteration(stmts, name):
+    """How one iteration of stmts (a prange body) first meets `name`:
+    "none" (no reference), "def" (always assigned before any read), "local"
+    (each read follows an assignment in the same iteration, but some paths
+    leave it unassigned), or None (a read may see another iteration's value,
+    so a private copy would differ from the serial result)."""
+    for i, s in enumerate(stmts):
+        if name not in _ast_names(s):
+            continue
+        later = any(name in _ast_names(u) for u in stmts[i + 1:])
+        if isinstance(s, (ast.Assign, ast.AnnAssign)):
+            targets = s.targets if isinstance(s, ast.Assign) else [s.target]
+            if s.value is not None and name in _ast_names(s.value):
+                return None
+            for tg in targets:
+                if name in _ast_names(tg) and not (
+                    isinstance(tg, ast.Name)
+                    or (isinstance(tg, (ast.Tuple, ast.List)) and all(isinstance(e, ast.Name) for e in tg.elts))
+                ):
+                    return None
+            return "def"
+        if isinstance(s, (ast.For, ast.While)):
+            head = s.iter if isinstance(s, ast.For) else s.test
+            if name in _ast_names(head) or s.orelse or later:
+                # A loop may run zero times, so a later read could see a
+                # stale value.
+                return None
+            if isinstance(s, ast.For) and isinstance(s.target, ast.Name) and s.target.id == name:
+                return "local"
+            return "local" if _first_ref_in_iteration(s.body, name) is not None else None
+        if isinstance(s, ast.If):
+            if name in _ast_names(s.test):
+                return None
+            rb = _first_ref_in_iteration(s.body, name)
+            ro = _first_ref_in_iteration(s.orelse, name)
+            if rb is None or ro is None:
+                return None
+            if rb == "def" and ro == "def":
+                return "def"
+            return None if later else "local"
+        return None
+    return "none"
+
+
+def _prange_escape(stmts, in_inner_loop=False):
+    """Why stmts (a prange body) can't be a parallel loop body, or None."""
+    for s in stmts:
+        if isinstance(s, (ast.Return, ast.Global, ast.Nonlocal)):
+            return type(s).__name__.lower()
+        if isinstance(s, ast.Break) and not in_inner_loop:
+            return "break"
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return "a nested definition"
+        inner = in_inner_loop or isinstance(s, (ast.For, ast.While))
+        subs = [getattr(s, f, None) or [] for f in ("body", "orelse", "finalbody")]
+        subs += [h.body for h in getattr(s, "handlers", None) or []]
+        for sub in subs:
+            if sub and isinstance(sub[0], ast.stmt):
+                r = _prange_escape(sub, inner)
+                if r:
+                    return r
+    return None
+
+
+def _numba_prange_plan(fn, loop):
+    """OpenMP clauses for a prange loop in a parallel=True function, as
+    numba runs it: reductions inferred from the updates numba recognizes,
+    variables assigned in the body private (lastprivate when also used
+    outside the loop). Returns (plan, None), or (None, reason) when the
+    loop must run serially."""
+    if loop.orelse:
+        return None, "for-else"
+    if not isinstance(loop.target, ast.Name):
+        return None, "the loop target is not a name"
+    r = _prange_escape(loop.body)
+    if r:
+        return None, f"{r} inside the loop"
+    body_mod = ast.Module(body=loop.body, type_ignores=[])
+    for n in ast.walk(body_mod):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in {"print", "input", "open"}:
+            return None, f"{n.func.id}() inside the loop"
+        if isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await)):
+            return None, "yield inside the loop"
+    loop_var = loop.target.id
+    if loop_var in _stored_names(loop.body):
+        return None, f"the loop variable '{loop_var}' is assigned in the loop"
+    body_stmts = [n for n in ast.walk(body_mod) if isinstance(n, ast.stmt)]
+    red_ops, red_stmts = {}, {}
+    for s in body_stmts:
+        rr = _prange_reduction(s)
+        if rr is not None:
+            red_ops.setdefault(rr[0], set()).add(rr[1])
+            red_stmts.setdefault(rr[0], []).append(s)
+    reductions = {}
+    for name, ops in red_ops.items():
+        # Every reference must be in one of its reduction updates.
+        uses = sum(1 for n in ast.walk(body_mod) if isinstance(n, ast.Name) and n.id == name)
+        in_updates = sum(
+            1 for s in red_stmts[name] for n in ast.walk(s) if isinstance(n, ast.Name) and n.id == name
+        )
+        if uses != in_updates:
+            continue
+        if len(ops) > 1:
+            return None, f"'{name}' is updated with different reduction operators"
+        reductions[name] = next(iter(ops))
+    stores = _stored_names(loop.body) - set(reductions)
+    first = {name: _first_ref_in_iteration(loop.body, name) for name in stores}
+    for name in sorted(stores):
+        if first[name] is None:
+            return None, f"'{name}' carries a value from one iteration to the next"
+    inside = {id(n) for n in ast.walk(loop)}
+    outside_names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and id(n) not in inside}
+    lastprivate = sorted(stores & outside_names)
+    for name in lastprivate:
+        if first[name] != "def":
+            return None, f"'{name}' is used outside the loop but not assigned in every iteration"
+    plan = {
+        "loop_var": loop_var,
+        "reductions": sorted(reductions.items()),
+        "private": sorted(stores - set(lastprivate)),
+        "lastprivate": lastprivate,
+        "python_names": _ast_names(fn),
+        "line": loop.lineno,
+    }
+    return plan, None
+
+
+def rewrite_numba(tree):
+    """Accept numba-compiled code by removing numba: drop `import numba` /
+    `from numba import njit, prange, float64, ...`, drop @jit/@njit
+    decorators (with or without options and signatures), and translate
+    prange as range. Any other use of numba is rejected."""
+    names = {}  # local name -> numba name, from `from numba import ...`
+    modules = set()  # local names of the numba module
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "numba":
+            if node.module != "numba":
+                raise NotImplementedError(f"unsupported numba module: {node.module}")
+            for a in node.names:
+                if a.name not in _NUMBA_SUPPORTED_NAMES:
+                    raise NotImplementedError(
+                        f"unsupported numba feature: {a.name} "
+                        f"(supported: jit, njit, prange, vectorize and type names in signatures)"
+                    )
+                names[a.asname or a.name] = a.name
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "numba":
+                    modules.add(a.asname or "numba")
+                elif a.name.split(".")[0] == "numba":
+                    raise NotImplementedError(f"unsupported numba module: {a.name}")
+    if not names and not modules:
+        return tree
+    NUMBA_VECTORIZE_FUNCS.clear()
+
+    def numba_name(node):
+        """The numba name `node` refers to (njit for `njit`, `nb.njit`, ...), else None."""
+        if isinstance(node, ast.Name) and node.id in names:
+            return names[node.id]
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in modules:
+            return node.attr
+        return None
+
+    def is_jit_decorator(dec):
+        if numba_name(dec) in _NUMBA_JIT_DECORATORS:
+            return True
+        if isinstance(dec, ast.Call) and numba_name(dec.func) in _NUMBA_JIT_DECORATORS:
+            for kw in dec.keywords:
+                if kw.arg not in _NUMBA_JIT_OPTIONS:
+                    raise NotImplementedError(
+                        f"unsupported numba jit option {kw.arg}="
+                    )
+                if kw.arg == "nopython" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                    raise NotImplementedError("numba object mode (nopython=False)")
+            return True
+        return False
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            if node.module == "numba":
+                return ast.copy_location(ast.Pass(), node)
+            return node
+
+        def visit_Import(self, node):
+            kept = [a for a in node.names if a.name != "numba"]
+            if len(kept) == len(node.names):
+                return node
+            if not kept:
+                return ast.copy_location(ast.Pass(), node)
+            node.names = kept
+            return node
+
+        def _visit_def(self, node):
+            parallel = any(
+                isinstance(d, ast.Call) and numba_name(d.func) in _NUMBA_JIT_DECORATORS
+                and any(kw.arg == "parallel" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                        for kw in d.keywords)
+                for d in node.decorator_list
+            )
+            for d in node.decorator_list:
+                if is_jit_decorator(d) and isinstance(d, ast.Call) and d.args:
+                    self._apply_signature(node, d.args[0])
+            vec = [d for d in node.decorator_list if numba_name(d.func if isinstance(d, ast.Call) else d) == "vectorize"]
+            for d in vec:
+                self._apply_vectorize(node, d)
+            node.decorator_list = [d for d in node.decorator_list if not is_jit_decorator(d) and d not in vec]
+            if parallel:
+                self._plan_pranges(node, node.body)
+            self.generic_visit(node)
+            return node
+
+        def _apply_vectorize(self, fn, dec):
+            # @vectorize(["float64(float64, float64)"]) -> an ELEMENTAL
+            # function of the signature's scalar types (see the elemental
+            # targets in the translation driver). The annotations are not
+            # call contracts: an elemental function takes arrays too.
+            where = f"numba @vectorize of '{fn.name}'"
+            if not isinstance(dec, ast.Call) or not dec.args:
+                raise NotImplementedError(
+                    f"{where} without a signature: give one, e.g. @vectorize(['float64(float64)'])"
+                )
+            for kw in dec.keywords:
+                if kw.arg not in _NUMBA_VECTORIZE_OPTIONS:
+                    raise NotImplementedError(f"{where}: unsupported option {kw.arg}=")
+            sig = dec.args[0]
+            if isinstance(sig, (ast.List, ast.Tuple)) and len(sig.elts) != 1:
+                raise NotImplementedError(f"{where} with {len(sig.elts)} signatures: only one is supported")
+            for a in fn.args.args:
+                a.annotation = None
+            fn.returns = None
+            self._apply_signature(fn, sig)
+            anns = [annotation_type_spec(a.annotation) for a in fn.args.args]
+            ret = annotation_type_spec(fn.returns)
+            if ret is None or any(s is None for s in anns) or ret[1] != 0 or any(s[1] != 0 for s in anns):
+                raise NotImplementedError(f"{where}: the signature must give scalar types xp2f supports")
+            for a in fn.args.args:
+                a._xp2f_generated_annotation = True
+            fn._xp2f_numba_vectorize = True
+            NUMBA_VECTORIZE_FUNCS.add(fn.name)
+
+        def _apply_signature(self, fn, sig):
+            # @njit("float64(int64, float64[:])") / @njit(float64(int64, ...)) /
+            # @njit([float64(float64)]): give unannotated parameters (and the
+            # result) the signature's types. Several signatures (an
+            # overloaded function) are not used.
+            if isinstance(sig, (ast.List, ast.Tuple)):
+                if len(sig.elts) != 1:
+                    return
+                sig = sig.elts[0]
+            from_string = isinstance(sig, ast.Constant) and isinstance(sig.value, str)
+            if from_string:
+                try:
+                    sig = ast.parse(sig.value.strip(), mode="eval").body
+                except SyntaxError:
+                    return
+
+            def type_name(n):
+                if from_string:
+                    if isinstance(n, ast.Name):
+                        return n.id
+                    if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+                        return n.attr  # "numba.float64(...)" in a string
+                    return None
+                return numba_name(n)
+
+            parsed = _numba_signature_annotations(sig, type_name)
+            params = fn.args.args
+            if parsed is None or fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs:
+                return
+            arg_anns, ret_ann = parsed
+            if len(arg_anns) != len(params):
+                return
+            for a, text in zip(params, arg_anns):
+                if a.annotation is None:
+                    a.annotation = ast.copy_location(ast.Constant(value=text), a)
+            if ret_ann is not None and fn.returns is None:
+                fn.returns = ast.copy_location(ast.Constant(value=ret_ann), fn)
+
+        def _plan_pranges(self, fn, stmts):
+            # The outermost prange loops of a parallel=True function become
+            # OpenMP loops (translator._place_numba_prange_directive);
+            # numba runs a prange nested in another one serially.
+            for s in stmts:
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if (
+                    isinstance(s, ast.For) and isinstance(s.iter, ast.Call)
+                    and numba_name(s.iter.func) == "prange"
+                ):
+                    plan, reason = _numba_prange_plan(fn, s)
+                    if plan is not None:
+                        s._numba_prange = plan
+                    else:
+                        numba_warning(s.lineno, f"prange loop translated as a serial loop: {reason}")
+                    continue
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(s, field, None)
+                    if isinstance(sub, list):
+                        self._plan_pranges(fn, sub)
+                for h in getattr(s, "handlers", None) or []:
+                    self._plan_pranges(fn, h.body)
+
+        visit_FunctionDef = _visit_def
+        visit_AsyncFunctionDef = _visit_def
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if numba_name(node.func) == "prange":
+                node.func = ast.copy_location(ast.Name(id="range", ctx=ast.Load()), node.func)
+            return node
+
+    tree = _Rewriter().visit(tree)
+    for node in ast.walk(tree):
+        name = numba_name(node)
+        if name is not None or (isinstance(node, ast.Name) and node.id in modules):
+            raise NotImplementedError(
+                f"unsupported use of numba{'.' + name if name else ''}"
+            )
     ast.fix_missing_locations(tree)
     return tree
 
@@ -29007,6 +29460,9 @@ class translator(ast.NodeVisitor):
                             dtype_txt = kw.value.attr.lower()
                 if "float" in dtype_txt:
                     return "real"
+                if not dtype_txt and any(self._expr_kind(a) == "real" for a in node.args[:3]):
+                    # np.arange(5.0), np.arange(0, 1, 0.25) are float64.
+                    return "real"
                 return "int"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -33438,7 +33894,10 @@ class translator(ast.NodeVisitor):
                     if len(node.args) == 1:
                         return 1
                     return 0
-                if node.func.id in self.local_elemental_funcs and len(node.args) >= 1:
+                if (
+                    (node.func.id in self.local_elemental_funcs or node.func.id in NUMBA_VECTORIZE_FUNCS)
+                    and len(node.args) >= 1
+                ):
                     return max(self._rank_expr(a) for a in node.args)
                 if node.func.id == "reshape" and len(node.args) >= 2 and isinstance(node.args[1], ast.List):
                     return max(1, len(node.args[1].elts))
@@ -41142,6 +41601,19 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "arange"
                 and len(node.args) >= 1
             ):
+                if (
+                    not any(kw.arg == "dtype" for kw in node.keywords)
+                    and any(self._expr_kind(a) == "real" for a in node.args[:3])
+                ):
+                    # Float arange: start + step*k for k = 0, ..., n-1 with
+                    # numpy's length n = ceil((stop - start)/step).
+                    parts = [f"real({self.expr(a)}, kind=dp)" for a in node.args[:3]]
+                    if len(parts) == 1:
+                        return f"real(arange_int(0, max(0, ceiling({parts[0]})), 1), kind=dp)"
+                    start, stop = parts[0], parts[1]
+                    step = parts[2] if len(parts) == 3 else "1.0_dp"
+                    n = f"max(0, ceiling(({stop} - {start}) / {step}))"
+                    return f"({start} + {step}*real(arange_int(0, {n}, 1), kind=dp))"
                 if len(node.args) == 1:
                     start_expr = "0"
                     stop_expr = self._coerce_expr_kind(node.args[0], self.expr(node.args[0]), "int")
@@ -41695,7 +42167,8 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
-                return f"pack(arange_int(int(0), int(size({a0})), int(1)), ({a0} /= 0))"
+                mask = a0 if self._expr_kind(node.args[0]) == "logical" else f"({a0} /= 0)"
+                return f"pack(arange_int(int(0), int(size({a0})), int(1)), {mask})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -41741,7 +42214,8 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
-                return f"reshape(pack(arange_int(int(0), int(size({a0})), int(1)), ({a0} /= 0)), [count(({a0} /= 0)), 1])"
+                mask = a0 if self._expr_kind(node.args[0]) == "logical" else f"({a0} /= 0)"
+                return f"reshape(pack(arange_int(int(0), int(size({a0})), int(1)), {mask}), [count({mask}), 1])"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -57153,6 +57627,110 @@ class translator(ast.NodeVisitor):
         return f"int({txt})"
 
     def visit_For(self, node):
+        plan = getattr(node, "_numba_prange", None)
+        if plan is None or self.__dict__.get("_in_numba_prange"):
+            return self._visit_For_impl(node)
+        start = len(self.o.lines)
+        self._in_numba_prange = True
+        try:
+            result = self._visit_For_impl(node)
+        finally:
+            self._in_numba_prange = False
+        self._place_numba_prange_directive(plan, start)
+        return result
+
+    _PRANGE_SERIAL_RE = re.compile(r"^\s*(?:call|print|write|read|stop|error\s+stop|return|open|close|goto)\b", re.I)
+    _PRANGE_DO_RE = re.compile(r"^(\s*)do\s+([a-z_]\w*)\s*=", re.I)
+    _PRANGE_LHS_RE = re.compile(r"^\s*([a-z_]\w*)\s*(=(?!=)|%)", re.I)
+    _PRANGE_ALLOC_RE = re.compile(r"^\s*(?:allocate|deallocate)\s*\(\s*([a-z_]\w*)", re.I)
+
+    def _place_numba_prange_directive(self, plan, start):
+        """Put `!$omp parallel do` with plan's clauses before the counted DO
+        loop emitted for a numba prange loop (lines start: of the output),
+        adding xp2f's own temporaries assigned in the loop to the private
+        list. The loop stays serial, with a warning, when the Fortran loop
+        has I/O, a CALL, an EXIT from the loop, or a whole-variable
+        assignment to a variable shared with the rest of the procedure."""
+        line = plan["line"]
+        lines = self.o.lines
+        loop_var = plan["loop_var"]
+        i_do = None
+        for k in range(start, len(lines)):
+            m = self._PRANGE_DO_RE.match(lines[k])
+            if m and m.group(2).lower() == loop_var.lower():
+                i_do = k
+                break
+        if i_do is None:
+            numba_warning(line, "prange loop translated without OpenMP: no counted DO loop was generated")
+            return
+        ind = self._PRANGE_DO_RE.match(lines[i_do]).group(1)
+        i_end = None
+        for k in range(i_do + 1, len(lines)):
+            if re.match(rf"^{ind}end\s*do\b", lines[k], re.I):
+                i_end = k
+                break
+        if i_end is None:
+            return
+        python_names = {n.lower() for n in plan["python_names"]}
+        reductions = {n.lower() for n, _ in plan["reductions"]}
+        listed = {n.lower() for n in plan["private"] + plan["lastprivate"]} | reductions
+        temps = []
+        do_depth = 0
+        reason = None
+        for k in range(i_do + 1, i_end):
+            s = lines[k].strip()
+            low = s.lower()
+            if not s or s.startswith("!") or s.startswith("&"):
+                continue
+            if self._PRANGE_SERIAL_RE.match(s):
+                reason = f"`{s.split('(')[0].split()[0]}` in the generated loop"
+                break
+            if re.match(r"^do\b", low):
+                do_depth += 1
+            elif re.match(r"^end\s*do\b", low):
+                do_depth -= 1
+            elif re.match(r"^exit\b", low) and do_depth == 0:
+                reason = "EXIT from the loop"
+                break
+            m = self._PRANGE_LHS_RE.match(s) or self._PRANGE_ALLOC_RE.match(s)
+            if m:
+                name = m.group(1).lower()
+                if name in listed or name == loop_var.lower():
+                    continue
+                if name in python_names:
+                    reason = f"'{name}' is assigned as a whole in the generated loop"
+                    break
+                if name not in temps:
+                    temps.append(name)
+        if reason is not None:
+            numba_warning(line, f"prange loop translated without OpenMP: {reason}")
+            return
+        for name, _ in plan["reductions"]:
+            if self._rank_expr(ast.Name(id=name, ctx=ast.Load())) > 0:
+                numba_warning(line, f"prange loop translated without OpenMP: array reduction '{name}'")
+                return
+        clauses = []
+        private = [n for n in plan["private"] if n.lower() != loop_var.lower()] + temps
+        if private:
+            clauses.append(f"private({', '.join(private)})")
+        if plan["lastprivate"]:
+            clauses.append(f"lastprivate({', '.join(plan['lastprivate'])})")
+        by_op = {}
+        for name, op in plan["reductions"]:
+            by_op.setdefault(op, []).append(name)
+        for op in sorted(by_op):
+            clauses.append(f"reduction({op}:{', '.join(by_op[op])})")
+        directive = [f"{ind}!$omp parallel do"]
+        for c in clauses:
+            if len(directive[-1]) + 1 + len(c) > 100:
+                directive[-1] += " &"
+                directive.append(f"{ind}!$omp& {c}")
+            else:
+                directive[-1] += " " + c
+        lines[i_end + 1:i_end + 1] = [f"{ind}!$omp end parallel do"]
+        lines[i_do:i_do] = directive
+
+    def _visit_For_impl(self, node):
         self._emit_comments_for(node)
         def _visit_loop_body_and_close_rebinds():
             depth0 = len(self.open_type_rebind_stack)
@@ -65818,6 +66396,11 @@ def _emit_local_function(
             break
     if is_elemental_fn and not tuple_return and not void_return:
         pure_prefix = "pure elemental " if is_pure_fn else "impure elemental "
+        if not is_pure_fn and getattr(fn, "_xp2f_numba_vectorize", False):
+            # A numba ufunc has no side effects; ELEMENTAL without IMPURE
+            # is pure (the Python-level check misses e.g. math.sqrt and
+            # dummies the body copies to locals before changing them).
+            pure_prefix = "elemental "
     else:
         pure_prefix = "pure " if is_pure_fn else ""
     _leads = getattr(fn, "_xp2f_leading_comments", None) or []
@@ -69208,7 +69791,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 _callee = _rhs.func.id
                 _ret_spec = scalar_or_array.get(_callee, tr_ctx.local_return_specs.get(_callee))
                 _ret_rank = int(scalar_or_array_ranks.get(_callee, tr_ctx.local_return_ranks.get(_callee, 1)))
-                if tr_ctx.local_overload_dispatch.get(_callee, {}).get("return_profiles"):
+                if (tr_ctx.local_overload_dispatch.get(_callee, {}).get("return_profiles")
+                        or _callee in NUMBA_VECTORIZE_FUNCS):
                     _ret_rank = int(tr_ctx._rank_expr(_rhs))
                     _kind = tr_ctx._expr_kind(_rhs)
                     _ret_spec = ({"int": "alloc_int", "real": "alloc_real",
@@ -69381,7 +69965,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             if isinstance(_rhs, ast.Call) and isinstance(_rhs.func, ast.Name):
                 _callee = _rhs.func.id
                 _spec = scalar_or_array.get(_callee)
-                if _spec is not None and not tr_ctx.local_overload_dispatch.get(_callee, {}).get("return_profiles"):
+                if (_spec is not None and not tr_ctx.local_overload_dispatch.get(_callee, {}).get("return_profiles")
+                        and _callee not in NUMBA_VECTORIZE_FUNCS):
                     _rank = int(scalar_or_array_ranks.get(_callee, 0))
                     if _rank > best_rank:
                         best_rank = _rank
@@ -70122,6 +70707,11 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         "char": "alloc_char"}[result_kind]
             if spec is None:
                 continue
+            if fn.name in NUMBA_VECTORIZE_FUNCS:
+                # ELEMENTAL: a scalar result for scalar dummies.
+                rr_spec = 0
+                if spec.startswith("alloc_"):
+                    spec = {"alloc_log": "logical"}.get(spec, spec[len("alloc_"):])
             if scalar_or_array.get(fn.name) != spec or int(scalar_or_array_ranks.get(fn.name, 0)) != int(rr_spec):
                 scalar_or_array[fn.name] = spec
                 scalar_or_array_ranks[fn.name] = int(rr_spec)
@@ -75897,6 +76487,15 @@ def generate_flat(
     # so the "scalar" specific duplicates the array one and gfortran
     # rejects the generic as ambiguous. Drop such duplicates.
     _local_fn_by_name = {fn.name: fn for fn in (local_funcs or [])}
+    # A numba @vectorize function is one ELEMENTAL procedure of scalar
+    # dummies, whatever ranks its callers pass: no rank-specific copies.
+    for fn in local_funcs or []:
+        if getattr(fn, "_xp2f_numba_vectorize", False):
+            local_overload_specs.pop(fn.name, None)
+            local_overload_dispatch.pop(fn.name, None)
+            joint_rank_managed.discard(fn.name)
+            if fn.name in local_func_arg_ranks:
+                local_func_arg_ranks[fn.name] = [0] * len(local_func_arg_ranks[fn.name])
     for _ov_name in list(local_overload_specs.keys()):
         _ov_fn = _local_fn_by_name.get(_ov_name)
         _ov_specs = local_overload_specs[_ov_name]
@@ -76102,6 +76701,16 @@ def generate_flat(
                 elemental_targets.discard(_nm)
     for gname in local_generic_overloads:
         elemental_targets.discard(gname)
+    # numba @vectorize functions (rewrite_numba) are ELEMENTAL, with a
+    # scalar result whatever ranks the callers pass.
+    for fn in local_funcs or []:
+        if getattr(fn, "_xp2f_numba_vectorize", False) and fn.name not in passed_as_actual:
+            elemental_targets.add(fn.name)
+            _rs = local_return_specs.get(fn.name)
+            if isinstance(_rs, str) and _rs.startswith("alloc_"):
+                local_return_specs[fn.name] = {"alloc_log": "logical"}.get(_rs, _rs[len("alloc_"):])
+            if local_return_ranks is not None and fn.name in local_return_ranks:
+                local_return_ranks[fn.name] = 0
 
     if module_only:
         for fn in local_funcs or []:
@@ -78155,6 +78764,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = ast.parse(src_text, filename=source_name)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
+    tree = rewrite_numba(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
@@ -78673,6 +79283,7 @@ def transpile_file(
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
+    tree = rewrite_numba(tree)
     if module_only:
         _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
     reject_undefined_names_in_functions(tree)
@@ -79481,6 +80092,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
+    tree = rewrite_numba(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)

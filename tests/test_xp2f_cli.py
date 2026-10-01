@@ -24786,3 +24786,480 @@ def test_xp2f_pyccel_openmp_unsupported_routine_is_rejected(tmp_path: Path) -> N
                           capture_output=True, text=True, check=False)
     assert proc.returncode != 0
     assert "unsupported OpenMP runtime routine omp_get_num_procs" in proc.stdout + proc.stderr
+
+
+def test_xp2f_numba_jit_code_matches_python(tmp_path: Path) -> None:
+    # numba's jit/njit decorators (bare, with options, with signatures, as
+    # numba.njit) are dropped and prange runs as range; --run-diff runs the
+    # Python side under numba itself.
+    pytest.importorskip("numba")
+    src = tmp_path / "xnb_mix.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "import numba",
+        "from numba import jit, njit, prange, float64, int64",
+        "",
+        "",
+        "@njit",
+        "def fib(n):",
+        "    if n < 2:",
+        "        return n",
+        "    return fib(n - 1) + fib(n - 2)",
+        "",
+        "",
+        "@jit(nopython=True, cache=True)",
+        "def total(a):",
+        "    s = 0.0",
+        "    for v in a:",
+        "        s += v",
+        "    return s",
+        "",
+        "",
+        "@njit(float64(int64, float64))",
+        "def power_sum(n, p):",
+        "    s = 0.0",
+        "    for i in range(1, n + 1):",
+        "        s += i ** p",
+        "    return s",
+        "",
+        "",
+        "@numba.njit(parallel=True, fastmath=True)",
+        "def scale(a, c):",
+        "    out = np.empty_like(a)",
+        "    for i in numba.prange(a.shape[0]):",
+        "        out[i] = c * a[i]",
+        "    return out",
+        "",
+        "",
+        "@njit(parallel=True)",
+        "def sum_sq(a):",
+        "    s = 0.0",
+        "    for i in prange(len(a)):",
+        "        s += a[i] * a[i]",
+        "    return s",
+        "",
+        "",
+        "x = np.linspace(0.0, 1.0, 11)",
+        "print(fib(15), total(x), power_sum(10, 2.0))",
+        "print(scale(x, 2.0))",
+        "print(round(sum_sq(x), 10))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xnb_mix_p.f90").read_text(encoding="utf-8")
+    assert "numba" not in out.lower() and "prange" not in out.lower(), out
+
+
+@pytest.mark.parametrize(
+    "code, message",
+    [
+        ("from numba import vectorize\n@vectorize\ndef f(x):\n    return x\nprint(f(1.0))\n",
+         "numba @vectorize of 'f' without a signature"),
+        ("from numba import vectorize\n@vectorize(['int64(int64)', 'float64(float64)'])\ndef f(x):\n"
+         "    return x + 1\nprint(f(1))\n", "numba @vectorize of 'f' with 2 signatures"),
+        ("from numba import guvectorize\nprint(1)\n", "unsupported numba feature: guvectorize"),
+        ("from numba.typed import List\nprint(1)\n", "unsupported numba module: numba.typed"),
+        ("from numba import njit\n@njit(nopython=False)\ndef f(x):\n    return x\nprint(f(1))\n",
+         "numba object mode"),
+        ("from numba import njit\n@njit(locals={'a': 1})\ndef f(x):\n    return x\nprint(f(1))\n",
+         "unsupported numba jit option locals="),
+        ("import numba as nb\nprint(nb.config.NUMBA_NUM_THREADS)\n", "unsupported use of numba.config"),
+    ],
+)
+def test_xp2f_numba_unsupported_features_are_rejected(tmp_path: Path, code: str, message: str) -> None:
+    src = tmp_path / "xnb_bad.py"
+    src.write_text(code, encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert message in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+
+
+def test_xp2f_nonzero_and_argwhere_of_logical_array(tmp_path: Path) -> None:
+    # np.nonzero(b) for a bool array compared it with 0 (LOGICAL /= INTEGER).
+    src = tmp_path / "xbool_nonzero.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "b = np.array([True, False, True, True])",
+        "print(np.nonzero(b)[0], np.argwhere(b))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_float_arange_is_real(tmp_path: Path) -> None:
+    # np.arange with a float argument is float64; it was translated with
+    # arange_int, truncating the arguments (np.arange(0, 2, 0.5) got step 0).
+    src = tmp_path / "xarange_float.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "a = np.arange(5.0)",
+        "b = np.arange(1, 4.0)",
+        "c = np.arange(0, 2, 0.5)",
+        "d = np.arange(1.0, 0.0, -0.25)",
+        "e = np.arange(6.0).reshape(2, 3)",
+        "print(a, b, c, d)",
+        "print(e)",
+        "print(a.sum() / 2, e.sum() / 4)",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xarange_float_p.f90").read_text(encoding="utf-8")
+    assert "real(kind=dp), allocatable :: a(:), b(:), c(:), d(:), e(:,:)" in out, out
+
+
+_PRANGE_SRC = """\
+import numpy as np
+from numba import njit, prange
+
+
+@njit(parallel=True)
+def extremes(a):
+    lo = a[0]
+    hi = a[0]
+    neg = 0.0
+    for i in prange(a.shape[0]):
+        lo = min(lo, a[i])
+        hi = max(a[i], hi)
+        neg = neg - a[i]
+    return lo, hi, neg
+
+
+@njit
+def not_parallel(a):
+    s = 0.0
+    for i in prange(a.shape[0]):
+        s += a[i]
+    return s
+
+
+@njit(parallel=True)
+def branches(a, out):
+    for i in prange(a.shape[0]):
+        if a[i] > 0.5:
+            v = a[i]
+        else:
+            v = -a[i]
+        out[i] = v * v
+
+
+@njit(parallel=True)
+def nested(a):
+    n, m = a.shape
+    total = 0.0
+    for i in prange(n):
+        for j in prange(m):
+            total += a[i, j]
+    return total
+
+
+@njit(parallel=True)
+def row_norms(a):
+    n = a.shape[0]
+    out = np.empty(n)
+    for i in prange(n):
+        row = a[i, :]
+        out[i] = np.sqrt(np.sum(row * row))
+    return out
+
+
+@njit(parallel=True)
+def time_steps(u, steps):
+    n = u.shape[0]
+    new = np.empty_like(u)
+    for _ in range(steps):
+        for i in prange(1, n - 1):
+            new[i] = 0.5 * (u[i - 1] + u[i + 1])
+        new[0] = u[0]
+        new[n - 1] = u[n - 1]
+        u[:] = new
+    return u
+
+
+x = np.linspace(0.0, 1.0, 21)
+m = np.arange(12.0).reshape(3, 4)
+lo, hi, neg = extremes(x)
+print(round(lo, 8), round(float(hi), 8), round(neg, 8))
+print(round(not_parallel(x), 8))
+o = np.empty_like(x)
+branches(x, o)
+print(np.round(o, 8))
+print(nested(m), np.round(row_norms(m), 8))
+print(np.round(time_steps(x.copy(), 5), 8))
+"""
+
+
+@pytest.mark.parametrize("openmp", [False, True])
+def test_xp2f_numba_prange_becomes_omp_parallel_do(tmp_path: Path, openmp: bool) -> None:
+    # In a parallel=True function the outermost prange loops get
+    # `!$omp parallel do` with the reductions numba infers (+, *, min, max)
+    # and private copies of the variables assigned in the body; a prange
+    # nested in another, or in a function without parallel=True, stays a
+    # plain loop as in numba.
+    pytest.importorskip("numba")
+    src = tmp_path / "xnb_prange.py"
+    src.write_text(_PRANGE_SRC, encoding="utf-8")
+    cmd = [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"]
+    env = dict(os.environ)
+    if openmp:
+        cmd += ["--compiler", "gfortran -O2 -fopenmp"]
+        env["OMP_NUM_THREADS"] = "4"
+    proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, check=False, env=env, timeout=600)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    assert "Warning: prange" not in proc.stderr, proc.stderr
+    out = (tmp_path / "xnb_prange_p.f90").read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in out.splitlines()]
+    for directive in [
+        "!$omp parallel do reduction(+:neg) reduction(max:hi) reduction(min:lo)",
+        "!$omp parallel do private(v)",
+        "!$omp parallel do private(j) reduction(+:total)",
+        "!$omp parallel do private(row)",
+    ]:
+        assert directive in lines, out
+    assert lines.count("!$omp parallel do") == 1, out  # time_steps
+    assert lines.count("!$omp end parallel do") == 5, out
+    assert re.search(r"(?im)^\s*pure\s+function\s+not_parallel\b", out), out
+
+
+def test_xp2f_numba_prange_serial_fallbacks_and_lastprivate(tmp_path: Path) -> None:
+    src = tmp_path / "xnb_prange_fb.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "from numba import njit, prange",
+        "",
+        "",
+        "@njit(parallel=True)",
+        "def carried(a):",
+        "    acc = 0.0",
+        "    out = np.empty_like(a)",
+        "    for i in prange(a.shape[0]):",
+        "        acc = 0.5 * acc + a[i]",
+        "        out[i] = acc",
+        "    return out",
+        "",
+        "",
+        "@njit(parallel=True)",
+        "def with_break(a):",
+        "    s = 0.0",
+        "    for i in prange(a.shape[0]):",
+        "        if a[i] > 0.7:",
+        "            break",
+        "        s += a[i]",
+        "    return s",
+        "",
+        "",
+        "@njit",
+        "def fill(row, v):",
+        "    for k in range(row.shape[0]):",
+        "        row[k] = v",
+        "",
+        "",
+        "@njit(parallel=True)",
+        "def fill_rows(a):",
+        "    for i in prange(a.shape[0]):",
+        "        fill(a[i], float(i))",
+        "",
+        "",
+        "@njit(parallel=True)",
+        "def last_value(a):",
+        "    last = 0.0",
+        "    for i in prange(a.shape[0]):",
+        "        last = 2.0 * a[i]",
+        "    return last",
+        "",
+        "",
+        "x = np.linspace(0.0, 1.0, 5)",
+        "a = np.zeros((3, 2))",
+        "fill_rows(a)",
+        "print(carried(x), with_break(x), last_value(x))",
+        "print(a)",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    err = proc.stderr
+    assert "line 9: Warning: prange loop translated as a serial loop: 'acc' carries a value" in err, err
+    assert "line 18: Warning: prange loop translated as a serial loop: break inside the loop" in err, err
+    assert "line 33: Warning: prange loop translated without OpenMP: `call` in the generated loop" in err, err
+    out = (tmp_path / "xnb_prange_fb_p.f90").read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in out.splitlines()]
+    assert [ln for ln in lines if ln.startswith("!$omp parallel")] == ["!$omp parallel do lastprivate(last)"], out
+    # a is changed through fill(a[i], ...): intent(inout), not intent(in).
+    assert re.search(r"(?im)^\s*real\(kind=dp\), intent\(inout\) :: a\(:,:\)", out), out
+
+
+def test_xp2f_numba_signatures_give_argument_types(tmp_path: Path) -> None:
+    # String, object and list signatures (with numba.* and contiguous
+    # `[:, ::1]` arrays) become annotations: sq(3) passes 3.0 to the
+    # float64 parameter, and prints 9.0 as numba does.
+    pytest.importorskip("numba")
+    src = tmp_path / "xnb_sigs.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "import numba",
+        "from numba import njit, float64, void",
+        "",
+        "",
+        '@njit("float64(float64[:])")',
+        "def mean(a):",
+        "    s = 0.0",
+        "    for v in a:",
+        "        s += v",
+        "    return s / a.size",
+        "",
+        "",
+        "@njit(void(float64[:], float64))",
+        "def scale_inplace(a, c):",
+        "    for i in range(a.shape[0]):",
+        "        a[i] *= c",
+        "",
+        "",
+        "@njit(float64[:](float64[:, ::1]))",
+        "def row_sums(m):",
+        "    out = np.zeros(m.shape[0])",
+        "    for i in range(m.shape[0]):",
+        "        for j in range(m.shape[1]):",
+        "            out[i] += m[i, j]",
+        "    return out",
+        "",
+        "",
+        '@njit(["int64(int64)"])',
+        "def tri(n):",
+        "    return n * (n + 1) // 2",
+        "",
+        "",
+        '@njit("f8(f8, i8)", cache=True)',
+        "def pw(x, k):",
+        "    r = 1.0",
+        "    for _ in range(k):",
+        "        r *= x",
+        "    return r",
+        "",
+        "",
+        "@numba.njit(numba.float64(numba.float64))",
+        "def sq(x):",
+        "    return x * x",
+        "",
+        "",
+        "a = np.array([1.0, 2.0, 4.0])",
+        "scale_inplace(a, 2.0)",
+        "m = np.arange(6.0).reshape(2, 3)",
+        "print(mean(a), a)",
+        "print(row_sums(m), tri(10), pw(1.5, 3), sq(3))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xnb_sigs_p.f90").read_text(encoding="utf-8")
+    assert "sq(real(3, kind=dp))" in out, out
+    assert re.search(r"(?im)^\s*real\(kind=dp\), intent\(in\) :: m\(:,:\)", out), out
+
+
+def test_xp2f_numba_signatures_type_a_module(tmp_path: Path) -> None:
+    # --module has no callers to infer from: the signatures type the
+    # dummies, and the parallel=True prange loop gets its directive.
+    src = tmp_path / "xnb_lib.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "from numba import njit, prange",
+        "",
+        "",
+        '@njit("int64(int64[:], int64)")',
+        "def count_above(a, t):",
+        "    c = 0",
+        "    for v in a:",
+        "        if v > t:",
+        "            c += 1",
+        "    return c",
+        "",
+        "",
+        '@njit("float64[:,:](float64[:,:], float64[:,:])", parallel=True)',
+        "def mat_mult(a, b):",
+        "    n, k = a.shape",
+        "    m = b.shape[1]",
+        "    c = np.zeros((n, m))",
+        "    for i in prange(n):",
+        "        for j in range(m):",
+        "            t = 0.0",
+        "            for p in range(k):",
+        "                t += a[i, p] * b[p, j]",
+        "            c[i, j] = t",
+        "    return c",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--module", "--compile", "--compiler", "gfortran -O2 -fopenmp"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = (tmp_path / "xnb_lib_p.f90").read_text(encoding="utf-8")
+    assert re.search(r"(?im)^\s*integer, intent\(in\) :: a\(:\)", out), out
+    assert re.search(r"(?im)^\s*real\(kind=dp\), intent\(in\) :: a\(:,:\), b\(:,:\)", out), out
+    assert "!$omp parallel do private(j, p, t)" in out, out
+
+
+def test_xp2f_numba_vectorize_is_elemental(tmp_path: Path) -> None:
+    # @vectorize with one signature: one ELEMENTAL function of scalar
+    # dummies, called with scalars, vectors, a matrix, and from another
+    # function.
+    pytest.importorskip("numba")
+    src = tmp_path / "xnb_vec.py"
+    src.write_text("\n".join([
+        "import math",
+        "import numpy as np",
+        "from numba import vectorize, float64",
+        "",
+        "",
+        "@vectorize([float64(float64, float64)])",
+        "def hypot2(x, y):",
+        "    return math.sqrt(x * x + y * y)",
+        "",
+        "",
+        '@vectorize(["float64(float64)"], cache=True)',
+        "def relu(x):",
+        "    return x if x > 0.0 else 0.0",
+        "",
+        "",
+        '@vectorize("int64(int64, int64)")',
+        "def gcd(a, b):",
+        "    while b != 0:",
+        "        a, b = b, a % b",
+        "    return a",
+        "",
+        "",
+        "def norm_relu(a, b):",
+        "    return relu(hypot2(a, b) - 6.0)",
+        "",
+        "",
+        "x = np.array([3.0, -5.0, 8.0])",
+        "y = np.array([4.0, 12.0, 15.0])",
+        "print(hypot2(x, y), relu(x), relu(-2.0), hypot2(3.0, 4.0))",
+        "print(norm_relu(x, y))",
+        "m = np.arange(6.0).reshape(2, 3) - 2.0",
+        "print(relu(m))",
+        "print(gcd(np.array([12, 18, 35]), np.array([8, 27, 14])), gcd(9, 6))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xnb_vec_p.f90").read_text(encoding="utf-8")
+    for name in ("hypot2", "relu", "gcd"):
+        assert re.search(rf"(?im)^\s*(?:pure\s+)?elemental\s+function\s+{name}\(", out), out
+    assert "impure" not in out.lower(), out
