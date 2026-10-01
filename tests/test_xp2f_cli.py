@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import csv
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -24730,3 +24731,58 @@ def test_xp2f_openmp_directives_inside_blocks_and_renamed_names(tmp_path: Path) 
     assert lines[i_end + 1] == "end if", out
     assert "!$omp parallel shared(A,x,out_) private(i,j,k)" in lines, out
     assert "!$omp end section" not in lines and "!$omp end sections" in lines, out
+
+
+@pytest.mark.parametrize("openmp", [False, True])
+def test_xp2f_pyccel_openmp_runtime_routines(tmp_path: Path, openmp: bool) -> None:
+    # `from pyccel.stdlib.internal.openmp import ...` maps to the python.f90
+    # py_omp_* wrappers, which use omp_lib with -fopenmp and otherwise give
+    # pyccel's pure-Python results (thread 0 of a team of 1). The -fopenmp
+    # run sets the team size with OMP_NUM_THREADS, not omp_set_num_threads:
+    # with the experimental gfortran 17 libgomp on Windows, a program that
+    # calls omp_set_num_threads hangs at exit.
+    set_line = "    omp_set_num_threads(n)" if not openmp else "    pass"
+    src = tmp_path / "xomp_rt.py"
+    src.write_text("\n".join([
+        "def team_size(n: int) -> int:",
+        "    from pyccel.stdlib.internal.openmp import omp_set_num_threads, omp_get_num_threads",
+        set_line,
+        "    result = 0",
+        "    # $ omp parallel",
+        "    # $ omp single",
+        "    result = omp_get_num_threads()",
+        "    # $ omp end single",
+        "    # $ omp end parallel",
+        "    return result",
+        "",
+        "",
+        "from pyccel.stdlib.internal.openmp import omp_get_thread_num, omp_get_max_threads",
+        "print(omp_get_thread_num(), omp_get_max_threads() >= 1, team_size(3))",
+        "",
+    ]), encoding="utf-8")
+    cmd = [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run"]
+    env = dict(os.environ)
+    if openmp:
+        cmd += ["--compiler", "gfortran -O2 -fopenmp"]
+        env["OMP_NUM_THREADS"] = "3"
+    proc = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, check=False,
+                          env=env, timeout=300)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = (tmp_path / "xomp_rt_p.f90").read_text(encoding="utf-8")
+    if not openmp:
+        assert "call py_omp_set_num_threads(n)" in out, out
+    assert "py_omp_get_num_threads()" in out and "pyccel" not in out.lower(), out
+    expected = ["0", "T", "3" if openmp else "1"]
+    assert any(ln.split() == expected for ln in proc.stdout.splitlines()), proc.stdout
+
+
+def test_xp2f_pyccel_openmp_unsupported_routine_is_rejected(tmp_path: Path) -> None:
+    src = tmp_path / "xomp_bad.py"
+    src.write_text(
+        "from pyccel.stdlib.internal.openmp import omp_get_num_procs\nprint(omp_get_num_procs())\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "unsupported OpenMP runtime routine omp_get_num_procs" in proc.stdout + proc.stderr

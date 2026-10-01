@@ -346,6 +346,10 @@ public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(
 public :: optval !@pyapi kind=function ret=scalar args=x:scalar:intent(in):optional,default:scalar:intent(in) desc="return x when present, otherwise default"
 public :: exec_cmd_status !@pyapi kind=function ret=integer args=cmd:character:intent(in) desc="execute shell command via execute_command_line and return exit status"
 public :: py_time !@pyapi kind=function ret=real args= desc="wall-clock seconds from system_clock (Python time.time approximation)"
+public :: py_omp_get_thread_num !@pyapi kind=function ret=integer args= desc="OpenMP thread number (0 without -fopenmp)"
+public :: py_omp_get_num_threads !@pyapi kind=function ret=integer args= desc="OpenMP threads in the current team (1 without -fopenmp)"
+public :: py_omp_get_max_threads !@pyapi kind=function ret=integer args= desc="OpenMP maximum threads (1 without -fopenmp)"
+public :: py_omp_set_num_threads !@pyapi kind=subroutine args=n:integer:intent(in) desc="set the OpenMP thread count (no effect without -fopenmp)"
 public :: py_ctime !@pyapi kind=function ret=character args=t:real(dp):intent(in):optional desc="string timestamp approximation for Python time.ctime"
 public :: py_format_g_real !@pyapi kind=function ret=character args=x:real(dp):intent(in) desc="Python-like %g formatting helper for real scalars"
 public :: py_format_real
@@ -1709,6 +1713,38 @@ contains
             t = 0.0_dp
          end if
       end function py_time
+
+      ! OpenMP runtime routines for pyccel-style code (from pyccel.stdlib.
+      ! internal.openmp import omp_get_thread_num, ...). The `!$ ` lines are
+      ! compiled only with -fopenmp; otherwise these return what pyccel's
+      ! pure-Python versions do (thread 0 of a team of 1).
+      function py_omp_get_thread_num() result(r)
+         !$ use omp_lib, only: omp_get_thread_num
+         integer :: r
+         r = 0
+         !$ r = omp_get_thread_num()
+      end function py_omp_get_thread_num
+
+      function py_omp_get_num_threads() result(r)
+         !$ use omp_lib, only: omp_get_num_threads
+         integer :: r
+         r = 1
+         !$ r = omp_get_num_threads()
+      end function py_omp_get_num_threads
+
+      function py_omp_get_max_threads() result(r)
+         !$ use omp_lib, only: omp_get_max_threads
+         integer :: r
+         r = 1
+         !$ r = omp_get_max_threads()
+      end function py_omp_get_max_threads
+
+      subroutine py_omp_set_num_threads(n)
+         !$ use omp_lib, only: omp_set_num_threads
+         integer, intent(in) :: n
+         !$ call omp_set_num_threads(n)
+         if (n < 0) continue  ! n is unused without -fopenmp
+      end subroutine py_omp_set_num_threads
 
       function py_ctime(t) result(s)
          real(kind=dp), intent(in), optional :: t

@@ -7573,6 +7573,7 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     np.-qualified name in the message instead of a bare one.
     """
     tree = normalize_numpy_wildcard_imports(tree)
+    tree = rewrite_pyccel_openmp_imports(tree)
     numpy_names = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "numpy":
@@ -16074,6 +16075,8 @@ def detect_needed_helpers(tree):
                     needed.add("py_ctime")
             if isinstance(node.func, ast.Name) and node.func.id in {"eye", "diag"}:
                 needed.add(node.func.id)
+            if isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS:
+                needed.add(node.func.id)
             if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
                     and node.func.value.id in self.time_aliases and node.func.attr == "sleep"):
                 needed.add("py_sleep")
@@ -18399,6 +18402,59 @@ def _local_module_exists(base_dir: Path, module_name: str) -> bool:
             continue
         return False
     return False
+
+
+# pyccel's OpenMP runtime routines (from pyccel.stdlib.internal.openmp)
+# that xp2f supports, mapped to the python.f90 wrappers, with result kinds
+# (None for the subroutine).
+PYCCEL_OPENMP_ROUTINES = {
+    "omp_get_thread_num": ("py_omp_get_thread_num", "int"),
+    "omp_get_num_threads": ("py_omp_get_num_threads", "int"),
+    "omp_get_max_threads": ("py_omp_get_max_threads", "int"),
+    "omp_set_num_threads": ("py_omp_set_num_threads", None),
+}
+OMP_RUNTIME_HELPERS = {helper: kind for helper, kind in PYCCEL_OPENMP_ROUTINES.values()}
+_PYCCEL_OPENMP_MODULE = "pyccel.stdlib.internal.openmp"
+
+
+def rewrite_pyccel_openmp_imports(tree):
+    """`from pyccel.stdlib.internal.openmp import omp_get_thread_num, ...`
+    (at any level; pyccel's tests import inside functions): drop the import
+    and call the python.f90 wrappers (py_omp_get_thread_num, ...), which
+    use omp_lib with -fopenmp and otherwise return what pyccel's pure-Python
+    versions do. Only the PYCCEL_OPENMP_ROUTINES subset is supported."""
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == _PYCCEL_OPENMP_MODULE:
+            for a in node.names:
+                if a.name not in PYCCEL_OPENMP_ROUTINES:
+                    raise NotImplementedError(
+                        f"unsupported OpenMP runtime routine {a.name} from {_PYCCEL_OPENMP_MODULE} "
+                        f"(supported: {', '.join(sorted(PYCCEL_OPENMP_ROUTINES))})"
+                    )
+                aliases[a.asname or a.name] = PYCCEL_OPENMP_ROUTINES[a.name][0]
+        elif isinstance(node, ast.Import) and any(a.name == _PYCCEL_OPENMP_MODULE for a in node.names):
+            raise NotImplementedError(
+                f"import the OpenMP routines by name: from {_PYCCEL_OPENMP_MODULE} import omp_get_thread_num, ..."
+            )
+    if not aliases:
+        return tree
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            if node.module == _PYCCEL_OPENMP_MODULE:
+                return ast.copy_location(ast.Pass(), node)
+            return node
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if isinstance(node.func, ast.Name) and node.func.id in aliases:
+                node.func = ast.copy_location(ast.Name(id=aliases[node.func.id], ctx=ast.Load()), node.func)
+            return node
+
+    tree = _Rewriter().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
 
 
 def validate_imports_supported(tree, py_path):
@@ -27379,6 +27435,8 @@ class translator(ast.NodeVisitor):
         )
 
     def _expr_kind(self, node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS:
+            return OMP_RUNTIME_HELPERS[node.func.id]
         if isinstance(node, ast.Name) and node.id in self.__dict__.get("_comp_int_scope", ()):
             return "int"
         if isinstance(node, ast.ListComp):
@@ -32586,6 +32644,8 @@ class translator(ast.NodeVisitor):
         return self._coerce_expr_kind(node, value, "logical")
 
     def _rank_expr(self, node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS:
+            return 0
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"array_equal", "array_equiv"}):
@@ -34423,6 +34483,11 @@ class translator(ast.NodeVisitor):
 
     def expr(self, node):
         validate_numpy_atleast_call(node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in OMP_RUNTIME_HELPERS and OMP_RUNTIME_HELPERS[node.func.id] is not None:
+            # An OpenMP runtime query (see rewrite_pyccel_openmp_imports).
+            if node.args or node.keywords:
+                raise NotImplementedError(f"{node.func.id} takes no arguments")
+            return f"{node.func.id}()"
         if self._where_tuple_index(node):
             if self._rank_expr(node.value) != 2:
                 raise NotImplementedError("matrix where index tuples require a rank-2 indexed array")
@@ -58324,6 +58389,17 @@ class translator(ast.NodeVisitor):
 
     def visit_Expr(self, node):
         self._emit_comments_for(node)
+        v = node.value
+        if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id in OMP_RUNTIME_HELPERS
+                and OMP_RUNTIME_HELPERS[v.func.id] is None):
+            # omp_set_num_threads(n) (see rewrite_pyccel_openmp_imports).
+            if len(v.args) != 1 or v.keywords:
+                raise NotImplementedError("omp_set_num_threads takes one argument")
+            arg = self.expr(v.args[0])
+            if self._expr_kind(v.args[0]) != "int":
+                arg = f"int({arg})"
+            self.o.w(f"call {v.func.id}({arg})")
+            return
         if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             # Ignore docstring / standalone string literal expressions.
             return
@@ -78078,6 +78154,7 @@ def _tree_uses_replayable_rng(tree):
 def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = ast.parse(src_text, filename=source_name)
     tree = normalize_numpy_wildcard_imports(tree)
+    tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
@@ -78595,6 +78672,7 @@ def transpile_file(
     _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
+    tree = rewrite_pyccel_openmp_imports(tree)
     if module_only:
         _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
     reject_undefined_names_in_functions(tree)
@@ -79402,6 +79480,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
     tree = normalize_numpy_wildcard_imports(tree)
+    tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
