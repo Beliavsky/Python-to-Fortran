@@ -28375,6 +28375,22 @@ class translator(ast.NodeVisitor):
 
     def _expr_kind(self, node):
         self._normalize_negative_axis(node)
+        if (
+            isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "lstsq"
+            and isinstance(node.value.func.value, ast.Attribute) and node.value.func.value.attr == "linalg"
+            and isinstance(node.slice, ast.Constant) and node.slice.value in (0, 1, 3)
+        ):
+            # lstsq(...)[0] solution, [1] residuals, [3] singular values: float.
+            return "real"
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and is_numpy_name_node(node.func.value) and node.func.attr == "append" and len(node.args) >= 2
+        ):
+            # The wider operand kind (bools with bools stay bool).
+            _k = self._promoted_kind(node.args[:2])
+            if _k is not None:
+                return _k
         _canon = self._canonical_numpy_call(node)
         if _canon is not None:
             return self._expr_kind(_canon)
@@ -30069,6 +30085,51 @@ class translator(ast.NodeVisitor):
                 # Element reordering keeps the dtype (Burkardt graph_dist.py:
                 # `noder = np.flip(noder)` on an int index array).
                 return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"flip", "flipud", "fliplr", "roll"}
+                and len(node.args) >= 1
+            ):
+                # Of a real array -- or, before the argument's kind is known,
+                # the same default as np.sort.
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"angle", "quantile", "percentile", "median", "nanquantile",
+                                       "nanpercentile", "nanmedian", "average", "corrcoef", "cov"}
+                and len(node.args) >= 1
+            ):
+                # Always float in numpy (complex for a complex corrcoef/cov).
+                if node.func.attr in {"corrcoef", "cov", "average"} and self._expr_kind(node.args[0]) == "complex":
+                    return "complex"
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "linalg"
+                and is_numpy_name_node(node.func.value.value)
+                and node.func.attr in {"norm", "det", "inv", "solve", "cond", "eigvalsh", "eigvals", "cholesky",
+                                       "lstsq", "pinv", "eig", "eigh", "qr", "svd"}
+                and len(node.args) >= 1
+            ):
+                # numpy.linalg results are float (complex for complex input);
+                # norm and cond are always real.
+                if node.func.attr not in {"norm", "cond"} and any(
+                    self._expr_kind(a) == "complex" for a in node.args
+                ):
+                    return "complex"
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "trace"
+                and len(node.args) >= 1
+            ):
+                # The sum of the diagonal: the matrix's kind (bools count as ints).
+                _k = self._expr_kind(node.args[0])
+                return {"int": "int", "logical": "int", "complex": "complex"}.get(_k, "real")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -43074,14 +43135,40 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
-                sh = "0"
-                if len(node.args) >= 2:
-                    sh = self.expr(node.args[1])
+                r0 = int(self._rank_expr(node.args[0]))
+                sh_node = node.args[1] if len(node.args) >= 2 else None
+                axis_node = node.args[2] if len(node.args) >= 3 else None
                 for kw in node.keywords:
                     if kw.arg == "shift":
-                        sh = self.expr(kw.value)
-                        break
-                return f"cshift({a0}, int({sh}))"
+                        sh_node = kw.value
+                    elif kw.arg == "axis":
+                        axis_node = kw.value
+                if sh_node is None:
+                    raise NotImplementedError("np.roll needs a shift")
+                if isinstance(sh_node, (ast.Tuple, ast.List)):
+                    raise NotImplementedError("np.roll with several shifts is not supported")
+                # np.roll(x, k) moves elements k places forward: CSHIFT by -k.
+                sh = f"-int({self.expr(sh_node)})"
+                if axis_node is None or (isinstance(axis_node, ast.Constant) and axis_node.value is None):
+                    if r0 <= 1:
+                        return f"cshift({a0}, {sh})"
+                    if r0 == 2:
+                        # Without an axis numpy rolls the row-major flattened array.
+                        flat = self._c_order_flat(a0, 2)
+                        return f"transpose(reshape(cshift({flat}, {sh}), [size({a0},2), size({a0},1)]))"
+                    raise NotImplementedError("np.roll without axis supports arrays of rank up to 2")
+                if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)):
+                    if isinstance(axis_node, ast.UnaryOp) and isinstance(axis_node.op, ast.USub) and isinstance(
+                        axis_node.operand, ast.Constant
+                    ):
+                        ax = -int(axis_node.operand.value)
+                    else:
+                        raise NotImplementedError("np.roll axis must be a constant integer")
+                else:
+                    ax = int(axis_node.value)
+                if ax < 0:
+                    ax += max(1, r0)
+                return f"cshift({a0}, {sh}, dim={ax + 1})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -43347,16 +43434,30 @@ class translator(ast.NodeVisitor):
                     if kw.arg == "axis":
                         axis_node = kw.value
                         break
-                if axis_node is not None:
-                    # Minimal support: axis-aware append only for rank-1 via flatten semantics.
+                if axis_node is not None and not (isinstance(axis_node, ast.Constant) and axis_node.value is None):
                     if max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1])) > 1:
-                        raise NotImplementedError("np.append with axis currently supports only rank-1 inputs")
-                a0 = self.expr(node.args[0])
-                a1 = self.expr(node.args[1])
-                r1 = self._rank_expr(node.args[1])
-                if r1 == 0:
-                    return f"[{a0}, {a1}]"
-                return f"[{a0}, {a1}]"
+                        # np.append(a, b, axis=k) is np.concatenate((a, b), axis=k).
+                        cat = ast.copy_location(ast.Call(
+                            func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="concatenate",
+                                               ctx=ast.Load()),
+                            args=[ast.Tuple(elts=list(node.args[:2]), ctx=ast.Load())],
+                            keywords=[ast.keyword(arg="axis", value=axis_node)]), node)
+                        return self.expr(ast.fix_missing_locations(cat))
+                # Without an axis both are flattened (row-major) and joined, in
+                # the wider of the two kinds.
+                kind = self._expr_kind(node)
+                parts = []
+                for a in node.args[:2]:
+                    txt = self._c_order_flat(self.expr(a), int(self._rank_expr(a))) if int(self._rank_expr(a)) >= 2                         else self.expr(a)
+                    ka = self._expr_kind(a)
+                    if kind == "real" and ka in {"int", "logical"}:
+                        txt = f"real({txt}, kind=dp)" if ka == "int" else f"merge(1.0_dp, 0.0_dp, {txt})"
+                    elif kind == "complex" and ka != "complex":
+                        txt = f"cmplx({txt}, 0.0_dp, kind=dp)"
+                    elif kind == "int" and ka == "logical":
+                        txt = f"merge(1, 0, {txt})"
+                    parts.append(txt)
+                return f"[{parts[0]}, {parts[1]}]"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -77039,10 +77140,16 @@ def generate_flat(
             # downstream, floor_div_int/floor_div_real dispatch on the
             # wrong operand kind entirely).
             _explicit_ann_kind = _ann_kind(_final_pos_args[i].annotation) if i < len(_final_pos_args) else None
+            # Nor a parameter a call passes a float to: `def g(x): return
+            # np.sum(x // 2)` called with a float array keeps x real (it was
+            # declared integer and the call converted the array with int()).
+            _observed = call_kind_sets.get(fn.name, [])
+            _observed_i = _observed[i] if i < len(_observed) else set()
             if (
                 _semantic_int_context(arg_nm)
                 and _default_kind_by_arg.get(arg_nm) != "real"
                 and _explicit_ann_kind != "real"
+                and not (_observed_i & {"real", "complex"})
                 and local_func_arg_kinds[fn.name][i] in {None, "real"}
             ):
                 local_func_arg_kinds[fn.name][i] = "int"

@@ -18,7 +18,7 @@ Statuses, worst first:
   RUN-FAIL    the Fortran executable stopped at the case
   BUILD-FAIL  gfortran rejected the translation
   XLATE-FAIL  xp2f.py raised an error (often an unsupported feature)
-  UNTESTED    left out because the case failed in the other context
+  UNTESTED    left out because the case failed in another context
   MATCH
 
     python numpy_conformance/run.py [name ...] [--no-split]
@@ -51,7 +51,8 @@ _TOKEN_RE = re.compile(
     r"True|False|(?<![\w.])[TF](?![\w.])|[-+]?(?:nan|NaN|inf|Infinity)"
     r"|[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][-+]?\d+)?"
 )
-_CASE_REF_RE = re.compile(r"\b[rf]_(c\d{3})([mf])?\b")
+_CASE_REF_RE = re.compile(r"\b([rfl])_(c\d{3})([mfl])?\b")
+_WHERE = {"m": "top level", "f": "in function", "l": "in loop"}
 _GF_LOC_RE = re.compile(r"^(?:[A-Za-z]:)?[^:]*\.f90:(\d+):\d+:")
 
 
@@ -73,7 +74,7 @@ def tokens(text):
 def blocks(text):
     out, cur = {}, None
     for line in text.splitlines():
-        m = re.fullmatch(r"\s*case (c\d+[mf])\s*", line)
+        m = re.fullmatch(r"\s*case (c\d+[mfl])\s*", line)
         if m:
             cur = m.group(1)
             out[cur] = []
@@ -90,6 +91,9 @@ def compare(py_text, ft_text):
         same = (va != va and vb != vb) or abs(va - vb) <= 1e-6 * max(1.0, abs(va), abs(vb))
         if not same:
             return "DIFF-value", ""
+    if "j" in py_text:
+        # A complex value prints as (7-2j): its parts aren't int/float evidence.
+        return "MATCH", ""
     for (ka, _), (kb, _) in zip(a, b):
         if ka != kb:
             return "DIFF-kind", f"{ka} vs {kb}"
@@ -142,14 +146,17 @@ def run_exe(py_path):
 
 def _owner(lines, idx, main_start):
     """(case id, context) of the code holding lines[idx]: the nearest
-    r_cNNN / f_cNNN reference at or above it (not in a PUBLIC or USE list)."""
+    r_cNNN<ctx> / f_cNNN / l_cNNN reference at or above it (not in a PUBLIC
+    or USE list)."""
     for k in range(idx, -1, -1):
         s = lines[k].strip().lower()
         if s.startswith(("public", "use ", "private")):
             continue
         m = _CASE_REF_RE.search(lines[k])
         if m:
-            return m.group(1), m.group(2) or ("m" if idx >= main_start else "f")
+            if m.group(3):
+                return m.group(2), m.group(3)
+            return m.group(2), ("m" if idx >= main_start else ("l" if m.group(1) == "l" else "f"))
     return None
 
 
@@ -206,7 +213,7 @@ def run_program(name, split=True):
             ftb, detail = run_exe(path)
             crashed = None
             for k in active:
-                for ctx in "mf":
+                for ctx in gen.contexts(exprs[k]):
                     key = ids[k] + ctx
                     if crashed is None and key in ftb:
                         record(k, ctx, *compare(pyb.get(key, ""), ftb[key]), pyb.get(key, ""), ftb[key])
@@ -217,8 +224,9 @@ def run_program(name, split=True):
             # Record the crash and rebuild without the cases up to it.
             k, ctx = crashed
             record(k, ctx, "RUN-FAIL", detail)
-            if ctx == "m":
-                record(k, "f", "UNTESTED", "")
+            ctxs = gen.contexts(exprs[k])
+            for later in ctxs[ctxs.index(ctx) + 1:]:
+                record(k, later, "UNTESTED", "")
             active = active[active.index(k) + 1:]
             continue
         culprits = {ids.index(cid): ctxs for cid, ctxs in attribute(status, log, path).items()}
@@ -230,11 +238,11 @@ def run_program(name, split=True):
                     results[(ids.index(r[0]), r[1])] = r
             else:
                 for k in active:
-                    for ctx in "mf":
+                    for ctx in gen.contexts(exprs[k]):
                         record(k, ctx, status, msg)
             break
         for k, ctxs in culprits.items():
-            for ctx in "mf":
+            for ctx in gen.contexts(exprs[k]):
                 record(k, ctx, *((status, ctxs[ctx]) if ctx in ctxs else ("UNTESTED", "")))
             active.remove(k)
     return [results[key] for key in sorted(results)]
@@ -251,13 +259,13 @@ def run_single(name, exprs, indices):
         status, log = translate_and_build(path)
         if status == "OK":
             ftb, detail = run_exe(path)
-            for ctx in "mf":
+            for ctx in gen.contexts(e):
                 key = cid + ctx
                 st, det = compare(pyb.get(key, ""), ftb[key]) if key in ftb else ("RUN-FAIL", detail)
                 out.append((cid, ctx, e, st, det, pyb.get(key, ""), ftb.get(key, "")))
         else:
-            out += [(cid, ctx, e, status, first_error(log), "", "") for ctx in "mf"]
-        print(f"    {cid} {out[-2][3]}/{out[-1][3]}  {e}", flush=True)
+            out += [(cid, ctx, e, status, first_error(log), "", "") for ctx in gen.contexts(e)]
+        print(f"    {cid} {out[-1][3]}  {e}", flush=True)
     return out
 
 
@@ -284,7 +292,7 @@ def main(argv):
             for cid, ctx, e, st, det, pyt, ftt in sorted(res, key=lambda r: (ORDER.index(r[3]), r[0], r[1])):
                 if st in ("MATCH", "UNTESTED"):
                     continue
-                where = "top level" if ctx == "m" else "in function"
+                where = _WHERE[ctx]
                 line = f"{st:10s} {cid}{ctx} {e}  [{where}]" + (f"  {det}" if det else "")
                 th.write("  " + line + "\n")
                 fh.write(line + "\n")

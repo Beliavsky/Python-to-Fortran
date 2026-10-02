@@ -12,13 +12,20 @@ below, so one template covers int, float and bool inputs of each rank:
     {N2}  numeric 2-D    i2 f2
     {S}   scalar         i0 f0
     {T}   second scalar  j0 g0
+    {SQ}  square matrix  s2 (well-conditioned float) k2 (integer)
+
+A case is an expression, or statements and an expression written
+`STMT <stmt>; <stmt> => <expr>` (for in-place operations); names w, w1,
+w2, ... in it are local to the case.
 
 Every case is evaluated with NumPy first; combinations NumPy rejects are
-dropped. Each surviving case is emitted twice: assigned at the top level
-(`r_c001m = <expr>`) and returned from a function whose arguments get
-their types from the call (`f_c001(i1)`), the two inference paths of xp2f.
-Each prints a `case <id>` label line followed by the value, so run.py can
-compare the cases one by one.
+dropped. Each surviving case is emitted in up to three contexts: assigned
+at the top level (`r_c001m = <expr>`), returned from a function whose
+arguments get their types from the call (`f_c001(i1)`), and, for a
+numeric result, accumulated in a loop (`acc = 0; for ...: acc +=
+np.sum(<expr>)`, `l_c001`), the pattern of the int-started float
+accumulator bug. Each prints a `case <id><context>` label line followed by
+the value, so run.py can compare the cases one by one.
 
     python numpy_conformance/gen.py [name ...]
 """
@@ -47,6 +54,13 @@ FIXTURES = {
     "i2": "np.array([[3, -1, 4], [1, -5, 9]])",
     "f2": "np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
     "b2": "np.array([[True, False, True], [True, False, False]])",
+    "s2": "np.array([[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]])",
+    "k2": "np.array([[2, 1, 0], [1, 3, 1], [0, 1, 4]])",
+    "v3": "np.array([1.0, -2.0, 0.5])",
+    "c1": "np.array([1 + 2j, -0.5 + 0j, 3 - 1j])",
+    "p1": "np.array([0.25, 0.5, -0.75])",
+    "q1": "np.array([1.5, 2.0, 3.0])",
+    "e1": "np.array([1.0, np.nan, np.inf, -np.inf, -0.0])",
 }
 
 PLACEHOLDERS = {
@@ -58,6 +72,7 @@ PLACEHOLDERS = {
     "N2": ["i2", "f2"],
     "S": ["i0", "f0"],
     "T": ["j0", "g0"],
+    "SQ": ["s2", "k2"],
 }
 
 _REDUCE = [
@@ -143,6 +158,65 @@ SPECS = {
              "np.mod({N}, 3)", "np.floor_divide({N}, 2)", "{N} // 2", "{N} % 3", "{N} ** 2", "-{N}"],
 }
 
+SPECS.update({
+    "linalg_norm": [
+        "np.linalg.norm({N1})", "np.linalg.norm({N2})", "np.linalg.norm({N1}, 1)", "np.linalg.norm({N1}, np.inf)",
+        "np.linalg.norm({N1}, ord=2)", "np.linalg.norm({N1}, -np.inf)", "np.linalg.norm({N2}, axis=0)",
+        "np.linalg.norm({N2}, axis=1)", "np.linalg.norm({N2}, axis=-1)", "np.linalg.norm({SQ}, 'fro')",
+        "np.linalg.norm({SQ}, 1)", "np.linalg.norm({SQ}, np.inf)", "np.linalg.norm({SQ}, 2)",
+        "np.linalg.norm({N1} - 1)", "np.linalg.norm(v3 - {SQ} @ v3)",
+    ],
+    "linalg": [
+        "np.linalg.solve({SQ}, v3)", "np.linalg.solve(s2, {SQ})", "np.linalg.det({SQ})", "np.linalg.inv({SQ})",
+        "np.linalg.cholesky(s2)", "np.linalg.lstsq(f2.T, v3, rcond=None)[0]", "np.linalg.cond({SQ})",
+        "np.linalg.solve({SQ}, v3) @ v3", "np.linalg.inv({SQ}) @ {SQ}", "np.linalg.det({SQ} * 2)",
+        "np.linalg.matrix_power({SQ}, 2)", "np.linalg.eigvalsh(s2)",
+    ],
+    "diag_trace": [
+        "np.diag({N1})", "np.diag({SQ})", "np.diag({N2})", "np.diag({N1}, 1)", "np.diag({N1}, k=-1)",
+        "np.diag({SQ}, 1)", "np.diag({SQ}, -1)", "np.trace({SQ})", "np.trace({N2})", "{SQ}.trace()",
+        "np.diagonal({SQ})", "np.diag(np.diag({SQ}))", "np.triu({SQ})", "np.tril({SQ}, -1)",
+    ],
+    "construct2": [
+        "np.empty(3).shape", "np.empty((2, 3)).shape", "np.empty_like({A}).shape", "np.asarray({N1}, dtype=float)",
+        "np.asarray([1, 2, 3])", "np.asarray({A1}, dtype=int)", "np.append({N1}, 7)", "np.append({N1}, {N1})",
+        "np.append({N2}, {N2}, axis=0)", "np.append({N2}, {N2}, axis=1)", "np.append({N2}, 1.5)",
+        "np.column_stack(({N1}, f1))", "np.meshgrid(i1[:3], f1[:2])[0]", "np.meshgrid(i1[:3], f1[:2])[1]",
+        "np.meshgrid(i1[:3], f1[:2], indexing='ij')[0]", "np.flip({A1})", "np.flip({A2})", "np.flip({A2}, axis=0)",
+        "np.flip({A2}, axis=1)", "np.flipud({A2})", "np.fliplr({A2})", "np.roll({A1}, 2)", "np.roll({A1}, -1)",
+        "np.roll({A2}, 1)", "np.roll({A2}, 1, axis=0)", "np.roll({A2}, -1, axis=1)", "np.tile({N1}, 2)",
+        "np.repeat({N1}, 2)", "np.ones((2, 3)).shape",
+    ],
+    "tests2": [
+        "np.isfinite({N})", "np.isnan({N})", "np.isinf({N})", "np.isfinite(e1)", "np.isnan(e1)", "np.isinf(e1)",
+        "np.nan_to_num(e1)", "np.array_equal({A}, {A})", "np.array_equal(i1, f1)", "np.array_equal(i1, i1 + 0)",
+        "np.array_equal(i2, i2.T)", "np.allclose({N1}, {N1} + 1e-12)", "np.allclose(f1, f1 + 0.1)",
+        "np.isclose({N1}, 1)", "np.finfo(float).eps", "np.finfo(float).max", "np.finfo(float).tiny",
+        "np.finfo(np.float64).eps", "np.iinfo(np.int32).max", "np.sum(np.isnan(e1))",
+    ],
+    "math2": [
+        "np.arctan({N})", "np.arccos(p1)", "np.arcsin(p1)", "np.tan({N1} / 4)", "np.sinh({N})", "np.cosh({N})",
+        "np.arccosh(q1)", "np.arcsinh({N})", "np.arctanh(p1)", "np.gcd(i1, 6)", "np.gcd(i1, i1 + 2)",
+        "np.lcm(i1, 4)", "np.conjugate(c1)", "np.conj(c1)", "np.angle(c1)", "np.abs(c1)", "np.real(c1)",
+        "np.imag(c1)", "c1.conjugate()", "np.angle(f1)", "np.deg2rad({N1})", "np.rad2deg(p1)", "np.cbrt({N1})",
+        "np.expm1(p1)", "np.log1p(q1)",
+    ],
+    "stats2": [
+        "np.corrcoef(f1, i1)", "np.corrcoef(f2)", "np.quantile({N1}, 0.5)", "np.quantile({N1}, 0.25)",
+        "np.quantile({N2}, 0.5)", "np.quantile({N1}, [0.1, 0.9])", "np.median({N})", "np.median({N2}, axis=0)",
+        "np.percentile({N1}, 75)", "np.ptp({N1})", "np.average({N1})", "np.average(f1, weights=q1[[0, 1, 2, 0, 1, 2]])",
+        "np.cov(f1, i1)", "np.histogram(f1, bins=3)[0]",
+    ],
+    "inplace": [
+        "STMT w = {SQ}.copy(); np.fill_diagonal(w, 0) => w", "STMT w = {SQ}.copy(); np.fill_diagonal(w, 9) => w",
+        "STMT w = f2.copy(); np.fill_diagonal(w, -1.5) => w", "STMT w = {N1}.copy(); w[::2] = 0 => w",
+        "STMT w = {N1}.copy(); w.sort() => w", "STMT w = {N2}.copy(); w[0, :] = w[1, :] => w",
+        "STMT w = {N2}.copy(); w += 1 => w", "STMT w = {N1}.copy(); w *= 2 => w", "STMT w = {N1}.copy(); w /= 4 => w",
+        "STMT w = f1.copy(); w[w < 0] = 0 => w", "STMT w = {N2}.copy(); w[:, 1] = -1 => w",
+        "STMT w = np.zeros(3); w[1] = {S} => w", "STMT w = np.zeros((2, 2)); w[0] = v3[:2] => w",
+    ],
+})
+
 _FIXTURE_RE = re.compile(r"\b(" + "|".join(FIXTURES) + r")\b")
 
 
@@ -160,22 +234,58 @@ def expand(template):
     return list(dict.fromkeys(out))
 
 
-def numpy_accepts(expr, env):
+def parse_case(case):
+    """(statements, expression) of a case: `STMT a; b => expr` or `expr`."""
+    if case.startswith("STMT "):
+        body, expr = case[len("STMT "):].rsplit("=>", 1)
+        return [s.strip() for s in body.split(";") if s.strip()], expr.strip()
+    return [], case
+
+
+def _local_names(case, cid, ctx):
+    """case with its local names (w, w1, ...) made unique to cid/ctx."""
+    return re.sub(r"\bw(\d*)\b", lambda m: f"w{m.group(1)}_{cid}{ctx}", case)
+
+
+def evaluate(case, env):
+    stmts, expr = parse_case(case)
+    local = dict(env)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for s in stmts:
+            exec(s, local)
+        return eval(expr, local)
+
+
+def numpy_accepts(case, env):
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            v = eval(expr, env)
+        v = evaluate(case, env)
     except Exception:
         return False
-    if isinstance(v, tuple):
+    if isinstance(v, tuple) and not all(isinstance(x, (int, np.integer)) for x in v):
         return False
     return True
 
 
-def build(name):
+def _fixture_env():
     env = {"np": np}
     for k, v in FIXTURES.items():
         env[k] = eval(v, env)
+    return env
+
+
+def contexts(case):
+    """The contexts a case is emitted in: "mf", plus "l" (accumulated in a
+    loop) for a numeric array or scalar result."""
+    try:
+        v = np.asarray(evaluate(case, _fixture_env()))
+    except Exception:
+        return "mf"
+    return "mfl" if v.dtype.kind in "biufc" else "mf"
+
+
+def build(name):
+    env = _fixture_env()
     exprs = []
     for template in SPECS[name]:
         for e in expand(template):
@@ -189,22 +299,28 @@ def program(name, exprs, ids=None):
     used = sorted({m for e in exprs for m in _FIXTURE_RE.findall(e)}, key=list(FIXTURES).index)
     lines = [f'"""xp2f NumPy conformance cases: {name} (generated by gen.py)."""', "import numpy as np", ""]
     for cid, e in zip(ids, exprs):
-        params = sorted(set(_FIXTURE_RE.findall(e)), key=list(FIXTURES).index)
-        lines += ["", f"def f_{cid}({', '.join(params)}):", f"    return {e}", ""]
+        params = ", ".join(sorted(set(_FIXTURE_RE.findall(e)), key=list(FIXTURES).index))
+        stmts, expr = parse_case(_local_names(e, cid, "f"))
+        lines += ["", f"def f_{cid}({params}):"] + [f"    {s}" for s in stmts] + [f"    return {expr}", ""]
+        if "l" in contexts(e):
+            stmts, expr = parse_case(_local_names(e, cid, "l"))
+            lines += ["", f"def l_{cid}({params}):", "    acc = 0", "    for k_loop in range(2):"]
+            lines += [f"        {s}" for s in stmts] + [f"        acc += np.sum({expr})", "    return acc", ""]
     lines += ["", "# fixtures"]
     lines += [f"{k} = {FIXTURES[k]}" for k in used]
     for cid, e in zip(ids, exprs):
-        params = sorted(set(_FIXTURE_RE.findall(e)), key=list(FIXTURES).index)
-        lines += [
-            "",
-            f"# {e}",
-            f"r_{cid}m = {e}",
+        params = ", ".join(sorted(set(_FIXTURE_RE.findall(e)), key=list(FIXTURES).index))
+        stmts, expr = parse_case(_local_names(e, cid, "m"))
+        lines += ["", f"# {e}"] + stmts + [
+            f"r_{cid}m = {expr}",
             f'print("case {cid}m")',
             f"print(r_{cid}m)",
-            f"r_{cid}f = f_{cid}({', '.join(params)})",
+            f"r_{cid}f = f_{cid}({params})",
             f'print("case {cid}f")',
             f"print(r_{cid}f)",
         ]
+        if "l" in contexts(e):
+            lines += [f"r_{cid}l = l_{cid}({params})", f'print("case {cid}l")', f"print(r_{cid}l)"]
     return "\n".join(lines) + "\n"
 
 

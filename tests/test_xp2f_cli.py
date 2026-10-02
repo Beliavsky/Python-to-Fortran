@@ -25555,3 +25555,54 @@ def test_xp2f_comprehension_loops_do_not_grow_one_element_at_a_time(tmp_path: Pa
     out = (tmp_path / "xcomp_loops_p.f90").read_text(encoding="utf-8")
     assert "lc_sum_" in out and "xp2f_cap_lc_buf_" in out, out
     assert not re.search(r"lc_list_\d+ = \[lc_list_\d+,", out), out
+
+
+def test_xp2f_numpy_conformance_phase2_silent_results(tmp_path: Path) -> None:
+    # numpy_conformance phase 2: np.roll rolled the wrong way and ignored
+    # numpy's flatten-first rule; np.append flattened 2-D column-major and
+    # didn't promote kinds; a float array passed to a function using it in
+    # `//` / `%` was declared integer (the call converted it with int());
+    # and these, accumulated with `acc += np.sum(...)` from `acc = 0`, were
+    # truncated because their kind came out int: np.trace of a real matrix,
+    # np.angle, np.quantile, np.roll, lstsq(...)[0].
+    src = tmp_path / "xnp_phase2.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "",
+        "",
+        "def floor_sum(x):",
+        "    return np.sum(x // 2), np.sum(x % 3)",
+        "",
+        "",
+        "def acc_of(x, m, c):",
+        "    acc = 0",
+        "    for k in range(2):",
+        "        acc += np.sum(np.angle(c)) + np.quantile(x, 0.25) + np.trace(m) + np.sum(np.roll(x, 1))",
+        "        acc += np.sum(np.linalg.lstsq(m, x[:3], rcond=None)[0])",
+        "    return acc",
+        "",
+        "",
+        "i1 = np.array([3, -1, 4, 1, -5, 9])",
+        "f1 = np.array([0.5, -1.25, 2.0, 3.75, -0.5, 1.5])",
+        "f2 = np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
+        "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+        "s2 = np.array([[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]])",
+        "c1 = np.array([1 + 2j, -0.5 + 0j, 3 - 1j])",
+        "print(np.roll(i1, 2), np.roll(f1, -1))",
+        "print(np.roll(i2, 1))",
+        "print(np.roll(f2, -1, axis=1))",
+        "print(np.append(f2, 1.5), np.append(f1, 7))",
+        "print(np.append(i2, i2, axis=0))",
+        "fs, fm = floor_sum(f1)",
+        "print(fs, fm)",
+        "print(np.trace(i2), np.trace(s2))",
+        "print(round(acc_of(f1, s2, c1), 8))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff",
+                           "--run-diff-display-tol", "1e-7"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xnp_phase2_p.f90").read_text(encoding="utf-8")
+    assert "int(f1)" not in out, out
