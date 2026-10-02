@@ -62273,6 +62273,23 @@ class translator(ast.NodeVisitor):
                 if not advance_no:
                     self.o.w(f"write({unit_txt},*)")
                 return
+            # List-directed PRINT always advances, and Fortran does not
+            # permit ADVANCE='no' with a list-directed format. For scalar
+            # arguments, use text conversion and an explicit format so the
+            # wrapper can append end= without first starting a new record.
+            if advance_no and all(self._rank_expr(a) == 0 for a in call.args):
+                text_parts = []
+                for i_arg, a in enumerate(call.args):
+                    if i_arg and sep_txt:
+                        text_parts.append(fstr(sep_txt))
+                    if isinstance(a, ast.JoinedStr):
+                        raise NotImplementedError("f-string in multi-argument print not supported")
+                    expr_txt = self.expr(a)
+                    if self._expr_kind(a) not in {"char", "str"}:
+                        expr_txt = f"py_str({expr_txt})"
+                    text_parts.append(expr_txt)
+                self.o.w(f"write({unit_txt},{fstr('(*(a))')}, advance='no') " + ", ".join(text_parts))
+                return
             parts = []
             for i_arg, a in enumerate(call.args):
                 # Fortran list-directed output already prefixes numeric
@@ -63775,7 +63792,10 @@ def _emit_local_function(
     if fn.args.kwarg is not None:
         _reserved_local_names.add(fn.args.kwarg.arg)
     local_list_counts = build_list_count_map(local_tree, reserved_names=_reserved_local_names)
-    module_global_names = set((module_global_decls or {}).keys())
+    # Integer parameters are host-associated just like module variables.
+    # Inference may mark a read-only extent (e.g. width in h * width + w)
+    # as an integer local; declaring it would hide the initialized parameter.
+    module_global_names = set((module_global_decls or {}).keys()) | set(params)
     # Python scoping: a name this function assigns without declaring it
     # `global` is a LOCAL of this function, even if another function makes
     # a same-named module global (Burkardt triangle01_monte_carlo.py:
