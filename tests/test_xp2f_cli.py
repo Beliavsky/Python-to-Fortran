@@ -25404,3 +25404,45 @@ def test_xp2f_numpy_conformance_compile_failures(tmp_path: Path) -> None:
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_function_alias_annotated_constants_and_mixed_dict(tmp_path: Path) -> None:
+    # From the Benchmarks Game spectral-norm program: a function bound to a
+    # local name (`local_f = f`, a CPython speed trick) was an unsupported
+    # call; annotated module constants (`N: int = 7`) were not declared;
+    # and an int field of a returned dict (`{"n": n, ...}` with `n: int`)
+    # was declared real, printing 7.000.
+    src = tmp_path / "xalias_const_dict.py"
+    src.write_text("\n".join([
+        "from typing import Final",
+        "",
+        "N: int = 7",
+        "SCALE: Final[float] = 0.5",
+        "",
+        "",
+        "def g(i: int, j: int) -> float:",
+        "    return 1.0 / (i + j + 1)",
+        "",
+        "",
+        "def times(u: list[float]) -> list[float]:",
+        "    local_g = g",
+        "    return [sum(local_g(i, j) * u_j for j, u_j in enumerate(u)) for i in range(len(u))]",
+        "",
+        "",
+        "def run(n: int = N) -> dict[str, object]:",
+        "    u = [1.0] * n",
+        "    v = times(u)",
+        "    return {\"n\": n, \"total\": round(SCALE * sum(v), 9)}",
+        "",
+        "",
+        "r = run()",
+        "print(f\"n={r['n']} total={r['total']}\")",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xalias_const_dict_p.f90").read_text(encoding="utf-8")
+    assert "local_g" not in out, out
+    assert re.search(r"(?im)^\s*integer, parameter :: N = 7\b", out), out

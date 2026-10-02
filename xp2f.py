@@ -7576,6 +7576,8 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
     tree = note_source_libraries(tree)
+    tree = lower_module_scalar_annotations(tree)
+    tree = inline_function_aliases(tree)
     numpy_names = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "numpy":
@@ -18737,6 +18739,108 @@ def _numba_prange_plan(fn, loop):
 
 
 SOURCE_USES_PANDAS = False
+_SCALAR_ANNOTATION_NAMES = {"int", "float", "bool", "str", "complex"}
+
+
+def inline_function_aliases(tree):
+    """`local_f = f`, with f a module-level function and local_f bound
+    only by that assignment in its scope (a CPython speed trick that saves
+    a global lookup), is dropped and local_f is called as f."""
+    funcs = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    if not funcs:
+        return tree
+
+    def own_nodes(scope_body):
+        # Nodes of this scope, not of nested functions/classes/lambdas.
+        stack = list(scope_body)
+        while stack:
+            n = stack.pop()
+            yield n
+            for c in ast.iter_child_nodes(n):
+                if not isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    stack.append(c)
+
+    def rewrite(scope, body, params):
+        nodes = list(own_nodes(body))
+        stores = {}
+        for n in nodes:
+            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                stores[n.id] = stores.get(n.id, 0) + 1
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                for nm in n.names:
+                    stores[nm] = stores.get(nm, 0) + 2
+        aliases = {}
+        for st in body:
+            if (
+                isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                and isinstance(st.value, ast.Name) and st.value.id in funcs
+                and stores.get(st.targets[0].id) == 1 and st.targets[0].id not in params
+                and stores.get(st.value.id, 0) == 0 and st.value.id not in params
+                and st.targets[0].id not in funcs
+            ):
+                aliases[st.targets[0].id] = st.value.id
+        if not aliases:
+            return
+        # A nested scope that rebinds the alias name keeps its own meaning.
+        for n in ast.walk(ast.Module(body=body, type_ignores=[])):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                inner = {a.arg for a in n.args.args + n.args.kwonlyargs}
+                inner |= {m.id for m in ast.walk(n) if isinstance(m, ast.Name) and isinstance(m.ctx, ast.Store)}
+                for nm in list(aliases):
+                    if nm in inner:
+                        aliases.pop(nm)
+        if not aliases:
+            return
+        for n in ast.walk(ast.Module(body=body, type_ignores=[])):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in aliases:
+                n.id = aliases[n.id]
+        body[:] = [st for st in body if not (
+            isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+            and st.targets[0].id in aliases and isinstance(st.value, ast.Name)
+        )] or [ast.Pass()]
+
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            rewrite(n, n.body, {a.arg for a in n.args.args + n.args.kwonlyargs + n.args.posonlyargs}
+                    | ({n.args.vararg.arg} if n.args.vararg else set())
+                    | ({n.args.kwarg.arg} if n.args.kwarg else set()))
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+def lower_module_scalar_annotations(tree):
+    """A module-level `N: int = 2000` as `N = 2000`, so it is found as a
+    module constant like the unannotated form. Python ignores the
+    annotation at run time, so this keeps the value's own type. Only
+    scalar annotations (int, float, bool, str, complex, or Final of one)
+    are lowered; container annotations are left for the code that uses
+    them."""
+    def scalar(ann):
+        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+            try:
+                ann = ast.parse(ann.value, mode="eval").body
+            except SyntaxError:
+                return False
+        if isinstance(ann, ast.Subscript) and isinstance(ann.value, (ast.Name, ast.Attribute)):
+            base = ann.value.id if isinstance(ann.value, ast.Name) else ann.value.attr
+            if base == "Final":
+                return scalar(ann.slice)
+        return isinstance(ann, ast.Name) and ann.id in _SCALAR_ANNOTATION_NAMES
+
+    body = []
+    for node in tree.body:
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+            and node.simple
+            and scalar(node.annotation)
+        ):
+            node = ast.copy_location(ast.Assign(targets=[node.target], value=node.value), node)
+        body.append(node)
+    tree.body = body
+    ast.fix_missing_locations(tree)
+    return tree
 
 
 def note_source_libraries(tree):
@@ -35746,6 +35850,23 @@ class translator(ast.NodeVisitor):
                 return f"{df_name}%index"
             if node.id in self.callable_aliases:
                 return self.callable_aliases[node.id]
+            _module_const = self.params.get(node.id, self.__dict__.get("module_params", {}).get(node.id))
+            _local_here = (
+                node.id in set(getattr(self, "dummy_arg_names", None) or ())
+                or node.id in self.local_assigned_names
+                or any(node.id in s for s in (
+                    self.ints, self.reals, self.logs, self.complexes, self.chars, self.alloc_ints,
+                    self.alloc_reals, self.alloc_logs, self.alloc_complexes, self.alloc_chars))
+            )
+            if (
+                isinstance(_module_const, str)
+                and not _local_here
+                and self._aliased_name(node.id) != node.id
+            ):
+                # A module constant hidden case-insensitively by a local
+                # (`N` in `def run(n=N)`): Fortran can't name it here, so
+                # use its value.
+                return f"({_module_const})"
             known_names = (
                 set(self.ints)
                 | set(self.reals)
@@ -62756,6 +62877,20 @@ def _analyze_dict_return_spec(
 
     tmp_out = emit()
     tr0 = translator(tmp_out, params={}, context="flat", list_counts={}, function_result_name=_function_result_var_name(fn))
+    # The parameters' annotated types (`n: int`), so a field holding a
+    # parameter isn't taken as real.
+    for _a in list(fn.args.args) + list(fn.args.kwonlyargs):
+        _spec = annotation_type_spec(_a.annotation)
+        if _spec is None:
+            continue
+        _k, _r = _spec[0], int(_spec[1])
+        if _r == 0:
+            {"int": tr0._mark_int, "real": tr0._mark_real, "logical": tr0._mark_log,
+             "complex": tr0._mark_complex, "char": tr0._mark_char}[_k](_a.arg)
+        elif _k == "int":
+            tr0._mark_alloc_int(_a.arg, rank=_r)
+        elif _k == "real":
+            tr0._mark_alloc_real(_a.arg, rank=_r)
     tr0.prescan(fn.body)
     comps = []
     list_elem_kind = {}
@@ -63843,6 +63978,8 @@ def _emit_local_function(
         current_function_name=fn.name,
         structured_type_components=structured_type_components,
     )
+    # Module constants, visible in the procedure by host association.
+    tr.module_params = dict(params or {})
     tr.real_kind_map.update(getattr(fn, "_xp2f_arg_real_precision", {}))
     # A local variable inside a function whose name happens to match the
     # ENCLOSING function's own name (e.g. `def work(...): work = ...;
@@ -79260,6 +79397,8 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
     tree = note_source_libraries(tree)
+    tree = lower_module_scalar_annotations(tree)
+    tree = inline_function_aliases(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
@@ -79780,6 +79919,8 @@ def transpile_file(
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
     tree = note_source_libraries(tree)
+    tree = lower_module_scalar_annotations(tree)
+    tree = inline_function_aliases(tree)
     if module_only:
         _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
     reject_undefined_names_in_functions(tree)
@@ -80590,6 +80731,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
     tree = note_source_libraries(tree)
+    tree = lower_module_scalar_annotations(tree)
+    tree = inline_function_aliases(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
