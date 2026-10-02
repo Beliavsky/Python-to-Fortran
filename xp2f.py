@@ -18844,6 +18844,32 @@ def inline_function_aliases(tree):
     return tree
 
 
+def augassign_makes_real(fn, name, tr):
+    """True when fn has `name += x` (-=, *=) with a real scalar x, or
+    `name /= k`, so an int-initialized `name` is a float in Python. Only
+    this evidence counts: a real assignment elsewhere (e.g. a `d = 0.0`
+    sentinel beside integer values) is left to the existing rules. A value
+    calling a program function of unknown or provisional result kind isn't
+    evidence."""
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id == name):
+            continue
+        if isinstance(n.op, ast.Div):
+            return True
+        if any(
+            isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in SOURCE_FUNCTION_NAMES
+            and (c.func.id not in tr.local_return_specs or tr.__dict__.get("_provisional_return_specs", False))
+            for c in ast.walk(n.value)
+        ):
+            continue
+        try:
+            if int(tr._rank_expr(n.value) or 0) == 0 and tr._expr_kind(n.value) == "real":
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def lower_module_scalar_annotations(tree):
     """A module-level `N: int = 2000` as `N = 2000`, so it is found as a
     module constant like the unannotated form. Python ignores the
@@ -69166,7 +69192,7 @@ def _emit_local_function(
                             break
                     if kind_hint in {"real", "alloc_real"}:
                         break
-            if kind_hint == "int" and rank_hint <= 0 and nm in tr.reals:
+            if kind_hint == "int" and rank_hint <= 0 and augassign_makes_real(fn, nm, tr):
                 # `acc = 0` then `acc += x` with a float x: real.
                 kind_hint = "real"
             if rank_hint > 0:
@@ -70634,8 +70660,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         best_kind = "complex"
                     elif _rnm in tr_ctx.alloc_chars or _rnm in tr_ctx.chars:
                         best_kind = "char"
-        if best_rank == 0 and best_kind == "int" and name_nm in tr_ctx.reals:
-            # `acc = 0` then `acc += x` with a float x: the prescan made it real.
+        if best_rank == 0 and best_kind == "int" and augassign_makes_real(fn_node, name_nm, tr_ctx):
+            # `acc = 0` then `acc += x` with a float x: real.
             best_kind = "real"
         if _all_scalar_char_assignments():
             result = ("char", 0)
@@ -71017,7 +71043,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                     if isinstance(e, ast.Name):
                         nm = e.id
                         direct_spec = _direct_assign_spec(fn, nm, tr)
-                        if direct_spec is not None and direct_spec[0] == "int" and nm in tr.reals:
+                        if direct_spec is not None and direct_spec[0] == "int" and augassign_makes_real(fn, nm, tr):
                             # `acc = 0` then `acc += x` with a float x: real.
                             direct_spec = ("real", direct_spec[1])
                         if direct_spec is not None:
@@ -76028,7 +76054,7 @@ def generate_flat(
                 refined_any = True
                 continue
             _dk, _dr = _name_direct_assign_spec(fn, _nm, _tr_fn)
-            if _dk == "int" and int(_dr) == 0 and _nm in _tr_fn.reals:
+            if _dk == "int" and int(_dr) == 0 and augassign_makes_real(fn, _nm, _tr_fn):
                 # `acc = 0` then `acc += x` with a float x: real.
                 _dk = "real"
             if _dk in {"int", "real", "logical", "char", "complex"} and int(_dr) == 0:
