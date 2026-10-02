@@ -21,7 +21,11 @@ Statuses, worst first:
   UNTESTED    left out because the case failed in another context
   MATCH
 
-    python numpy_conformance/run.py [name ...] [--no-split]
+    python numpy_conformance/run.py [name ...] [--no-split] [--edges | --no-edges]
+
+With no names, every program runs, including the edge-input programs
+"<spec>__<edge>" (empty, one-element, NaN/inf, 3-D and complex inputs);
+--no-edges leaves those out, --edges adds them for the named specs.
 
 Writes numpy_conformance/results/results_<date>.txt and a _terse.txt.
 """
@@ -46,9 +50,12 @@ RESULTS = HERE / "results"
 ORDER = ["DIFF-value", "DIFF-kind", "DIFF-count", "RUN-FAIL", "BUILD-FAIL", "XLATE-FAIL", "UNTESTED", "MATCH"]
 # xp2f's default debug flags, reporting every error instead of the first.
 COMPILER = "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -fmax-errors=100"
+# NaN inputs: an ordered comparison with NaN raises the invalid flag, which
+# -ffpe-trap=invalid turns into a crash where numpy just compares.
+COMPILER_NAN = "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=zero -fmax-errors=100"
 
 _TOKEN_RE = re.compile(
-    r"True|False|(?<![\w.])[TF](?![\w.])|[-+]?(?:nan|NaN|inf|Infinity)"
+    r"True|False|(?<![\w.])[TF](?![\w.])|[-+]?(?:nan|NaN|Infinity|inf|Inf)\b"
     r"|[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][-+]?\d+)?"
 )
 _CASE_REF_RE = re.compile(r"\b([rfl])_(c\d{3})([mfl])?\b")
@@ -66,7 +73,8 @@ def tokens(text):
         elif re.fullmatch(r"[-+]?\d+", t):
             out.append(("int", float(t)))
         else:
-            t = t.replace("Infinity", "inf").replace("NaN", "nan").replace("d", "e").replace("D", "e")
+            t = t.replace("Infinity", "inf").replace("Inf", "inf").replace("NaN", "nan")
+            t = t.replace("d", "e").replace("D", "e")
             out.append(("float", float(t)))
     return out
 
@@ -88,7 +96,8 @@ def compare(py_text, ft_text):
     if len(a) != len(b):
         return "DIFF-count", f"{len(a)} values vs {len(b)}"
     for (_, va), (_, vb) in zip(a, b):
-        same = (va != va and vb != vb) or abs(va - vb) <= 1e-6 * max(1.0, abs(va), abs(vb))
+        same = (va != va and vb != vb) or va == vb or (
+            va == va and vb == vb and abs(va - vb) <= 1e-6 * max(1.0, abs(va), abs(vb)))
         if not same:
             return "DIFF-value", ""
     if "j" in py_text:
@@ -117,8 +126,9 @@ def python_blocks(py_path):
 
 def translate_and_build(py_path):
     """("OK" | "XLATE-FAIL" | "BUILD-FAIL", log)."""
+    compiler = COMPILER_NAN if "__nan" in py_path.stem else COMPILER
     try:
-        xp = subprocess.run([sys.executable, str(XP2F), str(py_path), "--compile", "--compiler", COMPILER],
+        xp = subprocess.run([sys.executable, str(XP2F), str(py_path), "--compile", "--compiler", compiler],
                             cwd=ROOT, capture_output=True, text=True, timeout=900)
     except subprocess.TimeoutExpired:
         return "XLATE-FAIL", "timeout"
@@ -271,7 +281,12 @@ def run_single(name, exprs, indices):
 
 def main(argv):
     split = "--no-split" not in argv
-    names = [a for a in argv if not a.startswith("--")] or list(gen.SPECS)
+    names = [a for a in argv if not a.startswith("--")]
+    if not names:
+        names = gen.program_names(edges="--no-edges" not in argv)
+    elif "--edges" in argv:
+        names = [f"{n}__{e}" for e in gen.EDGE_SETS for n in names] + names
+    names = [n for n in names if gen.build(n)]
     RESULTS.mkdir(exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M")
     full = RESULTS / f"results_{stamp}.txt"

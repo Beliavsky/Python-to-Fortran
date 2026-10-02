@@ -217,16 +217,53 @@ SPECS.update({
     ],
 })
 
+# Edge-case inputs (phase 3): program "<spec>__<edge>" runs <spec>'s
+# templates with the placeholders mapped to these fixtures instead; only
+# cases that use one of them are kept.
+EDGE_FIXTURES = {
+    "z1": "np.array([], dtype=float)",
+    "zi1": "np.array([], dtype=int)",
+    "z2": "np.zeros((0, 3))",
+    "o1": "np.array([2.5])",
+    "oi1": "np.array([7])",
+    "o2": "np.array([[1.5]])",
+    "n1": "np.array([1.0, np.nan, -2.0, np.inf, -np.inf, 0.5])",
+    "n2": "np.array([[1.0, np.nan, -2.0], [np.inf, 0.5, -np.inf]])",
+    "i3": "np.arange(24).reshape(2, 3, 4) - 7",
+    "f3": "(np.arange(24).reshape(2, 3, 4) - 7) * 0.5",
+    "c2": "np.array([[1 + 2j, -0.5 + 0j, 3 - 1j], [2j, 1 - 1j, -2 + 0.5j]])",
+}
+FIXTURES.update(EDGE_FIXTURES)
+
+EDGE_SETS = {
+    "empty": {"A1": ["z1", "zi1"], "A2": ["z2"], "N1": ["z1", "zi1"], "N2": ["z2"]},
+    "one": {"A1": ["o1", "oi1"], "A2": ["o2"], "N1": ["o1", "oi1"], "N2": ["o2"]},
+    "nan": {"A1": ["n1"], "A2": ["n2"], "N1": ["n1"], "N2": ["n2"]},
+    "3d": {"A1": [], "A2": ["i3", "f3"], "N1": [], "N2": ["i3", "f3"]},
+    "complex": {"A1": ["c1"], "A2": ["c2"], "N1": ["c1"], "N2": ["c2"]},
+}
+for _es in EDGE_SETS.values():
+    _es["A"] = _es["A1"] + _es["A2"]
+    _es["N"] = _es["N1"] + _es["N2"]
+
+
+def split_name(name):
+    """(spec, edge set or None) of a program name such as "sum__nan"."""
+    spec, _, edge = name.partition("__")
+    return spec, (edge or None)
+
+
 _FIXTURE_RE = re.compile(r"\b(" + "|".join(FIXTURES) + r")\b")
 
 
-def expand(template):
+def expand(template, placeholders=None):
+    placeholders = dict(PLACEHOLDERS, **(placeholders or {}))
     keys = re.findall(r"\{(\w+)\}", template)
     keys = list(dict.fromkeys(keys))
     if not keys:
         return [template]
     out = []
-    for combo in itertools.product(*(PLACEHOLDERS[k] for k in keys)):
+    for combo in itertools.product(*(placeholders[k] for k in keys)):
         s = template
         for k, v in zip(keys, combo):
             s = s.replace("{" + k + "}", v)
@@ -292,12 +329,26 @@ def contexts(case):
 
 def build(name):
     env = _fixture_env()
+    spec, edge = split_name(name)
+    edge_names = set()
+    if edge is not None:
+        edge_names = {f for group in EDGE_SETS[edge].values() for f in group}
     exprs = []
-    for template in SPECS[name]:
-        for e in expand(template):
+    for template in SPECS[spec]:
+        for e in expand(template, EDGE_SETS[edge] if edge else None):
+            if edge is not None and not (set(_FIXTURE_RE.findall(e)) & edge_names):
+                continue
             if e not in exprs and numpy_accepts(e, env):
                 exprs.append(e)
     return exprs
+
+
+def program_names(edges=True):
+    """All program names: one per spec, then one per spec and edge set."""
+    names = list(SPECS)
+    if edges:
+        names += [f"{s}__{e}" for e in EDGE_SETS for s in SPECS]
+    return names
 
 
 def program(name, exprs, ids=None):
@@ -342,9 +393,11 @@ def write(name):
 
 
 if __name__ == "__main__":
-    names = sys.argv[1:] or list(SPECS)
+    names = sys.argv[1:] or program_names()
     total = 0
     for nm in names:
+        if not build(nm):
+            continue
         path, n = write(nm)
         total += n
         print(f"{path.name}: {n} cases")

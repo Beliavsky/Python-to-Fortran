@@ -42371,7 +42371,8 @@ class translator(ast.NodeVisitor):
                         a0_kind = self._expr_kind(node.args[0])
                         eq_op = ".eqv." if a0_kind == "logical" else "=="
                         return f"merge({fill}, {fill}, ({a0} {eq_op} {a0}))"
-                    return f"({fill} + 0*{a0})"
+                    # Not `fill + 0*a0`: 0*NaN and 0*inf are NaN.
+                    return f"reshape(spread({fill}, 1, size({a0})), shape({a0}))"
                 if node.func.attr == "clip":
                     a0 = self.expr(node.args[0])
                     a0_kind = self._expr_kind(node.args[0])
