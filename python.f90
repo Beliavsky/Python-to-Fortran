@@ -376,6 +376,12 @@ public :: sort_vec
 public :: argsort
 public :: argsort_idx
 public :: sorted_vec
+public :: diag_k
+public :: histogram_counts !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),nbins:integer:intent(in) desc="np.histogram(x, bins=n)[0]: counts in n equal bins spanning min(x)..max(x)"
+public :: histogram_counts_edges !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),edges:real(dp)(:):intent(in) desc="np.histogram(x, bins=edges)[0]"
+public :: triu
+public :: tril
+public :: quantile_axis_2d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) desc="np.quantile(x, q, axis) of a matrix: linear quantile of each column (dim=1) or row (dim=2)"
 public :: reversed_vec
 public :: sorted_2d
 public :: argsort_2d
@@ -478,6 +484,18 @@ end interface argsort_idx
 interface sorted_vec
    module procedure sorted_real_vec, sorted_int_vec
 end interface sorted_vec
+
+interface diag_k
+   module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
+end interface diag_k
+
+interface triu
+   module procedure triu_real, triu_int
+end interface triu
+
+interface tril
+   module procedure tril_real, tril_int
+end interface tril
 
 interface reversed_vec
    module procedure reversed_real_vec, reversed_int_vec, reversed_logical_vec
@@ -3696,6 +3714,166 @@ contains
          y = x(size(x):1:-1)
       end function reversed_logical_vec
 
+      pure function diag_k_vec_real(v, k) result(a)
+         ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.
+         real(kind=dp), intent(in) :: v(:)
+         integer, intent(in) :: k
+         real(kind=dp), allocatable :: a(:,:)
+         integer :: n, i
+         n = size(v) + abs(k)
+         allocate(a(n, n), source=0.0_dp)
+         do i = 1, size(v)
+            if (k >= 0) then
+               a(i, i + k) = v(i)
+            else
+               a(i - k, i) = v(i)
+            end if
+         end do
+      end function diag_k_vec_real
+
+      pure function diag_k_mat_real(a, k) result(v)
+         ! np.diag(a, k) of a matrix: its diagonal k (above the main for k > 0).
+         real(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: k
+         real(kind=dp), allocatable :: v(:)
+         integer :: n, i
+         if (k >= 0) then
+            n = max(0, min(size(a,1), size(a,2) - k))
+         else
+            n = max(0, min(size(a,1) + k, size(a,2)))
+         end if
+         allocate(v(n))
+         do i = 1, n
+            if (k >= 0) then
+               v(i) = a(i, i + k)
+            else
+               v(i) = a(i - k, i)
+            end if
+         end do
+      end function diag_k_mat_real
+
+      pure function triu_real(a, k) result(b)
+         ! np.triu(a, k): zero below diagonal k.
+         real(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in), optional :: k
+         real(kind=dp), allocatable :: b(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         b = a
+         do j = 1, size(a,2)
+            do i = 1, size(a,1)
+               if (j - i < kk) b(i, j) = 0.0_dp
+            end do
+         end do
+      end function triu_real
+
+      pure function tril_real(a, k) result(b)
+         ! np.tril(a, k): zero above diagonal k.
+         real(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in), optional :: k
+         real(kind=dp), allocatable :: b(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         b = a
+         do j = 1, size(a,2)
+            do i = 1, size(a,1)
+               if (j - i > kk) b(i, j) = 0.0_dp
+            end do
+         end do
+      end function tril_real
+
+      pure function diag_k_vec_int(v, k) result(a)
+         ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.
+         integer, intent(in) :: v(:)
+         integer, intent(in) :: k
+         integer, allocatable :: a(:,:)
+         integer :: n, i
+         n = size(v) + abs(k)
+         allocate(a(n, n), source=0)
+         do i = 1, size(v)
+            if (k >= 0) then
+               a(i, i + k) = v(i)
+            else
+               a(i - k, i) = v(i)
+            end if
+         end do
+      end function diag_k_vec_int
+
+      pure function diag_k_mat_int(a, k) result(v)
+         ! np.diag(a, k) of a matrix: its diagonal k (above the main for k > 0).
+         integer, intent(in) :: a(:,:)
+         integer, intent(in) :: k
+         integer, allocatable :: v(:)
+         integer :: n, i
+         if (k >= 0) then
+            n = max(0, min(size(a,1), size(a,2) - k))
+         else
+            n = max(0, min(size(a,1) + k, size(a,2)))
+         end if
+         allocate(v(n))
+         do i = 1, n
+            if (k >= 0) then
+               v(i) = a(i, i + k)
+            else
+               v(i) = a(i - k, i)
+            end if
+         end do
+      end function diag_k_mat_int
+
+      pure function triu_int(a, k) result(b)
+         ! np.triu(a, k): zero below diagonal k.
+         integer, intent(in) :: a(:,:)
+         integer, intent(in), optional :: k
+         integer, allocatable :: b(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         b = a
+         do j = 1, size(a,2)
+            do i = 1, size(a,1)
+               if (j - i < kk) b(i, j) = 0
+            end do
+         end do
+      end function triu_int
+
+      pure function tril_int(a, k) result(b)
+         ! np.tril(a, k): zero above diagonal k.
+         integer, intent(in) :: a(:,:)
+         integer, intent(in), optional :: k
+         integer, allocatable :: b(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         b = a
+         do j = 1, size(a,2)
+            do i = 1, size(a,1)
+               if (j - i > kk) b(i, j) = 0
+            end do
+         end do
+      end function tril_int
+
+      pure function quantile_axis_2d(x, q, dim) result(out)
+         ! np.quantile(x, q, axis=dim-1) of a matrix (np.median with q = 0.5).
+         real(kind=dp), intent(in) :: x(:,:)
+         real(kind=dp), intent(in) :: q
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:)
+         integer :: i
+         if (dim == 1) then
+            allocate(out(size(x,2)))
+            do i = 1, size(x,2)
+               out(i) = quantile_linear(x(:,i), q)
+            end do
+         else
+            allocate(out(size(x,1)))
+            do i = 1, size(x,1)
+               out(i) = quantile_linear(x(i,:), q)
+            end do
+         end if
+      end function quantile_axis_2d
+
       pure function sorted_real_vec(x) result(y)
          ! np.sort(x) of a vector: a sorted copy.
          real(kind=dp), intent(in) :: x(:)
@@ -4269,6 +4447,40 @@ contains
             end if
          end do
       end subroutine histogram_real_edges
+
+      pure function histogram_counts(x, nbins) result(h)
+         ! np.histogram(x, bins=nbins)[0]: nbins equal bins from min(x) to
+         ! max(x) (widened by 0.5 each side when they are equal, as numpy does).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: nbins
+         integer, allocatable :: h(:)
+         real(kind=dp), allocatable :: edges(:), e_out(:)
+         real(kind=dp) :: lo, hi
+         integer :: i
+         lo = 0.0_dp
+         hi = 1.0_dp
+         if (size(x) > 0) then
+            lo = minval(x)
+            hi = maxval(x)
+         end if
+         if (lo == hi) then
+            lo = lo - 0.5_dp
+            hi = hi + 0.5_dp
+         end if
+         allocate(edges(nbins + 1))
+         do i = 1, nbins + 1
+            edges(i) = lo + (hi - lo) * real(i - 1, kind=dp) / real(nbins, kind=dp)
+         end do
+         call histogram_real_edges(x, edges, h, e_out)
+      end function histogram_counts
+
+      pure function histogram_counts_edges(x, edges) result(h)
+         ! np.histogram(x, bins=edges)[0].
+         real(kind=dp), intent(in) :: x(:), edges(:)
+         integer, allocatable :: h(:)
+         real(kind=dp), allocatable :: e_out(:)
+         call histogram_real_edges(x, edges, h, e_out)
+      end function histogram_counts_edges
 
       pure subroutine histogram_int_edges(x, bins, h, edges)
          integer, intent(in) :: x(:), bins(:)

@@ -8803,7 +8803,10 @@ def function_is_pure(fn_node, known_pure_calls=None):
                 if np_chain is not None:
                     leaf = np_chain[-1].lower()
                     inner = {seg.lower() for seg in np_chain[1:-1]}
-                    if "linalg" in inner and leaf in {"det", "inv", "solve", "lstsq", "eigvals", "eig"}:
+                    if "linalg" in inner and leaf in {
+                        "det", "inv", "solve", "lstsq", "eigvals", "eig", "cholesky", "cond", "eigvalsh", "eigh",
+                        "matrix_power", "pinv", "qr", "svd", "slogdet", "matrix_rank",
+                    }:
                         self.ok = False
                         return
                     if "linalg" in inner and leaf == "norm":
@@ -15573,7 +15576,7 @@ def detect_needed_helpers(tree):
         "linspace": {"linspace"},
         "logspace": {"logspace"},
         "geomspace": {"geomspace"},
-        "cumsum": {"cumsum"},
+        "cumsum": {"cumsum", "reversed_vec"},
         "cumprod": {"cumprod"},
         "cumulative_sum": {"cumsum"},
         "cumulative_prod": {"cumprod"},
@@ -15591,7 +15594,12 @@ def detect_needed_helpers(tree):
         "round": {"np_rint"},
         "around": {"np_rint"},
         "rint": {"np_rint"},
-        "diag": {"diag"},
+        "diag": {"diag", "diag_k"},
+        "triu": {"triu"},
+        "tril": {"tril"},
+        "quantile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d"},
+        "median": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d"},
+        "percentile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d"},
         "diagonal": {"diagonal"},
         "repeat": {
             "repeat",
@@ -15618,6 +15626,8 @@ def detect_needed_helpers(tree):
         "unravel_index": {"unravel_index_2d"},
         "kron": {"kron_2d"},
         "mean": {"mean"},
+        "average": {"mean", "mean_1d"},
+        "histogram": {"histogram_counts", "histogram_counts_edges"},
         "var": {"var"},
         "std": {"std"},
         "nansum": {"nansum"},
@@ -15632,10 +15642,12 @@ def detect_needed_helpers(tree):
         "zeros": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
         "ones": {"ones_int", "ones_real", "ones_logical", "zeros_complex", "ones_complex"},
         "zeros_like": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
+        "empty": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
+        "empty_like": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
         "ones_like": {"ones_int", "ones_real", "ones_logical", "ones_complex"},
         "full": {"arange_int"},
         "nonzero": {"arange_int", "where_axis_2d"},
-        "sort": {"sort_vec", "sorted_vec", "sorted_2d"},
+        "sort": {"sort_vec", "sorted_vec", "sorted_2d", "reversed_vec"},
         "flip": {"reversed_vec"},
         "argsort": {"argsort", "argsort_idx", "argsort_2d"},
         "flatnonzero": {"arange_int"},
@@ -28119,7 +28131,8 @@ class translator(ast.NodeVisitor):
     # Array methods translated through their numpy function form
     # (x.mean(axis=0) as np.mean(x, axis=0)), where that form is the more
     # complete translation.
-    _METHODS_AS_NUMPY_FUNCTIONS = {"mean", "std", "var", "cumsum", "cumprod", "clip", "ptp"}
+    _METHODS_AS_NUMPY_FUNCTIONS = {"mean", "std", "var", "cumsum", "cumprod", "clip", "ptp", "trace", "diagonal",
+                                   "conjugate", "conj"}
     # Array methods of a bool array translated through the numpy function
     # (whose bool handling is below).
     _BOOL_METHODS_AS_NUMPY_FUNCTIONS = {
@@ -28246,6 +28259,62 @@ class translator(ast.NodeVisitor):
         ):
             new = ast.Call(func=func, args=[astype(node.args[0], "float")] + list(node.args[1:]),
                            keywords=list(node.keywords))
+        elif is_numpy_name_node(func.value) and attr in {"empty", "empty_like"}:
+            # Unspecified values: zeros are as good as any.
+            new = ast.Call(func=np_func("zeros" if attr == "empty" else "zeros_like"), args=list(node.args),
+                           keywords=list(node.keywords))
+        elif is_numpy_name_node(func.value) and attr == "percentile" and len(node.args) >= 2:
+            # np.percentile(x, p) is np.quantile(x, p / 100).
+            q = node.args[1]
+            if isinstance(q, (ast.List, ast.Tuple)):
+                q = ast.Call(func=np_func("asarray"), args=[q], keywords=[])
+            q = ast.BinOp(left=q, op=ast.Div(), right=ast.Constant(value=100.0))
+            new = ast.Call(func=np_func("quantile"), args=[node.args[0], q] + list(node.args[2:]),
+                           keywords=list(node.keywords))
+        elif is_numpy_name_node(func.value) and attr == "median" and len(node.args) >= 1:
+            # The median is numpy's linear 0.5 quantile.
+            new = ast.Call(func=np_func("quantile"), args=[node.args[0], ast.Constant(value=0.5)] + list(node.args[1:2]),
+                           keywords=[kw for kw in node.keywords if kw.arg == "axis"])
+        elif is_numpy_name_node(func.value) and attr == "fliplr" and len(node.args) == 1:
+            new = ast.Call(func=np_func("flip"), args=[node.args[0]],
+                           keywords=[ast.keyword(arg="axis", value=ast.Constant(value=1))])
+        elif is_numpy_name_node(func.value) and attr == "ptp" and len(node.args) >= 1:
+            # max - min, over the same axis.
+            new = ast.BinOp(left=ast.Call(func=np_func("max"), args=list(node.args), keywords=list(node.keywords)),
+                            op=ast.Sub(),
+                            right=ast.Call(func=np_func("min"), args=list(node.args), keywords=list(node.keywords)))
+        elif is_numpy_name_node(func.value) and attr == "average" and len(node.args) >= 1 and len(node.args) <= 2:
+            weights = node.args[1] if len(node.args) == 2 else next(
+                (kw.value for kw in node.keywords if kw.arg == "weights"), None)
+            others = [kw for kw in node.keywords if kw.arg != "weights"]
+            if weights is None:
+                new = ast.Call(func=np_func("mean"), args=[node.args[0]], keywords=others)
+            elif not others:
+                new = ast.BinOp(
+                    left=ast.Call(func=np_func("sum"), args=[ast.BinOp(left=node.args[0], op=ast.Mult(), right=weights)],
+                                  keywords=[]),
+                    op=ast.Div(), right=ast.Call(func=np_func("sum"), args=[weights], keywords=[]))
+        elif (
+            is_numpy_name_node(func.value) and attr in {"isnan", "isinf", "isfinite"} and len(node.args) == 1
+            and self._expr_kind(node.args[0]) in {"int", "logical"}
+        ):
+            # Integers and bools are always finite.
+            new = ast.Compare(left=node.args[0], ops=[ast.Eq() if attr == "isfinite" else ast.NotEq()],
+                              comparators=[node.args[0]])
+        elif (
+            is_numpy_name_node(func.value) and attr in {"corrcoef", "cov", "quantile"} and node.args
+            and any(self._expr_kind(a) in {"int", "logical"} for a in node.args[: (1 if attr == "quantile" else 2)])
+        ):
+            n_conv = 1 if attr == "quantile" else 2
+            args = [astype(a, "float") if i < n_conv and self._expr_kind(a) in {"int", "logical"} else a
+                    for i, a in enumerate(node.args)]
+            new = ast.Call(func=func, args=args, keywords=list(node.keywords))
+        elif (
+            is_numpy_name_node(func.value) and attr in {"asarray", "array"} and len(node.args) == 1
+            and self._expr_kind(node.args[0]) == "logical"
+            and any(kw.arg == "dtype" for kw in node.keywords) and "int" in self._np_dtype_text(node)
+        ):
+            new = astype(node.args[0], "int")
         elif is_numpy_name_node(func.value) and attr == "flatnonzero" and len(node.args) == 1 and not node.keywords:
             ravel = ast.Call(func=np_func("ravel"), args=[node.args[0]], keywords=[])
             new = ast.Subscript(value=ast.Call(func=np_func("nonzero"), args=[ravel], keywords=[]),
@@ -28313,11 +28382,18 @@ class translator(ast.NodeVisitor):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             return
         attr = node.func.attr
-        if attr not in self._AXIS_POSITIONAL_1 | self._AXIS_OF_FIRST_ARGUMENT:
+        _linalg = (isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "linalg"
+                   and is_numpy_name_node(node.func.value.value))
+        if attr not in self._AXIS_POSITIONAL_1 | self._AXIS_OF_FIRST_ARGUMENT and not (_linalg and attr == "norm"):
             # Only functions whose axis indexes their first argument (not
             # e.g. np.lexsort, whose axis is that of each key).
             return
-        if is_numpy_name_node(node.func.value):
+        if _linalg:
+            if not node.args:
+                return
+            arr = node.args[0]
+            pos_axis = 2
+        elif is_numpy_name_node(node.func.value):
             if not node.args:
                 return
             arr = node.args[0]
@@ -28375,6 +28451,24 @@ class translator(ast.NodeVisitor):
 
     def _expr_kind(self, node):
         self._normalize_negative_axis(node)
+        _mg = self._meshgrid_part(node)
+        if _mg is not None:
+            _k = self._expr_kind(_mg[0])
+            return _k if _k in {"int", "real", "complex", "logical"} else "real"
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and is_numpy_name_node(node.func.value) and node.func.attr in {"triu", "tril", "diagonal"} and node.args
+        ):
+            return "int" if self._expr_kind(node.args[0]) in {"int", "logical"} else "real"
+        if self._histogram_counts_call(node) is not None:
+            return "int"
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "matrix_power" and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "linalg" and node.args
+        ):
+            _k = self._expr_kind(node.args[0])
+            return "int" if _k in {"int", "logical"} else ("complex" if _k == "complex" else "real")
         if (
             isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "lstsq"
@@ -30115,7 +30209,8 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 # numpy.linalg results are float (complex for complex input);
-                # norm and cond are always real.
+                # norm and cond are always real. (matrix_power keeps its
+                # argument's kind; it isn't in this list.)
                 if node.func.attr not in {"norm", "cond"} and any(
                     self._expr_kind(a) == "complex" for a in node.args
                 ):
@@ -33688,6 +33783,35 @@ class translator(ast.NodeVisitor):
             return f"({value}) /= (0.0_dp, 0.0_dp)"
         return self._coerce_expr_kind(node, value, "logical")
 
+    def _histogram_counts_call(self, node):
+        """The np.histogram call of np.histogram(x, bins=...)[0], else None."""
+        if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value == 0
+                and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                and is_numpy_name_node(node.value.func.value) and node.value.func.attr == "histogram"
+                and node.value.args):
+            return node.value
+        return None
+
+    def _meshgrid_part(self, node):
+        """For np.meshgrid(a, b[, indexing=...])[k] with 1-D a, b: (the
+        array whose values fill the result, the vector along the other axis,
+        the result dimension it is spread along, the other vector)."""
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and node.slice.value in (0, 1) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute) and is_numpy_name_node(node.value.func.value)
+                and node.value.func.attr == "meshgrid" and len(node.value.args) == 2):
+            return None
+        call = node.value
+        indexing = next((kw.value.value for kw in call.keywords if kw.arg == "indexing"
+                         and isinstance(kw.value, ast.Constant)), "xy")
+        a, b = call.args
+        k = node.slice.value
+        if indexing == "ij":
+            # X[i, j] = a[i], Y[i, j] = b[j]: shape (len(a), len(b)).
+            return (a, b, 2, b) if k == 0 else (b, a, 1, a)
+        # "xy": X[i, j] = a[j], Y[i, j] = b[i]: shape (len(b), len(a)).
+        return (a, b, 1, b) if k == 0 else (b, a, 2, a)
+
     def _np_sort_dim(self, node):
         """The Fortran dimension np.sort / np.argsort of a 2-D array sorts
         along (numpy's default axis is the last)."""
@@ -33735,6 +33859,24 @@ class translator(ast.NodeVisitor):
 
     def _rank_expr(self, node):
         self._normalize_negative_axis(node)
+        _mg = self._meshgrid_part(node)
+        if _mg is not None:
+            return 2
+        if self._histogram_counts_call(node) is not None:
+            return 1
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_numpy_name_node(node.func.value):
+            _attr = node.func.attr
+            if _attr == "quantile" and len(node.args) >= 2:
+                _has_axis = len(node.args) >= 3 or any(kw.arg == "axis" for kw in node.keywords)
+                if _has_axis and int(self._rank_expr(node.args[0]) or 0) == 2:
+                    return 1
+                return 1 if int(self._rank_expr(node.args[1]) or 0) >= 1 else 0
+            if _attr in {"triu", "tril"} and node.args:
+                return 2
+            if _attr == "diagonal" and node.args and int(self._rank_expr(node.args[0]) or 0) == 2:
+                return 1
+            if _attr == "diag" and node.args:
+                return 2 if int(self._rank_expr(node.args[0]) or 0) == 1 else 1
         _canon = self._canonical_numpy_call(node)
         if _canon is not None:
             return self._rank_expr(_canon)
@@ -35608,6 +35750,38 @@ class translator(ast.NodeVisitor):
     def expr(self, node):
         validate_numpy_atleast_call(node)
         self._normalize_negative_axis(node)
+        _mg = self._meshgrid_part(node)
+        if _mg is not None:
+            vals, other, dim, _ = _mg
+            return f"spread({self.expr(vals)}, {dim}, size({self.expr(other)}))"
+        _hc = self._histogram_counts_call(node)
+        if _hc is not None:
+            if any(kw.arg not in {"bins"} for kw in _hc.keywords):
+                raise NotImplementedError("np.histogram(...)[0] supports only the bins= argument")
+            bins = _hc.args[1] if len(_hc.args) >= 2 else next(
+                (kw.value for kw in _hc.keywords if kw.arg == "bins"), ast.Constant(value=10))
+            x = self.expr(_hc.args[0])
+            if self._expr_kind(_hc.args[0]) != "real":
+                x = f"real({x}, kind=dp)"
+            if int(self._rank_expr(_hc.args[0]) or 0) != 1:
+                x = f"reshape({x}, [size({x})])"
+            if int(self._rank_expr(bins) or 0) >= 1:
+                e = self.expr(bins)
+                if self._expr_kind(bins) != "real":
+                    e = f"real({e}, kind=dp)"
+                return f"histogram_counts_edges({x}, {e})"
+            return f"histogram_counts({x}, int({self.expr(bins)}))"
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and is_numpy_name_node(node.func.value) and node.func.attr in {"triu", "tril"} and node.args
+        ):
+            k_node = node.args[1] if len(node.args) >= 2 else next(
+                (kw.value for kw in node.keywords if kw.arg == "k"), None)
+            a0 = self.expr(node.args[0])
+            if self._expr_kind(node.args[0]) == "logical":
+                a0 = f"merge(1, 0, {a0})"
+            k_txt = "" if k_node is None else f", int({self.expr(k_node)})"
+            return f"{node.func.attr}({a0}{k_txt})"
         _canon = self._canonical_numpy_call(node)
         if _canon is not None:
             return self.expr(_canon)
@@ -40660,6 +40834,16 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 q0 = self.expr(node.args[1])
+                if self._expr_kind(node.args[1]) != "real":
+                    q0 = f"real({q0}, kind=dp)"
+                axis_node = node.args[2] if len(node.args) >= 3 else next(
+                    (kw.value for kw in node.keywords if kw.arg == "axis"), None)
+                if axis_node is not None and int(self._rank_expr(node.args[0])) == 2:
+                    if not (isinstance(axis_node, ast.Constant) and axis_node.value in (0, 1)):
+                        raise NotImplementedError("np.quantile/np.median of a matrix needs axis 0, 1 or -1")
+                    if int(self._rank_expr(node.args[1])) >= 1:
+                        raise NotImplementedError("np.quantile with an axis takes one quantile")
+                    return f"quantile_axis_2d({a0}, {q0}, {int(axis_node.value) + 1})"
                 if int(self._rank_expr(node.args[1])) >= 1:
                     return f"quantile_linear_vec(reshape({a0}, [size({a0})]), {q0})"
                 return f"quantile_linear(reshape({a0}, [size({a0})]), {q0})"
@@ -41308,6 +41492,9 @@ class translator(ast.NodeVisitor):
                 _a0 = self.expr(node.args[0])
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    # numpy keeps an integer matrix integer.
+                    return f"nint(linalg_matrix_power({_a0}, int({self.expr(node.args[1])})))"
                 return f"linalg_matrix_power({_a0}, int({self.expr(node.args[1])}))"
             if self._is_linalg_call(node.func, {"multi_dot"}) and len(node.args) >= 1:
                 # np.linalg.multi_dot([A, B, C, ...]) -- chained matmul in
@@ -42149,9 +42336,21 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 if node.func.attr == "full" and len(node.args) >= 2:
-                    n_expr = self.expr(node.args[0])
+                    # SPREAD the fill value (of the result's kind) to the shape.
                     fill = self.expr(node.args[1])
-                    return f"({fill} + 0.0_dp*real(arange_int(0, int({n_expr}), 1), kind=dp))"
+                    kind = self._expr_kind(node)
+                    if kind == "real" and self._expr_kind(node.args[1]) != "real":
+                        fill = f"real({fill}, kind=dp)"
+                    elif kind == "int" and self._expr_kind(node.args[1]) == "real":
+                        fill = f"int({fill})"
+                    shape = node.args[0]
+                    dims = list(shape.elts) if isinstance(shape, (ast.Tuple, ast.List)) else [shape]
+                    if not 1 <= len(dims) <= 3:
+                        raise NotImplementedError("np.full supports arrays of rank 1 to 3")
+                    out = fill
+                    for d, dn in enumerate(dims, start=1):
+                        out = f"spread({out}, {d}, int({self.expr(dn)}))"
+                    return out
                 if node.func.attr == "full_like" and len(node.args) >= 2:
                     a0 = self.expr(node.args[0])
                     fill = self.expr(node.args[1])
@@ -42425,8 +42624,11 @@ class translator(ast.NodeVisitor):
                     if kw.arg == "k":
                         k_node = kw.value
                         break
-                if k_node is None:
+                if k_node is None or (isinstance(k_node, ast.Constant) and k_node.value == 0):
                     return f"diag({a0})"
+                # Diagonal k of a matrix, or a matrix with a vector on diagonal k.
+                if self._expr_kind(node.args[0]) in {"int", "real"}:
+                    return f"diag_k({a0}, int({self.expr(k_node)}))"
                 if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, int)):
                     raise NotImplementedError("np.diag currently supports only constant integer k")
                 k_val = int(k_node.value)
@@ -43207,6 +43409,16 @@ class translator(ast.NodeVisitor):
                 r0 = self._rank_expr(arg0)
                 if int(r0) <= 1 and not re.fullmatch(r"[A-Za-z_]\w*(?:%\w+)*", a0):
                     return f"reversed_vec({a0})"
+                if node.func.attr == "flip" and int(r0) == 2:
+                    axis_node = node.args[1] if len(node.args) >= 2 else next(
+                        (kw.value for kw in node.keywords if kw.arg == "axis"), None)
+                    if axis_node is None or (isinstance(axis_node, ast.Constant) and axis_node.value is None):
+                        return f"{a0}(size({a0},1):1:-1, size({a0},2):1:-1)"
+                    if isinstance(axis_node, ast.Constant) and axis_node.value == 0:
+                        return f"{a0}(size({a0},1):1:-1, :)"
+                    if isinstance(axis_node, ast.Constant) and axis_node.value == 1:
+                        return f"{a0}(:, size({a0},2):1:-1)"
+                    raise NotImplementedError("np.flip of a matrix needs axis None, 0, 1 or -1")
                 if node.func.attr == "flip":
                     return f"{a0}(size({a0}):1:-1)"
                 if r0 <= 1:
@@ -50363,7 +50575,12 @@ class translator(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
-        if isinstance(node.value, (ast.Call, ast.Subscript)):
+        if isinstance(node.value, (ast.Call, ast.Subscript)) and not (
+            # x = np.empty(...) keeps its own uninitialized allocation; only
+            # an np.empty inside an expression becomes np.zeros.
+            isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+            and is_numpy_name_node(node.value.func.value) and node.value.func.attr in {"empty", "empty_like"}
+        ):
             _canon = self._canonical_numpy_call(node.value)
             if _canon is not None:
                 node.value = _canon

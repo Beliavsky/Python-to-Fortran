@@ -25606,3 +25606,50 @@ def test_xp2f_numpy_conformance_phase2_silent_results(tmp_path: Path) -> None:
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
     out = (tmp_path / "xnp_phase2_p.f90").read_text(encoding="utf-8")
     assert "int(f1)" not in out, out
+
+
+def test_xp2f_numpy_conformance_phase2_compile_failures(tmp_path: Path) -> None:
+    # numpy_conformance phase 2 calls that didn't compile or were rejected:
+    # np.median/percentile/ptp/average/histogram(...)[0]/meshgrid(...)[k] as
+    # expressions, x.trace()/x.conjugate(), np.triu/tril, np.fliplr, np.flip
+    # of a matrix, np.diag(x, k) (negative k, vectors), np.isnan of ints,
+    # corrcoef/cov/quantile of ints, np.full with a shape tuple, np.empty in
+    # an expression, axis=-1 of np.linalg.norm, linalg helpers in a function
+    # (impure), np.linalg.matrix_power of an int matrix (int).
+    exprs = [
+        "np.median(f1)", "np.median(i2, axis=0)", "np.percentile(f1, 75)", "np.quantile(i1, [0.1, 0.9])",
+        "np.ptp(i1)", "np.average(f1)", "np.average(f1, weights=q1)", "np.histogram(f1, bins=3)[0]",
+        "np.meshgrid(i1[:3], f1[:2])[0]", "np.meshgrid(i1[:3], f1[:2], indexing='ij')[1]", "s2.trace()",
+        "c1.conjugate()", "np.triu(s2)", "np.tril(k2, -1)", "np.fliplr(i2)", "np.flip(f2)", "np.flip(i2, axis=0)",
+        "np.diag(f1, -1)", "np.diag(s2, 1)", "np.diag(k2, k=-1)", "np.isnan(i1)", "np.isfinite(i2)",
+        "np.corrcoef(f1, i1)", "np.cov(f1, i1)", "np.full((2, 3), -1.5)", "np.full(4, True)",
+        "np.empty((2, 3)).shape", "np.linalg.norm(f2, axis=-1)", "np.linalg.cond(s2)",
+        "np.linalg.matrix_power(k2, 2)",
+    ]
+    lines = [
+        "import numpy as np",
+        "",
+        "",
+        "def g(m):",
+        "    return np.linalg.cholesky(m) @ np.ones(3)",
+        "",
+        "",
+        "i1 = np.array([3, -1, 4, 1, -5, 9])",
+        "f1 = np.array([0.5, -1.25, 2.0, 3.75, -0.5, 1.5])",
+        "q1 = np.array([1.5, 2.0, 3.0, 1.5, 2.0, 3.0])",
+        "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+        "f2 = np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
+        "s2 = np.array([[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]])",
+        "k2 = np.array([[2, 1, 0], [1, 3, 1], [0, 1, 4]])",
+        "c1 = np.array([1 + 2j, -0.5 + 0j, 3 - 1j])",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(r{k})"]
+    lines += ["print(g(s2))", ""]
+    src = tmp_path / "xnp_phase2_compile.py"
+    src.write_text("\n".join(lines), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff",
+                           "--run-diff-display-tol", "1e-7"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

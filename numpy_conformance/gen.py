@@ -281,7 +281,13 @@ def contexts(case):
         v = np.asarray(evaluate(case, _fixture_env()))
     except Exception:
         return "mf"
-    return "mfl" if v.dtype.kind in "biufc" else "mf"
+    if v.dtype.kind not in "biufc":
+        return "mf"
+    with np.errstate(all="ignore"):
+        big = v.size and np.nanmax(np.abs(np.where(np.isfinite(v), v, 0))) > 1e300
+    # Summing values near the float maximum overflows, which the debug
+    # build traps (numpy gives inf).
+    return "mf" if big else "mfl"
 
 
 def build(name):
