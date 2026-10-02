@@ -630,6 +630,7 @@ interface print_matrix
    module procedure print_matrix_int_2d
    module procedure print_matrix_label_int_2d
    module procedure print_matrix_logical_2d
+   module procedure print_matrix_complex_2d
 end interface print_matrix
 
 interface print_array_3d
@@ -1081,6 +1082,34 @@ contains
             end if
          end do
       end subroutine print_matrix_int_2d
+
+      subroutine print_matrix_complex_2d(a)
+         ! A 2-D complex array row by row, each element as (re,im).
+         complex(kind=dp), intent(in) :: a(:,:)
+         integer :: i, j
+         character(len=80) :: buf
+         if (size(a,1) <= 0 .or. size(a,2) <= 0) then
+            write(*, "(a)") "[]"
+            return
+         end if
+         do i = 1, size(a,1)
+            if (i == 1) then
+               write(*, "(a)", advance="no") "[["
+            else
+               write(*, "(a)", advance="no") " ["
+            end if
+            do j = 1, size(a,2)
+               if (j > 1) write(*, "(a)", advance="no") " "
+               write(buf, "(a,g0,a,g0,a)") "(", real(a(i,j)), ",", aimag(a(i,j)), ")"
+               write(*, "(a)", advance="no") trim(buf)
+            end do
+            if (i == size(a,1)) then
+               write(*, "(a)") "]]"
+            else
+               write(*, "(a)") "]"
+            end if
+         end do
+      end subroutine print_matrix_complex_2d
 
       subroutine print_matrix_logical_2d(a)
          ! A 2-D logical array in NumPy's layout: rows in order, each

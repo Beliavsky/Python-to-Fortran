@@ -15628,8 +15628,8 @@ def detect_needed_helpers(tree):
         "mean": {"mean"},
         "average": {"mean", "mean_1d"},
         "histogram": {"histogram_counts", "histogram_counts_edges"},
-        "var": {"var"},
-        "std": {"std"},
+        "var": {"var", "mean", "mean_1d"},
+        "std": {"std", "mean", "mean_1d"},
         "nansum": {"nansum"},
         "nanmean": {"nanmean"},
         "nanvar": {"nanvar"},
@@ -28259,6 +28259,24 @@ class translator(ast.NodeVisitor):
         ):
             new = ast.Call(func=func, args=[astype(node.args[0], "float")] + list(node.args[1:]),
                            keywords=list(node.keywords))
+        elif (
+            is_numpy_name_node(func.value) and attr in {"var", "std"} and len(node.args) == 1
+            and self._expr_kind(node.args[0]) == "complex"
+        ):
+            if any(kw.arg != "ddof" for kw in node.keywords):
+                raise NotImplementedError(f"np.{attr} of a complex array supports only ddof=")
+            # numpy: var = sum(|x - mean(x)|**2) / (n - ddof), std its root.
+            x = node.args[0]
+            dev = ast.Call(func=np_func("abs"), args=[ast.BinOp(
+                left=x, op=ast.Sub(), right=ast.Call(func=np_func("mean"), args=[x], keywords=[]))], keywords=[])
+            n = ast.Call(func=np_func("size"), args=[x], keywords=[])
+            ddof = next((kw.value for kw in node.keywords if kw.arg == "ddof"), None)
+            denom = n if ddof is None else ast.BinOp(left=n, op=ast.Sub(), right=ddof)
+            var = ast.BinOp(
+                left=ast.Call(func=np_func("sum"), args=[ast.BinOp(left=dev, op=ast.Pow(), right=ast.Constant(value=2))],
+                              keywords=[]),
+                op=ast.Div(), right=denom)
+            new = var if attr == "var" else ast.Call(func=np_func("sqrt"), args=[var], keywords=[])
         elif is_numpy_name_node(func.value) and attr in {"empty", "empty_like"}:
             # Unspecified values: zeros are as good as any.
             new = ast.Call(func=np_func("zeros" if attr == "empty" else "zeros_like"), args=list(node.args),
@@ -30419,6 +30437,9 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"mean", "var", "std", "log2", "log10", "nansum", "nanmean", "nanvar", "nanstd", "nanmin", "nanmax"}
                 and len(node.args) >= 1
             ):
+                if node.func.attr in {"mean", "nanmean", "nansum", "log2", "log10"} and self._expr_kind(node.args[0]) == "complex":
+                    # The mean of complex values is complex (var/std are real).
+                    return "complex"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -42837,7 +42858,8 @@ class translator(ast.NodeVisitor):
                 a0_kind = self._expr_kind(node.args[0])
                 if a0_kind == "logical":
                     a0_real = None
-                elif a0_kind == "real":
+                elif a0_kind in {"real", "complex"}:
+                    # (real() of a complex array would drop its imaginary part)
                     a0_real = a0
                 else:
                     a0_real = f"real({a0}, kind=dp)"
@@ -42851,6 +42873,8 @@ class translator(ast.NodeVisitor):
                 if axis_node is None:
                     if a0_kind == "logical":
                         return f"(real(count({a0}), kind=dp) / real(size({a0}), kind=dp))"
+                    if a0_kind == "complex":
+                        return f"(sum({a0}) / real(size({a0}), kind=dp))"
                     return f"mean_1d({a0_real})"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 reduced = f"(sum({a0}, dim={dim_expr}) / real(size({a0}, dim={dim_expr}), kind=dp))"
@@ -62676,7 +62700,7 @@ class translator(ast.NodeVisitor):
                             self.o.w(f"write({unit_txt},*) " + ", ".join(pair_parts))
                     return
             if self._rank_expr(a0) == 2 and self._expr_kind(a0) in {
-                "real", "int", "alloc_real", "alloc_int", "logical", "alloc_log"
+                "real", "int", "alloc_real", "alloc_int", "logical", "alloc_log", "complex", "alloc_complex"
             }:
                 self.o.w(f"call print_matrix({self.expr(a0)})")
                 return
