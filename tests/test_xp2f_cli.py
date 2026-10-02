@@ -25446,3 +25446,112 @@ def test_xp2f_function_alias_annotated_constants_and_mixed_dict(tmp_path: Path) 
     out = (tmp_path / "xalias_const_dict_p.f90").read_text(encoding="utf-8")
     assert "local_g" not in out, out
     assert re.search(r"(?im)^\s*integer, parameter :: N = 7\b", out), out
+
+
+def test_xp2f_int_initialized_accumulator_of_floats_is_real(tmp_path: Path) -> None:
+    # `acc = 0` then `acc += <float>` makes acc a float in Python; it was
+    # declared integer and truncated (5.0 printed as 4), in a function, at
+    # top level, nested inside another loop, and as a tuple-return output.
+    src = tmp_path / "xacc_float.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "",
+        "",
+        "def g(j):",
+        "    return 0.5 * j",
+        "",
+        "",
+        "def f1(n):",
+        "    acc = 0",
+        "    for j in range(n):",
+        "        acc += 0.5 * j",
+        "    return acc",
+        "",
+        "",
+        "def f2(x):",
+        "    acc = 0",
+        "    for v in x:",
+        "        acc += v",
+        "    return acc",
+        "",
+        "",
+        "def f3(n):",
+        "    acc = 0",
+        "    for j in range(n):",
+        "        acc += g(j)",
+        "    return acc",
+        "",
+        "",
+        "def rows(u):",
+        "    out = []",
+        "    for i in range(len(u)):",
+        "        s = 0",
+        "        for j, u_j in enumerate(u):",
+        "            s += g(i + j) * u_j",
+        "        out.append(s)",
+        "    return out",
+        "",
+        "",
+        "def pair(n):",
+        "    a = 0",
+        "    b = 0",
+        "    for j in range(n):",
+        "        a += g(j)",
+        "        b += 2 * j",
+        "    return a, b",
+        "",
+        "",
+        "acc = 0",
+        "for j in range(5):",
+        "    acc += g(j)",
+        "print(f1(5), f2(np.array([0.5, 1.25])), f3(5), acc)",
+        "print(rows([1.5, 2.0, 0.25]))",
+        "p, q = pair(4)",
+        "print(p, q)",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_comprehension_loops_do_not_grow_one_element_at_a_time(tmp_path: Path) -> None:
+    # A comprehension calling a local function becomes a loop. Appending to
+    # the result list grew it one element per append (quadratic: the
+    # spectral-norm benchmark ran minutes instead of a second); now values
+    # go to a buffer that grows by doubling, and sum(<comprehension>) is a
+    # running total with no list at all.
+    src = tmp_path / "xcomp_loops.py"
+    src.write_text("\n".join([
+        "def a(i, j):",
+        "    return 1.0 / (i + j + 1)",
+        "",
+        "",
+        "def times(u):",
+        "    return [sum(a(i, j) * u_j for j, u_j in enumerate(u)) for i in range(len(u))]",
+        "",
+        "",
+        "def odd_squares(n):",
+        "    return [a(k, 0) * k for k in range(n) if k % 2 == 1]",
+        "",
+        "",
+        "def pairs(n):",
+        "    return sum(a(i, j) for i in range(n) for j in range(i))",
+        "",
+        "",
+        "u = [1.0] * 40",
+        "for _ in range(3):",
+        "    u = times(u)",
+        "print(round(sum(u), 10), len(u))",
+        "print(odd_squares(7))",
+        "print(round(pairs(30), 10), sum((a(k, k) for k in range(4)), 10))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    out = (tmp_path / "xcomp_loops_p.f90").read_text(encoding="utf-8")
+    assert "lc_sum_" in out and "xp2f_cap_lc_buf_" in out, out
+    assert not re.search(r"lc_list_\d+ = \[lc_list_\d+,", out), out

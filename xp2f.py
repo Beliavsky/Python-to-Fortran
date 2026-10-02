@@ -4883,7 +4883,12 @@ def rewrite_comprehensions_calling_local_functions_to_loops(tree):
             if COND:
                 lc_list_1.append(ELT)
 
-    and use `lc_list_1` in place of the comprehension. The loop variables
+    and use `lc_list_1` in place of the comprehension. The values are
+    appended to a buffer, lc_buf_1, which is copied out as lc_list_1 =
+    lc_buf_1[:len(lc_buf_1)]: a list that is only appended to and sliced
+    grows by doubling, where one read as a whole grows one element at a
+    time, which is quadratic. sum(<comprehension>) becomes a running total
+    (lc_sum_1 = 0, lc_sum_1 += ELT), with no list at all. The loop variables
     are renamed because a comprehension's own variables do not leak in
     Python. Only a comprehension Python always evaluates is moved: not one
     in a while test, an IfExp branch, a later and/or operand, a lambda or
@@ -4924,11 +4929,13 @@ def rewrite_comprehensions_calling_local_functions_to_loops(tree):
                 n.id = mapping[n.id]
         return node
 
-    def _loop_for(comp, out):
-        # Statements that build the comprehension's values; returns the list name.
+    def _loop_for(comp, out, total=None):
+        # Statements that build the comprehension's values; returns the list
+        # name, or with total=(name, start) the running-total name.
         if any(g.is_async for g in comp.generators):
             return None
-        tmp = _fresh("lc_list")
+        tmp = _fresh("lc_list") if total is None else total[0]
+        buf = _fresh("lc_buf") if total is None else tmp
         mapping = {}
         gens = []
         for g in comp.generators:
@@ -4939,21 +4946,49 @@ def rewrite_comprehensions_calling_local_functions_to_loops(tree):
             target = _rename(g.target, dict(mapping))
             gens.append((target, it, [_rename(c, dict(mapping)) for c in g.ifs]))
         elt = _rename(comp.elt, mapping)
-        body = [ast.Expr(value=ast.Call(
-            func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()), attr="append", ctx=ast.Load()),
-            args=[elt], keywords=[]))]
+        if total is None:
+            body = [ast.Expr(value=ast.Call(
+                func=ast.Attribute(value=ast.Name(id=buf, ctx=ast.Load()), attr="append", ctx=ast.Load()),
+                args=[elt], keywords=[]))]
+            init = ast.Assign(targets=[ast.Name(id=buf, ctx=ast.Store())], value=ast.List(elts=[], ctx=ast.Load()))
+        else:
+            body = [ast.AugAssign(target=ast.Name(id=tmp, ctx=ast.Store()), op=ast.Add(), value=elt)]
+            init = ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=total[1])
         for target, it, ifs in reversed(gens):
             for cond in reversed(ifs):
                 body = [ast.If(test=cond, body=body, orelse=[])]
             body = [ast.For(target=target, iter=it, body=body, orelse=[])]
-        init = ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=ast.List(elts=[], ctx=ast.Load()))
-        for st in [init] + body:
+        tail = []
+        if total is None:
+            # lc_list = lc_buf[:len(lc_buf)]
+            tail = [ast.Assign(
+                targets=[ast.Name(id=tmp, ctx=ast.Store())],
+                value=ast.Subscript(
+                    value=ast.Name(id=buf, ctx=ast.Load()),
+                    slice=ast.Slice(lower=None, upper=ast.Call(
+                        func=ast.Name(id="len", ctx=ast.Load()), args=[ast.Name(id=buf, ctx=ast.Load())],
+                        keywords=[]), step=None),
+                    ctx=ast.Load()))]
+        for st in [init] + body + tail:
             ast.copy_location(st, comp)
         out.append(init)
         out.extend(body)
+        out.extend(tail)
         return tmp
 
     def _hoist(node, out):
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "sum"
+            and "sum" not in user_fns and not node.keywords and 1 <= len(node.args) <= 2
+            and isinstance(node.args[0], (ast.ListComp, ast.GeneratorExp)) and _calls_user_fn(node.args[0])
+        ):
+            # sum(f(x) for x in xs): a running total, starting from sum's start (0).
+            start = node.args[1] if len(node.args) == 2 else ast.Constant(value=0)
+            start = _hoist(start, out)
+            acc = _loop_for(node.args[0], out, total=(_fresh("lc_sum"), start))
+            if acc is not None:
+                return ast.copy_location(ast.Name(id=acc, ctx=ast.Load()), node)
+            return node
         if isinstance(node, (ast.ListComp, ast.GeneratorExp)) and _calls_user_fn(node):
             tmp = _loop_for(node, out)
             if tmp is not None:
@@ -18739,6 +18774,7 @@ def _numba_prange_plan(fn, loop):
 
 
 SOURCE_USES_PANDAS = False
+SOURCE_FUNCTION_NAMES = set()
 _SCALAR_ANNOTATION_NAMES = {"int", "float", "bool", "str", "complex"}
 
 
@@ -18846,7 +18882,8 @@ def lower_module_scalar_annotations(tree):
 def note_source_libraries(tree):
     """Record facts about the file's imports that translation rules need
     (whether array methods might be pandas methods)."""
-    global SOURCE_USES_PANDAS
+    global SOURCE_USES_PANDAS, SOURCE_FUNCTION_NAMES
+    SOURCE_FUNCTION_NAMES = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     SOURCE_USES_PANDAS = any(
         (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "pandas" for a in n.names))
         or (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "pandas")
@@ -49619,8 +49656,28 @@ class translator(ast.NodeVisitor):
                     self._mark_alloc_real(t.id)
 
             if isinstance(node, ast.AugAssign):
+                # `acc = 0` then `acc += x` with a float x makes acc a float
+                # in Python (and `acc /= k` always does).
+                _aug_kind = None
+                _aug_known = not any(
+                    # A call to a program function whose result kind this pass
+                    # doesn't know yet says nothing about the value's kind.
+                    isinstance(_c, ast.Call) and isinstance(_c.func, ast.Name)
+                    and _c.func.id in SOURCE_FUNCTION_NAMES
+                    and (_c.func.id not in self.local_return_specs
+                         or self.__dict__.get("_provisional_return_specs", False))
+                    for _c in ast.walk(node.value)
+                )
+                if isinstance(node.target, ast.Name) and int(self._rank_expr(node.value) or 0) == 0:
+                    _aug_kind = self._expr_kind(node.value) if _aug_known else None
+                    if isinstance(node.op, ast.Div) and _aug_kind != "complex":
+                        _aug_kind = "real"
                 for nm in extract_target_names(node.target):
                     if nm in self.reals:
+                        self._mark_real(nm)
+                    elif _aug_kind == "complex":
+                        self._mark_complex(nm)
+                    elif _aug_kind == "real":
                         self._mark_real(nm)
                     else:
                         self._mark_int(nm)
@@ -65088,6 +65145,16 @@ def _emit_local_function(
             assign_specs = []
             bad = False
             for _st in ast.walk(fn):
+                if (
+                    isinstance(_st, ast.AugAssign) and isinstance(_st.target, ast.Name) and _st.target.id == _nm
+                    and int(tr._rank_expr(_st.value) or 0) == 0
+                ):
+                    # `s = 0` then `s += x`: a float x (or `s /= k`) makes s
+                    # a float, which the prescan already decided.
+                    _kk = "real" if isinstance(_st.op, ast.Div) else tr._expr_kind(_st.value)
+                    if _kk in {"real", "complex"}:
+                        assign_specs.append((_kk, 0))
+                    continue
                 if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _nm):
                     continue
                 _rr = int(tr._rank_expr(_st.value))
@@ -66787,6 +66854,18 @@ def _emit_local_function(
             specs = []
             bad = False
             for _st in ast.walk(fn):
+                if (
+                    isinstance(_st, ast.AugAssign) and isinstance(_st.target, ast.Name) and _st.target.id == _nm
+                ):
+                    # `s = 0` then `s += x` with a float x (or `s /= k`): real.
+                    try:
+                        if int(tr._rank_expr(_st.value) or 0) == 0:
+                            _kk = "real" if isinstance(_st.op, ast.Div) else tr._expr_kind(_st.value)
+                            if _kk in {"real", "complex"}:
+                                specs.append((_kk, 0))
+                    except Exception:
+                        pass
+                    continue
                 if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _nm):
                     continue
                 try:
@@ -69087,6 +69166,9 @@ def _emit_local_function(
                             break
                     if kind_hint in {"real", "alloc_real"}:
                         break
+            if kind_hint == "int" and rank_hint <= 0 and nm in tr.reals:
+                # `acc = 0` then `acc += x` with a float x: real.
+                kind_hint = "real"
             if rank_hint > 0:
                 if kind_hint == "real":
                     kind_hint = "alloc_real"
@@ -70552,6 +70634,9 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         best_kind = "complex"
                     elif _rnm in tr_ctx.alloc_chars or _rnm in tr_ctx.chars:
                         best_kind = "char"
+        if best_rank == 0 and best_kind == "int" and name_nm in tr_ctx.reals:
+            # `acc = 0` then `acc += x` with a float x: the prescan made it real.
+            best_kind = "real"
         if _all_scalar_char_assignments():
             result = ("char", 0)
         elif force_rank1:
@@ -70932,6 +71017,9 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                     if isinstance(e, ast.Name):
                         nm = e.id
                         direct_spec = _direct_assign_spec(fn, nm, tr)
+                        if direct_spec is not None and direct_spec[0] == "int" and nm in tr.reals:
+                            # `acc = 0` then `acc += x` with a float x: real.
+                            direct_spec = ("real", direct_spec[1])
                         if direct_spec is not None:
                             _spec, _rank = direct_spec
                             if _spec == "alloc_int":
@@ -72998,6 +73086,8 @@ def generate_flat(
         tr_seed.local_df_return_info.update(_scan_local_df_return_info(local_funcs))
         tr_seed.tuple_df_return_positions.update(_all_tuple_df_return_positions(local_funcs))
         _top_level_scan_nodes = [st for st in tree.body if not isinstance(st, ast.FunctionDef)]
+        # Its return specs are provisional (untyped parameters taken as real).
+        tr_seed._provisional_return_specs = True
         tr_seed.prescan(_top_level_scan_nodes)
         def _promote_kind_hint(cur, newk):
             if newk is None:
@@ -75938,6 +76028,9 @@ def generate_flat(
                 refined_any = True
                 continue
             _dk, _dr = _name_direct_assign_spec(fn, _nm, _tr_fn)
+            if _dk == "int" and int(_dr) == 0 and _nm in _tr_fn.reals:
+                # `acc = 0` then `acc += x` with a float x: real.
+                _dk = "real"
             if _dk in {"int", "real", "logical", "char", "complex"} and int(_dr) == 0:
                 base_kinds[_i] = _dk
                 base_ranks[_i] = 0
