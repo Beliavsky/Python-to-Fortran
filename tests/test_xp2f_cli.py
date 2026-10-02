@@ -25364,3 +25364,43 @@ def test_xp2f_numpy_result_kinds_match_numpy2(tmp_path: Path) -> None:
         assert nums, (e, got[k])
         is_float = ["." in x or "e" in x.lower() for x in nums]
         assert all(is_float) if kind == "float" else not any(is_float), (e, kind, got[k])
+
+
+def test_xp2f_numpy_conformance_compile_failures(tmp_path: Path) -> None:
+    # Calls numpy_conformance/ found failing to compile: axis=-1; array
+    # methods (x.mean(), x.cumsum(axis=0), x.clip(...)); 2-D input with no
+    # axis; bool arrays as numbers; mixed int/float operands; np.clip with
+    # a None bound; np.fmax of ints; cumprod/sort/argsort along an axis;
+    # np.var of ints; nonzero of 2-D; flatnonzero; vdot; sort(axis=None)
+    # and sort(x)[::-1]; full_like of bools; argmax with an axis;
+    # np.absolute and np.hypot of arrays.
+    exprs = [
+        "np.sum(i2, axis=-1)", "np.mean(f2, axis=-1)", "np.max(i2, axis=-1, keepdims=True)",
+        "np.cumsum(f2, axis=-1)", "np.sort(f2, axis=-2)", "i1.mean()", "i2.cumsum(axis=0)",
+        "f1.clip(-1, 3)", "np.mean(i2)", "np.cumsum(i2)", "np.prod(b2, axis=0)", "np.mean(b1)",
+        "np.max(b2, axis=1)", "np.argmin(b1)", "np.cumsum(b1)", "np.sort(b1)", "np.std(b2)",
+        "np.maximum(f1, 1)", "np.clip(i1, -0.5, 1.5)", "np.clip(i2, 0, None)",
+        "np.where(i2 > 1, i2, -0.5)", "np.where(i2, 1, 2)", "np.fmax(i1, 0)", "np.cumprod(i2, axis=1)",
+        "np.var(i1, ddof=1)", "np.nonzero(i2)[1]", "np.flatnonzero(f2)", "np.vdot(i1, f1)",
+        "np.sort(i2, axis=None)", "np.sort(f1)[::-1]", "np.argsort(f2, axis=0)", "np.full_like(b1, 2)",
+        "np.argmax(f2, axis=1)", "f2.argmax(axis=-1)", "np.absolute(i2)", "np.hypot(f1, 1)",
+    ]
+    lines = [
+        "import numpy as np",
+        "i1 = np.array([3, -1, 4, 1, -5, 9])",
+        "f1 = np.array([0.5, -1.25, 2.0, 3.75, -0.5, 1.5])",
+        "b1 = np.array([True, False, True, True, False, False])",
+        "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+        "f2 = np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
+        "b2 = np.array([[True, False, True], [True, False, False]])",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(r{k})"]
+    src = tmp_path / "xnp_compile.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # numpy prints arrays to 8 significant digits.
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff",
+                           "--run-diff-display-tol", "1e-7"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

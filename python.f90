@@ -107,6 +107,12 @@ public :: argsort_real !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx
 public :: argsort_int !@pyapi kind=subroutine args=x:integer(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of integer vector"
 public :: argsort_idx_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in) desc="argsort indices (0-based) of real vector"
 public :: argsort_idx_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="argsort indices (0-based) of integer vector"
+public :: sorted_real_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="np.sort of a real vector: a sorted copy"
+public :: sorted_int_vec !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="np.sort of an integer vector: a sorted copy"
+public :: sorted_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in) desc="np.sort of a real matrix along dimension dim (1 = down columns)"
+public :: sorted_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),dim:integer:intent(in) desc="np.sort of an integer matrix along dimension dim (1 = down columns)"
+public :: argsort_real_2d !@pyapi kind=function ret=integer(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in) desc="np.argsort (0-based) of a real matrix along dimension dim"
+public :: argsort_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),dim:integer:intent(in) desc="np.argsort (0-based) of an integer matrix along dimension dim"
 public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="integer arange(start, stop, step)"
 public :: np_insert_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in),val:real(dp):intent(in) desc="numpy insert for rank-1 real array and scalar value"
 public :: np_delete_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in) desc="numpy delete for rank-1 real array and scalar index"
@@ -205,6 +211,10 @@ public :: diag_from_mat_real !@pyapi kind=function ret=real(dp)(:) args=a:real(d
 public :: cumsum_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative sum of integer vector"
 public :: cumsum_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative sum of integer matrix along axis 0"
 public :: cumsum_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative sum of integer matrix along axis 1"
+public :: cumprod_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative product of real matrix along axis 0"
+public :: cumprod_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative product of real matrix along axis 1"
+public :: cumprod_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative product of integer matrix along axis 0"
+public :: cumprod_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative product of integer matrix along axis 1"
 public :: itertools_product2_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="itertools.product(a,b) for integer vectors"
 public :: itertools_combinations_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations(x,r) for integer vectors (r=2 currently)"
 public :: itertools_combinations_wr_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations_with_replacement(x,r) for integer vectors (r=2 currently)"
@@ -365,6 +375,10 @@ public :: unique
 public :: sort_vec
 public :: argsort
 public :: argsort_idx
+public :: sorted_vec
+public :: reversed_vec
+public :: sorted_2d
+public :: argsort_2d
 public :: histogram
 public :: reduceat_add
 public :: reduceat_mul
@@ -460,6 +474,22 @@ end interface argsort
 interface argsort_idx
    module procedure argsort_idx_real, argsort_idx_int
 end interface argsort_idx
+
+interface sorted_vec
+   module procedure sorted_real_vec, sorted_int_vec
+end interface sorted_vec
+
+interface reversed_vec
+   module procedure reversed_real_vec, reversed_int_vec, reversed_logical_vec
+end interface reversed_vec
+
+interface sorted_2d
+   module procedure sorted_real_2d, sorted_int_2d
+end interface sorted_2d
+
+interface argsort_2d
+   module procedure argsort_real_2d, argsort_int_2d
+end interface argsort_2d
 
 interface histogram
    module procedure histogram_real_edges, histogram_int_edges
@@ -3642,6 +3672,132 @@ contains
          call argsort_int(x, idx)
       end function argsort_idx_int
 
+      pure function reversed_real_vec(x) result(y)
+         ! x[::-1] / np.flip(x) of a vector expression (a function result
+         ! can't be subscripted in Fortran).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: y(:)
+         y = x(size(x):1:-1)
+      end function reversed_real_vec
+
+      pure function reversed_int_vec(x) result(y)
+         ! x[::-1] / np.flip(x) of a vector expression (a function result
+         ! can't be subscripted in Fortran).
+         integer, intent(in) :: x(:)
+         integer, allocatable :: y(:)
+         y = x(size(x):1:-1)
+      end function reversed_int_vec
+
+      pure function reversed_logical_vec(x) result(y)
+         ! x[::-1] / np.flip(x) of a vector expression (a function result
+         ! can't be subscripted in Fortran).
+         logical, intent(in) :: x(:)
+         logical, allocatable :: y(:)
+         y = x(size(x):1:-1)
+      end function reversed_logical_vec
+
+      pure function sorted_real_vec(x) result(y)
+         ! np.sort(x) of a vector: a sorted copy.
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: y(:)
+         y = x
+         call sort_real_vec(y)
+      end function sorted_real_vec
+
+      pure function sorted_real_2d(x, dim) result(y)
+         ! np.sort(x, axis) of a matrix: each column (dim = 1) or row
+         ! (dim = 2) sorted.
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: y(:,:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i
+         y = x
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               v = y(:,i)
+               call sort_real_vec(v)
+               y(:,i) = v
+            end do
+         else
+            do i = 1, size(x,1)
+               v = y(i,:)
+               call sort_real_vec(v)
+               y(i,:) = v
+            end do
+         end if
+      end function sorted_real_2d
+
+      pure function argsort_real_2d(x, dim) result(idx)
+         ! np.argsort(x, axis) of a matrix: 0-based positions within each
+         ! column (dim = 1) or row (dim = 2).
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: idx(:,:)
+         integer :: i
+         allocate(idx(size(x,1), size(x,2)))
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               idx(:,i) = argsort_idx_real(x(:,i))
+            end do
+         else
+            do i = 1, size(x,1)
+               idx(i,:) = argsort_idx_real(x(i,:))
+            end do
+         end if
+      end function argsort_real_2d
+
+      pure function sorted_int_vec(x) result(y)
+         ! np.sort(x) of a vector: a sorted copy.
+         integer, intent(in) :: x(:)
+         integer, allocatable :: y(:)
+         y = x
+         call sort_int_vec(y)
+      end function sorted_int_vec
+
+      pure function sorted_int_2d(x, dim) result(y)
+         ! np.sort(x, axis) of a matrix: each column (dim = 1) or row
+         ! (dim = 2) sorted.
+         integer, intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: y(:,:)
+         integer, allocatable :: v(:)
+         integer :: i
+         y = x
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               v = y(:,i)
+               call sort_int_vec(v)
+               y(:,i) = v
+            end do
+         else
+            do i = 1, size(x,1)
+               v = y(i,:)
+               call sort_int_vec(v)
+               y(i,:) = v
+            end do
+         end if
+      end function sorted_int_2d
+
+      pure function argsort_int_2d(x, dim) result(idx)
+         ! np.argsort(x, axis) of a matrix: 0-based positions within each
+         ! column (dim = 1) or row (dim = 2).
+         integer, intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: idx(:,:)
+         integer :: i
+         allocate(idx(size(x,1), size(x,2)))
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               idx(:,i) = argsort_idx_int(x(:,i))
+            end do
+         else
+            do i = 1, size(x,1)
+               idx(i,:) = argsort_idx_int(x(i,:))
+            end do
+         end if
+      end function argsort_int_2d
+
       pure function arange_int(start, stop, step) result(x)
          integer, intent(in) :: start, stop, step
          integer, allocatable :: x(:)
@@ -5744,6 +5900,66 @@ contains
             end do
          end if
       end function cumsum_int_axis1_2d
+
+      pure function cumprod_real_axis0_2d(x) result(y)
+         real(kind=dp), intent(in) :: x(:,:)
+         real(kind=dp), allocatable :: y(:,:)
+         integer :: i, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (m >= 1) then
+            y(1,:) = x(1,:)
+            do i = 2, m
+               y(i,:) = y(i-1,:) * x(i,:)
+            end do
+         end if
+      end function cumprod_real_axis0_2d
+
+      pure function cumprod_real_axis1_2d(x) result(y)
+         real(kind=dp), intent(in) :: x(:,:)
+         real(kind=dp), allocatable :: y(:,:)
+         integer :: j, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (n >= 1) then
+            y(:,1) = x(:,1)
+            do j = 2, n
+               y(:,j) = y(:,j-1) * x(:,j)
+            end do
+         end if
+      end function cumprod_real_axis1_2d
+
+      pure function cumprod_int_axis0_2d(x) result(y)
+         integer, intent(in) :: x(:,:)
+         integer, allocatable :: y(:,:)
+         integer :: i, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (m >= 1) then
+            y(1,:) = x(1,:)
+            do i = 2, m
+               y(i,:) = y(i-1,:) * x(i,:)
+            end do
+         end if
+      end function cumprod_int_axis0_2d
+
+      pure function cumprod_int_axis1_2d(x) result(y)
+         integer, intent(in) :: x(:,:)
+         integer, allocatable :: y(:,:)
+         integer :: j, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (n >= 1) then
+            y(:,1) = x(:,1)
+            do j = 2, n
+               y(:,j) = y(:,j-1) * x(:,j)
+            end do
+         end if
+      end function cumprod_int_axis1_2d
 
       pure function diag_from_vec_real(v) result(x)
          real(kind=dp), intent(in) :: v(:)

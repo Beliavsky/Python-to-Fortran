@@ -7575,6 +7575,7 @@ def rewrite_bare_numpy_imports_to_attribute_calls(tree):
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
+    tree = note_source_libraries(tree)
     numpy_names = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "numpy":
@@ -15596,7 +15597,11 @@ def detect_needed_helpers(tree):
         "zeros_like": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
         "ones_like": {"ones_int", "ones_real", "ones_logical", "ones_complex"},
         "full": {"arange_int"},
-        "nonzero": {"arange_int"},
+        "nonzero": {"arange_int", "where_axis_2d"},
+        "sort": {"sort_vec", "sorted_vec", "sorted_2d"},
+        "flip": {"reversed_vec"},
+        "argsort": {"argsort", "argsort_idx", "argsort_2d"},
+        "flatnonzero": {"arange_int"},
         "argwhere": {"arange_int"},
         "where": {"arange_int", "where_indices_2d", "where_axis_2d", "gather_where2d", "where_pair_2d"},
         "union1d": {"unique_int"},
@@ -16920,6 +16925,14 @@ def detect_needed_helpers(tree):
                 needed.add("cumsum_real_axis1_2d")
                 needed.add("cumsum_int_axis0_2d")
                 needed.add("cumsum_int_axis1_2d")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "cumprod"
+            ):
+                needed.update({"cumprod_real", "cumprod_int", "cumprod_real_axis0_2d", "cumprod_real_axis1_2d",
+                               "cumprod_int_axis0_2d", "cumprod_int_axis1_2d"})
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"cumsum", "cumprod"}
@@ -18721,6 +18734,21 @@ def _numba_prange_plan(fn, loop):
         "line": loop.lineno,
     }
     return plan, None
+
+
+SOURCE_USES_PANDAS = False
+
+
+def note_source_libraries(tree):
+    """Record facts about the file's imports that translation rules need
+    (whether array methods might be pandas methods)."""
+    global SOURCE_USES_PANDAS
+    SOURCE_USES_PANDAS = any(
+        (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "pandas" for a in n.names))
+        or (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "pandas")
+        for n in ast.walk(tree)
+    )
+    return tree
 
 
 def rewrite_numba(tree):
@@ -27913,6 +27941,262 @@ class translator(ast.NodeVisitor):
         )
 
     _KIND_ORDER = ("logical", "int", "real", "complex")
+    # numpy functions/methods whose positional argument 1 is the axis.
+    _AXIS_POSITIONAL_1 = {
+        "sum", "prod", "mean", "min", "max", "amin", "amax", "std", "var", "argmin", "argmax",
+        "cumsum", "cumprod", "sort", "argsort", "any", "all", "nansum", "nanmean", "nanmin",
+        "nanmax", "nanstd", "nanvar", "nanprod", "ptp", "median", "count_nonzero", "flip",
+        "nanargmin", "nanargmax", "squeeze", "expand_dims",
+    }
+
+    # Array methods translated through their numpy function form
+    # (x.mean(axis=0) as np.mean(x, axis=0)), where that form is the more
+    # complete translation.
+    _METHODS_AS_NUMPY_FUNCTIONS = {"mean", "std", "var", "cumsum", "cumprod", "clip", "ptp"}
+    # Array methods of a bool array translated through the numpy function
+    # (whose bool handling is below).
+    _BOOL_METHODS_AS_NUMPY_FUNCTIONS = {
+        "prod", "min", "max", "argmin", "argmax", "cumsum", "cumprod", "mean", "std", "var",
+    }
+    # numpy functions that treat a bool array as 0/1 integers.
+    _BOOL_AS_INT = {
+        "prod", "mean", "std", "var", "argmin", "argmax", "cumsum", "cumprod", "median", "ptp",
+        "average", "nanmean", "nanstd", "nanvar", "nanprod", "nancumsum", "nancumprod", "argsort",
+    }
+    # Elementwise functions whose numeric operands numpy promotes to a
+    # common kind (index into node.args).
+    _PROMOTED_OPERANDS = {"maximum": (0, 1), "minimum": (0, 1), "fmax": (0, 1), "fmin": (0, 1),
+                          "clip": (0, 1, 2), "where": (1, 2)}
+    # numpy functions that, without an axis, work on the flattened array.
+    _FLATTEN_WITHOUT_AXIS = {
+        "mean", "std", "var", "cumsum", "cumprod", "median", "ptp", "nanmean", "nanstd",
+        "nanvar", "nancumsum", "nancumprod", "nanmedian", "unique",
+    }
+
+    def _canonical_numpy_call(self, node):
+        """An equivalent, more directly translatable form of a numpy call
+        or array method, or None: x.cumsum(axis=0) -> np.cumsum(x, axis=0);
+        np.mean(m) of a 2-D m -> np.mean(np.ravel(m)); np.sort(m, axis=None)
+        -> np.sort(np.ravel(m))."""
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and is_numpy_name_node(node.value.func.value)
+            and node.value.func.attr in {"sort", "cumsum", "cumprod", "unique", "linspace", "arange"}
+            and isinstance(node.slice, ast.Slice)
+            and node.slice.lower is None and node.slice.upper is None
+            and isinstance(node.slice.step, ast.UnaryOp) and isinstance(node.slice.step.op, ast.USub)
+            and isinstance(node.slice.step.operand, ast.Constant) and node.slice.step.operand.value == 1
+            and int(self._rank_expr(node.value) or 0) == 1
+        ):
+            # np.sort(x)[::-1]: a call result can't be subscripted in Fortran.
+            cached = getattr(node, "_xp2f_canonical", None)
+            if cached is None:
+                cached = ast.fix_missing_locations(ast.copy_location(ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="flip", ctx=ast.Load()),
+                    args=[node.value], keywords=[]), node))
+                node._xp2f_canonical = cached
+            return cached
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and is_numpy_name_node(node.value.func.value)
+            and node.value.func.attr == "nonzero"
+            and len(node.value.args) == 1
+            and int(self._rank_expr(node.value.args[0]) or 0) == 2
+        ):
+            cached = getattr(node, "_xp2f_canonical", None)
+            if cached is not None:
+                return cached
+            x = node.value.args[0]
+            cond = x if self._expr_kind(x) == "logical" else ast.Compare(
+                left=x, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+            where = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="where",
+                                                ctx=ast.Load()), args=[cond], keywords=[])
+            new = ast.fix_missing_locations(ast.copy_location(
+                ast.Subscript(value=where, slice=node.slice, ctx=ast.Load()), node))
+            node._xp2f_canonical = new
+            return new
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        cached = getattr(node, "_xp2f_canonical", None)
+        if cached is not None:
+            return cached
+        func = node.func
+        attr = func.attr
+        new = None
+
+        def np_func(name):
+            return ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name, ctx=ast.Load())
+
+        def astype(n, type_name):
+            return ast.Call(func=ast.Attribute(value=n, attr="astype", ctx=ast.Load()),
+                            args=[ast.Name(id=type_name, ctx=ast.Load())], keywords=[])
+
+        def as_float(n):
+            # An int literal becomes a float literal; anything else astype(float).
+            if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool):
+                return ast.Constant(value=float(n.value))
+            if (isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant)
+                    and isinstance(n.operand.value, int) and not isinstance(n.operand.value, bool)):
+                return ast.Constant(value=-float(n.operand.value))
+            return astype(n, "float")
+
+        recv_kind = None if is_numpy_name_node(func.value) else self._expr_kind(func.value)
+        if (
+            not is_numpy_name_node(func.value)
+            and (attr in self._METHODS_AS_NUMPY_FUNCTIONS
+                 or (attr in self._BOOL_METHODS_AS_NUMPY_FUNCTIONS and recv_kind == "logical"))
+            and not SOURCE_USES_PANDAS
+            and int(self._rank_expr(func.value) or 0) >= 1
+            and recv_kind in {"int", "real", "logical", "complex"}
+        ):
+            new = ast.Call(func=np_func(attr), args=[func.value] + list(node.args), keywords=list(node.keywords))
+        elif is_numpy_name_node(func.value) and node.args and self._expr_kind(node.args[0]) == "logical" and (
+            attr in self._BOOL_AS_INT | {"min", "max", "amin", "amax", "sort", "unique", "full_like"}
+        ):
+            arr = node.args[0]
+            if attr == "full_like":
+                # A bool array filled with bool(v).
+                if not any(kw.arg == "dtype" for kw in node.keywords) and len(node.args) == 2:
+                    new = ast.Compare(left=ast.Call(func=func, args=[astype(arr, "int"), node.args[1]], keywords=[]),
+                                      ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+            elif attr in self._BOOL_AS_INT:
+                new = ast.Call(func=func, args=[astype(arr, "int")] + list(node.args[1:]), keywords=list(node.keywords))
+            elif attr in {"min", "max", "amin", "amax"}:
+                # The min of bools is their AND, the max their OR.
+                new = ast.Call(func=np_func("all" if attr in {"min", "amin"} else "any"),
+                               args=list(node.args), keywords=list(node.keywords))
+            elif all(kw.arg == "axis" for kw in node.keywords) and len(node.args) == 1:
+                # np.sort / np.unique of bools: of 0/1 integers, back to bool.
+                new = ast.Compare(left=ast.Call(func=func, args=[astype(arr, "int")], keywords=list(node.keywords)),
+                                  ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+        elif (
+            is_numpy_name_node(func.value) and attr in {"var", "nanvar"} and node.args
+            and self._expr_kind(node.args[0]) == "int"
+        ):
+            new = ast.Call(func=func, args=[astype(node.args[0], "float")] + list(node.args[1:]),
+                           keywords=list(node.keywords))
+        elif is_numpy_name_node(func.value) and attr == "flatnonzero" and len(node.args) == 1 and not node.keywords:
+            ravel = ast.Call(func=np_func("ravel"), args=[node.args[0]], keywords=[])
+            new = ast.Subscript(value=ast.Call(func=np_func("nonzero"), args=[ravel], keywords=[]),
+                                slice=ast.Constant(value=0), ctx=ast.Load())
+        elif is_numpy_name_node(func.value) and attr == "vdot" and len(node.args) == 2 and not node.keywords:
+            a, b = (ast.Call(func=np_func("ravel"), args=[x], keywords=[]) for x in node.args)
+            if self._expr_kind(node.args[0]) == "complex":
+                a = ast.Call(func=np_func("conj"), args=[a], keywords=[])
+            new = ast.Call(func=np_func("dot"), args=[a, b], keywords=[])
+        elif (
+            is_numpy_name_node(func.value) and attr == "where" and len(node.args) == 3
+            and self._expr_kind(node.args[0]) in {"int", "real"}
+        ):
+            # np.where(x, a, b) with a numeric x tests x != 0.
+            cond = ast.Compare(left=node.args[0], ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+            new = ast.Call(func=func, args=[cond] + list(node.args[1:]), keywords=list(node.keywords))
+        elif (
+            is_numpy_name_node(func.value) and attr in self._PROMOTED_OPERANDS
+            and (attr != "where" or len(node.args) == 3)
+        ):
+            idx = [i for i in self._PROMOTED_OPERANDS[attr] if i < len(node.args)
+                   and not (isinstance(node.args[i], ast.Constant) and node.args[i].value is None)]
+            kinds = [self._expr_kind(node.args[i]) for i in idx]
+            if "real" in kinds and all(k in {"int", "logical", "real"} for k in kinds) and any(
+                k != "real" for k in kinds
+            ):
+                args = list(node.args)
+                for i, k in zip(idx, kinds):
+                    if k != "real":
+                        args[i] = as_float(args[i])
+                new = ast.Call(func=func, args=args, keywords=list(node.keywords))
+        elif is_numpy_name_node(func.value) and node.args:
+            arr = node.args[0]
+            axis_kw = [kw for kw in node.keywords if kw.arg == "axis"]
+            has_axis = bool(axis_kw) or (attr != "unique" and len(node.args) >= 2)
+            axis_none = any(isinstance(kw.value, ast.Constant) and kw.value.value is None for kw in axis_kw)
+            flatten = (attr in self._FLATTEN_WITHOUT_AXIS and (not has_axis or axis_none)) or (
+                attr in {"sort", "argsort"} and axis_none
+            )
+            if flatten and int(self._rank_expr(arr) or 0) >= 2:
+                ravel = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="ravel",
+                                                    ctx=ast.Load()), args=[arr], keywords=[])
+                new = ast.Call(func=func, args=[ravel] + list(node.args[1:]),
+                               keywords=[kw for kw in node.keywords if kw.arg != "axis"])
+        if new is not None:
+            new = ast.fix_missing_locations(ast.copy_location(new, node))
+            if isinstance(new, ast.Call):
+                # Rewrites compose: b.mean() -> np.mean(b) -> np.mean(b.astype(int)) -> ...
+                new = self._canonical_numpy_call(new) or new
+            node._xp2f_canonical = new
+        return new
+
+    # Other numpy functions whose axis= indexes the first argument (or, for
+    # the joining functions, each array in it).
+    _AXIS_OF_FIRST_ARGUMENT = {
+        "concatenate", "stack", "hstack", "vstack", "column_stack", "diff", "take", "roll", "repeat",
+        "delete", "insert", "append", "gradient", "trapezoid", "trapz", "average", "percentile",
+        "quantile", "nanpercentile", "nanquantile", "take_along_axis", "split", "array_split",
+    }
+
+    def _normalize_negative_axis(self, node):
+        """Rewrite a constant negative axis (axis=-1) of a numpy call or
+        array method to the equivalent non-negative axis once the array's
+        rank is known, so the per-function code only sees axes >= 0."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return
+        attr = node.func.attr
+        if attr not in self._AXIS_POSITIONAL_1 | self._AXIS_OF_FIRST_ARGUMENT:
+            # Only functions whose axis indexes their first argument (not
+            # e.g. np.lexsort, whose axis is that of each key).
+            return
+        if is_numpy_name_node(node.func.value):
+            if not node.args:
+                return
+            arr = node.args[0]
+            pos_axis = 1 if attr in self._AXIS_POSITIONAL_1 else (2 if attr == "diff" else None)
+        else:
+            arr = node.func.value
+            pos_axis = 0 if attr in self._AXIS_POSITIONAL_1 else None
+        extra = 0
+        if attr in {"concatenate", "stack", "hstack", "vstack", "column_stack"}:
+            if not (isinstance(arr, (ast.Tuple, ast.List)) and arr.elts):
+                return
+            arr = arr.elts[0]
+            pos_axis = 1
+            extra = 1 if attr == "stack" else 0
+        if attr == "expand_dims":
+            extra = 1
+
+        def _neg_const(v):
+            if isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub) and isinstance(v.operand, ast.Constant):
+                v = -v.operand.value if isinstance(v.operand.value, int) else None
+            elif isinstance(v, ast.Constant) and isinstance(v.value, int) and not isinstance(v.value, bool):
+                v = v.value
+            else:
+                return None
+            return v if isinstance(v, int) and v < 0 else None
+
+        slots = [kw for kw in node.keywords if kw.arg == "axis"]
+        targets = [(kw, "kw") for kw in slots]
+        if not slots and pos_axis is not None and len(node.args) > pos_axis:
+            targets = [(pos_axis, "pos")]
+        for slot, how in targets:
+            value = slot.value if how == "kw" else node.args[slot]
+            neg = _neg_const(value)
+            if neg is None:
+                continue
+            try:
+                rank = int(self._rank_expr(arr)) + extra
+            except Exception:
+                return
+            if rank <= 0 or neg < -rank:
+                continue
+            new = ast.copy_location(ast.Constant(value=rank + neg), value)
+            if how == "kw":
+                slot.value = new
+            else:
+                node.args[slot] = new
 
     def _promoted_kind(self, nodes):
         """numpy's result kind for an operation on nodes: the widest of
@@ -27923,6 +28207,10 @@ class translator(ast.NodeVisitor):
         return max(ks, key=self._KIND_ORDER.index)
 
     def _expr_kind(self, node):
+        self._normalize_negative_axis(node)
+        _canon = self._canonical_numpy_call(node)
+        if _canon is not None:
+            return self._expr_kind(_canon)
         if self._float_dtype_reduction(node) is not None:
             return "real"
         if (
@@ -29971,9 +30259,12 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray", "ravel"}
+                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray", "ravel", "sort", "flip"}
                 and len(node.args) >= 1
             ):
+                if node.func.attr in {"sort", "flip"} and self._expr_kind(node.args[0]) not in {"int", "logical"}:
+                    # Real unless integer (complex inputs keep the earlier default).
+                    return "real"
                 if node.func.attr in {"dot", "matmul"} and len(node.args) >= 2:
                     # The wider of the two operand kinds: np.matmul(int, float) is float.
                     k = self._promoted_kind(node.args[:2])
@@ -33169,6 +33460,20 @@ class translator(ast.NodeVisitor):
             return f"({value}) /= (0.0_dp, 0.0_dp)"
         return self._coerce_expr_kind(node, value, "logical")
 
+    def _np_sort_dim(self, node):
+        """The Fortran dimension np.sort / np.argsort of a 2-D array sorts
+        along (numpy's default axis is the last)."""
+        axis_node = node.args[1] if len(node.args) >= 2 else None
+        for kw in node.keywords:
+            if kw.arg == "axis":
+                axis_node = kw.value
+        if axis_node is None:
+            return 2
+        if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)
+                and axis_node.value in (0, 1)):
+            raise NotImplementedError("np.sort/np.argsort of a 2-D array needs axis 0, 1 or -1")
+        return int(axis_node.value) + 1
+
     def _np_integer_rounding(self, node, a0, k0):
         """np.floor/ceil/trunc/fix/round/around of an integer array is that
         integer array in numpy 2 (np.round(i, d) with d < 0 rounds to a
@@ -33201,6 +33506,10 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError("ravel()/flatten() supports arrays of rank up to 3")
 
     def _rank_expr(self, node):
+        self._normalize_negative_axis(node)
+        _canon = self._canonical_numpy_call(node)
+        if _canon is not None:
+            return self._rank_expr(_canon)
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.slice, ast.Constant)
@@ -34222,8 +34531,9 @@ class translator(ast.NodeVisitor):
                     if isinstance(shp, (ast.Tuple, ast.List)):
                         return max(1, len(shp.elts))
                     return max(1, self._rank_expr(node.args[0]))
-                if node.func.attr == "argsort" and len(node.args) >= 1:
-                    return 1
+                if node.func.attr in {"argsort", "sort"} and len(node.args) >= 1:
+                    # Same shape as the input (axis=None is flattened first).
+                    return max(1, int(self._rank_expr(node.args[0])))
                 if self._is_numpy_array_ctor_call(node) and len(node.args) >= 1:
                     a0 = node.args[0]
                     if isinstance(a0, ast.List):
@@ -34404,6 +34714,12 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         return 0
                     return r0 if keepdims else max(0, r0 - 1)
+                if node.func.attr in {"argmin", "argmax"} and len(node.args) >= 1 and any(
+                    kw.arg == "axis" for kw in node.keywords
+                ):
+                    return max(0, int(self._rank_expr(node.args[0])) - 1)
+                if node.func.attr in {"absolute", "hypot", "arctan2", "copysign"} and len(node.args) >= 1:
+                    return max(int(self._rank_expr(a)) for a in node.args)
                 if node.func.attr in {"nanargmin", "nanargmax"} and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
                     axis_node = None
@@ -34488,6 +34804,14 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"argmin", "argmax", "min", "max"}:
                     return 0
                 return self._rank_expr(node.func.value)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"argmin", "argmax"}
+                and not is_numpy_name_node(node.func.value)
+                and any(kw.arg == "axis" for kw in node.keywords)
+            ):
+                # x.argmax(axis=k): one index per remaining position.
+                return max(0, int(self._rank_expr(node.func.value)) - 1)
             if (
                 isinstance(node.func, ast.Attribute)
                 and self._is_linalg_module_attr(node.func.value)
@@ -35055,6 +35379,10 @@ class translator(ast.NodeVisitor):
 
     def expr(self, node):
         validate_numpy_atleast_call(node)
+        self._normalize_negative_axis(node)
+        _canon = self._canonical_numpy_call(node)
+        if _canon is not None:
+            return self.expr(_canon)
         _bare = self._float_dtype_reduction(node)
         if _bare is not None:
             return f"real({self.expr(_bare)}, kind=dp)"
@@ -39345,7 +39673,21 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "argsort"
                 and len(node.args) >= 1
             ):
+                if int(self._rank_expr(node.args[0])) == 2:
+                    return f"argsort_2d({self.expr(node.args[0])}, {self._np_sort_dim(node)})"
                 return f"argsort_idx({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "sort"
+                and len(node.args) >= 1
+                and self._expr_kind(node.args[0]) in {"int", "real"}
+            ):
+                r0 = int(self._rank_expr(node.args[0]))
+                if r0 == 1:
+                    return f"sorted_vec({self.expr(node.args[0])})"
+                if r0 == 2:
+                    return f"sorted_2d({self.expr(node.args[0])}, {self._np_sort_dim(node)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -41589,8 +41931,9 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "clip":
                     a0 = self.expr(node.args[0])
                     a0_kind = self._expr_kind(node.args[0])
-                    lo = "(-huge(1.0_dp))"
-                    hi = "huge(1.0_dp)"
+                    # A missing (None) bound: HUGE of a0's own type and kind.
+                    lo = f"(-huge({a0}))"
+                    hi = f"huge({a0})"
                     # MAX/MIN require every argument to share one exact
                     # type -- an int-literal bound (e.g. np.clip(a, 0, 10)
                     # on a real array a) previously passed straight
@@ -42230,17 +42573,17 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
-                if node.func.attr == "cumsum":
+                if node.func.attr in {"cumsum", "cumprod"}:
                     axis_node = None
                     for kw in node.keywords:
                         if kw.arg == "axis":
                             axis_node = kw.value
                             break
                     k0 = self._expr_kind(node.args[0])
-                    fn = "cumsum_real" if k0 != "int" else "cumsum_int"
+                    fn = f"{node.func.attr}_real" if k0 != "int" else f"{node.func.attr}_int"
                     if axis_node is not None:
                         if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)):
-                            raise NotImplementedError("np.cumsum axis must be a constant integer")
+                            raise NotImplementedError(f"np.{node.func.attr} axis must be a constant integer")
                         ax = int(axis_node.value)
                         r0 = self._rank_expr(node.args[0])
                         if r0 == 2:
@@ -42248,7 +42591,7 @@ class translator(ast.NodeVisitor):
                                 return f"{fn}_axis0_2d({a0})"
                             if ax in {1, -1}:
                                 return f"{fn}_axis1_2d({a0})"
-                            raise NotImplementedError("np.cumsum axis out of range for 2D arrays")
+                            raise NotImplementedError(f"np.{node.func.attr} axis out of range for 2D arrays")
                     return f"{fn}({a0})"
                 if node.func.attr in {"repeat", "tile"}:
                     reps = "1"
@@ -42590,9 +42933,11 @@ class translator(ast.NodeVisitor):
                     if step_val == 1:
                         return f"{base_expr}({ub}:{lb}:-1)"
                 a0 = self.expr(arg0)
+                r0 = self._rank_expr(arg0)
+                if int(r0) <= 1 and not re.fullmatch(r"[A-Za-z_]\w*(?:%\w+)*", a0):
+                    return f"reversed_vec({a0})"
                 if node.func.attr == "flip":
                     return f"{a0}(size({a0}):1:-1)"
-                r0 = self._rank_expr(arg0)
                 if r0 <= 1:
                     return f"{a0}(size({a0}):1:-1)"
                 return f"{a0}(size({a0},1):1:-1, :)"
@@ -42968,17 +43313,9 @@ class translator(ast.NodeVisitor):
                     cond = self.expr(node.args[0])
                     a1 = self.expr(node.args[1])
                     a2 = self.expr(node.args[2])
-                    cond_rank = int(self._rank_expr(node.args[0]))
-                    if cond_rank > 0:
-                        def _spread_to_cond_shape(scalar_expr):
-                            e = scalar_expr
-                            for d in range(1, cond_rank + 1):
-                                e = f"spread({e}, {d}, size({cond},{d}))"
-                            return e
-                        if int(self._rank_expr(node.args[1])) == 0:
-                            a1 = _spread_to_cond_shape(a1)
-                        if int(self._rank_expr(node.args[2])) == 0:
-                            a2 = _spread_to_cond_shape(a2)
+                    # MERGE is elemental, so a scalar branch takes the
+                    # condition's shape without SPREAD (which gfortran 17
+                    # mis-folds to the wrong rank for a PARAMETER array).
                     # Fortran's MERGE intrinsic requires tsource/fsource to
                     # share the exact same type AND kind -- unlike np.where,
                     # which happily broadcasts/promotes mixed int/real/
@@ -44242,6 +44579,9 @@ class translator(ast.NodeVisitor):
                 a0 = self.expr(node.args[0])
                 b0 = self.expr(node.args[1])
                 fn = "max" if node.func.attr == "fmax" else "min"
+                if {self._expr_kind(node.args[0]), self._expr_kind(node.args[1])} <= {"int", "logical"}:
+                    # Integers have no NaN to ignore.
+                    return f"{fn}({a0}, {b0})"
                 # max()/min() are evaluated eagerly even inside a merge() that
                 # would otherwise mask NaN away, and comparing a NaN operand
                 # trips -ffpe-trap=invalid (SIGFPE) before the merge ever runs.
@@ -48739,10 +49079,12 @@ class translator(ast.NodeVisitor):
                     and v.func.attr == "sort"
                     and len(v.args) >= 1
                 ):
-                    k0 = self._expr_kind(v.args[0])
-                    rank_hint = max(1, self._rank_expr(v.args[0]))
+                    k0 = self._expr_kind(v)
+                    rank_hint = max(1, self._rank_expr(v))
                     if k0 == "int":
                         self._mark_alloc_int(t.id, rank=rank_hint)
+                    elif k0 == "logical":
+                        self._mark_alloc_log(t.id, rank=rank_hint)
                     else:
                         self._mark_alloc_real(t.id, rank=rank_hint)
                 # np.argsort(...)
@@ -48755,7 +49097,7 @@ class translator(ast.NodeVisitor):
                     and v.func.attr == "argsort"
                     and len(v.args) >= 1
                 ):
-                    self._mark_alloc_int(t.id)
+                    self._mark_alloc_int(t.id, rank=max(1, self._rank_expr(v)))
                 # np.argmax(a, axis=1) / np.argmin(a, axis=1)
                 if (
                     isinstance(t, ast.Name)
@@ -49716,6 +50058,10 @@ class translator(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
+        if isinstance(node.value, (ast.Call, ast.Subscript)):
+            _canon = self._canonical_numpy_call(node.value)
+            if _canon is not None:
+                node.value = _canon
         if len(node.targets) != 1:
             if not all(isinstance(_t, ast.Name) for _t in node.targets):
                 raise NotImplementedError("multiple assignment currently supports only name targets")
@@ -56272,6 +56618,7 @@ class translator(ast.NodeVisitor):
             and v.func.value.id == "np"
             and v.func.attr == "argsort"
             and len(v.args) >= 1
+            and int(self._rank_expr(v.args[0])) <= 1
         ):
             name = self._aliased_name(t.id)
             a0 = self.expr(v.args[0])
@@ -56290,6 +56637,7 @@ class translator(ast.NodeVisitor):
             and v.func.value.id == "np"
             and v.func.attr in {"argmax", "argmin"}
             and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Name)
         ):
             axis_node = None
             for kw in v.keywords:
@@ -56325,58 +56673,6 @@ class translator(ast.NodeVisitor):
                 self.o.pop()
                 self.o.w("end block")
                 return
-
-        # x = np.where(cond, a, b)
-        if (
-            isinstance(t, ast.Name)
-            and isinstance(v, ast.Call)
-            and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Name)
-            and v.func.value.id == "np"
-            and v.func.attr == "where"
-            and len(v.args) == 3
-        ):
-            name = t.id
-            cond = self.expr(v.args[0])
-            a1 = self.expr(v.args[1])
-            a2 = self.expr(v.args[2])
-            cond_rank = int(self._rank_expr(v.args[0]))
-            if cond_rank > 0:
-                def _spread_to_cond_shape(scalar_expr):
-                    e = scalar_expr
-                    for d in range(1, cond_rank + 1):
-                        e = f"spread({e}, {d}, size({cond},{d}))"
-                    return e
-                if int(self._rank_expr(v.args[1])) == 0:
-                    a1 = _spread_to_cond_shape(a1)
-                if int(self._rank_expr(v.args[2])) == 0:
-                    a2 = _spread_to_cond_shape(a2)
-            # See the matching np.where lowering in expr() for why this
-            # reconciliation is needed: MERGE requires tsource/fsource to
-            # share the exact same type and kind.
-            k1 = self._expr_kind(v.args[1])
-            k2 = self._expr_kind(v.args[2])
-            if k1 != k2 and k1 not in {"char", "logical"} and k2 not in {"char", "logical"}:
-                if "complex" in (k1, k2):
-                    if k1 != "complex":
-                        a1 = (
-                            f"cmplx({a1}, 0.0_dp, kind=dp)"
-                            if k1 == "real"
-                            else f"cmplx(real({a1}, kind=dp), 0.0_dp, kind=dp)"
-                        )
-                    if k2 != "complex":
-                        a2 = (
-                            f"cmplx({a2}, 0.0_dp, kind=dp)"
-                            if k2 == "real"
-                            else f"cmplx(real({a2}, kind=dp), 0.0_dp, kind=dp)"
-                        )
-                elif "real" in (k1, k2):
-                    if k1 == "int":
-                        a1 = f"real({a1}, kind=dp)"
-                    if k2 == "int":
-                        a2 = f"real({a2}, kind=dp)"
-            self.o.w(f"{name} = merge({a1}, {a2}, {cond})")
-            return
 
         # logical sieve init
         if isinstance(t, ast.Name) and isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult):
@@ -78943,6 +79239,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
+    tree = note_source_libraries(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
@@ -79462,6 +79759,7 @@ def transpile_file(
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
+    tree = note_source_libraries(tree)
     if module_only:
         _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
     reject_undefined_names_in_functions(tree)
@@ -80271,6 +80569,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
+    tree = note_source_libraries(tree)
     tree = rewrite_integer_quotient_seed_divisions(tree)
     tree = rewrite_pandas_read_csv_set_index(tree)
     tree = rewrite_for_enumerate_bare_target_to_tuple(tree)
