@@ -33920,7 +33920,10 @@ class translator(ast.NodeVisitor):
             if _attr == "diagonal" and node.args and int(self._rank_expr(node.args[0]) or 0) == 2:
                 return 1
             if _attr == "diag" and node.args:
-                return 2 if int(self._rank_expr(node.args[0]) or 0) == 1 else 1
+                # An unknown input rank must stay unresolved: diag builds a
+                # matrix from a vector, but extracts a vector from a matrix.
+                _input_rank = int(self._rank_expr(node.args[0]) or 0)
+                return 2 if _input_rank == 1 else 1 if _input_rank == 2 else 0
         _canon = self._canonical_numpy_call(node)
         if _canon is not None:
             return self._rank_expr(_canon)

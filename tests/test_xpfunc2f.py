@@ -201,7 +201,7 @@ def test_xpfunc2f_bridges_array_argument_and_array_result(tmp_path: Path) -> Non
     # idiom), a generated `.f2py_f2cmap` file (the confirmed fix for
     # f2py's own wrapper otherwise silently mis-resolving this project's
     # `dp = real64` kind parameter to single precision for an array), and
-    # inline_python_mod_helpers (acf calls python_mod's mean_1d --
+    # inline_python_mod_helpers (acf calls python_mod's mean --
     # inlined directly into the trimmed module rather than compiled/
     # linked as a separate object, since f2py's own Fortran cracker can't
     # parse either python.f90's full public surface or lapack_d.f90 at
@@ -227,7 +227,7 @@ def test_xpfunc2f_bridges_array_argument_and_array_result(tmp_path: Path) -> Non
     assert "pure subroutine acf(" in out_f90, out_f90
     assert "allocatable :: lc_res_1" not in out_f90, out_f90
     assert "use python_mod" not in out_f90, out_f90
-    assert "function mean_1d" in out_f90, out_f90
+    assert "function mean(" in out_f90, out_f90
 
 
 def test_xpfunc2f_run_both_matches_for_array_target(tmp_path: Path) -> None:
