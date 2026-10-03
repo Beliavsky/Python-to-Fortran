@@ -302,6 +302,53 @@ compilation/cache behavior. `--compiler`, `--pretty`, `--round`, and
 `:help` or `python xp2f_repl.py --help` for details. Session management and local
 execution live in `p2f_session.py`, separately from the terminal interface.
 
+## Desktop GUI
+
+Open the local Python/Fortran editor:
+
+```text
+python xp2f_ide.py
+python xp2f_ide.py examples/xprime.py
+```
+
+The Tkinter GUI provides Python and read-only generated Fortran editors with
+syntax coloring, line numbers, line counts, indentation, and undo. Live
+translation is enabled initially: it translates the complete buffer after a
+750 ms editing pause and waits for complete Python syntax. It never executes
+code automatically. Disable the checkbox or start with `--no-live` for manual
+translation.
+
+Unsaved GUI and REPL sessions use the logical source name `main.py` and generate
+`program main` (or `main_proc_mod` for module-only input). Opened or loaded files
+use their filename stem instead. Temporary source files remain unique and do
+not overwrite files in the working directory. The frontends pass `--source-name`
+to set this display/generated name; ordinary CLI translations retain their
+existing filename-based naming.
+
+Use **Run Python**, **Run Fortran**, **Run Both**, **Compare**, or **Time Both**
+to execute the complete current script from scratch. Python and Fortran outputs
+appear in separate panes; the Diagnostics tab retains the full CLI transcript.
+Use ordinary script semantics and explicit `print` calls, rather than REPL
+expression display. Run Fortran translates the current buffer before compiling.
+Time Both reports Python execution, translation, compilation, and Fortran
+execution times separately. Compiler commands, integer kinds, RNG replay,
+numeric comparisons, output rounding, and timeouts are configurable.
+
+Jobs run in the background, keeping the editor responsive. **Stop** cancels the
+current process tree. Source or option changes mark earlier translations and
+results stale, and obsolete jobs cannot replace results for newer input.
+Open, Save Python, Save Fortran, and unsaved-change prompts support local work;
+save generated Fortran for manual editing elsewhere. The working directory
+controls data paths and sibling imports and normally follows the opened file.
+Override it with `--work-dir` or Browse. Python packages and compilers must be
+installed locally. Interactive program input is not supported in this version.
+
+The GUI shares the REPL's `p2f_session.LocalBackend`; it uses ordinary script
+source and cancellable jobs. It runs the local `xp2f.py`, while the web
+playground continues to use its pinned published transpiler. Run
+`python xp2f_ide.py --help` for startup options and use the GUI Help menu for
+keyboard shortcuts and execution details.
+
 ## Interfaces for manually implemented Fortran procedures
 
 `xp2f_interface.py` generates a Fortran procedure contract without executing the
@@ -467,6 +514,7 @@ Important caveats:
 
 - `xp2f.py`: main transpiler and command-line interface.
 - `xp2f_repl.py`: interactive Python workspace with Fortran translation, fresh execution, output comparison, and timing commands.
+- `xp2f_ide.py`: local Tkinter GUI with live translation, Python/Fortran execution, comparisons, and cancellable background jobs.
 - `p2f_session.py`: reusable REPL session controller and local execution backends.
 - `xpfunc2f.py`: translates ONE function (and its dependency closure) from a Python script to Fortran, compiles it with `numpy.f2py`, and generates a thin Python wrapper -- same name, same call signature -- backed by the compiled Fortran, for use inside an otherwise-unchanged Python program.
 - `fortran_scan.py`: shared Fortran source-scanning/rewriting utilities used by `xp2f.py`.

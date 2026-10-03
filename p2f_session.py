@@ -36,6 +36,7 @@ class Result:
     workspace_lost: bool = False
     matches: bool | None = None
     exit_code: int | None = None
+    cancelled: bool = False
 
 
 def input_status(source: str) -> str:
@@ -300,6 +301,7 @@ class LocalOptions:
     numeric_diff: bool = False
     numeric_diff_tol: float = 1.0e-12
     round_digits: int | None = None
+    source_name: str = "main.py"
 
 
 class LocalBackend:
@@ -314,10 +316,13 @@ class LocalBackend:
         os.close(handle)
         self.source_path = Path(name)
         self._tmp = tempfile.TemporaryDirectory(prefix="p2f_repl_build_")
-        self.fortran_path = Path(self._tmp.name) / "session.f90"
+        self.fortran_path = Path(self._tmp.name) / (Path(options.source_name).stem + ".f90")
 
     def close(self) -> None:
         self.source_path.unlink(missing_ok=True)
+        replay_stem = self.source_path.with_name(self.source_path.stem + "_rng_replay")
+        for suffix in (".meta", ".bin"):
+            replay_stem.with_suffix(suffix).unlink(missing_ok=True)
         self._tmp.cleanup()
 
     def command(self, mode: str) -> list[str]:
@@ -327,7 +332,7 @@ class LocalBackend:
         if mode in {"run-python", "time-python"}:
             return [opts.python, str(self.source_path)]
         command = [opts.python, str(Path(opts.xp2f).resolve()), str(self.source_path),
-                   "--out", str(self.fortran_path)]
+                   "--out", str(self.fortran_path), "--source-name", opts.source_name]
         flag = {"run": "--run", "run-both": "--run-both", "diff": "--run-diff",
                 "time": "--time", "time-both": "--time-both"}.get(mode)
         if flag:
@@ -346,30 +351,58 @@ class LocalBackend:
             command.extend(["--numeric-diff", "--numeric-diff-tol", str(opts.numeric_diff_tol)])
         return command
 
-    def run(self, source: str, mode: str) -> Result:
+    def run(self, source: str, mode: str, *, expression_printing: bool = True,
+            cancel: threading.Event | None = None) -> Result:
+        if cancel is not None and cancel.is_set():
+            return Result(False, stderr="Cancelled.\n", cancelled=True)
         if not source.strip():
             return Result(False, stderr="The session is empty.\n")
         try:
-            normalized = replay_source(source)
+            if expression_printing:
+                normalized = replay_source(source)
+            else:
+                ast.parse(source)
+                normalized = source
         except (SyntaxError, ValueError) as error:
             return Result(False, stderr=f"Cannot replay source: {error}\n")
         self.source_path.write_text(normalized, encoding="utf-8")
+        self.fortran_path = Path(self._tmp.name) / (Path(self.options.source_name).stem + ".f90")
         self.fortran_path.unlink(missing_ok=True)
         command = self.command(mode)
         if mode == "translate":
             statements = ast.parse(normalized).body
             declarations = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            if statements and all(isinstance(node, declarations) for node in statements):
+            if statements and all(isinstance(node, declarations) or
+                                  (index == 0 and isinstance(node, ast.Expr)
+                                   and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))
+                                  for index, node in enumerate(statements)):
                 command.append("--module")
         started = time.perf_counter()
         process = None
+        cancelled = False
         try:
             process = subprocess.Popen(command, cwd=self.options.work_dir,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        text=True, encoding="utf-8", errors="replace",
                                        env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **_popen_options())
-            stdout, stderr = process.communicate(timeout=self.options.timeout)
-            ok = process.returncode == 0
+            deadline = started + self.options.timeout
+            while True:
+                if cancel is not None and cancel.is_set():
+                    _stop_process(process)
+                    stdout, stderr = process.communicate()
+                    stderr += "\nCancelled.\n"
+                    cancelled = True
+                    break
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, self.options.timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining) if cancel is not None else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel is None:
+                        raise
+            ok = process.returncode == 0 and not cancelled
         except subprocess.TimeoutExpired:
             _stop_process(process)
             stdout, stderr = process.communicate()
@@ -392,7 +425,8 @@ class LocalBackend:
             matches = bool(markers) and markers[-1].startswith("Run diff: MATCH")
             ok = matches
         fortran = self.fortran_path.read_text(encoding="utf-8") if self.fortran_path.exists() else ""
-        return Result(ok, stdout, stderr, time.perf_counter() - started, fortran, command, matches=matches)
+        return Result(ok, stdout, stderr, time.perf_counter() - started, fortran, command,
+                      matches=matches, cancelled=cancelled)
 
 
 class Session:

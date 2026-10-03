@@ -86,6 +86,8 @@ def handle_command(text: str, session: Session, *, timing: bool = False) -> bool
                 print("No generated Fortran. Use :translate.")
         elif command == "clear":
             session.clear()
+            if isinstance(session.backend, LocalBackend):
+                session.backend.options.source_name = "main.py"
             print("Session cleared.")
         elif command == "undo":
             if session.undo():
@@ -104,6 +106,8 @@ def handle_command(text: str, session: Session, *, timing: bool = False) -> bool
             source = path.read_text(encoding="utf-8-sig")
             ast_check(source)
             session.load(source)
+            if isinstance(session.backend, LocalBackend):
+                session.backend.options.source_name = path.name
             print(f"Loaded {path}; use :replay to execute it, or :run-both to compare it.")
         elif command in {"save", "save-source", "save-fortran"}:
             path = Path(arguments[0]).expanduser()
@@ -210,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         options = LocalOptions(args.xp2f.resolve(), work_dir, args.python, args.timeout,
                                args.compiler, args.int_kind, args.pretty, args.rng_replay,
                                args.numeric_diff, args.numeric_diff_tol, args.round_digits)
+        options.source_name = source_path.name if source_path else "main.py"
         session = Session(PythonWorkspace(work_dir, args.timeout, args.python), LocalBackend(options))
         try:
             if source_path:

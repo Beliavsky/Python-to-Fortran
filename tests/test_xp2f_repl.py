@@ -247,11 +247,15 @@ def test_real_transpiler_compiles_and_compares_repl_expressions(tmp_path):
         result = backend.run("def square(x: float) -> float:\n    return x * x\n", "translate")
         assert result.ok, result.stdout + result.stderr
         assert "module" in result.fortran and "function square" in result.fortran
+        assert "module main_proc_mod\n" in result.fortran
         source = "from helper import twice\nx = 3\ntwice(x)\nfor i in range(3):\n    print(i*i)\n"
         result = backend.run(source, "diff")
         assert result.ok and result.matches is True, result.stdout + result.stderr
         assert "Run diff: MATCH" in result.stdout
         assert "program" in result.fortran
+        assert "program main\n" in result.fortran
+        assert "from main.py on" in result.fortran
+        assert backend.source_path.stem not in result.fortran
     finally:
         backend.close()
 
@@ -270,3 +274,31 @@ def test_real_numpy_rng_replay_and_int64(tmp_path):
         assert "int64" in result.fortran
     finally:
         backend.close()
+
+
+def test_logical_source_names_keep_unique_files_and_cli_defaults(tmp_path):
+    existing = tmp_path / "main.py"
+    existing.write_text("# user's file\n", encoding="utf-8")
+    first = LocalBackend(LocalOptions(work_dir=tmp_path))
+    second = LocalBackend(LocalOptions(work_dir=tmp_path, source_name="my-model.py"))
+    try:
+        assert first.source_path != second.source_path and first.source_path != existing
+        for backend, name, program in ((first, "main.py", "main"),
+                                       (second, "my-model.py", "my_model")):
+            result = backend.run("print(2)\n", "translate")
+            assert result.ok, result.stdout + result.stderr
+            assert f"from {name} on" in result.fortran
+            assert f"program {program}\n" in result.fortran
+            assert backend.source_path.stem not in result.fortran
+            assert backend.fortran_path.name == Path(name).stem + ".f90"
+        assert existing.read_text(encoding="utf-8") == "# user's file\n"
+        source = tmp_path / "ordinary.py"
+        source.write_text("print(2)\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(ROOT / "xp2f.py"), str(source)],
+                              cwd=tmp_path, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        generated = (tmp_path / "ordinary_p.f90").read_text(encoding="utf-8")
+        assert "program ordinary\n" in generated and "from ordinary.py on" in generated
+    finally:
+        first.close()
+        second.close()
