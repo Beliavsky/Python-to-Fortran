@@ -528,6 +528,8 @@ Important caveats:
 - `python.f90`: Fortran helper runtime used by translated programs.
 - `dataframe_str_index.f90`, `dataframe_index_date.f90`, `dataframe_index_datetime.f90`: pandas `DataFrame` companion types (string-indexed, date-indexed, datetime-indexed), auto-included when a translated program uses pandas.
 - `lapack_d.f90`: bundled double-precision LAPACK helpers used by some translations.
+- `lapack_mod.f90`: opt-in module version of the same bundled LAPACK/BLAS procedures; not yet the default runtime dependency.
+- `xmake_lapack_mod.py`: regenerates `lapack_mod.f90` and optionally creates a `python.f90` variant that uses its module interfaces.
 - `xp2f_batch.py`: batch runner for many Python files.
 - `xpfunc2f_batch.py`: batch runner for `xpfunc2f.py` over many Python files, reporting outcomes by stage (`Target`/`Transpile`/`Extract`/`F2PY Build`/`Run`) and a blocker breakdown for `Extract: FAIL` reasons.
 - `xcompare_xp2f_batch_results.py`: compares batch result snapshots.
@@ -535,6 +537,81 @@ Important caveats:
 - `tests/`: focused tests for the Python-to-Fortran tooling.
 
 ## Testing
+
+### Standalone Fortran runtime tests
+
+`xpython.f90` tests representative helper families directly, without translating
+Python: scalar arithmetic, statistics, arrays/indices, strings, random helper
+invariants, grids/interpolation, histograms, filtering, quadrature, FFTs, and
+LAPACK-backed linear algebra. It uses the original `python.f90` and
+`lapack_d.f90`, not the opt-in modular LAPACK variant.
+
+Change the named integer parameters near the top of `xpython.f90` to vary the
+problem sizes: `n_stats`, `n_array`, `n_random`, `n_fft`, `n_matrix`,
+`n_lstsq_rows`, `n_lstsq_cols`, `n_grid`, and `n_quadrature`. Expected numerical
+results are derived from those sizes. Minimum sizes and the requirement
+`n_lstsq_rows >= n_lstsq_cols` are checked at startup. Small literal scalar and
+string fixtures remain fixed. Random tests use reproducibility and support
+invariants rather than compiler-specific draws or potentially flaky moments.
+
+```console
+mkdir xpython_build
+cd xpython_build
+gfortran -O0 -g -ffree-line-length-none -fcheck=all -fbacktrace ../python.f90 ../lapack_d.f90 ../xpython.f90 -o xpython.exe
+./xpython.exe
+cd ..
+```
+
+The driver reports failed checks and a final count, and exits nonzero if any
+check fails. It does not test every runtime procedure. Use a separate build
+directory to avoid overwriting helper caches in the repository root.
+
+Known finding: `fft_irfft` omits the last conjugate frequency for odd output
+lengths greater than one. The driver uses a ramp plus sinusoid to expose this;
+the default even size passes, while `n_fft = 7` fails the real-FFT round trip.
+The corresponding pytest case is a strict expected failure limited to that
+specific check; unrelated compilation/execution errors are not suppressed.
+This test addition leaves the helper implementation unchanged.
+
+```console
+python -m pytest tests/test_xpython.py -q -o addopts=""
+```
+
+### Opt-in modular LAPACK
+
+`lapack_mod.f90` retains the numerical bodies and legacy dummy argument shapes
+from `lapack_d.f90`, but makes the bundled procedures module procedures. The
+generator removes declarations that would otherwise refer to external copies
+of those procedures, while retaining external callback arguments. It does not
+add `intent` or `pure` declarations or change numerical precision.
+
+The original `python.f90` and automatic builds still use `lapack_d.f90`.
+To try the module version, generate a separate runtime variant. Its local
+external LAPACK interface blocks are replaced by `use lapack_mod, only: ...`
+statements. Procedure signatures in `python_mod` remain unchanged.
+
+```console
+mkdir lapack_mod_build
+python xmake_lapack_mod.py --python-output lapack_mod_build/python_lapack_mod.f90
+cd lapack_mod_build
+gfortran -ffree-line-length-none -fcheck=all ../lapack_mod.f90 python_lapack_mod.f90 ../tests/xpython_lapack_test.f90 -o xpython_lapack_test.exe
+./xpython_lapack_test.exe
+cd ..
+```
+
+Compile `lapack_mod.f90` before the adapted runtime and link its object instead
+of `lapack_d.o`. Do not combine this runtime variant with external LAPACK
+libraries as a substitute for the module. Use a separate build directory to
+avoid overwriting the default runtime's `python_mod.mod` and cached objects.
+The standalone Fortran test driver checks linear solves, Cholesky, inverse,
+determinant, eigenpairs, QR, SVD, least squares, and pseudoinverse. It also works
+with the original runtime and `lapack_d.f90`.
+
+Run the focused tests (including optimized gfortran builds and optional ifx):
+
+```console
+python -m pytest tests/test_lapack_mod.py -q -o addopts=""
+```
 
 Run a quick syntax check:
 
