@@ -277,7 +277,7 @@ changes. `:save PATH`, `:save-source PATH`, and `:save-fortran PATH` save origin
 Python, replay Python, and current Fortran respectively. `:load PATH` replaces
 the source without executing it. `:replay` explicitly rebuilds the live Python
 workspace. `:undo` removes the last entered block and resets the workspace;
-`:clear` clears the whole session. Exiting with `:quit` or EOF does not run or
+`:clear` clears the whole session. Exiting with `:quit`, `quit()`, `exit()`, or EOF does not run or
 automatically save code.
 
 Syntax errors are not saved. Runtime errors retain source, may leave partial

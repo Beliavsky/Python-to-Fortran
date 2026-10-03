@@ -35,6 +35,7 @@ class Result:
     command: list[str] = field(default_factory=list)
     workspace_lost: bool = False
     matches: bool | None = None
+    exit_code: int | None = None
 
 
 def input_status(source: str) -> str:
@@ -190,6 +191,8 @@ class PythonWorkspace:
             if response is None:
                 raise EOFError("Python interpreter exited; its workspace was lost.")
             data = json.loads(response)
+            if data.get("exit_code") is not None:
+                self.close()
             return Result(**data, seconds=time.perf_counter() - started)
         except queue.Empty:
             self.close()
@@ -228,6 +231,7 @@ def _workspace_worker() -> None:
         source = data["source"]
         number += 1
         filename = f"<p2f-input-{number}>"
+        exit_code = None
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as out, \
                 tempfile.TemporaryFile(mode="w+", encoding="utf-8") as err:
@@ -253,6 +257,15 @@ def _workspace_worker() -> None:
                             raise SyntaxError("incomplete input")
                         exec(code, namespace)
                         ok = True
+                    except SystemExit as error:
+                        if error.code is None:
+                            exit_code = 0
+                        elif isinstance(error.code, int):
+                            exit_code = error.code
+                        else:
+                            print(error.code, file=sys.stderr)
+                            exit_code = 1
+                        ok = exit_code == 0
                     except BaseException:
                         traceback.print_exc()
                         ok = False
@@ -267,8 +280,11 @@ def _workspace_worker() -> None:
                 sys.displayhook = old_hook
             out.seek(0)
             err.seek(0)
-            protocol_out.write(json.dumps({"ok": ok, "stdout": out.read(), "stderr": err.read()}) + "\n")
+            protocol_out.write(json.dumps({"ok": ok, "stdout": out.read(), "stderr": err.read(),
+                                           "exit_code": exit_code}) + "\n")
             protocol_out.flush()
+        if exit_code is not None:
+            break
 
 
 @dataclass
@@ -407,7 +423,10 @@ class Session:
             return Result(False, stderr=f"{error}\n")
         self.blocks.append(source)
         result = self.workspace.evaluate(source)
-        if not result.ok:
+        if result.exit_code is not None:
+            self.blocks.pop()  # Do not retain the command that ends the session.
+            self.workspace_synced = False
+        elif not result.ok:
             self.workspace_synced = False
             result.stderr += "Source was retained. Use :undo, :clear, or correct the source and :replay.\n"
         return result
@@ -438,7 +457,7 @@ class Session:
         self.workspace.reset()
         self.workspace_synced = False
         result = self.workspace.evaluate(source, display=False)
-        self.workspace_synced = result.ok
+        self.workspace_synced = result.ok and result.exit_code is None
         return result
 
     def run(self, mode: str) -> Result:

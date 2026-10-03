@@ -32,7 +32,7 @@ source from the beginning in fresh processes, repeating any program side effects
 :save-fortran PATH   Save current Fortran; translate first if it is stale
 :undo                Remove last input block and reset Python; use :replay afterward
 :clear               Clear source, generated Fortran, and Python workspace
-:help, :quit
+:help, :quit          quit() and exit() also end the session
 
 Quote filenames containing spaces. Ctrl+C cancels an input block or running job;
 EOF exits. Exiting does not execute or automatically save the session.
@@ -95,7 +95,10 @@ def handle_command(text: str, session: Session, *, timing: bool = False) -> bool
                 print("Session is empty.")
         elif command == "replay":
             print("Replaying saved source into a new live Python workspace.")
-            show_result(session.replay_workspace(), timing=timing)
+            result = session.replay_workspace()
+            show_result(result, timing=timing)
+            if result.exit_code is not None:
+                raise SystemExit(result.exit_code)
         elif command == "load":
             path = Path(arguments[0]).expanduser()
             source = path.read_text(encoding="utf-8-sig")
@@ -164,7 +167,10 @@ def run_repl(session: Session, *, timing: bool = False) -> int:
             except (SyntaxError, OverflowError, ValueError) as error:
                 print(f"{type(error).__name__}: {error}", file=sys.stderr)
         else:
-            show_result(session.submit(source), timing=timing)
+            result = session.submit(source)
+            show_result(result, timing=timing)
+            if result.exit_code is not None:
+                return result.exit_code
         pending.clear()
 
 

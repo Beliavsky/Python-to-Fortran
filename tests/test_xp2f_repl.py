@@ -81,8 +81,12 @@ def test_workspace_captures_traceback_low_level_output_and_survives_error(worksp
     assert not result.ok
     assert "ZeroDivisionError" in result.stderr and "x = 9; 1 / 0" in result.stderr
     assert workspace.evaluate("x").stdout == "9\n"
-    assert not workspace.evaluate("raise SystemExit(2)").ok
-    assert workspace.evaluate("x").stdout == "9\n"
+
+
+def test_workspace_reports_system_exit_without_traceback(workspace):
+    result = workspace.evaluate("raise SystemExit(2)")
+    assert not result.ok and result.exit_code == 2
+    assert result.stderr == "" and workspace.process is None
 
 
 def test_workspace_future_flags_and_reset(workspace):
@@ -209,6 +213,30 @@ def test_terminal_multiline_and_expression_input(tmp_path):
     assert "6\n" in result.stdout and "return 2*x" in result.stdout
     assert "SyntaxError" not in result.stderr
     assert not list(tmp_path.glob("p2f_repl_*.py"))
+
+
+@pytest.mark.parametrize("expression, code, message", [
+    ("quit()", 0, ""),
+    ("exit()", 0, ""),
+    ("raise SystemExit", 0, ""),
+    ("import sys; sys.exit(3)", 3, ""),
+    ("quit('goodbye')", 1, "goodbye"),
+])
+def test_terminal_python_exit_commands(tmp_path, expression, code, message):
+    result = subprocess.run([sys.executable, str(ROOT / "xp2f_repl.py"), "--work-dir", str(tmp_path)],
+                            input=f"quit\n{expression}\nprint('SHOULD NOT RUN')\n",
+                            text=True, capture_output=True, timeout=15)
+    assert result.returncode == code, result.stdout + result.stderr
+    assert "SHOULD NOT RUN" not in result.stdout
+    assert "Traceback" not in result.stderr and "Source was retained" not in result.stderr
+    assert result.stderr.strip() == message
+    assert not list(tmp_path.glob("p2f_repl_*.py"))
+
+
+def test_shadowed_quit_is_executed_as_normal_python(workspace):
+    assert workspace.evaluate("def quit():\n    return 7\n").ok
+    result = workspace.evaluate("quit()")
+    assert result.ok and result.exit_code is None and result.stdout == "7\n"
 
 
 @pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran is required")
