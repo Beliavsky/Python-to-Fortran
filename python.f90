@@ -5116,8 +5116,9 @@ contains
          allocate(x(n), source=.true.)
       end function ones_logical
 
-      pure character(len=len(s)) function to_lower(s)
+      pure function to_lower(s)
          character(len=*), intent(in) :: s
+         character(len=len(s)) :: to_lower
          integer :: i, k
          do i = 1, len(s)
             k = iachar(s(i:i))
@@ -5129,8 +5130,9 @@ contains
          end do
       end function to_lower
 
-      pure character(len=len(s)) function to_upper(s)
+      pure function to_upper(s)
          character(len=*), intent(in) :: s
+         character(len=len(s)) :: to_upper
          integer :: i, k
          do i = 1, len(s)
             k = iachar(s(i:i))

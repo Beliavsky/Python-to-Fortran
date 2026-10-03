@@ -787,7 +787,7 @@ def test_inline_python_mod_helpers_resolves_generic_interface() -> None:
 
 
 def test_proc_start_re_matches_nested_paren_type_spec() -> None:
-    # Regression test: python.f90's own `to_lower` is declared
+    # Regression test for python.f90's former `to_lower` declaration,
     # `pure character(len=len(s)) function to_lower(s)` -- a dynamic-
     # length character function whose own type spec has a NESTED paren
     # (`len(s)` inside `(len=len(s))`). The original `_FUNC_TYPE_PREFIX_RE`
