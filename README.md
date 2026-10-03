@@ -233,6 +233,75 @@ Summarize historical batch progress files:
 python xsummarize_xp2f_progress.py
 ```
 
+## Interactive Python and Fortran
+
+Start the terminal REPL:
+
+```text
+python xp2f_repl.py
+```
+
+Enter Python normally, ending an indented block with a blank line. Imports,
+variables, and function definitions persist in a separate Python process.
+Bare expressions display their values. Commands start with `:` so they do not
+conflict with Python names:
+
+```text
+p2f> def square(x):
+...>     return x * x
+...>
+p2f> square(3)
+9
+p2f> :diff
+```
+
+`:translate` generates Fortran (using module mode for source containing only
+imports and function/class definitions); `:run` compiles and runs it; `:run-python` runs
+fresh Python; `:run-both` runs both; `:diff` compares their outputs using the
+existing transpiler checks. `:time`, `:time-python`, and `:time-both` report
+timings. These commands replay **all saved source from the beginning**, including
+file writes and random draws, without changing the live Python workspace.
+Only explicit commands translate or run Fortran.
+
+`:list` shows entered source. `:source` shows the replay version, which adds
+explicit `print(...)` calls to top-level value expressions. Live Python uses
+normal interactive `repr` display; replay uses `print` formatting. Existing
+print calls and common calls for side effects are preserved. For unfamiliar
+calls that return `None`, prefer explicit statements and inspect `:source`;
+expression printing is a convenience, not complete return-type inference.
+Use explicit prints inside loops and functions when comparing output. Python
+input requiring responses through `input()` is not supported in this version.
+
+`:fortran` displays the latest translation and marks it stale after source
+changes. `:save PATH`, `:save-source PATH`, and `:save-fortran PATH` save original
+Python, replay Python, and current Fortran respectively. `:load PATH` replaces
+the source without executing it. `:replay` explicitly rebuilds the live Python
+workspace. `:undo` removes the last entered block and resets the workspace;
+`:clear` clears the whole session. Exiting with `:quit` or EOF does not run or
+automatically save code.
+
+Syntax errors are not saved. Runtime errors retain source, may leave partial
+Python state changes, and require `:undo`/`:replay` or `:clear` before continuing.
+Ctrl+C cancels input or execution; a timeout or interrupted evaluation discards
+the live interpreter. Source remains available for inspection and replay.
+
+Load a file, or execute one comparison and exit:
+
+```text
+python xp2f_repl.py examples/xprime.py
+python xp2f_repl.py examples/xprime.py --batch --mode diff
+python xp2f_repl.py --int-kind int64 --rng-replay --timeout 120
+```
+
+The working directory defaults to the loaded file's directory, or the current
+directory. Override it with `--work-dir`. Local imports and data files resolve
+there; temporary source files are placed there to preserve sibling-module
+resolution and removed on exit. Fortran builds use the CLI's usual helper
+compilation/cache behavior. `--compiler`, `--pretty`, `--round`, and
+`--numeric-diff` forward the corresponding execution/display options. Run
+`:help` or `python xp2f_repl.py --help` for details. Session management and local
+execution live in `p2f_session.py`, separately from the terminal interface.
+
 ## Interfaces for manually implemented Fortran procedures
 
 `xp2f_interface.py` generates a Fortran procedure contract without executing the
@@ -397,6 +466,8 @@ Important caveats:
 ## Repository Contents
 
 - `xp2f.py`: main transpiler and command-line interface.
+- `xp2f_repl.py`: interactive Python workspace with Fortran translation, fresh execution, output comparison, and timing commands.
+- `p2f_session.py`: reusable REPL session controller and local execution backends.
 - `xpfunc2f.py`: translates ONE function (and its dependency closure) from a Python script to Fortran, compiles it with `numpy.f2py`, and generates a thin Python wrapper -- same name, same call signature -- backed by the compiled Fortran, for use inside an otherwise-unchanged Python program.
 - `fortran_scan.py`: shared Fortran source-scanning/rewriting utilities used by `xp2f.py`.
 - `fortran_post.py`: shared post-processing rewrites (cleanup, simplification, formatting) applied to generated Fortran.
