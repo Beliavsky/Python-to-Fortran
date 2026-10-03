@@ -5983,7 +5983,7 @@ def test_xp2f_runs_statistics_quantiles_and_means(tmp_path: Path) -> None:
     assert "Run: PASS" in proc.stdout
     # xp2f strips the no-op `int(...)` wrap off an already-integer literal.
     assert "statistics_quantiles_real(real(x, kind=dp), 4)" in out_text
-    assert "exp(mean_1d(log(real(x, kind=dp))))" in out_text
+    assert "exp(mean(log(real(x, kind=dp))))" in out_text
     assert "sum(1.0_dp / real(x, kind=dp))" in out_text
 
 
@@ -7012,7 +7012,7 @@ def test_xp2f_eliminates_shadow_copy_of_never_reassigned_param(tmp_path: Path) -
     )
     out_f90 = (tmp_path / "xshadow_copy_elim_p.f90").read_text(encoding="utf-8")
     assert "x_local" not in out_f90, out_f90
-    assert re.search(r"\bx0\s*=\s*x\s*-\s*mean_1d\s*\(\s*x\s*\)", out_f90), out_f90
+    assert re.search(r"\bx0\s*=\s*x\s*-\s*mean\s*\(\s*x\s*\)", out_f90), out_f90
 
 
 def test_xp2f_skips_nan_guard_on_literal_comparison_operand(tmp_path: Path) -> None:
@@ -7456,7 +7456,8 @@ def test_xp2f_simplifies_redundant_dp_cast_around_known_dp_returning_call(tmp_pa
         ],
     )
     out_f90 = (tmp_path / "xdp_returning_call_cast_p.f90").read_text(encoding="utf-8")
-    assert "real(mean_1d" not in out_f90, out_f90
+    assert "mean(h ** 1.5_dp)" in out_f90, out_f90
+    assert "real(mean(" not in out_f90, out_f90
 
 
 def test_fortran_simplify_redundant_dp_cast_general_covers_compound_expressions() -> None:
@@ -15467,7 +15468,7 @@ def test_xp2f_pandas_df_print_helpers_skip_block_for_bare_df_name(tmp_path: Path
     )
     f90_text = (tmp_path / "xpandas_block_skip_p.f90").read_text(encoding="utf-8")
     assert "x = df%values" in f90_text, f90_text
-    assert '"a", mean_1d(df%values' in f90_text, f90_text
+    assert '"a", mean(df%values' in f90_text, f90_text
     assert "block" in f90_text, f90_text  # axis=1 and the df[["a","b"]] cases still need one
     assert "pdf_src" in f90_text, f90_text  # the materialized-temp path is still exercised
 

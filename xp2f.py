@@ -1026,7 +1026,7 @@ def fuse_bare_copy_into_next_self_referential_assignment(lines):
     can't write the actual INTENT(IN) dummy, so the codegen always routes
     it through a fresh `_local` variable instead) -- as two adjacent
     Fortran statements, `x_local = x` then `x_local = x_local -
-    mean_1d(x_local)`. The first assignment's only reason for existing is
+    mean(x_local)`. The first assignment's only reason for existing is
     to seed the second statement's own self-reference; nothing ever reads
     NAME in its bare "= SOURCE" state, so the two collapse into one with
     no semantic change.
@@ -1104,9 +1104,9 @@ def eliminate_redundant_readonly_param_shadow_copies(lines):
         ...
         real(kind=dp), allocatable :: x_local(:)
         x_local = x
-        x0 = x_local - mean_1d(x_local)
+        x0 = x_local - mean(x_local)
             --> (x_local declaration and seed copy removed)
-        x0 = x - mean_1d(x)
+        x0 = x - mean(x)
 
     Conservative scope: only fires when
     - `NAME` is an `intent(in)` dummy and `NAME_local` a plain (non-
@@ -1413,10 +1413,10 @@ def simplify_redundant_dp_cast_around_dp_returning_calls(lines):
     run also generated, or one of the vendored runtime helpers (mean_1d,
     mean, var, var_1d, special_factorial, ...). User-reported example:
 
-        eh32 = real(mean_1d(h ** 1.5_dp), kind=dp)
-            --> eh32 = mean_1d(h ** 1.5_dp)
+        eh32 = real(mean(h ** 1.5_dp), kind=dp)
+            --> eh32 = mean(h ** 1.5_dp)
 
-    `mean_1d` is declared `pure real(kind=dp) function mean_1d(x)` in
+    `mean` is declared `pure real(kind=dp) function mean(x)` in
     python.f90, so its result is ALREADY real(kind=dp); wrapping it in
     another cast to that same kind is pure noise (general principle, in
     the user's own words: don't use int()/real(..., kind=dp) when the
@@ -1552,8 +1552,8 @@ def simplify_redundant_dp_cast_general(lines):
             --> eh = exp(mean_x + 0.5_dp * var_x)
         emp_var_r2 = real(emp_acv_r2(1), kind=dp)
             --> emp_var_r2 = emp_acv_r2(1)
-        emp_kurt = real(mean_1d(eps ** 4) / (mean_1d(eps ** 2) ** 2), kind=dp)
-            --> emp_kurt = mean_1d(eps ** 4) / (mean_1d(eps ** 2) ** 2)
+        emp_kurt = real(mean(eps ** 4) / (mean(eps ** 2) ** 2), kind=dp)
+            --> emp_kurt = mean(eps ** 4) / (mean(eps ** 2) ** 2)
 
     Provability is a small, conservative, RECURSIVE type check over the
     expression text (see _dp_expr_type): every top-level +, -, *, /, **
@@ -15626,10 +15626,10 @@ def detect_needed_helpers(tree):
         "unravel_index": {"unravel_index_2d"},
         "kron": {"kron_2d"},
         "mean": {"mean"},
-        "average": {"mean", "mean_1d"},
+        "average": {"mean"},
         "histogram": {"histogram_counts", "histogram_counts_edges"},
-        "var": {"var", "mean", "mean_1d"},
-        "std": {"std", "mean", "mean_1d"},
+        "var": {"var", "mean"},
+        "std": {"std", "mean"},
         "nansum": {"nansum"},
         "nanmean": {"nanmean"},
         "nanvar": {"nanvar"},
@@ -16014,10 +16014,10 @@ def detect_needed_helpers(tree):
             if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
                 sf = self.statistics_func_aliases[node.func.id]
                 if sf in {"mean", "fmean"}:
-                    needed.add("mean_1d")
+                    needed.add("mean")
                     needed.add("weighted_mean_1d")
                 elif sf == "geometric_mean":
-                    needed.add("mean_1d")
+                    needed.add("mean")
                 elif sf in {"variance", "pvariance"}:
                     needed.add("var_1d")
                 elif sf in {"stdev", "pstdev"}:
@@ -16042,10 +16042,10 @@ def detect_needed_helpers(tree):
             ):
                 sf = node.func.attr
                 if sf in {"mean", "fmean"}:
-                    needed.add("mean_1d")
+                    needed.add("mean")
                     needed.add("weighted_mean_1d")
                 elif sf == "geometric_mean":
-                    needed.add("mean_1d")
+                    needed.add("mean")
                 elif sf in {"variance", "pvariance"}:
                     needed.add("var_1d")
                 elif sf in {"stdev", "pstdev"}:
@@ -16540,7 +16540,7 @@ def detect_needed_helpers(tree):
                 needed.add("random_choice_norep")
                 needed.add("arange_int")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "mean":
-                needed.add("mean_1d")
+                needed.add("mean")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "var":
                 needed.add("var_1d")
             if (
@@ -16607,8 +16607,8 @@ def detect_needed_helpers(tree):
                 and node.func.attr == "describe"
                 and len(node.args) == 0
             ):
-                # pandas DataFrame.describe() lowers to mean_1d/std/quantile_linear.
-                needed.add("mean_1d")
+                # pandas DataFrame.describe() lowers to mean/std/quantile_linear.
+                needed.add("mean")
                 needed.add("std")
                 needed.add("quantile_linear")
             if (
@@ -17094,6 +17094,11 @@ def detect_needed_helpers(tree):
             self.generic_visit(node)
 
     scan().visit(tree)
+    if "mean" in needed:
+        # The emitter may need the compatibility name to avoid a binding
+        # in another scope (not visible in this helper scan). Final USE
+        # pruning removes it when the canonical name suffices.
+        needed.add("mean_1d")
     return needed
 
 
@@ -21449,17 +21454,17 @@ end interface gather_where2d"""
       end function rolling_std_1d"""
 
     mean_pub = (
-        "public :: mean_1d !@pyapi kind=function ret=real(dp) "
+        "public :: mean !@pyapi kind=function ret=real(dp) "
         "args=x:real(dp)(:):intent(in) desc=\"mean of 1D real vector\""
     )
-    mean_blk = """      pure real(kind=dp) function mean_1d(x)
+    mean_blk = """      pure real(kind=dp) function mean(x)
          real(kind=dp), intent(in) :: x(:)
          if (size(x) <= 0) then
-            mean_1d = 0.0_dp
+            mean = 0.0_dp
          else
-            mean_1d = sum(x) / real(size(x), kind=dp)
+            mean = sum(x) / real(size(x), kind=dp)
          end if
-      end function mean_1d"""
+      end function mean"""
 
     stat_quant_pub = (
         "public :: statistics_quantiles_real !@pyapi kind=function ret=real(dp)(:) "
@@ -21542,7 +21547,7 @@ end interface gather_where2d"""
             var_1d = 0.0_dp
             return
          end if
-         mu = mean_1d(x)
+         mu = mean(x)
          var_1d = sum((x - mu)**2) / real(n - d, kind=dp)
       end function var_1d"""
 
@@ -21936,7 +21941,8 @@ end interface gather_where2d"""
         "argsort_idx_real": (asrt_idx_pub, asrt_idx_blk),
         "argsort_idx_int": (asrt_idx_i_pub, asrt_idx_i_blk),
         "argsort_idx": (argsort_idx_pub, argsort_idx_blk),
-        "mean_1d": (mean_pub, mean_blk),
+        "mean": (mean_pub, mean_blk),
+        "mean_1d": (mean_pub.replace("mean", "mean_1d"), mean_blk.replace("mean", "mean_1d")),
         "rolling_mean_1d": (rolling_mean_pub, rolling_mean_blk),
         "rolling_std_1d": (rolling_std_pub, rolling_std_blk),
         "statistics_quantiles_real": (stat_quant_pub, stat_quant_blk),
@@ -33186,7 +33192,7 @@ class translator(ast.NodeVisitor):
         # expression text, required (and only meaningful) for method ==
         # "quantile".
         if method == "mean":
-            return f"mean_1d({col_expr})"
+            return self._mean_call(col_expr)
         if method == "median":
             return f"quantile_linear({col_expr}, 0.5_dp)"
         if method == "quantile":
@@ -33865,11 +33871,28 @@ class translator(ast.NodeVisitor):
         return (f"merge({a0}, nint(np_rint(real({a0}, kind=dp) * 10.0_dp**int({d})) / 10.0_dp**int({d})), "
                 f"int({d}) >= 0)")
 
+    def _mean_call(self, x):
+        # A user procedure/variable can shadow the shorter runtime name.
+        names = set(self.local_func_arg_names)
+        for args in self.local_func_arg_names.values():
+            names.update(args)
+        for attr in ("params", "ints", "reals", "logs", "chars", "complexes",
+                     "alloc_ints", "alloc_reals", "alloc_logs", "alloc_complexes", "alloc_chars", "dummy_arg_names"):
+            names.update(getattr(self, attr, ()) or ())
+        helper = "mean_1d" if any(n.lower() == "mean" for n in names) else "mean"
+        return f"{helper}({x})"
+
+    def _flat_1d(self, x, rank):
+        """Flatten for rank-1 helpers; preserve known vectors without RESHAPE."""
+        if rank == 1:
+            return x
+        return f"reshape({x}, [size({x})])"
+
     def _c_order_flat(self, x, rank):
         """The elements of array expression x in NumPy's (row-major) order,
         as a rank-1 array: what ravel()/flatten() give."""
         if rank <= 1:
-            return f"reshape({x}, [size({x})])"
+            return self._flat_1d(x, rank)
         if rank == 2:
             return f"reshape(transpose({x}), [size({x})])"
         if rank == 3:
@@ -39110,7 +39133,7 @@ class translator(ast.NodeVisitor):
                 x_expr = self.expr(x_node)
                 x_real = x_expr if xk == "real" else f"real({x_expr}, kind=dp)"
                 if stat_fn in {"mean", "median", "median_grouped"}:
-                    return f"mean_1d({x_real})" if stat_fn == "mean" else f"median_1d_real({x_real})"
+                    return self._mean_call(x_real) if stat_fn == "mean" else f"median_1d_real({x_real})"
                 if stat_fn == "quantiles":
                     n_node = stat_args[1] if len(stat_args) >= 2 else None
                     for kw in getattr(node, "keywords", []):
@@ -39126,7 +39149,7 @@ class translator(ast.NodeVisitor):
                     n_expr = self.expr(n_node) if n_node is not None else "4"
                     return f"statistics_quantiles_real({x_real}, int({n_expr}))"
                 if stat_fn == "geometric_mean":
-                    return f"exp(mean_1d(log({x_real})))"
+                    return f"exp({self._mean_call('log(' + x_real + ')')})"
                 if stat_fn == "harmonic_mean":
                     return f"(real(size({x_real}), kind=dp) / sum(1.0_dp / {x_real}))"
                 if stat_fn == "fmean":
@@ -39135,7 +39158,7 @@ class translator(ast.NodeVisitor):
                         if kw.arg == "weights":
                             w_node = kw.value
                     if w_node is None:
-                        return f"mean_1d({x_real})"
+                        return self._mean_call(x_real)
                     w_expr = self.expr(w_node)
                     wk = self._expr_kind(w_node)
                     w_real = w_expr if wk == "real" else f"real({w_expr}, kind=dp)"
@@ -39515,7 +39538,7 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         if self._expr_kind(node.func.value) == "logical":
                             return f"(real(count({base_expr}), kind=dp) / real(size({base_expr}), kind=dp))"
-                        return f"mean_1d({base_expr})"
+                        return self._mean_call(base_expr)
                     dim_expr = f"({self.expr(axis_node)} + 1)"
                     reduced = f"(sum({base_expr}, dim={dim_expr}) / real(size({base_expr}, dim={dim_expr}), kind=dp))"
                     if keepdims:
@@ -39591,6 +39614,10 @@ class translator(ast.NodeVisitor):
                         return f"(maxloc({flat}, dim=1) - 1)"
                     return f"(maxloc({base_expr}, dim=({self.expr(axis_node)} + 1)) - 1)"
                 if attr in {"ravel", "flatten"}:
+                    if attr == "flatten" and self._rank_expr(node.func.value) == 1:
+                        # flatten promises a copy, including when passed to a
+                        # procedure that writes its dummy argument.
+                        return f"reshape({base_expr}, [size({base_expr})])"
                     return self._c_order_flat(base_expr, self._rank_expr(node.func.value))
                 if attr == "transpose":
                     rank0 = self._rank_expr(node.func.value)
@@ -40866,8 +40893,8 @@ class translator(ast.NodeVisitor):
                         raise NotImplementedError("np.quantile with an axis takes one quantile")
                     return f"quantile_axis_2d({a0}, {q0}, {int(axis_node.value) + 1})"
                 if int(self._rank_expr(node.args[1])) >= 1:
-                    return f"quantile_linear_vec(reshape({a0}, [size({a0})]), {q0})"
-                return f"quantile_linear(reshape({a0}, [size({a0})]), {q0})"
+                    return f"quantile_linear_vec({self._flat_1d(a0, self._rank_expr(node.args[0]))}, {q0})"
+                return f"quantile_linear({self._flat_1d(a0, self._rank_expr(node.args[0]))}, {q0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "integers"
@@ -40931,7 +40958,7 @@ class translator(ast.NodeVisitor):
                     elif kw.arg == "keepdims":
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is None:
-                    return f"nanmax(reshape({a0}, [size({a0})]))"
+                    return f"nanmax({self._flat_1d(a0, self._rank_expr(node.args[0]))})"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 reduced = f"maxval(merge({a0}, (-huge(1.0_dp)), (.not. ieee_is_nan({a0}))), dim={dim_expr})"
                 if keepdims:
@@ -42040,11 +42067,11 @@ class translator(ast.NodeVisitor):
                 if r0 == 0:
                     aa = f"[real({a0}, kind=dp)]"
                 else:
-                    aa = f"reshape(real({a0}, kind=dp), [size({a0})])"
+                    aa = self._flat_1d(f"real({a0}, kind=dp)", r0)
                 if r1 == 0:
                     bb = f"[real({a1}, kind=dp)]"
                 else:
-                    bb = f"reshape(real({a1}, kind=dp), [size({a1})])"
+                    bb = self._flat_1d(f"real({a1}, kind=dp)", r1)
                 return f"allclose({aa}, {bb}, real({rtol}, kind=dp), real({atol}, kind=dp), {equal_nan})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -42187,7 +42214,7 @@ class translator(ast.NodeVisitor):
                     elif kw.arg == "keepdims":
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is None:
-                    return f"nanmin(reshape({a0}, [size({a0})]))"
+                    return f"nanmin({self._flat_1d(a0, self._rank_expr(node.args[0]))})"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 reduced = f"minval(merge({a0}, huge(1.0_dp), (.not. ieee_is_nan({a0}))), dim={dim_expr})"
                 if keepdims:
@@ -42552,7 +42579,7 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
-                return f"reshape({a0}, [size({a0})])"
+                return self._flat_1d(a0, self._rank_expr(node.args[0]))
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -42875,7 +42902,7 @@ class translator(ast.NodeVisitor):
                         return f"(real(count({a0}), kind=dp) / real(size({a0}), kind=dp))"
                     if a0_kind == "complex":
                         return f"(sum({a0}) / real(size({a0}), kind=dp))"
-                    return f"mean_1d({a0_real})"
+                    return self._mean_call(a0_real)
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 reduced = f"(sum({a0}, dim={dim_expr}) / real(size({a0}, dim={dim_expr}), kind=dp))"
                 if keepdims:
@@ -42897,7 +42924,7 @@ class translator(ast.NodeVisitor):
                     elif kw.arg == "keepdims":
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is None:
-                    return f"nanmean(reshape({a0}, [size({a0})]))"
+                    return f"nanmean({self._flat_1d(a0, self._rank_expr(node.args[0]))})"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 num = f"sum(merge({a0}, 0.0_dp, (.not. ieee_is_nan({a0}))), dim={dim_expr})"
                 den = f"max(1, count((.not. ieee_is_nan({a0})), dim={dim_expr}))"
@@ -42924,7 +42951,7 @@ class translator(ast.NodeVisitor):
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 a0 = self.expr(node.args[0])
                 if axis_node is None:
-                    flat = f"reshape({a0}, [size({a0})])"
+                    flat = self._flat_1d(a0, self._rank_expr(node.args[0]))
                     if ddof_node is None:
                         return f"var_1d({flat})"
                     return f"var_1d({flat}, {self.expr(ddof_node)})"
@@ -42966,8 +42993,8 @@ class translator(ast.NodeVisitor):
                 if axis_node is not None:
                     raise NotImplementedError("np.nanvar(..., axis=...) not yet supported")
                 if ddof_node is None:
-                    return f"nanvar(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]))"
-                return f"nanvar(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]), {self.expr(ddof_node)})"
+                    return f"nanvar({self._flat_1d(self.expr(node.args[0]), self._rank_expr(node.args[0]))})"
+                return f"nanvar({self._flat_1d(self.expr(node.args[0]), self._rank_expr(node.args[0]))}, {self.expr(ddof_node)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -42989,12 +43016,8 @@ class translator(ast.NodeVisitor):
                     elif kw.arg == "keepdims":
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is None:
-                    # Flatten first -- std() (like var_1d(), see np.var's
-                    # own axis=None case just above) is the 1D reduction
-                    # helper and gfortran rejects it outright for a
-                    # rank>1 x ("Rank mismatch") without this; a pre-
-                    # existing gap, not new with axis= support.
-                    flat = f"reshape({a0_real}, [size({a0_real})])"
+                    # std takes a vector; flatten higher/unknown ranks only.
+                    flat = self._flat_1d(a0_real, self._rank_expr(node.args[0]))
                     if ddof_node is None:
                         return f"std({flat})"
                     return f"std({flat}, {self.expr(ddof_node)})"
@@ -43035,8 +43058,8 @@ class translator(ast.NodeVisitor):
                 if axis_node is not None:
                     raise NotImplementedError("np.nanstd(..., axis=...) not yet supported")
                 if ddof_node is None:
-                    return f"nanstd(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]))"
-                return f"nanstd(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]), {self.expr(ddof_node)})"
+                    return f"nanstd({self._flat_1d(self.expr(node.args[0]), self._rank_expr(node.args[0]))})"
+                return f"nanstd({self._flat_1d(self.expr(node.args[0]), self._rank_expr(node.args[0]))}, {self.expr(ddof_node)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -52657,7 +52680,7 @@ class translator(ast.NodeVisitor):
                 self.chars.discard(e.id)
                 self.alloc_ints.discard(e.id)
                 self.alloc_reals.discard(e.id)
-                self.o.w(f"{e.id} = quantile_linear(reshape({a0}, [size({a0})]), {self.expr(qn)})")
+                self.o.w(f"{e.id} = quantile_linear({self._flat_1d(a0, self._rank_expr(v.args[0]))}, {self.expr(qn)})")
             return
         # tuple unpacking from np.polynomial.legendre.leggauss(n):
         #   nodes, weights = np.polynomial.legendre.leggauss(n)
@@ -61709,7 +61732,7 @@ class translator(ast.NodeVisitor):
             self.o.push()
             row_expr = f"{df_expr}%values(pdf_row_reduce_i, :)"
             if method == "mean":
-                val_expr = f"mean_1d({row_expr})"
+                val_expr = self._mean_call(row_expr)
             elif method == "median":
                 val_expr = f"quantile_linear({row_expr}, 0.5_dp)"
             elif method == "std":
@@ -61746,7 +61769,7 @@ class translator(ast.NodeVisitor):
         for j, cname in enumerate(col_names, start=1):
             col_expr = f"{df_expr}%values(:, {j})"
             if method == "mean":
-                val_expr = f"mean_1d({col_expr})"
+                val_expr = self._mean_call(col_expr)
             elif method == "median":
                 val_expr = f"quantile_linear({col_expr}, 0.5_dp)"
             elif method == "std":
@@ -62246,7 +62269,7 @@ class translator(ast.NodeVisitor):
         self.o.w(f"do desc_j = 1, {n_cols}")
         self.o.push()
         self.o.w(f"desc_mat(1, desc_j) = real(size({df_expr}%values, 1), kind=dp)")
-        self.o.w(f"desc_mat(2, desc_j) = mean_1d({df_expr}%values(:, desc_j))")
+        self.o.w(f"desc_mat(2, desc_j) = {self._mean_call(df_expr + '%values(:, desc_j)')}")
         self.o.w(f"desc_mat(3, desc_j) = std({df_expr}%values(:, desc_j), 1)")
         self.o.w(f"desc_mat(4, desc_j) = minval({df_expr}%values(:, desc_j))")
         self.o.w(f"desc_mat(5, desc_j) = quantile_linear({df_expr}%values(:, desc_j), 0.25_dp)")
@@ -80372,13 +80395,15 @@ def transpile_file(
     module_only=False,
     assume_float=False,
     assume_scalar=False,
+    source_name=None,
 ):
     specialization_notes = set() if report_specializations else None
     if src_override is not None:
         src = normalize_numpy_removed_aliases(src_override)
     else:
         src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
-    stem = Path(py_path).stem
+    logical_source = Path(source_name).name if source_name else Path(py_path).name
+    stem = Path(logical_source).stem
     global _SOURCE_TOPLEVEL_LAYOUT, _SOURCE_LINE_INFO
     _SOURCE_TOPLEVEL_LAYOUT = source_toplevel_layout(src)
     _SOURCE_LINE_INFO = source_line_info(src)
@@ -80790,7 +80815,6 @@ def transpile_file(
     if missing_helpers:
         print("warning: missing helper symbols:", ", ".join(sorted(missing_helpers)))
 
-    stem = Path(py_path).stem
     # Tagged string results require local tuple-return procedures. The narrow
     # structured driver generator does not carry their signatures or guards.
     # The structured generator targets one narrow top-level-`if` pattern and
@@ -81176,7 +81200,7 @@ def transpile_file(
     # Source comments are always carried over (--comment only adds the
     # generated procedure/argument comments).
     header = "".join(ln + "\n" for ln in python_header_comment_lines(src))
-    f90 = f"! transpiled by xp2f.py from {Path(py_path).name} on {stamp}\n" + header + f90
+    f90 = f"! transpiled by xp2f.py from {logical_source} on {stamp}\n" + header + f90
     out_path.write_text(f90, encoding="utf-8")
     for note in sorted(specialization_notes or ()):
         print(note, file=sys.stderr)
@@ -81366,6 +81390,7 @@ def main():
     ap.add_argument("input_py", help="input python source")
     ap.add_argument("helpers", nargs="*", help="zero or more helper .f90 module files")
     ap.add_argument("--out", help="output .f90 path (default: input basename with _p.f90)")
+    ap.add_argument("--source-name", help="logical source filename for generated program/module names and header (does not change import resolution or output path)")
     ap.add_argument("--module", action="store_true", help="emit a Fortran procedure module without a main program; --compile creates an object file")
     ap.add_argument("--assume-float", action="store_true", help="with --module, explicitly assume real type for unresolved arguments (with a warning)")
     ap.add_argument("--assume-scalar", action="store_true", help="with --module, explicitly assume scalar rank for unresolved arguments (with a warning)")
@@ -81898,6 +81923,7 @@ def main():
             module_only=args.module,
             assume_float=args.assume_float,
             assume_scalar=args.assume_scalar,
+            source_name=args.source_name,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:

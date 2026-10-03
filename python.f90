@@ -4824,11 +4824,8 @@ contains
 
       pure real(kind=dp) function mean_1d(x)
          real(kind=dp), intent(in) :: x(:)
-         if (size(x) <= 0) then
-            mean_1d = 0.0_dp
-         else
-            mean_1d = sum(x) / real(size(x), kind=dp)
-         end if
+         ! Compatibility name for previously generated translations.
+         mean_1d = mean(x)
       end function mean_1d
 
       pure real(kind=dp) function weighted_mean_1d(x, w)
@@ -4864,7 +4861,7 @@ contains
             var_1d = 0.0_dp
             return
          end if
-         mu = mean_1d(x)
+         mu = mean(x)
          var_1d = sum((x - mu)**2) / real(n - d, kind=dp)
       end function var_1d
 
@@ -4882,7 +4879,7 @@ contains
             skew_1d = ieee_value(0.0_dp, ieee_quiet_nan)
             return
          end if
-         mu = mean_1d(x)
+         mu = mean(x)
          m2 = sum((x - mu)**2) / real(n, kind=dp)
          m3 = sum((x - mu)**3) / real(n, kind=dp)
          if (m2 <= tiny(1.0_dp)) then
@@ -4906,7 +4903,7 @@ contains
             kurt_1d = ieee_value(0.0_dp, ieee_quiet_nan)
             return
          end if
-         mu = mean_1d(x)
+         mu = mean(x)
          m2 = sum((x - mu)**2) / real(n, kind=dp)
          m4 = sum((x - mu)**4) / real(n, kind=dp)
          if (m2 <= tiny(1.0_dp)) then
