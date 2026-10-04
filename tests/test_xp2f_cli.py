@@ -25811,3 +25811,15 @@ def test_xp2f_numpy_complex_ordering_and_dot(tmp_path: Path) -> None:
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_run_diff_with_relative_source_path(tmp_path: Path) -> None:
+    # The built program is launched by absolute path: with
+    # NoDefaultCurrentDirectoryInExePath set, Windows does not search the
+    # current directory for a bare "xrel_p.exe" (FileNotFoundError).
+    (tmp_path / "xrel.py").write_text("print(1 + 2)\n", encoding="utf-8")
+    env = dict(os.environ, NoDefaultCurrentDirectoryInExePath="1")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), "xrel.py", "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False, env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

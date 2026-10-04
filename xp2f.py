@@ -82598,8 +82598,10 @@ def main():
         final_build_status = "pass"
         if args.run:
             t0_run = time.perf_counter()
+            # An absolute path: with NoDefaultCurrentDirectoryInExePath set,
+            # Windows does not find a bare "x_p.exe" in the current directory.
             rp_rc, rp_out, rp_err, rp_live = run_capture(
-                [str(exe)],
+                [str(exe.resolve())],
                 tee=args.tee,
                 stream_line_filter=(
                     lambda line: _display_line(
@@ -82643,7 +82645,7 @@ def main():
                         print("Build: PASS")
                         t0_run_retry = time.perf_counter()
                         rp_rc, rp_out, rp_err, rp_live = run_capture(
-                            [str(exe)],
+                            [str(exe.resolve())],
                             tee=args.tee,
                             stream_line_filter=(
                                 lambda line: _display_line(
@@ -82688,7 +82690,7 @@ def main():
                     else:
                         print("Debug rebuild: PASS")
                         dbg_rc, dbg_out, dbg_err, dbg_live = run_capture(
-                            [str(exe)],
+                            [str(exe.resolve())],
                             tee=args.tee,
                             stream_line_filter=(
                                 lambda line: _display_line(
