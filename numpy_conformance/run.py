@@ -91,7 +91,13 @@ def blocks(text):
     return {k: "\n".join(v) for k, v in out.items()}
 
 
+# A complex scalar with no real part prints as -9j / 0j; Fortran prints
+# both parts, (0.0,-9.0).
+_LONE_IMAG_RE = re.compile(r"^(\s*)([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?j)\s*$", re.M)
+
+
 def compare(py_text, ft_text):
+    py_text = _LONE_IMAG_RE.sub(r"\g<1>0 \g<2>", py_text)
     a, b = tokens(py_text), tokens(ft_text)
     if len(a) != len(b):
         return "DIFF-count", f"{len(a)} values vs {len(b)}"

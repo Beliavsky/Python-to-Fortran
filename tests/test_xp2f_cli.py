@@ -25773,3 +25773,41 @@ def test_xp2f_numpy_axis_operations_on_3d_arrays(tmp_path: Path) -> None:
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_complex_ordering_and_dot(tmp_path: Path) -> None:
+    # numpy_conformance phase 3 (complex inputs): numpy orders complex
+    # numbers lexicographically (comparisons, min/max, argmin/argmax,
+    # maximum/minimum/clip, sort/argsort/unique, median); np.dot/@/.dot do
+    # not conjugate (Fortran's dot_product does), vdot does; isclose uses
+    # the complex modulus; where/concatenate of complex and real arrays
+    # stay complex; `w /= 4` keeps a complex array complex; abs(1j + 2)
+    # keeps the complex literal's parentheses.
+    lines = [
+        "import numpy as np",
+        "c1 = np.array([1 + 2j, -0.5 + 0j, 3 - 1j, 2j])",
+        "c2 = np.array([[1 + 2j, -0.5 + 0j, 3 - 1j], [2j, 1 - 1j, -2 + 0.5j]])",
+        "f1 = np.array([1.0, -0.5, 3.0, 0.0])",
+        "i1 = np.array([3, -1, 4, 1])",
+    ]
+    exprs = [
+        "np.dot(c1, c1)", "np.vdot(c1, c1)", "np.dot(f1, c1)", "c1 @ c1", "c1.dot(c1)", "np.vdot(c2, c2)",
+        "np.sort(c1)", "np.sort(c2, axis=1)", "np.sort(c1)[::-1]", "np.argmax(c2, axis=1)", "np.argsort(c1)",
+        "np.unique(np.concatenate([c1, c1]))", "np.round(c1 / 4, 1)", "np.maximum(c1, c1[::-1])",
+        "np.minimum(c1, 0)", "np.clip(c1, 0, 1)", "np.cumsum(c1)", "np.cumprod(c2, axis=0)", "np.max(c2)",
+        "np.max(c2, axis=0)", "np.min(c2, axis=-1, keepdims=True)", "np.argmin(c1)", "c1.argmin()",
+        "np.argmax(c2)", "np.any(c1 > 2)", "np.all(c2 >= -10)", "np.where(c2 > 1, c2, 0)",
+        "np.where(c1 > 1, c1, -0.5)", "np.where(c1)[0]", "np.where(c2, 1, 2)", "np.median(c1)",
+        "np.median(c2, axis=0)", "np.ptp(c1)", "np.tile(c1, 2)", "np.repeat(c1, 2)", "np.diag(c1, 1)",
+        "np.diag(c2, -1)", "np.fmax(c1, 0)", "np.concatenate([c1, f1, i1])", "np.hstack((c1, f1))",
+        "np.isclose(c1, 1)", "np.isclose(c1, f1, atol=1.5)", "np.allclose(c1, f1)", "abs(1j + 2)",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(r{k})"]
+    lines += ["w = c1.copy()", "w.sort()", "print(w)", "v = c1.copy()", "v /= 4", "s = v", "print(s)"]
+    src = tmp_path / "xnp_complex.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

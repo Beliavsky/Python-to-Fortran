@@ -377,6 +377,13 @@ public :: argsort
 public :: argsort_idx
 public :: sorted_vec
 public :: diag_k
+public :: c_lt, c_le, c_gt, c_ge, c_maximum, c_minimum, c_round
+public :: c_amin, c_amax, c_argmin, c_argmax
+public :: cumsum_complex, cumprod_complex, cumsum_complex_2d, cumprod_complex_2d
+public :: sorted_complex_vec, sorted_complex_2d, argsort_complex_vec, argsort_complex_2d
+public :: sort_complex_vec, unique_complex, median_complex, median_complex_2d
+public :: reversed_complex_vec
+public :: repeat_complex, tile_complex, diag_k_vec_complex, diag_k_mat_complex
 public :: sort_axis_3d
 public :: argsort_axis_3d
 public :: cumsum_axis_3d
@@ -470,20 +477,20 @@ interface diagonal
 end interface diagonal
 
 interface repeat
-   module procedure repeat_real, repeat_int, repeat_logical
+   module procedure repeat_real, repeat_int, repeat_logical, repeat_complex
 end interface repeat
 
 interface tile
-   module procedure tile_real, tile_int
+   module procedure tile_real, tile_int, tile_complex
    module procedure tile_real_2d, tile_int_2d
 end interface tile
 
 interface unique
-   module procedure unique_real, unique_int, unique_char
+   module procedure unique_real, unique_int, unique_char, unique_complex
 end interface unique
 
 interface sort_vec
-   module procedure sort_real_vec, sort_int_vec, sort_char_vec
+   module procedure sort_real_vec, sort_int_vec, sort_char_vec, sort_complex_vec
 end interface sort_vec
 
 interface argsort
@@ -491,11 +498,11 @@ interface argsort
 end interface argsort
 
 interface argsort_idx
-   module procedure argsort_idx_real, argsort_idx_int
+   module procedure argsort_idx_real, argsort_idx_int, argsort_complex_vec
 end interface argsort_idx
 
 interface sorted_vec
-   module procedure sorted_real_vec, sorted_int_vec
+   module procedure sorted_real_vec, sorted_int_vec, sorted_complex_vec
 end interface sorted_vec
 
 interface np_amin
@@ -538,8 +545,25 @@ interface concat_3d
    module procedure concat_3d_real, concat_3d_int
 end interface concat_3d
 
+interface c_amin
+   module procedure c_amin_r1, c_amin_r2, c_amin_r2_dim
+end interface c_amin
+
+interface c_amax
+   module procedure c_amax_r1, c_amax_r2, c_amax_r2_dim
+end interface c_amax
+
+interface c_argmin
+   module procedure c_argmin_r1, c_argmin_r2_dim
+end interface c_argmin
+
+interface c_argmax
+   module procedure c_argmax_r1, c_argmax_r2_dim
+end interface c_argmax
+
 interface diag_k
    module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
+   module procedure diag_k_vec_complex, diag_k_mat_complex
 end interface diag_k
 
 interface triu
@@ -551,15 +575,15 @@ interface tril
 end interface tril
 
 interface reversed_vec
-   module procedure reversed_real_vec, reversed_int_vec, reversed_logical_vec
+   module procedure reversed_real_vec, reversed_int_vec, reversed_logical_vec, reversed_complex_vec
 end interface reversed_vec
 
 interface sorted_2d
-   module procedure sorted_real_2d, sorted_int_2d
+   module procedure sorted_real_2d, sorted_int_2d, sorted_complex_2d
 end interface sorted_2d
 
 interface argsort_2d
-   module procedure argsort_real_2d, argsort_int_2d
+   module procedure argsort_real_2d, argsort_int_2d, argsort_complex_2d
 end interface argsort_2d
 
 interface histogram
@@ -4348,6 +4372,454 @@ contains
             end do
          end do
       end function nonzero_3d
+
+      elemental logical function c_lt(a, b)
+         ! numpy's ordering of complex numbers: by real part, then imaginary part.
+         complex(kind=dp), intent(in) :: a, b
+         if (real(a, kind=dp) == real(b, kind=dp)) then
+            c_lt = aimag(a) < aimag(b)
+         else
+            c_lt = real(a, kind=dp) < real(b, kind=dp)
+         end if
+      end function c_lt
+
+      elemental logical function c_le(a, b)
+         ! numpy's ordering of complex numbers: by real part, then imaginary part.
+         complex(kind=dp), intent(in) :: a, b
+         if (real(a, kind=dp) == real(b, kind=dp)) then
+            c_le = aimag(a) <= aimag(b)
+         else
+            c_le = real(a, kind=dp) < real(b, kind=dp)
+         end if
+      end function c_le
+
+      elemental logical function c_gt(a, b)
+         ! numpy's ordering of complex numbers: by real part, then imaginary part.
+         complex(kind=dp), intent(in) :: a, b
+         if (real(a, kind=dp) == real(b, kind=dp)) then
+            c_gt = aimag(a) > aimag(b)
+         else
+            c_gt = real(a, kind=dp) > real(b, kind=dp)
+         end if
+      end function c_gt
+
+      elemental logical function c_ge(a, b)
+         ! numpy's ordering of complex numbers: by real part, then imaginary part.
+         complex(kind=dp), intent(in) :: a, b
+         if (real(a, kind=dp) == real(b, kind=dp)) then
+            c_ge = aimag(a) >= aimag(b)
+         else
+            c_ge = real(a, kind=dp) > real(b, kind=dp)
+         end if
+      end function c_ge
+
+      elemental function c_maximum(a, b) result(r)
+         ! np.maximum of complex numbers (lexicographic).
+         complex(kind=dp), intent(in) :: a, b
+         complex(kind=dp) :: r
+         r = merge(b, a, c_lt(a, b))
+      end function c_maximum
+
+      elemental function c_minimum(a, b) result(r)
+         complex(kind=dp), intent(in) :: a, b
+         complex(kind=dp) :: r
+         r = merge(b, a, c_gt(a, b))
+      end function c_minimum
+
+      elemental function c_round(z, d) result(r)
+         ! np.round of a complex number: both parts, half to even.
+         complex(kind=dp), intent(in) :: z
+         integer, intent(in) :: d
+         complex(kind=dp) :: r
+         real(kind=dp) :: s
+         s = 10.0_dp**d
+         r = cmplx(anint_even(real(z, kind=dp) * s) / s, anint_even(aimag(z) * s) / s, kind=dp)
+      contains
+         elemental real(kind=dp) function anint_even(x)
+            real(kind=dp), intent(in) :: x
+            anint_even = anint(x)
+            if (abs(x - aint(x)) == 0.5_dp) anint_even = 2.0_dp * anint(x / 2.0_dp)
+         end function anint_even
+      end function c_round
+
+      pure function c_amin_r1(x) result(r)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp) :: r
+         integer :: i
+         r = x(1)
+         do i = 2, size(x)
+            if (c_lt(x(i), r)) r = x(i)
+         end do
+      end function c_amin_r1
+
+      pure function c_amin_r2(x) result(r)
+         complex(kind=dp), intent(in) :: x(:,:)
+         complex(kind=dp) :: r
+         r = c_amin_r1(reshape(x, [size(x)]))
+      end function c_amin_r2
+
+      pure function c_amin_r2_dim(x, dim) result(r)
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         complex(kind=dp), allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = c_amin_r1(x(:, i))
+            else
+               r(i) = c_amin_r1(x(i, :))
+            end if
+         end do
+      end function c_amin_r2_dim
+
+      pure function c_amax_r1(x) result(r)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp) :: r
+         integer :: i
+         r = x(1)
+         do i = 2, size(x)
+            if (c_gt(x(i), r)) r = x(i)
+         end do
+      end function c_amax_r1
+
+      pure function c_amax_r2(x) result(r)
+         complex(kind=dp), intent(in) :: x(:,:)
+         complex(kind=dp) :: r
+         r = c_amax_r1(reshape(x, [size(x)]))
+      end function c_amax_r2
+
+      pure function c_amax_r2_dim(x, dim) result(r)
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         complex(kind=dp), allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = c_amax_r1(x(:, i))
+            else
+               r(i) = c_amax_r1(x(i, :))
+            end if
+         end do
+      end function c_amax_r2_dim
+
+      pure function c_argmin_r1(x) result(r)
+         ! np.argmin (0-based) of complex numbers, the first extreme value.
+         complex(kind=dp), intent(in) :: x(:)
+         integer :: r, i
+         r = 1
+         do i = 2, size(x)
+            if (c_lt(x(i), x(r))) r = i
+         end do
+         r = r - 1
+      end function c_argmin_r1
+
+      pure function c_argmin_r2_dim(x, dim) result(r)
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = c_argmin_r1(x(:, i))
+            else
+               r(i) = c_argmin_r1(x(i, :))
+            end if
+         end do
+      end function c_argmin_r2_dim
+
+      pure function c_argmax_r1(x) result(r)
+         ! np.argmax (0-based) of complex numbers, the first extreme value.
+         complex(kind=dp), intent(in) :: x(:)
+         integer :: r, i
+         r = 1
+         do i = 2, size(x)
+            if (c_gt(x(i), x(r))) r = i
+         end do
+         r = r - 1
+      end function c_argmax_r1
+
+      pure function c_argmax_r2_dim(x, dim) result(r)
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = c_argmax_r1(x(:, i))
+            else
+               r(i) = c_argmax_r1(x(i, :))
+            end if
+         end do
+      end function c_argmax_r2_dim
+
+      pure function cumsum_complex(x) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), allocatable :: y(:)
+         integer :: i
+         allocate(y(size(x)))
+         if (size(x) == 0) return
+         y(1) = x(1)
+         do i = 2, size(x)
+            y(i) = y(i - 1) + x(i)
+         end do
+      end function cumsum_complex
+
+      pure function cumsum_complex_2d(x, dim) result(y)
+         ! np.cumsum(x, axis=dim-1) of a complex matrix.
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         complex(kind=dp), allocatable :: y(:,:)
+         integer :: i
+         allocate(y(size(x,1), size(x,2)))
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               y(:, i) = cumsum_complex(x(:, i))
+            end do
+         else
+            do i = 1, size(x,1)
+               y(i, :) = cumsum_complex(x(i, :))
+            end do
+         end if
+      end function cumsum_complex_2d
+
+      pure function cumprod_complex(x) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), allocatable :: y(:)
+         integer :: i
+         allocate(y(size(x)))
+         if (size(x) == 0) return
+         y(1) = x(1)
+         do i = 2, size(x)
+            y(i) = y(i - 1) * x(i)
+         end do
+      end function cumprod_complex
+
+      pure function cumprod_complex_2d(x, dim) result(y)
+         ! np.cumprod(x, axis=dim-1) of a complex matrix.
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         complex(kind=dp), allocatable :: y(:,:)
+         integer :: i
+         allocate(y(size(x,1), size(x,2)))
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               y(:, i) = cumprod_complex(x(:, i))
+            end do
+         else
+            do i = 1, size(x,1)
+               y(i, :) = cumprod_complex(x(i, :))
+            end do
+         end if
+      end function cumprod_complex_2d
+
+      pure function argsort_complex_vec(x) result(idx)
+         ! np.argsort (0-based, stable) of complex numbers in numpy's
+         ! lexicographic order -- an insertion-free bottom-up merge sort.
+         complex(kind=dp), intent(in) :: x(:)
+         integer, allocatable :: idx(:)
+         integer, allocatable :: tmp(:)
+         integer :: n, width, lo, mid, hi, i, j, k
+         n = size(x)
+         allocate(idx(n), tmp(n))
+         idx = [(i, i = 1, n)]
+         width = 1
+         do while (width < n)
+            lo = 1
+            do while (lo <= n)
+               mid = min(lo + width - 1, n)
+               hi = min(lo + 2 * width - 1, n)
+               i = lo
+               j = mid + 1
+               k = lo
+               do while (i <= mid .and. j <= hi)
+                  if (c_le(x(idx(i)), x(idx(j)))) then
+                     tmp(k) = idx(i)
+                     i = i + 1
+                  else
+                     tmp(k) = idx(j)
+                     j = j + 1
+                  end if
+                  k = k + 1
+               end do
+               do while (i <= mid)
+                  tmp(k) = idx(i)
+                  i = i + 1
+                  k = k + 1
+               end do
+               do while (j <= hi)
+                  tmp(k) = idx(j)
+                  j = j + 1
+                  k = k + 1
+               end do
+               lo = lo + 2 * width
+            end do
+            idx = tmp
+            width = 2 * width
+         end do
+         idx = idx - 1
+      end function argsort_complex_vec
+
+      pure function sorted_complex_vec(x) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), allocatable :: y(:)
+         y = x(argsort_complex_vec(x) + 1)
+      end function sorted_complex_vec
+
+      pure subroutine sort_complex_vec(x)
+         ! x.sort() of a complex vector.
+         complex(kind=dp), intent(inout) :: x(:)
+         x = x(argsort_complex_vec(x) + 1)
+      end subroutine sort_complex_vec
+
+      pure function sorted_complex_2d(x, dim) result(y)
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         complex(kind=dp), allocatable :: y(:,:)
+         integer :: i
+         allocate(y(size(x,1), size(x,2)))
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               y(:, i) = sorted_complex_vec(x(:, i))
+            end do
+         else
+            do i = 1, size(x,1)
+               y(i, :) = sorted_complex_vec(x(i, :))
+            end do
+         end if
+      end function sorted_complex_2d
+
+      pure function argsort_complex_2d(x, dim) result(idx)
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: idx(:,:)
+         integer :: i
+         allocate(idx(size(x,1), size(x,2)))
+         if (dim == 1) then
+            do i = 1, size(x,2)
+               idx(:, i) = argsort_complex_vec(x(:, i))
+            end do
+         else
+            do i = 1, size(x,1)
+               idx(i, :) = argsort_complex_vec(x(i, :))
+            end do
+         end if
+      end function argsort_complex_2d
+
+      pure function unique_complex(x) result(y)
+         ! np.unique of complex numbers: sorted, duplicates removed.
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), allocatable :: y(:)
+         complex(kind=dp), allocatable :: s(:)
+         logical, allocatable :: keep(:)
+         s = sorted_complex_vec(x)
+         allocate(keep(size(s)))
+         if (size(s) > 0) keep(1) = .true.
+         if (size(s) > 1) keep(2:) = s(2:) /= s(:size(s)-1)
+         y = pack(s, keep)
+      end function unique_complex
+
+      pure function median_complex(x) result(m)
+         ! np.median of complex numbers: the middle of the lexicographic
+         ! order (the mean of the two middle values for an even count).
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp) :: m
+         complex(kind=dp), allocatable :: s(:)
+         integer :: n
+         n = size(x)
+         s = sorted_complex_vec(x)
+         if (mod(n, 2) == 1) then
+            m = s((n + 1) / 2)
+         else
+            m = (s(n / 2) + s(n / 2 + 1)) / 2.0_dp
+         end if
+      end function median_complex
+
+      pure function median_complex_2d(x, dim) result(m)
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         complex(kind=dp), allocatable :: m(:)
+         integer :: i
+         allocate(m(size(x, 3 - dim)))
+         do i = 1, size(m)
+            if (dim == 1) then
+               m(i) = median_complex(x(:, i))
+            else
+               m(i) = median_complex(x(i, :))
+            end if
+         end do
+      end function median_complex_2d
+
+      pure function reversed_complex_vec(x) result(y)
+         ! x[::-1] of a complex vector expression.
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), allocatable :: y(:)
+         y = x(size(x):1:-1)
+      end function reversed_complex_vec
+
+      pure function repeat_complex(x, reps) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: reps
+         complex(kind=dp), allocatable :: y(:)
+         integer :: i
+         allocate(y(size(x) * reps))
+         do i = 1, size(x)
+            y((i - 1) * reps + 1:i * reps) = x(i)
+         end do
+      end function repeat_complex
+
+      pure function tile_complex(x, reps) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: reps
+         complex(kind=dp), allocatable :: y(:)
+         integer :: i
+         allocate(y(size(x) * reps))
+         do i = 1, reps
+            y((i - 1) * size(x) + 1:i * size(x)) = x
+         end do
+      end function tile_complex
+
+      pure function diag_k_vec_complex(v, k) result(a)
+         ! np.diag(v, k) of a complex vector.
+         complex(kind=dp), intent(in) :: v(:)
+         integer, intent(in) :: k
+         complex(kind=dp), allocatable :: a(:,:)
+         integer :: n, i
+         n = size(v) + abs(k)
+         allocate(a(n, n))
+         a = (0.0_dp, 0.0_dp)
+         do i = 1, size(v)
+            if (k >= 0) then
+               a(i, i + k) = v(i)
+            else
+               a(i - k, i) = v(i)
+            end if
+         end do
+      end function diag_k_vec_complex
+
+      pure function diag_k_mat_complex(a, k) result(v)
+         ! np.diag(a, k) of a complex matrix: its k-th diagonal.
+         complex(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: k
+         complex(kind=dp), allocatable :: v(:)
+         integer :: n, i
+         if (k >= 0) then
+            n = max(0, min(size(a,1), size(a,2) - k))
+         else
+            n = max(0, min(size(a,1) + k, size(a,2)))
+         end if
+         allocate(v(n))
+         do i = 1, n
+            if (k >= 0) then
+               v(i) = a(i, i + k)
+            else
+               v(i) = a(i - k, i)
+            end if
+         end do
+      end function diag_k_mat_complex
 
       pure function diag_k_vec_real(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.

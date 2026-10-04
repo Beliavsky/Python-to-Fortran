@@ -534,7 +534,20 @@ def simplify_narrow_redundant_arith_parens(lines):
                 # "=", start-of-line) carries no such risk: distributing
                 # a "+" over a group never changes any term's sign.
                 minus_sign_flip_risk = prev_ch == "-" and re.search(r"[+\-,]", inner)
-                if inner and not minus_sign_flip_risk:
+                # A top-level comma makes it a complex literal such as
+                # (0.0_dp, 1.0_dp), not a grouping: abs((0.0_dp, 1.0_dp) + 2)
+                # became abs(0.0_dp, 1.0_dp + 2).
+                _d5 = 0
+                _comma5 = False
+                for _ch5 in inner:
+                    if _ch5 == "(":
+                        _d5 += 1
+                    elif _ch5 == ")":
+                        _d5 -= 1
+                    elif _ch5 == "," and _d5 == 0:
+                        _comma5 = True
+                        break
+                if inner and not minus_sign_flip_risk and not _comma5:
                     removals5.append((open_idx, close_idx))
                     # Skip past this whole matched span instead of just
                     # past its own opening paren: a NESTED "(" inside it
@@ -15491,6 +15504,11 @@ def template_derived_needed_helpers(structured_type_components):
 def detect_needed_helpers(tree):
     needed = set()
     for node in ast.walk(tree):
+        # An ordering comparison may be of complex numbers (c_lt etc.,
+        # translator._complex_numpy) -- not a Call, so scanned here.
+        if isinstance(node, ast.Compare) and any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+                                                 for op in node.ops):
+            needed.update({"c_lt", "c_le", "c_gt", "c_ge"})
         # `s[::-1]` (full-string reversal) lowers to a call to the
         # str_reverse runtime helper in translator.expr's own Subscript
         # codegen -- unlike every other helper this function detects,
@@ -15898,6 +15916,9 @@ def detect_needed_helpers(tree):
             # Rank-3 axis operations (translator._rank3_numpy).
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._RANK3_ATTRS:
                 needed.update(translator._RANK3_HELPERS)
+            # Complex ordering and friends (translator._complex_numpy).
+            if isinstance(node.func, ast.Attribute) and node.func.attr in translator._COMPLEX_ATTRS:
+                needed.update(translator._COMPLEX_HELPERS)
             def _attr_chain_parts(n):
                 parts = []
                 cur = n
@@ -28193,6 +28214,157 @@ class translator(ast.NodeVisitor):
         "nanvar", "nancumsum", "nancumprod", "nanmedian", "unique",
     }
 
+    _COMPLEX_HELPERS = {
+        "c_lt", "c_le", "c_gt", "c_ge", "c_maximum", "c_minimum", "c_round", "c_amin", "c_amax", "c_argmin",
+        "c_argmax", "cumsum_complex", "cumprod_complex", "cumsum_complex_2d", "cumprod_complex_2d",
+        "sorted_complex_vec", "sorted_complex_2d", "argsort_complex_vec", "argsort_complex_2d",
+        "sort_complex_vec", "unique_complex", "median_complex", "median_complex_2d", "repeat_complex",
+        "tile_complex", "diag_k_vec_complex", "diag_k_mat_complex", "reversed_complex_vec"}
+    _COMPLEX_ATTRS = {
+        "min", "max", "amin", "amax", "argmin", "argmax", "ptp", "maximum", "minimum", "fmax", "fmin", "clip",
+        "cumsum", "cumprod", "sort", "argsort", "unique", "round", "around", "quantile", "median", "where",
+        "repeat", "tile", "diag"}
+    _COMPLEX_ORDER_OPS = {ast.Lt: "c_lt", ast.LtE: "c_le", ast.Gt: "c_gt", ast.GtE: "c_ge"}
+
+    def _complex_numpy(self, node):
+        """Fortran for numpy operations on complex arrays that need numpy's
+        lexicographic ordering of complex numbers (comparisons, min/max,
+        argmin/argmax, maximum/minimum/clip, sort/argsort/unique, median),
+        complex cumsum/cumprod and round, and complex truth values in
+        np.where; None to use the general translation."""
+        def ctxt(n):
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "complex" else f"cmplx({txt}, 0.0_dp, kind=dp)"
+
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1 or type(node.ops[0]) not in self._COMPLEX_ORDER_OPS:
+                return None
+            a, b = node.left, node.comparators[0]
+            if "complex" not in {self._expr_kind(a), self._expr_kind(b)}:
+                return None
+            return f"{self._COMPLEX_ORDER_OPS[type(node.ops[0])]}({ctxt(a)}, {ctxt(b)})"
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute) and is_numpy_name_node(node.value.func.value)
+                and node.value.func.attr == "where" and len(node.value.args) == 1
+                and self._expr_kind(node.value.args[0]) == "complex"):
+            cond = ast.Compare(left=node.value.args[0], ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+            new = ast.fix_missing_locations(ast.copy_location(ast.Subscript(
+                value=ast.Call(func=node.value.func, args=[cond], keywords=[]), slice=node.slice, ctx=ast.Load()),
+                node))
+            return self.expr(new)
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value) and node.args):
+            return None
+        attr = node.func.attr
+        x = node.args[0]
+        if attr == "where" and len(node.args) == 3 and self._expr_kind(x) == "complex":
+            cond = ast.Compare(left=x, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+            new = ast.fix_missing_locations(ast.copy_location(
+                ast.Call(func=node.func, args=[cond] + list(node.args[1:]), keywords=[]), node))
+            return self.expr(new)
+        if attr in {"maximum", "minimum", "fmax", "fmin"}:
+            if len(node.args) != 2 or node.keywords or "complex" not in {
+                    self._expr_kind(node.args[0]), self._expr_kind(node.args[1])}:
+                return None
+            fn = "c_maximum" if attr in {"maximum", "fmax"} else "c_minimum"
+            return f"{fn}({ctxt(node.args[0])}, {ctxt(node.args[1])})"
+        if self._expr_kind(x) != "complex":
+            return None
+        r0 = int(self._rank_expr(x) or 0)
+        if r0 not in (1, 2):
+            return None
+        a = self.expr(x)
+        flat = self._c_order_flat(a, r0) if r0 == 2 else a
+        if attr == "clip":
+            if len(node.args) != 3 or node.keywords:
+                return None
+            out = a
+            if not is_none(node.args[1]):
+                out = f"c_maximum({out}, {ctxt(node.args[1])})"
+            if not is_none(node.args[2]):
+                out = f"c_minimum({out}, {ctxt(node.args[2])})"
+            return out
+        if attr in {"round", "around"}:
+            d = node.args[1] if len(node.args) >= 2 else next(
+                (kw.value for kw in node.keywords if kw.arg == "decimals"), None)
+            return f"c_round({a}, {0 if d is None else 'int(' + self.expr(d) + ')'})"
+        if attr == "unique":
+            if node.keywords or len(node.args) != 1:
+                return None
+            return f"unique_complex({flat})"
+        if attr == "quantile":
+            q = node.args[1] if len(node.args) >= 2 else None
+            if not (isinstance(q, ast.Constant) and q.value == 0.5):
+                return None
+            attr = "median"
+            node_args = [x] + list(node.args[2:])
+        else:
+            node_args = list(node.args)
+        pos_axis = 1 if attr in {"min", "max", "amin", "amax", "argmin", "argmax", "ptp", "cumsum", "cumprod",
+                                 "sort", "argsort", "median"} else None
+        if pos_axis is None:
+            return None
+        allowed = {"axis"} | ({"keepdims"} if attr in {"min", "max", "amin", "amax"} else set()) \
+            | ({"kind"} if attr in {"sort", "argsort"} else set())
+        if any(kw.arg not in allowed for kw in node.keywords):
+            return None
+        axis = node_args[pos_axis] if len(node_args) > pos_axis else "default"
+        axis = next((kw.value for kw in node.keywords if kw.arg == "axis"), axis)
+        if axis == "default":
+            axis = -1 if attr in {"sort", "argsort"} else None
+        elif is_none(axis):
+            axis = None
+        elif isinstance(axis, ast.Constant) and isinstance(axis.value, int):
+            axis = axis.value
+        elif isinstance(axis, ast.UnaryOp) and isinstance(axis.op, ast.USub) and isinstance(axis.operand, ast.Constant):
+            axis = -axis.operand.value
+        else:
+            return None
+        dim = None if axis is None else (axis % r0) + 1
+        keepdims = any(kw.arg == "keepdims" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                       for kw in node.keywords)
+        if attr in {"min", "max", "amin", "amax", "ptp"}:
+            def red(op):
+                fn = "c_amin" if op in {"min", "amin"} else "c_amax"
+                return f"{fn}({a})" if dim is None or r0 == 1 else f"{fn}({a}, {dim})"
+            out = f"({red('max')} - {red('min')})" if attr == "ptp" else red(attr)
+            if keepdims:
+                if dim is None or r0 == 1:
+                    return None
+                out = f"spread({out}, dim={dim}, ncopies=1)"
+            return out
+        if attr in {"argmin", "argmax"}:
+            return f"c_{attr}({flat})" if dim is None or r0 == 1 else f"c_{attr}({a}, {dim})"
+        if attr in {"cumsum", "cumprod"}:
+            return f"{attr}_complex({flat})" if dim is None or r0 == 1 else f"{attr}_complex_2d({a}, {dim})"
+        if attr in {"sort", "argsort"}:
+            base = "sorted_complex" if attr == "sort" else "argsort_complex"
+            return f"{base}_vec({flat})" if dim is None or r0 == 1 else f"{base}_2d({a}, {dim})"
+        if attr == "median":
+            return f"median_complex({flat})" if dim is None or r0 == 1 else f"median_complex_2d({a}, {dim})"
+        return None
+
+    def _complex_close_test(self, node):
+        """np.isclose(a, b, rtol, atol) with a complex operand, elementwise:
+        abs(a - b) <= atol + rtol*abs(b) with the complex modulus (the real
+        helpers dropped the imaginary parts); None if neither is complex."""
+        a, b = node.args[0], node.args[1]
+        if "complex" not in {self._expr_kind(a), self._expr_kind(b)}:
+            return None
+        if any(kw.arg not in {"rtol", "atol"} for kw in node.keywords):
+            return None
+        rtol = node.args[2] if len(node.args) >= 3 else next((kw.value for kw in node.keywords if kw.arg == "rtol"), None)
+        atol = node.args[3] if len(node.args) >= 4 else next((kw.value for kw in node.keywords if kw.arg == "atol"), None)
+
+        def ctxt(n):
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "complex" else f"cmplx({txt}, 0.0_dp, kind=dp)"
+
+        rt = "1.0e-5_dp" if rtol is None else f"real({self.expr(rtol)}, kind=dp)"
+        at = "1.0e-8_dp" if atol is None else f"real({self.expr(atol)}, kind=dp)"
+        ta, tb = ctxt(a), ctxt(b)
+        return f"(abs({ta} - ({tb})) <= {at} + {rt} * abs({tb}))"
+
     def _pad_partial_index(self, node):
         """x[i, j] of a rank-3 (or higher) array x means x[i, j, :]: append
         the missing full slices to the subscript tuple, in place."""
@@ -28216,6 +28388,23 @@ class translator(ast.NodeVisitor):
         np.mean(m) of a 2-D m -> np.mean(np.ravel(m)); np.sort(m, axis=None)
         -> np.sort(np.ravel(m))."""
         self._pad_partial_index(node)
+        # a @ b / a.dot(b) of vectors with a complex operand: no conjugation
+        # (Fortran's dot_product conjugates a).
+        _dot_pair = None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            _dot_pair = (node.left, node.right)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "dot"
+              and not is_numpy_name_node(node.func.value) and len(node.args) == 1 and not node.keywords):
+            _dot_pair = (node.func.value, node.args[0])
+        if (_dot_pair is not None and "complex" in {self._expr_kind(x) for x in _dot_pair}
+                and all(int(self._rank_expr(x) or 0) == 1 for x in _dot_pair)):
+            cached = getattr(node, "_xp2f_canonical", None)
+            if cached is None:
+                cached = ast.fix_missing_locations(ast.copy_location(ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="sum", ctx=ast.Load()),
+                    args=[ast.BinOp(left=_dot_pair[0], op=ast.Mult(), right=_dot_pair[1])], keywords=[]), node))
+                node._xp2f_canonical = cached
+            return cached
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Call)
@@ -28287,7 +28476,7 @@ class translator(ast.NodeVisitor):
             not is_numpy_name_node(func.value)
             and (attr in self._METHODS_AS_NUMPY_FUNCTIONS
                  or (attr in self._BOOL_METHODS_AS_NUMPY_FUNCTIONS and recv_kind == "logical")
-                 or (attr in {"min", "max", "argmin", "argmax"} and recv_kind == "real"))
+                 or (attr in {"min", "max", "argmin", "argmax"} and recv_kind in {"real", "complex"}))
             and not SOURCE_USES_PANDAS
             and int(self._rank_expr(func.value) or 0) >= 1
             and recv_kind in {"int", "real", "logical", "complex"}
@@ -28322,19 +28511,37 @@ class translator(ast.NodeVisitor):
             is_numpy_name_node(func.value) and attr in {"var", "std"} and len(node.args) == 1
             and self._expr_kind(node.args[0]) == "complex"
         ):
-            if any(kw.arg != "ddof" for kw in node.keywords):
-                raise NotImplementedError(f"np.{attr} of a complex array supports only ddof=")
-            # numpy: var = sum(|x - mean(x)|**2) / (n - ddof), std its root.
+            if any(kw.arg not in {"ddof", "axis"} for kw in node.keywords):
+                raise NotImplementedError(f"np.{attr} of a complex array supports only ddof= and axis=")
+            # numpy: var = sum(|x - mean(x)|**2) / (n - ddof), std its root;
+            # with axis=, along that axis (the mean kept as a size-1 axis).
             x = node.args[0]
-            dev = ast.Call(func=np_func("abs"), args=[ast.BinOp(
-                left=x, op=ast.Sub(), right=ast.Call(func=np_func("mean"), args=[x], keywords=[]))], keywords=[])
-            n = ast.Call(func=np_func("size"), args=[x], keywords=[])
+            axis = next((kw.value for kw in node.keywords if kw.arg == "axis"), None)
+            if axis is not None and is_none(axis):
+                axis = None
             ddof = next((kw.value for kw in node.keywords if kw.arg == "ddof"), None)
+
+            def sq_abs(e, kw):
+                return ast.Call(func=np_func("sum"), args=[ast.BinOp(
+                    left=ast.Call(func=np_func("abs"), args=[e], keywords=[]), op=ast.Pow(),
+                    right=ast.Constant(value=2))], keywords=kw)
+
+            if axis is None:
+                mean = ast.Call(func=np_func("mean"), args=[x], keywords=[])
+                n = ast.Call(func=np_func("size"), args=[x], keywords=[])
+                ss = sq_abs(ast.BinOp(left=x, op=ast.Sub(), right=mean), [])
+            else:
+                # Along an axis: sum(|x|**2) - n*|mean|**2 (x - mean would
+                # need numpy broadcasting of the kept axis).
+                n = ast.Subscript(value=ast.Attribute(value=x, attr="shape", ctx=ast.Load()), slice=axis,
+                                  ctx=ast.Load())
+                mean = ast.Call(func=np_func("mean"), args=[x], keywords=[ast.keyword(arg="axis", value=axis)])
+                ss = ast.BinOp(left=sq_abs(x, [ast.keyword(arg="axis", value=axis)]), op=ast.Sub(),
+                               right=ast.BinOp(left=n, op=ast.Mult(), right=ast.BinOp(
+                                   left=ast.Call(func=np_func("abs"), args=[mean], keywords=[]), op=ast.Pow(),
+                                   right=ast.Constant(value=2))))
             denom = n if ddof is None else ast.BinOp(left=n, op=ast.Sub(), right=ddof)
-            var = ast.BinOp(
-                left=ast.Call(func=np_func("sum"), args=[ast.BinOp(left=dev, op=ast.Pow(), right=ast.Constant(value=2))],
-                              keywords=[]),
-                op=ast.Div(), right=denom)
+            var = ast.BinOp(left=ss, op=ast.Div(), right=denom)
             new = var if attr == "var" else ast.Call(func=np_func("sqrt"), args=[var], keywords=[])
         elif is_numpy_name_node(func.value) and attr in {"empty", "empty_like"}:
             # Unspecified values: zeros are as good as any.
@@ -28398,9 +28605,23 @@ class translator(ast.NodeVisitor):
                                 slice=ast.Constant(value=0), ctx=ast.Load())
         elif is_numpy_name_node(func.value) and attr == "vdot" and len(node.args) == 2 and not node.keywords:
             a, b = (ast.Call(func=np_func("ravel"), args=[x], keywords=[]) for x in node.args)
-            if self._expr_kind(node.args[0]) == "complex":
-                a = ast.Call(func=np_func("conj"), args=[a], keywords=[])
-            new = ast.Call(func=np_func("dot"), args=[a, b], keywords=[])
+            if "complex" in {self._expr_kind(x) for x in node.args}:
+                # sum(conj(a) * b): Fortran's dot_product would conjugate a
+                # (again), np.dot below does not.
+                if self._expr_kind(node.args[0]) == "complex":
+                    a = ast.Call(func=np_func("conj"), args=[a], keywords=[])
+                new = ast.Call(func=np_func("sum"), args=[ast.BinOp(left=a, op=ast.Mult(), right=b)], keywords=[])
+            else:
+                new = ast.Call(func=np_func("dot"), args=[a, b], keywords=[])
+        elif (
+            is_numpy_name_node(func.value) and attr in {"dot", "inner"} and len(node.args) == 2 and not node.keywords
+            and "complex" in {self._expr_kind(x) for x in node.args}
+            and all(int(self._rank_expr(x) or 0) == 1 for x in node.args)
+        ):
+            # np.dot of complex vectors does not conjugate; Fortran's
+            # dot_product conjugates its first argument.
+            new = ast.Call(func=np_func("sum"), args=[ast.BinOp(left=node.args[0], op=ast.Mult(),
+                                                                right=node.args[1])], keywords=[])
         elif (
             is_numpy_name_node(func.value) and attr == "where" and len(node.args) == 3
             and self._expr_kind(node.args[0]) in {"int", "real"}
@@ -28565,6 +28786,15 @@ class translator(ast.NodeVisitor):
         _canon = self._canonical_numpy_call(node)
         if _canon is not None:
             return self._expr_kind(_canon)
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and is_numpy_name_node(node.func.value) and node.args
+            and node.func.attr in self._COMPLEX_ATTRS - {"where"}
+            and "complex" in {self._expr_kind(a) for a in node.args[:2 if node.func.attr in {
+                "maximum", "minimum", "fmax", "fmin"} else 1]}
+        ):
+            # Complex in, complex out (translator._complex_numpy), but indices.
+            return "int" if node.func.attr in {"argmin", "argmax", "argsort"} else "complex"
         if self._float_dtype_reduction(node) is not None:
             return "real"
         if (
@@ -30009,10 +30239,10 @@ class translator(ast.NodeVisitor):
                 if len(node.args) == 3:
                     k1 = self._expr_kind(node.args[1])
                     k2 = self._expr_kind(node.args[2])
-                    if "real" in {k1, k2}:
-                        return "real"
                     if "complex" in {k1, k2}:
                         return "complex"
+                    if "real" in {k1, k2}:
+                        return "real"
                     if "logical" in {k1, k2}:
                         return "logical"
                     if "char" in {k1, k2}:
@@ -30675,6 +30905,12 @@ class translator(ast.NodeVisitor):
                         return "int" if k == "logical" else k
                 if node.func.attr == "fabs":
                     return "real"
+                if (node.func.attr in {"hstack", "vstack", "column_stack", "concatenate"}
+                        and isinstance(node.args[0], (ast.List, ast.Tuple)) and node.args[0].elts):
+                    # The widest kind of the joined arrays.
+                    k = self._promoted_kind(node.args[0].elts)
+                    if k is not None:
+                        return k
                 return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -36070,6 +36306,9 @@ class translator(ast.NodeVisitor):
         _r3_txt = self._rank3_numpy(node)
         if _r3_txt is not None:
             return _r3_txt
+        _cx_txt = self._complex_numpy(node)
+        if _cx_txt is not None:
+            return _cx_txt
         _bare = self._float_dtype_reduction(node)
         if _bare is not None:
             return f"real({self.expr(_bare)}, kind=dp)"
@@ -42231,6 +42470,9 @@ class translator(ast.NodeVisitor):
                 # scalar the (length-1 array) result is indexed back down
                 # to a plain scalar logical.
                 _a0_node, _a1_node = node.args[0], node.args[1]
+                _cx = self._complex_close_test(node)
+                if _cx is not None:
+                    return _cx
                 _ra = self._rank_expr(_a0_node)
                 _rb = self._rank_expr(_a1_node)
                 _a0_cast = self._dp_cast_if_needed(_a0_node, self.expr(_a0_node))
@@ -42284,6 +42526,9 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "allclose"
                 and len(node.args) >= 2
             ):
+                _cx = self._complex_close_test(node)
+                if _cx is not None:
+                    return f"all({_cx})"
                 a0 = self.expr(node.args[0])
                 a1 = self.expr(node.args[1])
                 rtol = "1.0e-5_dp"
@@ -42921,7 +43166,7 @@ class translator(ast.NodeVisitor):
                 if k_node is None or (isinstance(k_node, ast.Constant) and k_node.value == 0):
                     return f"diag({a0})"
                 # Diagonal k of a matrix, or a matrix with a vector on diagonal k.
-                if self._expr_kind(node.args[0]) in {"int", "real"}:
+                if self._expr_kind(node.args[0]) in {"int", "real", "complex"}:
                     return f"diag_k({a0}, int({self.expr(k_node)}))"
                 if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, int)):
                     raise NotImplementedError("np.diag currently supports only constant integer k")
@@ -43352,6 +43597,8 @@ class translator(ast.NodeVisitor):
                         fn = "repeat_real"
                         if k0 == "int":
                             fn = "repeat_int"
+                        elif k0 == "complex":
+                            fn = "repeat_complex"
                         elif k0 == "logical":
                             fn = "repeat_logical"
                         if axis_node is not None:
@@ -50309,6 +50556,10 @@ class translator(ast.NodeVisitor):
                     if isinstance(node.op, ast.Div) and _aug_kind != "complex":
                         _aug_kind = "real"
                 for nm in extract_target_names(node.target):
+                    if nm in self.alloc_reals or nm in self.alloc_complexes or nm in self.alloc_ints                             or nm in self.alloc_logs:
+                        # An array keeps its declaration (w = c1.copy(); w /= 4
+                        # marked the complex array w a real scalar too).
+                        continue
                     if nm in self.reals:
                         self._mark_real(nm)
                     elif _aug_kind == "complex":
@@ -57374,6 +57625,7 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "sort"
             and len(v.args) >= 1
             and self._rank3_parts(v) is None
+            and self._expr_kind(v.args[0]) != "complex"
         ):
             name = t.id
             a0 = self.expr(v.args[0])
@@ -57439,6 +57691,7 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "argsort"
             and len(v.args) >= 1
             and int(self._rank_expr(v.args[0])) <= 1
+            and self._expr_kind(v.args[0]) != "complex"
         ):
             name = self._aliased_name(t.id)
             a0 = self.expr(v.args[0])
@@ -57458,8 +57711,9 @@ class translator(ast.NodeVisitor):
             and v.func.attr in {"argmax", "argmin"}
             and len(v.args) >= 1
             and isinstance(v.args[0], ast.Name)
-            # real arrays go through the NaN-aware np_argmin/np_argmax
-            and self._expr_kind(v.args[0]) != "real"
+            # real arrays go through the NaN-aware np_argmin/np_argmax,
+            # complex ones through c_argmin/c_argmax
+            and self._expr_kind(v.args[0]) not in {"real", "complex"}
             and int(self._rank_expr(v.args[0]) or 0) == 2
         ):
             axis_node = None
@@ -82721,6 +82975,9 @@ def main():
                         else:
                             folded.append(ln)
                     lines = folded
+                    # numpy pads a complex array's real parts: "0.  +2.j".
+                    lines = [re.sub(r"(?<=[\d.])\s+(?=[+-](?:\d|\.\d|inf|nan)[\w.]*j\b)", "", ln)
+                             for ln in lines]
                     lines = [_normalize_bracket_spacing(ln) for ln in lines]
                     lines = [_normalize_hyphen_banner_text(ln) for ln in lines]
                     lines = [" ".join(_norm_tok(tok) for tok in ln.split()) for ln in lines]
