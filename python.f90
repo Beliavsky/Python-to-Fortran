@@ -377,6 +377,14 @@ public :: argsort
 public :: argsort_idx
 public :: sorted_vec
 public :: diag_k
+public :: sort_axis_3d
+public :: argsort_axis_3d
+public :: cumsum_axis_3d
+public :: cumprod_axis_3d
+public :: trace_3d
+public :: concat_3d
+public :: nonzero_3d
+public :: quantile_axis_3d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) desc="np.quantile(x, q, axis) of a rank-3 array"
 public :: np_amin
 public :: np_amax
 public :: np_argmin
@@ -505,6 +513,30 @@ end interface np_argmin
 interface np_argmax
    module procedure np_argmax_r1, np_argmax_r2_dim
 end interface np_argmax
+
+interface sort_axis_3d
+   module procedure sort_axis_3d_real, sort_axis_3d_int
+end interface sort_axis_3d
+
+interface argsort_axis_3d
+   module procedure argsort_axis_3d_real, argsort_axis_3d_int
+end interface argsort_axis_3d
+
+interface cumsum_axis_3d
+   module procedure cumsum_axis_3d_real, cumsum_axis_3d_int
+end interface cumsum_axis_3d
+
+interface cumprod_axis_3d
+   module procedure cumprod_axis_3d_real, cumprod_axis_3d_int
+end interface cumprod_axis_3d
+
+interface trace_3d
+   module procedure trace_3d_real, trace_3d_int
+end interface trace_3d
+
+interface concat_3d
+   module procedure concat_3d_real, concat_3d_int
+end interface concat_3d
 
 interface diag_k
    module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
@@ -3989,6 +4021,334 @@ contains
          end if
       end function np_sign
 
+      pure function sort_axis_3d_real(x, dim) result(out)
+         ! np.sort(x, axis=dim-1) of a rank-3 array: sorted_vec along dim.
+         real(kind=dp), intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = sorted_vec(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = sorted_vec(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = sorted_vec(x(i, j, :))
+               end do
+            end do
+         end select
+      end function sort_axis_3d_real
+
+      pure function sort_axis_3d_int(x, dim) result(out)
+         ! np.sort(x, axis=dim-1) of a rank-3 array: sorted_vec along dim.
+         integer, intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = sorted_vec(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = sorted_vec(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = sorted_vec(x(i, j, :))
+               end do
+            end do
+         end select
+      end function sort_axis_3d_int
+
+      pure function argsort_axis_3d_real(x, dim) result(out)
+         ! np.argsort(x, axis=dim-1) of a rank-3 array: argsort_idx along dim.
+         real(kind=dp), intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = argsort_idx(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = argsort_idx(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = argsort_idx(x(i, j, :))
+               end do
+            end do
+         end select
+      end function argsort_axis_3d_real
+
+      pure function argsort_axis_3d_int(x, dim) result(out)
+         ! np.argsort(x, axis=dim-1) of a rank-3 array: argsort_idx along dim.
+         integer, intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = argsort_idx(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = argsort_idx(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = argsort_idx(x(i, j, :))
+               end do
+            end do
+         end select
+      end function argsort_axis_3d_int
+
+      pure function cumsum_axis_3d_real(x, dim) result(out)
+         ! np.cumsum(x, axis=dim-1) of a rank-3 array: cumsum_real along dim.
+         real(kind=dp), intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = cumsum_real(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = cumsum_real(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = cumsum_real(x(i, j, :))
+               end do
+            end do
+         end select
+      end function cumsum_axis_3d_real
+
+      pure function cumsum_axis_3d_int(x, dim) result(out)
+         ! np.cumsum(x, axis=dim-1) of a rank-3 array: cumsum_int along dim.
+         integer, intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = cumsum_int(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = cumsum_int(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = cumsum_int(x(i, j, :))
+               end do
+            end do
+         end select
+      end function cumsum_axis_3d_int
+
+      pure function cumprod_axis_3d_real(x, dim) result(out)
+         ! np.cumprod(x, axis=dim-1) of a rank-3 array: cumprod_real along dim.
+         real(kind=dp), intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = cumprod_real(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = cumprod_real(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = cumprod_real(x(i, j, :))
+               end do
+            end do
+         end select
+      end function cumprod_axis_3d_real
+
+      pure function cumprod_axis_3d_int(x, dim) result(out)
+         ! np.cumprod(x, axis=dim-1) of a rank-3 array: cumprod_int along dim.
+         integer, intent(in) :: x(:,:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: out(:,:,:)
+         integer :: i, j
+         allocate(out(size(x,1), size(x,2), size(x,3)))
+         select case (dim)
+         case (1)
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(:, i, j) = cumprod_int(x(:, i, j))
+               end do
+            end do
+         case (2)
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, :, j) = cumprod_int(x(i, :, j))
+               end do
+            end do
+         case default
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j, :) = cumprod_int(x(i, j, :))
+               end do
+            end do
+         end select
+      end function cumprod_axis_3d_int
+
+      pure function trace_3d_real(x) result(out)
+         ! np.trace of a rank-3 array: sum of x[i, i, :] over i.
+         real(kind=dp), intent(in) :: x(:,:,:)
+         real(kind=dp), allocatable :: out(:)
+         integer :: i
+         allocate(out(size(x,3)))
+         out = 0
+         do i = 1, min(size(x,1), size(x,2))
+            out = out + x(i, i, :)
+         end do
+      end function trace_3d_real
+
+      pure function trace_3d_int(x) result(out)
+         ! np.trace of a rank-3 array: sum of x[i, i, :] over i.
+         integer, intent(in) :: x(:,:,:)
+         integer, allocatable :: out(:)
+         integer :: i
+         allocate(out(size(x,3)))
+         out = 0
+         do i = 1, min(size(x,1), size(x,2))
+            out = out + x(i, i, :)
+         end do
+      end function trace_3d_int
+
+      pure function concat_3d_real(a, b, dim) result(out)
+         ! np.concatenate([a, b], axis=dim-1) of rank-3 arrays.
+         real(kind=dp), intent(in) :: a(:,:,:), b(:,:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:,:,:)
+         integer :: n(3)
+         n = shape(a)
+         n(dim) = n(dim) + size(b, dim)
+         allocate(out(n(1), n(2), n(3)))
+         select case (dim)
+         case (1)
+            out(:size(a,1), :, :) = a
+            out(size(a,1)+1:, :, :) = b
+         case (2)
+            out(:, :size(a,2), :) = a
+            out(:, size(a,2)+1:, :) = b
+         case default
+            out(:, :, :size(a,3)) = a
+            out(:, :, size(a,3)+1:) = b
+         end select
+      end function concat_3d_real
+
+      pure function concat_3d_int(a, b, dim) result(out)
+         ! np.concatenate([a, b], axis=dim-1) of rank-3 arrays.
+         integer, intent(in) :: a(:,:,:), b(:,:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: out(:,:,:)
+         integer :: n(3)
+         n = shape(a)
+         n(dim) = n(dim) + size(b, dim)
+         allocate(out(n(1), n(2), n(3)))
+         select case (dim)
+         case (1)
+            out(:size(a,1), :, :) = a
+            out(size(a,1)+1:, :, :) = b
+         case (2)
+            out(:, :size(a,2), :) = a
+            out(:, size(a,2)+1:, :) = b
+         case default
+            out(:, :, :size(a,3)) = a
+            out(:, :, size(a,3)+1:) = b
+         end select
+      end function concat_3d_int
+
+      pure function nonzero_3d(mask, k) result(idx)
+         ! np.nonzero(x)[k-1] of a rank-3 array (mask = x /= 0): the
+         ! 0-based axis-k indices of the true elements, in C (row-major) order.
+         logical, intent(in) :: mask(:,:,:)
+         integer, intent(in) :: k
+         integer, allocatable :: idx(:)
+         integer :: i, j, l, m
+         allocate(idx(count(mask)))
+         m = 0
+         do i = 1, size(mask,1)
+            do j = 1, size(mask,2)
+               do l = 1, size(mask,3)
+                  if (mask(i, j, l)) then
+                     m = m + 1
+                     select case (k)
+                     case (1)
+                        idx(m) = i - 1
+                     case (2)
+                        idx(m) = j - 1
+                     case default
+                        idx(m) = l - 1
+                     end select
+                  end if
+               end do
+            end do
+         end do
+      end function nonzero_3d
+
       pure function diag_k_vec_real(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.
          real(kind=dp), intent(in) :: v(:)
@@ -4128,6 +4488,39 @@ contains
             end do
          end do
       end function tril_int
+
+      pure function quantile_axis_3d(x, q, dim) result(out)
+         ! np.quantile(x, q, axis=dim-1) of a rank-3 array (np.median with
+         ! q = 0.5): one quantile per position along the other two axes.
+         real(kind=dp), intent(in) :: x(:,:,:)
+         real(kind=dp), intent(in) :: q
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:,:)
+         integer :: i, j
+         select case (dim)
+         case (1)
+            allocate(out(size(x,2), size(x,3)))
+            do j = 1, size(x,3)
+               do i = 1, size(x,2)
+                  out(i, j) = quantile_linear(x(:, i, j), q)
+               end do
+            end do
+         case (2)
+            allocate(out(size(x,1), size(x,3)))
+            do j = 1, size(x,3)
+               do i = 1, size(x,1)
+                  out(i, j) = quantile_linear(x(i, :, j), q)
+               end do
+            end do
+         case default
+            allocate(out(size(x,1), size(x,2)))
+            do j = 1, size(x,2)
+               do i = 1, size(x,1)
+                  out(i, j) = quantile_linear(x(i, j, :), q)
+               end do
+            end do
+         end select
+      end function quantile_axis_3d
 
       pure function quantile_axis_2d(x, q, dim) result(out)
          ! np.quantile(x, q, axis=dim-1) of a matrix (np.median with q = 0.5).

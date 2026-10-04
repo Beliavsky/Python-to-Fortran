@@ -25689,3 +25689,87 @@ def test_xp2f_numpy_nan_semantics(tmp_path: Path) -> None:
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_median_quantile_axis_of_3d_array(tmp_path: Path) -> None:
+    # np.median/np.quantile with an axis of a rank-3 array reduce that axis
+    # (they were flattened to one scalar).
+    src = tmp_path / "xmed3.py"
+    src.write_text(
+        "import numpy as np\n"
+        "x = (np.arange(24).reshape(2, 3, 4) - 7) * 0.5\n"
+        "print(np.median(x, axis=0))\n"
+        "print(np.median(x, axis=1))\n"
+        "print(np.quantile(x, 0.25, axis=2))\n"
+        "print(np.median(x, axis=-1))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_module_global_reshaped_arrays_keep_kind_and_rank(tmp_path: Path) -> None:
+    # Top-level arrays read inside functions live in the proc module; one
+    # built with x.reshape(...)/astype/ravel or a nested list was declared
+    # a real scalar (or rank 2), so the functions did not compile.
+    src = tmp_path / "xglob_reshape.py"
+    src.write_text(
+        "import numpy as np\n"
+        "i3 = np.arange(24).reshape(2, 3, 4) - 7\n"
+        "f3 = i3 * 0.5\n"
+        "m2 = np.arange(6).reshape((2, 3)).astype(float)\n"
+        "v = m2.ravel()\n"
+        "c3 = np.array([[[1, 2], [3, 4]], [[5, 6], [7, 8]]])\n"
+        "def f_a():\n"
+        "    return np.sum(i3, axis=0, keepdims=True)\n"
+        "def g():\n"
+        "    return np.sum(f3) + np.sum(m2.T) + v[1] + np.sum(c3[1])\n"
+        "print(f_a())\n"
+        "print(g())\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    f90 = (tmp_path / "xglob_reshape_p.f90").read_text(encoding="utf-8")
+    assert "integer, allocatable :: i3(:,:,:)" in f90
+    assert "integer, allocatable :: c3(:,:,:)" in f90
+    assert "real(kind=dp), allocatable :: m2(:,:)" in f90
+
+
+def test_xp2f_numpy_axis_operations_on_3d_arrays(tmp_path: Path) -> None:
+    # numpy_conformance phase 3 (3-D inputs): axis operations, keepdims,
+    # trace, nonzero, concatenate and partial indexing of rank-3 arrays.
+    exprs = [
+        "np.sum(i3, axis=0, keepdims=True)", "f3.max(axis=1, keepdims=True)", "np.argmin(i3, axis=1)",
+        "np.argmax(i3, axis=2)", "np.cumsum(i3, axis=0)", "np.cumprod(f3, axis=-1)", "np.sort(f3, axis=1)",
+        "np.sort(i3)", "np.argsort(f3, axis=0)", "np.flip(i3)", "np.flip(f3, axis=1)", "np.flipud(i3)",
+        "np.fliplr(f3)", "np.diff(i3)", "np.diff(f3, axis=0)", "np.roll(i3, 5)", "np.trace(i3)",
+        "np.nonzero(i3)[2]", "np.where(f3 > 0)[0]", "np.concatenate([i3, f3], axis=2)", "np.vstack([i3, i3])",
+        "np.zeros_like(f3)",
+    ]
+    lines = [
+        "import numpy as np",
+        "i3 = np.arange(24).reshape(2, 3, 4) - 7",
+        "i3[1, 2, 0] = 50",
+        "f3 = i3 * 0.5",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(r{k})"]
+    lines += [
+        "w = i3.copy()",
+        "w[0, :] = w[1, :]",
+        "w[:, 1] = -1",
+        "w[1, 0] += 100",
+        "print(w)",
+        "print(w[0, 1:])",
+    ]
+    src = tmp_path / "xnp_3d.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

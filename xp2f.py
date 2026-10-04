@@ -15597,9 +15597,9 @@ def detect_needed_helpers(tree):
         "diag": {"diag", "diag_k"},
         "triu": {"triu"},
         "tril": {"tril"},
-        "quantile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d"},
-        "median": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d"},
-        "percentile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d"},
+        "quantile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
+        "median": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
+        "percentile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
         "diagonal": {"diagonal"},
         "repeat": {
             "repeat",
@@ -15895,6 +15895,9 @@ def detect_needed_helpers(tree):
                     and node.func.attr in {"min", "max", "amin", "amax", "argmin", "argmax", "maximum", "minimum",
                                            "clip", "floor", "ceil", "sign", "ptp", "norm"}):
                 needed.update(translator._NAN_HELPERS)
+            # Rank-3 axis operations (translator._rank3_numpy).
+            if isinstance(node.func, ast.Attribute) and node.func.attr in translator._RANK3_ATTRS:
+                needed.update(translator._RANK3_HELPERS)
             def _attr_chain_parts(n):
                 parts = []
                 cur = n
@@ -18012,10 +18015,12 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_re
             return None, 0
         if n.elts and all(isinstance(e, (ast.List, ast.Tuple)) for e in n.elts):
             k = None
+            r = 1
             for e in n.elts:
-                ke, _ = _infer_from_literal_seq(e)
+                ke, re_ = _infer_from_literal_seq(e)
                 k = _merge_kind(k, ke)
-            return (k or "real"), 2
+                r = max(r, re_)
+            return (k or "real"), r + 1
         k = None
         for e in n.elts:
             if isinstance(e, ast.Constant):
@@ -18173,6 +18178,29 @@ def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_re
             # state), so its shared module declaration must match that,
             # not fall through to the generic real-valued-call default.
             return "int", 0
+        # Array methods: x.reshape(2, 3, 4) / x.reshape((2, 3)) has one axis
+        # per dimension, x.ravel()/flatten() one; astype/copy keep the rank
+        # (np.arange(24).reshape(2, 3, 4) was declared a real scalar).
+        if isinstance(n, ast.Attribute) and n.attr == "T":
+            return _infer_from_node(n.value, _seen)
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in {"reshape", "ravel", "flatten", "astype", "copy"}
+            and not (isinstance(n.func.value, ast.Name) and n.func.value.id in {"np", "numpy", "pd", "pandas"})
+        ):
+            k, r = _infer_from_node(n.func.value, _seen)
+            if n.func.attr == "astype" and n.args:
+                k = _kind_from_dtype_node(n.args[0]) or k
+            if n.func.attr in {"ravel", "flatten"}:
+                return (k or "real"), 1
+            if n.func.attr == "reshape" and n.args:
+                if len(n.args) == 1 and isinstance(n.args[0], (ast.Tuple, ast.List)):
+                    return (k or "real"), max(1, len(n.args[0].elts))
+                if len(n.args) == 1 and not isinstance(n.args[0], ast.Constant):
+                    return k, r
+                return (k or "real"), len(n.args)
+            return k, r
         return "real", 0
 
     def _spec_kind_rank(spec, rank):
@@ -28165,11 +28193,29 @@ class translator(ast.NodeVisitor):
         "nanvar", "nancumsum", "nancumprod", "nanmedian", "unique",
     }
 
+    def _pad_partial_index(self, node):
+        """x[i, j] of a rank-3 (or higher) array x means x[i, j, :]: append
+        the missing full slices to the subscript tuple, in place."""
+        if not (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and isinstance(node.slice, ast.Tuple) and node.slice.elts):
+            return
+        elts = node.slice.elts
+        if any(isinstance(e, ast.Starred) or is_none(e)
+               or (isinstance(e, ast.Constant) and e.value is Ellipsis) for e in elts):
+            return
+        r = int(self._rank_expr(node.value) or 0)
+        if r < 3 or len(elts) >= r:
+            return
+        if any(not isinstance(e, ast.Slice) and int(self._rank_expr(e) or 0) != 0 for e in elts):
+            return
+        node.slice.elts = list(elts) + [ast.Slice() for _ in range(r - len(elts))]
+
     def _canonical_numpy_call(self, node):
         """An equivalent, more directly translatable form of a numpy call
         or array method, or None: x.cumsum(axis=0) -> np.cumsum(x, axis=0);
         np.mean(m) of a 2-D m -> np.mean(np.ravel(m)); np.sort(m, axis=None)
         -> np.sort(np.ravel(m))."""
+        self._pad_partial_index(node)
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Call)
@@ -33849,6 +33895,118 @@ class translator(ast.NodeVisitor):
     _NAN_HELPERS = {"np_amin", "np_amax", "np_argmin", "np_argmax", "np_maximum", "np_minimum", "np_clip",
                     "np_floor", "np_ceil", "np_sign"}
 
+    _RANK3_HELPERS = {"sort_axis_3d", "argsort_axis_3d", "cumsum_axis_3d", "cumprod_axis_3d", "trace_3d",
+                      "concat_3d", "nonzero_3d"}
+    _RANK3_ATTRS = {"sort", "argsort", "cumsum", "cumprod", "flip", "flipud", "fliplr", "diff", "roll", "trace",
+                    "concatenate", "vstack", "hstack", "nonzero", "where"}
+
+    def _rank3_parts(self, node):
+        """(attr, x, axis) of a numpy call on a rank-3 array that
+        _rank3_numpy translates, else None; axis is 0..2, None (no axis)
+        or "default". For concatenate/vstack/hstack x is the list of arrays."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value) and node.func.attr in self._RANK3_ATTRS and node.args):
+            return None
+        attr = node.func.attr
+        x = node.args[0]
+        if attr in {"concatenate", "vstack", "hstack"}:
+            if not (isinstance(x, (ast.List, ast.Tuple)) and x.elts
+                    and all(int(self._rank_expr(e) or 0) == 3 for e in x.elts)):
+                return None
+            kinds = {self._expr_kind(e) for e in x.elts}
+        else:
+            if int(self._rank_expr(x) or 0) != 3:
+                return None
+            kinds = {self._expr_kind(x)}
+        if not kinds <= {"int", "real"}:
+            return None
+        pos_axis = {"sort": 1, "argsort": 1, "cumsum": 1, "cumprod": 1, "flip": 1, "diff": 2, "roll": 2,
+                    "concatenate": 1}.get(attr)
+        allowed = {"axis"} | ({"n"} if attr == "diff" else set())
+        if any(kw.arg not in allowed for kw in node.keywords):
+            return None
+        axis = "default"
+        if pos_axis is not None and len(node.args) > pos_axis:
+            axis = node.args[pos_axis]
+        axis = next((kw.value for kw in node.keywords if kw.arg == "axis"), axis)
+        if axis != "default":
+            if is_none(axis):
+                axis = None
+            elif isinstance(axis, ast.Constant) and isinstance(axis.value, int) and -3 <= axis.value < 3:
+                axis = axis.value % 3
+            else:
+                return None
+        return attr, x, axis
+
+    def _rank3_numpy(self, node):
+        """Fortran for numpy axis operations on rank-3 int/real arrays
+        (sort/argsort/cumsum/cumprod/flip/diff/roll/trace/concatenate and
+        nonzero(x)[k]); None to use the general translation."""
+        if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int) and 0 <= node.slice.value < 3
+                and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                and is_numpy_name_node(node.value.func.value) and node.value.func.attr in {"nonzero", "where"}
+                and len(node.value.args) == 1 and not node.value.keywords
+                and int(self._rank_expr(node.value.args[0]) or 0) == 3):
+            x = node.value.args[0]
+            mask = self.expr(x)
+            if self._expr_kind(x) != "logical":
+                mask = f"({mask} /= 0)"
+            return f"nonzero_3d({mask}, {node.slice.value + 1})"
+        parts = self._rank3_parts(node)
+        if parts is None:
+            return None
+        attr, x, axis = parts
+        if attr in {"nonzero", "where"}:
+            return None
+        if attr in {"concatenate", "vstack", "hstack"}:
+            dim = {"vstack": 1, "hstack": 2}.get(attr)
+            if dim is None:
+                if axis is None:
+                    return None
+                dim = 1 if axis == "default" else axis + 1
+            real = any(self._expr_kind(e) == "real" for e in x.elts)
+            txts = [self.expr(e) if not (real and self._expr_kind(e) == "int") else f"real({self.expr(e)}, kind=dp)"
+                    for e in x.elts]
+            out = txts[0]
+            for e in txts[1:]:
+                out = f"concat_3d({out}, {e}, {dim})"
+            return out
+        a = self.expr(x)
+        if attr in {"sort", "argsort", "cumsum", "cumprod"}:
+            if axis is None or (axis == "default" and attr in {"cumsum", "cumprod"}):
+                return None
+            dim = 3 if axis == "default" else axis + 1
+            return f"{attr}_axis_3d({a}, {dim})"
+        if attr == "trace":
+            return f"trace_3d({a})" if len(node.args) == 1 and not node.keywords else None
+        if attr == "roll":
+            if axis != "default" or len(node.args) < 2 or int(self._rank_expr(node.args[1]) or 0) != 0:
+                return None
+            flat = self._c_order_flat(a, 3)
+            return f"reshape(cshift({flat}, -({self.expr(node.args[1])})), shape({a}), order=[3,2,1])"
+        # Section-based: the array must be a variable.
+        if not isinstance(x, ast.Name):
+            return None
+        if attr in {"flip", "flipud", "fliplr"}:
+            if attr == "flip":
+                dims = (1, 2, 3) if axis in (None, "default") else (axis + 1,)
+            else:
+                dims = (1,) if attr == "flipud" else (2,)
+            secs = [f"size({a},{d}):1:-1" if d in dims else ":" for d in (1, 2, 3)]
+            return f"{a}({', '.join(secs)})"
+        if attr == "diff":
+            n = node.args[1] if len(node.args) >= 2 else next((kw.value for kw in node.keywords if kw.arg == "n"), None)
+            if n is not None and not (isinstance(n, ast.Constant) and n.value == 1):
+                return None
+            if axis is None:
+                return None
+            dim = 3 if axis == "default" else axis + 1
+            hi = [f"2:" if d == dim else ":" for d in (1, 2, 3)]
+            lo = [f":size({a},{d})-1" if d == dim else ":" for d in (1, 2, 3)]
+            return f"({a}({', '.join(hi)}) - {a}({', '.join(lo)}))"
+        return None
+
     def _nan_aware_numpy(self, node):
         """Fortran for numpy calls on real arrays whose numpy result depends
         on NaN -- min/max/amin/amax and argmin/argmax propagate (find) NaN,
@@ -33976,12 +34134,18 @@ class translator(ast.NodeVisitor):
             return 2
         if self._histogram_counts_call(node) is not None:
             return 1
+        _r3 = self._rank3_parts(node)
+        if _r3 is not None and _r3[0] not in {"nonzero", "where"}:
+            if _r3[0] == "trace":
+                return 1
+            if not (_r3[0] in {"cumsum", "cumprod"} and _r3[2] in (None, "default")):
+                return 3
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_numpy_name_node(node.func.value):
             _attr = node.func.attr
             if _attr == "quantile" and len(node.args) >= 2:
                 _has_axis = len(node.args) >= 3 or any(kw.arg == "axis" for kw in node.keywords)
-                if _has_axis and int(self._rank_expr(node.args[0]) or 0) == 2:
-                    return 1
+                if _has_axis and int(self._rank_expr(node.args[0]) or 0) >= 2:
+                    return int(self._rank_expr(node.args[0])) - 1
                 return 1 if int(self._rank_expr(node.args[1]) or 0) >= 1 else 0
             if _attr in {"triu", "tril"} and node.args:
                 return 2
@@ -35903,6 +36067,9 @@ class translator(ast.NodeVisitor):
         _nan_txt = self._nan_aware_numpy(node)
         if _nan_txt is not None:
             return _nan_txt
+        _r3_txt = self._rank3_numpy(node)
+        if _r3_txt is not None:
+            return _r3_txt
         _bare = self._float_dtype_reduction(node)
         if _bare is not None:
             return f"real({self.expr(_bare)}, kind=dp)"
@@ -40960,12 +41127,16 @@ class translator(ast.NodeVisitor):
                     q0 = f"real({q0}, kind=dp)"
                 axis_node = node.args[2] if len(node.args) >= 3 else next(
                     (kw.value for kw in node.keywords if kw.arg == "axis"), None)
-                if axis_node is not None and int(self._rank_expr(node.args[0])) == 2:
-                    if not (isinstance(axis_node, ast.Constant) and axis_node.value in (0, 1)):
-                        raise NotImplementedError("np.quantile/np.median of a matrix needs axis 0, 1 or -1")
+                _r0 = int(self._rank_expr(node.args[0]))
+                if axis_node is not None and _r0 >= 2:
+                    if _r0 > 3:
+                        raise NotImplementedError("np.quantile/np.median with an axis supports arrays of rank up to 3")
+                    if not (isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int)
+                            and 0 <= axis_node.value < _r0):
+                        raise NotImplementedError("np.quantile/np.median needs a constant axis")
                     if int(self._rank_expr(node.args[1])) >= 1:
                         raise NotImplementedError("np.quantile with an axis takes one quantile")
-                    return f"quantile_axis_2d({a0}, {q0}, {int(axis_node.value) + 1})"
+                    return f"quantile_axis_{_r0}d({a0}, {q0}, {int(axis_node.value) + 1})"
                 if int(self._rank_expr(node.args[1])) >= 1:
                     return f"quantile_linear_vec({self._flat_1d(a0, self._rank_expr(node.args[0]))}, {q0})"
                 return f"quantile_linear({self._flat_1d(a0, self._rank_expr(node.args[0]))}, {q0})"
@@ -48691,7 +48862,11 @@ class translator(ast.NodeVisitor):
                                     axis_node = kw.value
                                 elif kw.arg == "keepdims":
                                     keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
-                            if keepdims:
+                            # Only a matrix gives a (1,m) row / (n,1) column; a
+                            # rank-3 keepdims result keeps rank 3.
+                            _kd_src = v.args[0] if (isinstance(v.func.value, ast.Name) and v.func.value.id == "np"
+                                                    and v.args) else v.func.value
+                            if keepdims and int(self._rank_expr(_kd_src) or 0) <= 2:
                                 if isinstance(axis_node, ast.Constant) and isinstance(axis_node.value, int):
                                     if axis_node.value == 1:
                                         self.broadcast_col2.add(t.id)
@@ -50697,6 +50872,8 @@ class translator(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
+        for _tgt in node.targets:
+            self._pad_partial_index(_tgt)
         if isinstance(node.value, (ast.Call, ast.Subscript)) and not (
             # x = np.empty(...) keeps its own uninitialized allocation; only
             # an np.empty inside an expression becomes np.zeros.
@@ -55441,10 +55618,9 @@ class translator(ast.NodeVisitor):
             self.o.w(f"if (allocated({name})) deallocate({name})")
             if r0 <= 1:
                 self.o.w(f"allocate({name}(1:size({a0})))")
-            elif r0 == 2:
-                self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)))")
             else:
-                raise NotImplementedError("zeros_like/ones_like supports rank up to 2")
+                _dims = ",".join(f"1:size({a0},{_d})" for _d in range(1, int(r0) + 1))
+                self.o.w(f"allocate({name}({_dims}))")
             self.o.w(f"{name} = {fill_expr}")
             return
 
@@ -55469,10 +55645,9 @@ class translator(ast.NodeVisitor):
             self.o.w(f"if (allocated({name})) deallocate({name})")
             if r0 <= 1:
                 self.o.w(f"allocate({name}(1:size({a0})))")
-            elif r0 == 2:
-                self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)))")
             else:
-                raise NotImplementedError("empty_like/copy currently supports rank up to 2 in assignment form")
+                _dims = ",".join(f"1:size({a0},{_d})" for _d in range(1, int(r0) + 1))
+                self.o.w(f"allocate({name}({_dims}))")
             if v.func.attr == "copy":
                 self.o.w(f"{name} = {a0}")
             return
@@ -57198,6 +57373,7 @@ class translator(ast.NodeVisitor):
             and v.func.value.id == "np"
             and v.func.attr == "sort"
             and len(v.args) >= 1
+            and self._rank3_parts(v) is None
         ):
             name = t.id
             a0 = self.expr(v.args[0])
@@ -57284,6 +57460,7 @@ class translator(ast.NodeVisitor):
             and isinstance(v.args[0], ast.Name)
             # real arrays go through the NaN-aware np_argmin/np_argmax
             and self._expr_kind(v.args[0]) != "real"
+            and int(self._rank_expr(v.args[0]) or 0) == 2
         ):
             axis_node = None
             for kw in v.keywords:
@@ -57957,6 +58134,7 @@ class translator(ast.NodeVisitor):
 
     def visit_AugAssign(self, node):
         self._emit_comments_for(node)
+        self._pad_partial_index(node.target)
         # Pattern: A.flat[::d+1] += rhs  -> diagonal update of matrix A.
         if (
             isinstance(node.target, ast.Subscript)
