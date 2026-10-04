@@ -377,6 +377,11 @@ public :: argsort
 public :: argsort_idx
 public :: sorted_vec
 public :: diag_k
+public :: np_amin
+public :: np_amax
+public :: np_argmin
+public :: np_argmax
+public :: np_maximum, np_minimum, np_clip, np_floor, np_ceil, np_sign
 public :: histogram_counts !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),nbins:integer:intent(in) desc="np.histogram(x, bins=n)[0]: counts in n equal bins spanning min(x)..max(x)"
 public :: histogram_counts_edges !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),edges:real(dp)(:):intent(in) desc="np.histogram(x, bins=edges)[0]"
 public :: triu
@@ -484,6 +489,22 @@ end interface argsort_idx
 interface sorted_vec
    module procedure sorted_real_vec, sorted_int_vec
 end interface sorted_vec
+
+interface np_amin
+   module procedure np_amin_r1, np_amin_r2, np_amin_r2_dim
+end interface np_amin
+
+interface np_amax
+   module procedure np_amax_r1, np_amax_r2, np_amax_r2_dim
+end interface np_amax
+
+interface np_argmin
+   module procedure np_argmin_r1, np_argmin_r2_dim
+end interface np_argmin
+
+interface np_argmax
+   module procedure np_argmax_r1, np_argmax_r2_dim
+end interface np_argmax
 
 interface diag_k
    module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
@@ -3455,7 +3476,20 @@ contains
       end subroutine random_choice_prob
 
       pure subroutine sort_real_vec(x)
-         ! sort real vector x in ascending order -- bottom-up iterative
+         ! sort real vector x in ascending order, NaN last (as numpy does).
+         real(kind=dp), intent(inout) :: x(:)
+         integer :: nn, n
+         n = size(x)
+         nn = count(ieee_is_nan(x))
+         if (nn > 0) then
+            x(1:n - nn) = pack(x, .not. ieee_is_nan(x))
+            x(n - nn + 1:) = ieee_value(1.0_dp, ieee_quiet_nan)
+         end if
+         call sort_real_vec_nonan(x(1:n - nn))
+      end subroutine sort_real_vec
+
+      pure subroutine sort_real_vec_nonan(x)
+         ! sort real vector x (no NaN) in ascending order -- bottom-up iterative
          ! merge sort (O(n log n) worst case). Previously a plain
          ! insertion sort (O(n^2)): fine for the small arrays it was
          ! first written against, but a severe bottleneck for the sizes
@@ -3503,7 +3537,7 @@ contains
             end do
             width = width * 2
          end do
-      end subroutine sort_real_vec
+      end subroutine sort_real_vec_nonan
 
       pure subroutine sort_int_vec(x)
          ! sort integer vector x in ascending order -- see sort_real_vec
@@ -3615,6 +3649,18 @@ contains
          end if
       end subroutine argsort_real
 
+      pure logical function le_nan_last(a, b)
+         ! a <= b with NaN after every number (and NaN <= NaN, for stability).
+         real(kind=dp), intent(in) :: a, b
+         if (ieee_is_nan(b)) then
+            le_nan_last = .true.
+         else if (ieee_is_nan(a)) then
+            le_nan_last = .false.
+         else
+            le_nan_last = a <= b
+         end if
+      end function le_nan_last
+
       pure recursive subroutine argsort_msort_real(x, idx, tmp, lo, hi)
          ! O(n log n) stable merge sort of idx by x(idx(:)+1); insertion
          ! sort here previously made argsort O(n**2), catastrophic for
@@ -3631,7 +3677,7 @@ contains
          j = mid + 1
          k = lo
          do while (i <= mid .and. j <= hi)
-            if (x(idx(i)+1) <= x(idx(j)+1)) then
+            if (le_nan_last(x(idx(i) + 1), x(idx(j) + 1))) then
                tmp(k) = idx(i)
                i = i + 1
             else
@@ -3742,6 +3788,206 @@ contains
          logical, allocatable :: y(:)
          y = x(size(x):1:-1)
       end function reversed_logical_vec
+
+      pure function np_amin_r1(x) result(r)
+         ! np.min: NaN if x holds a NaN (numpy propagates it).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp) :: r
+         if (any(ieee_is_nan(x))) then
+            r = ieee_value(1.0_dp, ieee_quiet_nan)
+         else
+            r = minval(x)
+         end if
+      end function np_amin_r1
+
+      pure function np_amin_r2(x) result(r)
+         real(kind=dp), intent(in) :: x(:,:)
+         real(kind=dp) :: r
+         if (any(ieee_is_nan(x))) then
+            r = ieee_value(1.0_dp, ieee_quiet_nan)
+         else
+            r = minval(x)
+         end if
+      end function np_amin_r2
+
+      pure function np_amin_r2_dim(x, dim) result(r)
+         ! Along dimension dim, NaN where that column (row) holds a NaN.
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = np_amin_r1(x(:, i))
+            else
+               r(i) = np_amin_r1(x(i, :))
+            end if
+         end do
+      end function np_amin_r2_dim
+
+      pure function np_amax_r1(x) result(r)
+         ! np.max: NaN if x holds a NaN (numpy propagates it).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp) :: r
+         if (any(ieee_is_nan(x))) then
+            r = ieee_value(1.0_dp, ieee_quiet_nan)
+         else
+            r = maxval(x)
+         end if
+      end function np_amax_r1
+
+      pure function np_amax_r2(x) result(r)
+         real(kind=dp), intent(in) :: x(:,:)
+         real(kind=dp) :: r
+         if (any(ieee_is_nan(x))) then
+            r = ieee_value(1.0_dp, ieee_quiet_nan)
+         else
+            r = maxval(x)
+         end if
+      end function np_amax_r2
+
+      pure function np_amax_r2_dim(x, dim) result(r)
+         ! Along dimension dim, NaN where that column (row) holds a NaN.
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = np_amax_r1(x(:, i))
+            else
+               r(i) = np_amax_r1(x(i, :))
+            end if
+         end do
+      end function np_amax_r2_dim
+
+      pure function np_argmin_r1(x) result(r)
+         ! np.argmin (0-based): the first NaN if x holds one, as numpy does.
+         real(kind=dp), intent(in) :: x(:)
+         integer :: r
+         if (any(ieee_is_nan(x))) then
+            r = findloc(ieee_is_nan(x), .true., dim=1) - 1
+         else
+            r = minloc(x, dim=1) - 1
+         end if
+      end function np_argmin_r1
+
+      pure function np_argmin_r2_dim(x, dim) result(r)
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = np_argmin_r1(x(:, i))
+            else
+               r(i) = np_argmin_r1(x(i, :))
+            end if
+         end do
+      end function np_argmin_r2_dim
+
+      pure function np_argmax_r1(x) result(r)
+         ! np.argmax (0-based): the first NaN if x holds one, as numpy does.
+         real(kind=dp), intent(in) :: x(:)
+         integer :: r
+         if (any(ieee_is_nan(x))) then
+            r = findloc(ieee_is_nan(x), .true., dim=1) - 1
+         else
+            r = maxloc(x, dim=1) - 1
+         end if
+      end function np_argmax_r1
+
+      pure function np_argmax_r2_dim(x, dim) result(r)
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x, 3 - dim)))
+         do i = 1, size(r)
+            if (dim == 1) then
+               r(i) = np_argmax_r1(x(:, i))
+            else
+               r(i) = np_argmax_r1(x(i, :))
+            end if
+         end do
+      end function np_argmax_r2_dim
+
+      elemental function np_maximum(a, b) result(r)
+         ! np.maximum: NaN if either is NaN.
+         real(kind=dp), intent(in) :: a, b
+         real(kind=dp) :: r
+         if (ieee_is_nan(a)) then
+            r = a
+         else if (ieee_is_nan(b)) then
+            r = b
+         else
+            r = max(a, b)
+         end if
+      end function np_maximum
+
+      elemental function np_minimum(a, b) result(r)
+         ! np.minimum: NaN if either is NaN.
+         real(kind=dp), intent(in) :: a, b
+         real(kind=dp) :: r
+         if (ieee_is_nan(a)) then
+            r = a
+         else if (ieee_is_nan(b)) then
+            r = b
+         else
+            r = min(a, b)
+         end if
+      end function np_minimum
+
+      elemental function np_clip(x, lo, hi) result(r)
+         ! np.clip: NaN stays NaN.
+         real(kind=dp), intent(in) :: x, lo, hi
+         real(kind=dp) :: r
+         if (ieee_is_nan(x)) then
+            r = x
+         else
+            r = min(max(x, lo), hi)
+         end if
+      end function np_clip
+
+      elemental function np_floor(x) result(r)
+         ! np.floor of a float: NaN and infinities unchanged, no integer
+         ! conversion (which overflows for large values).
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: r
+         r = x
+         if (ieee_is_nan(x)) return
+         if (.not. ieee_is_finite(x)) return
+         r = aint(x)
+         if (r > x) r = r - 1.0_dp
+      end function np_floor
+
+      elemental function np_ceil(x) result(r)
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: r
+         r = x
+         if (ieee_is_nan(x)) return
+         if (.not. ieee_is_finite(x)) return
+         r = aint(x)
+         if (r < x) r = r + 1.0_dp
+      end function np_ceil
+
+      elemental function np_sign(x) result(r)
+         ! np.sign of a float: -1, 0 or 1, NaN for NaN.
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: r
+         if (ieee_is_nan(x)) then
+            r = x
+         else if (x > 0.0_dp) then
+            r = 1.0_dp
+         else if (x < 0.0_dp) then
+            r = -1.0_dp
+         else
+            r = 0.0_dp
+         end if
+      end function np_sign
 
       pure function diag_k_vec_real(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.
@@ -6453,10 +6699,13 @@ contains
          allocate(tmp(1:n))
          tmp = x
          call sort_real_vec(tmp)
+         ! NaNs sort last; numpy keeps one (equal_nan).
          m = 0
          do i = 1, n
             if (i == 1) then
                m = m + 1
+            else if (ieee_is_nan(tmp(i))) then
+               if (.not. ieee_is_nan(tmp(i-1))) m = m + 1
             else if (tmp(i) /= tmp(i-1)) then
                m = m + 1
             end if
@@ -6467,6 +6716,11 @@ contains
             if (i == 1) then
                m = m + 1
                y(m) = tmp(i)
+            else if (ieee_is_nan(tmp(i))) then
+               if (.not. ieee_is_nan(tmp(i-1))) then
+                  m = m + 1
+                  y(m) = tmp(i)
+               end if
             else if (tmp(i) /= tmp(i-1)) then
                m = m + 1
                y(m) = tmp(i)
@@ -7407,6 +7661,10 @@ contains
          n = size(x)
          if (n <= 0) then
             quantile_linear = 0.0_dp
+            return
+         end if
+         if (any(ieee_is_nan(x))) then
+            quantile_linear = ieee_value(1.0_dp, ieee_quiet_nan)
             return
          end if
          allocate(xs(1:n), source=x)

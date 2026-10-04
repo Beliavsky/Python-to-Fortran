@@ -4310,8 +4310,9 @@ def test_xp2f_compiles_numpy_rounding_family_calls(tmp_path: Path) -> None:
     assert "aint(" in out_text
     # np.round/np.rint round ties to even (np_rint), unlike ANINT.
     assert "np_rint(" in out_text
-    assert "real(floor(" in out_text
-    assert "real(ceiling(" in out_text
+    # Float floor/ceil keep NaN and infinities (no integer conversion).
+    assert "np_floor(" in out_text
+    assert "np_ceil(" in out_text
 
 
 def test_xp2f_compiles_numpy_inverse_trig_aliases(tmp_path: Path) -> None:
@@ -25651,6 +25652,40 @@ def test_xp2f_numpy_conformance_phase2_compile_failures(tmp_path: Path) -> None:
     src.write_text("\n".join(lines), encoding="utf-8")
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff",
                            "--run-diff-display-tol", "1e-7"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_nan_semantics(tmp_path: Path) -> None:
+    # numpy_conformance phase 3 (NaN/inf inputs): min/max propagate NaN,
+    # argmin/argmax return the first NaN, maximum/minimum/clip/floor/ceil/
+    # sign keep NaN, sort/argsort put NaN last, unique keeps one NaN,
+    # quantile/median/ptp/norm(inf) give NaN, full_like ignores x's values.
+    # The np_* helpers never compare with NaN, so this builds and runs
+    # under xp2f's default -ffpe-trap=invalid debug flags.
+    exprs = [
+        "np.min(n1)", "np.max(n2)", "n1.max()", "np.min(n2, axis=0)", "np.max(n2, axis=1)",
+        "np.max(n2, axis=-1, keepdims=True)", "np.amin(n1)", "np.argmin(n1)", "np.argmax(n2)",
+        "n1.argmax()", "np.argmin(n2, axis=1)", "np.argmax(n2, axis=0)", "np.maximum(n1, 0.0)",
+        "np.minimum(n2, i2)", "np.clip(n1, -1, 2)", "n2.clip(0, None)", "np.floor(n1)", "np.ceil(n2)",
+        "np.sign(n1)", "np.sort(n1)", "np.sort(n2, axis=-1)", "np.argsort(n1)", "np.unique(n2)",
+        "np.quantile(n1, 0.5)", "np.median(n1)", "np.ptp(n1)", "np.linalg.norm(n1, np.inf)",
+        "np.full_like(n1, 2)", "np.min(f1)", "np.argmax(f2, axis=1)", "np.clip(f1, -1, 1)",
+    ]
+    lines = [
+        "import numpy as np",
+        "n1 = np.array([1.0, np.nan, -2.0, np.inf, -np.inf, 0.5])",
+        "n2 = np.array([[1.0, np.nan, -2.0], [np.inf, 0.5, -np.inf]])",
+        "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+        "f1 = np.array([0.5, -1.25, 2.0, 3.75, -0.5, 1.5])",
+        "f2 = np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(r{k})"]
+    src = tmp_path / "xnp_nan.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

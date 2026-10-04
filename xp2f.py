@@ -15890,6 +15890,11 @@ def detect_needed_helpers(tree):
                     and node.func.attr in {"floor_divide", "mod", "remainder"}):
                 needed.add("floor_div_int")
                 needed.add("floor_div_real")
+            # NaN-aware reductions and elementwise functions (translator._nan_aware_numpy).
+            if (isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"min", "max", "amin", "amax", "argmin", "argmax", "maximum", "minimum",
+                                           "clip", "floor", "ceil", "sign", "ptp", "norm"}):
+                needed.update(translator._NAN_HELPERS)
             def _attr_chain_parts(n):
                 parts = []
                 cur = n
@@ -27001,9 +27006,10 @@ class translator(ast.NodeVisitor):
         if ord_node is None or ord_is_fro or ord_is_two:
             return f"sqrt(sum({sq_term}))"
         if ord_is_posinf:
-            return f"maxval(abs({a0}))"
+            # (NaN-aware: numpy's norm of a vector holding a NaN is NaN)
+            return f"np_amax(abs({a0}))" if int(self._rank_expr(node.args[0]) or 0) == 1 else f"maxval(abs({a0}))"
         if ord_is_neginf:
-            return f"minval(abs({a0}))"
+            return f"np_amin(abs({a0}))" if int(self._rank_expr(node.args[0]) or 0) == 1 else f"minval(abs({a0}))"
         if ord_is_one:
             return f"sum(abs({a0}))"
         if ord_is_zero:
@@ -28234,7 +28240,8 @@ class translator(ast.NodeVisitor):
         if (
             not is_numpy_name_node(func.value)
             and (attr in self._METHODS_AS_NUMPY_FUNCTIONS
-                 or (attr in self._BOOL_METHODS_AS_NUMPY_FUNCTIONS and recv_kind == "logical"))
+                 or (attr in self._BOOL_METHODS_AS_NUMPY_FUNCTIONS and recv_kind == "logical")
+                 or (attr in {"min", "max", "argmin", "argmax"} and recv_kind == "real"))
             and not SOURCE_USES_PANDAS
             and int(self._rank_expr(func.value) or 0) >= 1
             and recv_kind in {"int", "real", "logical", "complex"}
@@ -33839,6 +33846,67 @@ class translator(ast.NodeVisitor):
         # "xy": X[i, j] = a[j], Y[i, j] = b[i]: shape (len(b), len(a)).
         return (a, b, 1, b) if k == 0 else (b, a, 2, a)
 
+    _NAN_HELPERS = {"np_amin", "np_amax", "np_argmin", "np_argmax", "np_maximum", "np_minimum", "np_clip",
+                    "np_floor", "np_ceil", "np_sign"}
+
+    def _nan_aware_numpy(self, node):
+        """Fortran for numpy calls on real arrays whose numpy result depends
+        on NaN -- min/max/amin/amax and argmin/argmax propagate (find) NaN,
+        maximum/minimum/clip/floor/ceil/sign keep it -- through the np_*
+        helpers of python.f90; None to use the general translation."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value) and node.args):
+            return None
+        attr = node.func.attr
+        x = node.args[0]
+
+        def real_txt(n):
+            txt = self.expr(n)
+            k = self._expr_kind(n)
+            if k == "int":
+                return f"real({txt}, kind=dp)"
+            return txt
+
+        if attr in {"min", "max", "amin", "amax", "argmin", "argmax"}:
+            if self._expr_kind(x) != "real" or any(kw.arg not in {"axis", "keepdims"} for kw in node.keywords):
+                return None
+            r0 = int(self._rank_expr(x) or 0)
+            if r0 not in (1, 2):
+                return None
+            axis = node.args[1] if len(node.args) >= 2 else next(
+                (kw.value for kw in node.keywords if kw.arg == "axis"), None)
+            keepdims = any(kw.arg == "keepdims" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                           for kw in node.keywords)
+            fn = "np_" + {"min": "amin", "max": "amax"}.get(attr, attr)
+            a0 = self.expr(x)
+            if axis is not None and not (isinstance(axis, ast.Constant) and isinstance(axis.value, int)):
+                return None
+            if axis is None or r0 == 1:
+                if keepdims:
+                    return None
+                arg = self._c_order_flat(a0, r0) if attr in {"argmin", "argmax"} and r0 == 2 else a0
+                return f"{fn}({arg})"
+            dim = int(axis.value) + 1
+            reduced = f"{fn}({a0}, {dim})"
+            if keepdims:
+                if attr in {"argmin", "argmax"}:
+                    return None
+                return f"spread({reduced}, dim={dim}, ncopies=1)"
+            return reduced
+        if attr in {"maximum", "minimum"} and len(node.args) == 2 and not node.keywords:
+            if self._promoted_kind(node.args[:2]) != "real":
+                return None
+            return f"np_{attr}({real_txt(node.args[0])}, {real_txt(node.args[1])})"
+        if attr == "clip" and len(node.args) == 3 and not node.keywords and self._expr_kind(x) == "real":
+            # A missing bound is no bound at all (inf stays inf).
+            lo = "ieee_value(1.0_dp, ieee_negative_inf)" if is_none(node.args[1]) else real_txt(node.args[1])
+            hi = "ieee_value(1.0_dp, ieee_positive_inf)" if is_none(node.args[2]) else real_txt(node.args[2])
+            return f"np_clip({self.expr(x)}, {lo}, {hi})"
+        if attr in {"floor", "ceil", "sign"} and len(node.args) == 1 and not node.keywords \
+                and self._expr_kind(x) == "real":
+            return f"np_{attr}({self.expr(x)})"
+        return None
+
     def _np_sort_dim(self, node):
         """The Fortran dimension np.sort / np.argsort of a 2-D array sorts
         along (numpy's default axis is the last)."""
@@ -35832,6 +35900,9 @@ class translator(ast.NodeVisitor):
         _canon = self._canonical_numpy_call(node)
         if _canon is not None:
             return self.expr(_canon)
+        _nan_txt = self._nan_aware_numpy(node)
+        if _nan_txt is not None:
+            return _nan_txt
         _bare = self._float_dtype_reduction(node)
         if _bare is not None:
             return f"real({self.expr(_bare)}, kind=dp)"
@@ -57211,6 +57282,8 @@ class translator(ast.NodeVisitor):
             and v.func.attr in {"argmax", "argmin"}
             and len(v.args) >= 1
             and isinstance(v.args[0], ast.Name)
+            # real arrays go through the NaN-aware np_argmin/np_argmax
+            and self._expr_kind(v.args[0]) != "real"
         ):
             axis_node = None
             for kw in v.keywords:
