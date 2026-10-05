@@ -12056,7 +12056,14 @@ def promote_immediate_scalar_constants(lines):
                 j = n
                 break
             code_j = out[j].split("!", 1)[0].strip()
-            if code_j == "" or depth_at[j] != d:
+            if code_j == "":
+                j += 1
+                continue
+            if depth_at[j] != d:
+                # A mention inside a nested block (e.g. `t = xp_tmp1(...)`
+                # in a hoisting block) comes first: not an initializer.
+                if nm_re.search(code_j):
+                    break
                 j += 1
                 continue
             if nm_re.search(code_j):
@@ -12310,7 +12317,14 @@ def promote_immediate_array_constants(lines):
                 j = n
                 break
             code_j = out[j].split("!", 1)[0].strip()
-            if code_j == "" or depth_at[j] != d:
+            if code_j == "":
+                j += 1
+                continue
+            if depth_at[j] != d:
+                # A mention inside a nested block (e.g. `t = xp_tmp1(...)`
+                # in a hoisting block) comes first: not an initializer.
+                if nm_re.search(code_j):
+                    break
                 j += 1
                 continue
             if nm_re.search(code_j):
@@ -12552,7 +12566,14 @@ def promote_immediate_2d_array_constants(lines):
                 j = n
                 break
             code_j = out[j].split("!", 1)[0].strip()
-            if code_j == "" or depth_at[j] != d:
+            if code_j == "":
+                j += 1
+                continue
+            if depth_at[j] != d:
+                # A mention inside a nested block (e.g. `t = xp_tmp1(...)`
+                # in a hoisting block) comes first: not an initializer.
+                if nm_re.search(code_j):
+                    break
                 j += 1
                 continue
             if nm_re.search(code_j):

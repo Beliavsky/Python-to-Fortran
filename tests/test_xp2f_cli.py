@@ -25930,3 +25930,30 @@ def test_xp2f_indexed_array_expressions_use_temporaries(tmp_path: Path) -> None:
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode != 0
     assert "assign the expression to a variable first" in proc.stdout + proc.stderr
+
+
+def test_xp2f_constant_promotion_sees_assignment_in_nested_block(tmp_path: Path) -> None:
+    # A conditional expression with a non-atomic branch is lowered to
+    # if/else assigning a temporary, and an indexed array expression in
+    # that branch is hoisted into a block. The `else` branch's
+    # `ternary_tmp_1 = -1.5` was then promoted to a PARAMETER (the
+    # constant-promotion passes skipped the earlier assignment inside the
+    # nested block), and the Fortran did not compile.
+    for cond in ("True", "False"):
+        src = tmp_path / f"xpromo_{cond.lower()}.py"
+        src.write_text(
+            "import numpy as np\n"
+            "x4 = np.arange(120).reshape(2, 3, 4, 5) - 50.0\n"
+            f"c = {cond}\n"
+            "print([(x4 * 2)[1, 2, 3, 4] if c else -1.5, 7])\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        f90 = src.with_name(src.stem + "_p.f90").read_text(encoding="utf-8")
+        assert "parameter :: ternary_tmp_1" not in f90, f90
+        run = subprocess.run([str(src.with_name(src.stem + "_p.exe"))],
+                             capture_output=True, text=True, check=True)
+        values = [float(v) for v in run.stdout.split()]
+        assert values == ([138.0, 7.0] if cond == "True" else [-1.5, 7.0]), run.stdout
