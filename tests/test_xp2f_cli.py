@@ -25823,3 +25823,66 @@ def test_xp2f_run_diff_with_relative_source_path(tmp_path: Path) -> None:
                           cwd=tmp_path, capture_output=True, text=True, check=False, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_rank4_arrays_rank_generic_operations(tmp_path: Path) -> None:
+    # Arrays above rank 3 are supported where the Fortran is rank-generic:
+    # elementwise operations, reductions (also along an axis), indexing,
+    # transpose, ravel, flip/diff/roll, function arguments and results.
+    # print of a rank-4 array writes its values in numpy's (C) order as one
+    # flat list, with a translation-time warning.
+    src = tmp_path / "xrank4.py"
+    src.write_text(
+        "import numpy as np\n"
+        "x4 = np.arange(120).reshape(2, 3, 4, 5) - 50\n"
+        "f4 = x4 * 0.5\n"
+        "def scale(a, s):\n"
+        "    return a * s + 1\n"
+        "def total(a):\n"
+        "    return np.sum(a, axis=1)\n"
+        "print(x4)\n"
+        "print(x4.T)\n"
+        "w = scale(f4, 2.0)\n"
+        "print(w[1, 2, 3, 4], w[0, :, 1, 2])\n"
+        "print(total(x4))\n"
+        "m3 = np.max(x4, axis=0)\n"
+        "a3 = np.mean(f4, axis=2)\n"
+        "print(np.argmax(f4), m3[2, 3], a3[1])\n"
+        "v = np.flip(x4, axis=2)\n"
+        "print(v[1, 2, 0, :])\n"
+        "print(np.roll(x4, 7).ravel()[:9])\n"
+        "d4 = np.diff(f4, axis=3)\n"
+        "print(d4[1, 2])\n"
+        "z = np.zeros((2, 2, 2, 2))\n"
+        "z[1, 0, 1, 1] = 7\n"
+        "z[0, :, 1, 0] = 3\n"
+        "z[1] += 1\n"
+        "print(z.ravel())\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Warning: print of a rank-4 array" in proc.stderr
+    nums = lambda s: [float(v) for v in re.findall(r"-?\d+\.?\d*(?:[eE][-+]?\d+)?", s)]
+    py = subprocess.run([sys.executable, str(src)], capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xrank4_p.exe"))], capture_output=True, text=True, check=True).stdout
+    a, b = nums(py), nums(ft)
+    assert len(a) == len(b), (py, ft)
+    assert all(abs(x - y) <= 1e-12 * max(1.0, abs(x)) for x, y in zip(a, b)), (py, ft)
+
+
+def test_xp2f_rank4_arrays_rank_specific_operations_fail_clearly(tmp_path: Path) -> None:
+    # Operations with rank-specific helpers report the rank limit instead
+    # of producing Fortran that does not compile.
+    for expr, msg in [("np.sort(x4)", "np.sort supports arrays of rank up to 3"),
+                      ("np.cumsum(x4, axis=1)", "np.cumsum supports arrays of rank up to 3"),
+                      ("np.nonzero(x4)[0]", "np.nonzero supports arrays of rank up to 3"),
+                      ("np.diff(x4)[1, 2]", "assign the expression to a variable first")]:
+        src = tmp_path / "xrank4_fail.py"
+        src.write_text("import numpy as np\nx4 = np.zeros((2, 3, 4, 5))\n"
+                       f"print({expr})\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode != 0, expr
+        assert msg in proc.stdout + proc.stderr, (expr, proc.stdout + proc.stderr)

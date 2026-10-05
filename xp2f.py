@@ -34137,21 +34137,26 @@ class translator(ast.NodeVisitor):
                     "concatenate", "vstack", "hstack", "nonzero", "where"}
 
     def _rank3_parts(self, node):
-        """(attr, x, axis) of a numpy call on a rank-3 array that
-        _rank3_numpy translates, else None; axis is 0..2, None (no axis)
-        or "default". For concatenate/vstack/hstack x is the list of arrays."""
+        """(attr, x, axis) of a numpy call on an array of rank 3 or more
+        that _rank3_numpy translates, else None; axis is 0..rank-1, None (no
+        axis) or "default". For concatenate/vstack/hstack x is the list of
+        arrays."""
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value) and node.func.attr in self._RANK3_ATTRS and node.args):
             return None
         attr = node.func.attr
         x = node.args[0]
         if attr in {"concatenate", "vstack", "hstack"}:
-            if not (isinstance(x, (ast.List, ast.Tuple)) and x.elts
-                    and all(int(self._rank_expr(e) or 0) == 3 for e in x.elts)):
+            if not (isinstance(x, (ast.List, ast.Tuple)) and x.elts):
                 return None
+            ranks = {int(self._rank_expr(e) or 0) for e in x.elts}
+            if len(ranks) != 1 or min(ranks) < 3:
+                return None
+            r = ranks.pop()
             kinds = {self._expr_kind(e) for e in x.elts}
         else:
-            if int(self._rank_expr(x) or 0) != 3:
+            r = int(self._rank_expr(x) or 0)
+            if r < 3:
                 return None
             kinds = {self._expr_kind(x)}
         if not kinds <= {"int", "real"}:
@@ -34168,8 +34173,8 @@ class translator(ast.NodeVisitor):
         if axis != "default":
             if is_none(axis):
                 axis = None
-            elif isinstance(axis, ast.Constant) and isinstance(axis.value, int) and -3 <= axis.value < 3:
-                axis = axis.value % 3
+            elif isinstance(axis, ast.Constant) and isinstance(axis.value, int) and -r <= axis.value < r:
+                axis = axis.value % r
             else:
                 return None
         return attr, x, axis
@@ -34177,7 +34182,13 @@ class translator(ast.NodeVisitor):
     def _rank3_numpy(self, node):
         """Fortran for numpy axis operations on rank-3 int/real arrays
         (sort/argsort/cumsum/cumprod/flip/diff/roll/trace/concatenate and
-        nonzero(x)[k]); None to use the general translation."""
+        nonzero(x)[k]); flip/diff/roll at any rank, which use only array
+        sections and reshape; None to use the general translation."""
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and is_numpy_name_node(node.value.func.value) and node.value.func.attr in {"nonzero", "where"}
+                and len(node.value.args) == 1 and int(self._rank_expr(node.value.args[0]) or 0) > 3):
+            raise NotImplementedError(f"np.{node.value.func.attr} supports arrays of rank up to 3")
         if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
                 and isinstance(node.slice.value, int) and 0 <= node.slice.value < 3
                 and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
@@ -34195,6 +34206,9 @@ class translator(ast.NodeVisitor):
         attr, x, axis = parts
         if attr in {"nonzero", "where"}:
             return None
+        r = int(self._rank_expr(x.elts[0] if isinstance(x, (ast.List, ast.Tuple)) else x) or 0)
+        if r > 3 and attr not in {"flip", "flipud", "fliplr", "diff", "roll"}:
+            raise NotImplementedError(f"np.{attr} supports arrays of rank up to 3")
         if attr in {"concatenate", "vstack", "hstack"}:
             dim = {"vstack": 1, "hstack": 2}.get(attr)
             if dim is None:
@@ -34219,17 +34233,18 @@ class translator(ast.NodeVisitor):
         if attr == "roll":
             if axis != "default" or len(node.args) < 2 or int(self._rank_expr(node.args[1]) or 0) != 0:
                 return None
-            flat = self._c_order_flat(a, 3)
-            return f"reshape(cshift({flat}, -({self.expr(node.args[1])})), shape({a}), order=[3,2,1])"
+            flat = self._c_order_flat(a, r)
+            order = ",".join(str(d) for d in range(r, 0, -1))
+            return f"reshape(cshift({flat}, -({self.expr(node.args[1])})), shape({a}), order=[{order}])"
         # Section-based: the array must be a variable.
         if not isinstance(x, ast.Name):
             return None
         if attr in {"flip", "flipud", "fliplr"}:
             if attr == "flip":
-                dims = (1, 2, 3) if axis in (None, "default") else (axis + 1,)
+                dims = tuple(range(1, r + 1)) if axis in (None, "default") else (axis + 1,)
             else:
                 dims = (1,) if attr == "flipud" else (2,)
-            secs = [f"size({a},{d}):1:-1" if d in dims else ":" for d in (1, 2, 3)]
+            secs = [f"size({a},{d}):1:-1" if d in dims else ":" for d in range(1, r + 1)]
             return f"{a}({', '.join(secs)})"
         if attr == "diff":
             n = node.args[1] if len(node.args) >= 2 else next((kw.value for kw in node.keywords if kw.arg == "n"), None)
@@ -34237,9 +34252,9 @@ class translator(ast.NodeVisitor):
                 return None
             if axis is None:
                 return None
-            dim = 3 if axis == "default" else axis + 1
-            hi = [f"2:" if d == dim else ":" for d in (1, 2, 3)]
-            lo = [f":size({a},{d})-1" if d == dim else ":" for d in (1, 2, 3)]
+            dim = r if axis == "default" else axis + 1
+            hi = [f"2:" if d == dim else ":" for d in range(1, r + 1)]
+            lo = [f":size({a},{d})-1" if d == dim else ":" for d in range(1, r + 1)]
             return f"({a}({', '.join(hi)}) - {a}({', '.join(lo)}))"
         return None
 
@@ -34350,6 +34365,15 @@ class translator(ast.NodeVisitor):
             return x
         return f"reshape({x}, [size({x})])"
 
+    @staticmethod
+    def _reverse_axes(x, rank):
+        """x with its axes reversed (numpy's x.T / np.transpose(x)), any rank:
+        reshape(x, [size(x,r), ..., size(x,1)], order=[r, ..., 1]) gives
+        y(i_r, ..., i_1) = x(i_1, ..., i_r)."""
+        dims = ", ".join(f"size({x},{d})" for d in range(rank, 0, -1))
+        order = ",".join(str(d) for d in range(rank, 0, -1))
+        return f"reshape({x}, [{dims}], order=[{order}])"
+
     def _c_order_flat(self, x, rank):
         """The elements of array expression x in NumPy's (row-major) order,
         as a rank-1 array: what ravel()/flatten() give."""
@@ -34357,11 +34381,8 @@ class translator(ast.NodeVisitor):
             return self._flat_1d(x, rank)
         if rank == 2:
             return f"reshape(transpose({x}), [size({x})])"
-        if rank == 3:
-            # Reverse the axes, then flatten column-major.
-            return (f"reshape(reshape({x}, [size({x},3), size({x},2), size({x},1)], order=[3,2,1]), "
-                    f"[size({x})])")
-        raise NotImplementedError("ravel()/flatten() supports arrays of rank up to 3")
+        # Reverse the axes, then flatten column-major.
+        return f"reshape({self._reverse_axes(x, rank)}, [size({x})])"
 
     def _rank_expr(self, node):
         self._normalize_negative_axis(node)
@@ -34372,10 +34393,11 @@ class translator(ast.NodeVisitor):
             return 1
         _r3 = self._rank3_parts(node)
         if _r3 is not None and _r3[0] not in {"nonzero", "where"}:
+            _r3x = _r3[1].elts[0] if isinstance(_r3[1], (ast.List, ast.Tuple)) else _r3[1]
             if _r3[0] == "trace":
-                return 1
+                return int(self._rank_expr(_r3x) or 0) - 2
             if not (_r3[0] in {"cumsum", "cumprod"} and _r3[2] in (None, "default")):
-                return 3
+                return int(self._rank_expr(_r3x) or 0)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_numpy_name_node(node.func.value):
             _attr = node.func.attr
             if _attr == "quantile" and len(node.args) >= 2:
@@ -36582,6 +36604,10 @@ class translator(ast.NodeVisitor):
                             return f"({base_size_expr} - {k - 1})"
                         return f"({self.expr(idx_part)} + 1)"
 
+                    if int(self._rank_expr(base_node) or 0) > 2:
+                        raise NotImplementedError(
+                            "indexing the result of an expression of rank > 2 is not supported; "
+                            "assign the expression to a variable first")
                     i_expr = _scalar_index_expr(idx_node.elts[0], 1)
                     j_expr = _scalar_index_expr(idx_node.elts[1], 2)
                     return f"index2({base_expr}, {i_expr}, {j_expr})"
@@ -38452,6 +38478,21 @@ class translator(ast.NodeVisitor):
                     trailing = ", ".join(":" for _ in range(base_rank - 1))
                     return f"{base}({trip}, {trailing})"
                 return f"{base}({trip})"
+            if (
+                isinstance(node.slice, ast.Tuple) and len(node.slice.elts) >= 4
+                and isinstance(node.value, ast.Name)
+                and all(isinstance(a, ast.Slice) or (not is_none(a) and int(self._rank_expr(a) or 0) == 0)
+                        for a in node.slice.elts)
+            ):
+                # Rank 4 and up: one index or triplet per dimension (Fortran
+                # arrays go up to rank 15).
+                def _size_nd(dim1):
+                    return f"size({base_name if isinstance(node.value, ast.Name) else base},{dim1})"
+
+                parts_nd = [self._slice_triplet(a, _size_nd(d1)) if isinstance(a, ast.Slice)
+                            else self._scalar_idx1_expr(a, _size_nd(d1))
+                            for d1, a in enumerate(node.slice.elts, start=1)]
+                return f"{base}({', '.join(parts_nd)})"
             if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
                 a0, a1 = node.slice.elts
                 def _idx1_expr(a, dim_size_expr):
@@ -38505,6 +38546,10 @@ class translator(ast.NodeVisitor):
                 # Scalar 2D indexing: a[i, j] -> a(i+1, j+1)
                 if (not isinstance(a0, ast.Slice)) and (not isinstance(a1, ast.Slice)) and (not none0) and (not none1):
                     if isinstance(node.value, ast.Call):
+                        if int(self._rank_expr(node.value) or 0) > 2:
+                            raise NotImplementedError(
+                                "indexing the result of an expression of rank > 2 is not supported; "
+                                "assign the expression to a variable first")
                         return f"index2({base}, {_idx1_expr(a0, f'size({base_name},1)')}, {_idx1_expr(a1, f'size({base_name},2)')})"
                     return f"{base}({_idx1_expr(a0, f'size({base_name},1)')}, {_idx1_expr(a1, f'size({base_name},2)')})"
                 raise NotImplementedError("only [None,:] and [:,None] tuple subscripts are supported")
@@ -41860,12 +41905,7 @@ class translator(ast.NodeVisitor):
                         return a0
                     if _r0 == 2:
                         return f"transpose({a0})"
-                    if _r0 == 3:
-                        return (
-                            f"reshape({a0}, [size({a0},3), size({a0},2), size({a0},1)], "
-                            f"order=[3,2,1])"
-                        )
-                    raise NotImplementedError("np.transpose currently supports rank up to 3")
+                    return self._reverse_axes(a0, int(_r0))
                 axes = node.args[1]
                 if not isinstance(axes, (ast.Tuple, ast.List)):
                     raise NotImplementedError("np.transpose axes must be tuple/list")
@@ -45923,7 +45963,7 @@ class translator(ast.NodeVisitor):
                     return vtxt
                 if _t_rank == 2:
                     return f"transpose({vtxt})"
-                if _t_rank == 3:
+                if _t_rank >= 3:
                     # Fortran's TRANSPOSE intrinsic strictly requires a
                     # rank-2 matrix -- numpy's own .T (no explicit axes)
                     # reverses ALL axes instead, which for rank 3 needs
@@ -45934,11 +45974,7 @@ class translator(ast.NodeVisitor):
                     # `np.transpose(x)` default-axes semantics) --
                     # mirroring the identical rank-3 case the sibling
                     # `.transpose()` METHOD-call codegen already has.
-                    return (
-                        f"reshape({vtxt}, "
-                        f"[size({vtxt},3), size({vtxt},2), size({vtxt},1)], "
-                        f"order=[3,2,1])"
-                    )
+                    return self._reverse_axes(vtxt, int(_t_rank))
                 raise NotImplementedError(".T currently supports rank up to 3")
             if node.attr == "flat":
                 vtxt = self.expr(node.value)
@@ -63237,6 +63273,14 @@ class translator(ast.NodeVisitor):
                 return
             if self._rank_expr(a0) == 3 and self._expr_kind(a0) in {"real", "int", "alloc_real", "alloc_int"}:
                 self.o.w(f"call print_array_3d({self.expr(a0)})")
+                return
+            if int(self._rank_expr(a0) or 0) > 3 and not advance_no and unit_txt == "*":
+                # No numpy-style printer above rank 3: list-directed output
+                # of the elements in numpy's (C) order, with a warning.
+                _r_pr = int(self._rank_expr(a0))
+                print(f"line {getattr(call, 'lineno', '?')}: Warning: print of a rank-{_r_pr} array: values "
+                      "printed in NumPy (C) order as one flat list; layout differs from NumPy", file=sys.stderr)
+                self.o.w(f"print *, {self._c_order_flat(self.expr(a0), _r_pr)}")
                 return
         if len(call.args) != 1:
             if (
