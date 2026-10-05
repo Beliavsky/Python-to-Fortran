@@ -27982,6 +27982,185 @@ class translator(ast.NodeVisitor):
             return None
         return kind, rank - sum(1 for p in parts if not isinstance(p, ast.Slice))
 
+    _VIEW_METHODS = {"reshape", "ravel", "transpose", "view", "squeeze", "swapaxes"}
+    _VIEW_FUNCTIONS = {"reshape", "ravel", "transpose", "squeeze", "swapaxes", "asarray"}
+    _MUTATING_METHODS = {"sort", "fill", "put", "itemset", "partition"}
+
+    def _view_base(self, value):
+        """The array name whose memory `value` shares in numpy, for a
+        binding `b = value`: b = a, a basic slice a[1:4] / a[::2] / m[i] /
+        m[:, j], a.T, a.reshape(...)/ravel()/transpose()/view()/squeeze(),
+        np.reshape(a, ...) etc. (an array, not a Python list); else None."""
+        if isinstance(value, ast.Name):
+            base = value
+        elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
+            parts = list(value.slice.elts) if isinstance(value.slice, ast.Tuple) else [value.slice]
+            # Fancy or boolean indexing copies.
+            if any(not isinstance(q, ast.Slice) and int(self._rank_expr(q) or 0) != 0 for q in parts):
+                return None
+            # A scalar element is not a view; a row of a matrix is.
+            if not any(isinstance(q, ast.Slice) for q in parts) and \
+                    len(parts) >= int(self._rank_expr(value.value) or 0):
+                return None
+            base = value.value
+        elif isinstance(value, ast.Attribute) and value.attr == "T" and isinstance(value.value, ast.Name):
+            base = value.value
+        elif (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+              and isinstance(value.func.value, ast.Name) and not is_numpy_name_node(value.func.value)
+              and value.func.attr in self._VIEW_METHODS):
+            base = value.func.value
+        elif (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+              and is_numpy_name_node(value.func.value) and value.func.attr in self._VIEW_FUNCTIONS
+              and value.args and isinstance(value.args[0], ast.Name)
+              and not (value.func.attr == "asarray" and value.keywords)):
+            base = value.args[0]
+        else:
+            return None
+        if int(self._rank_expr(base) or 0) == 0 or self._is_python_list_expr(base):
+            return None
+        return base.id
+
+    def _check_view_mutation(self, body):
+        """numpy views share memory: after `b = a[1:4]` (or b = a, a.T,
+        a.reshape(...), ...), modifying b in place changes a and vice versa.
+        The translation gives every name its own copy, so when one of two
+        names sharing an array is modified in place and the other is used
+        afterwards, the results would differ silently: raise instead."""
+        # Python lists are not numpy arrays (the translator aliases `y = x`
+        # of a list itself); python_list_vars is only filled in later.
+        def root_name(n):
+            while isinstance(n, ast.Attribute):
+                n = n.value
+            return n.id if isinstance(n, ast.Name) else None
+
+        # pandas Series/DataFrames are aliased by the translator too.
+        list_names = set(self.python_list_vars) | set(self.pandas_series_vars) | set(self.pandas_df_vars)
+        for n in ast.walk(ast.Module(body=list(body), type_ignores=[])):
+            if isinstance(n, ast.Assign) and (
+                    isinstance(n.value, (ast.List, ast.ListComp))
+                    or (isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name)
+                        and n.value.func.id == "list")
+                    or (isinstance(n.value, ast.Call) and root_name(n.value.func) in {"pd", "pandas"})):
+                list_names.update(tg.id for tg in n.targets if isinstance(tg, ast.Name))
+        obj = {}          # name -> id of the numpy array it is bound to
+        fresh = [0]
+        events = []       # ("bind", b, a, stmt) / ("rebind", x, stmt) / ("mutate", x, stmt) / ("use", x, stmt)
+
+        def new_obj():
+            fresh[0] += 1
+            return fresh[0]
+
+        def uses(n, line, skip=None):
+            for m in ast.walk(n):
+                if isinstance(m, ast.Name) and isinstance(m.ctx, ast.Load) and m is not skip:
+                    events.append(("use", m.id, line))
+
+        def target_base(tg):
+            cur = tg
+            while isinstance(cur, ast.Subscript):
+                cur = cur.value
+            return cur if isinstance(cur, ast.Name) else None
+
+        def stmts(seq):
+            for st in seq:
+                line = st
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(st, ast.Assign):
+                    uses(st.value, line)
+                    for tg in st.targets:
+                        if isinstance(tg, ast.Name):
+                            base = self._view_base(st.value) if len(st.targets) == 1 else None
+                            if base is not None and base != tg.id and base not in list_names:
+                                events.append(("bind", tg.id, base, line))
+                            else:
+                                events.append(("rebind", tg.id, line))
+                        elif isinstance(tg, ast.Subscript):
+                            b = target_base(tg)
+                            uses(tg.slice, line)
+                            if b is not None:
+                                events.append(("mutate", b.id, line))
+                        else:
+                            for m in ast.walk(tg):
+                                if isinstance(m, ast.Name) and isinstance(m.ctx, ast.Store):
+                                    events.append(("rebind", m.id, line))
+                    continue
+                if isinstance(st, ast.AugAssign):
+                    uses(st.value, line)
+                    b = target_base(st.target)
+                    if isinstance(st.target, ast.Subscript):
+                        uses(st.target.slice, line)
+                        if b is not None:
+                            events.append(("mutate", b.id, line))
+                    elif b is not None:
+                        # In place for an array, a rebinding for a number.
+                        if int(self._rank_expr(b) or 0) > 0:
+                            events.append(("mutate", b.id, line))
+                        else:
+                            events.append(("rebind", b.id, line))
+                    continue
+                if (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+                        and isinstance(st.value.func, ast.Attribute) and isinstance(st.value.func.value, ast.Name)
+                        and st.value.func.attr in self._MUTATING_METHODS
+                        and int(self._rank_expr(st.value.func.value) or 0) > 0):
+                    for a in st.value.args:
+                        uses(a, line)
+                    events.append(("mutate", st.value.func.value.id, line))
+                    continue
+                if isinstance(st, (ast.For, ast.AsyncFor)):
+                    uses(st.iter, line)
+                    for m in ast.walk(st.target):
+                        if isinstance(m, ast.Name):
+                            events.append(("rebind", m.id, line))
+                    stmts(st.body)
+                    stmts(st.orelse)
+                    continue
+                if isinstance(st, (ast.If, ast.While)):
+                    uses(st.test, line)
+                    stmts(st.body)
+                    stmts(st.orelse)
+                    continue
+                if isinstance(st, (ast.With, ast.AsyncWith)):
+                    for it in st.items:
+                        uses(it.context_expr, line)
+                    stmts(st.body)
+                    continue
+                if isinstance(st, ast.Try):
+                    stmts(st.body)
+                    for h in st.handlers:
+                        stmts(h.body)
+                    stmts(st.orelse)
+                    stmts(st.finalbody)
+                    continue
+                uses(st, line)
+
+        stmts(body)
+        for i, ev in enumerate(events):
+            if ev[0] == "bind":
+                _, b, a, _line = ev
+                obj[b] = obj.setdefault(a, new_obj())
+            elif ev[0] == "rebind":
+                obj[ev[1]] = new_obj()
+            elif ev[0] == "mutate":
+                x, stmt = ev[1], ev[2]
+                if x not in obj:
+                    continue
+                sharers = {n for n, o in obj.items() if o == obj[x] and n != x}
+                for later in events[i + 1:]:
+                    if not sharers:
+                        break
+                    if later[0] in {"rebind", "bind"} and later[1] in sharers:
+                        sharers.discard(later[1])
+                    elif later[0] == "use" and later[1] in sharers:
+                        y = later[1]
+                        node = stmt  # noqa: F841 -- the error report's line (frame locals)
+                        raise NotImplementedError(
+                            f"modifying '{x}' in place also changes '{y}' in numpy, because "
+                            f"they share memory ('{x}' and '{y}' are the same array or views of it, e.g. "
+                            "a slice, row, column, .T or reshape); the Fortran translation copies arrays, "
+                            "so its results would differ. Use .copy() where a separate array is meant, "
+                            "or modify the original array directly")
+
     _HOIST_STMTS = (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Return, ast.If, ast.For, ast.While)
 
     @staticmethod
@@ -66087,6 +66266,7 @@ def _emit_local_function(
     tr.python_set_vars.update(getattr(fn, "_xp2f_set_args", set()))
     tr.prescan(fn.body)
     tr._check_annotation_contracts(fn.body)
+    tr._check_view_mutation(fn.body)
     _check_conditional_element_return(fn, tr)
     if fn.name in (local_df_return_info or {}):
         # tr.prescan above is scoped to just this function's own body, so
@@ -68727,7 +68907,7 @@ def _emit_local_function(
                         # `_arg_array_rank` only sees body usage, so also
                         # accept a `float[:]`-style annotation for a param
                         # whose only appearance is this bare `nm += ...`.
-                        if _arg_array_rank(nm) > 0 or "[:" in ann_map.get(nm, ""):
+                        if _arg_rank_with_call_sites(nm) > 0 or "[:" in ann_map.get(nm, ""):
                             return True
                 if (
                     isinstance(n, ast.Call)
@@ -68753,6 +68933,16 @@ def _emit_local_function(
                     # directly on the function's own parameter.
                     return True
         return False
+
+    def _arg_rank_with_call_sites(nm):
+        """_arg_array_rank, or the rank the program's calls pass: in
+        `def scale(v, s): v *= s` nothing in the body shows v is an array."""
+        r = _arg_array_rank(nm)
+        if local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
+            names = [a.arg for a in fn.args.args]
+            if nm in names and names.index(nm) < len(local_func_arg_ranks[fn.name]):
+                r = max(r, int(local_func_arg_ranks[fn.name][names.index(nm)] or 0))
+        return r
 
     def _arg_is_rebound_name(nm):
         for st in fn.body:
@@ -68784,7 +68974,7 @@ def _emit_local_function(
                         # `float[:]`-style annotation for a param whose only
                         # appearance is the bare `nm += ...` itself.
                         _ann = ann_map.get(nm, "")
-                        if _arg_array_rank(nm) <= 0 and "[:" not in _ann:
+                        if _arg_rank_with_call_sites(nm) <= 0 and "[:" not in _ann:
                             return True
         return False
 
@@ -79599,6 +79789,10 @@ def generate_flat(
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":
             tr._check_annotation_contracts(st.body)
+    tr._check_view_mutation(tree.body)
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef) and st.name == "main":
+            tr._check_view_mutation(st.body)
     tr.validate_unsafe_if_type_merges(tree.body)
     for st in tree.body:
         if isinstance(st, ast.FunctionDef) and st.name == "main":

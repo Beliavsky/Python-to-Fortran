@@ -25957,3 +25957,72 @@ def test_xp2f_constant_promotion_sees_assignment_in_nested_block(tmp_path: Path)
                              capture_output=True, text=True, check=True)
         values = [float(v) for v in run.stdout.split()]
         assert values == ([138.0, 7.0] if cond == "True" else [-1.5, 7.0]), run.stdout
+
+
+def test_xp2f_numpy_view_mutation_is_reported(tmp_path: Path) -> None:
+    # numpy views share memory: after b = a / a[1:4] / m[1] / m[:, 2] / m.T
+    # / a.reshape(...) / m.ravel(), modifying one name in place changes the
+    # other. The translation copies arrays, so it reports the pattern
+    # instead of silently printing different values.
+    cases = [
+        "a = np.arange(6.0)\nb = a\nb[0] = 99.0\nprint(a)",
+        "a = np.arange(6.0)\nb = a[1:4]\nb[0] = 99.0\nprint(a)",
+        "m = np.arange(6.0).reshape(2, 3)\nr = m[1]\nr[0] = 99.0\nprint(m)",
+        "m = np.arange(6.0).reshape(2, 3)\nc = m[:, 2]\nc[:] = -1.0\nprint(m)",
+        "m = np.arange(6.0).reshape(2, 3)\nt = m.T\nt[0, 1] = 99.0\nprint(m)",
+        "a = np.arange(6.0)\nm = a.reshape(2, 3)\nm[1, 1] = 99.0\nprint(a)",
+        "m = np.arange(6.0).reshape(2, 3)\nv = m.ravel()\nv[4] = 99.0\nprint(m)",
+        "a = np.arange(4.0)\nb = a\nb += 1\nprint(a)",
+        "a = np.zeros(4)\nfor i in range(4):\n    b = a[i:]\n    b[0] += i\nprint(a)",
+        "m = np.arange(6.0).reshape(3, 2)\ntmp = m[0]\nm[0] = m[2]\nm[2] = tmp\nprint(m)",
+    ]
+    for k, body in enumerate(cases):
+        src = tmp_path / f"xview_{k}.py"
+        src.write_text("import numpy as np\n" + body + "\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode != 0, body
+        assert "in place also changes" in proc.stdout + proc.stderr, (body, proc.stdout + proc.stderr)
+
+
+def test_xp2f_numpy_copies_and_argument_mutation_match(tmp_path: Path) -> None:
+    # No shared memory (copy(), rebinding, a Python list, fancy indexing),
+    # or a function modifying its array argument in place -- including
+    # `v *= s`, which made a local copy (v intent(in)) when nothing in the
+    # body but the augmented assignment showed v is an array.
+    src = tmp_path / "xview_ok.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def zero_first(v):\n"
+        "    v[0] = 0.0\n"
+        "def scale(v, s):\n"
+        "    v *= s\n"
+        "a = np.arange(4.0)\n"
+        "b = a.copy()\n"
+        "b[0] = 99.0\n"
+        "print(a, b)\n"
+        "c = a\n"
+        "c = c + 1\n"
+        "print(a, c)\n"
+        "x = [1.0, 2.0, 3.0]\n"
+        "y = x\n"
+        "y[0] = 9.0\n"
+        "print(x)\n"
+        "m = np.arange(6.0).reshape(3, 2)\n"
+        "m[[0, 2]] = m[[2, 0]]\n"
+        "print(m)\n"
+        "tmp = m[0].copy()\n"
+        "m[0] = m[1]\n"
+        "m[1] = tmp\n"
+        "print(m)\n"
+        "zero_first(a[2:])\n"
+        "print(a)\n"
+        "scale(m[0], 10.0)\n"
+        "print(m)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    assert "intent(inout) :: v(:)" in (tmp_path / "xview_ok_p.f90").read_text(encoding="utf-8")
