@@ -25878,11 +25878,55 @@ def test_xp2f_rank4_arrays_rank_specific_operations_fail_clearly(tmp_path: Path)
     for expr, msg in [("np.sort(x4)", "np.sort supports arrays of rank up to 3"),
                       ("np.cumsum(x4, axis=1)", "np.cumsum supports arrays of rank up to 3"),
                       ("np.nonzero(x4)[0]", "np.nonzero supports arrays of rank up to 3"),
-                      ("np.diff(x4)[1, 2]", "assign the expression to a variable first")]:
+                      ("(x4 * 2)[1, 2, 3, 4] if x4[0, 0, 0, 0] > 0 else 0",
+                       "assign the expression to a variable first")]:
         src = tmp_path / "xrank4_fail.py"
         src.write_text("import numpy as np\nx4 = np.zeros((2, 3, 4, 5))\n"
-                       f"print({expr})\n", encoding="utf-8")
+                       f"r = {expr}\nprint(r)\n", encoding="utf-8")
         proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
                               cwd=tmp_path, capture_output=True, text=True, check=False)
         assert proc.returncode != 0, expr
         assert msg in proc.stdout + proc.stderr, (expr, proc.stdout + proc.stderr)
+
+
+def test_xp2f_indexed_array_expressions_use_temporaries(tmp_path: Path) -> None:
+    # Fortran can't index the result of an expression: np.diff(x4)[1, 2],
+    # (m * 2)[1, 2] and x4.T[4, 3] are translated through a temporary in a
+    # block (statement value, if condition, for iterable, return value),
+    # and a while condition or conditional expression reports the limit.
+    src = tmp_path / "xhoist.py"
+    src.write_text(
+        "import numpy as np\n"
+        "x4 = np.arange(120).reshape(2, 3, 4, 5) - 50\n"
+        "f3 = (np.arange(24).reshape(2, 3, 4) - 7) * 0.5\n"
+        "m = np.arange(6).reshape(2, 3)\n"
+        "print(np.diff(x4, axis=2)[1, 2])\n"
+        "r = np.diff(x4)[1, 2, 0] + np.flip(x4, axis=0)[0, 0, 0, 0]\n"
+        "print(r)\n"
+        "print(np.sum((f3 + 1)[1]), (m * 2)[1, 2], (m + 1)[1], (-m)[:, 2])\n"
+        "t = x4.T[4, 3]\n"
+        "print(t)\n"
+        "w = 0\n"
+        "w += (x4 - 1)[1, 1, 1, 1]\n"
+        "print(w)\n"
+        "if (x4 * 3)[1, 2, 3, 4] > 0:\n"
+        "    print('pos')\n"
+        "for v in (f3 * 2)[1, 2]:\n"
+        "    print(v)\n"
+        "def g(a):\n"
+        "    return np.diff(a, axis=1)[0, 1, 2]\n"
+        "print(g(x4))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    assert "xp_tmp" in (tmp_path / "xhoist_p.f90").read_text(encoding="utf-8")
+    bad = tmp_path / "xhoist_bad.py"
+    bad.write_text("import numpy as np\nx4 = np.zeros((2, 3, 4, 5))\nk = 0\n"
+                   "while (x4 + k)[1, 2, 3, 4] < 3:\n    k += 1\nprint(k)\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "assign the expression to a variable first" in proc.stdout + proc.stderr

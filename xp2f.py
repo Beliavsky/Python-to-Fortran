@@ -27940,7 +27940,143 @@ class translator(ast.NodeVisitor):
 
     _BLOCK_STMTS = (ast.For, ast.AsyncFor, ast.While, ast.If, ast.With, ast.AsyncWith, ast.Try)
 
+    def _indexed_expression_kind_rank(self, node):
+        """(kind, rank) of an index into an array expression of rank 3 or
+        more, such as np.diff(x4)[1, 2] (hoisted to a temporary by
+        _hoist_indexed_expressions); None otherwise."""
+        if not (isinstance(node, ast.Subscript) and not isinstance(node.value, ast.Name)):
+            return None
+        if isinstance(node.value, ast.Attribute) and node.value.attr != "T":
+            return None
+        parts = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if any(is_none(p) or (isinstance(p, ast.Constant) and p.value is Ellipsis) for p in parts):
+            return None
+        if any(not isinstance(p, ast.Slice) and int(self._rank_expr(p) or 0) != 0 for p in parts):
+            return None
+        rank = int(self._rank_expr(node.value) or 0)
+        if not self._needs_hoisting(node.value, rank) or len(parts) > rank:
+            return None
+        kind = self._expr_kind(node.value)
+        if kind not in {"int", "real", "complex", "logical"}:
+            return None
+        return kind, rank - sum(1 for p in parts if not isinstance(p, ast.Slice))
+
+    _HOIST_STMTS = (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Return, ast.If, ast.For, ast.While)
+
+    @staticmethod
+    def _needs_hoisting(base, rank):
+        """Whether indexing array expression base needs a temporary: rank 3
+        or more, or a rank-2 expression other than a call (index1/index2
+        cover calls up to rank 2)."""
+        return rank >= 3 or (rank == 2 and not isinstance(base, ast.Call))
+
+    def _hoist_indexed_expressions(self, stmt):
+        """Fortran can't index the result of an expression, and an array
+        expression of rank 3 or more has no index helper: for
+        np.diff(x4)[1, 2], return a copy of stmt using a temporary for
+        np.diff(x4), with [(name, kind, rank, value), ...] of the
+        temporaries in evaluation order; None if there is nothing to hoist.
+        Only parts of stmt evaluated exactly once are searched (not an
+        x if c else y branch, the later operands of and/or, a lambda or a
+        comprehension), and an expression calling a function of the
+        program is left alone (hoisting could reorder its side effects)."""
+        if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Return)):
+            field = "value"
+        elif isinstance(stmt, ast.If):
+            field = "test"
+        elif isinstance(stmt, ast.For):
+            field = "iter"
+        elif isinstance(stmt, ast.While):
+            field = "test"
+        else:
+            return None
+        root = getattr(stmt, field, None)
+        if root is None:
+            return None
+        if not any(isinstance(n, ast.Subscript) and not isinstance(n.value, ast.Name) for n in ast.walk(root)):
+            return None
+        new_stmt = copy.deepcopy(stmt)
+        temps = []
+        counter = self.__dict__.setdefault("_hoist_tmp_counter", [0])
+
+        def calls_program_function(n):
+            return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in SOURCE_FUNCTION_NAMES
+                       for c in ast.walk(n))
+
+        def unsupported(why):
+            raise NotImplementedError(
+                f"indexing the result of an array expression {why} is not supported; "
+                "assign the expression to a variable first")
+
+        def visit(n, safe):
+            # safe: evaluated exactly once, before the statement runs.
+            if isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                for child in ast.iter_child_nodes(n):
+                    visit(child, False)
+                return
+            if isinstance(n, ast.IfExp):
+                visit(n.test, safe)
+                visit(n.body, False)
+                visit(n.orelse, False)
+                return
+            if isinstance(n, ast.BoolOp):
+                visit(n.values[0], safe)
+                for v in n.values[1:]:
+                    visit(v, False)
+                return
+            for child in ast.iter_child_nodes(n):
+                visit(child, safe)
+            if not isinstance(n, ast.Subscript) or isinstance(n.value, ast.Name):
+                return
+            base = n.value
+            if isinstance(base, ast.Attribute) and base.attr != "T":
+                return
+            rank = int(self._rank_expr(base) or 0)
+            kind = self._expr_kind(base)
+            if not self._needs_hoisting(base, rank) or kind not in {"int", "real", "complex", "logical"}:
+                return
+            if not safe:
+                unsupported("in a while condition, a conditional expression, a later and/or operand, "
+                            "a comprehension or a lambda")
+            if calls_program_function(base):
+                unsupported("that calls a function of the program")
+            counter[0] += 1
+            name = f"xp_tmp{counter[0]}"
+            temps.append((name, kind, rank, self.expr(base)))
+            # Later temporaries (and the statement) see this one's kind/rank.
+            self.open_type_rebind_meta.append((name, kind, rank))
+            n.value = ast.copy_location(ast.Name(id=name, ctx=ast.Load()), base)
+
+        try:
+            visit(getattr(new_stmt, field), not isinstance(stmt, ast.While))
+        finally:
+            for _ in temps:
+                self.open_type_rebind_meta.pop()
+        return (new_stmt, temps) if temps else None
+
     def visit(self, node):
+        if isinstance(node, self._HOIST_STMTS) and not getattr(node, "_xp2f_hoisted", False):
+            hoisted = self._hoist_indexed_expressions(node)
+            if hoisted is not None:
+                new_stmt, temps = hoisted
+                new_stmt._xp2f_hoisted = True
+                decl = {"int": "integer", "real": "real(kind=dp)", "complex": "complex(kind=dp)",
+                        "logical": "logical"}
+                self.o.w("block")
+                self.o.push()
+                for name, kind, rank, _value in temps:
+                    self.o.w(f"{decl[kind]}, allocatable :: {name}({','.join(':' * rank)})")
+                for name, _kind, _rank, value in temps:
+                    self.o.w(f"{name} = {value}")
+                for name, kind, rank, _value in temps:
+                    self.open_type_rebind_meta.append((name, kind, rank))
+                try:
+                    return self.visit(new_stmt)
+                finally:
+                    for _ in temps:
+                        self.open_type_rebind_meta.pop()
+                    self.o.pop()
+                    self.o.w("end block")
         # Track the compound statement being translated and its latest
         # direct child, for comments at the end of a block.
         stack = self.__dict__.setdefault("_block_stack", [])
@@ -28749,6 +28885,9 @@ class translator(ast.NodeVisitor):
 
     def _expr_kind(self, node):
         self._normalize_negative_axis(node)
+        _ixr = self._indexed_expression_kind_rank(node)
+        if _ixr is not None:
+            return _ixr[0]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             _k = self._expr_kind(_mg[0])
@@ -34386,6 +34525,9 @@ class translator(ast.NodeVisitor):
 
     def _rank_expr(self, node):
         self._normalize_negative_axis(node)
+        _ixr = self._indexed_expression_kind_rank(node)
+        if _ixr is not None:
+            return _ixr[1]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             return 2
@@ -70712,6 +70854,11 @@ def _emit_local_function(
                 rhs = tr.expr(v)
                 lhs = f"{dnm}%{cname}"
                 o.w(f"{lhs} = {rhs}")
+            continue
+        if isinstance(s, ast.Return) and s.value is not None and tr._hoist_indexed_expressions(s) is not None:
+            # return np.diff(a)[0, 1, 2]: translator.visit hoists the indexed
+            # expression into a temporary (block) and emits the return.
+            tr.visit(s)
             continue
         if isinstance(s, ast.Return):
             # Avoid emitting a redundant RETURN when this is the final statement.
