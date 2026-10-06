@@ -8992,7 +8992,9 @@ contains
          if (present(rtol)) rtolv = rtol
          if (present(atol)) atolv = atol
          if (present(equal_nan)) eqnan = equal_nan
+         ! numpy broadcasting: an empty operand gives an empty result.
          n = max(size(a), size(b))
+         if (size(a) == 0 .or. size(b) == 0) n = 0
          allocate(mask(1:n))
          do i = 1, n
             if (size(a) == 1) then

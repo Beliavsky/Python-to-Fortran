@@ -26026,3 +26026,21 @@ def test_xp2f_numpy_copies_and_argument_mutation_match(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
     assert "intent(inout) :: v(:)" in (tmp_path / "xview_ok_p.f90").read_text(encoding="utf-8")
+
+
+def test_xp2f_isclose_of_empty_array_is_empty(tmp_path: Path) -> None:
+    # numpy broadcasting: an empty array against a scalar gives an empty
+    # result; isclose_real read a(1) of the empty array.
+    src = tmp_path / "xisclose_empty.py"
+    src.write_text(
+        "import numpy as np\n"
+        "z = np.array([], dtype=float)\n"
+        "r = np.isclose(z, 1)\n"
+        "print(r.size, np.sum(r))\n"
+        "print(np.isclose(np.array([1.0, 2.0]), 1))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
