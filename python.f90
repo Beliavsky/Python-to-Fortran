@@ -377,6 +377,7 @@ public :: argsort
 public :: argsort_idx
 public :: sorted_vec
 public :: diag_k
+public :: np_kron2, np_cross3, matrix_normm2_real
 public :: np_searchsorted
 public :: np_union1d
 public :: np_intersect1d
@@ -615,6 +616,14 @@ end interface np_digitize
 interface np_gather2d
    module procedure np_gather2d_real, np_gather2d_int, np_gather2d_log, np_gather2d_complex
 end interface np_gather2d
+
+interface np_kron2
+   module procedure np_kron2_int, np_kron2_real, np_kron2_complex
+end interface np_kron2
+
+interface np_cross3
+   module procedure np_cross3_int, np_cross3_real, np_cross3_complex
+end interface np_cross3
 
 interface diag_k
    module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
@@ -5345,6 +5354,85 @@ contains
             r(i) = findloc(u == x(i), .true., dim=1) - 1
          end do
       end function np_unique_inverse_complex
+
+      pure function np_kron2_int(a, b) result(r)
+         ! np.kron of two matrices.
+         integer, intent(in) :: a(:,:), b(:,:)
+         integer, allocatable :: r(:,:)
+         integer :: i, j, rb, cb
+         rb = size(b, 1)
+         cb = size(b, 2)
+         allocate(r(size(a, 1) * rb, size(a, 2) * cb))
+         r = 0
+         do j = 1, size(a, 2)
+            do i = 1, size(a, 1)
+               r((i - 1) * rb + 1:i * rb, (j - 1) * cb + 1:j * cb) = a(i, j) * b
+            end do
+         end do
+      end function np_kron2_int
+
+      pure function np_cross3_int(a, b) result(c)
+         ! np.cross of two 3-vectors.
+         integer, intent(in) :: a(:), b(:)
+         integer :: c(3)
+         c = [a(2) * b(3) - a(3) * b(2), a(3) * b(1) - a(1) * b(3), a(1) * b(2) - a(2) * b(1)]
+      end function np_cross3_int
+
+      pure function np_kron2_real(a, b) result(r)
+         ! np.kron of two matrices.
+         real(kind=dp), intent(in) :: a(:,:), b(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         integer :: i, j, rb, cb
+         rb = size(b, 1)
+         cb = size(b, 2)
+         allocate(r(size(a, 1) * rb, size(a, 2) * cb))
+         r = 0.0_dp
+         do j = 1, size(a, 2)
+            do i = 1, size(a, 1)
+               r((i - 1) * rb + 1:i * rb, (j - 1) * cb + 1:j * cb) = a(i, j) * b
+            end do
+         end do
+      end function np_kron2_real
+
+      pure function np_cross3_real(a, b) result(c)
+         ! np.cross of two 3-vectors.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp) :: c(3)
+         c = [a(2) * b(3) - a(3) * b(2), a(3) * b(1) - a(1) * b(3), a(1) * b(2) - a(2) * b(1)]
+      end function np_cross3_real
+
+      pure function np_kron2_complex(a, b) result(r)
+         ! np.kron of two matrices.
+         complex(kind=dp), intent(in) :: a(:,:), b(:,:)
+         complex(kind=dp), allocatable :: r(:,:)
+         integer :: i, j, rb, cb
+         rb = size(b, 1)
+         cb = size(b, 2)
+         allocate(r(size(a, 1) * rb, size(a, 2) * cb))
+         r = (0.0_dp, 0.0_dp)
+         do j = 1, size(a, 2)
+            do i = 1, size(a, 1)
+               r((i - 1) * rb + 1:i * rb, (j - 1) * cb + 1:j * cb) = a(i, j) * b
+            end do
+         end do
+      end function np_kron2_complex
+
+      pure function np_cross3_complex(a, b) result(c)
+         ! np.cross of two 3-vectors.
+         complex(kind=dp), intent(in) :: a(:), b(:)
+         complex(kind=dp) :: c(3)
+         c = [a(2) * b(3) - a(3) * b(2), a(3) * b(1) - a(1) * b(3), a(1) * b(2) - a(2) * b(1)]
+      end function np_cross3_complex
+
+      function matrix_normm2_real(a) result(value)
+         ! np.linalg.norm(a, -2): the smallest singular value.
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp) :: value
+         real(kind=dp), allocatable :: u(:,:), s(:), vt(:,:)
+         if (min(size(a,1), size(a,2)) == 0) error stop "matrix_norm: empty matrix"
+         call linalg_svd_econ(a, u, s, vt)
+         value = minval(s)
+      end function matrix_normm2_real
 
       pure function diag_k_vec_real(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.

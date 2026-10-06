@@ -6124,6 +6124,208 @@ def rewrite_mutating_call_literal_arg_to_temp(tree):
     return new_tree
 
 
+def _signed_int_constant(n):
+    """The int value of a literal like 2 or -2, else None."""
+    if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool):
+        return n.value
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant) \
+            and isinstance(n.operand.value, int) and not isinstance(n.operand.value, bool):
+        return -n.operand.value
+    return None
+
+
+# np.einsum subscripts (letters renamed in order of appearance, explicit
+# output) -> builder of the equivalent numpy expression.
+def _einsum_table():
+    def np_call(attr, args, **kws):
+        return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=attr, ctx=ast.Load()),
+                        args=list(args), keywords=[ast.keyword(arg=k, value=ast.Constant(value=v))
+                                                   for k, v in kws.items()])
+
+    def mul(a, b):
+        return ast.BinOp(left=a, op=ast.Mult(), right=b)
+
+    def T(a):
+        return ast.Attribute(value=a, attr="T", ctx=ast.Load())
+
+    return {
+        "ab,bc->ac": lambda a, b: np_call("matmul", [a, b]),
+        "ab,b->a": lambda a, b: np_call("matmul", [a, b]),
+        "a,ab->b": lambda a, b: np_call("matmul", [a, b]),
+        "ab,cb->ac": lambda a, b: np_call("matmul", [a, T(b)]),
+        "ab,ac->bc": lambda a, b: np_call("matmul", [T(a), b]),
+        "ab,ca->bc": lambda a, b: np_call("matmul", [T(a), T(b)]),
+        "aa->": lambda a: np_call("trace", [a]),
+        "aa->a": lambda a: np_call("diagonal", [a]),
+        "ab->ba": lambda a: T(a),
+        "ab->ab": lambda a: a,
+        "a->a": lambda a: a,
+        "a,a->": lambda a, b: np_call("sum", [mul(a, b)]),
+        "a,a->a": lambda a, b: mul(a, b),
+        "ab,ab->": lambda a, b: np_call("sum", [mul(a, b)]),
+        "ab,ab->ab": lambda a, b: mul(a, b),
+        "ab,ba->": lambda a, b: np_call("sum", [mul(a, T(b))]),
+        "a,b->ab": lambda a, b: np_call("outer", [a, b]),
+        "ab->a": lambda a: np_call("sum", [a], axis=1),
+        "ab->b": lambda a: np_call("sum", [a], axis=0),
+        "ab->": lambda a: np_call("sum", [a]),
+        "a->": lambda a: np_call("sum", [a]),
+    }
+
+
+def _normalized_einsum(spec, nargs):
+    """einsum subscripts with whitespace removed, the implicit output made
+    explicit (the letters appearing once, sorted) and letters renamed
+    a, b, c, ... in order of appearance; None for a form not handled
+    (ellipsis, repeated operands mismatch)."""
+    s = spec.replace(" ", "")
+    if "." in s:
+        return None
+    lhs, arrow, out = s.partition("->")
+    ins = lhs.split(",")
+    if len(ins) != nargs or not all(x.isalpha() for x in ins if x) or (out and not out.isalpha()):
+        return None
+    if not arrow:
+        letters = "".join(ins)
+        out = "".join(sorted(c for c in set(letters) if letters.count(c) == 1))
+    rename = {}
+    for c in "".join(ins) + out:
+        if c not in rename:
+            rename[c] = "abcdefghijklmnopqrstuvwxyz"[len(rename)]
+    return ",".join("".join(rename[c] for c in x) for x in ins) + "->" + "".join(rename[c] for c in out)
+
+
+_LINALG_TUPLE_ARITY = {"eig": 2, "eigh": 2, "svd": 3, "qr": 2, "slogdet": 2, "lstsq": 4}
+
+
+def rewrite_indexed_linalg_tuple_calls(tree):
+    """np.linalg.eigh(a)[0], np.linalg.svd(a)[1], np.linalg.qr(a)[0],
+    np.linalg.slogdet(a)[1], np.linalg.lstsq(a, b)[1], ...: the translator
+    supports these tuple-returning functions in tuple-unpacking form
+    (w, v = np.linalg.eigh(a)), so assign the tuple to temporaries just
+    before the statement and use the one indexed. A call repeated in one
+    statement shares its temporaries. Also np.linalg.svd(a,
+    compute_uv=False) and np.linalg.svdvals(a) (the singular values) and
+    np.linalg.norm(a, 'nuc') (their sum). Only parts of a statement
+    evaluated exactly once are rewritten (not a while condition, a branch
+    of x if c else y, a later and/or operand, a comprehension or lambda)."""
+    existing = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    counter = [0]
+
+    def np_func(attr):
+        return ast.Attribute(value=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="linalg",
+                                                 ctx=ast.Load()), attr=attr, ctx=ast.Load())
+
+    def is_linalg(func, names):
+        if not (isinstance(func, ast.Attribute) and func.attr in names):
+            return False
+        v = func.value
+        return ((isinstance(v, ast.Attribute) and v.attr == "linalg" and isinstance(v.value, ast.Name)
+                 and v.value.id in {"np", "numpy"})
+                or (isinstance(v, ast.Name) and v.id == "linalg"))
+
+    def kw(call, name):
+        return next((k.value for k in call.keywords if k.arg == name), None)
+
+    def svd_values_call(a):
+        return ast.Call(func=np_func("svd"), args=[a], keywords=[
+            ast.keyword(arg="full_matrices", value=ast.Constant(value=False))])
+
+    def rewrite_root(root, inserts, cache):
+        def temps_for(call, arity):
+            key = ast.dump(call)
+            if key not in cache:
+                counter[0] += 1
+                names = []
+                for k in range(arity):
+                    nm = f"xp_la{counter[0]}_{k}"
+                    while nm in existing:
+                        nm += "_"
+                    existing.add(nm)
+                    names.append(nm)
+                cache[key] = names
+                inserts.append(ast.Assign(
+                    targets=[ast.Tuple(elts=[ast.Name(id=nm, ctx=ast.Store()) for nm in names], ctx=ast.Store())],
+                    value=call))
+            return cache[key]
+
+        def visit(n, safe):
+            # Returns the replacement node.
+            if isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                return n
+            if isinstance(n, ast.IfExp):
+                n.test = visit(n.test, safe)
+                return n
+            if isinstance(n, ast.BoolOp):
+                n.values[0] = visit(n.values[0], safe)
+                return n
+            for field, value in ast.iter_fields(n):
+                if isinstance(value, ast.AST):
+                    setattr(n, field, visit(value, safe))
+                elif isinstance(value, list):
+                    setattr(n, field, [visit(v, safe) if isinstance(v, ast.AST) else v for v in value])
+            if not safe:
+                return n
+            # norm(a, 'nuc') -> sum of the singular values.
+            if (isinstance(n, ast.Call) and is_linalg(n.func, {"norm"}) and len(n.args) == 2 and not n.keywords
+                    and isinstance(n.args[1], ast.Constant) and n.args[1].value == "nuc"):
+                s = temps_for(svd_values_call(n.args[0]), 3)[1]
+                return ast.copy_location(ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="sum", ctx=ast.Load()),
+                    args=[ast.Name(id=s, ctx=ast.Load())], keywords=[]), n)
+            # svd(a, compute_uv=False) / svdvals(a) -> the singular values.
+            if isinstance(n, ast.Call) and n.args and (
+                    (is_linalg(n.func, {"svd"}) and isinstance(kw(n, "compute_uv"), ast.Constant)
+                     and kw(n, "compute_uv").value is False)
+                    or is_linalg(n.func, {"svdvals"})):
+                s = temps_for(svd_values_call(n.args[0]), 3)[1]
+                return ast.copy_location(ast.Name(id=s, ctx=ast.Load()), n)
+            if (isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
+                    and isinstance(n.slice.value, int) and isinstance(n.value, ast.Call)
+                    and is_linalg(n.value.func, set(_LINALG_TUPLE_ARITY))):
+                call = n.value
+                arity = _LINALG_TUPLE_ARITY[call.func.attr]
+                if call.func.attr == "qr" and isinstance(kw(call, "mode"), ast.Constant) \
+                        and kw(call, "mode").value in {"r", "raw"}:
+                    return n
+                if call.func.attr == "svd" and kw(call, "compute_uv") is not None:
+                    return n
+                k = n.slice.value
+                if not -arity <= k < arity:
+                    return n
+                return ast.copy_location(ast.Name(id=temps_for(call, arity)[k % arity], ctx=ast.Load()), n)
+            return n
+
+        return visit(root, True)
+
+    def process_body(body):
+        out = []
+        for st in body:
+            inserts = []
+            cache = {}
+            if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Return)):
+                if getattr(st, "value", None) is not None:
+                    st.value = rewrite_root(st.value, inserts, cache)
+            elif isinstance(st, ast.If):
+                st.test = rewrite_root(st.test, inserts, cache)
+            elif isinstance(st, (ast.For, ast.AsyncFor)):
+                st.iter = rewrite_root(st.iter, inserts, cache)
+            for field in ("body", "orelse", "finalbody"):
+                if isinstance(getattr(st, field, None), list):
+                    setattr(st, field, process_body(getattr(st, field)))
+            if isinstance(st, ast.Try):
+                for h in st.handlers:
+                    h.body = process_body(h.body)
+            for ins in inserts:
+                out.append(ast.copy_location(ins, st))
+            out.append(st)
+        return out
+
+    tree.body = process_body(tree.body)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_nonatomic_ternary_to_temp(tree):
     """Hoist a ternary (`A if test else B`) whose branches are NOT both
     simple atoms (a bare Name or Constant) out of whatever expression it
@@ -8822,11 +9024,11 @@ def function_is_pure(fn_node, known_pure_calls=None):
                     }:
                         self.ok = False
                         return
-                    if "linalg" in inner and leaf == "norm":
+                    if "linalg" in inner and leaf in {"norm", "matrix_norm"}:
                         order = next((kw.value for kw in node.keywords if kw.arg == "ord"),
                                      node.args[1] if len(node.args) >= 2 else None)
-                        if isinstance(order, ast.Constant) and order.value == 2:
-                            # Matrix order 2 lowers to an impure LAPACK SVD.
+                        if _signed_int_constant(order) in (2, -2):
+                            # Matrix orders 2 and -2 lower to an impure LAPACK SVD.
                             self.ok = False
                             return
                     if leaf in impure_np_leaf_calls or any(seg in impure_np_chain_segments for seg in inner):
@@ -15644,6 +15846,7 @@ def detect_needed_helpers(tree):
         "median": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
         "percentile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
         "diagonal": {"diagonal"},
+        "einsum": {"diagonal"},
         "repeat": {
             "repeat",
             "repeat_int",
@@ -15667,7 +15870,8 @@ def detect_needed_helpers(tree):
         "lexsort": {"lexsort_keys", "lexsort2_int", "lexsort2_real"},
         "ravel_multi_index": {"ravel_multi_index_2d"},
         "unravel_index": {"unravel_index_2d"},
-        "kron": {"kron_2d"},
+        "kron": {"kron_2d", "np_kron2"},
+        "cross": {"np_cross3"},
         "mean": {"mean"},
         "average": {"mean"},
         "histogram": {"histogram_counts", "histogram_counts_edges"},
@@ -16842,8 +17046,10 @@ def detect_needed_helpers(tree):
                 elif node.func.attr == "inv":
                     needed.add("linalg_inv")
                 elif node.func.attr == "cond":
-                    needed.add("linalg_cond")
+                    # cond(a, p) = norm(a, p) * norm(inv(a), p).
+                    needed.update({"linalg_cond", "linalg_inv", "matrix_normm2_real"})
                 elif node.func.attr == "norm":
+                    needed.add("matrix_normm2_real")
                     order = next((kw.value for kw in node.keywords if kw.arg == "ord"),
                                  node.args[1] if len(node.args) >= 2 else None)
                     if isinstance(order, ast.Constant) and order.value == 2:
@@ -16895,7 +17101,8 @@ def detect_needed_helpers(tree):
                 elif node.func.attr == "inv":
                     needed.add("linalg_inv")
                 elif node.func.attr == "cond":
-                    needed.add("linalg_cond")
+                    # cond(a, p) = norm(a, p) * norm(inv(a), p).
+                    needed.update({"linalg_cond", "linalg_inv", "matrix_normm2_real"})
                 elif node.func.attr == "matrix_rank":
                     needed.add("linalg_matrix_rank")
                 elif node.func.attr == "eigvals":
@@ -16924,23 +17131,12 @@ def detect_needed_helpers(tree):
             ):
                 needed.add("quantile_linear")
                 needed.add("quantile_linear_vec")
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr == "trace"
-            ):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "trace":
+                # np.trace and np.linalg.trace.
                 needed.add("diag")
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
-                and node.func.attr == "einsum"
-                and len(node.args) >= 1
-                and is_const_str(node.args[0])
-                and node.args[0].value == "ii->"
-            ):
-                needed.add("diag")
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "einsum":
+                # einsum patterns lower to trace/diagonal among others.
+                needed.update({"diag", "diagonal"})
             if is_print_like:
                 needed.add("print_matrix")
                 needed.add("print_array_3d")
@@ -26989,7 +27185,8 @@ class translator(ast.NodeVisitor):
         if self._expr_kind(node.args[0]) in {"int", "logical"}:
             a0 = f"real({a0}, kind=dp)"
         ord_node = node.args[1] if len(node.args) >= 2 else None
-        axis_node = None
+        # norm(x, ord, axis, keepdims) also takes the axis positionally.
+        axis_node = node.args[2] if len(node.args) >= 3 else None
         keepdims = False
         for kw in node.keywords:
             if kw.arg == "ord":
@@ -26998,6 +27195,10 @@ class translator(ast.NodeVisitor):
                 axis_node = kw.value
             elif kw.arg == "keepdims":
                 keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+        if ord_node is not None and is_none(ord_node):
+            ord_node = None  # ord=None is the default (2-norm / Frobenius)
+        if axis_node is not None and is_none(axis_node):
+            axis_node = None
         ord_is_fro = bool(is_const_str(ord_node) and str(ord_node.value).lower() in {"fro", "f"})
         ord_is_two = bool(
             isinstance(ord_node, ast.Constant)
@@ -27077,6 +27278,11 @@ class translator(ast.NodeVisitor):
                 reduced = f"maxval(sum(abs({a0}), dim=2))"
             elif ord_is_neginf:
                 reduced = f"minval(sum(abs({a0}), dim=2))"
+            elif _signed_int_constant(ord_node) == -1:
+                reduced = f"minval(sum(abs({a0}), dim=1))"
+            elif _signed_int_constant(ord_node) == -2 and self._expr_kind(node.args[0]) != "complex":
+                _a_real = a0 if self._expr_kind(node.args[0]) == "real" else f"real({a0}, kind=dp)"
+                reduced = f"matrix_normm2_real({_a_real})"
             else:
                 raise NotImplementedError("unsupported matrix norm order")
             return f"reshape([{reduced}], [1, 1])" if keepdims else reduced
@@ -29150,6 +29356,89 @@ class translator(ast.NodeVisitor):
             new = ast.Subscript(value=ast.Call(func=np_func("nonzero"), args=[ravel], keywords=[]),
                                 slice=ast.Constant(value=0), ctx=ast.Load())
         elif (
+            isinstance(func.value, ast.Attribute) and func.value.attr == "linalg"
+            and is_numpy_name_node(func.value.value) and attr == "cond" and len(node.args) == 2 and not node.keywords
+            and not is_none(node.args[1]) and _signed_int_constant(node.args[1]) not in (2,)
+        ):
+            # numpy: cond(x, p) = norm(x, p) * norm(inv(x), p); p = -2 is
+            # the smallest over the largest singular value.
+            a, pn = node.args
+            la = func.value
+            if _signed_int_constant(pn) == -2:
+                new = ast.BinOp(left=ast.Constant(value=1.0), op=ast.Div(), right=ast.Call(
+                    func=ast.Attribute(value=la, attr="cond", ctx=ast.Load()), args=[a], keywords=[]))
+            else:
+                def _nrm(x):
+                    return ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()), args=[x, pn],
+                                    keywords=[])
+                inv = ast.Call(func=ast.Attribute(value=la, attr="inv", ctx=ast.Load()), args=[a], keywords=[])
+                new = ast.BinOp(left=_nrm(a), op=ast.Mult(), right=_nrm(inv))
+        elif (
+            is_numpy_name_node(func.value) and attr == "inner" and len(node.args) == 2 and not node.keywords
+            and int(self._rank_expr(node.args[0]) or 0) >= 1 and int(self._rank_expr(node.args[1]) or 0) >= 1
+            and max(int(self._rank_expr(node.args[0])), int(self._rank_expr(node.args[1]))) == 2
+        ):
+            # inner sums over the last axes: A @ B.T, A @ v, A @ v for v, A.
+            a, b = node.args
+            ra, rb = int(self._rank_expr(a)), int(self._rank_expr(b))
+            if ra == 2 and rb == 2:
+                new = ast.Call(func=np_func("matmul"), args=[a, ast.Attribute(value=b, attr="T", ctx=ast.Load())],
+                               keywords=[])
+            elif ra == 2:
+                new = ast.Call(func=np_func("matmul"), args=[a, b], keywords=[])
+            else:
+                new = ast.Call(func=np_func("matmul"), args=[b, a], keywords=[])
+        elif is_numpy_name_node(func.value) and attr == "einsum" and node.args:
+            spec = node.args[0]
+            if not (isinstance(spec, ast.Constant) and isinstance(spec.value, str)) or node.keywords:
+                raise NotImplementedError("np.einsum needs a constant subscripts string and no keywords")
+            norm_spec = _normalized_einsum(spec.value, len(node.args) - 1)
+            build = _einsum_table().get(norm_spec) if norm_spec else None
+            if build is None:
+                raise NotImplementedError(f"np.einsum('{spec.value}', ...) is not supported")
+            new = build(*node.args[1:])
+        elif (
+            isinstance(func.value, ast.Attribute) and func.value.attr == "linalg"
+            and is_numpy_name_node(func.value.value)
+            and attr in {"vector_norm", "matrix_norm", "vecdot", "outer", "cross", "matrix_transpose",
+                         "diagonal", "trace"}
+        ):
+            # numpy 2's array-API linalg names.
+            la = func.value
+            kwd = {kw.arg: kw.value for kw in node.keywords}
+            if attr == "vector_norm" and node.args and set(kwd) <= {"ord", "axis"}:
+                x = node.args[0]
+                ordn = node.args[1] if len(node.args) > 1 else kwd.get("ord")
+                if "axis" in kwd and not is_none(kwd["axis"]):
+                    kws = [ast.keyword(arg="axis", value=kwd["axis"])]
+                    if ordn is not None:
+                        kws.insert(0, ast.keyword(arg="ord", value=ordn))
+                    new = ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()), args=[x],
+                                   keywords=kws)
+                else:
+                    # Always flattened: the rank of x may not be known yet
+                    # when this rewrite is made (and cached).
+                    flat = ast.Call(func=np_func("ravel"), args=[x], keywords=[])
+                    new = ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()),
+                                   args=[flat] + ([ordn] if ordn is not None else []), keywords=[])
+            elif attr == "matrix_norm" and node.args and set(kwd) <= {"ord"}:
+                ordn = node.args[1] if len(node.args) > 1 else kwd.get("ord", ast.Constant(value="fro"))
+                new = ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()),
+                               args=[node.args[0], ordn], keywords=[])
+            elif attr == "vecdot" and len(node.args) == 2 and not kwd:
+                a, b = node.args
+                if self._expr_kind(a) == "complex":
+                    a = ast.Call(func=np_func("conj"), args=[a], keywords=[])
+                new = ast.Call(func=np_func("sum"), args=[ast.BinOp(left=a, op=ast.Mult(), right=b)],
+                               keywords=[ast.keyword(arg="axis", value=ast.Constant(value=-1))])
+            elif attr in {"outer", "cross"}:
+                new = ast.Call(func=np_func(attr), args=list(node.args), keywords=list(node.keywords))
+            elif attr == "matrix_transpose" and len(node.args) == 1 and int(self._rank_expr(node.args[0]) or 0) == 2:
+                new = ast.Attribute(value=node.args[0], attr="T", ctx=ast.Load())
+            elif attr in {"diagonal", "trace"} and node.args and set(kwd) <= {"offset"} \
+                    and int(self._rank_expr(node.args[0]) or 0) == 2:
+                new = ast.Call(func=np_func(attr), args=list(node.args), keywords=list(node.keywords))
+        elif (
             is_numpy_name_node(func.value) and attr == "take" and len(node.args) in (2, 3)
             and all(kw.arg == "axis" for kw in node.keywords)
             and int(self._rank_expr(node.args[0]) or 0) >= 1
@@ -29332,6 +29621,13 @@ class translator(ast.NodeVisitor):
             return "int" if self._expr_kind(node.args[0]) in {"int", "logical"} else "real"
         if self._histogram_counts_call(node) is not None:
             return "int"
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and is_numpy_name_node(node.func.value) and node.func.attr == "kron" and len(node.args) == 2
+        ):
+            _kk = self._promoted_kind(node.args)
+            if _kk is not None:
+                return "int" if _kk == "logical" else _kk
         if (
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and node.func.attr == "matrix_power" and isinstance(node.func.value, ast.Attribute)
@@ -35536,6 +35832,8 @@ class translator(ast.NodeVisitor):
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if keepdims and self._rank_expr(node.args[0]) == 2:
                     return 2
+                if axis_node is not None and is_none(axis_node):
+                    axis_node = None
                 if axis_node is not None:
                     if keepdims:
                         # keepdims=True keeps the reduced axis as a
@@ -41158,6 +41456,9 @@ class translator(ast.NodeVisitor):
                     return f"py_float({self.expr(a0)})"
                 if self._expr_kind(a0) == "char":
                     return f"py_float({self.expr(a0)})"
+                if self._expr_kind(a0) == "logical":
+                    # REAL() doesn't accept a LOGICAL argument: float(True) is 1.0.
+                    return f"merge(1.0_dp, 0.0_dp, {self.expr(a0)})"
                 return f"real({self.expr(a0)}, kind=dp)"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -42879,7 +43180,17 @@ class translator(ast.NodeVisitor):
                 if self._rank_expr(node.args[0]) <= 1 and self._rank_expr(node.args[1]) <= 1:
                     return f"reshape(spread({a1}, dim=1, ncopies=size({a0})) * spread({a0}, dim=2, ncopies=size({a1})), [size({a0})*size({a1})])"
                 if self._rank_expr(node.args[0]) == 2 and self._rank_expr(node.args[1]) == 2:
-                    return f"kron_2d({a0}, {a1})"
+                    _kk = self._promoted_kind(node.args[:2])
+                    if _kk in {None, "int", "logical"}:
+                        return f"kron_2d({a0}, {a1})"
+                    def _cast(n, txt):
+                        kn = self._expr_kind(n)
+                        if _kk == "complex" and kn != "complex":
+                            return f"cmplx({txt}, 0.0_dp, kind=dp)"
+                        if _kk == "real" and kn in {"int", "logical"}:
+                            return f"real({txt}, kind=dp)"
+                        return txt
+                    return f"np_kron2({_cast(node.args[0], a0)}, {_cast(node.args[1], a1)})"
                 raise NotImplementedError("np.kron currently supports only 1D/2D arrays")
             if (
                 isinstance(node.func, ast.Attribute)
@@ -46403,6 +46714,17 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 b0 = self.expr(node.args[1])
+                if not (isinstance(node.args[0], ast.Name) and isinstance(node.args[1], ast.Name)):
+                    # An expression (f2[0]) can't be indexed in Fortran.
+                    _kc = self._promoted_kind(node.args[:2]) or "real"
+                    def _castc(n, txt):
+                        kn = self._expr_kind(n)
+                        if _kc == "complex" and kn != "complex":
+                            return f"cmplx({txt}, 0.0_dp, kind=dp)"
+                        if _kc == "real" and kn in {"int", "logical"}:
+                            return f"real({txt}, kind=dp)"
+                        return txt
+                    return f"np_cross3({_castc(node.args[0], a0)}, {_castc(node.args[1], b0)})"
                 return (
                     f"[({a0}(2) * {b0}(3)) - ({a0}(3) * {b0}(2)), "
                     f"({a0}(3) * {b0}(1)) - ({a0}(1) * {b0}(3)), "
@@ -81075,6 +81397,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -81605,6 +81928,7 @@ def transpile_file(
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -82410,6 +82734,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)

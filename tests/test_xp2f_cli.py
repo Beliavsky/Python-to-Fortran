@@ -26102,3 +26102,57 @@ def test_xp2f_numpy_set_search_and_indexing(tmp_path: Path) -> None:
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_linalg_coverage(tmp_path: Path) -> None:
+    # numpy_conformance phase 5 (linear algebra): indexed results of the
+    # tuple-returning decompositions (eigh/svd/qr/slogdet/lstsq), svd with
+    # compute_uv=False and svdvals, the 'nuc', -1 and -2 matrix norms,
+    # cond with an order (it was ignored), inner of matrices, kron of real
+    # matrices, cross of matrix rows, einsum's common patterns, norm with a
+    # positional axis or ord=None, and numpy 2's linalg names. Results that
+    # are unique only up to sign/order are checked through invariants.
+    exprs = [
+        "np.linalg.eigh(s2)[0]",
+        "float(np.linalg.norm(s2 @ np.linalg.eigh(s2)[1] - np.linalg.eigh(s2)[1] * np.linalg.eigh(s2)[0]) < 1e-12)",
+        "np.linalg.svd(f2, compute_uv=False)", "np.linalg.svd(g3)[1]", "np.linalg.svdvals(g3)",
+        "np.abs(np.linalg.qr(g3)[1])", "float(np.linalg.norm(np.linalg.qr(g3)[0] @ np.linalg.qr(g3)[1] - g3) < 1e-12)",
+        "np.linalg.slogdet(g3)[1]", "np.linalg.lstsq(a42, y4, rcond=None)[1]",
+        "np.linalg.norm(g3, 'nuc')", "np.linalg.norm(g3, -2)", "np.linalg.norm(g3, -1)",
+        "np.linalg.cond(g3, 1)", "np.linalg.cond(g3, np.inf)", "np.linalg.cond(g3, 'fro')", "np.linalg.cond(g3, -2)",
+        "np.inner(g3, s2)", "np.inner(v3, g3)", "np.kron(s2[:2, :2], np.eye(2))", "np.cross(f2[0], f2[1])",
+        "np.einsum('ij,jk->ik', g3, s2)", "np.einsum('ii', g3)", "np.einsum('ii->i', g3)", "np.einsum('ij->ji', f2)",
+        "np.einsum('i,i', v3, q1)", "np.einsum('ij,j->i', g3, v3)", "np.einsum('i,j', v3, q1)",
+        "np.einsum('ij->j', f2)", "np.einsum('ij,kj->ik', f2, f2)",
+        "np.linalg.norm(f2, None, 0)", "np.linalg.norm(f2, axis=None)",
+        "np.linalg.vector_norm(f2, ord=1)", "np.linalg.vector_norm(f2, axis=0)", "np.linalg.matrix_norm(g3, ord=1)",
+        "np.linalg.vecdot(v3, q1)", "np.linalg.matrix_transpose(f2)", "np.linalg.diagonal(g3)", "np.linalg.trace(g3)",
+        "np.linalg.outer(v3, q1)", "np.linalg.cross(v3, q1)",
+    ]
+    lines = [
+        "import numpy as np",
+        "s2 = np.array([[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]])",
+        "g3 = np.array([[2.0, -1.0, 0.5], [1.0, 3.0, 1.0], [0.0, 1.0, 1.5]])",
+        "f2 = np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
+        "v3 = np.array([1.0, -2.0, 0.5])",
+        "q1 = np.array([1.5, 2.0, 3.0])",
+        "a42 = np.array([[1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0]])",
+        "y4 = np.array([1.1, 1.9, 3.2, 3.9])",
+        "def nuc_in_function(a):",
+        "    return np.linalg.norm(a, 'nuc') + np.linalg.svd(a)[1][0]",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(np.round(r{k}, 10))"]
+    lines.append("print(np.round(nuc_in_function(g3), 10))")
+    src = tmp_path / "xnp_linalg.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # numpy prints arrays to 8 significant digits: compare the numbers.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    py = subprocess.run([sys.executable, str(src)], capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xnp_linalg_p.exe"))], capture_output=True, text=True, check=True).stdout
+    a, b = nums(py), nums(ft)
+    assert len(a) == len(b), (py, ft)
+    assert all(abs(x - y) <= 1e-7 * max(1.0, abs(x)) for x, y in zip(a, b)), (py, ft)
