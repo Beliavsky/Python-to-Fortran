@@ -61,6 +61,10 @@ FIXTURES = {
     "p1": "np.array([0.25, 0.5, -0.75])",
     "q1": "np.array([1.5, 2.0, 3.0])",
     "e1": "np.array([1.0, np.nan, np.inf, -np.inf, -0.0])",
+    "r1": "np.array([-2.0, 0.5, 0.5, 3.0, 7.5])",
+    "ri1": "np.array([1, 3, 3, 8])",
+    "ix": "np.array([0, 2, 5])",
+    "nb1": "np.array([0, 2, 1, 2, 5, 0])",
 }
 
 PLACEHOLDERS = {
@@ -214,6 +218,32 @@ SPECS.update({
         "STMT w = {N2}.copy(); w += 1 => w", "STMT w = {N1}.copy(); w *= 2 => w", "STMT w = {N1}.copy(); w /= 4 => w",
         "STMT w = f1.copy(); w[w < 0] = 0 => w", "STMT w = {N2}.copy(); w[:, 1] = -1 => w",
         "STMT w = np.zeros(3); w[1] = {S} => w", "STMT w = np.zeros((2, 2)); w[0] = v3[:2] => w",
+    ],
+})
+
+# Phase 4: set/search functions and indexing.
+SPECS.update({
+    "setsearch": [
+        "np.searchsorted(r1, {N1})", "np.searchsorted(r1, {S})", "np.searchsorted(r1, {N1}, side='right')",
+        "np.searchsorted(ri1, {S}, side='right')", "np.searchsorted(ri1, i1)",
+        "np.isin({A1}, ri1)", "np.isin({N2}, [1, 3, -0.5])", "np.isin({N1}, r1, invert=True)",
+        "np.intersect1d({N1}, ri1)", "np.union1d({N1}, r1)", "np.setdiff1d({N1}, ri1)", "np.setxor1d(i1, ri1)",
+        "np.bincount(nb1)", "np.bincount(nb1, minlength=8)", "np.bincount(nb1, weights=f1)",
+        "np.digitize({N1}, r1)", "np.digitize({N1}, r1, right=True)",
+        "np.unique({A1}, return_counts=True)[1]", "np.unique({A1}, return_index=True)[1]",
+        "np.unique({A1}, return_inverse=True)[1]", "np.unique({A1}, return_counts=True)[0]",
+        "np.count_nonzero({A2}, axis=0)", "np.count_nonzero({A2}, axis=1)",
+    ],
+    "indexing": [
+        "{A1}[ix]", "{A2}[[1, 0]]", "{A2}[[1, 0], :]", "{A2}[:, [2, 0]]", "{A2}[[0, 1], [2, 0]]",
+        "{N1}[{N1} > 0]", "{N2}[{N2} > 0]", "{A1}[b1]", "np.take({A1}, ix)", "np.take({A2}, [1, 0], axis=1)",
+        "{A1}[-1]", "{A1}[::-2]", "{A2}[-1, ::-1]", "{N1}[np.argsort({N1})]", "{N1}[ix[::-1]]",
+        "STMT w = {N1}.copy(); w[w > 0] = 0 => w", "STMT w = {N2}.copy(); w[w < 0] += 10 => w",
+        "STMT w = {N1}.copy(); w[ix] = -7 => w", "STMT w = {N1}.copy(); w[[0, 1]] = w[[1, 0]] => w",
+        "STMT w = {N2}.copy(); w[:, [0, 2]] = 0 => w", "STMT w = {N1}.copy(); np.put(w, ix, 9) => w",
+        "STMT w = {N1}.copy(); w[ix] += 1 => w", "STMT w = {N2}.copy(); w[w > 1] = w[w > 1] * 2 => w",
+        "STMT w = {N1}.copy(); w[np.argsort(w)[:2]] = 0 => w", "STMT w = {N1}.copy(); w[np.where(w < 0)] = 1 => w",
+        "STMT w = {N2}.copy(); w[1] = w[0][::-1] => w", "STMT w = {N1}.copy(); w[b1] = {S} => w",
     ],
 })
 

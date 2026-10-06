@@ -377,6 +377,17 @@ public :: argsort
 public :: argsort_idx
 public :: sorted_vec
 public :: diag_k
+public :: np_searchsorted
+public :: np_union1d
+public :: np_intersect1d
+public :: np_setdiff1d
+public :: np_setxor1d
+public :: np_isin1
+public :: np_unique_counts
+public :: np_unique_index
+public :: np_unique_inverse
+public :: np_gather2d
+public :: np_bincount_weights, np_digitize
 public :: c_lt, c_le, c_gt, c_ge, c_maximum, c_minimum, c_round
 public :: c_amin, c_amax, c_argmin, c_argmax
 public :: cumsum_complex, cumprod_complex, cumsum_complex_2d, cumprod_complex_2d
@@ -561,6 +572,50 @@ interface c_argmax
    module procedure c_argmax_r1, c_argmax_r2_dim
 end interface c_argmax
 
+interface np_searchsorted
+   module procedure np_searchsorted_real, np_searchsorted_real_vec, np_searchsorted_int, np_searchsorted_int_vec
+end interface np_searchsorted
+
+interface np_union1d
+   module procedure np_union1d_real, np_union1d_int, np_union1d_complex
+end interface np_union1d
+
+interface np_intersect1d
+   module procedure np_intersect1d_real, np_intersect1d_int, np_intersect1d_complex
+end interface np_intersect1d
+
+interface np_setdiff1d
+   module procedure np_setdiff1d_real, np_setdiff1d_int, np_setdiff1d_complex
+end interface np_setdiff1d
+
+interface np_setxor1d
+   module procedure np_setxor1d_real, np_setxor1d_int, np_setxor1d_complex
+end interface np_setxor1d
+
+interface np_isin1
+   module procedure np_isin1_real, np_isin1_int, np_isin1_complex
+end interface np_isin1
+
+interface np_unique_counts
+   module procedure np_unique_counts_real, np_unique_counts_int, np_unique_counts_complex
+end interface np_unique_counts
+
+interface np_unique_index
+   module procedure np_unique_index_real, np_unique_index_int, np_unique_index_complex
+end interface np_unique_index
+
+interface np_unique_inverse
+   module procedure np_unique_inverse_real, np_unique_inverse_int, np_unique_inverse_complex
+end interface np_unique_inverse
+
+interface np_digitize
+   module procedure np_digitize_scalar, np_digitize_vec
+end interface np_digitize
+
+interface np_gather2d
+   module procedure np_gather2d_real, np_gather2d_int, np_gather2d_log, np_gather2d_complex
+end interface np_gather2d
+
 interface diag_k
    module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
    module procedure diag_k_vec_complex, diag_k_mat_complex
@@ -714,6 +769,7 @@ interface print_array_3d
    module procedure print_array_3d_real
    module procedure print_array_3d_label_real
    module procedure print_array_3d_int
+   module procedure print_array_3d_logical
    module procedure print_array_3d_label_int
 end interface print_array_3d
 
@@ -1318,6 +1374,55 @@ contains
             if (i < size(a,1)) write(*, "(a)") ""
          end do
       end subroutine print_array_3d_int
+
+      subroutine print_array_3d_logical(a)
+         logical, intent(in) :: a(:,:,:)
+         integer :: i, j, k, pad, w
+         character(len=64) :: buf
+
+         if (size(a,1) <= 0 .or. size(a,2) <= 0 .or. size(a,3) <= 0) then
+            write(*, "(a)") "[]"
+            return
+         end if
+
+         w = 1
+         do k = 1, size(a,3)
+            do j = 1, size(a,2)
+               do i = 1, size(a,1)
+                  buf = merge("True ", "False", a(i, j, k))
+                  w = max(w, len_trim(adjustl(buf)))
+               end do
+            end do
+         end do
+
+         do i = 1, size(a,1)
+            do j = 1, size(a,2)
+               if (i == 1 .and. j == 1) then
+                  write(*, "(a)", advance="no") "[[["
+               else if (j == 1) then
+                  write(*, "(a)", advance="no") " [["
+               else
+                  write(*, "(a)", advance="no") "  ["
+               end if
+               do k = 1, size(a,3)
+                  if (k > 1) write(*, "(a)", advance="no") " "
+                  buf = merge("True ", "False", a(i, j, k))
+                  buf = adjustl(buf)
+                  pad = w - len_trim(buf)
+                  if (pad > 0) write(*, "(a)", advance="no") repeat(" ", pad)
+                  write(*, "(a)", advance="no") trim(buf)
+               end do
+               if (i == size(a,1) .and. j == size(a,2)) then
+                  write(*, "(a)") "]]]"
+               else if (j == size(a,2)) then
+                  write(*, "(a)") "]]"
+               else
+                  write(*, "(a)") "]"
+               end if
+            end do
+            if (i < size(a,1)) write(*, "(a)") ""
+         end do
+      end subroutine print_array_3d_logical
 
       subroutine print_array_3d_label_real(label, a)
          character(len=*), intent(in) :: label
@@ -4820,6 +4925,426 @@ contains
             end if
          end do
       end function diag_k_mat_complex
+
+      pure function np_searchsorted_real(a, v, right) result(idx)
+         ! np.searchsorted(a, v, side): 0-based insertion index of v in the
+         ! sorted vector a (before equal values, or after them if right);
+         ! NaN sorts after every number, as in numpy.
+         real(kind=dp), intent(in) :: a(:), v
+         logical, intent(in) :: right
+         integer :: idx, lo, hi, mid
+         logical :: goes_before
+         lo = 0
+         hi = size(a)
+         do while (lo < hi)
+            mid = (lo + hi) / 2
+            if (ieee_is_nan(a(mid + 1))) then
+               goes_before = right .and. ieee_is_nan(v)
+            else if (ieee_is_nan(v)) then
+               goes_before = .true.
+            else
+               goes_before = a(mid + 1) < v .or. (right .and. a(mid + 1) == v)
+            end if
+            if (goes_before) then
+               lo = mid + 1
+            else
+               hi = mid
+            end if
+         end do
+         idx = lo
+      end function np_searchsorted_real
+
+      pure function np_searchsorted_real_vec(a, v, right) result(idx)
+         real(kind=dp), intent(in) :: a(:), v(:)
+         logical, intent(in) :: right
+         integer, allocatable :: idx(:)
+         integer :: i
+         allocate(idx(size(v)))
+         do i = 1, size(v)
+            idx(i) = np_searchsorted_real(a, v(i), right)
+         end do
+      end function np_searchsorted_real_vec
+
+      pure function np_isin1_real(a, b) result(mask)
+         ! a(i) in b for each element of the vector a.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         logical, allocatable :: mask(:)
+         integer :: i
+         allocate(mask(size(a)))
+         do i = 1, size(a)
+            mask(i) = any(b == a(i))
+         end do
+      end function np_isin1_real
+
+      pure function np_union1d_real(a, b) result(c)
+         ! np.union1d of vectors: sorted, without duplicates.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), allocatable :: c(:)
+         c = unique_real([a, b])
+      end function np_union1d_real
+
+      pure function np_intersect1d_real(a, b) result(c)
+         ! np.intersect1d of vectors: sorted, without duplicates.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), allocatable :: c(:)
+         c = unique_real(pack(a, np_isin1_real(a, b)))
+      end function np_intersect1d_real
+
+      pure function np_setdiff1d_real(a, b) result(c)
+         ! np.setdiff1d of vectors: sorted, without duplicates.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), allocatable :: c(:)
+         c = unique_real(pack(a, .not. np_isin1_real(a, b)))
+      end function np_setdiff1d_real
+
+      pure function np_setxor1d_real(a, b) result(c)
+         ! np.setxor1d of vectors: sorted, without duplicates.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), allocatable :: c(:)
+         c = unique_real([a, b])
+         c = pack(c, .not. (np_isin1_real(c, a) .and. np_isin1_real(c, b)))
+      end function np_setxor1d_real
+
+      elemental logical function eq_nan_real(a, b)
+         ! a == b, with every NaN equal to every NaN (numpy's unique).
+         real(kind=dp), intent(in) :: a, b
+         if (ieee_is_nan(a) .or. ieee_is_nan(b)) then
+            eq_nan_real = ieee_is_nan(a) .and. ieee_is_nan(b)
+         else
+            eq_nan_real = a == b
+         end if
+      end function eq_nan_real
+
+      pure function np_unique_counts_real(x) result(r)
+         ! np.unique(x, return_counts=True)[1] of a vector (0-based indices).
+         real(kind=dp), intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         real(kind=dp), allocatable :: u(:)
+         integer :: i
+         u = unique_real(x)
+         allocate(r(size(u)))
+         do i = 1, size(u)
+            r(i) = count(eq_nan_real(x, u(i)))
+         end do
+      end function np_unique_counts_real
+
+      pure function np_unique_index_real(x) result(r)
+         ! np.unique(x, return_index=True)[1] of a vector (0-based indices).
+         real(kind=dp), intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         real(kind=dp), allocatable :: u(:)
+         integer :: i
+         u = unique_real(x)
+         allocate(r(size(u)))
+         do i = 1, size(u)
+            r(i) = findloc(eq_nan_real(x, u(i)), .true., dim=1) - 1
+         end do
+      end function np_unique_index_real
+
+      pure function np_unique_inverse_real(x) result(r)
+         ! np.unique(x, return_inverse=True)[1] of a vector (0-based indices).
+         real(kind=dp), intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         real(kind=dp), allocatable :: u(:)
+         integer :: i
+         u = unique_real(x)
+         allocate(r(size(x)))
+         do i = 1, size(x)
+            r(i) = findloc(eq_nan_real(u, x(i)), .true., dim=1) - 1
+         end do
+      end function np_unique_inverse_real
+
+      pure function np_searchsorted_int(a, v, right) result(idx)
+         ! np.searchsorted(a, v, side): 0-based insertion index of v in the
+         ! sorted vector a (before equal values, or after them if right).
+         integer, intent(in) :: a(:), v
+         logical, intent(in) :: right
+         integer :: idx, lo, hi, mid
+         lo = 0
+         hi = size(a)
+         do while (lo < hi)
+            mid = (lo + hi) / 2
+            if (a(mid + 1) < v .or. (right .and. a(mid + 1) == v)) then
+               lo = mid + 1
+            else
+               hi = mid
+            end if
+         end do
+         idx = lo
+      end function np_searchsorted_int
+
+      pure function np_searchsorted_int_vec(a, v, right) result(idx)
+         integer, intent(in) :: a(:), v(:)
+         logical, intent(in) :: right
+         integer, allocatable :: idx(:)
+         integer :: i
+         allocate(idx(size(v)))
+         do i = 1, size(v)
+            idx(i) = np_searchsorted_int(a, v(i), right)
+         end do
+      end function np_searchsorted_int_vec
+
+      pure function np_isin1_int(a, b) result(mask)
+         ! a(i) in b for each element of the vector a.
+         integer, intent(in) :: a(:), b(:)
+         logical, allocatable :: mask(:)
+         integer :: i
+         allocate(mask(size(a)))
+         do i = 1, size(a)
+            mask(i) = any(b == a(i))
+         end do
+      end function np_isin1_int
+
+      pure function np_union1d_int(a, b) result(c)
+         ! np.union1d of vectors: sorted, without duplicates.
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: c(:)
+         c = unique_int([a, b])
+      end function np_union1d_int
+
+      pure function np_intersect1d_int(a, b) result(c)
+         ! np.intersect1d of vectors: sorted, without duplicates.
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: c(:)
+         c = unique_int(pack(a, np_isin1_int(a, b)))
+      end function np_intersect1d_int
+
+      pure function np_setdiff1d_int(a, b) result(c)
+         ! np.setdiff1d of vectors: sorted, without duplicates.
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: c(:)
+         c = unique_int(pack(a, .not. np_isin1_int(a, b)))
+      end function np_setdiff1d_int
+
+      pure function np_setxor1d_int(a, b) result(c)
+         ! np.setxor1d of vectors: sorted, without duplicates.
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: c(:)
+         c = unique_int([a, b])
+         c = pack(c, .not. (np_isin1_int(c, a) .and. np_isin1_int(c, b)))
+      end function np_setxor1d_int
+
+      pure function np_unique_counts_int(x) result(r)
+         ! np.unique(x, return_counts=True)[1] of a vector (0-based indices).
+         integer, intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         integer, allocatable :: u(:)
+         integer :: i
+         u = unique_int(x)
+         allocate(r(size(u)))
+         do i = 1, size(u)
+            r(i) = count(x == u(i))
+         end do
+      end function np_unique_counts_int
+
+      pure function np_unique_index_int(x) result(r)
+         ! np.unique(x, return_index=True)[1] of a vector (0-based indices).
+         integer, intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         integer, allocatable :: u(:)
+         integer :: i
+         u = unique_int(x)
+         allocate(r(size(u)))
+         do i = 1, size(u)
+            r(i) = findloc(x, u(i), dim=1) - 1
+         end do
+      end function np_unique_index_int
+
+      pure function np_unique_inverse_int(x) result(r)
+         ! np.unique(x, return_inverse=True)[1] of a vector (0-based indices).
+         integer, intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         integer, allocatable :: u(:)
+         integer :: i
+         u = unique_int(x)
+         allocate(r(size(x)))
+         do i = 1, size(x)
+            r(i) = findloc(u, x(i), dim=1) - 1
+         end do
+      end function np_unique_inverse_int
+
+      pure function np_gather2d_real(m, i, j) result(r)
+         ! m[i, j] with integer index vectors i, j (0-based, negative from
+         ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
+         real(kind=dp), intent(in) :: m(:,:)
+         integer, intent(in) :: i(:), j(:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: k, ii, jj
+         allocate(r(size(i)))
+         do k = 1, size(i)
+            ii = i(k)
+            jj = j(k)
+            if (ii < 0) ii = ii + size(m, 1)
+            if (jj < 0) jj = jj + size(m, 2)
+            r(k) = m(ii + 1, jj + 1)
+         end do
+      end function np_gather2d_real
+
+      pure function np_gather2d_int(m, i, j) result(r)
+         ! m[i, j] with integer index vectors i, j (0-based, negative from
+         ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
+         integer, intent(in) :: m(:,:)
+         integer, intent(in) :: i(:), j(:)
+         integer, allocatable :: r(:)
+         integer :: k, ii, jj
+         allocate(r(size(i)))
+         do k = 1, size(i)
+            ii = i(k)
+            jj = j(k)
+            if (ii < 0) ii = ii + size(m, 1)
+            if (jj < 0) jj = jj + size(m, 2)
+            r(k) = m(ii + 1, jj + 1)
+         end do
+      end function np_gather2d_int
+
+      pure function np_gather2d_log(m, i, j) result(r)
+         ! m[i, j] with integer index vectors i, j (0-based, negative from
+         ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
+         logical, intent(in) :: m(:,:)
+         integer, intent(in) :: i(:), j(:)
+         logical, allocatable :: r(:)
+         integer :: k, ii, jj
+         allocate(r(size(i)))
+         do k = 1, size(i)
+            ii = i(k)
+            jj = j(k)
+            if (ii < 0) ii = ii + size(m, 1)
+            if (jj < 0) jj = jj + size(m, 2)
+            r(k) = m(ii + 1, jj + 1)
+         end do
+      end function np_gather2d_log
+
+      pure function np_gather2d_complex(m, i, j) result(r)
+         ! m[i, j] with integer index vectors i, j (0-based, negative from
+         ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
+         complex(kind=dp), intent(in) :: m(:,:)
+         integer, intent(in) :: i(:), j(:)
+         complex(kind=dp), allocatable :: r(:)
+         integer :: k, ii, jj
+         allocate(r(size(i)))
+         do k = 1, size(i)
+            ii = i(k)
+            jj = j(k)
+            if (ii < 0) ii = ii + size(m, 1)
+            if (jj < 0) jj = jj + size(m, 2)
+            r(k) = m(ii + 1, jj + 1)
+         end do
+      end function np_gather2d_complex
+
+      pure function np_bincount_weights(x, w, minlength) result(c)
+         ! np.bincount(x, weights=w, minlength=...): c(v+1) = sum of w where x == v.
+         integer, intent(in) :: x(:)
+         real(kind=dp), intent(in) :: w(:)
+         integer, intent(in) :: minlength
+         real(kind=dp), allocatable :: c(:)
+         integer :: i, n
+         n = minlength
+         if (size(x) > 0) n = max(n, maxval(x) + 1)
+         allocate(c(n))
+         c = 0.0_dp
+         do i = 1, size(x)
+            c(x(i) + 1) = c(x(i) + 1) + w(i)
+         end do
+      end function np_bincount_weights
+
+      pure integer function np_digitize_scalar(x, bins, right) result(r)
+         ! np.digitize(x, bins, right) for increasing bins: the i with
+         ! bins[i-1] <= x < bins[i] (bins[i-1] < x <= bins[i] if right).
+         real(kind=dp), intent(in) :: x
+         real(kind=dp), intent(in) :: bins(:)
+         logical, intent(in) :: right
+         if (ieee_is_nan(x)) then
+            ! NaN sorts after every bin edge.
+            r = size(bins)
+         else if (right) then
+            r = count(bins < x)
+         else
+            r = count(bins <= x)
+         end if
+      end function np_digitize_scalar
+
+      pure function np_digitize_vec(x, bins, right) result(r)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), intent(in) :: bins(:)
+         logical, intent(in) :: right
+         integer, allocatable :: r(:)
+         integer :: i
+         allocate(r(size(x)))
+         do i = 1, size(x)
+            r(i) = np_digitize_scalar(x(i), bins, right)
+         end do
+      end function np_digitize_vec
+
+      pure function np_isin1_complex(a, b) result(mask)
+         complex(kind=dp), intent(in) :: a(:), b(:)
+         logical, allocatable :: mask(:)
+         integer :: i
+         allocate(mask(size(a)))
+         do i = 1, size(a)
+            mask(i) = any(b == a(i))
+         end do
+      end function np_isin1_complex
+
+      pure function np_union1d_complex(a, b) result(c)
+         complex(kind=dp), intent(in) :: a(:), b(:)
+         complex(kind=dp), allocatable :: c(:)
+         c = unique_complex([a, b])
+      end function np_union1d_complex
+
+      pure function np_intersect1d_complex(a, b) result(c)
+         complex(kind=dp), intent(in) :: a(:), b(:)
+         complex(kind=dp), allocatable :: c(:)
+         c = unique_complex(pack(a, np_isin1_complex(a, b)))
+      end function np_intersect1d_complex
+
+      pure function np_setdiff1d_complex(a, b) result(c)
+         complex(kind=dp), intent(in) :: a(:), b(:)
+         complex(kind=dp), allocatable :: c(:)
+         c = unique_complex(pack(a, .not. np_isin1_complex(a, b)))
+      end function np_setdiff1d_complex
+
+      pure function np_setxor1d_complex(a, b) result(c)
+         complex(kind=dp), intent(in) :: a(:), b(:)
+         complex(kind=dp), allocatable :: c(:)
+         c = unique_complex([a, b])
+         c = pack(c, .not. (np_isin1_complex(c, a) .and. np_isin1_complex(c, b)))
+      end function np_setxor1d_complex
+
+      pure function np_unique_counts_complex(x) result(r)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         complex(kind=dp), allocatable :: u(:)
+         integer :: i
+         u = unique_complex(x)
+         allocate(r(size(u)))
+         do i = 1, size(u)
+            r(i) = count(x == u(i))
+         end do
+      end function np_unique_counts_complex
+
+      pure function np_unique_index_complex(x) result(r)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         complex(kind=dp), allocatable :: u(:)
+         integer :: i
+         u = unique_complex(x)
+         allocate(r(size(u)))
+         do i = 1, size(u)
+            r(i) = findloc(x == u(i), .true., dim=1) - 1
+         end do
+      end function np_unique_index_complex
+
+      pure function np_unique_inverse_complex(x) result(r)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, allocatable :: r(:)
+         complex(kind=dp), allocatable :: u(:)
+         integer :: i
+         u = unique_complex(x)
+         allocate(r(size(x)))
+         do i = 1, size(x)
+            r(i) = findloc(u == x(i), .true., dim=1) - 1
+         end do
+      end function np_unique_inverse_complex
 
       pure function diag_k_vec_real(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.

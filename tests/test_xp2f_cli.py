@@ -23147,7 +23147,7 @@ def test_xp2f_compound_masked_division_skips_unselected_zeros(tmp_path: Path) ->
 
 @pytest.mark.parametrize("rhs, message", [
     ("b + 1", "requires a scalar or vector RHS"),
-    ("b[rows] + 1", "RHS requires full-shape rank-1 or rank-2 masks"),
+    ("b[rows] + 1", "RHS requires full-shape masks"),
 ])
 def test_xp2f_rejects_compound_masked_unsupported_shapes(tmp_path: Path, rhs: str, message: str) -> None:
     src = tmp_path / "xmasked_shapes.py"
@@ -26040,6 +26040,64 @@ def test_xp2f_isclose_of_empty_array_is_empty(tmp_path: Path) -> None:
         "print(np.isclose(np.array([1.0, 2.0]), 1))\n",
         encoding="utf-8",
     )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_set_search_and_indexing(tmp_path: Path) -> None:
+    # numpy_conformance phase 4: set/search functions and indexing. isin
+    # invert=, bincount weights=, digitize right= and the arrays of
+    # np.unique(..., return_index/inverse/counts=True) were ignored (silent);
+    # a matrix's boolean-mask read came out in column-major order; NaN sorts
+    # last and NaNs are one unique value; complex set operations dropped the
+    # imaginary parts; a logical array argument used as a mask was passed
+    # as integers; np.take ignored axis=.
+    exprs = [
+        "np.searchsorted(r1, f1)", "np.searchsorted(r1, i1, side='right')", "np.searchsorted(ri1, 3)",
+        "np.searchsorted(r1, n1)", "np.isin(f1, r1, invert=True)", "np.isin(i2, [1, 3, -0.5])",
+        "np.isin(c1, [3 - 1j, 2])", "np.intersect1d(f1, ri1)", "np.union1d(i1, r1)", "np.setdiff1d(f1, ri1)",
+        "np.setxor1d(i1, ri1)", "np.union1d(c1, f1[:2])", "np.bincount(nb1, weights=f1)",
+        "np.bincount(nb1, minlength=8)", "np.digitize(f1, dg)", "np.digitize(f1, dg, right=True)",
+        "np.digitize(n1, dg)", "np.unique(f1, return_counts=True)[1]", "np.unique(i1, return_index=True)[1]",
+        "np.unique(n1, return_inverse=True)[1]", "np.unique(b1, return_counts=True)[0]",
+        "np.unique(c1, return_counts=True)[1]", "i2[i2 > 0]", "f2[[0, 1], [2, 0]]", "np.take(f2, [1, 0], axis=1)",
+        "np.take(i2, [5, 0])", "np.isin(i3, [1, 3, -0.5])",
+    ]
+    lines = [
+        "import numpy as np",
+        "i1 = np.array([3, -1, 4, 1, -5, 9])",
+        "f1 = np.array([0.5, -1.25, 2.0, 3.75, -0.5, 1.5])",
+        "b1 = np.array([True, False, True, True, False, False])",
+        "i2 = np.array([[3, -1, 4], [1, -5, 9]])",
+        "f2 = np.array([[0.5, -1.25, 2.0], [3.75, -0.5, 1.5]])",
+        "r1 = np.array([-2.0, 0.5, 0.5, 3.0, 7.5])",
+        "ri1 = np.array([1, 3, 3, 8])",
+        "dg = np.array([-2.0, 0.5, 3.0, 7.5])",
+        "nb1 = np.array([0, 2, 1, 2, 5, 0])",
+        "n1 = np.array([1.0, np.nan, -2.0, np.inf, -np.inf, 0.5, np.nan])",
+        "c1 = np.array([1 + 2j, -0.5 + 0j, 3 - 1j, 1 + 2j])",
+        "i3 = np.arange(24).reshape(2, 3, 4) - 7",
+        "def masked_sum(x, m):",
+        "    return np.sum(x[m])",
+        "def zero_cols(a):",
+        "    w = a.copy()",
+        "    w[:, [0, 2]] = 0",
+        "    return w",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(r{k})"]
+    lines += [
+        "print(masked_sum(i1, b1))",
+        "print(zero_cols(i3))",
+        "w = i3.copy()",
+        "w[w < 0] += 10",
+        "print(w)",
+        "print(i3[[1, 0], :])",
+    ]
+    src = tmp_path / "xnp_setsearch.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff"],
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
