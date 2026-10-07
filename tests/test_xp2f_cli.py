@@ -26535,3 +26535,41 @@ def test_xp2f_numpy_gradient_trapezoid_interp_options(tmp_path: Path) -> None:
     # numpy prints 8 significant digits.
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)
+
+
+def test_xp2f_interp_period_leggauss_histogram2d_forms(tmp_path: Path) -> None:
+    # np.interp(..., period=p); leggauss(n)[k] and histogram(...)[k] /
+    # histogram2d(...)[k] as expressions; histogram2d with a number of bins,
+    # range=, weights= and density= (float counts, as numpy's); and
+    # np.histogram with a number of bins in tuple form (float edges).
+    src = tmp_path / "xhist2d_forms.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def quad(n):\n"
+        "    x, w = np.polynomial.legendre.leggauss(n)\n"
+        "    return np.sum(w * np.cos(x))\n"
+        "ang = np.array([350.0, 10.0, 30.0, 100.0, 200.0])\n"
+        "val = np.array([1.0, 2.0, 4.0, 3.0, 0.0])\n"
+        "print(np.interp(np.array([-5.0, 0.0, 355.0, 20.0, 400.0, 150.0]), ang, val, period=360.0))\n"
+        "print(np.interp(5.0, ang, val, period=360))\n"
+        "print(np.polynomial.legendre.leggauss(5)[0], quad(6))\n"
+        "x = np.array([0.1, 0.4, 0.4, 0.9, 1.0, 0.25, 0.75, 0.5])\n"
+        "y = np.array([1.0, 2.0, 2.5, 3.0, 1.5, 2.0, 2.9, 1.0])\n"
+        "H, xe, ye = np.histogram2d(x, y, bins=3)\n"
+        "print(H, xe, ye)\n"
+        "print(np.histogram2d(x, y, bins=[2, 4])[0])\n"
+        "H2, xe2, ye2 = np.histogram2d(x, y, bins=2, range=[[0.0, 1.0], [0.0, 4.0]], density=True)\n"
+        "print(H2, np.histogram2d(x, y, bins=(2, 3), weights=x * 10)[0])\n"
+        "counts, edges = np.histogram(x, bins=4)\n"
+        "print(counts, edges, np.histogram(x, bins=4)[1])\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xhist2d_forms_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints 8 significant digits.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)

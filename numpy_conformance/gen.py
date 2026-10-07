@@ -436,6 +436,11 @@ SPECS["calculus"] = [
     "np.trapezoid({N1})", "np.trapezoid({N1}, xc)", "np.trapezoid({N1}, dx=0.5)",
     "np.interp(np.array([0.25, 2.0, 4.9]), xc, {N1})", "np.interp(np.array([-1.0, 6.0]), xc, {N1}, left=-5.0, right=5.0)",
     "np.interp({S}, xc, {N1})", "np.diff({N1}) / np.diff(xc)",
+    "np.interp(np.array([-0.5, 2.0, 5.5, 7.0]), xc, {N1}, period=4.0)", "np.interp({S}, xc, {N1}, period=4.0)",
+    "np.polynomial.legendre.leggauss(4)[0]", "np.polynomial.legendre.leggauss(5)[1]",
+    "np.histogram2d(f1, xc, bins=3)[0]", "np.histogram2d(i1, f1, bins=[2, 3], density=True)[0]",
+    "np.histogram2d(f1, xc, bins=2, range=[[-2.0, 4.0], [0.0, 5.0]])[1]", "np.histogram2d(f1, xc, bins=2, weights=xc)[0]",
+    "np.histogram({N1}, bins=3)[1]", "np.histogram({N1}, bins=3, range=(-2, 10))[0]",
 ]
 
 SPECS["dtypes"] = [

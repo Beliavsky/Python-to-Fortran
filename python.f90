@@ -263,6 +263,7 @@ public :: reduceat_logical_or !@pyapi kind=function ret=logical(:) args=x:logica
 public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 public :: np_gradient_1d, np_gradient_2d, np_trapezoid_1d, interp_0d
+public :: interp_periodic_1d, interp_periodic_0d, np_hist_edges, histogram2d_np
 public :: unwrap_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="unwrap 1D phase vector using numpy-like default discontinuity pi"
 public :: bitwise_count_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="population count for each integer element"
 public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="modified Bessel function I0 approximation (elemental)"
@@ -7401,6 +7402,101 @@ contains
          end do
       end subroutine histogram_int_edges
 
+      pure function np_hist_edges(x, n, lo_in, hi_in) result(edges)
+         ! n equal bins over [min(x), max(x)] (or [lo_in, hi_in]), widened by
+         ! 0.5 each side when the ends are equal, with np.linspace's
+         ! arithmetic (start + i * step, the last edge exactly the end).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: n
+         real(kind=dp), intent(in), optional :: lo_in, hi_in
+         real(kind=dp), allocatable :: edges(:)
+         real(kind=dp) :: lo, hi, step
+         integer :: i
+         if (n < 1) error stop "np.histogram: bins must be positive"
+         lo = 0.0_dp
+         hi = 1.0_dp
+         if (present(lo_in)) then
+            lo = lo_in
+            hi = hi_in
+            if (lo > hi) error stop "np.histogram: max must be larger than min in range parameter"
+         else if (size(x) > 0) then
+            lo = minval(x)
+            hi = maxval(x)
+         end if
+         if (lo == hi) then
+            lo = lo - 0.5_dp
+            hi = hi + 0.5_dp
+         end if
+         allocate(edges(n + 1))
+         step = (hi - lo) / real(n, kind=dp)
+         do i = 1, n
+            edges(i) = real(i - 1, kind=dp) * step + lo
+         end do
+         edges(n + 1) = hi
+      end function np_hist_edges
+
+      pure subroutine histogram2d_np(x, y, xbins, ybins, h, weights, density)
+         ! numpy.histogram2d(x, y, bins=[xbins, ybins], weights=, density=):
+         ! float counts (or sums of weights); per axis the last bin includes
+         ! its right edge; density divides by the bin areas and the total.
+         real(kind=dp), intent(in) :: x(:), y(:), xbins(:), ybins(:)
+         real(kind=dp), allocatable, intent(out) :: h(:,:)
+         real(kind=dp), intent(in), optional :: weights(:)
+         logical, intent(in), optional :: density
+         integer :: i, ix, iy, nxb, nyb
+         real(kind=dp) :: s
+         nxb = size(xbins) - 1
+         nyb = size(ybins) - 1
+         if (nxb < 1 .or. nyb < 1) error stop "np.histogram2d: bins must have at least 2 edges"
+         if (size(x) /= size(y)) error stop "np.histogram2d: x and y must have the same length"
+         if (present(weights)) then
+            if (size(weights) /= size(x)) error stop "np.histogram2d: weights must have the length of x"
+         end if
+         allocate(h(nxb, nyb), source=0.0_dp)
+         do i = 1, size(x)
+            ix = bin_of(x(i), xbins)
+            iy = bin_of(y(i), ybins)
+            if (ix == 0 .or. iy == 0) cycle
+            if (present(weights)) then
+               h(ix, iy) = h(ix, iy) + weights(i)
+            else
+               h(ix, iy) = h(ix, iy) + 1.0_dp
+            end if
+         end do
+         if (present(density)) then
+            if (density) then
+               s = sum(h)
+               h = h / spread(xbins(2:) - xbins(:nxb), 2, nyb)
+               h = h / spread(ybins(2:) - ybins(:nyb), 1, nxb)
+               h = h / s
+            end if
+         end if
+      contains
+         pure integer function bin_of(v, e)
+            ! 1-based bin of v in edges e (0 outside); the last bin is closed.
+            real(kind=dp), intent(in) :: v, e(:)
+            integer :: lo, hi, mid, m
+            m = size(e)
+            bin_of = 0
+            if (.not. (v >= e(1) .and. v <= e(m))) return
+            if (v == e(m)) then
+               bin_of = m - 1
+               return
+            end if
+            lo = 1
+            hi = m
+            do while (hi - lo > 1)
+               mid = (lo + hi) / 2
+               if (e(mid) <= v) then
+                  lo = mid
+               else
+                  hi = mid
+               end if
+            end do
+            bin_of = lo
+         end function bin_of
+      end subroutine histogram2d_np
+
       pure subroutine histogram2d_real_edges(x, y, xbins, ybins, h)
          ! 2D histogram with explicit real bin edges on both axes,
          ! matching numpy.histogram2d(x, y, bins=[xbins, ybins]): same
@@ -9618,6 +9714,40 @@ contains
          end do
       end function lcm_int
 
+      pure function interp_periodic_1d(x, xp, fp, period) result(y)
+         ! np.interp(x, xp, fp, period=p): x and xp are reduced modulo |p|,
+         ! xp sorted (fp with it) and extended by one point at each end
+         ! across the period boundary, as numpy does.
+         real(kind=dp), intent(in) :: x(:), xp(:), fp(:), period
+         real(kind=dp), allocatable :: y(:), xs(:), xpe(:), fpe(:)
+         integer, allocatable :: idx(:)
+         real(kind=dp) :: p
+         integer :: n
+         p = abs(period)
+         if (p == 0.0_dp) error stop "np.interp: period must be a non-zero value"
+         n = size(xp)
+         if (n /= size(fp)) error stop "np.interp: fp and xp are not of the same length"
+         if (n == 0) error stop "np.interp: array of sample points is empty"
+         xs = modulo(xp, p)
+         allocate(idx(n))
+         call argsort_real(xs, idx)
+         allocate(xpe(n + 2), fpe(n + 2))
+         xpe(2:n+1) = xs(idx + 1)
+         fpe(2:n+1) = fp(idx + 1)
+         xpe(1) = xpe(n + 1) - p
+         fpe(1) = fpe(n + 1)
+         xpe(n + 2) = xpe(2) + p
+         fpe(n + 2) = fpe(2)
+         y = interp_1d(modulo(x, p), xpe, fpe)
+      end function interp_periodic_1d
+
+      pure function interp_periodic_0d(x, xp, fp, period) result(y)
+         real(kind=dp), intent(in) :: x, xp(:), fp(:), period
+         real(kind=dp) :: y, r(1)
+         r = interp_periodic_1d([x], xp, fp, period)
+         y = r(1)
+      end function interp_periodic_0d
+
       pure function interp_0d(x, xp, fp, left, right) result(y)
          ! np.interp of a scalar x.
          real(kind=dp), intent(in) :: x, xp(:), fp(:)
@@ -9628,36 +9758,63 @@ contains
       end function interp_0d
 
       pure function interp_1d(x, xp, fp, left, right) result(y)
-         ! np.interp(x, xp, fp, left=, right=): the values outside xp are
-         ! left (default fp(1)) and right (default fp(n)).
+         ! np.interp(x, xp, fp, left=, right=) as numpy computes it: j is the
+         ! last index with xp(j) <= x (so with repeated xp values the last
+         ! one is used), y = fp(j) where x == xp(j), else
+         ! slope * (x - xp(j)) + fp(j); outside xp, left (default fp(1)) and
+         ! right (default fp(n)); a NaN x gives NaN.
          real(kind=dp), intent(in) :: x(:), xp(:), fp(:)
          real(kind=dp), intent(in), optional :: left, right
          real(kind=dp), allocatable :: y(:)
-         integer :: i, j, n
-         real(kind=dp) :: t
-         n = size(x)
-         allocate(y(n))
-         if (size(xp) /= size(fp)) error stop "interp_1d: xp/fp size mismatch"
-         if (size(xp) == 0) error stop "interp_1d: xp must be nonempty"
-         do i = 1, n
-            if (x(i) < xp(1)) then
-               y(i) = fp(1)
-               if (present(left)) y(i) = left
-            else if (x(i) > xp(size(xp))) then
-               y(i) = fp(size(fp))
-               if (present(right)) y(i) = right
-            else if (x(i) == xp(size(xp))) then
-               y(i) = fp(size(fp))
-            else if (x(i) == xp(1)) then
-               y(i) = fp(1)
+         real(kind=dp) :: lval, rval, slope, xv
+         integer :: i, j, lo, hi, mid, m
+         m = size(xp)
+         if (m /= size(fp)) error stop "np.interp: fp and xp are not of the same length"
+         if (m == 0) error stop "np.interp: array of sample points is empty"
+         allocate(y(size(x)))
+         lval = fp(1)
+         if (present(left)) lval = left
+         rval = fp(m)
+         if (present(right)) rval = right
+         do i = 1, size(x)
+            xv = x(i)
+            if (xv /= xv) then
+               y(i) = xv
+               cycle
+            end if
+            if (xv < xp(1)) then
+               y(i) = lval
+               cycle
+            end if
+            if (xv > xp(m)) then
+               y(i) = rval
+               cycle
+            end if
+            if (xv == xp(m)) then
+               y(i) = fp(m)
+               cycle
+            end if
+            ! xp(lo) <= xv < xp(hi)
+            lo = 1
+            hi = m
+            do while (hi - lo > 1)
+               mid = (lo + hi) / 2
+               if (xp(mid) <= xv) then
+                  lo = mid
+               else
+                  hi = mid
+               end if
+            end do
+            j = lo
+            if (xp(j) == xv) then
+               y(i) = fp(j)
             else
-               do j = 1, size(xp) - 1
-                  if (x(i) >= xp(j) .and. x(i) <= xp(j + 1)) then
-                     t = (x(i) - xp(j)) / (xp(j + 1) - xp(j))
-                     y(i) = (1.0_dp - t) * fp(j) + t * fp(j + 1)
-                     exit
-                  end if
-               end do
+               slope = (fp(j + 1) - fp(j)) / (xp(j + 1) - xp(j))
+               y(i) = slope * (xv - xp(j)) + fp(j)
+               if (y(i) /= y(i)) then
+                  y(i) = slope * (xv - xp(j + 1)) + fp(j + 1)
+                  if (y(i) /= y(i) .and. fp(j) == fp(j + 1)) y(i) = fp(j)
+               end if
             end if
          end do
       end function interp_1d

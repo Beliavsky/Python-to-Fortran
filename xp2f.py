@@ -6484,6 +6484,18 @@ def rewrite_indexed_linalg_tuple_calls(tree):
                     or is_linalg(n.func, {"svdvals"})):
                 s = temps_for(svd_values_call(n.args[0]), 3)[1]
                 return ast.copy_location(ast.Name(id=s, ctx=ast.Load()), n)
+            # leggauss(n)[k], np.histogram(...)[k], np.histogram2d(...)[k].
+            if (isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
+                    and isinstance(n.slice.value, int) and isinstance(n.value, ast.Call)
+                    and isinstance(n.value.func, ast.Attribute)
+                    and (n.value.func.attr == "leggauss"
+                         or (n.value.func.attr in ("histogram", "histogram2d")
+                             and isinstance(n.value.func.value, ast.Name)
+                             and n.value.func.value.id in {"np", "numpy"}))):
+                arity = {"leggauss": 2, "histogram": 2, "histogram2d": 3}[n.value.func.attr]
+                k = n.slice.value
+                if -arity <= k < arity:
+                    return ast.copy_location(ast.Name(id=temps_for(n.value, arity)[k % arity], ctx=ast.Load()), n)
             if (isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
                     and isinstance(n.slice.value, int) and isinstance(n.value, ast.Call)
                     and is_linalg(n.value.func, set(_LINALG_TUPLE_ARITY))):
@@ -16042,7 +16054,7 @@ def detect_needed_helpers(tree):
         "signbit": {"signbit_real"},
         "gcd": {"gcd_int_scalar"},
         "lcm": {"lcm_int_scalar"},
-        "interp": {"interp_1d", "interp_0d"},
+        "interp": {"interp_1d", "interp_0d", "interp_periodic_1d", "interp_periodic_0d", "argsort_real"},
         "gradient": {"gradient_1d", "np_gradient_1d", "np_gradient_2d"},
         "trapezoid": {"np_trapezoid_1d"},
         "trapz": {"np_trapezoid_1d"},
@@ -16075,8 +16087,7 @@ def detect_needed_helpers(tree):
         "unique": {"unique"},
         "bincount": {"bincount_int"},
         "searchsorted": {"searchsorted_left_int", "searchsorted_right_int", "searchsorted_left_int_scalar", "searchsorted_right_int_scalar"},
-        "histogram": {"histogram"},
-        "histogram2d": {"histogram2d_real_edges"},
+        "histogram2d": {"histogram2d_real_edges", "histogram2d_np", "np_hist_edges"},
         "setdiff1d": {"setdiff1d_int"},
         "intersect1d": {"intersect1d_int"},
         "lexsort": {"lexsort_keys", "lexsort2_int", "lexsort2_real"},
@@ -16086,7 +16097,8 @@ def detect_needed_helpers(tree):
         "cross": {"np_cross3"},
         "mean": {"mean"},
         "average": {"mean"},
-        "histogram": {"histogram_counts", "histogram_counts_edges"},
+        "histogram": {"histogram_counts", "histogram_counts_edges", "histogram", "histogram_real_edges",
+                      "np_hist_edges"},
         "var": {"var", "mean"},
         "std": {"std", "mean"},
         "nansum": {"nansum"},
@@ -47220,13 +47232,21 @@ class translator(ast.NodeVisitor):
                     txt = self.expr(n)
                     return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
                 args = [_real(a) for a in node.args[:3]]
+                period = None
                 for kw in node.keywords:
                     if kw.arg in ("left", "right"):
                         if not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
                             args.append(f"{kw.arg}={_real(kw.value)}")
+                    elif kw.arg == "period":
+                        if not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
+                            period = _real(kw.value)
                     else:
                         raise NotImplementedError(f"np.interp: unsupported argument {kw.arg}=")
-                return f"interp_{'0' if self._rank_expr(node.args[0]) == 0 else '1'}d({', '.join(args)})"
+                rank_tag = "0" if self._rank_expr(node.args[0]) == 0 else "1"
+                if period is not None:
+                    # numpy ignores left= and right= with a period.
+                    return f"interp_periodic_{rank_tag}d({', '.join(args[:3])}, {period})"
+                return f"interp_{rank_tag}d({', '.join(args)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -49315,10 +49335,8 @@ class translator(ast.NodeVisitor):
                             if kw.arg == "bins":
                                 bins_node = kw.value
                                 break
-                        if bins_node is not None and self._expr_kind(bins_node) == "int":
-                            self._mark_alloc_int(outs[1], rank=1)
-                        else:
-                            self._mark_alloc_real(outs[1], rank=1)
+                        # numpy's bin edges are float, also for integer data.
+                        self._mark_alloc_real(outs[1], rank=1)
                         continue
                 if (
                     len(node.targets) == 1
@@ -49331,7 +49349,8 @@ class translator(ast.NodeVisitor):
                 ):
                     outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
                     if len(outs) >= 3:
-                        self._mark_alloc_int(outs[0], rank=2)
+                        # numpy's counts are float (sums of weights, densities).
+                        self._mark_alloc_real(outs[0], rank=2)
                         self._mark_alloc_real(outs[1], rank=1)
                         self._mark_alloc_real(outs[2], rank=1)
                         continue
@@ -55177,16 +55196,35 @@ class translator(ast.NodeVisitor):
                 outs.append(e.id)
             if len(outs) < 2 or len(v.args) < 1:
                 raise NotImplementedError("np.histogram assignment expects two outputs and input array")
-            xname = self.expr(v.args[0])
-            bins_node = v.args[1] if len(v.args) >= 2 else None
+            if len(outs) != 2:
+                raise NotImplementedError("np.histogram returns two arrays (counts, bin edges)")
+            x_node = v.args[0]
+            xname = self.expr(x_node)
+            if self._expr_kind(x_node) != "real":
+                xname = f"real({xname}, kind=dp)"
+            bins_node = v.args[1] if len(v.args) >= 2 else ast.Constant(value=10)
+            lohi = ""
             for kw in v.keywords:
                 if kw.arg == "bins":
                     bins_node = kw.value
-                elif kw.arg in {"range", "weights", "density"}:
+                elif kw.arg == "range" and isinstance(kw.value, (ast.Tuple, ast.List)) and len(kw.value.elts) == 2:
+                    lohi = ", " + ", ".join(
+                        self.expr(e) if self._expr_kind(e) == "real" else f"real({self.expr(e)}, kind=dp)"
+                        for e in kw.value.elts)
+                elif kw.arg == "range" and isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                    continue
+                else:
                     raise NotImplementedError(f"np.histogram keyword '{kw.arg}' is not yet supported")
-            if bins_node is None:
-                raise NotImplementedError("np.histogram currently requires explicit bins")
-            self.o.w(f"call histogram({xname}, {self.expr(bins_node)}, {outs[0]}, {outs[1]})")
+            if self._rank_expr(bins_node) == 0:
+                # n equal bins: numpy's edges (np.linspace over the data or range).
+                edges = f"np_hist_edges({xname}, int({self.expr(bins_node)}){lohi})"
+            else:
+                if lohi:
+                    raise NotImplementedError("np.histogram: range= applies only to a number of bins")
+                edges = self.expr(bins_node)
+                if self._expr_kind(bins_node) != "real":
+                    edges = f"real({edges}, kind=dp)"
+            self.o.w(f"call histogram_real_edges({xname}, {edges}, {outs[0]}, {outs[1]})")
             return
         # tuple unpacking from np.histogram2d(x, y, bins=[xedges, yedges])
         if (
@@ -55202,27 +55240,9 @@ class translator(ast.NodeVisitor):
                 if not isinstance(e, ast.Name):
                     raise NotImplementedError("tuple assignment targets must be names")
                 outs.append(e.id)
-            if len(outs) < 3 or len(v.args) < 2:
+            if len(outs) != 3 or len(v.args) < 2:
                 raise NotImplementedError("np.histogram2d assignment expects three outputs and x, y input arrays")
-            xname = self.expr(v.args[0])
-            yname = self.expr(v.args[1])
-            bins_node = v.args[2] if len(v.args) >= 3 else None
-            for kw in v.keywords:
-                if kw.arg == "bins":
-                    bins_node = kw.value
-                elif kw.arg in {"range", "weights", "density"}:
-                    raise NotImplementedError(f"np.histogram2d keyword '{kw.arg}' is not yet supported")
-            if (
-                bins_node is None
-                or not isinstance(bins_node, (ast.List, ast.Tuple))
-                or len(bins_node.elts) != 2
-            ):
-                raise NotImplementedError("np.histogram2d currently requires explicit bins=[xedges, yedges]")
-            xedges_txt = self.expr(bins_node.elts[0])
-            yedges_txt = self.expr(bins_node.elts[1])
-            self.o.w(f"call histogram2d_real_edges({xname}, {yname}, {xedges_txt}, {yedges_txt}, {outs[0]})")
-            self.o.w(f"{outs[1]} = {xedges_txt}")
-            self.o.w(f"{outs[2]} = {yedges_txt}")
+            self._np_histogram2d(v, outs)
             return
         # tuple unpacking from os.path.splitext(path):
         #   head, tail = os.path.splitext(filename)
@@ -60189,6 +60209,54 @@ class translator(ast.NodeVisitor):
 
         stmt_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
         raise NotImplementedError(f"unsupported assign: {stmt_txt}")
+
+    def _np_histogram2d(self, v, outs):
+        """H, xedges, yedges = np.histogram2d(x, y, bins=10, range=None,
+        density=None, weights=None)."""
+        def real_txt(n):
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+
+        def is_none(n):
+            return n is None or (isinstance(n, ast.Constant) and n.value is None)
+        x_txt, y_txt = real_txt(v.args[0]), real_txt(v.args[1])
+        opts = {"bins": v.args[2] if len(v.args) >= 3 else None, "range": None, "density": None, "weights": None}
+        for kw in v.keywords:
+            if kw.arg not in opts:
+                raise NotImplementedError(f"np.histogram2d: unsupported argument {kw.arg}=")
+            opts[kw.arg] = kw.value
+        bins = opts["bins"]
+        if bins is None:
+            per_axis = [ast.Constant(value=10)] * 2
+        elif isinstance(bins, (ast.List, ast.Tuple)):
+            if len(bins.elts) != 2:
+                raise NotImplementedError("np.histogram2d: bins must give one entry per axis (x and y)")
+            per_axis = list(bins.elts)
+        else:
+            per_axis = [bins, bins]
+        rng = opts["range"]
+        if not is_none(rng):
+            if not (isinstance(rng, (ast.List, ast.Tuple)) and len(rng.elts) == 2
+                    and all(isinstance(r, (ast.List, ast.Tuple)) and len(r.elts) == 2 for r in rng.elts)):
+                raise NotImplementedError("np.histogram2d: range must be [[xmin, xmax], [ymin, ymax]]")
+            ranges = [(real_txt(r.elts[0]), real_txt(r.elts[1])) for r in rng.elts]
+        else:
+            ranges = [None, None]
+        for k, (b, data, out) in enumerate(zip(per_axis, (x_txt, y_txt), outs[1:])):
+            if self._rank_expr(b) == 0:
+                lohi = f", {ranges[k][0]}, {ranges[k][1]}" if ranges[k] else ""
+                self.o.w(f"{out} = np_hist_edges({data}, int({self.expr(b)}){lohi})")
+            elif self._rank_expr(b) == 1:
+                self.o.w(f"{out} = {real_txt(b)}")
+            else:
+                raise NotImplementedError("np.histogram2d: bins must be a count or an array of edges per axis")
+        extra = []
+        if not is_none(opts["weights"]):
+            extra.append(f"weights={real_txt(opts['weights'])}")
+        if not is_none(opts["density"]):
+            extra.append(f"density={self.expr(opts['density'])}")
+        self.o.w(f"call histogram2d_np({x_txt}, {y_txt}, {outs[1]}, {outs[2]}, {outs[0]}"
+                 + "".join(f", {e}" for e in extra) + ")")
 
     def _np_gradient(self, node):
         """np.gradient(f, *spacing, axis=, edge_order=) for a vector, or a
