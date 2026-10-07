@@ -377,6 +377,33 @@ public :: argsort
 public :: argsort_idx
 public :: sorted_vec
 public :: diag_k
+public :: stack_inv
+public :: stack_cholesky
+public :: stack_pinv
+public :: stack_matrix_power
+public :: stack_det
+public :: stack_cond
+public :: stack_matrix_rank
+public :: stack_norm2
+public :: stack_normm2
+public :: stack_eigvalsh
+public :: stack_eigvals
+public :: stack_trace
+public :: stack_diagonal
+public :: stack_fro
+public :: stack_solve_v
+public :: stack_solve_m
+public :: stack_solve_s
+public :: stack_matmul_ss
+public :: stack_matmul_sm
+public :: stack_matmul_ms
+public :: stack_matmul_sv
+public :: stack_matmul_vs
+public :: stack_eigh
+public :: stack_eig
+public :: stack_qr
+public :: stack_svd
+public :: stack_svd_econ
 public :: np_kron2, np_cross3, matrix_normm2_real
 public :: np_searchsorted
 public :: np_union1d
@@ -5433,6 +5460,359 @@ contains
          call linalg_svd_econ(a, u, s, vt)
          value = minval(s)
       end function matrix_normm2_real
+
+      function stack_inv(a) result(r)
+         ! numpy's stacked (batched) linear algebra: linalg_inv(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:), m(:,:)
+         integer :: b
+         if (size(a, 1) == 0) then
+            allocate(r(0, size(a, 3), size(a, 2)))
+            return
+         end if
+         do b = 1, size(a, 1)
+            m = linalg_inv(a(b, :, :))
+            if (b == 1) allocate(r(size(a, 1), size(m, 1), size(m, 2)))
+            r(b, :, :) = m
+         end do
+      end function stack_inv
+
+      function stack_cholesky(a) result(r)
+         ! numpy's stacked (batched) linear algebra: linalg_cholesky(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:), m(:,:)
+         integer :: b
+         if (size(a, 1) == 0) then
+            allocate(r(0, size(a, 3), size(a, 2)))
+            return
+         end if
+         do b = 1, size(a, 1)
+            m = linalg_cholesky(a(b, :, :))
+            if (b == 1) allocate(r(size(a, 1), size(m, 1), size(m, 2)))
+            r(b, :, :) = m
+         end do
+      end function stack_cholesky
+
+      function stack_pinv(a) result(r)
+         ! numpy's stacked (batched) linear algebra: linalg_pinv(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:), m(:,:)
+         integer :: b
+         if (size(a, 1) == 0) then
+            allocate(r(0, size(a, 3), size(a, 2)))
+            return
+         end if
+         do b = 1, size(a, 1)
+            m = linalg_pinv(a(b, :, :))
+            if (b == 1) allocate(r(size(a, 1), size(m, 1), size(m, 2)))
+            r(b, :, :) = m
+         end do
+      end function stack_pinv
+
+      function stack_matrix_power(a, p) result(r)
+         ! numpy's stacked (batched) linear algebra: linalg_matrix_power(A, p) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         integer, intent(in) :: p
+         real(kind=dp), allocatable :: r(:,:,:), m(:,:)
+         integer :: b
+         if (size(a, 1) == 0) then
+            allocate(r(0, size(a, 3), size(a, 2)))
+            return
+         end if
+         do b = 1, size(a, 1)
+            m = linalg_matrix_power(a(b, :, :), p)
+            if (b == 1) allocate(r(size(a, 1), size(m, 1), size(m, 2)))
+            r(b, :, :) = m
+         end do
+      end function stack_matrix_power
+
+      function stack_det(a) result(r)
+         ! numpy's stacked linear algebra: linalg_det(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: b
+         allocate(r(size(a, 1)))
+         do b = 1, size(a, 1)
+            r(b) = linalg_det(a(b, :, :))
+         end do
+      end function stack_det
+
+      function stack_cond(a) result(r)
+         ! numpy's stacked linear algebra: linalg_cond(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: b
+         allocate(r(size(a, 1)))
+         do b = 1, size(a, 1)
+            r(b) = linalg_cond(a(b, :, :))
+         end do
+      end function stack_cond
+
+      function stack_matrix_rank(a) result(r)
+         ! numpy's stacked linear algebra: linalg_matrix_rank(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         integer, allocatable :: r(:)
+         integer :: b
+         allocate(r(size(a, 1)))
+         do b = 1, size(a, 1)
+            r(b) = linalg_matrix_rank(a(b, :, :))
+         end do
+      end function stack_matrix_rank
+
+      function stack_norm2(a) result(r)
+         ! numpy's stacked linear algebra: matrix_norm2_real(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: b
+         allocate(r(size(a, 1)))
+         do b = 1, size(a, 1)
+            r(b) = matrix_norm2_real(a(b, :, :))
+         end do
+      end function stack_norm2
+
+      function stack_normm2(a) result(r)
+         ! numpy's stacked linear algebra: matrix_normm2_real(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: b
+         allocate(r(size(a, 1)))
+         do b = 1, size(a, 1)
+            r(b) = matrix_normm2_real(a(b, :, :))
+         end do
+      end function stack_normm2
+
+      function stack_eigvalsh(a) result(r)
+         ! numpy's stacked linear algebra: linalg_eigvalsh(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:,:), w(:)
+         integer :: b
+         if (size(a, 1) == 0) then
+            allocate(r(0, min(size(a, 2), size(a, 3))))
+            return
+         end if
+         do b = 1, size(a, 1)
+            w = linalg_eigvalsh(a(b, :, :))
+            if (b == 1) allocate(r(size(a, 1), size(w)))
+            r(b, :) = w
+         end do
+      end function stack_eigvalsh
+
+      function stack_eigvals(a) result(r)
+         ! numpy's stacked linear algebra: linalg_eigvals_real(A) of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         complex(kind=dp), allocatable :: r(:,:), w(:)
+         integer :: b
+         if (size(a, 1) == 0) then
+            allocate(r(0, min(size(a, 2), size(a, 3))))
+            return
+         end if
+         do b = 1, size(a, 1)
+            w = linalg_eigvals_real(a(b, :, :))
+            if (b == 1) allocate(r(size(a, 1), size(w)))
+            r(b, :) = w
+         end do
+      end function stack_eigvals
+
+      pure function stack_trace(a) result(r)
+         ! np.linalg.trace of a stack: the trace of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: b, i
+         allocate(r(size(a, 1)))
+         r = 0.0_dp
+         do b = 1, size(a, 1)
+            do i = 1, min(size(a, 2), size(a, 3))
+               r(b) = r(b) + a(b, i, i)
+            end do
+         end do
+      end function stack_trace
+
+      pure function stack_diagonal(a) result(r)
+         ! np.linalg.diagonal of a stack: the diagonal of each a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         integer :: b, i
+         allocate(r(size(a, 1), min(size(a, 2), size(a, 3))))
+         do b = 1, size(a, 1)
+            do i = 1, size(r, 2)
+               r(b, i) = a(b, i, i)
+            end do
+         end do
+      end function stack_diagonal
+
+      pure function stack_fro(a) result(r)
+         ! The Frobenius norm of each a(b,:,:) (norm(a, axis=(-2, -1))).
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: b
+         allocate(r(size(a, 1)))
+         do b = 1, size(a, 1)
+            r(b) = sqrt(sum(a(b, :, :)**2))
+         end do
+      end function stack_fro
+
+      function stack_solve_v(a, x) result(r)
+         ! np.linalg.solve(a, x) with a 1-D x: solve each a(b,:,:) y = x.
+         real(kind=dp), intent(in) :: a(:,:,:), x(:)
+         real(kind=dp), allocatable :: r(:,:)
+         integer :: b
+         allocate(r(size(a, 1), size(x)))
+         do b = 1, size(a, 1)
+            r(b, :) = linalg_solve_vec(a(b, :, :), x)
+         end do
+      end function stack_solve_v
+
+      function stack_solve_m(a, x) result(r)
+         ! np.linalg.solve(a, x) with a matrix x, used for every a(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:), x(:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         integer :: b
+         allocate(r(size(a, 1), size(x, 1), size(x, 2)))
+         do b = 1, size(a, 1)
+            r(b, :, :) = linalg_solve_mat(a(b, :, :), x)
+         end do
+      end function stack_solve_m
+
+      function stack_solve_s(a, x) result(r)
+         ! np.linalg.solve(a, x) of two stacks: a(b,:,:) y = x(b,:,:).
+         real(kind=dp), intent(in) :: a(:,:,:), x(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         integer :: b
+         allocate(r(size(x, 1), size(x, 2), size(x, 3)))
+         do b = 1, size(a, 1)
+            r(b, :, :) = linalg_solve_mat(a(b, :, :), x(b, :, :))
+         end do
+      end function stack_solve_s
+
+      pure function stack_matmul_ss(a, x) result(r)
+         ! a @ x of two stacks of matrices.
+         real(kind=dp), intent(in) :: a(:,:,:), x(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         integer :: b
+         allocate(r(size(a, 1), size(a, 2), size(x, 3)))
+         do b = 1, size(a, 1)
+            r(b, :, :) = matmul(a(b, :, :), x(b, :, :))
+         end do
+      end function stack_matmul_ss
+
+      pure function stack_matmul_sm(a, x) result(r)
+         ! a @ x of a stack and a matrix.
+         real(kind=dp), intent(in) :: a(:,:,:), x(:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         integer :: b
+         allocate(r(size(a, 1), size(a, 2), size(x, 2)))
+         do b = 1, size(a, 1)
+            r(b, :, :) = matmul(a(b, :, :), x)
+         end do
+      end function stack_matmul_sm
+
+      pure function stack_matmul_ms(a, x) result(r)
+         ! a @ x of a matrix and a stack.
+         real(kind=dp), intent(in) :: a(:,:), x(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         integer :: b
+         allocate(r(size(x, 1), size(a, 1), size(x, 3)))
+         do b = 1, size(x, 1)
+            r(b, :, :) = matmul(a, x(b, :, :))
+         end do
+      end function stack_matmul_ms
+
+      pure function stack_matmul_sv(a, x) result(r)
+         ! a @ x of a stack and a vector.
+         real(kind=dp), intent(in) :: a(:,:,:), x(:)
+         real(kind=dp), allocatable :: r(:,:)
+         integer :: b
+         allocate(r(size(a, 1), size(a, 2)))
+         do b = 1, size(a, 1)
+            r(b, :) = matmul(a(b, :, :), x)
+         end do
+      end function stack_matmul_sv
+
+      pure function stack_matmul_vs(a, x) result(r)
+         ! a @ x of a vector and a stack.
+         real(kind=dp), intent(in) :: a(:), x(:,:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         integer :: b
+         allocate(r(size(x, 1), size(x, 3)))
+         do b = 1, size(x, 1)
+            r(b, :) = matmul(a, x(b, :, :))
+         end do
+      end function stack_matmul_vs
+
+      subroutine stack_eigh(a, w, v)
+         ! w, v = np.linalg.eigh(a) of a stack.
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable, intent(out) :: w(:,:), v(:,:,:)
+         real(kind=dp), allocatable :: wb(:), vb(:,:)
+         integer :: b
+         allocate(w(size(a, 1), size(a, 2)), v(size(a, 1), size(a, 2), size(a, 3)))
+         do b = 1, size(a, 1)
+            call linalg_eigh(a(b, :, :), wb, vb)
+            w(b, :) = wb
+            v(b, :, :) = vb
+         end do
+      end subroutine stack_eigh
+
+      subroutine stack_eig(a, w, v)
+         ! w, v = np.linalg.eig(a) of a stack.
+         real(kind=dp), intent(in) :: a(:,:,:)
+         complex(kind=dp), allocatable, intent(out) :: w(:,:), v(:,:,:)
+         complex(kind=dp), allocatable :: wb(:), vb(:,:)
+         integer :: b
+         allocate(w(size(a, 1), size(a, 2)), v(size(a, 1), size(a, 2), size(a, 3)))
+         do b = 1, size(a, 1)
+            call linalg_eig(a(b, :, :), wb, vb)
+            w(b, :) = wb
+            v(b, :, :) = vb
+         end do
+      end subroutine stack_eig
+
+      subroutine stack_qr(a, q, r)
+         ! q, r = np.linalg.qr(a) (reduced) of a stack.
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable, intent(out) :: q(:,:,:), r(:,:,:)
+         real(kind=dp), allocatable :: qb(:,:), rb(:,:)
+         integer :: b, k
+         k = min(size(a, 2), size(a, 3))
+         allocate(q(size(a, 1), size(a, 2), k), r(size(a, 1), k, size(a, 3)))
+         do b = 1, size(a, 1)
+            call linalg_qr_reduced(a(b, :, :), qb, rb)
+            q(b, :, :) = qb
+            r(b, :, :) = rb
+         end do
+      end subroutine stack_qr
+
+      subroutine stack_svd(a, u, s, vt)
+         ! u, s, vt = np.linalg.svd(a) of a stack.
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable, intent(out) :: u(:,:,:), s(:,:), vt(:,:,:)
+         real(kind=dp), allocatable :: ub(:,:), sb(:), vtb(:,:)
+         integer :: b, k
+         k = min(size(a, 2), size(a, 3))
+         allocate(u(size(a, 1), size(a, 2), size(a, 2)), s(size(a, 1), k), vt(size(a, 1), size(a, 3), size(a, 3)))
+         do b = 1, size(a, 1)
+            call linalg_svd(a(b, :, :), ub, sb, vtb)
+            u(b, :, :) = ub
+            s(b, :) = sb
+            vt(b, :, :) = vtb
+         end do
+      end subroutine stack_svd
+
+      subroutine stack_svd_econ(a, u, s, vt)
+         ! u, s, vt = np.linalg.svd(a, full_matrices=False) of a stack.
+         real(kind=dp), intent(in) :: a(:,:,:)
+         real(kind=dp), allocatable, intent(out) :: u(:,:,:), s(:,:), vt(:,:,:)
+         real(kind=dp), allocatable :: ub(:,:), sb(:), vtb(:,:)
+         integer :: b, k
+         k = min(size(a, 2), size(a, 3))
+         allocate(u(size(a, 1), size(a, 2), k), s(size(a, 1), k), vt(size(a, 1), k, size(a, 3)))
+         do b = 1, size(a, 1)
+            call linalg_svd_econ(a(b, :, :), ub, sb, vtb)
+            u(b, :, :) = ub
+            s(b, :) = sb
+            vt(b, :, :) = vtb
+         end do
+      end subroutine stack_svd_econ
 
       pure function diag_k_vec_real(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.

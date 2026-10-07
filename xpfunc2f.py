@@ -2265,6 +2265,22 @@ def inline_python_mod_helpers(trimmed_text: str):
         return new_text, unresolved
     insertion = "\n".join(inlined_body) + "\n"
     new_text = new_text[: em.start()] + insertion + new_text[em.start() :]
+    # The inlined helpers' ieee_arithmetic names (python.f90 imports them
+    # module-wide, e.g. ieee_is_nan/ieee_value/ieee_quiet_nan in the NaN-
+    # aware sort and quantile helpers): import the ones the trimmed module
+    # doesn't already, with a use line of their own after `module NAME`.
+    ieee_used = sorted({n.lower() for n in re.findall(r"\bieee_\w+", "\n".join(inlined_body), re.IGNORECASE)}
+                       - {"ieee_arithmetic"})
+    imported = set()
+    for um in re.finditer(r"(?im)^\s*use\s*,\s*intrinsic\s*::\s*ieee_arithmetic\b(.*(?:&\s*\n.*)*)", new_text):
+        imported |= {n.lower() for n in re.findall(r"\bieee_\w+", um.group(1), re.IGNORECASE)}
+    missing = [n for n in ieee_used if n not in imported]
+    if missing:
+        mod_re = re.compile(r"^\s*module\s+(?!procedure\b)\w+\s*$", re.IGNORECASE | re.MULTILINE)
+        mm = mod_re.search(new_text)
+        if mm is not None:
+            use_line = "\n   use, intrinsic :: ieee_arithmetic, only: " + ", ".join(missing)
+            new_text = new_text[: mm.end()] + use_line + new_text[mm.end() :]
     return new_text, unresolved
 
 

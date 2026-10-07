@@ -6170,6 +6170,18 @@ def _einsum_table():
         "ab->b": lambda a: np_call("sum", [a], axis=0),
         "ab->": lambda a: np_call("sum", [a]),
         "a->": lambda a: np_call("sum", [a]),
+        # Stacks of matrices (batch axis first).
+        "abc,acd->abd": lambda a, b: np_call("matmul", [a, b]),
+        "abc,cd->abd": lambda a, b: np_call("matmul", [a, b]),
+        "ab,cbd->cad": lambda a, b: np_call("matmul", [a, b]),
+        "abc,c->ab": lambda a, b: np_call("matmul", [a, b]),
+        "abb->a": lambda a: ast.Call(func=ast.Attribute(value=ast.Attribute(
+            value=ast.Name(id="np", ctx=ast.Load()), attr="linalg", ctx=ast.Load()), attr="trace", ctx=ast.Load()),
+            args=[a], keywords=[]),
+        "abb->ab": lambda a: ast.Call(func=ast.Attribute(value=ast.Attribute(
+            value=ast.Name(id="np", ctx=ast.Load()), attr="linalg", ctx=ast.Load()), attr="diagonal", ctx=ast.Load()),
+            args=[a], keywords=[]),
+        "abc->acb": lambda a: np_call("swapaxes", [a, ast.Constant(value=1), ast.Constant(value=2)]),
     }
 
 
@@ -15727,6 +15739,10 @@ def template_derived_needed_helpers(structured_type_components):
 def detect_needed_helpers(tree):
     needed = set()
     for node in ast.walk(tree):
+        # a @ b may be of stacks of matrices (translator._stacked_linalg).
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            needed.update({"stack_matmul_ss", "stack_matmul_sm", "stack_matmul_ms", "stack_matmul_sv",
+                           "stack_matmul_vs"})
         # m[[i...], [j...]] (translator._setsearch_numpy) -- not a Call.
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Tuple) and any(
                 isinstance(e, (ast.List, ast.Name)) for e in node.slice.elts):
@@ -16151,6 +16167,12 @@ def detect_needed_helpers(tree):
             # Set/search functions (translator._setsearch_numpy).
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._SETSEARCH_ATTRS:
                 needed.update(translator._SETSEARCH_HELPERS)
+            # Stacked linear algebra (translator._stacked_linalg): any linalg
+            # call or matmul may get a stack of matrices.
+            if isinstance(node.func, ast.Attribute) and (
+                    node.func.attr == "matmul" or (isinstance(node.func.value, ast.Attribute)
+                                                   and node.func.value.attr == "linalg")):
+                needed.update(translator._STACK_HELPERS)
             def _attr_chain_parts(n):
                 parts = []
                 cur = n
@@ -17135,8 +17157,8 @@ def detect_needed_helpers(tree):
                 # np.trace and np.linalg.trace.
                 needed.add("diag")
             if isinstance(node.func, ast.Attribute) and node.func.attr == "einsum":
-                # einsum patterns lower to trace/diagonal among others.
-                needed.update({"diag", "diagonal"})
+                # einsum patterns lower to trace/diagonal and (batched) matmul among others.
+                needed.update({"diag", "diagonal"} | translator._STACK_HELPERS)
             if is_print_like:
                 needed.add("print_matrix")
                 needed.add("print_array_3d")
@@ -29089,6 +29111,139 @@ class translator(ast.NodeVisitor):
             return f"(unique({as_kind(node.args[0], 'int')}) /= 0)"
         return None
 
+    _STACK_HELPERS = {
+        "stack_inv", "stack_cholesky", "stack_pinv", "stack_matrix_power", "stack_det", "stack_cond",
+        "stack_matrix_rank", "stack_norm2", "stack_normm2", "stack_eigvalsh", "stack_eigvals", "stack_trace",
+        "stack_diagonal", "stack_fro", "stack_solve_v", "stack_solve_m", "stack_solve_s", "stack_matmul_ss",
+        "stack_matmul_sm", "stack_matmul_ms", "stack_matmul_sv", "stack_matmul_vs", "stack_eigh", "stack_eig",
+        "stack_qr", "stack_svd", "stack_svd_econ", "linalg_inv", "linalg_det", "linalg_cholesky", "linalg_pinv",
+        "linalg_matrix_power", "linalg_cond", "linalg_matrix_rank", "matrix_norm2_real", "matrix_normm2_real",
+        "linalg_eigvalsh", "linalg_eigvals_real", "linalg_solve", "linalg_eigh", "linalg_eig", "linalg_qr_reduced",
+        "linalg_svd", "linalg_svd_econ"}
+    # per-matrix function -> (helper, result: "mat" same rank / "scalar" rank-2 / "vec" rank-1, kind)
+    _STACK_FUNCS = {
+        "inv": ("stack_inv", "mat", "real"), "cholesky": ("stack_cholesky", "mat", "real"),
+        "pinv": ("stack_pinv", "mat", "real"), "matrix_power": ("stack_matrix_power", "mat", "real"),
+        "det": ("stack_det", "scalar", "real"), "cond": ("stack_cond", "scalar", "real"),
+        "matrix_rank": ("stack_matrix_rank", "scalar", "int"),
+        "eigvalsh": ("stack_eigvalsh", "vec", "real"), "eigvals": ("stack_eigvals", "vec", "complex"),
+        "trace": ("stack_trace", "scalar", "real"), "diagonal": ("stack_diagonal", "vec", "real"),
+    }
+
+    def _stacked_linalg_parts(self, node):
+        """(what, kind, rank) of numpy linear algebra on a stack of matrices
+        (an array of rank 3 or more: the last two axes are the matrices)
+        that _stacked_linalg translates, else None."""
+        def rank(n):
+            return int(self._rank_expr(n) or 0)
+
+        def operands_ok(ns):
+            # An unknown kind (np.stack(...)) is taken as real.
+            ks = {self._expr_kind(n) for n in ns}
+            if "complex" in ks:
+                raise NotImplementedError("stacked (batched) linear algebra of complex arrays is not supported")
+            return ks <= {"int", "real", None}
+
+        # a @ b / np.matmul(a, b) with a stack.
+        pair = None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            pair = (node.left, node.right)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_numpy_name_node(node.func.value)
+              and node.func.attr == "matmul" and len(node.args) == 2 and not node.keywords):
+            pair = tuple(node.args)
+        if pair is not None:
+            ra, rb = rank(pair[0]), rank(pair[1])
+            if max(ra, rb) >= 3 and operands_ok(pair):
+                if (ra, rb) not in {(3, 3), (3, 2), (2, 3), (3, 1), (1, 3)}:
+                    raise NotImplementedError("matmul of these stacks of matrices is not supported")
+                return ("matmul", "real", {(3, 3): 3, (3, 2): 3, (2, 3): 3, (3, 1): 2, (1, 3): 2}[(ra, rb)])
+            return None
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args
+                and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "linalg"
+                and is_numpy_name_node(node.func.value.value)):
+            return None
+        attr = node.func.attr
+        a = node.args[0]
+        r = rank(a)
+        if r < 3:
+            return None
+        if attr == "solve" and len(node.args) == 2 and not node.keywords:
+            if not operands_ok(node.args):
+                return None
+            rb = rank(node.args[1])
+            if r != 3 or rb not in (1, 2, 3):
+                raise NotImplementedError("np.linalg.solve of these stacks is not supported")
+            return ("solve", "real", {1: 2, 2: 3, 3: 3}[rb])
+        if attr in {"norm", "matrix_norm"}:
+            kw = {k.arg: k.value for k in node.keywords}
+            ordn = node.args[1] if len(node.args) > 1 else kw.get("ord")
+            axis = node.args[2] if len(node.args) > 2 else kw.get("axis")
+            per_matrix = attr == "matrix_norm" or (
+                isinstance(axis, ast.Tuple) and len(axis.elts) == 2
+                and [(_signed_int_constant(e) or 0) % r for e in axis.elts] == [r - 2, r - 1])
+            if not per_matrix or not set(kw) <= {"ord", "axis"} or not operands_ok([a]):
+                return None
+            if ordn is None or is_none(ordn) or (isinstance(ordn, ast.Constant) and ordn.value == "fro"):
+                return ("norm_fro", "real", r - 2)
+            if _signed_int_constant(ordn) in (2, -2):
+                return ("norm2" if _signed_int_constant(ordn) == 2 else "normm2", "real", r - 2)
+            raise NotImplementedError("this matrix norm order of a stack of matrices is not supported")
+        if attr in self._STACK_FUNCS:
+            if node.keywords or (attr != "matrix_power" and len(node.args) != 1) \
+                    or (attr == "matrix_power" and len(node.args) != 2) or not operands_ok([a]):
+                raise NotImplementedError(f"np.linalg.{attr} of a stack of matrices supports only the array argument")
+            _helper, res, kind = self._STACK_FUNCS[attr]
+            return (attr, kind, {"mat": r, "scalar": r - 2, "vec": r - 1}[res])
+        return None
+
+    def _stacked_linalg(self, node):
+        """Fortran for numpy linear algebra on stacks of matrices: the
+        stack_* helpers apply the 2-D routine to each a(b,:,:); arrays of
+        rank 4 and up are reshaped to one batch axis and back."""
+        parts = self._stacked_linalg_parts(node)
+        if parts is None:
+            return None
+        what, kind, out_rank = parts
+
+        def real_txt(n):
+            txt = self.expr(n)
+            return f"real({txt}, kind=dp)" if self._expr_kind(n) == "int" else txt
+
+        if what == "matmul":
+            pair = (node.left, node.right) if isinstance(node, ast.BinOp) else tuple(node.args)
+            ra, rb = (int(self._rank_expr(x)) for x in pair)
+            suffix = {(3, 3): "ss", (3, 2): "sm", (2, 3): "ms", (3, 1): "sv", (1, 3): "vs"}[(ra, rb)]
+            return f"stack_matmul_{suffix}({real_txt(pair[0])}, {real_txt(pair[1])})"
+        a = node.args[0]
+        r = int(self._rank_expr(a))
+        at = real_txt(a)
+        if what == "solve":
+            rb = int(self._rank_expr(node.args[1]))
+            return f"stack_solve_{ {1: 'v', 2: 'm', 3: 's'}[rb] }({at}, {real_txt(node.args[1])})"
+        if r >= 4:
+            # One batch axis: reshape(a, [prod(leading), n, m]) keeps each
+            # matrix's elements together in column-major order.
+            lead = " * ".join(f"size({at},{d})" for d in range(1, r - 1))
+            a3 = f"reshape({at}, [{lead}, size({at},{r - 1}), size({at},{r})])"
+        else:
+            a3 = at
+        if what == "norm_fro":
+            res = f"stack_fro({a3})"
+        elif what in {"norm2", "normm2"}:
+            res = f"stack_{what}({a3})"
+        else:
+            helper = self._STACK_FUNCS[what][0]
+            extra = f", int({self.expr(node.args[1])})" if what == "matrix_power" else ""
+            res = f"{helper}({a3}{extra})"
+        if r >= 4:
+            lead_dims = [f"size({at},{d})" for d in range(1, r - 1)]
+            if out_rank == r:      # one matrix per matrix
+                return f"reshape({res}, [{', '.join(lead_dims)}, size({res},2), size({res},3)])"
+            if out_rank == r - 1:  # one vector per matrix
+                return f"reshape({res}, [{', '.join(lead_dims)}, size({res},2)])"
+            return f"reshape({res}, [{', '.join(lead_dims)}])"
+        return res
+
     def _complex_close_test(self, node):
         """np.isclose(a, b, rtol, atol) with a complex operand, elementwise:
         abs(a - b) <= atol + rtol*abs(b) with the complex modulus (the real
@@ -29421,7 +29576,8 @@ class translator(ast.NodeVisitor):
                     flat = ast.Call(func=np_func("ravel"), args=[x], keywords=[])
                     new = ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()),
                                    args=[flat] + ([ordn] if ordn is not None else []), keywords=[])
-            elif attr == "matrix_norm" and node.args and set(kwd) <= {"ord"}:
+            elif attr == "matrix_norm" and node.args and set(kwd) <= {"ord"} \
+                    and int(self._rank_expr(node.args[0]) or 0) <= 2:
                 ordn = node.args[1] if len(node.args) > 1 else kwd.get("ord", ast.Constant(value="fro"))
                 new = ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()),
                                args=[node.args[0], ordn], keywords=[])
@@ -29438,6 +29594,55 @@ class translator(ast.NodeVisitor):
             elif attr in {"diagonal", "trace"} and node.args and set(kwd) <= {"offset"} \
                     and int(self._rank_expr(node.args[0]) or 0) == 2:
                 new = ast.Call(func=np_func(attr), args=list(node.args), keywords=list(node.keywords))
+        elif (
+            is_numpy_name_node(func.value) and attr == "reshape" and len(node.args) == 2
+            and all(kw.arg == "order" and is_const_str(kw.value) and kw.value.value == "C" for kw in node.keywords)
+            and int(self._rank_expr(node.args[0]) or 0) >= 2
+        ):
+            # np.reshape(a, shape) of a multi-dimensional a: the method form
+            # reads a in numpy's (C) order; this form read it column-major.
+            new = ast.Call(func=ast.Attribute(value=node.args[0], attr="reshape", ctx=ast.Load()),
+                           args=[node.args[1]], keywords=[])
+        elif (
+            is_numpy_name_node(func.value) and attr in {"moveaxis", "rollaxis", "expand_dims", "transpose"}
+            and node.args and not node.keywords and int(self._rank_expr(node.args[0]) or 0) >= 1
+            and all(_signed_int_constant(a) is not None for a in node.args[1:]
+                    if not isinstance(a, (ast.Tuple, ast.List)))
+            and (attr != "transpose" or (len(node.args) == 2 and isinstance(node.args[1], (ast.Tuple, ast.List))
+                                         and any(_signed_int_constant(e) is not None and _signed_int_constant(e) < 0
+                                                 for e in node.args[1].elts)))
+        ):
+            # Axis permutations as np.transpose with explicit, non-negative
+            # axes; expand_dims as a reshape with a length-1 axis.
+            a = node.args[0]
+            r = int(self._rank_expr(a))
+            if attr == "transpose":
+                vals = [_signed_int_constant(e) for e in node.args[1].elts]
+                if all(v is not None for v in vals) and len(vals) == r:
+                    new = ast.Call(func=func, args=[a, ast.Tuple(
+                        elts=[ast.Constant(value=v % r) for v in vals], ctx=ast.Load())], keywords=[])
+            elif attr == "expand_dims" and len(node.args) == 2:
+                k = _signed_int_constant(node.args[1]) % (r + 1)
+                dims = [ast.Subscript(value=ast.Attribute(value=a, attr="shape", ctx=ast.Load()),
+                                      slice=ast.Constant(value=d), ctx=ast.Load()) for d in range(r)]
+                dims.insert(k, ast.Constant(value=1))
+                new = ast.Call(func=ast.Attribute(value=a, attr="reshape", ctx=ast.Load()),
+                               args=[ast.Tuple(elts=dims, ctx=ast.Load())], keywords=[])
+            elif attr == "moveaxis" and len(node.args) == 3:
+                src = _signed_int_constant(node.args[1]) % r
+                dst = _signed_int_constant(node.args[2]) % r
+                order = [d for d in range(r) if d != src]
+                order.insert(dst, src)
+                new = ast.Call(func=np_func("transpose"), args=[a, ast.Tuple(
+                    elts=[ast.Constant(value=d) for d in order], ctx=ast.Load())], keywords=[])
+            elif attr == "rollaxis" and len(node.args) in (2, 3):
+                ax = _signed_int_constant(node.args[1]) % r
+                start = _signed_int_constant(node.args[2]) if len(node.args) == 3 else 0
+                start = start % (r + 1) if start < 0 else start
+                order = [d for d in range(r) if d != ax]
+                order.insert(start - 1 if start > ax else start, ax)
+                new = ast.Call(func=np_func("transpose"), args=[a, ast.Tuple(
+                    elts=[ast.Constant(value=d) for d in order], ctx=ast.Load())], keywords=[])
         elif (
             is_numpy_name_node(func.value) and attr == "take" and len(node.args) in (2, 3)
             and all(kw.arg == "axis" for kw in node.keywords)
@@ -29610,6 +29815,9 @@ class translator(ast.NodeVisitor):
         _ssr = self._setsearch_parts(node)
         if _ssr is not None:
             return _ssr[2]
+        _stp = self._stacked_linalg_parts(node)
+        if _stp is not None:
+            return _stp[1]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             _k = self._expr_kind(_mg[0])
@@ -35260,6 +35468,9 @@ class translator(ast.NodeVisitor):
         _ssr = self._setsearch_parts(node)
         if _ssr is not None:
             return _ssr[3]
+        _stp = self._stacked_linalg_parts(node)
+        if _stp is not None:
+            return _stp[2]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             return 2
@@ -37210,6 +37421,9 @@ class translator(ast.NodeVisitor):
         _ss_txt = self._setsearch_numpy(node)
         if _ss_txt is not None:
             return _ss_txt
+        _st_txt = self._stacked_linalg(node)
+        if _st_txt is not None:
+            return _st_txt
         _bare = self._float_dtype_reduction(node)
         if _bare is not None:
             return f"real({self.expr(_bare)}, kind=dp)"
@@ -40462,9 +40676,10 @@ class translator(ast.NodeVisitor):
                         raise NotImplementedError(f"{callee} axes must be tuple/list")
                     if not all(isinstance(a, ast.Constant) and isinstance(a.value, int) for a in axes.elts):
                         raise NotImplementedError(f"{callee} axes must be integer constants")
-                    perm = [int(a.value) + 1 for a in axes.elts]
+                    perm = [int(a.value) % len(axes.elts) + 1 for a in axes.elts]
                     shp = ", ".join([f"size({a0},{p})" for p in perm])
-                    ordp = ", ".join(str(p) for p in perm)
+                    # order= is the inverse permutation (source axis -> result axis).
+                    ordp = ", ".join(str(perm.index(q) + 1) for q in range(1, len(perm) + 1))
                     return f"reshape({a0}, [{shp}], order=[{ordp}])"
                 if callee == "np.linalg.matrix_transpose":
                     a0 = self.expr(node.args[0]) if len(node.args) >= 1 else ""
@@ -41049,9 +41264,10 @@ class translator(ast.NodeVisitor):
                         return base_expr
                     if not all(isinstance(a, ast.Constant) and isinstance(a.value, int) for a in axes_nodes):
                         raise NotImplementedError("transpose axes must be integer constants")
-                    perm = [int(a.value) + 1 for a in axes_nodes]
+                    perm = [int(a.value) % len(axes_nodes) + 1 for a in axes_nodes]
                     shp = ", ".join([f"size({base_expr},{p})" for p in perm])
-                    ordp = ", ".join(str(p) for p in perm)
+                    # order= is the inverse permutation (source axis -> result axis).
+                    ordp = ", ".join(str(perm.index(q) + 1) for q in range(1, len(perm) + 1))
                     return f"reshape({base_expr}, [{shp}], order=[{ordp}])"
                 if attr == "dot" and len(node.args) >= 1:
                     a1 = self.expr(node.args[0])
@@ -42678,7 +42894,11 @@ class translator(ast.NodeVisitor):
                     else:
                         tgt_shape_parts.append(f"size({first},{p})")
                 tgt_shape = ", ".join(tgt_shape_parts)
-                ordp = ", ".join(str(p) for p in perm)
+                # RESHAPE's order= lists, for each source axis in turn, the
+                # result axis it becomes: the inverse of perm (result axis
+                # k is source axis perm[k]). perm itself only coincided for
+                # some axes (np.stack([m1, m2]) of matrices was wrong).
+                ordp = ", ".join(str(perm.index(q) + 1) for q in range(1, r0 + 2))
                 return f"reshape({src}, [{tgt_shape}], order=[{ordp}])"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -42797,9 +43017,10 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("np.transpose axes must be tuple/list")
                 if not all(isinstance(a, ast.Constant) and isinstance(a.value, int) for a in axes.elts):
                     raise NotImplementedError("np.transpose axes must be integer constants")
-                perm = [int(a.value) + 1 for a in axes.elts]
+                perm = [int(a.value) % len(axes.elts) + 1 for a in axes.elts]
                 shp = ", ".join([f"size({a0},{p})" for p in perm])
-                ordp = ", ".join(str(p) for p in perm)
+                # order= is the inverse permutation (source axis -> result axis).
+                ordp = ", ".join(str(perm.index(q) + 1) for q in range(1, len(perm) + 1))
                 return f"reshape({a0}, [{shp}], order=[{ordp}])"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -42823,7 +43044,8 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("swapaxes axes out of range")
                 perm[ax1], perm[ax2] = perm[ax2], perm[ax1]
                 shp = ", ".join([f"size({a0},{p})" for p in perm])
-                ordp = ", ".join(str(p) for p in perm)
+                # order= is the inverse permutation (source axis -> result axis).
+                ordp = ", ".join(str(perm.index(q) + 1) for q in range(1, len(perm) + 1))
                 return f"reshape({a0}, [{shp}], order=[{ordp}])"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -47681,9 +47903,14 @@ class translator(ast.NodeVisitor):
                 and self._is_linalg_module_attr(node.value.func.value)
                 and node.value.func.attr == "slogdet"
             ):
+                # One sign and log|det| per matrix of a stack.
+                _sl_b = max(0, int(self._rank_expr(node.value.args[0]) or 0) - 2) if node.value.args else 0
                 for _e in node.targets[0].elts[:2]:
                     if isinstance(_e, ast.Name):
-                        self._mark_real(_e.id)
+                        if _sl_b:
+                            self._mark_alloc_real(self._aliased_name(_e.id), rank=_sl_b)
+                        else:
+                            self._mark_real(_e.id)
             if (
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
@@ -48485,22 +48712,28 @@ class translator(ast.NodeVisitor):
                     and self._is_linalg_module_attr(node.value.func.value)
                 ):
                     outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
+                    # A stack of matrices adds its batch axis to every output.
+                    _sb = max(0, int(self._rank_expr(node.value.args[0]) or 0) - 2) if node.value.args else 0
                     if node.value.func.attr == "eig" and len(outs) >= 2:
-                        self._mark_alloc_complex(outs[0], rank=1)
-                        self._mark_alloc_complex(outs[1], rank=2)
+                        self._mark_alloc_complex(outs[0], rank=1 + _sb)
+                        self._mark_alloc_complex(outs[1], rank=2 + _sb)
                         continue
                     if node.value.func.attr == "eigh" and len(outs) >= 2:
-                        self._mark_alloc_real(outs[0], rank=1)
-                        self._mark_alloc_real(outs[1], rank=2)
+                        self._mark_alloc_real(outs[0], rank=1 + _sb)
+                        self._mark_alloc_real(outs[1], rank=2 + _sb)
                         continue
                     if node.value.func.attr == "qr" and len(outs) >= 2:
-                        self._mark_alloc_real(outs[0], rank=2)
-                        self._mark_alloc_real(outs[1], rank=2)
+                        self._mark_alloc_real(outs[0], rank=2 + _sb)
+                        self._mark_alloc_real(outs[1], rank=2 + _sb)
                         continue
                     if node.value.func.attr == "svd" and len(outs) >= 3:
-                        self._mark_alloc_real(outs[0], rank=2)
-                        self._mark_alloc_real(outs[1], rank=1)
-                        self._mark_alloc_real(outs[2], rank=2)
+                        self._mark_alloc_real(outs[0], rank=2 + _sb)
+                        self._mark_alloc_real(outs[1], rank=1 + _sb)
+                        self._mark_alloc_real(outs[2], rank=2 + _sb)
+                        continue
+                    if node.value.func.attr == "slogdet" and len(outs) >= 2 and _sb:
+                        self._mark_alloc_real(outs[0], rank=_sb)
+                        self._mark_alloc_real(outs[1], rank=_sb)
                         continue
                     if node.value.func.attr == "lstsq" and len(outs) >= 1:
                         first_t = node.targets[0].elts[0]
@@ -54208,6 +54441,46 @@ class translator(ast.NodeVisitor):
                     outs.append("_")
                 else:
                     raise NotImplementedError("tuple assignment targets must be names or starred ignores")
+            _stack_r = int(self._rank_expr(v.args[0]) or 0) if v.args else 0
+            if _stack_r >= 3 and v.func.attr in {"eig", "eigh", "qr", "svd", "slogdet"}:
+                # A stack of matrices: the stacked subroutines (batch axis first).
+                if _stack_r != 3:
+                    raise NotImplementedError(f"np.linalg.{v.func.attr} supports stacks of matrices of rank 3")
+                if self._expr_kind(v.args[0]) == "complex":
+                    raise NotImplementedError("stacked (batched) linear algebra of complex arrays is not supported")
+                _sa = self.expr(v.args[0])
+                if self._expr_kind(v.args[0]) == "int":
+                    _sa = f"real({_sa}, kind=dp)"
+                if v.func.attr == "slogdet":
+                    if outs[0] != "_":
+                        self.o.w(f"{outs[0]} = merge(-1.0_dp, 1.0_dp, stack_det({_sa}) < 0.0_dp)")
+                    if outs[1] != "_":
+                        self.o.w(f"{outs[1]} = log(abs(stack_det({_sa})))")
+                    return
+                if v.func.attr == "qr":
+                    _mode = next((kw.value for kw in v.keywords if kw.arg == "mode"), None)
+                    if _mode is not None and not (is_const_str(_mode) and _mode.value == "reduced"):
+                        raise NotImplementedError("np.linalg.qr of a stack supports only mode='reduced'")
+                _sub = {"eig": "stack_eig", "eigh": "stack_eigh", "qr": "stack_qr",
+                        "svd": "stack_svd_econ" if _svd_call_wants_economy(v) else "stack_svd"}[v.func.attr]
+                _n_out = 3 if v.func.attr == "svd" else 2
+                _ranks = {"eig": (2, 3), "eigh": (2, 3), "qr": (3, 3), "svd": (3, 2, 3)}[v.func.attr]
+                _decl = "complex(kind=dp)" if v.func.attr == "eig" else "real(kind=dp)"
+                if all(o != "_" for o in outs[:_n_out]):
+                    self.o.w(f"call {_sub}({_sa}, {', '.join(outs[:_n_out])})")
+                else:
+                    self.o.w("block")
+                    self.o.push()
+                    _tmps = [f"xp_stack_out{k}" for k in range(_n_out)]
+                    for _tn, _rk in zip(_tmps, _ranks):
+                        self.o.w(f"{_decl}, allocatable :: {_tn}({','.join(':' * _rk)})")
+                    self.o.w(f"call {_sub}({_sa}, {', '.join(_tmps)})")
+                    for _o, _tn in zip(outs[:_n_out], _tmps):
+                        if _o != "_":
+                            self.o.w(f"{_o} = {_tn}")
+                    self.o.pop()
+                    self.o.w("end block")
+                return
             if v.func.attr == "eig" and len(v.args) >= 1 and len(outs) >= 2:
                 out0, out1 = outs[0], outs[1]
                 eig_arg = self.expr(v.args[0])

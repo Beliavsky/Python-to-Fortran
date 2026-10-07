@@ -26156,3 +26156,68 @@ def test_xp2f_numpy_linalg_coverage(tmp_path: Path) -> None:
     a, b = nums(py), nums(ft)
     assert len(a) == len(b), (py, ft)
     assert all(abs(x - y) <= 1e-7 * max(1.0, abs(x)) for x, y in zip(a, b)), (py, ft)
+
+
+def test_xp2f_numpy_stacked_linalg_and_axis_permutations(tmp_path: Path) -> None:
+    # numpy's linear algebra on stacks of matrices (the last two axes are
+    # the matrices; rank 4 and up reshaped to one batch axis), batched
+    # matmul/@/einsum, and the stacked tuple forms (checked through
+    # invariants). Also silent wrong results found on the way:
+    # np.stack([m1, m2]) of matrices, np.transpose(a, axes) / moveaxis /
+    # rollaxis for a non-self-inverse permutation, and np.reshape(a, shape)
+    # of a multi-dimensional a all read elements in the wrong order.
+    exprs = [
+        "np.linalg.inv(a3)", "np.linalg.det(a3)", "np.linalg.det(k3)", "np.linalg.cholesky(a3)",
+        "np.linalg.pinv(m3)", "np.linalg.matrix_power(a3, 3)", "np.linalg.matrix_rank(r3)", "np.linalg.cond(a3)",
+        "np.linalg.eigvalsh(a3)", "np.linalg.solve(a3, b1)", "np.linalg.solve(a3, b2)", "np.linalg.solve(a3, b3)",
+        "np.linalg.norm(a3, axis=(1, 2))", "np.linalg.norm(a3, ord=2, axis=(-2, -1))", "np.linalg.matrix_norm(a3)",
+        "np.linalg.trace(a3)", "np.linalg.diagonal(m3)", "a3 @ a3", "a3 @ m2", "m2.T @ a3", "a3 @ b1", "b1 @ a3",
+        "np.einsum('bij,bjk->bik', a3, a3)", "np.einsum('bii->b', a3)", "np.linalg.det(a4)", "np.linalg.inv(a4)",
+        "np.linalg.svd(m3, compute_uv=False)", "np.linalg.slogdet(a3)[1]", "np.linalg.eigh(a3)[0]",
+        "np.stack([m2, m2 * 10])", "np.stack([a3, a3 * 10], axis=1)", "np.transpose(a3, (2, 0, 1))",
+        "np.moveaxis(a3, 0, -1)", "np.rollaxis(a3, 2)", "np.reshape(m2, (3, 2))", "np.expand_dims(m2, 0)",
+    ]
+    lines = [
+        "import numpy as np",
+        "a3 = np.array([[[4.0, 1.0], [1.0, 3.0]], [[2.0, 0.5], [0.5, 1.0]], [[5.0, 2.0], [2.0, 6.0]]])",
+        "k3 = np.array([[[2, 1], [1, 3]], [[4, 1], [2, 5]]])",
+        "m3 = np.array([[[1.0, 2.0, 0.5], [0.0, 1.0, 3.0]], [[2.0, -1.0, 1.0], [1.0, 1.0, 1.0]],"
+        " [[0.5, 0.0, 2.0], [1.5, 2.0, -1.0]]])",
+        "r3 = np.array([[[1.0, 2.0], [2.0, 4.0]], [[1.0, 0.0], [0.0, 1.0]]])",
+        "m2 = np.array([[1.0, 2.0, 0.5], [0.0, 1.0, 3.0]])",
+        "b1 = np.array([1.0, 2.0])",
+        "b2 = np.array([[1.0, 0.0, 2.0], [3.0, 1.0, -1.0]])",
+        "b3 = np.array([[[1.0], [2.0]], [[0.5], [1.0]], [[2.0], [-1.0]]])",
+        "a4 = np.zeros((2, 3, 2, 2))",
+        "a4[0] = a3",
+        "a4[1] = a3 * 2.0",
+    ]
+    for k, e in enumerate(exprs):
+        lines += [f"r{k} = {e}", f"print(np.ravel(r{k}))"]
+    lines += [
+        "w, v = np.linalg.eigh(a3)",
+        "print(np.linalg.norm(a3 @ v - v * w[:, None, :]) < 1e-12)",
+        "u, s, vt = np.linalg.svd(m3, full_matrices=False)",
+        "print(np.linalg.norm(u @ (s[:, :, None] * vt) - m3) < 1e-12)",
+        "q, r = np.linalg.qr(m3)",
+        "print(np.ravel(np.abs(r)), np.linalg.norm(q @ r - m3) < 1e-12)",
+        "sign, logdet = np.linalg.slogdet(a3)",
+        "print(sign, logdet)",
+    ]
+    src = tmp_path / "xnp_stack.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    def nums(s):
+        s = s.replace("True", "1").replace("False", "0")
+        s = re.sub(r"(?<![\w.])T(?![\w.])", "1", s)
+        s = re.sub(r"(?<![\w.])F(?![\w.])", "0", s)
+        return [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+
+    py = subprocess.run([sys.executable, str(src)], capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xnp_stack_p.exe"))], capture_output=True, text=True, check=True).stdout
+    a, b = nums(py), nums(ft)
+    assert len(a) == len(b), (py, ft)
+    assert all(abs(x - y) <= 1e-7 * max(1.0, abs(x)) for x, y in zip(a, b)), (py, ft)
