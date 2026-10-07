@@ -26502,3 +26502,36 @@ def test_xp2f_masked_assignment_of_array_fills_selected_in_order(tmp_path: Path)
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_gradient_trapezoid_interp_options(tmp_path: Path) -> None:
+    # np.gradient ignored its spacing (coordinates or dx) and edge_order,
+    # and a matrix was unsupported; np.trapezoid ignored dx= and x= given
+    # as keywords; np.interp ignored left=/right= and rejected a scalar x.
+    src = tmp_path / "xcalculus.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def slope(f, x):\n"
+        "    return np.gradient(f, x, edge_order=2)\n"
+        "x = np.array([0.5, 1.0, 2.0, 3.5, 4.0, 5.0, 6.5, 7.0])\n"
+        "y = np.array([1.0, 3.0, 2.0, 5.0, 4.0, 6.0, 8.0, 7.0])\n"
+        "print(np.gradient(y, x), np.gradient(y, 0.5), np.gradient(y, edge_order=2))\n"
+        "print(slope(y, x), np.gradient(np.array([1, 4, 9, 16, 25])))\n"
+        "m = np.array([[1.0, 2.0, 4.0, 7.0], [2.0, 5.0, 3.0, 1.0], [0.0, 1.0, 1.0, 6.0]])\n"
+        "gy, gx = np.gradient(m, 0.5, np.array([0.0, 1.0, 3.0, 4.0]))\n"
+        "print(gy)\n"
+        "print(gx)\n"
+        "print(np.gradient(m, axis=1, edge_order=2))\n"
+        "print(np.trapezoid(y, dx=0.5), np.trapezoid(y, x=x), np.trapezoid(np.sin(x), x))\n"
+        "print(np.interp(np.array([-1.0, 0.7, 9.0]), x, y, left=-9.0, right=99.0), np.interp(2.0, x, y))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xcalculus_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints 8 significant digits.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)

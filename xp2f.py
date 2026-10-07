@@ -6332,6 +6332,41 @@ def _normalized_einsum(spec, nargs):
 _LINALG_TUPLE_ARITY = {"eig": 2, "eigh": 2, "svd": 3, "qr": 2, "slogdet": 2, "lstsq": 4}
 
 
+def rewrite_gradient_unpack(tree):
+    """gy, gx = np.gradient(m[, dy, dx]): one np.gradient(..., axis=k) per
+    target (numpy returns one array per axis)."""
+
+    def process(body):
+        out = []
+        for st in body:
+            for field in ("body", "orelse", "finalbody"):
+                if isinstance(getattr(st, field, None), list):
+                    setattr(st, field, process(getattr(st, field)))
+            v = getattr(st, "value", None)
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr == "gradient"
+                    and isinstance(v.func.value, ast.Name) and v.func.value.id in ("np", "numpy")
+                    and v.args and not any(k.arg == "axis" for k in v.keywords)
+                    and all(isinstance(e, ast.Name) for e in st.targets[0].elts)):
+                names = [e.id for e in st.targets[0].elts]
+                k = len(names)
+                spacing = v.args[1:]
+                used = {n.id for n in ast.walk(v) if isinstance(n, ast.Name)}
+                if len(spacing) in (0, 1, k) and not (set(names) & used):
+                    for j, nm in enumerate(names):
+                        sp = [] if not spacing else [spacing[0] if len(spacing) == 1 else spacing[j]]
+                        call = ast.Call(func=copy.deepcopy(v.func), args=[copy.deepcopy(v.args[0])] + copy.deepcopy(sp),
+                                        keywords=copy.deepcopy(v.keywords) + [ast.keyword(arg="axis", value=ast.Constant(value=j))])
+                        out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=call), st))
+                    continue
+            out.append(st)
+        return out
+
+    tree.body = process(tree.body)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_loadtxt_unpack(tree):
     """x, y = np.loadtxt(..., unpack=True): load into a temporary and take
     its columns (numpy's unpack transposes the result)."""
@@ -16007,8 +16042,10 @@ def detect_needed_helpers(tree):
         "signbit": {"signbit_real"},
         "gcd": {"gcd_int_scalar"},
         "lcm": {"lcm_int_scalar"},
-        "interp": {"interp_1d"},
-        "gradient": {"gradient_1d"},
+        "interp": {"interp_1d", "interp_0d"},
+        "gradient": {"gradient_1d", "np_gradient_1d", "np_gradient_2d"},
+        "trapezoid": {"np_trapezoid_1d"},
+        "trapz": {"np_trapezoid_1d"},
         "eye": {"eye"},
         "identity": {"eye"},
         "round": {"np_rint"},
@@ -31168,9 +31205,10 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"trapezoid", "trapz"}
+                and node.func.attr in {"trapezoid", "trapz", "gradient"}
                 and len(node.args) >= 1
             ):
+                # np.gradient is float even for an integer array.
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -44688,11 +44726,7 @@ class translator(ast.NodeVisitor):
                         return f"({a0}(2:,:) - {a0}(:size({a0},1)-1,:))"
                     return f"({a0}(:,2:) - {a0}(:,:size({a0},2)-1))"
                 if node.func.attr == "gradient":
-                    a0 = self.expr(node.args[0])
-                    r0 = self._rank_expr(node.args[0])
-                    if r0 <= 1:
-                        return f"gradient_1d({a0})"
-                    raise NotImplementedError("np.gradient currently supports only 1D arrays")
+                    return self._np_gradient(node)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -47182,7 +47216,17 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "interp"
                 and len(node.args) >= 3
             ):
-                return f"interp_1d({self.expr(node.args[0])}, {self.expr(node.args[1])}, {self.expr(node.args[2])})"
+                def _real(n):
+                    txt = self.expr(n)
+                    return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+                args = [_real(a) for a in node.args[:3]]
+                for kw in node.keywords:
+                    if kw.arg in ("left", "right"):
+                        if not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
+                            args.append(f"{kw.arg}={_real(kw.value)}")
+                    else:
+                        raise NotImplementedError(f"np.interp: unsupported argument {kw.arg}=")
+                return f"interp_{'0' if self._rank_expr(node.args[0]) == 0 else '1'}d({', '.join(args)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -47394,14 +47438,28 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"trapezoid", "trapz"}
                 and len(node.args) >= 1
             ):
-                y0 = self.expr(node.args[0])
-                x0 = self.expr(node.args[1]) if len(node.args) >= 2 else None
-                if x0 is None:
-                    return f"sum(0.5_dp * ({y0}(2:) + {y0}(:size({y0})-1)))"
-                return (
-                    f"sum(0.5_dp * ({y0}(2:) + {y0}(:size({y0})-1)) * "
-                    f"({x0}(2:) - {x0}(:size({x0})-1)))"
-                )
+                # np.trapezoid(y, x=None, dx=1.0, axis=-1) of a vector.
+                if self._rank_expr(node.args[0]) != 1:
+                    raise NotImplementedError("np.trapezoid supports a vector y")
+                opts = {"x": node.args[1] if len(node.args) >= 2 else None,
+                        "dx": node.args[2] if len(node.args) >= 3 else None}
+                for kw in node.keywords:
+                    if kw.arg in opts:
+                        opts[kw.arg] = kw.value
+                    elif kw.arg == "axis" and isinstance(kw.value, (ast.Constant, ast.UnaryOp)):
+                        continue  # a vector's only axis
+                    else:
+                        raise NotImplementedError(f"np.trapezoid: unsupported argument {kw.arg}=")
+
+                def _real(n):
+                    txt = self.expr(n)
+                    return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+                args = [_real(node.args[0])]
+                if opts["x"] is not None:
+                    args.append(f"x={_real(opts['x'])}")
+                elif opts["dx"] is not None:
+                    args.append(f"dx={_real(opts['dx'])}")
+                return f"np_trapezoid_1d({', '.join(args)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -60131,6 +60189,58 @@ class translator(ast.NodeVisitor):
 
         stmt_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
         raise NotImplementedError(f"unsupported assign: {stmt_txt}")
+
+    def _np_gradient(self, node):
+        """np.gradient(f, *spacing, axis=, edge_order=) for a vector, or a
+        matrix along one axis (np_gradient_1d / np_gradient_2d)."""
+        f = node.args[0]
+        spacing = node.args[1:]
+        axis = None
+        edge_order = 1
+        for kw in node.keywords:
+            if kw.arg == "edge_order":
+                if not (isinstance(kw.value, ast.Constant) and kw.value.value in (1, 2)):
+                    raise NotImplementedError("np.gradient: edge_order must be the literal 1 or 2")
+                edge_order = kw.value.value
+            elif kw.arg == "axis":
+                ax = kw.value
+                if isinstance(ax, ast.UnaryOp) and isinstance(ax.op, ast.USub) and isinstance(ax.operand, ast.Constant):
+                    axis = -ax.operand.value
+                elif isinstance(ax, ast.Constant) and isinstance(ax.value, int):
+                    axis = ax.value
+                else:
+                    raise NotImplementedError("np.gradient: axis must be a literal integer")
+            else:
+                raise NotImplementedError(f"np.gradient: unsupported argument {kw.arg}=")
+        rank = self._rank_expr(f)
+        if rank not in (1, 2):
+            raise NotImplementedError("np.gradient supports a vector or a matrix")
+        if axis is not None and not -rank <= axis < rank:
+            raise NotImplementedError(f"np.gradient: axis {axis} is out of bounds for an array of rank {rank}")
+        if rank == 2 and axis is None:
+            raise NotImplementedError(
+                "np.gradient of a matrix returns one array per axis: unpack it (gy, gx = np.gradient(m)) "
+                "or pass axis=")
+        if len(spacing) > 1:
+            raise NotImplementedError("np.gradient: give one spacing (a scalar or the coordinates) per axis")
+
+        def real_txt(n):
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+        args = [real_txt(f)]
+        if rank == 2:
+            args.append(str(axis % 2 + 1))
+        args.append(str(edge_order))
+        if spacing:
+            sp = spacing[0]
+            sr = self._rank_expr(sp)
+            if sr == 0:
+                args.append(f"dx={real_txt(sp)}")
+            elif sr == 1:
+                args.append(f"x={real_txt(sp)}")
+            else:
+                raise NotImplementedError("np.gradient: a spacing must be a scalar or a vector of coordinates")
+        return f"np_gradient_{rank}d({', '.join(args)})"
 
     def _masked_assign_compact_rhs(self, t, v):
         """x[mask] = values: numpy puts the values, in order (C order for an
@@ -82263,6 +82373,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
+    tree = rewrite_gradient_unpack(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
@@ -82796,6 +82907,7 @@ def transpile_file(
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
+    tree = rewrite_gradient_unpack(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
@@ -83604,6 +83716,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
+    tree = rewrite_gradient_unpack(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)

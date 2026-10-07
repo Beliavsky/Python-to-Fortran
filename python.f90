@@ -262,6 +262,7 @@ public :: reduceat_logical_and !@pyapi kind=function ret=logical(:) args=x:logic
 public :: reduceat_logical_or !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),idx:integer(:):intent(in) desc="np.logical_or.reduceat for logical vector"
 public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
+public :: np_gradient_1d, np_gradient_2d, np_trapezoid_1d, interp_0d
 public :: unwrap_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="unwrap 1D phase vector using numpy-like default discontinuity pi"
 public :: bitwise_count_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="population count for each integer element"
 public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="modified Bessel function I0 approximation (elemental)"
@@ -9381,6 +9382,122 @@ contains
          g(n) = x(n) - x(n-1)
       end function gradient_1d
 
+      pure function np_trapezoid_1d(y, dx, x) result(s)
+         ! np.trapezoid(y, x=x | dx=dx) of a vector, summed as numpy does:
+         ! sum(d * (y[1:] + y[:-1]) / 2).
+         real(kind=dp), intent(in) :: y(:)
+         real(kind=dp), intent(in), optional :: dx
+         real(kind=dp), intent(in), optional :: x(:)
+         real(kind=dp) :: s, d
+         integer :: n
+         n = size(y)
+         s = 0.0_dp
+         if (present(x)) then
+            if (size(x) /= n) error stop "np.trapezoid: x and y must have the same length"
+            if (n >= 2) s = sum((x(2:n) - x(1:n-1)) * (y(2:n) + y(1:n-1)) / 2.0_dp)
+         else
+            d = 1.0_dp
+            if (present(dx)) d = dx
+            if (n >= 2) s = sum(d * (y(2:n) + y(1:n-1)) / 2.0_dp)
+         end if
+      end function np_trapezoid_1d
+
+      pure function np_gradient_1d(f, edge_order, dx, x) result(g)
+         ! np.gradient(f, [dx | x], edge_order=...) of a vector, with numpy's
+         ! formulas: second-order interior differences (for uneven
+         ! coordinates x too), first- or second-order one-sided edges.
+         ! Evenly spaced coordinates are treated as uniform, as numpy does.
+         real(kind=dp), intent(in) :: f(:)
+         integer, intent(in) :: edge_order
+         real(kind=dp), intent(in), optional :: dx
+         real(kind=dp), intent(in), optional :: x(:)
+         real(kind=dp), allocatable :: g(:), h(:), dx1(:), dx2(:)
+         real(kind=dp) :: s, a, b, c, d1, d2
+         logical :: uniform
+         integer :: n
+         n = size(f)
+         if (edge_order /= 1 .and. edge_order /= 2) error stop "np.gradient: edge_order must be 1 or 2"
+         if (n < edge_order + 1) error stop "np.gradient: shape of array too small to calculate a numerical " // &
+            "gradient, at least (edge_order + 1) elements are required"
+         allocate(g(n))
+         s = 1.0_dp
+         if (present(dx)) s = dx
+         uniform = .true.
+         if (present(x)) then
+            if (size(x) /= n) error stop "np.gradient: when 1d, distances must match the length of the " // &
+               "corresponding dimension"
+            h = x(2:n) - x(1:n-1)
+            if (all(h == h(1))) then
+               s = h(1)
+            else
+               uniform = .false.
+            end if
+         end if
+         if (uniform) then
+            g(2:n-1) = (f(3:n) - f(1:n-2)) / (2.0_dp * s)
+         else
+            dx1 = h(1:n-2)
+            dx2 = h(2:n-1)
+            g(2:n-1) = -(dx2) / (dx1 * (dx1 + dx2)) * f(1:n-2) + (dx2 - dx1) / (dx1 * dx2) * f(2:n-1) &
+               + dx1 / (dx2 * (dx1 + dx2)) * f(3:n)
+         end if
+         if (edge_order == 1) then
+            if (uniform) then
+               g(1) = (f(2) - f(1)) / s
+               g(n) = (f(n) - f(n-1)) / s
+            else
+               g(1) = (f(2) - f(1)) / h(1)
+               g(n) = (f(n) - f(n-1)) / h(n-1)
+            end if
+         else
+            if (uniform) then
+               a = -1.5_dp / s
+               b = 2.0_dp / s
+               c = -0.5_dp / s
+            else
+               d1 = h(1)
+               d2 = h(2)
+               a = -(2.0_dp * d1 + d2) / (d1 * (d1 + d2))
+               b = (d1 + d2) / (d1 * d2)
+               c = -d1 / (d2 * (d1 + d2))
+            end if
+            g(1) = a * f(1) + b * f(2) + c * f(3)
+            if (uniform) then
+               a = 0.5_dp / s
+               b = -2.0_dp / s
+               c = 1.5_dp / s
+            else
+               d1 = h(n-2)
+               d2 = h(n-1)
+               a = d2 / (d1 * (d1 + d2))
+               b = -(d2 + d1) / (d1 * d2)
+               c = (2.0_dp * d2 + d1) / (d2 * (d1 + d2))
+            end if
+            g(n) = a * f(n-2) + b * f(n-1) + c * f(n)
+         end if
+      end function np_gradient_1d
+
+      pure function np_gradient_2d(f, dim, edge_order, dx, x) result(g)
+         ! np.gradient(f, ..., axis=dim-1) of a matrix: each column (dim 1)
+         ! or row (dim 2) differentiated by np_gradient_1d.
+         real(kind=dp), intent(in) :: f(:,:)
+         integer, intent(in) :: dim, edge_order
+         real(kind=dp), intent(in), optional :: dx
+         real(kind=dp), intent(in), optional :: x(:)
+         real(kind=dp), allocatable :: g(:,:)
+         integer :: k
+         allocate(g(size(f, 1), size(f, 2)))
+         if (dim == 1) then
+            do k = 1, size(f, 2)
+               g(:, k) = np_gradient_1d(f(:, k), edge_order, dx, x)
+            end do
+         else
+            do k = 1, size(f, 1)
+               g(k, :) = np_gradient_1d(f(k, :), edge_order, dx, x)
+            end do
+         end if
+      end function np_gradient_2d
+
       pure function unwrap_1d(x) result(y)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
@@ -9501,8 +9618,20 @@ contains
          end do
       end function lcm_int
 
-      pure function interp_1d(x, xp, fp) result(y)
+      pure function interp_0d(x, xp, fp, left, right) result(y)
+         ! np.interp of a scalar x.
+         real(kind=dp), intent(in) :: x, xp(:), fp(:)
+         real(kind=dp), intent(in), optional :: left, right
+         real(kind=dp) :: y, r(1)
+         r = interp_1d([x], xp, fp, left, right)
+         y = r(1)
+      end function interp_0d
+
+      pure function interp_1d(x, xp, fp, left, right) result(y)
+         ! np.interp(x, xp, fp, left=, right=): the values outside xp are
+         ! left (default fp(1)) and right (default fp(n)).
          real(kind=dp), intent(in) :: x(:), xp(:), fp(:)
+         real(kind=dp), intent(in), optional :: left, right
          real(kind=dp), allocatable :: y(:)
          integer :: i, j, n
          real(kind=dp) :: t
@@ -9511,10 +9640,16 @@ contains
          if (size(xp) /= size(fp)) error stop "interp_1d: xp/fp size mismatch"
          if (size(xp) == 0) error stop "interp_1d: xp must be nonempty"
          do i = 1, n
-            if (x(i) <= xp(1)) then
+            if (x(i) < xp(1)) then
                y(i) = fp(1)
-            else if (x(i) >= xp(size(xp))) then
+               if (present(left)) y(i) = left
+            else if (x(i) > xp(size(xp))) then
                y(i) = fp(size(fp))
+               if (present(right)) y(i) = right
+            else if (x(i) == xp(size(xp))) then
+               y(i) = fp(size(fp))
+            else if (x(i) == xp(1)) then
+               y(i) = fp(1)
             else
                do j = 1, size(xp) - 1
                   if (x(i) >= xp(j) .and. x(i) <= xp(j + 1)) then

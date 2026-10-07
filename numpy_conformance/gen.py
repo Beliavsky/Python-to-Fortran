@@ -424,6 +424,20 @@ FIXTURES.update({
     "q82": "np.array([[100, -3, 50], [7, 127, -128]], dtype=np.int8)",
 })
 PLACEHOLDERS["Q"] = ["q8", "qu8", "q16", "qu16"]
+
+# Phase 7: numerical calculus on samples (uneven coordinates xc).
+FIXTURES["xc"] = "np.array([0.0, 0.5, 1.5, 3.0, 3.5, 5.0])"
+SPECS["calculus"] = [
+    "np.gradient({N1})", "np.gradient({N1}, 0.5)", "np.gradient({N1}, xc)", "np.gradient({N1}, xc, edge_order=2)",
+    "np.gradient({N1}, edge_order=2)", "np.gradient({N1}, np.linspace(0.0, 2.5, 6))", "np.gradient({N1}[:2])",
+    "np.gradient({N2}, axis=0)", "np.gradient({N2}, axis=1)", "np.gradient({N2}, 2.0, axis=-1, edge_order=2)",
+    "np.gradient({N2}, xc[:3], axis=1)", "STMT w1, w2 = np.gradient({N2}) => w1 + 10 * w2",
+    "STMT w1, w2 = np.gradient({N2}, 0.5, xc[:3]) => w1 - w2",
+    "np.trapezoid({N1})", "np.trapezoid({N1}, xc)", "np.trapezoid({N1}, dx=0.5)",
+    "np.interp(np.array([0.25, 2.0, 4.9]), xc, {N1})", "np.interp(np.array([-1.0, 6.0]), xc, {N1}, left=-5.0, right=5.0)",
+    "np.interp({S}, xc, {N1})", "np.diff({N1}) / np.diff(xc)",
+]
+
 SPECS["dtypes"] = [
     "{Q} + {Q}", "{Q} * 3", "{Q} - 100", "-{Q}", "{Q} // 3", "{Q} % 7", "{Q} ** 2", "np.abs({Q})",
     "{Q} + i1", "{Q} * 1.5", "{Q} / 2", "q8 + q16", "q8 + qu8", "qu8 + q16", "qu8 + qu16", "q8 * qu8",
