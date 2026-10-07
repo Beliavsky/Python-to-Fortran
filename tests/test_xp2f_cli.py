@@ -18688,6 +18688,11 @@ def test_xp2f_xrosetta_least_squares_callback_results(tmp_path: Path, int_kind: 
     ft = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run", *options],
                         cwd=tmp_path, capture_output=True, text=True, check=False)
     assert py.returncode == 0, py.stdout + py.stderr
+    if int_kind is None:
+        # The example's integer product (36288000000000000) overflows the
+        # default 32-bit integer: the debug build stops there with a note.
+        assert "most likely an integer overflow" in ft.stdout, ft.stdout + ft.stderr
+        return
     assert ft.returncode == 0, ft.stdout + ft.stderr
     # The whole example intentionally exercises array/tuple/formatting output;
     # compare numerical fitting results independently of presentation differences.
@@ -26355,7 +26360,7 @@ def test_xp2f_numpy_loadtxt_savetxt_basic_uses(tmp_path: Path) -> None:
 
 def test_xp2f_integer_overflow_traps_in_debug_build(tmp_path: Path) -> None:
     # Fortran's default integer is 32-bit, numpy's 64-bit: the default
-    # (debug) build uses -ftrapv so an overflow aborts with a note instead
+    # (debug) build traps signed overflow so it stops with a note instead
     # of printing a silently wrapped value; a sum that fits still matches.
     bad = tmp_path / "xovf.py"
     bad.write_text("import numpy as np\nprint(np.sum(np.arange(100000)))\n", encoding="utf-8")
@@ -26391,3 +26396,47 @@ def test_xp2f_int_kind_int64_widens_integer_helper_results(tmp_path: Path) -> No
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
     assert "4999950000" in proc.stdout
+
+
+def test_xp2f_numpy_small_int_dtypes_wrap_like_numpy(tmp_path: Path) -> None:
+    # int8/int16/uint8/uint16 values are default Fortran integers; their
+    # arithmetic, astype and np.int8(...) must wrap around as numpy's do,
+    # following numpy 2's promotion (a Python int takes the array's dtype,
+    # sum widens to int64), also through local functions; iinfo and dtype
+    # comparisons are numpy's.
+    src = tmp_path / "xsmallint.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def f(v, k):\n"
+        "    return v * k + 100\n"
+        "a = np.array([100, -120, 7, 127], dtype=np.int8)\n"
+        "u = np.array([250, 3, 128, 0], dtype=np.uint8)\n"
+        "h = np.array([30000, -5, 32767, 1], dtype=np.int16)\n"
+        "print(a + a, a * 3, -a, a // 3, np.abs(a), a + h, a + u, u - 5)\n"
+        "print(np.sum(a), np.cumsum(a), np.max(a) + 100, a[0] + 100, np.diff(a), f(a, 2))\n"
+        "w = a.copy()\n"
+        "w += 100\n"
+        "s = 0\n"
+        "for v in a:\n"
+        "    s = s + v\n"
+        "print(w, s, np.array([200, 300, -129]).astype(np.int8), np.array([1.7, -2.9, 300.0]).astype(np.uint8))\n"
+        "print(np.iinfo(np.int8).min, np.iinfo(np.uint16).max, np.iinfo(np.int32).min, a.dtype == np.int8)\n"
+        "print(np.array([1, 2]).dtype == np.int64, np.array([1.0]).dtype == np.int64)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # numpy warns about the scalar overflows on stderr; compare the values.
+    py = subprocess.run([sys.executable, "-W", "ignore", str(src)], cwd=tmp_path, capture_output=True,
+                        text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xsmallint_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    toks = lambda s: re.findall(r"-?\d+|True|False|\bT\b|\bF\b", s)
+    assert [{"T": "True", "F": "False"}.get(x, x) for x in toks(ft)] == toks(py), (py, ft)
+    bad = tmp_path / "xsmallint_bad.py"
+    bad.write_text("import numpy as np\ndef f(v):\n    return v + 100\n"
+                   "print(f(np.array([100], dtype=np.int8)), f(np.array([100])))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad)], cwd=tmp_path, capture_output=True,
+                          text=True, check=False)
+    assert "a small-integer dtype must be the same at every call" in proc.stdout + proc.stderr

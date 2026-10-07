@@ -38,6 +38,7 @@ from datetime import datetime
 from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import fortran_output as fout
 import fortran_int_kind as fikind
+import numpy_small_int as npsmallint
 import fortran_perf_hints as fphints
 import fortran_print_suppress as fpsuppress
 import fortran_loop_reorder as floop
@@ -2739,25 +2740,44 @@ def run_python_with_rng_replay(input_py, replay_path, tee=False, stream_line_fil
 def debug_flags_for_compiler(compiler_exe):
     low = (compiler_exe or "").lower()
     if "gfortran" in low:
-        # -ftrapv: a signed integer overflow aborts (numpy's int64 values
+        # A signed integer overflow stops the program (numpy's int64 values
         # can exceed the default 32-bit integer) instead of wrapping silently.
-        return ["-g", "-fcheck=all", "-fbacktrace", "-ffpe-trap=invalid,zero,overflow", "-ftrapv"]
+        return ["-g", "-fcheck=all", "-fbacktrace", "-ffpe-trap=invalid,zero,overflow", *INT_OVERFLOW_TRAP_FLAGS]
     if low in {"ifx", "ifort"} or low.endswith("\\ifx.exe") or low.endswith("\\ifort.exe"):
         return ["-g", "-traceback", "-check", "all", "-fpe0"]
     # Conservative fallback for unknown Fortran compilers.
     return ["-g"]
 
 
+# gfortran: trap a signed integer overflow in the generated program's
+# arithmetic (including inlined sum/product); the runtime helpers are
+# compiled without it (see _prepare_helper_link_inputs). UBSan's trap mode
+# needs no runtime library, so it also works with MinGW. -ftrapv is not
+# used: it also traps gfortran's own dead index arithmetic on the
+# descriptor of a not yet allocated array (`a = f(x)` with elemental f).
+INT_OVERFLOW_TRAP_FLAGS = ["-fsanitize=signed-integer-overflow", "-fsanitize-undefined-trap-on-error"]
+
+
 def default_compiler_command():
-    return "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -ftrapv -Wfatal-errors"
+    return ("gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow "
+            + " ".join(INT_OVERFLOW_TRAP_FLAGS) + " -Wfatal-errors")
 
 
 def _integer_overflow_hint(output, compiler_parts):
-    """A note for a run aborted by -ftrapv (SIGABRT with only addresses in
-    the backtrace): the likely cause is a 32-bit integer overflow."""
-    if "-ftrapv" in " ".join(compiler_parts or []) and "SIGABRT" in (output or ""):
-        print("Note: the program aborted under -ftrapv, most likely an integer overflow: Fortran's default "
-              "integer is 32-bit, numpy's 64-bit (values beyond 2147483647 need 64-bit integers).")
+    """A note for a run stopped by the signed-overflow trap (SIGILL with
+    only addresses in the backtrace): likely a 32-bit integer overflow."""
+    if INT_OVERFLOW_TRAP_FLAGS[0] in " ".join(compiler_parts or []) and "SIGILL" in (output or ""):
+        print("Note: the program stopped on a trap, most likely an integer overflow: Fortran's default "
+              "integer is 32-bit, numpy's 64-bit (values beyond 2147483647 need 64-bit integers; "
+              "--int-kind int64 declares the generated integers 64-bit).")
+
+
+def _big_integer_literal_hint(output):
+    """A note for a build failing on an integer literal beyond the default
+    (32-bit) kind, which --int-kind int64 makes valid."""
+    if "Integer too big for its kind" in (output or ""):
+        print("Note: an integer constant exceeds Fortran's default 32-bit integer (numpy's is 64-bit); "
+              "--int-kind int64 declares the generated integers 64-bit.")
 
 
 def default_timing_compiler_command():
@@ -3165,6 +3185,18 @@ def find_parameters(tree, local_funcs=None):
             except (TypeError, ValueError):
                 pass
     return params
+
+
+def _int_param_decl(name, val):
+    """`integer, parameter :: name = val`; -2**31 is written -2147483647 - 1
+    (the literal 2147483648 alone overflows the default kind)."""
+    try:
+        v = int(str(val).strip())
+    except ValueError:
+        return f"integer, parameter :: {name} = {val}"
+    if v in (-2 ** 31, -2 ** 63):
+        return f"integer, parameter :: {name} = {v + 1} - 1"
+    return f"integer, parameter :: {name} = {val}"
 
 
 def const_comment(name, tree):
@@ -10626,7 +10658,9 @@ def simplify_index_arithmetic_notation(lines):
             def _idx_const_binop_repl(m):
                 a = int(m.group(1))
                 b = int(m.group(3))
-                return str(a + b if m.group(2) == "+" else a - b)
+                v = a + b if m.group(2) == "+" else a - b
+                # -2147483647 - 1 stays: the literal 2147483648 overflows.
+                return str(v) if -2 ** 31 < v <= 2 ** 31 - 1 else m.group(0)
 
             seg = re_idx_const_binop.sub(_idx_const_binop_repl, seg)
             seg = re_nested_const_binop.sub(_idx_const_binop_repl, seg)
@@ -30629,6 +30663,8 @@ class translator(ast.NodeVisitor):
                 nm = self._aliased_name(node.value.id)
                 if nm in self.structured_array_types:
                     return "char"
+            if node.attr == "dtype":
+                return "char"  # translated to its name ("int64", ...)
             if node.attr == "size" and isinstance(node.value, ast.Name):
                 return "int"
             if node.attr == "shape":
@@ -38280,6 +38316,15 @@ class translator(ast.NodeVisitor):
             if isinstance(v, bool):
                 return ".true." if v else ".false."
             if isinstance(v, int):
+                if not -2 ** 63 <= v <= 2 ** 63 - 1:
+                    raise NotImplementedError(f"integer literal {v} exceeds int64")
+                if v in (-2 ** 31, -2 ** 63):
+                    # The literal 2147483648 (9223372036854775808) alone
+                    # overflows its kind. A literal beyond the default
+                    # integer otherwise stays a compile error unless
+                    # --int-kind int64 widens it (an int64 literal would
+                    # be truncated silently in a default-integer variable).
+                    return f"({v + 1} - 1)"
                 return str(v)
             if isinstance(v, float):
                 return f"{repr(v)}_dp"
@@ -39074,6 +39119,9 @@ class translator(ast.NodeVisitor):
 
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.USub):
+                if (isinstance(node.operand, ast.Constant) and type(node.operand.value) is int
+                        and node.operand.value in (2 ** 31, 2 ** 63)):
+                    return self.expr(ast.Constant(value=-node.operand.value))
                 return f"(-{self.expr(node.operand)})"
             if isinstance(node.op, ast.UAdd):
                 return f"(+{self.expr(node.operand)})"
@@ -44639,6 +44687,10 @@ class translator(ast.NodeVisitor):
                             out += (" - " if c < 0 else (" + " if out else "")) + mag + term
                         return f"({out.strip()})"
                     if r0 <= 1:
+                        if not re.fullmatch(r"[A-Za-z_]\w*(%\w+)*", a0.strip()):
+                            # An expression (an array constructor, a call) cannot be sliced.
+                            return (f"pack(eoshift({a0}, 1) - {a0}, "
+                                    f"eoshift(spread(.true., 1, size({a0})), 1, .false.))")
                         return f"({a0}(2:) - {a0}(:size({a0})-1))"
                     if isinstance(node.args[0], ast.Call):
                         if axis == 0:
@@ -47589,14 +47641,22 @@ class translator(ast.NodeVisitor):
                         return fstr("float32")
                     if rtag == "real64":
                         return fstr("float64")
+                    # numpy's names (an int array is int64, its default integer).
                     if nm in self.alloc_ints or nm in self.ints:
-                        return fstr("int")
+                        return fstr("int64")
                     if nm in self.alloc_complexes or nm in self.complexes:
-                        return fstr("complex")
+                        return fstr("complex128")
                     if nm in self.alloc_reals or nm in self.reals:
-                        return fstr("float")
+                        return fstr("float64")
                     if nm in self.alloc_logs or nm in self.logs:
                         return fstr("bool")
+                # An expression (np.array([1, 2]).dtype): its inferred kind.
+                _dk = self._expr_kind(node.value)
+                if _dk == "real":
+                    rtag = self._expr_real_kind_tag(node.value)
+                    return fstr("float32" if rtag == "real32" else "float64")
+                if _dk in {"int", "complex", "logical"}:
+                    return fstr({"int": "int64", "complex": "complex128", "logical": "bool"}[_dk])
                 return fstr("unknown")
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "pi":
                 return "acos(-1.0_dp)"
@@ -80541,7 +80601,7 @@ def generate_flat(
         om.w("integer, parameter :: sp = real32")
         om.w("integer, parameter :: dp = real64")
         for name, val in params.items():  # insertion order = dependency order
-            om.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
+            om.w(f"{_int_param_decl(name, val)} ! {const_comment(name, tree)}")
         for _gnm in sorted(module_global_decls):
             _gk, _gr = module_global_decls[_gnm]
             if _gr > 0:
@@ -81064,7 +81124,7 @@ def generate_flat(
         _emit_type_defs(o)
 
     for name, val in params.items():  # insertion order = dependency order
-        o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
+        o.w(f"{_int_param_decl(name, val)} ! {const_comment(name, tree)}")
 
     tr = translator(
         o,
@@ -81685,7 +81745,7 @@ def generate_structured(tree, stem, helper_uses, params, needed_helpers, list_co
     o.w(f"use main_mod, only: {run_name}")
     o.w("implicit none")
     for name, val in params.items():  # insertion order = dependency order
-        o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
+        o.w(f"{_int_param_decl(name, val)} ! {const_comment(name, tree)}")
     o.w("")
     if rng_replay_path:
         o.w(f"call rng_replay_init({fstr(str(rng_replay_path))})")
@@ -81979,6 +82039,10 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
     For helper Fortran sources, reuse <basename>.o in current directory when present
     together with required .mod files. Otherwise compile once to that object.
     """
+    # The integer-overflow trap is for the generated program only: with it,
+    # gfortran reads the descriptor of an absent optional array argument
+    # that a helper passes on (loadtxt's usecols=usecols) and crashes.
+    compiler_parts = [p for p in compiler_parts if p not in INT_OVERFLOW_TRAP_FLAGS and p != "-ftrapv"]
     helper_list = list(helper_files)
     helper_names = {Path(h).name.lower() for h in helper_list}
     if "python.f90" in helper_names and "lapack_d.f90" not in helper_names:
@@ -82131,6 +82195,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
+    tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -82663,6 +82728,7 @@ def transpile_file(
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
+    tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -83470,6 +83536,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
+    tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -84293,6 +84360,7 @@ def main():
                 print(cp.stdout.rstrip())
             if cp.stderr.strip():
                 print(cp.stderr.rstrip())
+            _big_integer_literal_hint(cp.stdout + cp.stderr)
             if args.autofix:
                 autofix_compile_status = "attempted"
                 af_rc = _run_xautofix([out, *helper_files], runtime=False)

@@ -1295,17 +1295,23 @@ def _fold_simple_integer_arithmetic(stmt: str) -> str:
                 return m.group(0)
         a = int(m.group(1))
         b = int(m.group(3))
+
+        def _fits(v: int) -> str:
+            # A result outside the default integer kind is not folded:
+            # `-2147483647 - 1` is the way to write -2**31 (the literal
+            # 2147483648 alone overflows).
+            return str(v) if -2 ** 31 < v <= 2 ** 31 - 1 else m.group(0)
         if op == "+":
-            return str(a + b)
+            return _fits(a + b)
         if op == "-":
-            return str(a - b)
+            return _fits(a - b)
         if op == "*":
-            return str(a * b)
+            return _fits(a * b)
         if b == 0:
             return m.group(0)
         if a % b != 0:
             return m.group(0)
-        return str(a // b)
+        return _fits(a // b)
 
     prev = None
     out = stmt

@@ -413,6 +413,35 @@ _ls = SPECS.pop("linalg_stack")
 SPECS["linalg_stack_a"] = _ls[:len(_ls) // 2]
 SPECS["linalg_stack_b"] = _ls[len(_ls) // 2:]
 
+# Phase 6: small integer dtypes (numpy wraps int8/int16/uint8/uint16
+# arithmetic around; reductions such as sum widen to int64), iinfo, and
+# conversions with astype / np.int8(...).
+FIXTURES.update({
+    "q8": "np.array([100, -120, 7, 127, -128, 0], dtype=np.int8)",
+    "qu8": "np.array([200, 3, 255, 0, 128, 17], dtype=np.uint8)",
+    "q16": "np.array([30000, -30000, 5, 32767, -1, 2], dtype=np.int16)",
+    "qu16": "np.array([60000, 1, 65535, 0, 40000, 7], dtype=np.uint16)",
+    "q82": "np.array([[100, -3, 50], [7, 127, -128]], dtype=np.int8)",
+})
+PLACEHOLDERS["Q"] = ["q8", "qu8", "q16", "qu16"]
+SPECS["dtypes"] = [
+    "{Q} + {Q}", "{Q} * 3", "{Q} - 100", "-{Q}", "{Q} // 3", "{Q} % 7", "{Q} ** 2", "np.abs({Q})",
+    "{Q} + i1", "{Q} * 1.5", "{Q} / 2", "q8 + q16", "q8 + qu8", "qu8 + q16", "qu8 + qu16", "q8 * qu8",
+    "np.sum({Q})", "np.cumsum({Q})", "np.prod(q8[:3])", "np.mean({Q})", "np.max({Q}) + 100", "{Q}.min() - 100",
+    "{Q}[1] * 2", "{Q}[::2] + 100", "np.diff({Q})", "np.where({Q} > 5, {Q}, 0) + 100", "np.minimum({Q}, 5) - 100",
+    "np.sort({Q}) * 2", "np.flip({Q}) + {Q}", "np.concatenate([{Q}, {Q}]) * 3", "np.dot(q8, q8)",
+    "q82 @ q82.T", "q82.T + q82.T", "q82 * 2", "np.sum(q82, axis=0)", "np.max(q82, axis=1) + 100",
+    "{Q}.astype(int) * 1000", "{Q}.astype(np.float64) / 2", "(i1 * 50).astype(np.int8)",
+    "(f1 * 100).astype(np.int8)", "(i1 * 100).astype(np.uint8)", "(i1 * 20000).astype(np.int16)",
+    "(i1 * 30000).astype(np.uint16)", "i2.astype(np.int8) * 64", "np.int16(i0) * 20000",
+    "STMT w = {Q}.copy(); w += 100 => w", "STMT w = {Q}.copy(); w *= 3 => w", "STMT w = {Q}.copy(); w[1:3] -= 50 => w",
+    "STMT w = q8.copy(); w[0] = 3 => w * 50", "STMT w = np.zeros(3, dtype=np.int8); w[1] = 100 => w + w",
+    "STMT w = np.full(4, 7, dtype=np.uint8) => w - 10", "STMT w = np.arange(5, dtype=np.int16) => w * 10000",
+    "np.iinfo(np.int8).max", "np.iinfo(np.int8).min", "np.iinfo(np.int16).min", "np.iinfo(np.uint8).max",
+    "np.iinfo(np.int32).min", "np.iinfo(np.int32).max", "np.iinfo(int).bits",
+    "{Q}.dtype == np.int8", "i1.dtype == np.int64", "f1.dtype == np.float64", "f1.dtype != np.int64",
+]
+
 # Edge-case inputs (phase 3): program "<spec>__<edge>" runs <spec>'s
 # templates with the placeholders mapped to these fixtures instead; only
 # cases that use one of them are kept.
