@@ -18688,11 +18688,6 @@ def test_xp2f_xrosetta_least_squares_callback_results(tmp_path: Path, int_kind: 
     ft = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run", *options],
                         cwd=tmp_path, capture_output=True, text=True, check=False)
     assert py.returncode == 0, py.stdout + py.stderr
-    if int_kind is None:
-        # The example's integer product (36288000000000000) overflows the
-        # default 32-bit integer: the debug build stops there with a note.
-        assert "most likely an integer overflow" in ft.stdout, ft.stdout + ft.stderr
-        return
     assert ft.returncode == 0, ft.stdout + ft.stderr
     # The whole example intentionally exercises array/tuple/formatting output;
     # compare numerical fitting results independently of presentation differences.
@@ -26358,20 +26353,20 @@ def test_xp2f_numpy_loadtxt_savetxt_basic_uses(tmp_path: Path) -> None:
     assert nums(py) == pytest.approx(nums(ft))
 
 
-def test_xp2f_integer_overflow_traps_in_debug_build(tmp_path: Path) -> None:
-    # Fortran's default integer is 32-bit, numpy's 64-bit: the default
-    # (debug) build traps signed overflow so it stops with a note instead
-    # of printing a silently wrapped value; a sum that fits still matches.
+def test_xp2f_integer_overflow_traps_with_option(tmp_path: Path) -> None:
+    # Fortran's default integer is 32-bit, numpy's 64-bit: with
+    # --trap-int-overflow the program stops with a note instead of printing
+    # a silently wrapped value; a sum that fits still matches.
     bad = tmp_path / "xovf.py"
     bad.write_text("import numpy as np\nprint(np.sum(np.arange(100000)))\n", encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad), "--run-diff"],
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad), "--run-diff", "--trap-int-overflow"],
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     out = proc.stdout + proc.stderr
     assert "704982704" not in out
     assert "most likely an integer overflow" in out, out
     ok = tmp_path / "xnovf.py"
     ok.write_text("import numpy as np\nprint(np.sum(np.arange(1000)), np.prod(np.arange(1, 10)))\n", encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(ok), "--run-diff"],
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(ok), "--run-diff", "--trap-int-overflow"],
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
 
@@ -26440,3 +26435,32 @@ def test_xp2f_numpy_small_int_dtypes_wrap_like_numpy(tmp_path: Path) -> None:
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad)], cwd=tmp_path, capture_output=True,
                           text=True, check=False)
     assert "a small-integer dtype must be the same at every call" in proc.stdout + proc.stderr
+
+
+def test_xp2f_literal_slice_bounds_clip_like_numpy(tmp_path: Path) -> None:
+    # numpy clips slice bounds to the array (x[2:100] of a length-5 x is
+    # x[2:5]); literal bounds were emitted unclipped (a bounds error, or an
+    # out-of-bounds read in an optimized build). s[:-1] of a string kept the
+    # last character.
+    src = tmp_path / "xslice_clip.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def strip_last(t):\n"
+        "    return t[:-1] + '|' + t[-1:] + '|' + t[:-2]\n"
+        "x = np.arange(5.0)\n"
+        "print(x[2:100], x[-100:2], x[10:], x[:-10], x[3:1], x[:10])\n"
+        "print(x[::10], x[1:100:2], x[100:0:-1], x[-100::-1], x[::-7], x[4:-100:-2])\n"
+        "m = np.arange(12.0).reshape(3, 4)\n"
+        "print(m[1:10, 2:99], m[-9:, :1])\n"
+        "x[3:100] = 7.0\n"
+        "x[-100:1] = -1.0\n"
+        "print(x)\n"
+        "a = [1, 2, 3, 4, 5]\n"
+        "print(a[2:100], a[-100:2], a[10:])\n"
+        "s = 'hello'\n"
+        "print(s[2:100], s[-100:2], s[10:] == '', s[:-1], strip_last(s), strip_last('abc'))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

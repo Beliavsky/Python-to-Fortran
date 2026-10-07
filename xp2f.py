@@ -2740,27 +2740,26 @@ def run_python_with_rng_replay(input_py, replay_path, tee=False, stream_line_fil
 def debug_flags_for_compiler(compiler_exe):
     low = (compiler_exe or "").lower()
     if "gfortran" in low:
-        # A signed integer overflow stops the program (numpy's int64 values
-        # can exceed the default 32-bit integer) instead of wrapping silently.
-        return ["-g", "-fcheck=all", "-fbacktrace", "-ffpe-trap=invalid,zero,overflow", *INT_OVERFLOW_TRAP_FLAGS]
+        return ["-g", "-fcheck=all", "-fbacktrace", "-ffpe-trap=invalid,zero,overflow"]
     if low in {"ifx", "ifort"} or low.endswith("\\ifx.exe") or low.endswith("\\ifort.exe"):
         return ["-g", "-traceback", "-check", "all", "-fpe0"]
     # Conservative fallback for unknown Fortran compilers.
     return ["-g"]
 
 
-# gfortran: trap a signed integer overflow in the generated program's
-# arithmetic (including inlined sum/product); the runtime helpers are
-# compiled without it (see _prepare_helper_link_inputs). UBSan's trap mode
-# needs no runtime library, so it also works with MinGW. -ftrapv is not
-# used: it also traps gfortran's own dead index arithmetic on the
-# descriptor of a not yet allocated array (`a = f(x)` with elemental f).
+# --trap-int-overflow (gfortran): trap a signed integer overflow in the
+# generated program's arithmetic (including inlined sum/product); the
+# runtime helpers are compiled without it (see
+# _prepare_helper_link_inputs). UBSan's trap mode needs no runtime
+# library, so it also works with MinGW. It is opt-in: like -ftrapv, it
+# also instruments gfortran's own dead index arithmetic on the descriptor
+# of a not yet allocated array, which can stop a correct program (seen
+# with `a = f(x)` for elemental f, and a mask assigned before a pack).
 INT_OVERFLOW_TRAP_FLAGS = ["-fsanitize=signed-integer-overflow", "-fsanitize-undefined-trap-on-error"]
 
 
 def default_compiler_command():
-    return ("gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow "
-            + " ".join(INT_OVERFLOW_TRAP_FLAGS) + " -Wfatal-errors")
+    return "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -Wfatal-errors"
 
 
 def _integer_overflow_hint(output, compiler_parts):
@@ -33170,24 +33169,36 @@ class translator(ast.NodeVisitor):
             if step_val == 0:
                 raise NotImplementedError("slice step cannot be zero")
 
-        def normalized(bound):
+        def normalized(bound, is_start):
             value = _int_const(bound)
             if value is None:
                 # A helper evaluates a possibly side-effecting bound exactly
                 # once; inline MERGE would repeat it in the sign test.
                 reverse = ".true." if step_val < 0 else ".false."
                 return f"py_slice_bound({self.expr(bound)}, {extent_expr}, {reverse})"
-            # Keep the existing compact literal-bound expressions. Runtime
-            # bounds require sign normalization and clipping in the helper.
+            # A literal bound is clipped to the array as numpy does
+            # (x[:10] of a shorter x), but only where it could reach
+            # outside it: elsewhere an out-of-range literal gives an empty
+            # Fortran section, which is numpy's result too (x[10:], x[:-9]).
+            if step_val > 0:
+                if is_start and value < 0:
+                    return f"max({extent_expr} - {-value}, 0)"
+                if not is_start and value > 0:
+                    return f"min({value}, {extent_expr})"
+            else:
+                if is_start and value >= 0:
+                    return f"min({value}, {extent_expr} - 1)"
+                if not is_start and value < 0:
+                    return f"max({extent_expr} - {-value}, -1)"
             return str(value) if value >= 0 else f"({extent_expr} - {abs(value)})"
 
-        lb = (extent_expr if step_val < 0 else "1") if slc.lower is None else f"({normalized(slc.lower)} + 1)"
+        lb = (extent_expr if step_val < 0 else "1") if slc.lower is None else f"({normalized(slc.lower, True)} + 1)"
         # Python stop is exclusive. A reverse section ends at stop+1 in
         # zero-based indices, hence stop+2 in Fortran (not stop+1).
         if slc.upper is None:
             ub = "1" if step_val < 0 else extent_expr
         else:
-            stop = normalized(slc.upper)
+            stop = normalized(slc.upper, False)
             ub = f"({stop} + 2)" if step_val < 0 else stop
         return lb, ub, step_val
 
@@ -39994,32 +40005,9 @@ class translator(ast.NodeVisitor):
                         raise NotImplementedError("character slicing with step is not supported")
                     if node.slice.lower is None and node.slice.upper is None:
                         return base
-                    if node.slice.lower is None:
-                        lo_expr = "1"
-                    elif (
-                        isinstance(node.slice.lower, ast.UnaryOp)
-                        and isinstance(node.slice.lower.op, ast.USub)
-                        and isinstance(node.slice.lower.operand, ast.Constant)
-                        and isinstance(node.slice.lower.operand.value, int)
-                        and node.slice.lower.operand.value >= 1
-                    ):
-                        k = int(node.slice.lower.operand.value)
-                        lo_expr = char_len_expr if k == 1 else f"({char_len_expr} - {k - 1})"
-                    else:
-                        lo_expr = f"({self.expr(node.slice.lower)} + 1)"
-                    if node.slice.upper is None:
-                        hi_expr = char_len_expr
-                    elif (
-                        isinstance(node.slice.upper, ast.UnaryOp)
-                        and isinstance(node.slice.upper.op, ast.USub)
-                        and isinstance(node.slice.upper.operand, ast.Constant)
-                        and isinstance(node.slice.upper.operand.value, int)
-                        and node.slice.upper.operand.value >= 1
-                    ):
-                        k = int(node.slice.upper.operand.value)
-                        hi_expr = char_len_expr if k == 1 else f"({char_len_expr} - {k})"
-                    else:
-                        hi_expr = self.expr(node.slice.upper)
+                    # The array-section bounds: Python's clipping, negative
+                    # bounds (s[:-1] ends at len(s) - 1), runtime bounds.
+                    lo_expr, hi_expr, _step = self._slice_bounds_fortran(node.slice, char_len_expr)
                     return f"{base}({lo_expr}:{hi_expr})"
                 if slice_rank > 0:
                     raise NotImplementedError("character scalar indexing supports only scalar indices")
@@ -83722,6 +83710,10 @@ def main():
     ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
     ap.add_argument("--optimize-loops", action="store_true", help="swap the nesting order of immediately-nested do loops that fill a 2D array in (outer,inner) subscript order, when provably safe -- see fortran_loop_reorder.py")
     ap.add_argument("--value-args", action="store_true", help="declare a read-only scalar dummy argument (not CHARACTER, not a derived type) VALUE instead of intent(in) -- avoids a pass-by-reference indirection on every access, a real win for hot scalar arguments (e.g. deep recursion)")
+    ap.add_argument("--trap-int-overflow", action="store_true",
+                    help="gfortran: stop the program on a signed integer overflow in the generated code "
+                         "(Fortran's default integer is 32-bit, numpy's 64-bit) instead of wrapping around; "
+                         "a diagnostic, since gfortran can also trap on its own internal index arithmetic")
     ap.add_argument("--int-kind", choices=["int32", "int64"], default=None, help="declare integers with an explicit kind (integer, parameter :: ikind = int32|int64; integer(kind=ikind) everywhere) instead of the compiler's bare default integer -- avoids silent overflow on large values, matching pyccel's own default. Excludes a fixed set of external LAPACK/scipy.optimize-bridge boundary calls, which require plain default-kind INTEGER arguments -- see fortran_int_kind.py")
     ap.add_argument("--perf-hints", action="store_true", help="print (to stderr; never modifies the generated Fortran) a warning for each row-slice or loop-strided array access found AFTER --optimize-loops has already run -- a pattern pyccel's translation typically avoids by transposing array storage, that this project's own tools can't safely fix (would mean reshaping an array's own declared layout) -- see fortran_perf_hints.py")
     ap.add_argument("--suppress-function-print", action="store_true", help="comment out every stdout PRINT/external-unit WRITE statement reachable (directly, or through any number of calls) from any FUNCTION in the generated Fortran -- a Fortran FUNCTION is usable inside an expression, and calling one that performs I/O from within another print/write statement's own argument list is a hard 'recursive I/O' crash at runtime, so this removes the risk globally rather than leaving it for a future caller to trip over. Prints a warning (to stderr) for every statement suppressed, since that is exactly where the Fortran translation's own console output starts to diverge from the original Python program's -- see fortran_print_suppress.py")
@@ -84314,6 +84306,11 @@ def main():
 
     if args.compile or args.run:
         compiler_parts = shlex.split(args.compiler)
+        if args.trap_int_overflow:
+            if not compiler_parts or "gfortran" not in compiler_parts[0].lower():
+                print("Option error: --trap-int-overflow requires gfortran.")
+                return 1
+            compiler_parts += [f for f in INT_OVERFLOW_TRAP_FLAGS if f not in compiler_parts]
         if args.time:
             if len(compiler_parts) > 1:
                 print("Compile options:", " ".join(compiler_parts[1:]))
