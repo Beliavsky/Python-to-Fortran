@@ -59511,6 +59511,11 @@ class translator(ast.NodeVisitor):
                         )
                     )
                     mask = self.expr(a1)
+                    if rhs_rank == 1:
+                        # m[i, mask] = values: in order, not elementwise.
+                        self._emit_masked_scatter(row_ref, mask, 1, self._expr_kind(t.value),
+                                                  self._expr_kind(v), self.expr(v))
+                        return
                     self.o.w(f"where (({mask}))")
                     self.o.push()
                     self.o.w(f"{row_ref} = {_array_assignment_rhs(v)}")
@@ -59530,6 +59535,11 @@ class translator(ast.NodeVisitor):
                         )
                     )
                     mask = self.expr(a0)
+                    if rhs_rank == 1:
+                        # m[mask, j] = values: in order, not elementwise.
+                        self._emit_masked_scatter(col_ref, mask, 1, self._expr_kind(t.value),
+                                                  self._expr_kind(v), self.expr(v))
+                        return
                     self.o.w(f"where (({mask}))")
                     self.o.push()
                     self.o.w(f"{col_ref} = {_array_assignment_rhs(v)}")
@@ -59769,6 +59779,25 @@ class translator(ast.NodeVisitor):
                                 return copy.deepcopy(_sub.value)
                             return _sub
 
+                    def _is_masked(_n):
+                        return (isinstance(_n, ast.Subscript) and self._expr_kind(_n.slice) == "logical"
+                                and ast.dump(_n.slice) == ast.dump(_mask))
+
+                    def _only_masked_arrays(_n):
+                        # WHERE pairs the RHS elementwise with the target, so
+                        # every array in it must be indexed by the same mask
+                        # (`x[m] = x[m] + y` with a compact y is not).
+                        if _is_masked(_n):
+                            return True
+                        if isinstance(_n, ast.expr) and not any(_is_masked(_s) for _s in ast.walk(_n)):
+                            try:
+                                return self._rank_expr(_n) == 0
+                            except Exception:
+                                return False
+                        return all(_only_masked_arrays(_c) for _c in ast.iter_child_nodes(_n))
+
+                    if not _only_masked_arrays(_node):
+                        return None
                     _rewriter = _MaskedSubscriptUnpacker()
                     _new_node = _rewriter.visit(copy.deepcopy(_node))
                     if not _rewriter.changed:
@@ -59791,11 +59820,7 @@ class translator(ast.NodeVisitor):
                     _rhs_expr = self._coerce_expr_kind(v, self.expr(v), _target_kind)
                     self.o.w(f"{self.expr(t.value)} = merge({_rhs_expr}, {self.expr(t.value)}, {self.expr(t.slice)})")
                 else:
-                    self.o.w(f"where (({self.expr(t.slice)}))")
-                    self.o.push()
-                    self.o.w(f"{self.expr(t.value)} = {_array_assignment_rhs(v)}")
-                    self.o.pop()
-                    self.o.w("end where")
+                    self._masked_assign_compact_rhs(t, v)
                 return
             if isinstance(t.slice, ast.Slice) and t.slice.lower is None and t.slice.upper is None and t.slice.step is None:
                 if not isinstance(t.value, ast.Name):
@@ -60106,6 +60131,61 @@ class translator(ast.NodeVisitor):
 
         stmt_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
         raise NotImplementedError(f"unsupported assign: {stmt_txt}")
+
+    def _masked_assign_compact_rhs(self, t, v):
+        """x[mask] = values: numpy puts the values, in order (C order for an
+        array of rank >= 2), into the selected positions -- not elementwise,
+        as WHERE would. A one-element value is repeated; another size is an
+        error, as in numpy."""
+        base = self.expr(t.value)
+        rank = self._rank_expr(t.value)
+        if rank < 1 or self._rank_expr(t.slice) != rank:
+            raise NotImplementedError("masked assignment of an array requires a full-shape mask")
+        if self._rank_expr(v) > 1:
+            raise NotImplementedError("masked assignment requires a scalar or vector value")
+        bk = self._expr_kind(t.value)
+        rk = self._expr_kind(v)
+        if bk == "logical" and rk != "logical":
+            raise NotImplementedError("masked assignment of non-Boolean values to a Boolean array is not supported")
+        rhs_node = copy.deepcopy(v)
+        for part in ast.walk(rhs_node):
+            if (isinstance(part, ast.Subscript) and self._expr_kind(part.slice) == "logical"
+                    and self._rank_expr(part.slice) > 0 and self._rank_expr(part.value) >= 2):
+                part._xp2f_c_order_mask = True
+        self._emit_masked_scatter(base, self.expr(t.slice), rank, bk, rk, self.expr(rhs_node))
+
+    def _emit_masked_scatter(self, base, mask_txt, rank, bk, rk, rhs):
+        """base(mask) = rhs with rhs the selected values in numpy's order."""
+        if rk == "logical" and bk != "logical":
+            rhs = f"merge(1, 0, {rhs})"
+        decl = {"int": "integer", "real": "real(kind=dp)", "complex": "complex(kind=dp)", "logical": "logical"}
+        dims = ",".join(":" for _ in range(rank))
+        # Rank-suffixed names beyond rank 2: a name-based post-pass treats
+        # size(x, d) of a name declared rank 1 elsewhere as size(x).
+        sfx = "" if rank <= 2 else f"_r{rank}"
+        msk = f"xp2f_update_mask{sfx}"
+        self.o.w("block")
+        self.o.push()
+        self.o.w(f"logical, allocatable :: {msk}({dims})")
+        self.o.w(f"{decl[bk]}, allocatable :: xp2f_update_rhs(:)")
+        if rank >= 3:
+            self.o.w(f"{decl[bk]}, allocatable :: xp2f_update_rev{sfx}({dims})")
+        self.o.w(f"{msk} = {mask_txt}")
+        self.o.w(f"xp2f_update_rhs = {rhs}")
+        self.o.w(f"if (size(xp2f_update_rhs) == 1) xp2f_update_rhs = spread(xp2f_update_rhs(1), 1, count({msk}))")
+        self.o.w(f'if (size(xp2f_update_rhs) /= count({msk})) error stop "masked assignment: value size does not match the number of selected elements"')
+        if rank == 1:
+            self.o.w(f"{base} = unpack(xp2f_update_rhs, {msk}, {base})")
+        elif rank == 2:
+            self.o.w(f"{base} = transpose(unpack(xp2f_update_rhs, transpose({msk}), transpose({base})))")
+        else:
+            # In numpy's order: reverse the axes, scatter column-major, and
+            # reverse back (reversing the axes is its own inverse).
+            self.o.w(f"xp2f_update_rev{sfx} = unpack(xp2f_update_rhs, {self._reverse_axes(msk, rank)}, "
+                     f"{self._reverse_axes(base, rank)})")
+            self.o.w(f"{base} = {self._reverse_axes(f'xp2f_update_rev{sfx}', rank)}")
+        self.o.pop()
+        self.o.w("end block")
 
     def visit_AugAssign(self, node):
         self._emit_comments_for(node)

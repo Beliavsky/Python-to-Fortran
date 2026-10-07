@@ -26464,3 +26464,41 @@ def test_xp2f_literal_slice_bounds_clip_like_numpy(tmp_path: Path) -> None:
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_masked_assignment_of_array_fills_selected_in_order(tmp_path: Path) -> None:
+    # numpy's x[mask] = values puts the values, in order (C order for a
+    # matrix), into the selected positions; it was a WHERE assignment,
+    # which pairs them elementwise (a shape error in a debug build, wrong
+    # values in an optimized one). Same for a row or column mask.
+    src = tmp_path / "xmask_assign.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def f(a, vals):\n"
+        "    a[a < 0] = vals\n"
+        "    return a\n"
+        "x = np.arange(6.0)\n"
+        "x[x > 2] = x[:3]\n"
+        "m = np.arange(6.0).reshape(2, 3)\n"
+        "m[m > 1] = np.array([-1.0, -2.0, -3.0, -4.0])\n"
+        "k = np.arange(6)\n"
+        "k[k % 2 == 0] = np.array([10, 20, 30])\n"
+        "z = np.arange(6.0)\n"
+        "z[z > 0] = z[z > 0] + np.array([1.0, 2.0, 3.0, 4.0, 5.0])\n"
+        "w = np.arange(6.0)\n"
+        "w[w > 3] = np.array([5.5])\n"
+        "t3 = np.arange(24.0).reshape(2, 3, 4)\n"
+        "t3[t3 > 20] = np.array([-1.0, -2.0, -3.0])\n"
+        "r = np.arange(12.0).reshape(3, 4)\n"
+        "r[0, r[0] > 1] = np.array([-1.0, -2.0])\n"
+        "r[r[:, 1] > 2, 1] = np.array([-5.0, -6.0])\n"
+        "print(x, k, z, w)\n"
+        "print(m)\n"
+        "print(t3.sum(axis=2))\n"
+        "print(r)\n"
+        "print(f(np.array([1.0, -2.0, 3.0, -4.0]), np.array([9.0, 8.0])))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
