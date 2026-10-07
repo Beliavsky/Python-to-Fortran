@@ -54,7 +54,7 @@ Python infers types at runtime; Fortran declarations fix the type of each declar
 | `z = 1 + 2j` | `complex(kind=dp) :: z`; `z = cmplx(1.0_dp, 2.0_dp, kind=dp)` |
 | `text = 'hello'` | `character(len=:), allocatable :: text`; `text = 'hello'` |
 
-Here `dp` denotes double precision, as imported in the complete example. Fortran default `real` need not be double precision. Python integers have arbitrary precision; Fortran integers have a finite range. `--int-kind int64` can widen eligible generated integer declarations, but does not provide arbitrary precision.
+Here `dp` denotes double precision, as imported in the complete example. Fortran default `real` need not be double precision. Python integers have arbitrary precision; Fortran integers have a finite range. `--int-kind int64` can widen eligible generated integer declarations, but does not provide arbitrary precision; see [Numeric and Output Pitfalls](#numeric-and-output-pitfalls).
 
 Fortran identifiers are case-insensitive. Python names such as `A` and `a` therefore need distinct generated spellings; leading underscores and other naming conflicts may also require renaming.
 
@@ -243,6 +243,7 @@ Fortran optional arguments use `optional` and `present()`. Python defaults and `
 - Python `//` floors toward negative infinity. Fortran integer division is not equivalent for negative values; generated code may need a floor-division helper.
 - Python `%` has both numeric and string-formatting meanings. Numeric remainder sign rules and formatted field widths must be handled separately.
 - `print` output is not portable byte-for-byte between Python and Fortran list-directed I/O. Array layout, exponent spelling, complex-number display, and significant digits can differ.
+- Fortran's default `integer` is normally 32-bit (at most 2147483647); numpy's default integer is 64-bit. `np.sum(np.arange(100000))` is 4999950000 in numpy but overflows a default Fortran integer. Debug builds (the default compile command) use gfortran's `-ftrapv`, so a signed integer overflow aborts the program, and `xp2f.py` adds a note naming the likely cause; optimized builds wrap around silently. `--int-kind int64` declares the generated integers 64-bit and widens the integer results of runtime helpers such as `np.arange` and `np.argsort`, so arithmetic and reductions on them are done in 64 bits. The runtime helpers themselves still compute in default integers, so a value that overflows inside one (for example an integer `np.cumsum` past 2147483647) is not fixed by `--int-kind int64`; it is trapped in debug builds.
 - Fixed-width Fortran numeric formats may print asterisks on overflow. Python formatting and runtime-string assembly can require helpers rather than a single Fortran format descriptor.
 - Random seeds alone do not guarantee the same stream across Python and Fortran generators. For supported draws, `--rng-replay` records and replays Python values when comparing runs.
 

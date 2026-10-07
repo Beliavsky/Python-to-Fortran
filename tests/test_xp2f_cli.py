@@ -26369,3 +26369,25 @@ def test_xp2f_integer_overflow_traps_in_debug_build(tmp_path: Path) -> None:
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(ok), "--run-diff"],
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_int_kind_int64_widens_integer_helper_results(tmp_path: Path) -> None:
+    # Runtime helpers return default (32-bit) integers; under --int-kind
+    # int64 their results are widened, so a sum or product over them is done
+    # in 64 bits (it overflowed before), and a result can be passed to a
+    # local procedure whose dummy is now 64-bit (a type mismatch before).
+    src = tmp_path / "xik64.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def tot(v):\n"
+        "    return np.sum(v) * 2\n"
+        "print(np.sum(np.arange(100000)))\n"
+        "x = np.arange(70000)\n"
+        "print(np.sum(x * x), np.argmax(x), len(x))\n"
+        "print(tot(np.arange(5)), np.arange(4)[np.argsort(np.array([3.0, 1.0, 2.0, 0.5]))])\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--int-kind", "int64", "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    assert "4999950000" in proc.stdout

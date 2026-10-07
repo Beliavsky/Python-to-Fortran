@@ -36,6 +36,12 @@ call is converted argument by argument:
 - a generic with a specific for other integer kinds (py_str_int64,
   py_format_int64) is left to resolve by itself, keeping the full value.
 
+With int64, a helper function's default-integer result is widened
+(`int(arange_int(...), kind=ikind)`), so arithmetic and reductions on it
+are done in 64 bits, except where it is passed straight back to a helper's
+default-integer dummy. A value that overflows inside a helper (its own
+cumsum or prod) is not fixed this way.
+
 Integer-result intrinsics without a KIND argument (size, len, nint, ...)
 get `kind=ikind`, and interface bodies import `ikind`.
 
@@ -585,9 +591,12 @@ class _Boundary:
                     names.update(re.findall(r"\b[a-z_]\w*\b", v.lower()))
         return names
 
-    def rewrite(self, code: str, int_names: Set[str]) -> str:
+    def rewrite(self, code: str, int_names: Set[str], widen: bool = True) -> str:
         """Apply the per-argument conversions to one statement whose
-        literals are already suffixed."""
+        literals are already suffixed. With int64, a helper's default-integer
+        result is widened (`int(arange_int(...), kind=ikind)`), so arithmetic
+        and reductions on it (`sum`) are done in 64 bits; not where it goes
+        straight back into a default-integer helper argument (widen=False)."""
         out: List[str] = []
         pos = 0
         for name, typebound, op, cl in self.calls(code):
@@ -600,7 +609,7 @@ class _Boundary:
             for arg, role in zip(args, roles):
                 kw = _KEYWORD_ARG_RE.match(arg)
                 prefix, value = (kw.group(1).strip(), kw.group(2)) if kw else ("", arg)
-                body = self.rewrite(value, int_names).strip()
+                body = self.rewrite(value, int_names, widen=role is None).strip()
                 if role == "legacy":
                     body = re.sub(r"(?<![\w.])(\d+)_ikind\b", r"\1", body)
                 elif role in ("in", "maybe_in", "out"):
@@ -617,6 +626,12 @@ class _Boundary:
                 new_args.append(prefix + body)
             out.append(", ".join(new_args))
             out.append(")")
+            if widen and self.narrow != "int" and not typebound and name in _INT_RESULT_HELPERS:
+                # Wrap the call just emitted; out[-3] ends with `name (`.
+                head = out[-3]
+                cut = len(head[:-1].rstrip()) - len(name)
+                out[-3] = head[:cut] + "int(" + head[cut:]
+                out.append(", kind=ikind)")
             pos = cl + 1
         out.append(code[pos:])
         return "".join(out)
