@@ -26221,3 +26221,93 @@ def test_xp2f_numpy_stacked_linalg_and_axis_permutations(tmp_path: Path) -> None
     a, b = nums(py), nums(ft)
     assert len(a) == len(b), (py, ft)
     assert all(abs(x - y) <= 1e-7 * max(1.0, abs(x)) for x, y in zip(a, b)), (py, ft)
+
+
+def test_xp2f_numpy_random_api_matches_numpy_under_replay(tmp_path: Path) -> None:
+    # numpy's random API (Generator methods and the legacy np.random
+    # functions) through the replay-aware rng_* helpers: under --rng-replay
+    # the Fortran program uses numpy's recorded draws and must print
+    # exactly numpy's results. Covers integers/randint (high-only form,
+    # endpoint=), choice (n or an array expression, replace=False, p=),
+    # permutation, shuffle (rows of a matrix), the distributions, scalar
+    # draws, several draws in one expression (Python's evaluation order) and
+    # a draw used twice by its translation (np.std(rng.random(...))).
+    lines = [
+        "import numpy as np",
+        "rng = np.random.default_rng(11)",
+        "print(rng.integers(0, 10, size=5), rng.integers(5), rng.integers(1, 6, size=(2, 3), endpoint=True))",
+        "print(rng.choice(5, 3), rng.choice(5, 3, replace=False), rng.choice([10, 20, 30, 40], size=3))",
+        "print(rng.choice(4, size=6, p=[0.1, 0.2, 0.3, 0.4]))",
+        "print(rng.permutation(6))",
+        "m = np.arange(6.0).reshape(3, 2)",
+        "rng.shuffle(m)",
+        "print(m)",
+        "print(rng.exponential(2.0, 3), rng.poisson(3.0, 3), rng.binomial(10, 0.3, 3))",
+        "print(rng.gamma(2.0, 1.5, 3), rng.beta(2.0, 3.0, 3), rng.lognormal(0.5, 0.25, 3))",
+        "print(rng.chisquare(3.0, 2), rng.geometric(0.3, 2), rng.standard_t(5.0, 2), rng.triangular(0.0, 1.0, 3.0, 2))",
+        "print(rng.multivariate_normal([0.0, 1.0], [[1.0, 0.5], [0.5, 2.0]], size=2))",
+        "x = rng.normal() + rng.uniform(1.0, 2.0) * rng.random()",
+        "print(x)",
+        "print(np.std(rng.random((2, 3))), rng.normal(2.0, 0.5, 3).mean())",
+        "np.random.seed(5)",
+        "print(np.random.randint(0, 10, 4), np.random.choice(np.array([1.5, 2.5, 3.5]), 3), np.random.permutation(4))",
+        "print(np.random.rand(2) + np.random.randn(2), np.random.exponential(2.0, 2), np.random.normal())",
+        "v = np.arange(5)",
+        "np.random.shuffle(v)",
+        "print(v)",
+    ]
+    src = tmp_path / "xnp_random.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff", "--numeric-diff",
+                           "--numeric-diff-tol", "1e-7", "--rng-replay"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0 or "numeric diff: MATCH" in proc.stdout.lower(), proc.stdout + proc.stderr
+    assert re.search(r"numeric diff: MATCH", proc.stdout, re.IGNORECASE), proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_random_native_distributions_are_sound(tmp_path: Path) -> None:
+    # Without replay the program draws from Fortran's generator: the
+    # distributions' sample means and variances must match theory, and
+    # permutation / choice(replace=False) / integers must be valid.
+    import math
+    dists = {
+        "normal": ("rng.normal(2.0, 0.5, n)", 2.0, 0.25),
+        "uniform": ("rng.uniform(-1.0, 3.0, n)", 1.0, 16 / 12),
+        "integers": ("rng.integers(0, 10, n)", 4.5, 99 / 12),
+        "exponential": ("rng.exponential(2.0, n)", 2.0, 4.0),
+        "poisson": ("rng.poisson(3.0, n)", 3.0, 3.0),
+        "binomial": ("rng.binomial(10, 0.3, n)", 3.0, 2.1),
+        "gamma": ("rng.gamma(2.0, 1.5, n)", 3.0, 4.5),
+        "gamma_small": ("rng.gamma(0.5, 1.0, n)", 0.5, 0.5),
+        "beta": ("rng.beta(2.0, 3.0, n)", 0.4, 0.04),
+        "geometric": ("rng.geometric(0.3, n)", 1 / 0.3, 0.7 / 0.09),
+        "laplace": ("rng.laplace(1.0, 2.0, n)", 1.0, 8.0),
+        "standard_t": ("rng.standard_t(5.0, n)", 0.0, 5 / 3),
+        "choice_p": ("rng.choice(4, size=n, p=[0.1, 0.2, 0.3, 0.4])", 2.0, 1.0),
+    }
+    lines = ["import numpy as np", "rng = np.random.default_rng(7)", "n = 40000"]
+    for name, (expr, _, _) in dists.items():
+        lines += [f"x = {expr}", f"print('{name}', np.mean(x), np.var(x))"]
+    lines += [
+        "p = rng.permutation(50)",
+        "print('perm', np.sum(np.sort(p) == np.arange(50)))",
+        "c = rng.choice(20, size=20, replace=False)",
+        "print('norep', np.sum(np.sort(c) == np.arange(20)))",
+        "k = rng.integers(3, 8, 1000)",
+        "print('range', np.min(k), np.max(k))",
+    ]
+    src = tmp_path / "xnp_random_native.py"
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = subprocess.run([str(src.with_name("xnp_random_native_p.exe"))], capture_output=True, text=True,
+                         check=True).stdout
+    got = {ln.split()[0]: [float(v) for v in ln.split()[1:]] for ln in out.splitlines() if ln.split()}
+    n = 40000
+    for name, (_, mu, var) in dists.items():
+        mean, v = got[name]
+        assert abs(mean - mu) < 6 * math.sqrt(var / n), (name, mean, mu)
+        assert abs(v - var) < 0.08 * var, (name, v, var)
+    assert got["perm"] == [50.0] and got["norep"] == [20.0]
+    assert got["range"] == [3.0, 7.0]

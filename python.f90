@@ -377,6 +377,31 @@ public :: argsort
 public :: argsort_idx
 public :: sorted_vec
 public :: diag_k
+public :: rng_pick
+public :: rng_take_values
+public :: rng_integers_v
+public :: rng_choice_idx
+public :: rng_choice_idx_p
+public :: rng_permutation_idx
+public :: rng_mvnormal
+public :: rng_unit_uniform
+public :: rng_std_normal1
+public :: rng_std_gamma1
+public :: rng_exponential_v
+public :: rng_lognormal_v
+public :: rng_gamma_v
+public :: rng_beta_v
+public :: rng_chisquare_v
+public :: rng_laplace_v
+public :: rng_logistic_v
+public :: rng_standard_t_v
+public :: rng_triangular_v
+public :: rng_weibull_v
+public :: rng_pareto_v
+public :: rng_rayleigh_v
+public :: rng_poisson_v
+public :: rng_binomial_v
+public :: rng_geometric_v
 public :: stack_inv
 public :: stack_cholesky
 public :: stack_pinv
@@ -651,6 +676,10 @@ end interface np_kron2
 interface np_cross3
    module procedure np_cross3_int, np_cross3_real, np_cross3_complex
 end interface np_cross3
+
+interface rng_pick
+   module procedure rng_pick_real, rng_pick_int, rng_pick_log, rng_pick_complex
+end interface rng_pick
 
 interface diag_k
    module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
@@ -5813,6 +5842,673 @@ contains
             vt(b, :, :) = vtb
          end do
       end subroutine stack_svd_econ
+
+      logical function rng_take_values(rank, n0, n1, x)
+         ! Under RNG replay, read the next recorded "values" call (numpy's
+         ! own results) into x and return .true.; otherwise .false.
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), intent(out) :: x(:)
+         call rng_replay_expect("values", rank, n0, n1)
+         rng_take_values = rng_replay_enabled
+         if (rng_replay_enabled .and. size(x) > 0) read(rng_replay_bin_u) x
+      end function rng_take_values
+
+      function rng_unit_uniform() result(u)
+         ! One uniform draw in [0, 1) from Fortran's generator.
+         real(kind=dp) :: u
+         call random_number(u)
+      end function rng_unit_uniform
+
+      function rng_std_normal1() result(z)
+         real(kind=dp) :: z
+         real(kind=dp) :: v(1)
+         call random_normal_vec(v)
+         z = v(1)
+      end function rng_std_normal1
+
+      recursive function rng_std_gamma1(k) result(g)
+         ! Marsaglia-Tsang; k < 1 by boosting.
+         real(kind=dp), intent(in) :: k
+         real(kind=dp) :: g, d, c, z, v, u
+         if (k <= 0.0_dp) then
+            g = 0.0_dp
+            return
+         end if
+         if (k < 1.0_dp) then
+            call random_number(u)
+            g = rng_std_gamma1(k + 1.0_dp) * u**(1.0_dp / k)
+            return
+         end if
+         d = k - 1.0_dp / 3.0_dp
+         c = 1.0_dp / sqrt(9.0_dp * d)
+         do
+            z = rng_std_normal1()
+            v = (1.0_dp + c * z)**3
+            if (v <= 0.0_dp) cycle
+            call random_number(u)
+            if (log(max(u, tiny(1.0_dp))) < 0.5_dp * z * z + d - d * v + d * log(v)) exit
+         end do
+         g = d * v
+      end function rng_std_gamma1
+
+      function rng_integers_v(lo, hi, rank, n0, n1) result(x)
+         ! integers in [lo, hi): numpy's rng.integers / np.random.randint.
+         integer, intent(in) :: lo, hi, rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i
+         if (hi <= lo) error stop "integers: low >= high"
+         allocate(v(max(n0, 1) * max(n1, 1)))
+         if (rank == 1) deallocate(v)
+         if (rank == 1) allocate(v(n0))
+         if (rank == 2) deallocate(v)
+         if (rank == 2) allocate(v(n0 * n1))
+         allocate(x(size(v)))
+         if (rng_take_values(rank, n0, n1, v)) then
+            x = nint(v)
+            return
+         end if
+         call random_number(v)
+         do i = 1, size(x)
+            x(i) = lo + min(int(v(i) * real(hi - lo, kind=dp)), hi - lo - 1)
+         end do
+      end function rng_integers_v
+
+      function rng_choice_idx(npop, rank, n0, n1, replace) result(idx)
+         ! 0-based indices of rng.choice(npop, size, replace).
+         integer, intent(in) :: npop, rank, n0, n1
+         logical, intent(in) :: replace
+         integer, allocatable :: idx(:), pool(:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i, j, n, tmp
+         n = merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)
+         allocate(v(n), idx(n))
+         if (rng_take_values(rank, n0, n1, v)) then
+            idx = nint(v)
+            return
+         end if
+         if (replace) then
+            call random_number(v)
+            do i = 1, n
+               idx(i) = min(int(v(i) * real(npop, kind=dp)), npop - 1)
+            end do
+         else
+            if (n > npop) error stop "choice: cannot take a larger sample than population when replace=False"
+            allocate(pool(npop))
+            pool = [(i - 1, i = 1, npop)]
+            do i = 1, n
+               call random_number(v(i))
+               j = i + min(int(v(i) * real(npop - i + 1, kind=dp)), npop - i)
+               tmp = pool(i)
+               pool(i) = pool(j)
+               pool(j) = tmp
+            end do
+            idx = pool(1:n)
+         end if
+      end function rng_choice_idx
+
+      function rng_choice_idx_p(pr, rank, n0, n1, replace) result(idx)
+         ! 0-based indices of rng.choice(len(p), size, replace, p=pr).
+         real(kind=dp), intent(in) :: pr(:)
+         integer, intent(in) :: rank, n0, n1
+         logical, intent(in) :: replace
+         integer, allocatable :: idx(:)
+         real(kind=dp), allocatable :: v(:), w(:)
+         real(kind=dp) :: u, acc, tot
+         integer :: i, j, n
+         n = merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)
+         allocate(v(n), idx(n))
+         if (rng_take_values(rank, n0, n1, v)) then
+            idx = nint(v)
+            return
+         end if
+         w = pr
+         do i = 1, n
+            tot = sum(w)
+            if (tot <= 0.0_dp) error stop "choice: probabilities exhausted"
+            call random_number(u)
+            u = u * tot
+            acc = 0.0_dp
+            idx(i) = size(w) - 1
+            do j = 1, size(w)
+               acc = acc + w(j)
+               if (u < acc) then
+                  idx(i) = j - 1
+                  exit
+               end if
+            end do
+            if (.not. replace) w(idx(i) + 1) = 0.0_dp
+         end do
+      end function rng_choice_idx_p
+
+      function rng_permutation_idx(n) result(idx)
+         ! A random permutation of 0 .. n-1 (rng.permutation / shuffle order).
+         integer, intent(in) :: n
+         integer, allocatable :: idx(:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i, j, tmp
+         real(kind=dp) :: u
+         allocate(v(n), idx(n))
+         if (rng_take_values(1, n, -1, v)) then
+            idx = nint(v)
+            return
+         end if
+         idx = [(i - 1, i = 1, n)]
+         do i = n, 2, -1
+            call random_number(u)
+            j = 1 + min(int(u * real(i, kind=dp)), i - 1)
+            tmp = idx(i)
+            idx(i) = idx(j)
+            idx(j) = tmp
+         end do
+      end function rng_permutation_idx
+
+      function rng_mvnormal(mean, cov, n) result(x)
+         ! rng.multivariate_normal(mean, cov, size=n): row i is mean + L z.
+         real(kind=dp), intent(in) :: mean(:), cov(:,:)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: x(:,:), l(:,:), z(:), flat(:)
+         integer :: i, d
+         d = size(mean)
+         allocate(x(n, d), z(d), flat(n * d))
+         if (rng_take_values(2, n, d, flat)) then
+            x = reshape(flat, [n, d])
+            return
+         end if
+         l = linalg_cholesky(cov)
+         do i = 1, n
+            call random_normal_vec(z)
+            x(i, :) = mean + matmul(l, z)
+         end do
+      end function rng_mvnormal
+
+      function rng_exponential_v(scale, rank, n0, n1) result(x)
+         ! numpy's exponential draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: scale
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = -scale * log(1.0_dp - u)
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_exponential_v
+
+      function rng_lognormal_v(mean, sigma, rank, n0, n1) result(x)
+         ! numpy's lognormal draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: mean, sigma
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = exp(mean + sigma * rng_std_normal1())
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_lognormal_v
+
+      function rng_gamma_v(shape, scale, rank, n0, n1) result(x)
+         ! numpy's gamma draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: shape, scale
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = scale * rng_std_gamma1(shape)
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_gamma_v
+
+      function rng_beta_v(a, b, rank, n0, n1) result(x)
+         ! numpy's beta draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: a, b
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = beta_draw(a, b)
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_beta_v
+
+      function rng_chisquare_v(df, rank, n0, n1) result(x)
+         ! numpy's chisquare draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: df
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = 2.0_dp * rng_std_gamma1(0.5_dp * df)
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_chisquare_v
+
+      function rng_laplace_v(loc, scale, rank, n0, n1) result(x)
+         ! numpy's laplace draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: loc, scale
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = loc - scale * sign(1.0_dp, u - 0.5_dp) * log(1.0_dp - 2.0_dp * abs(u - 0.5_dp))
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_laplace_v
+
+      function rng_logistic_v(loc, scale, rank, n0, n1) result(x)
+         ! numpy's logistic draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: loc, scale
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = loc + scale * log(max(u, tiny(1.0_dp)) / (1.0_dp - u))
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_logistic_v
+
+      function rng_standard_t_v(df, rank, n0, n1) result(x)
+         ! numpy's standard_t draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: df
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = rng_std_normal1() / sqrt(2.0_dp * rng_std_gamma1(0.5_dp * df) / df)
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_standard_t_v
+
+      function rng_triangular_v(left, mode, right, rank, n0, n1) result(x)
+         ! numpy's triangular draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: left, mode, right
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = triangular_draw(left, mode, right, u)
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_triangular_v
+
+      function rng_weibull_v(a, rank, n0, n1) result(x)
+         ! numpy's weibull draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: a
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = (-log(1.0_dp - u))**(1.0_dp / a)
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_weibull_v
+
+      function rng_pareto_v(a, rank, n0, n1) result(x)
+         ! numpy's pareto draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: a
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = (1.0_dp - u)**(-1.0_dp / a) - 1.0_dp
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_pareto_v
+
+      function rng_rayleigh_v(scale, rank, n0, n1) result(x)
+         ! numpy's rayleigh draws (rank 0/1/2 of n0 x n1, flattened column-major).
+         real(kind=dp), intent(in) :: scale
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = scale * sqrt(-2.0_dp * log(1.0_dp - u))
+         end do
+      contains
+         function beta_draw(aa, bb) result(r)
+            real(kind=dp), intent(in) :: aa, bb
+            real(kind=dp) :: r, g1, g2
+            g1 = rng_std_gamma1(aa)
+            g2 = rng_std_gamma1(bb)
+            r = g1 / (g1 + g2)
+         end function beta_draw
+         function triangular_draw(lft, md, rgt, uu) result(r)
+            real(kind=dp), intent(in) :: lft, md, rgt, uu
+            real(kind=dp) :: r
+            if (uu < (md - lft) / (rgt - lft)) then
+               r = lft + sqrt(uu * (rgt - lft) * (md - lft))
+            else
+               r = rgt - sqrt((1.0_dp - uu) * (rgt - lft) * (rgt - md))
+            end if
+         end function triangular_draw
+      end function rng_rayleigh_v
+
+      function rng_poisson_v(lam, rank, n0, n1) result(x)
+         ! numpy's poisson draws: Knuth for small lam, otherwise a normal
+         ! approximation-free inversion by summing exponential gaps.
+         real(kind=dp), intent(in) :: lam
+         integer, intent(in) :: rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:)
+         real(kind=dp) :: s, u
+         integer :: i, k
+         allocate(v(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         allocate(x(size(v)))
+         if (rng_take_values(rank, n0, n1, v)) then
+            x = nint(v)
+            return
+         end if
+         do i = 1, size(x)
+            k = 0
+            s = 0.0_dp
+            do
+               call random_number(u)
+               s = s - log(1.0_dp - u)
+               if (s > lam) exit
+               k = k + 1
+            end do
+            x(i) = k
+         end do
+      end function rng_poisson_v
+
+      function rng_binomial_v(nt, pp, rank, n0, n1) result(x)
+         ! numpy's binomial draws (sum of nt Bernoulli trials).
+         integer, intent(in) :: nt
+         real(kind=dp), intent(in) :: pp
+         integer, intent(in) :: rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:), u(:)
+         integer :: i
+         allocate(v(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)), u(max(nt, 0)))
+         allocate(x(size(v)))
+         if (rng_take_values(rank, n0, n1, v)) then
+            x = nint(v)
+            return
+         end if
+         do i = 1, size(x)
+            call random_number(u)
+            x(i) = count(u < pp)
+         end do
+      end function rng_binomial_v
+
+      function rng_geometric_v(pp, rank, n0, n1) result(x)
+         ! numpy's geometric draws (trials to the first success, >= 1).
+         real(kind=dp), intent(in) :: pp
+         integer, intent(in) :: rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:)
+         real(kind=dp) :: u
+         integer :: i
+         allocate(v(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         allocate(x(size(v)))
+         if (rng_take_values(rank, n0, n1, v)) then
+            x = nint(v)
+            return
+         end if
+         do i = 1, size(x)
+            call random_number(u)
+            if (pp >= 1.0_dp) then
+               x(i) = 1
+            else
+               x(i) = max(1, ceiling(log(1.0_dp - u) / log(1.0_dp - pp)))
+            end if
+         end do
+      end function rng_geometric_v
+
+      pure function rng_pick_real(a, idx) result(r)
+         ! a[idx] of a vector expression (rng.choice of an array).
+         real(kind=dp), intent(in) :: a(:)
+         integer, intent(in) :: idx(:)
+         real(kind=dp), allocatable :: r(:)
+         r = a(idx + 1)
+      end function rng_pick_real
+
+      pure function rng_pick_int(a, idx) result(r)
+         ! a[idx] of a vector expression (rng.choice of an array).
+         integer, intent(in) :: a(:)
+         integer, intent(in) :: idx(:)
+         integer, allocatable :: r(:)
+         r = a(idx + 1)
+      end function rng_pick_int
+
+      pure function rng_pick_log(a, idx) result(r)
+         ! a[idx] of a vector expression (rng.choice of an array).
+         logical, intent(in) :: a(:)
+         integer, intent(in) :: idx(:)
+         logical, allocatable :: r(:)
+         r = a(idx + 1)
+      end function rng_pick_log
+
+      pure function rng_pick_complex(a, idx) result(r)
+         ! a[idx] of a vector expression (rng.choice of an array).
+         complex(kind=dp), intent(in) :: a(:)
+         integer, intent(in) :: idx(:)
+         complex(kind=dp), allocatable :: r(:)
+         r = a(idx + 1)
+      end function rng_pick_complex
 
       pure function diag_k_vec_real(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.

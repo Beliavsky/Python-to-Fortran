@@ -78,7 +78,7 @@ FIXTURES = {
     "sb1": "np.array([1.0, 2.0])",
     "sb2": "np.array([[1.0, 0.0, 2.0], [3.0, 1.0, -1.0]])",
     "sb3": "np.array([[[1.0], [2.0]], [[0.5], [1.0]], [[2.0], [-1.0]]])",
-    "sa4": "np.arange(1.0, 25.0).reshape(2, 3, 2, 2) + np.eye(2) * 10",
+    "sa4": "np.stack([sa3, sa3 * 2.0 - 1.0])",
 }
 
 PLACEHOLDERS = {
@@ -407,6 +407,11 @@ SPECS.update({
         'np.linalg.solve(sa3, sb1) @ sb1',
     ],
 })
+
+# Two halves, so each program builds in reasonable time.
+_ls = SPECS.pop("linalg_stack")
+SPECS["linalg_stack_a"] = _ls[:len(_ls) // 2]
+SPECS["linalg_stack_b"] = _ls[len(_ls) // 2:]
 
 # Edge-case inputs (phase 3): program "<spec>__<edge>" runs <spec>'s
 # templates with the placeholders mapped to these fixtures instead; only

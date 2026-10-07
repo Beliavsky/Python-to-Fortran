@@ -150,7 +150,16 @@ def _split_top_level(text, sep=","):
 # `_ARRAY_HELPER_ARG_IS_SIZE`: the result's length IS that argument's own
 # VALUE (never its own `size(...)`) -- e.g. `rnorm(k)` (python.f90's
 # `rnorm1`, reached through the generic `rnorm` interface) has length k.
-_ARRAY_HELPER_ARG_IS_SIZE = {"rnorm": 0}
+_ARRAY_HELPER_ARG_IS_SIZE = {
+    "rnorm": 0, "runif": 0, "rng_permutation_idx": 0,
+    # xp2f.py's replay-aware random helpers take (..., rank, n0, n1): for a
+    # rank-1 draw the length is n0.
+    "rng_choice_idx": 2, "rng_choice_idx_p": 2, "rng_integers_v": 3,
+    "rng_exponential_v": 2, "rng_chisquare_v": 2, "rng_standard_t_v": 2, "rng_weibull_v": 2,
+    "rng_pareto_v": 2, "rng_rayleigh_v": 2, "rng_poisson_v": 2, "rng_geometric_v": 2,
+    "rng_lognormal_v": 3, "rng_gamma_v": 3, "rng_beta_v": 3, "rng_laplace_v": 3, "rng_logistic_v": 3,
+    "rng_binomial_v": 3, "rng_triangular_v": 4,
+}
 # `_ARRAY_HELPER_ARG_LIKE_SIZE`: the result's length equals that
 # argument's OWN length -- e.g. `lfilter_real(b, a, x[, zi])`
 # (python.f90's scipy.signal.lfilter port) has the same length as `x`.

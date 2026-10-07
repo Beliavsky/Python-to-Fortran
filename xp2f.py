@@ -2400,8 +2400,17 @@ def main():
     orig_randn = np.random.randn
     orig_rand = np.random.rand
     orig_default_rng = np.random.default_rng
+    _VALUE_METHODS = {"integers", "randint", "exponential", "standard_exponential", "lognormal", "gamma",
+                      "standard_gamma", "beta", "chisquare", "laplace", "logistic", "standard_t", "triangular",
+                      "weibull", "pareto", "rayleigh", "poisson", "binomial", "geometric"}
 
     with open(str(replay_stem) + ".meta", "w", encoding="utf-8") as meta_fh, open(str(replay_stem) + ".bin", "wb") as bin_fh:
+        def _record_values(out):
+            nonlocal call_index
+            _record_array(meta_fh, bin_fh, call_index, "values", out)
+            call_index += 1
+            return out
+
         def _record_standard_normal(out):
             nonlocal call_index
             _record_array(meta_fh, bin_fh, call_index, "normal", out)
@@ -2508,12 +2517,84 @@ def main():
                 out = self._base.random(*args, **kwargs)
                 return _record_unit_uniform(out)
 
+            # Other methods record their results ("values"); choice,
+            # permutation and shuffle record the indices, drawn by the same
+            # call on an index array (the same random stream consumption).
+            def choice(self, a, size=None, replace=True, p=None, **kwargs):
+                npop = int(a) if np.ndim(a) == 0 else len(a)
+                idx = self._base.choice(npop, size=size, replace=replace, p=p, **kwargs)
+                _record_values(idx)
+                return idx if np.ndim(a) == 0 else np.asarray(a)[idx]
+
+            def permutation(self, x):
+                n = int(x) if np.ndim(x) == 0 else len(x)
+                idx = np.arange(n)
+                self._base.shuffle(idx)
+                _record_values(idx)
+                return idx if np.ndim(x) == 0 else np.asarray(x)[idx]
+
+            def shuffle(self, x):
+                idx = np.arange(len(x))
+                self._base.shuffle(idx)
+                _record_values(idx)
+                x[...] = np.asarray(x)[idx].copy()
+
+            def multivariate_normal(self, mean, cov, size=None, **kwargs):
+                out = self._base.multivariate_normal(mean, cov, size=size, **kwargs)
+                _record_values(np.asarray(out).reshape(-1, len(mean)))
+                return out
+
             def __getattr__(self, name):
-                return getattr(self._base, name)
+                attr = getattr(self._base, name)
+                if name in _VALUE_METHODS:
+                    def _recorded(*args, **kwargs):
+                        return _record_values(attr(*args, **kwargs))
+                    return _recorded
+                return attr
 
         def rec_default_rng(*args, **kwargs):
             return ReplayGenerator(orig_default_rng(*args, **kwargs))
 
+        def _legacy_values(fn):
+            def _recorded(*args, **kwargs):
+                return _record_values(fn(*args, **kwargs))
+            return _recorded
+
+        orig_choice = np.random.choice
+        orig_shuffle = np.random.shuffle
+        orig_mvn = np.random.multivariate_normal
+
+        def rec_choice(a, size=None, replace=True, p=None):
+            npop = int(a) if np.ndim(a) == 0 else len(a)
+            idx = orig_choice(npop, size=size, replace=replace, p=p)
+            _record_values(idx)
+            return idx if np.ndim(a) == 0 else np.asarray(a)[idx]
+
+        def rec_permutation(x):
+            n = int(x) if np.ndim(x) == 0 else len(x)
+            idx = np.arange(n)
+            orig_shuffle(idx)
+            _record_values(idx)
+            return idx if np.ndim(x) == 0 else np.asarray(x)[idx]
+
+        def rec_shuffle(x):
+            idx = np.arange(len(x))
+            orig_shuffle(idx)
+            _record_values(idx)
+            x[...] = np.asarray(x)[idx].copy()
+
+        def rec_mvn(mean, cov, size=None, **kwargs):
+            out = orig_mvn(mean, cov, size=size, **kwargs)
+            _record_values(np.asarray(out).reshape(-1, len(mean)))
+            return out
+
+        for _nm in _VALUE_METHODS:
+            if hasattr(np.random, _nm):
+                setattr(np.random, _nm, _legacy_values(getattr(np.random, _nm)))
+        np.random.choice = rec_choice
+        np.random.permutation = rec_permutation
+        np.random.shuffle = rec_shuffle
+        np.random.multivariate_normal = rec_mvn
         np.random.normal = rec_normal
         np.random.standard_normal = rec_standard_normal
         np.random.uniform = rec_uniform
@@ -16167,6 +16248,9 @@ def detect_needed_helpers(tree):
             # Set/search functions (translator._setsearch_numpy).
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._SETSEARCH_ATTRS:
                 needed.update(translator._SETSEARCH_HELPERS)
+            # Random draws (translator._random_numpy).
+            if isinstance(node.func, ast.Attribute) and node.func.attr in translator._RNG_ATTRS:
+                needed.update(translator._RNG_HELPERS)
             # Stacked linear algebra (translator._stacked_linalg): any linalg
             # call or matmul may get a stack of matrices.
             if isinstance(node.func, ast.Attribute) and (
@@ -19092,6 +19176,9 @@ def _numba_prange_plan(fn, loop):
 
 SOURCE_USES_PANDAS = False
 SOURCE_FUNCTION_NAMES = set()
+# Names bound to a numpy random Generator/RandomState anywhere in the file
+# (rng = np.random.default_rng(...)), known before the prescan reaches them.
+SOURCE_RNG_NAMES = set()
 _SCALAR_ANNOTATION_NAMES = {"int", "float", "bool", "str", "complex"}
 
 
@@ -19225,8 +19312,14 @@ def lower_module_scalar_annotations(tree):
 def note_source_libraries(tree):
     """Record facts about the file's imports that translation rules need
     (whether array methods might be pandas methods)."""
-    global SOURCE_USES_PANDAS, SOURCE_FUNCTION_NAMES
+    global SOURCE_USES_PANDAS, SOURCE_FUNCTION_NAMES, SOURCE_RNG_NAMES
     SOURCE_FUNCTION_NAMES = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    SOURCE_RNG_NAMES = set()
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and isinstance(n.value.func, (ast.Attribute, ast.Name))
+                and (n.value.func.attr if isinstance(n.value.func, ast.Attribute) else n.value.func.id)
+                in {"default_rng", "RandomState", "Generator"}):
+            SOURCE_RNG_NAMES.update(tg.id for tg in n.targets if isinstance(tg, ast.Name))
     SOURCE_USES_PANDAS = any(
         (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "pandas" for a in n.names))
         or (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "pandas")
@@ -28444,8 +28537,32 @@ class translator(ast.NodeVisitor):
                 return c if isinstance(c, ast.Subscript) else None
             return None
 
-        if not any((isinstance(n, ast.Subscript) and not isinstance(n.value, ast.Name))
-                   or canon_subscript(n) is not None for n in ast.walk(root)):
+        def is_draw(n):
+            # A random draw that returns a value (not rng.shuffle).
+            rc = self._rng_call(n)
+            return rc is not None and rc[0] != "shuffle"
+
+        def draws_in_unsafe_position(n):
+            if isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                return any(is_draw(m) for m in ast.walk(n))
+            if isinstance(n, ast.IfExp):
+                return (draws_in_unsafe_position(n.test) or any(is_draw(m) for m in ast.walk(n.body))
+                        or any(is_draw(m) for m in ast.walk(n.orelse)))
+            if isinstance(n, ast.BoolOp):
+                return draws_in_unsafe_position(n.values[0]) or any(
+                    is_draw(m) for v in n.values[1:] for m in ast.walk(v))
+            return any(draws_in_unsafe_position(c) for c in ast.iter_child_nodes(n))
+
+        # A random draw inside a larger expression gets a temporary: the
+        # translation of the expression may repeat its argument's text
+        # (np.std(x) uses x twice -- two different draws), and with two or
+        # more draws Fortran may evaluate them in any order, numpy (and
+        # --rng-replay) in Python's. A draw that is the whole value stays.
+        n_draws = sum(1 for n in ast.walk(root) if is_draw(n))
+        hoist_draws = ((n_draws >= 2 or (n_draws == 1 and not is_draw(root)))
+                       and not isinstance(stmt, ast.While) and not draws_in_unsafe_position(root))
+        if not hoist_draws and not any((isinstance(n, ast.Subscript) and not isinstance(n.value, ast.Name))
+                                       or canon_subscript(n) is not None for n in ast.walk(root)):
             return None
         new_stmt = copy.deepcopy(stmt)
 
@@ -28458,6 +28575,31 @@ class translator(ast.NodeVisitor):
         setattr(new_stmt, field, _Canon().visit(getattr(new_stmt, field)))
         temps = []
         counter = self.__dict__.setdefault("_hoist_tmp_counter", [0])
+        if hoist_draws:
+            tr_self = self
+            # Cached rewrites (x.mean() -> np.mean(np.ravel(x)), ...) still
+            # hold the original draw nodes: rebuild them from the copy.
+            for _n in ast.walk(new_stmt):
+                if hasattr(_n, "_xp2f_canonical"):
+                    delattr(_n, "_xp2f_canonical")
+
+            class _Draws(ast.NodeTransformer):
+                # Innermost first, left to right: Python's evaluation order.
+                def visit_Call(self_, n):
+                    self_.generic_visit(n)
+                    if not is_draw(n):
+                        return n
+                    kind = tr_self._expr_kind(n)
+                    rank = int(tr_self._rank_expr(n) or 0)
+                    if kind not in {"int", "real", "complex", "logical"}:
+                        return n
+                    counter[0] += 1
+                    name = f"xp_tmp{counter[0]}"
+                    temps.append((name, kind, rank, tr_self.expr(n)))
+                    tr_self.open_type_rebind_meta.append((name, kind, rank))
+                    return ast.copy_location(ast.Name(id=name, ctx=ast.Load()), n)
+
+            setattr(new_stmt, field, _Draws().visit(getattr(new_stmt, field)))
 
         def calls_program_function(n):
             return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in SOURCE_FUNCTION_NAMES
@@ -28517,6 +28659,15 @@ class translator(ast.NodeVisitor):
         return (new_stmt, temps) if temps else None
 
     def visit(self, node):
+        if (isinstance(node, ast.Expr) and self._rng_call(node.value) is not None
+                and self._rng_call(node.value)[0] == "shuffle" and len(node.value.args) == 1
+                and isinstance(node.value.args[0], ast.Name)):
+            # rng.shuffle(x): x in a random order (rows, for a matrix).
+            xt = self.expr(node.value.args[0])
+            r = int(self._rank_expr(node.value.args[0]) or 0)
+            rest = ", :" * max(0, r - 1)
+            self.o.w(f"{xt} = {xt}(rng_permutation_idx(size({xt}, 1)) + 1{rest})")
+            return None
         if isinstance(node, self._HOIST_STMTS) and not getattr(node, "_xp2f_hoisted", False):
             hoisted = self._hoist_indexed_expressions(node)
             if hoisted is not None:
@@ -28527,7 +28678,10 @@ class translator(ast.NodeVisitor):
                 self.o.w("block")
                 self.o.push()
                 for name, kind, rank, _value in temps:
-                    self.o.w(f"{decl[kind]}, allocatable :: {name}({','.join(':' * rank)})")
+                    if rank == 0:
+                        self.o.w(f"{decl[kind]} :: {name}")
+                    else:
+                        self.o.w(f"{decl[kind]}, allocatable :: {name}({','.join(':' * rank)})")
                 for name, _kind, _rank, value in temps:
                     self.o.w(f"{name} = {value}")
                 for name, kind, rank, _value in temps:
@@ -29244,6 +29398,232 @@ class translator(ast.NodeVisitor):
             return f"reshape({res}, [{', '.join(lead_dims)}])"
         return res
 
+    # Random methods (Generator names; legacy np.random aliases): positional
+    # parameter names (size handled separately), real defaults.
+    _RNG_DISTS = {
+        "exponential": (["scale"], {"scale": 1.0}), "standard_exponential": ([], {}),
+        "lognormal": (["mean", "sigma"], {"mean": 0.0, "sigma": 1.0}),
+        "gamma": (["shape", "scale"], {"scale": 1.0}), "standard_gamma": (["shape"], {}),
+        "beta": (["a", "b"], {}), "chisquare": (["df"], {}),
+        "laplace": (["loc", "scale"], {"loc": 0.0, "scale": 1.0}),
+        "logistic": (["loc", "scale"], {"loc": 0.0, "scale": 1.0}), "standard_t": (["df"], {}),
+        "triangular": (["left", "mode", "right"], {}), "weibull": (["a"], {}), "pareto": (["a"], {}),
+        "rayleigh": (["scale"], {"scale": 1.0}),
+    }
+    _RNG_INT_DISTS = {"poisson": (["lam"], {"lam": 1.0}), "binomial": (["n", "p"], {}), "geometric": (["p"], {})}
+    _RNG_ATTRS = (set(_RNG_DISTS) | set(_RNG_INT_DISTS)
+                  | {"integers", "randint", "choice", "permutation", "shuffle", "multivariate_normal", "random",
+                     "normal", "uniform", "standard_normal", "rand", "randn", "random_sample"})
+    _RNG_HELPERS = {"rng_take_values", "rng_integers_v", "rng_choice_idx", "rng_choice_idx_p",
+                    "rng_permutation_idx", "rng_mvnormal", "rng_unit_uniform", "rng_std_normal1", "rng_pick",
+                    "rng_std_gamma1", "rng_poisson_v", "rng_binomial_v", "rng_geometric_v", "runif", "rnorm",
+                    "linalg_cholesky"} | {f"rng_{k}_v" for k in ("exponential", "lognormal", "gamma", "beta",
+                                                               "chisquare", "laplace", "logistic", "standard_t",
+                                                               "triangular", "weibull", "pareto", "rayleigh")}
+
+    def _rng_call(self, node):
+        """(method, generator?) of rng.method(...) with rng a numpy Generator,
+        or np.random.method(...); else None."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in self._RNG_ATTRS):
+            return None
+        recv = node.func.value
+        if isinstance(recv, ast.Name) and (recv.id in self.rng_vars or recv.id in SOURCE_RNG_NAMES):
+            return node.func.attr, True
+        if (isinstance(recv, ast.Attribute) and recv.attr == "random" and isinstance(recv.value, ast.Name)
+                and recv.value.id in {"np", "numpy"}):
+            return node.func.attr, False
+        return None
+
+    def _rng_args(self, node, names, size_pos):
+        """{param: node} of a random call: positional params, then size."""
+        got = dict(zip(names + ["size"], node.args)) if size_pos else dict(zip(names, node.args))
+        for kw in node.keywords:
+            got[kw.arg] = kw.value
+        return got
+
+    def _rng_size(self, size):
+        """(rank, n0 text, n1 text) of a size argument."""
+        if size is None or is_none(size):
+            return 0, "-1", "-1"
+        if isinstance(size, (ast.Tuple, ast.List)):
+            if len(size.elts) == 1:
+                return 1, f"int({self.expr(size.elts[0])})", "-1"
+            if len(size.elts) == 2:
+                return 2, f"int({self.expr(size.elts[0])})", f"int({self.expr(size.elts[1])})"
+            raise NotImplementedError("random draws with a size of rank above 2 are not supported")
+        if int(self._rank_expr(size) or 0) == 0:
+            return 1, f"int({self.expr(size)})", "-1"
+        raise NotImplementedError("random draws need a constant-rank size")
+
+    def _random_parts(self, node):
+        """(kind, rank) of a random call _random_numpy translates, else None."""
+        rc = self._rng_call(node)
+        if rc is None:
+            return None
+        m, gen = rc
+        if m == "shuffle":
+            return None
+        if m in {"random", "normal", "uniform", "standard_normal", "random_sample"}:
+            # Only the scalar forms (no size): the sized ones have their own translation.
+            size = next((kw.value for kw in node.keywords if kw.arg == "size"), None)
+            pos = {"random": 0, "random_sample": 0, "standard_normal": 0, "normal": 2, "uniform": 2}[m]
+            if len(node.args) > pos:
+                size = node.args[pos]
+            return ("real", 0) if size is None or is_none(size) else None
+        if m in {"rand", "randn"}:
+            # rand(d0, d1, ...) / randn(...): the dimensions are the arguments.
+            if node.keywords or len(node.args) > 2:
+                return None
+            return ("real", len(node.args))
+        if m == "choice":
+            a = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == "a"), None)
+            size = node.args[1] if len(node.args) > 1 else next((kw.value for kw in node.keywords if kw.arg == "size"), None)
+            r = self._rng_size(size)[0]
+            if a is not None and int(self._rank_expr(a) or 0) >= 1:
+                return (self._expr_kind(a) or "real", r)
+            return ("int", r)
+        if m == "permutation":
+            x = node.args[0] if node.args else None
+            if x is not None and int(self._rank_expr(x) or 0) >= 1:
+                return (self._expr_kind(x) or "real", int(self._rank_expr(x)))
+            return ("int", 1)
+        if m in {"integers", "randint"}:
+            names = ["low", "high"]
+        elif m == "multivariate_normal":
+            size = node.args[2] if len(node.args) > 2 else next((kw.value for kw in node.keywords if kw.arg == "size"), None)
+            return ("real", 1 if size is None or is_none(size) else 2)
+        elif m in self._RNG_DISTS:
+            names = self._RNG_DISTS[m][0]
+        else:
+            names = self._RNG_INT_DISTS[m][0]
+        got = self._rng_args(node, names, True)
+        rank = self._rng_size(got.get("size"))[0]
+        return ("int" if (m in {"integers", "randint"} or m in self._RNG_INT_DISTS) else "real", rank)
+
+    def _random_numpy(self, node):
+        """Fortran for numpy random calls through the replay-aware rng_*
+        helpers of python.f90 (numpy's recorded draws under --rng-replay)."""
+        parts = self._random_parts(node)
+        if parts is None:
+            return None
+        m, _gen = self._rng_call(node)
+
+        def real_txt(n):
+            txt = self.expr(n)
+            if int(self._rank_expr(n) or 0) != 0:
+                raise NotImplementedError(f"random {m} with array-valued parameters is not supported")
+            return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+
+        def shaped(call, rank, n0, n1):
+            if rank == 0:
+                return f"sum({call})"  # the one draw of a length-1 result
+            if rank == 2:
+                return f"reshape({call}, [{n0}, {n1}])"
+            return call
+
+        if m in {"rand", "randn"}:
+            dims = ", ".join(f"int({self.expr(a)})" for a in node.args)
+            return f"{'runif' if m == 'rand' else 'rnorm'}({dims})"
+        if m in {"random", "random_sample"}:
+            return "runif()"
+        if m == "standard_normal":
+            return "rnorm()"
+        if m == "normal":
+            got = self._rng_args(node, ["loc", "scale"], False)
+            loc = real_txt(got["loc"]) if "loc" in got else "0.0_dp"
+            scale = real_txt(got["scale"]) if "scale" in got else "1.0_dp"
+            return f"({loc} + {scale} * rnorm())"
+        if m == "uniform":
+            got = self._rng_args(node, ["low", "high"], False)
+            lo = real_txt(got["low"]) if "low" in got else "0.0_dp"
+            hi = real_txt(got["high"]) if "high" in got else "1.0_dp"
+            return f"({lo} + ({hi} - {lo}) * runif())"
+        if m in {"integers", "randint"}:
+            got = self._rng_args(node, ["low", "high"], True)
+            if set(got) - {"low", "high", "size", "endpoint", "dtype"}:
+                raise NotImplementedError(f"random {m} supports low, high, size, endpoint")
+            low, high = got.get("low"), got.get("high")
+            if high is None or is_none(high):
+                lo_t, hi_t = "0", f"int({self.expr(low)})"
+            else:
+                lo_t, hi_t = f"int({self.expr(low)})", f"int({self.expr(high)})"
+            ep = got.get("endpoint")
+            if ep is not None and not (isinstance(ep, ast.Constant) and ep.value in (True, False)):
+                raise NotImplementedError("rng.integers endpoint must be True or False")
+            if ep is not None and ep.value:
+                hi_t = f"({hi_t} + 1)"
+            rank, n0, n1 = self._rng_size(got.get("size"))
+            return shaped(f"rng_integers_v({lo_t}, {hi_t}, {rank}, {n0}, {n1})", rank, n0, n1)
+        if m == "choice":
+            got = self._rng_args(node, ["a", "size", "replace", "p"], False)
+            if set(got) - {"a", "size", "replace", "p"}:
+                raise NotImplementedError("rng.choice supports a, size, replace, p")
+            a = got["a"]
+            rank, n0, n1 = self._rng_size(got.get("size"))
+            rep_ = got.get("replace")
+            if rep_ is not None and not (isinstance(rep_, ast.Constant) and rep_.value in (True, False)):
+                raise NotImplementedError("rng.choice replace must be True or False")
+            rep_t = ".false." if (rep_ is not None and rep_.value is False) else ".true."
+            arr = int(self._rank_expr(a) or 0) >= 1
+            if arr and int(self._rank_expr(a)) != 1:
+                raise NotImplementedError("rng.choice of a multidimensional array is not supported")
+            npop = f"size({self.expr(a)})" if arr else f"int({self.expr(a)})"
+            pr = got.get("p")
+            if pr is not None and not is_none(pr):
+                pt = self.expr(pr)
+                if self._expr_kind(pr) != "real":
+                    pt = f"real({pt}, kind=dp)"
+                idx = f"rng_choice_idx_p({pt}, {rank}, {n0}, {n1}, {rep_t})"
+            else:
+                idx = f"rng_choice_idx({npop}, {rank}, {n0}, {n1}, {rep_t})"
+            if arr:
+                # A variable is indexed directly; any other array via rng_pick.
+                idx = (f"{self.expr(a)}({idx} + 1)" if isinstance(a, ast.Name)
+                       else f"rng_pick({self.expr(a)}, {idx})")
+            return shaped(idx, rank, n0, n1)
+        if m == "permutation":
+            x = node.args[0]
+            r = int(self._rank_expr(x) or 0)
+            if r == 0:
+                return f"rng_permutation_idx(int({self.expr(x)}))"
+            if not isinstance(x, ast.Name):
+                raise NotImplementedError("rng.permutation of an array expression: assign the array to a variable first")
+            xt = self.expr(x)
+            rest = ", :" * (r - 1)
+            return f"{xt}(rng_permutation_idx(size({xt}, 1)) + 1{rest})"
+        if m == "multivariate_normal":
+            got = self._rng_args(node, ["mean", "cov", "size"], False)
+            mean, cov = self.expr(got["mean"]), self.expr(got["cov"])
+            if self._expr_kind(got["mean"]) != "real":
+                mean = f"real({mean}, kind=dp)"
+            if self._expr_kind(got["cov"]) != "real":
+                cov = f"real({cov}, kind=dp)"
+            size = got.get("size")
+            if size is None or is_none(size):
+                return f"reshape(rng_mvnormal({mean}, {cov}, 1), [size({mean})])"
+            return f"rng_mvnormal({mean}, {cov}, int({self.expr(size)}))"
+        dists = dict(self._RNG_DISTS, **self._RNG_INT_DISTS)
+        names, defaults = dists[m]
+        got = self._rng_args(node, names, True)
+        if set(got) - set(names) - {"size"}:
+            raise NotImplementedError(f"random {m}: unsupported arguments")
+        vals = []
+        for nm in names:
+            if nm in got:
+                vals.append(f"int({self.expr(got[nm])})" if (m == "binomial" and nm == "n") else real_txt(got[nm]))
+            elif nm in defaults:
+                vals.append(f"{float(defaults[nm])!r}_dp")
+            else:
+                raise NotImplementedError(f"random {m} needs {nm}")
+        rank, n0, n1 = self._rng_size(got.get("size"))
+        helper = {"standard_exponential": "exponential", "standard_gamma": "gamma"}.get(m, m)
+        if m == "standard_exponential":
+            vals = ["1.0_dp"]
+        if m == "standard_gamma":
+            vals = vals + ["1.0_dp"]
+        return shaped(f"rng_{helper}_v({', '.join(vals + [str(rank), n0, n1])})", rank, n0, n1)
+
     def _complex_close_test(self, node):
         """np.isclose(a, b, rtol, atol) with a complex operand, elementwise:
         abs(a - b) <= atol + rtol*abs(b) with the complex modulus (the real
@@ -29577,7 +29957,7 @@ class translator(ast.NodeVisitor):
                     new = ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()),
                                    args=[flat] + ([ordn] if ordn is not None else []), keywords=[])
             elif attr == "matrix_norm" and node.args and set(kwd) <= {"ord"} \
-                    and int(self._rank_expr(node.args[0]) or 0) <= 2:
+                    and int(self._rank_expr(node.args[0]) or 0) == 2:
                 ordn = node.args[1] if len(node.args) > 1 else kwd.get("ord", ast.Constant(value="fro"))
                 new = ast.Call(func=ast.Attribute(value=la, attr="norm", ctx=ast.Load()),
                                args=[node.args[0], ordn], keywords=[])
@@ -29818,6 +30198,9 @@ class translator(ast.NodeVisitor):
         _stp = self._stacked_linalg_parts(node)
         if _stp is not None:
             return _stp[1]
+        _rgp = self._random_parts(node)
+        if _rgp is not None:
+            return _rgp[0]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             _k = self._expr_kind(_mg[0])
@@ -35471,6 +35854,9 @@ class translator(ast.NodeVisitor):
         _stp = self._stacked_linalg_parts(node)
         if _stp is not None:
             return _stp[2]
+        _rgp = self._random_parts(node)
+        if _rgp is not None:
+            return _rgp[1]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             return 2
@@ -37424,6 +37810,9 @@ class translator(ast.NodeVisitor):
         _st_txt = self._stacked_linalg(node)
         if _st_txt is not None:
             return _st_txt
+        _rg_txt = self._random_numpy(node)
+        if _rg_txt is not None:
+            return _rg_txt
         _bare = self._float_dtype_reduction(node)
         if _bare is not None:
             return f"real({self.expr(_bare)}, kind=dp)"
@@ -51431,14 +51820,16 @@ class translator(ast.NodeVisitor):
                     size_node = None
                     if v.func.attr == "standard_normal" and len(v.args) >= 1:
                         size_node = v.args[0]
+                    if v.func.attr == "normal" and len(v.args) >= 3:
+                        size_node = v.args[2]
                     for kw in v.keywords:
                         if kw.arg == "size":
                             size_node = kw.value
                             break
-                    if size_node is None and v.func.attr == "normal":
-                        # Keep existing behavior for normal: size required.
-                        self._mark_alloc_real(t.id)
-                    elif size_node is None:
+                    if size_node is not None and is_none(size_node):
+                        size_node = None
+                    if size_node is None:
+                        # normal() without a size is one draw (translator._random_numpy).
                         self._mark_real(t.id)
                     elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 3:
                         self._mark_alloc_real(t.id, rank=3)
@@ -51626,13 +52017,16 @@ class translator(ast.NodeVisitor):
                     size_node = None
                     if v.func.attr == "standard_normal" and len(v.args) >= 1:
                         size_node = v.args[0]
+                    if v.func.attr == "normal" and len(v.args) >= 3:
+                        size_node = v.args[2]
                     for kw in v.keywords:
                         if kw.arg == "size":
                             size_node = kw.value
                             break
-                    if size_node is None and v.func.attr == "normal":
-                        self._mark_alloc_real(t.id)
-                    elif size_node is None:
+                    if size_node is not None and is_none(size_node):
+                        size_node = None
+                    if size_node is None:
+                        # normal() without a size is one draw (translator._random_numpy).
                         self._mark_real(t.id)
                     elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
                         self._mark_alloc_real(t.id, rank=2)
@@ -52310,6 +52704,14 @@ class translator(ast.NodeVisitor):
             _canon = self._canonical_numpy_call(node.value)
             if _canon is not None:
                 node.value = _canon
+        if (
+            len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and self._random_parts(node.value) is not None
+        ):
+            # x = rng.integers(...) etc.: replay-aware helpers, ahead of the
+            # older statement-level random translations.
+            self.o.w(f"{self._aliased_name(node.targets[0].id)} = {self._random_numpy(node.value)}")
+            return
         if (
             len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
             and isinstance(node.value, ast.Subscript) and self._setsearch_parts(node.value) is not None
