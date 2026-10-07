@@ -26311,3 +26311,43 @@ def test_xp2f_numpy_random_native_distributions_are_sound(tmp_path: Path) -> Non
         assert abs(v - var) < 0.08 * var, (name, v, var)
     assert got["perm"] == [50.0] and got["norep"] == [20.0]
     assert got["range"] == [3.0, 7.0]
+
+
+def test_xp2f_numpy_loadtxt_savetxt_basic_uses(tmp_path: Path) -> None:
+    # Basic np.loadtxt (delimiter, skiprows, usecols, dtype, max_rows,
+    # unpack=True) must read what numpy reads, and np.savetxt (default
+    # %.18e, %.Nf with the leading zero, %Ne, %d, a width, header/footer/
+    # comments, a vector) must write byte-identical files.
+    (tmp_path / "ws.txt").write_text("1.5 2.0 3.0\n4.0 -5.5 6.0\n7.0 8.0 9.25\n", encoding="utf-8")
+    (tmp_path / "comma.txt").write_text("# header\nx,y\n1,10\n2,20\n3,30\n", encoding="utf-8")
+    src = tmp_path / "xnp_io.py"
+    src.write_text(
+        "import numpy as np\n"
+        "print(np.loadtxt('ws.txt'))\n"
+        "print(np.loadtxt('comma.txt', delimiter=',', skiprows=2))\n"
+        "print(np.loadtxt('comma.txt', delimiter=',', skiprows=2, usecols=1))\n"
+        "print(np.loadtxt('comma.txt', delimiter=',', skiprows=2, dtype=int))\n"
+        "print(np.loadtxt('ws.txt', max_rows=2, usecols=(0, 2)))\n"
+        "x, y = np.loadtxt('comma.txt', delimiter=',', skiprows=2, unpack=True)\n"
+        "print(x, y)\n"
+        "m = np.array([[1.5, 2.0], [3.25, -4.0]])\n"
+        "np.savetxt('o_default.txt', m)\n"
+        "np.savetxt('o_fmt.txt', m, delimiter=',', fmt='%.3f')\n"
+        "np.savetxt('o_vec.txt', np.array([1.0, 2.5]))\n"
+        "np.savetxt('o_hdr.txt', m, header='a b', fmt='%d')\n"
+        "np.savetxt('o_e.txt', np.array([[0.5, -0.25e-120, 1.0e105]]), fmt='%.4e', footer='end', comments='% ')\n"
+        "np.savetxt('o_w.txt', np.array([[0.125, -0.5]]), fmt='%10.3f')\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    names = ["o_default.txt", "o_fmt.txt", "o_vec.txt", "o_hdr.txt", "o_e.txt", "o_w.txt"]
+    ft = subprocess.run([str(src.with_name("xnp_io_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    written = {n: (tmp_path / n).read_bytes() for n in names}
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    for n in names:
+        assert (tmp_path / n).read_bytes() == written[n], n
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(py) == pytest.approx(nums(ft))

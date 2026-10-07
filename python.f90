@@ -327,6 +327,7 @@ public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:charac
 public :: loadtxt_int_1d !@pyapi kind=function ret=integer(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected integer column as vector"
 public :: loadtxt_logical_2d !@pyapi kind=function ret=logical(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load logical matrix from text file (nonzero=>true)"
 public :: loadtxt_logical_1d !@pyapi kind=function ret=logical(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected logical column as vector (nonzero=>true)"
+public :: np_fmt_number
 public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in),delimiter:character:intent(in):optional,fmt:character:intent(in):optional desc="write real matrix text file with basic delimiter/fmt options"
 public :: print_matrix !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),label:character:intent(in):optional desc="print 2D real matrix with aligned columns"
 public :: print_array_3d !@pyapi kind=subroutine args=a:real(dp)(:,:,:):intent(in),label:character:intent(in):optional desc="print 3D real array with numpy-style nested brackets"
@@ -2379,45 +2380,106 @@ contains
          x = (tmp /= 0.0_dp)
       end function loadtxt_logical_1d
 
-      subroutine savetxt_real_2d(path, x, delimiter, fmt)
-         character(len=*), intent(in) :: path
-         real(kind=dp), intent(in) :: x(:,:)
-         character(len=*), intent(in), optional :: delimiter, fmt
-         integer :: u, i, j, ipos, prec, ios, dsep_len
-         character(len=32) :: dsep, wfmt, fmt_txt
-
-         dsep = " "
-         dsep_len = 1
-         if (present(delimiter)) then
-            if (len(delimiter) > 0) then
-               dsep = delimiter
-               dsep_len = min(len(delimiter), len(dsep))
-            end if
+      function np_fmt_number(x, spec) result(s)
+         ! x formatted like Python's `spec % x` for the printf specs numpy's
+         ! savetxt uses: %[width][.prec]{e,f,g,d,i} (default %.18e).
+         real(kind=dp), intent(in) :: x
+         character(len=*), intent(in) :: spec
+         character(len=:), allocatable :: s
+         character(len=64) :: buf, wf
+         character(len=1) :: conv
+         integer :: width, prec, ipos, ios, k, e
+         character(len=:), allocatable :: body
+         conv = spec(len_trim(spec):len_trim(spec))
+         body = spec(2:len_trim(spec) - 1)
+         width = 0
+         prec = 6
+         ipos = index(body, ".")
+         if (ipos > 0) then
+            read(body(ipos + 1:), *, iostat=ios) prec
+            if (ios /= 0) prec = 6
+            if (ipos > 1) read(body(1:ipos - 1), *, iostat=ios) width
+         else if (len(body) > 0) then
+            read(body, *, iostat=ios) width
          end if
-         wfmt = "(g0)"
-         if (present(fmt)) then
-            fmt_txt = adjustl(trim(fmt))
-            if (len_trim(fmt_txt) >= 2 .and. fmt_txt(1:1) == "%") then
-               if (fmt_txt(len_trim(fmt_txt):len_trim(fmt_txt)) == "f") then
-                  ipos = index(fmt_txt, ".")
-                  if (ipos > 0 .and. ipos < len_trim(fmt_txt)) then
-                     read(fmt_txt(ipos+1:len_trim(fmt_txt)-1), *, iostat=ios) prec
-                     if (ios == 0 .and. prec >= 0) then
-                        write(wfmt, "(a,i0,a)") "(f0.", prec, ")"
-                     end if
+         select case (conv)
+         case ("d", "i")
+            ! Python's %d truncates a float toward zero.
+            write(buf, "(i0)") int(x)
+         case ("f", "F")
+            write(wf, "(a,i0,a)") "(f0.", prec, ")"
+            write(buf, wf) x
+            buf = adjustl(buf)
+            ! Fortran leaves out the zero before the decimal point.
+            if (buf(1:1) == ".") buf = "0" // buf
+            if (buf(1:2) == "-.") buf = "-0" // buf(2:)
+         case ("g", "G")
+            write(buf, "(g0)") x
+         case default
+            ! %e: d.ddd...e+XX, at least two exponent digits.
+            write(wf, "(a,i0,a,i0,a)") "(es", prec + 10, ".", prec, "e3)"
+            write(buf, wf) x
+            buf = adjustl(buf)
+            k = index(buf, "E")
+            if (k > 0) then
+               read(buf(k + 1:), *, iostat=ios) e
+               if (ios == 0) then
+                  if (abs(e) < 100) then
+                     write(buf(k:), "(a,sp,i3.2)") "e", e
+                  else
+                     write(buf(k:), "(a,sp,i0)") "e", e
                   end if
                end if
             end if
-         end if
+         end select
+         s = trim(adjustl(buf))
+         if (len(s) < width) s = repeat(" ", width - len(s)) // s
+      end function np_fmt_number
+
+      subroutine savetxt_real_2d(path, x, delimiter, fmt, header, footer, comments)
+         ! np.savetxt(path, x, fmt, delimiter, header=, footer=, comments=).
+         character(len=*), intent(in) :: path
+         real(kind=dp), intent(in) :: x(:,:)
+         character(len=*), intent(in), optional :: delimiter, fmt, header, footer, comments
+         character(len=:), allocatable :: dsep, spec, cmt
+         integer :: u, i, j
+         dsep = " "
+         if (present(delimiter)) dsep = delimiter
+         spec = "%.18e"
+         if (present(fmt)) spec = trim(adjustl(fmt))
+         cmt = "# "
+         if (present(comments)) cmt = comments
          open(newunit=u, file=trim(path), status="replace", action="write")
-         do i = 1, size(x,1)
-            do j = 1, size(x,2)
-               if (j > 1) write(u, "(a)", advance="no") dsep(1:dsep_len)
-               write(u, trim(wfmt), advance="no") x(i, j)
+         if (present(header)) then
+            if (len(header) > 0) call write_commented(header)
+         end if
+         do i = 1, size(x, 1)
+            do j = 1, size(x, 2)
+               if (j > 1) write(u, "(a)", advance="no") dsep
+               write(u, "(a)", advance="no") np_fmt_number(x(i, j), spec)
             end do
-            write(u, *)
+            write(u, "(a)") ""
          end do
+         if (present(footer)) then
+            if (len(footer) > 0) call write_commented(footer)
+         end if
          close(u)
+      contains
+         subroutine write_commented(text)
+            ! Each line of text with the comment prefix, as numpy writes them.
+            character(len=*), intent(in) :: text
+            integer :: a, b
+            a = 1
+            do
+               b = index(text(a:), new_line("a"))
+               if (b == 0) then
+                  write(u, "(a)") cmt // text(a:)
+                  exit
+               end if
+               write(u, "(a)") cmt // text(a:a + b - 2)
+               a = a + b
+            end do
+         end subroutine write_commented
       end subroutine savetxt_real_2d
 
       pure integer function optval_int(x, default) result(v)

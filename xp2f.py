@@ -6291,6 +6291,41 @@ def _normalized_einsum(spec, nargs):
 _LINALG_TUPLE_ARITY = {"eig": 2, "eigh": 2, "svd": 3, "qr": 2, "slogdet": 2, "lstsq": 4}
 
 
+def rewrite_loadtxt_unpack(tree):
+    """x, y = np.loadtxt(..., unpack=True): load into a temporary and take
+    its columns (numpy's unpack transposes the result)."""
+    counter = [0]
+
+    def process(body):
+        out = []
+        for st in body:
+            for field in ("body", "orelse", "finalbody"):
+                if isinstance(getattr(st, field, None), list):
+                    setattr(st, field, process(getattr(st, field)))
+            v = getattr(st, "value", None)
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr == "loadtxt"
+                    and any(k.arg == "unpack" and isinstance(k.value, ast.Constant) and k.value.value is True
+                            for k in v.keywords)
+                    and all(isinstance(e, ast.Name) for e in st.targets[0].elts)):
+                counter[0] += 1
+                tmp = f"xp_loadtxt{counter[0]}"
+                call = ast.Call(func=v.func, args=v.args, keywords=[k for k in v.keywords if k.arg != "unpack"])
+                new = [ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=call)]
+                for j, e in enumerate(st.targets[0].elts):
+                    new.append(ast.Assign(targets=[ast.Name(id=e.id, ctx=ast.Store())], value=ast.Subscript(
+                        value=ast.Name(id=tmp, ctx=ast.Load()),
+                        slice=ast.Tuple(elts=[ast.Slice(), ast.Constant(value=j)], ctx=ast.Load()), ctx=ast.Load())))
+                out.extend(ast.copy_location(n, st) for n in new)
+                continue
+            out.append(st)
+        return out
+
+    tree.body = process(tree.body)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_indexed_linalg_tuple_calls(tree):
     """np.linalg.eigh(a)[0], np.linalg.svd(a)[1], np.linalg.qr(a)[0],
     np.linalg.slogdet(a)[1], np.linalg.lstsq(a, b)[1], ...: the translator
@@ -16007,7 +16042,7 @@ def detect_needed_helpers(tree):
         "correlate": {"correlate_real"},
         "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_vector", "loadtxt_int_vector", "loadtxt_logical_vector"},
         "genfromtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
-        "savetxt": {"savetxt_real_2d"},
+        "savetxt": {"savetxt_real_2d", "np_fmt_number"},
         "pad": {"pad2d_int", "pad2d_real"},
         "allclose": {"allclose"},
         "isclose": {"isclose_real", "isclose_scalar_real"},
@@ -62528,16 +62563,28 @@ class translator(ast.NodeVisitor):
                 arr_emit = f"reshape({arr_emit}, [size({arr_txt}), 1])"
             fmt_txt = self.expr(c.args[2]) if len(c.args) >= 3 else None
             delim_txt = self.expr(c.args[3]) if len(c.args) >= 4 else None
+            extra = {}
             for kw in c.keywords:
                 if kw.arg == "fmt":
                     fmt_txt = self.expr(kw.value)
                 elif kw.arg == "delimiter":
                     delim_txt = self.expr(kw.value)
+                elif kw.arg in {"header", "footer", "comments"}:
+                    extra[kw.arg] = self.expr(kw.value)
+                elif kw.arg == "newline":
+                    if not (is_const_str(kw.value) and kw.value.value == "\n"):
+                        raise NotImplementedError("np.savetxt supports only newline='\\n'")
+                else:
+                    raise NotImplementedError(f"np.savetxt: unsupported argument {kw.arg}=")
             parts = [path_txt, arr_emit]
             if delim_txt is not None:
                 parts.append(f"delimiter={delim_txt}")
             if fmt_txt is not None:
+                if isinstance(c.args[2] if len(c.args) >= 3 else next(
+                        kw.value for kw in c.keywords if kw.arg == "fmt"), (ast.List, ast.Tuple)):
+                    raise NotImplementedError("np.savetxt supports one fmt for all columns")
                 parts.append(f"fmt={fmt_txt}")
+            parts += [f"{k}={v}" for k, v in extra.items()]
             self.o.w("call savetxt_real_2d(" + ", ".join(parts) + ")")
             return
 
@@ -82073,6 +82120,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
+    tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -82604,6 +82652,7 @@ def transpile_file(
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
+    tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
@@ -83410,6 +83459,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
+    tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)
