@@ -26351,3 +26351,21 @@ def test_xp2f_numpy_loadtxt_savetxt_basic_uses(tmp_path: Path) -> None:
         assert (tmp_path / n).read_bytes() == written[n], n
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(py) == pytest.approx(nums(ft))
+
+
+def test_xp2f_integer_overflow_traps_in_debug_build(tmp_path: Path) -> None:
+    # Fortran's default integer is 32-bit, numpy's 64-bit: the default
+    # (debug) build uses -ftrapv so an overflow aborts with a note instead
+    # of printing a silently wrapped value; a sum that fits still matches.
+    bad = tmp_path / "xovf.py"
+    bad.write_text("import numpy as np\nprint(np.sum(np.arange(100000)))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad), "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    out = proc.stdout + proc.stderr
+    assert "704982704" not in out
+    assert "most likely an integer overflow" in out, out
+    ok = tmp_path / "xnovf.py"
+    ok.write_text("import numpy as np\nprint(np.sum(np.arange(1000)), np.prod(np.arange(1, 10)))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(ok), "--run-diff"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr

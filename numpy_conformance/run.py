@@ -49,10 +49,10 @@ SINGLE = CASES / "single"
 RESULTS = HERE / "results"
 ORDER = ["DIFF-value", "DIFF-kind", "DIFF-count", "RUN-FAIL", "BUILD-FAIL", "XLATE-FAIL", "UNTESTED", "MATCH"]
 # xp2f's default debug flags, reporting every error instead of the first.
-COMPILER = "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -fmax-errors=100"
+COMPILER = "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -ftrapv -fmax-errors=100"
 # NaN inputs: an ordered comparison with NaN raises the invalid flag, which
 # -ffpe-trap=invalid turns into a crash where numpy just compares.
-COMPILER_NAN = "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=zero -fmax-errors=100"
+COMPILER_NAN = "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=zero -ftrapv -fmax-errors=100"
 
 _TOKEN_RE = re.compile(
     r"True|False|(?<![\w.])[TF](?![\w.])|[-+]?(?:nan|NaN|Infinity|inf|Inf)\b"

@@ -2057,7 +2057,8 @@ contains
          call random_seed(size=nseed_rng)
          allocate(seed_buf(nseed_rng))
          do i_rng = 1, nseed_rng
-            seed_buf(i_rng) = s0 + 104729 * (i_rng - 1)
+            ! In 64 bits and reduced, so a seed near huge(0) cannot overflow (-ftrapv).
+            seed_buf(i_rng) = int(modulo(int(s0, int64) + 104729_int64 * (i_rng - 1), int(huge(0), int64)))
          end do
          call random_seed(put=seed_buf)
          deallocate(seed_buf)

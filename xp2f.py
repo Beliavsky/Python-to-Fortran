@@ -2739,7 +2739,9 @@ def run_python_with_rng_replay(input_py, replay_path, tee=False, stream_line_fil
 def debug_flags_for_compiler(compiler_exe):
     low = (compiler_exe or "").lower()
     if "gfortran" in low:
-        return ["-g", "-fcheck=all", "-fbacktrace", "-ffpe-trap=invalid,zero,overflow"]
+        # -ftrapv: a signed integer overflow aborts (numpy's int64 values
+        # can exceed the default 32-bit integer) instead of wrapping silently.
+        return ["-g", "-fcheck=all", "-fbacktrace", "-ffpe-trap=invalid,zero,overflow", "-ftrapv"]
     if low in {"ifx", "ifort"} or low.endswith("\\ifx.exe") or low.endswith("\\ifort.exe"):
         return ["-g", "-traceback", "-check", "all", "-fpe0"]
     # Conservative fallback for unknown Fortran compilers.
@@ -2747,7 +2749,15 @@ def debug_flags_for_compiler(compiler_exe):
 
 
 def default_compiler_command():
-    return "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -Wfatal-errors"
+    return "gfortran -O0 -g -fcheck=all -fbacktrace -ffpe-trap=invalid,zero,overflow -ftrapv -Wfatal-errors"
+
+
+def _integer_overflow_hint(output, compiler_parts):
+    """A note for a run aborted by -ftrapv (SIGABRT with only addresses in
+    the backtrace): the likely cause is a 32-bit integer overflow."""
+    if "-ftrapv" in " ".join(compiler_parts or []) and "SIGABRT" in (output or ""):
+        print("Note: the program aborted under -ftrapv, most likely an integer overflow: Fortran's default "
+              "integer is 32-bit, numpy's 64-bit (values beyond 2147483647 need 64-bit integers).")
 
 
 def default_timing_compiler_command():
@@ -84343,6 +84353,7 @@ def main():
                     print(_display_text(rp_out, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                 if (not rp_live) and rp_err.strip():
                     print(_display_text(rp_err, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
+                _integer_overflow_hint(rp_out + rp_err, compiler_parts)
                 if args.autofix:
                     autofix_runtime_status = "attempted"
                     af_rc = _run_xautofix([*helper_files, out], runtime=True)
@@ -84432,6 +84443,8 @@ def main():
                             print(_display_text(dbg_out, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
                         if (not dbg_live) and dbg_err.strip():
                             print(_display_text(dbg_err, pretty=args.pretty, round_digits=fortran_round_digits).rstrip())
+                        if dbg_rc != 0:
+                            _integer_overflow_hint(dbg_out + dbg_err, dbg_cmd)
                     _emit_timing_summary()
                     _emit_autofix_report()
                     return rp_rc
