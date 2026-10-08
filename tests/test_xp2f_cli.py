@@ -26754,3 +26754,65 @@ def test_xp2f_numpy_polynomial_series_functions(tmp_path: Path) -> None:
     # numpy prints arrays with 8 decimals.
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)
+
+
+def test_xp2f_loop_over_literal_list_of_arrays(tmp_path: Path) -> None:
+    # for r in [a, b, c]: over arrays of different sizes and ranks (it was
+    # packed into a matrix and indexed as reshape(...)(i, :), invalid
+    # Fortran): the body is repeated per element, writes through r reach the
+    # element (numpy's aliasing), r += ... is in place, a rebound r is a
+    # copy, and break / continue / for-else / enumerate / return work.
+    src = tmp_path / "xlistloop.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def first_big(a, b, c):\n"
+        "    for r in [a, b, c]:\n"
+        "        if np.max(r) > 4.0:\n"
+        "            return np.sum(r)\n"
+        "    return -1.0\n"
+        "def tot(xs):\n"
+        "    s = 0.0\n"
+        "    for r in [xs, xs * 2, np.sqrt(xs)]:\n"
+        "        s += np.sum(r)\n"
+        "    return s\n"
+        "a = np.array([1.0, 2.0])\n"
+        "b = np.array([3.0, 4.0, 5.0])\n"
+        "c = np.array([9.0])\n"
+        "m = np.ones((2, 3))\n"
+        "for r in [a, m, b * 2]:\n"
+        "    print(r.size, np.sum(r))\n"
+        "for i, r in enumerate([a, b]):\n"
+        "    print(i, np.max(r))\n"
+        "for r in [a, b, c]:\n"
+        "    if r.size == 3:\n"
+        "        continue\n"
+        "    if r.size == 1:\n"
+        "        break\n"
+        "    print(r)\n"
+        "else:\n"
+        "    print(-7)\n"
+        "for r in [a, b]:\n"
+        "    r = r * 2\n"
+        "    print(r)\n"
+        "print(a, b, first_big(a, b, c), first_big(a, a, a), tot(np.array([1.0, 4.0])))\n"
+        "for r in [a, b]:\n"
+        "    r[0] = -1.0\n"
+        "    r *= 10\n"
+        "print(a, b)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xlistloop_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints arrays with 8 decimals.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)
+    bad = tmp_path / "xlistloop_bad.py"
+    bad.write_text("import numpy as np\na = np.array([1.0])\nb = np.array([2.0])\nfor r in [a, b]:\n    pass\n"
+                   "print(r)\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad)], cwd=tmp_path, capture_output=True,
+                          text=True, check=False)
+    assert "is used after the loop" in proc.stdout + proc.stderr

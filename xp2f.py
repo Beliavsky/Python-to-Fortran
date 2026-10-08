@@ -6481,6 +6481,225 @@ def rewrite_numpy_polynomial_aliases(tree):
     return tree
 
 
+_UNROLL_MAX_ELEMENTS = 16
+
+
+def rewrite_unroll_array_list_loops(tree):
+    """for r in [a, b, c]: (or enumerate([...])) over arrays, which may differ
+    in shape and rank: the body is repeated once per element (Fortran has
+    no array of arrays). In each copy r is the element itself, so writes
+    through r reach a (numpy's aliasing); an element that is not a name is
+    evaluated before the loop, as Python builds the list first. A body
+    that rebinds r gets a fresh variable per copy instead. break, continue
+    and for-else become one-trip loops and a flag. Lists of scalars or
+    strings keep their loop."""
+    funcs = [f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)]
+    array_params = _possibly_array_params([s for s in tree.body if not isinstance(s, ast.FunctionDef)],
+                                          [f for f in tree.body if isinstance(f, ast.FunctionDef)])
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {f.name for f in funcs}
+    counter = [0]
+
+    def fresh(stem):
+        counter[0] += 1
+        name = f"xp_{stem}{counter[0]}"
+        while name in used:
+            counter[0] += 1
+            name = f"xp_{stem}{counter[0]}"
+        used.add(name)
+        return name
+
+    def own_level(stmts, kinds):
+        """break/continue statements of this loop: not those in the body of a
+        nested loop (but those in a nested loop's else clause), nor in a
+        nested function."""
+        found = []
+
+        class _V(ast.NodeVisitor):
+            def generic_visit(self, n):
+                if isinstance(n, kinds):
+                    found.append(n)
+                if isinstance(n, (ast.For, ast.While)):
+                    for s in n.orelse:
+                        self.visit(s)
+                    return
+                if isinstance(n, (ast.FunctionDef, ast.Lambda, ast.ClassDef)):
+                    return
+                super().generic_visit(n)
+        for st in stmts:
+            _V().visit(st)
+        return found
+
+    class _Subst(ast.NodeTransformer):
+        def __init__(self, name, repl):
+            self.name, self.repl = name, repl
+
+        def visit_Name(self, n):
+            if n.id == self.name:
+                return ast.copy_location(ast.Name(id=self.repl, ctx=n.ctx), n)
+            return n
+
+        def visit_FunctionDef(self, n):
+            return n
+
+        def visit_Lambda(self, n):
+            return n
+
+    class _Jumps(ast.NodeTransformer):
+        """break -> flag = True; break (out of the copy's one-trip loop)."""
+        def __init__(self, flag):
+            self.flag = flag
+
+        def visit_Break(self, n):
+            return [ast.Assign(targets=[ast.Name(id=self.flag, ctx=ast.Store())], value=ast.Constant(value=True)),
+                    n]
+
+        def visit_For(self, n):
+            n.orelse = [self.visit(s) for s in n.orelse]
+            return n
+
+        visit_While = visit_For
+
+        def visit_FunctionDef(self, n):
+            return n
+
+    def process(body, arr_names, after):
+        out = []
+        for idx, st in enumerate(body):
+            for field in ("body", "orelse", "finalbody"):
+                if isinstance(getattr(st, field, None), list) and not isinstance(st, ast.FunctionDef):
+                    setattr(st, field, process(getattr(st, field), arr_names, body[idx + 1:] + after))
+            if isinstance(st, ast.Try):
+                for h in st.handlers:
+                    h.body = process(h.body, arr_names, body[idx + 1:] + after)
+            new = unroll(st, arr_names, body[idx + 1:] + after)
+            out.extend(new if new is not None else [st])
+        return out
+
+    def unroll(st, arr_names, after):
+        if not isinstance(st, ast.For):
+            return None
+        it, tgt, idx_name = st.iter, st.target, None
+        if (isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "enumerate"
+                and len(it.args) == 1 and not it.keywords and isinstance(tgt, ast.Tuple) and len(tgt.elts) == 2
+                and all(isinstance(e, ast.Name) for e in tgt.elts)):
+            idx_name, tgt, it = tgt.elts[0].id, tgt.elts[1], it.args[0]
+        if not (isinstance(it, (ast.List, ast.Tuple)) and isinstance(tgt, ast.Name) and it.elts):
+            return None
+        elts = list(it.elts)
+        if any(isinstance(e, ast.Starred) for e in elts) or not any(_possibly_array(e, arr_names) for e in elts):
+            return None
+        if len(elts) > _UNROLL_MAX_ELEMENTS:
+            raise NotImplementedError(
+                f"a loop over a list of {len(elts)} arrays is not supported (at most {_UNROLL_MAX_ELEMENTS})")
+        r = tgt.id
+
+        def reads_r(nodes):
+            return any(isinstance(n, ast.Name) and n.id == r and isinstance(n.ctx, ast.Load)
+                       for x in nodes for n in ast.walk(x))
+        def first_use(stmts):
+            """'read' if r may be read before it is rebound, 'write' if it is
+            rebound first on every path, else None."""
+            for s in stmts:
+                if isinstance(s, ast.For):
+                    if reads_r([s.iter]):
+                        return "read"
+                    if any(isinstance(n, ast.Name) and n.id == r for n in ast.walk(s.target)):
+                        return "write"
+                    if first_use(s.body) == "read" or first_use(s.orelse) == "read":
+                        return "read"
+                elif isinstance(s, ast.While):
+                    if reads_r([s.test]) or first_use(s.body) == "read" or first_use(s.orelse) == "read":
+                        return "read"
+                elif isinstance(s, ast.If):
+                    if reads_r([s.test]):
+                        return "read"
+                    u1, u2 = first_use(s.body), first_use(s.orelse)
+                    if "read" in (u1, u2):
+                        return "read"
+                    if u1 == u2 == "write":
+                        return "write"
+                elif isinstance(s, ast.Assign) and any(isinstance(n, ast.Name) and n.id == r and isinstance(n.ctx, ast.Store)
+                                                       for tg in s.targets for n in ast.walk(tg)):
+                    return "read" if reads_r([s.value]) else "write"
+                elif isinstance(s, (ast.FunctionDef, ast.ClassDef)):
+                    continue
+                elif reads_r([s]):
+                    return "read"
+            return None
+        if first_use(after) == "read":
+            raise NotImplementedError(
+                f"the loop variable {r} of a loop over a list of arrays is used after the loop")
+        # r += ... updates an array in place (it rebinds only a scalar).
+        inplace = all(_possibly_array(e, arr_names) for e in elts)
+        aug_targets = {id(n.target) for s in st.body for n in ast.walk(s)
+                       if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name)} if inplace else set()
+        stored = {n.id for s in st.body for n in ast.walk(s)
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and id(n) not in aug_targets}
+        elt_names = {n.id for e in elts for n in ast.walk(e) if isinstance(n, ast.Name)}
+        if stored & elt_names:
+            raise NotImplementedError(
+                f"the body of a loop over a list of arrays rebinds {sorted(stored & elt_names)[0]}, "
+                "which is in the list")
+        rebinds = r in stored
+        pre = []
+        sources = []
+        for e in elts:
+            if isinstance(e, ast.Name):
+                sources.append(e.id)
+            else:
+                tmp = fresh("item")
+                pre.append(ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=e))
+                sources.append(tmp)
+        has_break = bool(own_level(st.body, ast.Break))
+        has_continue = bool(own_level(st.body, ast.Continue))
+        flag = fresh("broke") if has_break else None
+        if flag:
+            pre.append(ast.Assign(targets=[ast.Name(id=flag, ctx=ast.Store())], value=ast.Constant(value=False)))
+        copies = []
+        for k, src in enumerate(sources):
+            body = [copy.deepcopy(s) for s in st.body]
+            head = []
+            if idx_name:
+                head.append(ast.Assign(targets=[ast.Name(id=idx_name, ctx=ast.Store())], value=ast.Constant(value=k)))
+            if rebinds:
+                # r is rebound in the body: a variable of its own per copy.
+                var = fresh(r + "_")
+                head.append(ast.Assign(targets=[ast.Name(id=var, ctx=ast.Store())],
+                                       value=ast.Name(id=src, ctx=ast.Load())))
+            else:
+                var = src
+            body = [_Subst(r, var).visit(s) for s in body]
+            if flag:
+                body = [x for s in body for x in (lambda v: v if isinstance(v, list) else [v])(_Jumps(flag).visit(s))]
+            if has_break or has_continue:
+                body = [ast.For(target=ast.Name(id=fresh("once"), ctx=ast.Store()),
+                                iter=ast.Call(func=ast.Name(id="range", ctx=ast.Load()),
+                                              args=[ast.Constant(value=1)], keywords=[]),
+                                body=body, orelse=[])]
+            copies.append(head + body)
+        out = list(pre)
+        for k, cp in enumerate(copies):
+            if flag and k > 0:
+                out.append(ast.If(test=ast.UnaryOp(op=ast.Not(), operand=ast.Name(id=flag, ctx=ast.Load())),
+                                  body=cp, orelse=[]))
+            else:
+                out.extend(cp)
+        if st.orelse:
+            if flag:
+                out.append(ast.If(test=ast.UnaryOp(op=ast.Not(), operand=ast.Name(id=flag, ctx=ast.Load())),
+                                  body=st.orelse, orelse=[]))
+            else:
+                out.extend(st.orelse)
+        return [ast.copy_location(s, st) for s in out]
+
+    module_body = [s for s in tree.body if not isinstance(s, ast.FunctionDef)]
+    tree.body = process(tree.body, _possibly_array_names(module_body, set()), [])
+    for f in funcs:
+        f.body = process(f.body, _possibly_array_names(f.body, array_params.get(f.name, set())), [])
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_two_result_numpy_unpack(tree):
     """q, r = np.polydiv(u, v), m, e = np.frexp(x) and f, i = np.modf(x):
     one indexed call per target (the translator evaluates np.polydiv(u,
@@ -83252,6 +83471,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
@@ -83789,6 +84009,7 @@ def transpile_file(
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
@@ -84607,6 +84828,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
