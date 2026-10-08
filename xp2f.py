@@ -6332,6 +6332,82 @@ def _normalized_einsum(spec, nargs):
 _LINALG_TUPLE_ARITY = {"eig": 2, "eigh": 2, "svd": 3, "qr": 2, "slogdet": 2, "lstsq": 4}
 
 
+def rewrite_function_valued_library_args(tree):
+    """A numpy or math function passed as an argument (quad(np.cos, n),
+    apply(math.sqrt, t), red(np.abs, x)) becomes a generated module-level
+    wrapper, def xp_np_cos(a0): return np.cos(a0), which is then an
+    ordinary local callback. A ufunc takes its nin arguments, a math
+    function its required parameters, any other numpy function one."""
+    import inspect
+    import numpy as np
+    import math as _math
+    import cmath as _cmath
+    modules = {"np": np, "numpy": np, "math": _math, "cmath": _cmath}
+    aliases = {}
+    for st in tree.body:
+        if isinstance(st, ast.Import):
+            for a in st.names:
+                if a.name in modules:
+                    aliases[a.asname or a.name] = a.name
+    if not aliases:
+        return tree
+    existing = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    existing.update(n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    wrappers = {}
+
+    def arity(mod, obj):
+        if mod in ("numpy", "np"):
+            return getattr(obj, "nin", 1) if isinstance(obj, np.ufunc) else 1
+        try:
+            sig = inspect.signature(obj)
+        except (TypeError, ValueError):
+            return 1
+        req = [q for q in sig.parameters.values()
+               if q.default is inspect.Parameter.empty and q.kind in (q.POSITIONAL_ONLY, q.POSITIONAL_OR_KEYWORD)]
+        return len(req) or 1
+
+    def wrapper_for(node):
+        if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases):
+            return None
+        mod = aliases[node.value.id]
+        obj = getattr(modules[mod], node.attr, None)
+        if obj is None or isinstance(obj, type) or not callable(obj):
+            return None
+        key = (node.value.id, node.attr)
+        if key not in wrappers:
+            stem = f"xp_{'np' if mod == 'numpy' else mod}_{node.attr}"
+            name, k = stem, 2
+            while name in existing:
+                name, k = f"{stem}_{k}", k + 1
+            existing.add(name)
+            params = [f"a{i}" for i in range(arity(mod, obj))]
+            fn = ast.parse(f"def {name}({', '.join(params)}):\n    return {node.value.id}.{node.attr}({', '.join(params)})\n").body[0]
+            wrappers[key] = (name, fn)
+        return wrappers[key][0]
+
+    class _Args(ast.NodeTransformer):
+        def visit_Call(self, call):
+            self.generic_visit(call)
+            call.args = [ast.copy_location(ast.Name(id=w, ctx=ast.Load()), a) if (w := wrapper_for(a)) else a
+                         for a in call.args]
+            for kw in call.keywords:
+                w = wrapper_for(kw.value)
+                if w:
+                    kw.value = ast.copy_location(ast.Name(id=w, ctx=ast.Load()), kw.value)
+            return call
+
+    _Args().visit(tree)
+    if wrappers:
+        pos = 0
+        while pos < len(tree.body) and isinstance(tree.body[pos], (ast.Import, ast.ImportFrom)) or (
+                pos < len(tree.body) and isinstance(tree.body[pos], ast.Expr)
+                and isinstance(tree.body[pos].value, ast.Constant) and isinstance(tree.body[pos].value.value, str)):
+            pos += 1
+        tree.body[pos:pos] = [fn for _, fn in wrappers.values()]
+        ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_gradient_unpack(tree):
     """gy, gx = np.gradient(m[, dy, dx]): one np.gradient(..., axis=k) per
     target (numpy returns one array per axis)."""
@@ -13754,8 +13830,22 @@ def mark_recursive_procedures(lines):
         )
         call_re = re.compile(rf"\bcall\s+(?:{self_names})\s*\(", re.IGNORECASE)
         func_re = re.compile(rf"(?<![A-Za-z_])(?:{self_names})\s*\(", re.IGNORECASE)
+        in_iface = 0
         while j < len(out):
             code = _line_code_only(out[j])
+            # An interface body (a callback's procedure interface) has its
+            # own `end function`, which is not the end of this procedure.
+            if re.match(r"^\s*(?:abstract\s+)?interface\b", code, re.IGNORECASE):
+                in_iface += 1
+                j += 1
+                continue
+            if re.match(r"^\s*end\s+interface\b", code, re.IGNORECASE):
+                in_iface = max(0, in_iface - 1)
+                j += 1
+                continue
+            if in_iface:
+                j += 1
+                continue
             if end_re.match(code):
                 break
             if kind == "subroutine":
@@ -23028,6 +23118,185 @@ def normalize_unused_callable_arguments(exec_body, local_funcs):
                         kw.value = ast.copy_location(ast.Constant(value=0), kw.value)
 
 
+_SCALAR_NUMPY_RESULTS = {
+    "sum", "mean", "max", "min", "prod", "std", "var", "median", "trapezoid", "trapz", "average", "ptp",
+    "argmax", "argmin", "count_nonzero", "any", "all", "amax", "amin", "nanmax", "nanmin", "nansum", "nanmean",
+    "float64", "float32", "int64", "int32", "det", "trace", "vdot", "isscalar", "ndim", "size",
+}
+
+
+def _possibly_array(e, names):
+    """Could expression e be an array (a conservative pre-inference guess:
+    True unless it is clearly a scalar)? names: the names that may be."""
+    import numpy as _np
+    if e is None or isinstance(e, ast.Constant):
+        return False
+    if isinstance(e, ast.Name):
+        return e.id in names
+    if isinstance(e, (ast.List, ast.Tuple, ast.ListComp, ast.Set)):
+        return True
+    if isinstance(e, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp)):
+        return any(_possibly_array(c, names) for c in ast.iter_child_nodes(e) if isinstance(c, ast.expr))
+    if isinstance(e, ast.Subscript) and any(isinstance(s, ast.Slice) for s in ast.walk(e.slice)):
+        return True  # a slice is an array
+    if isinstance(e, (ast.Subscript, ast.Attribute)):
+        return _possibly_array(e.value, names)
+    if isinstance(e, ast.Call):
+        f = e.func
+        args = list(e.args) + [k.value for k in e.keywords]
+        if isinstance(f, ast.Attribute):
+            root = f.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in {"math", "cmath"}:
+                return False
+            if isinstance(root, ast.Name) and root.id in {"np", "numpy"}:
+                if f.attr in _SCALAR_NUMPY_RESULTS and not any(k.arg == "axis" for k in e.keywords):
+                    return False
+                if isinstance(getattr(_np, f.attr, None), _np.ufunc):
+                    return any(_possibly_array(a, names) for a in args)
+                return True
+            if f.attr in {"sum", "mean", "max", "min", "prod", "std", "var", "item", "count", "index"}:
+                return False
+            return _possibly_array(f.value, names)
+        if isinstance(f, ast.Name):
+            if f.id in {"float", "int", "len", "round", "bool", "complex", "str", "sum"}:
+                return False
+            if f.id in {"abs", "min", "max", "pow"}:
+                return any(_possibly_array(a, names) for a in args)
+        return True
+    return True
+
+
+def _possibly_array_names(stmts, params):
+    """Names in a scope that may hold arrays: the given parameters, and
+    names assigned something that may be (to a fixpoint)."""
+    names = set(params)
+    assigns = []
+    for st in stmts:
+        for n in ast.walk(st):
+            if isinstance(n, ast.Assign):
+                assigns.extend((tg, n.value) for tg in n.targets)
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and n.value is not None:
+                assigns.append((n.target, n.value))
+    changed = True
+    while changed:
+        changed = False
+        for tg, val in assigns:
+            if isinstance(tg, ast.Name):
+                if tg.id not in names and _possibly_array(val, names):
+                    names.add(tg.id)
+                    changed = True
+            elif isinstance(tg, (ast.Tuple, ast.List)):
+                # x, w = leggauss(n): unpacked results of a call may be arrays.
+                multi = isinstance(val, ast.Call) or _possibly_array(val, names)
+                for el in tg.elts:
+                    if isinstance(el, ast.Name) and el.id not in names and multi:
+                        names.add(el.id)
+                        changed = True
+    return names
+
+
+def _possibly_array_params(exec_body, local_funcs):
+    """Local function name -> its parameters that some call may pass an
+    array (a fixpoint over the call sites)."""
+    fns = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
+    pa = {nm: set() for nm in fns}
+    for _round in range(len(fns) + 2):
+        changed = False
+        scopes = [(exec_body, set())] + [(f.body, pa[f.name]) for f in fns.values()]
+        for body, params in scopes:
+            names = _possibly_array_names(body, params)
+            for st in body:
+                for c in ast.walk(st):
+                    if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in fns):
+                        continue
+                    callee = fns[c.func.id]
+                    pnames = [a.arg for a in callee.args.args]
+                    for i, a in enumerate(c.args):
+                        if i < len(pnames) and pnames[i] not in pa[callee.name] and _possibly_array(a, names):
+                            pa[callee.name].add(pnames[i])
+                            changed = True
+                    for k in c.keywords:
+                        if k.arg in pnames and k.arg not in pa[callee.name] and _possibly_array(k.value, names):
+                            pa[callee.name].add(k.arg)
+                            changed = True
+        if not changed:
+            break
+    return pa
+
+
+def _callback_needs_binding(fn, param, fn_map, array_params, seen):
+    """Is callback parameter `param` of fn called with something that may be
+    an array, in fn or in a local function it passes the callback on to?"""
+    if (fn.name, param) in seen:
+        return False
+    seen.add((fn.name, param))
+    names = _possibly_array_names(fn.body, array_params.get(fn.name, set()))
+    for c in ast.walk(fn):
+        if not isinstance(c, ast.Call):
+            continue
+        if isinstance(c.func, ast.Name) and c.func.id == param:
+            if any(_possibly_array(a, names) for a in c.args):
+                return True
+            continue
+        if isinstance(c.func, ast.Name) and c.func.id in fn_map:
+            callee = fn_map[c.func.id]
+            pnames = [a.arg for a in callee.args.args]
+            passed = [pnames[i] for i, a in enumerate(c.args)
+                      if i < len(pnames) and isinstance(a, ast.Name) and a.id == param]
+            passed += [k.arg for k in c.keywords
+                       if k.arg in pnames and isinstance(k.value, ast.Name) and k.value.id == param]
+            if any(_callback_needs_binding(callee, q, fn_map, array_params, seen) for q in passed):
+                return True
+    return False
+
+
+def _separate_bound_callback_calls(exec_body, local_funcs):
+    """A function g that is passed as a procedure argument somewhere needs
+    one specific procedure there; a direct call g(x) that may receive an
+    array (in a bound clone, or elsewhere) gives g rank specializations,
+    which make it a generic name. Such direct calls use a copy of g
+    (g_direct) instead."""
+    fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
+    passed = set()
+    for root in list(exec_body) + list(local_funcs):
+        for c in ast.walk(root):
+            if isinstance(c, ast.Call):
+                for a in list(c.args) + [k.value for k in c.keywords]:
+                    if isinstance(a, ast.Name) and a.id in fn_map:
+                        passed.add(a.id)
+    if not passed:
+        return
+    array_params = _possibly_array_params(exec_body, local_funcs)
+    used = {f.name.lower() for f in local_funcs}
+    copies = {}
+    scopes = [(None, list(exec_body), set())] + [
+        (f, f.body, array_params.get(f.name, set())) for f in list(local_funcs) if isinstance(f, ast.FunctionDef)]
+    for owner, body, params in scopes:
+        names = _possibly_array_names(body, params)
+        for st in body:
+            for c in ast.walk(st):
+                if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in passed
+                        and (owner is None or c.func.id != owner.name)
+                        and any(_possibly_array(a, names) for a in c.args)):
+                    continue
+                g = c.func.id
+                if g not in copies:
+                    name, k = f"{g}_direct", 2
+                    while name.lower() in used:
+                        name, k = f"{g}_direct_{k}", k + 1
+                    used.add(name.lower())
+                    dup = copy.deepcopy(fn_map[g])
+                    dup.name = name
+                    for n in ast.walk(dup):
+                        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == g:
+                            n.func.id = name  # its own recursion
+                    local_funcs.append(ast.fix_missing_locations(dup))
+                    copies[g] = name
+                c.func.id = copies[g]
+
+
 def specialize_named_slice_callbacks(exec_body, local_funcs, nested=False):
     """Bind distinct known callbacks used on slices before rank inference.
 
@@ -23039,6 +23308,7 @@ def specialize_named_slice_callbacks(exec_body, local_funcs, nested=False):
     lifting, including wrappers with just one known callback actual.
     """
     fn_map = {f.name: f for f in local_funcs if isinstance(f, ast.FunctionDef)}
+    array_params = _possibly_array_params(exec_body, local_funcs) if not nested else {}
     roots = list(exec_body) + list(local_funcs)
     module_rebound = {n.id for st in exec_body for n in ast.walk(st)
                       if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} if nested else set()
@@ -23067,11 +23337,26 @@ def specialize_named_slice_callbacks(exec_body, local_funcs, nested=False):
                               or scope.name == arg.arg for scope in inner_scopes):
                 continue
             refs = [n for n in nodes if isinstance(n, ast.Name) and n.id == arg.arg]
-            if not refs or any(not isinstance(n.ctx, ast.Load) or not isinstance(parents.get(id(n)), ast.Call)
-                               or parents[id(n)].func is not n for n in refs):
+
+            def _call_or_pass(n):
+                # Called (f(x)), or passed on to another local function
+                # (inner(f, x)), which a later round binds in its turn.
+                par = parents.get(id(n))
+                if not isinstance(n.ctx, ast.Load):
+                    return False
+                if isinstance(par, ast.Call) and par.func is n:
+                    return True
+                if (not nested and isinstance(par, ast.Call) and isinstance(par.func, ast.Name)
+                        and par.func.id in fn_map and par.func.id != fn.name and n in par.args):
+                    return True
+                kw_par = parents.get(id(par)) if isinstance(par, ast.keyword) else None
+                return (not nested and isinstance(kw_par, ast.Call) and isinstance(kw_par.func, ast.Name)
+                        and kw_par.func.id in fn_map and kw_par.func.id != fn.name)
+            if not refs or not all(_call_or_pass(n) for n in refs):
                 continue
-            if not nested and not any(isinstance(a, ast.Subscript) and any(isinstance(s, ast.Slice) for s in ast.walk(a.slice))
-                       for n in refs for a in parents[id(n)].args):
+            if not nested and not _callback_needs_binding(fn, arg.arg, fn_map, array_params, set()):
+                # Called only with scalars (also where it is passed on): the
+                # procedure-dummy interface fits.
                 continue
             sites = []
             for root in list(exec_body) + list(local_funcs):
@@ -23094,7 +23379,10 @@ def specialize_named_slice_callbacks(exec_body, local_funcs, nested=False):
                             if actual.id in caller_bound:
                                 continue
                         sites.append((call, actual.id))
-            if len({name for _, name in sites}) < (1 if nested else 2):
+            # One clone per distinct callback: the call in the clone is then a
+            # direct call, typed by its own arguments (g(x) of an array x),
+            # not through one procedure interface for all callbacks.
+            if not sites:
                 continue
             bound = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
             bound.update(n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
@@ -31868,6 +32156,23 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"fft", "ifft", "rfft"}:
                     return "complex"
                 if node.func.attr in {"irfft", "fftfreq", "rfftfreq"}:
+                    return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in (self.math_aliases | {"math"})
+                and node.func.value.id not in self.reals | self.ints | self.alloc_reals | self.alloc_ints
+            ):
+                # math.cos(a) is a float whatever the kind of a (it was a's
+                # kind, an integer while a was not yet typed).
+                if node.func.attr in {"floor", "ceil", "trunc", "comb", "perm", "factorial", "gcd", "lcm", "isqrt"}:
+                    return "int"
+                if node.func.attr in {"isfinite", "isinf", "isnan", "isclose"}:
+                    return "logical"
+                if node.func.attr in {"fsum", "sqrt", "exp", "log", "log2", "log10", "log1p", "expm1", "sin", "cos",
+                                      "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh", "acosh",
+                                      "atanh", "hypot", "pow", "fabs", "fmod", "copysign", "degrees", "radians", "erf",
+                                      "erfc", "gamma", "lgamma", "ldexp", "remainder", "dist", "cbrt", "exp2"}:
                     return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -79977,6 +80282,14 @@ def generate_flat(
     profile_scan_enabled = True
     joint_rank_managed = set()
     joint_rank_targets = set()
+    # A function already specialized for several signatures (ev(x) called
+    # with a scalar and an array) passes each one on to the local functions
+    # it calls (g(x) inside it needs both ranks too).
+    for fn in (local_funcs or []):
+        if len(local_overload_specs.get(fn.name, [])) > 1:
+            joint_rank_targets.update(n.func.id for n in ast.walk(fn)
+                                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                                      and n.func.id in local_func_arg_names and n.func.id != fn.name)
     for _joint_pass in range(len(local_funcs or []) + 2):
         joint_rank_changed = False
         for fn in (local_funcs or []):
@@ -80234,7 +80547,15 @@ def generate_flat(
     for _return_pass in range(len(joint_rank_managed) + 2):
         _return_changed = False
         for fn in (local_funcs or []):
-            if fn.name not in joint_rank_managed:
+            # Also the functions specialized earlier for several signatures:
+            # a forwarded result (return g(x)) has each signature's rank.
+            if fn.name not in joint_rank_managed and not (
+                    len(local_overload_specs.get(fn.name, [])) > 1
+                    and fn.name not in tuple_return_funcs and fn.name not in local_void_funcs
+                    and fn.name not in dict_return_specs
+                    and all(isinstance(s[1], dict) and isinstance(s[2], dict) for s in local_overload_specs[fn.name])
+                    and all(a in s[1] and a in s[2] for s in local_overload_specs[fn.name]
+                            for a in local_func_arg_names.get(fn.name, []))):
                 continue
             names = local_func_arg_names[fn.name]
             profiles = []
@@ -80254,7 +80575,7 @@ def generate_flat(
                         _return_changed = True
                     overload_return_maps[pname] = result
                     profiles.append({"kinds": kinds, "ranks": ranks, "return_rank": result[1]})
-            local_overload_dispatch[fn.name]["return_profiles"] = profiles
+            local_overload_dispatch.setdefault(fn.name, {})["return_profiles"] = profiles
         if not _return_changed:
             break
     else:
@@ -82442,6 +82763,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
+    tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
@@ -82976,6 +83298,7 @@ def transpile_file(
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
+    tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
@@ -83254,7 +83577,13 @@ def transpile_file(
         if isinstance(_fn, ast.FunctionDef):
             specialize_lambda_function_args(_fn.body, local_funcs)
 
-    specialize_named_slice_callbacks(effective_tree.body, local_funcs)
+    # Repeated: binding outer(f) exposes inner(g, x) in the clone.
+    for _bind_round in range(8):
+        _before = [id(f) for f in local_funcs]
+        specialize_named_slice_callbacks(effective_tree.body, local_funcs)
+        if [id(f) for f in local_funcs] == _before:
+            break
+    _separate_bound_callback_calls(effective_tree.body, local_funcs)
     normalize_unused_callable_arguments(effective_tree.body, local_funcs)
 
     local_funcs = prune_unused_string_length_helpers(effective_tree.body, local_funcs)
@@ -83785,6 +84114,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
+    tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)

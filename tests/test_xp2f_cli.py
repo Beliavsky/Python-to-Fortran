@@ -26573,3 +26573,63 @@ def test_xp2f_interp_period_leggauss_histogram2d_forms(tmp_path: Path) -> None:
     # numpy prints 8 significant digits.
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)
+
+
+def test_xp2f_library_and_local_function_callbacks_on_arrays(tmp_path: Path) -> None:
+    # A numpy or math function passed as an argument (quad(np.cos, n)) was
+    # unsupported; a local function passed to one that calls it with an
+    # array failed to compile (a scalar procedure interface), also through
+    # another function and for a recursive callee; ev(x) called with both a
+    # scalar and an array needed both ranks of g(x) inside it; math.cos(a)
+    # of a parameter was typed integer.
+    src = tmp_path / "xcallbacks.py"
+    src.write_text(
+        "import math\n"
+        "import numpy as np\n"
+        "def g(t):\n"
+        "    return t * t + 1.0\n"
+        "def quad(f, n):\n"
+        "    x, w = np.polynomial.legendre.leggauss(n)\n"
+        "    return np.sum(w * f(x))\n"
+        "def trap(f, a, b, n):\n"
+        "    x = np.linspace(a, b, n)\n"
+        "    return np.trapezoid(f(x), x)\n"
+        "def ev(x):\n"
+        "    return g(x)\n"
+        "def inner(f, x):\n"
+        "    return f(x) + 1.0\n"
+        "def outer(f, x):\n"
+        "    return inner(f, x) * 2.0\n"
+        "def comb(f, a, b):\n"
+        "    return f(a, b)\n"
+        "def it(f, x, n):\n"
+        "    if n == 0:\n"
+        "        return x\n"
+        "    return it(f, f(x), n - 1)\n"
+        "def euler(f, y0, h, n):\n"
+        "    y = y0.copy()\n"
+        "    for k in range(n):\n"
+        "        y = y + h * f(y)\n"
+        "    return y\n"
+        "def rhs(y):\n"
+        "    return -0.5 * y\n"
+        "def apply(f, t):\n"
+        "    return f(t)\n"
+        "def cosine(a):\n"
+        "    return math.cos(a)\n"
+        "print(quad(np.cos, 6), quad(np.exp, 4), quad(g, 5), trap(np.sin, 0.0, np.pi, 101))\n"
+        "print(ev(0.5), ev(np.array([1.0, 2.0])), outer(cosine, 2.0), outer(np.exp, np.array([0.0, 1.0])))\n"
+        "print(comb(np.maximum, np.array([1.0, 5.0]), np.array([3.0, 2.0])), comb(np.hypot, 3.0, 4.0))\n"
+        "print(it(np.cos, 1.0, 5), euler(rhs, np.array([1.0, 2.0]), 0.1, 10))\n"
+        "print(apply(math.sqrt, 2.0), apply(np.abs, np.array([-1.5, 2.0])), cosine(0.5))\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xcallbacks_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints 8 significant digits.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)
