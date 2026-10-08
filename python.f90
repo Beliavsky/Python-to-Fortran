@@ -270,11 +270,44 @@ public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 public :: np_gradient_1d, np_gradient_2d, np_trapezoid_1d, interp_0d
 public :: interp_periodic_1d, interp_periodic_0d, np_hist_edges, histogram2d_np
+public :: histogram_np !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:real(dp)(:):intent(out),edges:real(dp)(:):intent(out),weights:real(dp)(:):intent(in):optional,density:logical:intent(in):optional lib=statistics desc="np.histogram with bin edges, weights= and density=: float counts"
+public :: np_hist_bin_count !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in),method:character(*):intent(in),integer_data:logical:intent(in),lo_in:real(dp):intent(in):optional,hi_in:real(dp):intent(in):optional lib=statistics desc="number of histogram bins chosen by numpy's estimators auto, fd, doane, scott, rice, sturges, sqrt"
 public :: np_spacing, np_chkfinite
+public :: np_packbits !@pyapi kind=function ret=integer(:) args=bits:logical(:):intent(in),little:logical:intent(in) lib=arrays desc="np.packbits: pack a logical vector into bytes (values 0..255), big- or little-endian bit order"
+public :: np_unpackbits !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),little:logical:intent(in),count:integer:intent(in):optional lib=arrays desc="np.unpackbits: the bits (0/1) of bytes 0..255, with numpy's count="
+public :: np_pad_indices !@pyapi kind=function ret=integer(:) args=n:integer:intent(in),before:integer:intent(in),after:integer:intent(in),mode:integer:intent(in) lib=arrays desc="np.pad: 1-based source indices of a vector of size n padded by before/after elements (mode 1 edge, 2 wrap, 3 reflect, 4 symmetric)"
+public :: np_pad_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),before:integer:intent(in),after:integer:intent(in),mode:integer:intent(in) lib=arrays desc="np.pad of a real, integer, complex or logical vector with mode 1 edge, 2 wrap, 3 reflect, 4 symmetric"
+public :: np_pad_index !@pyapi kind=function ret=integer args=i:integer:intent(in),n:integer:intent(in),mode:integer:intent(in) lib=arrays desc="np.pad index map: 0-based source index of padded position i for mode 1 edge, 2 wrap, 3 reflect, 4 symmetric"
 public :: np_window, np_poly_roots, np_polyadd, np_polymul, np_polydiv, np_polyint
 public :: nan_quantile_vec, nan_quantile_axis_2d
 public :: powval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial, lowest degree first) at x (scalar, vector or matrix x)"
 public :: powvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.polynomial.polyvander: pseudo-Vandermonde matrix"
+public :: powval2d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval2d: 2-D series value at points (x, y) (scalars, vectors or matrices)"
+public :: powval3d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),z:real(dp):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval3d: 3-D series value at points (x, y, z) (scalars or vectors)"
+public :: powgrid2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polygrid2d: 2-D series on the grid x by y"
+public :: powgrid3d !@pyapi kind=function ret=real(dp)(:,:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),z:real(dp)(:):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polygrid3d: 3-D series on the grid x by y by z"
+public :: chebval2d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.chebyshev.chebval2d: 2-D series value at points (x, y) (scalars, vectors or matrices)"
+public :: chebval3d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),z:real(dp):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.chebyshev.chebval3d: 3-D series value at points (x, y, z) (scalars or vectors)"
+public :: chebgrid2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.chebyshev.chebgrid2d: 2-D series on the grid x by y"
+public :: chebgrid3d !@pyapi kind=function ret=real(dp)(:,:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),z:real(dp)(:):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.chebyshev.chebgrid3d: 3-D series on the grid x by y by z"
+public :: legval2d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.legendre.legval2d: 2-D series value at points (x, y) (scalars, vectors or matrices)"
+public :: legval3d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),z:real(dp):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.legendre.legval3d: 3-D series value at points (x, y, z) (scalars or vectors)"
+public :: leggrid2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.legendre.leggrid2d: 2-D series on the grid x by y"
+public :: leggrid3d !@pyapi kind=function ret=real(dp)(:,:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),z:real(dp)(:):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.legendre.leggrid3d: 3-D series on the grid x by y by z"
+public :: hermval2d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.hermite.hermval2d: 2-D series value at points (x, y) (scalars, vectors or matrices)"
+public :: hermval3d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),z:real(dp):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.hermite.hermval3d: 3-D series value at points (x, y, z) (scalars or vectors)"
+public :: hermgrid2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.hermite.hermgrid2d: 2-D series on the grid x by y"
+public :: hermgrid3d !@pyapi kind=function ret=real(dp)(:,:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),z:real(dp)(:):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.hermite.hermgrid3d: 3-D series on the grid x by y by z"
+public :: hermeval2d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.hermite_e.hermeval2d: 2-D series value at points (x, y) (scalars, vectors or matrices)"
+public :: hermeval3d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),z:real(dp):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.hermite_e.hermeval3d: 3-D series value at points (x, y, z) (scalars or vectors)"
+public :: hermegrid2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.hermite_e.hermegrid2d: 2-D series on the grid x by y"
+public :: hermegrid3d !@pyapi kind=function ret=real(dp)(:,:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),z:real(dp)(:):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.hermite_e.hermegrid3d: 3-D series on the grid x by y by z"
+public :: lagval2d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.laguerre.lagval2d: 2-D series value at points (x, y) (scalars, vectors or matrices)"
+public :: lagval3d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),z:real(dp):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.laguerre.lagval3d: 3-D series value at points (x, y, z) (scalars or vectors)"
+public :: laggrid2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.laguerre.laggrid2d: 2-D series on the grid x by y"
+public :: laggrid3d !@pyapi kind=function ret=real(dp)(:,:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),z:real(dp)(:):intent(in),c:real(dp)(:,:,:):intent(in) lib=polynomial desc="np.polynomial.laguerre.laggrid3d: 3-D series on the grid x by y by z"
+public :: powvalfromroots !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),r:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyvalfromroots: prod(x - r) at scalar, vector or matrix x"
+public :: opoly_val2d0, opoly_val3d0, opoly_grid2d, opoly_grid3d
 public :: powder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.polynomial.polyder: derivative coefficients"
 public :: powint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.polynomial.polyint: integral coefficients"
 public :: powfit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.polynomial.polyfit: least-squares fit, coefficients lowest degree first"
@@ -771,6 +804,45 @@ interface powval
    module procedure powval_0, powval_1, powval_2
 end interface powval
 
+interface powval2d
+   module procedure powval2d_0, powval2d_1, powval2d_2
+end interface powval2d
+interface powval3d
+   module procedure powval3d_0, powval3d_1
+end interface powval3d
+interface chebval2d
+   module procedure chebval2d_0, chebval2d_1, chebval2d_2
+end interface chebval2d
+interface chebval3d
+   module procedure chebval3d_0, chebval3d_1
+end interface chebval3d
+interface legval2d
+   module procedure legval2d_0, legval2d_1, legval2d_2
+end interface legval2d
+interface legval3d
+   module procedure legval3d_0, legval3d_1
+end interface legval3d
+interface hermval2d
+   module procedure hermval2d_0, hermval2d_1, hermval2d_2
+end interface hermval2d
+interface hermval3d
+   module procedure hermval3d_0, hermval3d_1
+end interface hermval3d
+interface hermeval2d
+   module procedure hermeval2d_0, hermeval2d_1, hermeval2d_2
+end interface hermeval2d
+interface hermeval3d
+   module procedure hermeval3d_0, hermeval3d_1
+end interface hermeval3d
+interface lagval2d
+   module procedure lagval2d_0, lagval2d_1, lagval2d_2
+end interface lagval2d
+interface lagval3d
+   module procedure lagval3d_0, lagval3d_1
+end interface lagval3d
+interface powvalfromroots
+   module procedure powvalfromroots_0, powvalfromroots_1, powvalfromroots_2
+end interface powvalfromroots
 interface chebval
    module procedure chebval_0, chebval_1, chebval_2
 end interface chebval
@@ -955,6 +1027,9 @@ interface slice1
    module procedure slice1_char
 end interface slice1
 
+interface np_pad_vec
+   module procedure np_pad_vec_real, np_pad_vec_int, np_pad_vec_complex, np_pad_vec_logical
+end interface np_pad_vec
 interface fft2
    module procedure fft2_real, fft2_complex
 end interface fft2
@@ -5586,6 +5661,125 @@ contains
          end if
       end function np_spacing
 
+      elemental integer function np_pad_index(i, n, mode) result(j)
+         ! The 0-based index into a vector of size n that position i (0 is
+         ! its first element, i < 0 before it, i >= n after it) of np.pad
+         ! takes: mode 1 'edge', 2 'wrap', 3 'reflect' (mirror without the
+         ! edge element), 4 'symmetric' (mirror with it).
+         integer, intent(in) :: i, n, mode
+         integer :: per
+         select case (mode)
+         case (1)
+            j = min(max(i, 0), n - 1)
+         case (2)
+            j = modulo(i, n)
+         case (3)
+            if (n == 1) then
+               j = 0
+            else
+               per = 2 * n - 2
+               j = modulo(i, per)
+               if (j >= n) j = per - j
+            end if
+         case default
+            per = 2 * n
+            j = modulo(i, per)
+            if (j >= n) j = per - 1 - j
+         end select
+      end function np_pad_index
+
+      pure function np_pad_indices(n, before, after, mode) result(idx)
+         ! The 1-based indices into a vector of size n that np.pad(x,
+         ! (before, after), mode) takes (mode as for np_pad_index).
+         integer, intent(in) :: n, before, after, mode
+         integer, allocatable :: idx(:)
+         integer :: i
+         allocate(idx(n + before + after))
+         do i = 1, size(idx)
+            idx(i) = np_pad_index(i - 1 - before, n, mode) + 1
+         end do
+      end function np_pad_indices
+
+      pure function np_pad_vec_real(x, before, after, mode) result(y)
+         ! np.pad(x, (before, after), mode) of a vector (mode as for
+         ! np_pad_index).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: before, after, mode
+         real(kind=dp), allocatable :: y(:)
+         y = x(np_pad_indices(size(x), before, after, mode))
+      end function np_pad_vec_real
+
+      pure function np_pad_vec_int(x, before, after, mode) result(y)
+         ! np.pad(x, (before, after), mode) of a vector (mode as for
+         ! np_pad_index).
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: before, after, mode
+         integer, allocatable :: y(:)
+         y = x(np_pad_indices(size(x), before, after, mode))
+      end function np_pad_vec_int
+
+      pure function np_pad_vec_complex(x, before, after, mode) result(y)
+         ! np.pad(x, (before, after), mode) of a vector (mode as for
+         ! np_pad_index).
+         complex(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: before, after, mode
+         complex(kind=dp), allocatable :: y(:)
+         y = x(np_pad_indices(size(x), before, after, mode))
+      end function np_pad_vec_complex
+
+      pure function np_pad_vec_logical(x, before, after, mode) result(y)
+         ! np.pad(x, (before, after), mode) of a vector (mode as for
+         ! np_pad_index).
+         logical, intent(in) :: x(:)
+         integer, intent(in) :: before, after, mode
+         logical, allocatable :: y(:)
+         y = x(np_pad_indices(size(x), before, after, mode))
+      end function np_pad_vec_logical
+
+      pure function np_packbits(bits, little) result(y)
+         ! np.packbits of a flat logical array: groups of 8 bits as integers
+         ! 0..255, the first bit the most significant (the least if
+         ! little), the last group padded with zero bits.
+         logical, intent(in) :: bits(:)
+         logical, intent(in) :: little
+         integer, allocatable :: y(:)
+         integer :: i, b
+         allocate(y((size(bits) + 7) / 8), source=0)
+         do i = 1, size(bits)
+            if (.not. bits(i)) cycle
+            b = mod(i - 1, 8)
+            if (.not. little) b = 7 - b
+            y((i - 1) / 8 + 1) = ibset(y((i - 1) / 8 + 1), b)
+         end do
+      end function np_packbits
+
+      pure function np_unpackbits(x, little, count) result(bits)
+         ! np.unpackbits of a flat array of integers 0..255: 8 bits each
+         ! (0 or 1), the most significant first (the least if little);
+         ! count keeps the first count bits (count < 0: drops -count; more
+         ! than 8*size(x) pads with zeros).
+         integer, intent(in) :: x(:)
+         logical, intent(in) :: little
+         integer, intent(in), optional :: count
+         integer, allocatable :: bits(:)
+         integer :: i, j, n, b
+         n = 8 * size(x)
+         if (present(count)) then
+            if (count >= 0) then
+               n = count
+            else
+               n = max(0, n + count)
+            end if
+         end if
+         allocate(bits(n), source=0)
+         do i = 1, min(n, 8 * size(x))
+            j = (i - 1) / 8 + 1
+            b = mod(i - 1, 8)
+            if (.not. little) b = 7 - b
+            if (btest(x(j), b)) bits(i) = 1
+         end do
+      end function np_unpackbits
+
       elemental function np_chkfinite(x) result(y)
          ! np.asarray_chkfinite(x): x, or an error if it is inf or NaN.
          real(kind=dp), intent(in) :: x
@@ -7635,6 +7829,132 @@ contains
          end do
          edges(n + 1) = hi
       end function np_hist_edges
+
+      pure subroutine histogram_np(x, bins, h, edges, weights, density)
+         ! numpy.histogram(x, bins=edges, weights=, density=): float counts
+         ! (or sums of weights) per bin, the last bin including its right
+         ! edge; density divides by the bin widths and the total.
+         real(kind=dp), intent(in) :: x(:), bins(:)
+         real(kind=dp), allocatable, intent(out) :: h(:), edges(:)
+         real(kind=dp), intent(in), optional :: weights(:)
+         logical, intent(in), optional :: density
+         integer :: i, j, nb
+         real(kind=dp) :: s
+         nb = size(bins) - 1
+         if (nb < 1) error stop "np.histogram: bins must have at least 2 entries"
+         if (present(weights)) then
+            if (size(weights) /= size(x)) error stop "np.histogram: weights should have the same shape as a"
+         end if
+         allocate(h(nb), source=0.0_dp)
+         edges = bins
+         do i = 1, size(x)
+            if (ieee_is_nan(x(i)) .or. x(i) < bins(1) .or. x(i) > bins(nb + 1)) cycle
+            j = nb
+            if (x(i) < bins(nb + 1)) j = count(bins(2:nb) <= x(i)) + 1
+            if (present(weights)) then
+               h(j) = h(j) + weights(i)
+            else
+               h(j) = h(j) + 1.0_dp
+            end if
+         end do
+         if (present(density)) then
+            if (density) then
+               s = sum(h)
+               h = h / (bins(2:) - bins(:nb)) / s
+            end if
+         end if
+      end subroutine histogram_np
+
+      pure integer function np_hist_bin_count(x, method, integer_data, lo_in, hi_in) result(n)
+         ! The number of equal bins numpy's histogram estimator method
+         ! ('auto', 'fd', 'doane', 'scott', 'rice', 'sturges', 'sqrt') picks
+         ! for x (only the values in [lo_in, hi_in] if given); integer_data:
+         ! x holds integers (the width is then at least 1).
+         real(kind=dp), intent(in) :: x(:)
+         character(len=*), intent(in) :: method
+         logical, intent(in) :: integer_data
+         real(kind=dp), intent(in), optional :: lo_in, hi_in
+         real(kind=dp), allocatable :: a(:), s(:)
+         real(kind=dp) :: lo, hi, w, ptp, nn, sd, g1, sg1, fd, st
+         integer :: m
+         if (present(lo_in)) then
+            lo = lo_in
+            hi = hi_in
+            a = pack(x, x >= lo .and. x <= hi)
+         else
+            a = x
+            lo = 0.0_dp
+            hi = 1.0_dp
+            if (size(a) > 0) then
+               lo = minval(a)
+               hi = maxval(a)
+            end if
+         end if
+         if (lo == hi) then
+            lo = lo - 0.5_dp
+            hi = hi + 0.5_dp
+         end if
+         m = size(a)
+         if (m == 0) then
+            n = 1
+            return
+         end if
+         nn = real(m, kind=dp)
+         ptp = maxval(a) - minval(a)
+         sd = sqrt(sum((a - sum(a) / nn) ** 2) / nn)
+         select case (method)
+         case ("sqrt")
+            w = ptp / sqrt(nn)
+         case ("sturges")
+            w = ptp / (log(nn) / log(2.0_dp) + 1.0_dp)
+         case ("rice")
+            w = ptp / (2.0_dp * nn ** (1.0_dp / 3.0_dp))
+         case ("scott")
+            w = (24.0_dp * sqrt(acos(-1.0_dp)) / nn) ** (1.0_dp / 3.0_dp) * sd
+         case ("doane")
+            w = 0.0_dp
+            if (m > 2 .and. sd > 0.0_dp) then
+               sg1 = sqrt(6.0_dp * (nn - 2.0_dp) / ((nn + 1.0_dp) * (nn + 3.0_dp)))
+               g1 = sum(((a - sum(a) / nn) / sd) ** 3) / nn
+               w = ptp / (1.0_dp + log(nn) / log(2.0_dp) + log(1.0_dp + abs(g1) / sg1) / log(2.0_dp))
+            end if
+         case ("fd", "auto")
+            s = a
+            call sort_vec(s)
+            fd = 2.0_dp * (pct(0.75_dp) - pct(0.25_dp)) * nn ** (-1.0_dp / 3.0_dp)
+            w = fd
+            if (method == "auto") then
+               st = ptp / (log(nn) / log(2.0_dp) + 1.0_dp)
+               if (fd /= 0.0_dp) then
+                  w = min(fd, st)
+               else
+                  w = st
+               end if
+            end if
+         case default
+            error stop "np.histogram: unknown bin estimator"
+         end select
+         if (w /= 0.0_dp) then
+            if (integer_data .and. w < 1.0_dp) w = 1.0_dp
+            n = int(ceiling((hi - lo) / w))
+         else
+            n = 1
+         end if
+      contains
+         pure real(kind=dp) function pct(q)
+            ! The q quantile of the sorted s (numpy's linear method).
+            real(kind=dp), intent(in) :: q
+            real(kind=dp) :: pos
+            integer :: k
+            pos = q * real(size(s) - 1, kind=dp)
+            k = int(pos)
+            if (k >= size(s) - 1) then
+               pct = s(size(s))
+            else
+               pct = s(k + 1) + (pos - real(k, kind=dp)) * (s(k + 2) - s(k + 1))
+            end if
+         end function pct
+      end function np_hist_bin_count
 
       pure subroutine histogram2d_np(x, y, xbins, ybins, h, weights, density)
          ! numpy.histogram2d(x, y, bins=[xbins, ybins], weights=, density=):
@@ -9749,6 +10069,451 @@ contains
             y = c0 + c1 * x
          end select
       end function opoly_val0
+
+      pure function opoly_val2d0(fam, x, y, c) result(r)
+         ! sum_ij c(i, j) P_i(x) P_j(y) for the basis P of family fam (as
+         ! opoly_val0): numpy's <f>val2d at one point.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: x, y, c(:,:)
+         real(kind=dp) :: r
+         real(kind=dp) :: v(size(c, 1))
+         integer :: i
+         do i = 1, size(c, 1)
+            v(i) = opoly_val0(fam, y, c(i, :))
+         end do
+         r = opoly_val0(fam, x, v)
+      end function opoly_val2d0
+
+      pure function opoly_val3d0(fam, x, y, z, c) result(r)
+         ! sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z): <f>val3d at one point.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
+         real(kind=dp) :: r
+         real(kind=dp) :: v(size(c, 1))
+         integer :: i
+         do i = 1, size(c, 1)
+            v(i) = opoly_val2d0(fam, y, z, c(i, :, :))
+         end do
+         r = opoly_val0(fam, x, v)
+      end function opoly_val3d0
+
+      pure function opoly_grid2d(fam, x, y, c) result(r)
+         ! r(a, b) = sum_ij c(i, j) P_i(x(a)) P_j(y(b)): <f>grid2d.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         if (size(c, 1) == 0 .or. size(c, 2) == 0) error stop "np.polynomial: the coefficient array is empty"
+         r = matmul(matmul(opoly_vander(fam, x, size(c, 1) - 1), c), &
+            transpose(opoly_vander(fam, y, size(c, 2) - 1)))
+      end function opoly_grid2d
+
+      pure function opoly_grid3d(fam, x, y, z, c) result(r)
+         ! r(a, b, d) = sum_ijk c(i, j, k) P_i(x(a)) P_j(y(b)) P_k(z(d)):
+         ! <f>grid3d.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         real(kind=dp), allocatable :: vz(:,:)
+         real(kind=dp) :: cz(size(c, 1), size(c, 2))
+         integer :: d, k
+         if (size(c, 3) == 0) error stop "np.polynomial: the coefficient array is empty"
+         vz = opoly_vander(fam, z, size(c, 3) - 1)
+         allocate(r(size(x), size(y), size(z)))
+         do d = 1, size(z)
+            cz = 0.0_dp
+            do k = 1, size(c, 3)
+               cz = cz + c(:, :, k) * vz(d, k)
+            end do
+            r(:, :, d) = opoly_grid2d(fam, x, y, cz)
+         end do
+      end function opoly_grid3d
+
+      pure function powvalfromroots_0(x, r) result(y)
+         ! np.polynomial.polynomial.polyvalfromroots: prod(x - r).
+         real(kind=dp), intent(in) :: x, r(:)
+         real(kind=dp) :: y
+         y = product(x - r)
+      end function powvalfromroots_0
+
+      pure function powvalfromroots_1(x, r) result(y)
+         real(kind=dp), intent(in) :: x(:), r(:)
+         real(kind=dp) :: y(size(x))
+         integer :: i
+         do i = 1, size(x)
+            y(i) = product(x(i) - r)
+         end do
+      end function powvalfromroots_1
+
+      pure function powvalfromroots_2(x, r) result(y)
+         real(kind=dp), intent(in) :: x(:,:), r(:)
+         real(kind=dp) :: y(size(x, 1), size(x, 2))
+         integer :: i, j
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               y(i, j) = product(x(i, j) - r)
+            end do
+         end do
+      end function powvalfromroots_2
+
+      pure function powval2d_0(x, y, c) result(r)
+         ! np.polynomial.polynomial.polyval2d: sum_ij c(i, j) P_i(x) P_j(y).
+         real(kind=dp), intent(in) :: x, y, c(:,:)
+         real(kind=dp) :: r
+         r = opoly_val2d0(1, x, y, c)
+      end function powval2d_0
+
+      pure function powval2d_1(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x)) error stop "polyval2d: x and y must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val2d0(1, x(i), y(i), c)
+         end do
+      end function powval2d_1
+
+      pure function powval2d_2(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
+         real(kind=dp) :: r(size(x, 1), size(x, 2))
+         integer :: i, j
+         if (any(shape(y) /= shape(x))) error stop "polyval2d: x and y must have the same shape"
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               r(i, j) = opoly_val2d0(1, x(i, j), y(i, j), c)
+            end do
+         end do
+      end function powval2d_2
+
+      pure function powval3d_0(x, y, z, c) result(r)
+         ! np.polynomial.polynomial.polyval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
+         real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
+         real(kind=dp) :: r
+         r = opoly_val3d0(1, x, y, z, c)
+      end function powval3d_0
+
+      pure function powval3d_1(x, y, z, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x) .or. size(z) /= size(x)) error stop "polyval3d: x, y and z must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val3d0(1, x(i), y(i), z(i), c)
+         end do
+      end function powval3d_1
+
+      pure function powgrid2d(x, y, c) result(r)
+         ! np.polynomial.polynomial.polygrid2d: r(a, b) = polyval2d(x(a), y(b), c).
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         r = opoly_grid2d(1, x, y, c)
+      end function powgrid2d
+
+      pure function powgrid3d(x, y, z, c) result(r)
+         ! np.polynomial.polynomial.polygrid3d: r(a, b, d) = polyval3d(x(a), y(b), z(d), c).
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         r = opoly_grid3d(1, x, y, z, c)
+      end function powgrid3d
+
+      pure function chebval2d_0(x, y, c) result(r)
+         ! np.polynomial.chebyshev.chebval2d: sum_ij c(i, j) P_i(x) P_j(y).
+         real(kind=dp), intent(in) :: x, y, c(:,:)
+         real(kind=dp) :: r
+         r = opoly_val2d0(2, x, y, c)
+      end function chebval2d_0
+
+      pure function chebval2d_1(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x)) error stop "chebval2d: x and y must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val2d0(2, x(i), y(i), c)
+         end do
+      end function chebval2d_1
+
+      pure function chebval2d_2(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
+         real(kind=dp) :: r(size(x, 1), size(x, 2))
+         integer :: i, j
+         if (any(shape(y) /= shape(x))) error stop "chebval2d: x and y must have the same shape"
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               r(i, j) = opoly_val2d0(2, x(i, j), y(i, j), c)
+            end do
+         end do
+      end function chebval2d_2
+
+      pure function chebval3d_0(x, y, z, c) result(r)
+         ! np.polynomial.chebyshev.chebval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
+         real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
+         real(kind=dp) :: r
+         r = opoly_val3d0(2, x, y, z, c)
+      end function chebval3d_0
+
+      pure function chebval3d_1(x, y, z, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x) .or. size(z) /= size(x)) error stop "chebval3d: x, y and z must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val3d0(2, x(i), y(i), z(i), c)
+         end do
+      end function chebval3d_1
+
+      pure function chebgrid2d(x, y, c) result(r)
+         ! np.polynomial.chebyshev.chebgrid2d: r(a, b) = chebval2d(x(a), y(b), c).
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         r = opoly_grid2d(2, x, y, c)
+      end function chebgrid2d
+
+      pure function chebgrid3d(x, y, z, c) result(r)
+         ! np.polynomial.chebyshev.chebgrid3d: r(a, b, d) = chebval3d(x(a), y(b), z(d), c).
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         r = opoly_grid3d(2, x, y, z, c)
+      end function chebgrid3d
+
+      pure function legval2d_0(x, y, c) result(r)
+         ! np.polynomial.legendre.legval2d: sum_ij c(i, j) P_i(x) P_j(y).
+         real(kind=dp), intent(in) :: x, y, c(:,:)
+         real(kind=dp) :: r
+         r = opoly_val2d0(3, x, y, c)
+      end function legval2d_0
+
+      pure function legval2d_1(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x)) error stop "legval2d: x and y must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val2d0(3, x(i), y(i), c)
+         end do
+      end function legval2d_1
+
+      pure function legval2d_2(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
+         real(kind=dp) :: r(size(x, 1), size(x, 2))
+         integer :: i, j
+         if (any(shape(y) /= shape(x))) error stop "legval2d: x and y must have the same shape"
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               r(i, j) = opoly_val2d0(3, x(i, j), y(i, j), c)
+            end do
+         end do
+      end function legval2d_2
+
+      pure function legval3d_0(x, y, z, c) result(r)
+         ! np.polynomial.legendre.legval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
+         real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
+         real(kind=dp) :: r
+         r = opoly_val3d0(3, x, y, z, c)
+      end function legval3d_0
+
+      pure function legval3d_1(x, y, z, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x) .or. size(z) /= size(x)) error stop "legval3d: x, y and z must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val3d0(3, x(i), y(i), z(i), c)
+         end do
+      end function legval3d_1
+
+      pure function leggrid2d(x, y, c) result(r)
+         ! np.polynomial.legendre.leggrid2d: r(a, b) = legval2d(x(a), y(b), c).
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         r = opoly_grid2d(3, x, y, c)
+      end function leggrid2d
+
+      pure function leggrid3d(x, y, z, c) result(r)
+         ! np.polynomial.legendre.leggrid3d: r(a, b, d) = legval3d(x(a), y(b), z(d), c).
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         r = opoly_grid3d(3, x, y, z, c)
+      end function leggrid3d
+
+      pure function hermval2d_0(x, y, c) result(r)
+         ! np.polynomial.hermite.hermval2d: sum_ij c(i, j) P_i(x) P_j(y).
+         real(kind=dp), intent(in) :: x, y, c(:,:)
+         real(kind=dp) :: r
+         r = opoly_val2d0(4, x, y, c)
+      end function hermval2d_0
+
+      pure function hermval2d_1(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x)) error stop "hermval2d: x and y must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val2d0(4, x(i), y(i), c)
+         end do
+      end function hermval2d_1
+
+      pure function hermval2d_2(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
+         real(kind=dp) :: r(size(x, 1), size(x, 2))
+         integer :: i, j
+         if (any(shape(y) /= shape(x))) error stop "hermval2d: x and y must have the same shape"
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               r(i, j) = opoly_val2d0(4, x(i, j), y(i, j), c)
+            end do
+         end do
+      end function hermval2d_2
+
+      pure function hermval3d_0(x, y, z, c) result(r)
+         ! np.polynomial.hermite.hermval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
+         real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
+         real(kind=dp) :: r
+         r = opoly_val3d0(4, x, y, z, c)
+      end function hermval3d_0
+
+      pure function hermval3d_1(x, y, z, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x) .or. size(z) /= size(x)) error stop "hermval3d: x, y and z must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val3d0(4, x(i), y(i), z(i), c)
+         end do
+      end function hermval3d_1
+
+      pure function hermgrid2d(x, y, c) result(r)
+         ! np.polynomial.hermite.hermgrid2d: r(a, b) = hermval2d(x(a), y(b), c).
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         r = opoly_grid2d(4, x, y, c)
+      end function hermgrid2d
+
+      pure function hermgrid3d(x, y, z, c) result(r)
+         ! np.polynomial.hermite.hermgrid3d: r(a, b, d) = hermval3d(x(a), y(b), z(d), c).
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         r = opoly_grid3d(4, x, y, z, c)
+      end function hermgrid3d
+
+      pure function hermeval2d_0(x, y, c) result(r)
+         ! np.polynomial.hermite_e.hermeval2d: sum_ij c(i, j) P_i(x) P_j(y).
+         real(kind=dp), intent(in) :: x, y, c(:,:)
+         real(kind=dp) :: r
+         r = opoly_val2d0(5, x, y, c)
+      end function hermeval2d_0
+
+      pure function hermeval2d_1(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x)) error stop "hermeval2d: x and y must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val2d0(5, x(i), y(i), c)
+         end do
+      end function hermeval2d_1
+
+      pure function hermeval2d_2(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
+         real(kind=dp) :: r(size(x, 1), size(x, 2))
+         integer :: i, j
+         if (any(shape(y) /= shape(x))) error stop "hermeval2d: x and y must have the same shape"
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               r(i, j) = opoly_val2d0(5, x(i, j), y(i, j), c)
+            end do
+         end do
+      end function hermeval2d_2
+
+      pure function hermeval3d_0(x, y, z, c) result(r)
+         ! np.polynomial.hermite_e.hermeval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
+         real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
+         real(kind=dp) :: r
+         r = opoly_val3d0(5, x, y, z, c)
+      end function hermeval3d_0
+
+      pure function hermeval3d_1(x, y, z, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x) .or. size(z) /= size(x)) error stop "hermeval3d: x, y and z must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val3d0(5, x(i), y(i), z(i), c)
+         end do
+      end function hermeval3d_1
+
+      pure function hermegrid2d(x, y, c) result(r)
+         ! np.polynomial.hermite_e.hermegrid2d: r(a, b) = hermeval2d(x(a), y(b), c).
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         r = opoly_grid2d(5, x, y, c)
+      end function hermegrid2d
+
+      pure function hermegrid3d(x, y, z, c) result(r)
+         ! np.polynomial.hermite_e.hermegrid3d: r(a, b, d) = hermeval3d(x(a), y(b), z(d), c).
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         r = opoly_grid3d(5, x, y, z, c)
+      end function hermegrid3d
+
+      pure function lagval2d_0(x, y, c) result(r)
+         ! np.polynomial.laguerre.lagval2d: sum_ij c(i, j) P_i(x) P_j(y).
+         real(kind=dp), intent(in) :: x, y, c(:,:)
+         real(kind=dp) :: r
+         r = opoly_val2d0(6, x, y, c)
+      end function lagval2d_0
+
+      pure function lagval2d_1(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x)) error stop "lagval2d: x and y must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val2d0(6, x(i), y(i), c)
+         end do
+      end function lagval2d_1
+
+      pure function lagval2d_2(x, y, c) result(r)
+         real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
+         real(kind=dp) :: r(size(x, 1), size(x, 2))
+         integer :: i, j
+         if (any(shape(y) /= shape(x))) error stop "lagval2d: x and y must have the same shape"
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               r(i, j) = opoly_val2d0(6, x(i, j), y(i, j), c)
+            end do
+         end do
+      end function lagval2d_2
+
+      pure function lagval3d_0(x, y, z, c) result(r)
+         ! np.polynomial.laguerre.lagval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
+         real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
+         real(kind=dp) :: r
+         r = opoly_val3d0(6, x, y, z, c)
+      end function lagval3d_0
+
+      pure function lagval3d_1(x, y, z, c) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp) :: r(size(x))
+         integer :: i
+         if (size(y) /= size(x) .or. size(z) /= size(x)) error stop "lagval3d: x, y and z must have the same shape"
+         do i = 1, size(x)
+            r(i) = opoly_val3d0(6, x(i), y(i), z(i), c)
+         end do
+      end function lagval3d_1
+
+      pure function laggrid2d(x, y, c) result(r)
+         ! np.polynomial.laguerre.laggrid2d: r(a, b) = lagval2d(x(a), y(b), c).
+         real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
+         real(kind=dp), allocatable :: r(:,:)
+         r = opoly_grid2d(6, x, y, c)
+      end function laggrid2d
+
+      pure function laggrid3d(x, y, z, c) result(r)
+         ! np.polynomial.laguerre.laggrid3d: r(a, b, d) = lagval3d(x(a), y(b), z(d), c).
+         real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
+         real(kind=dp), allocatable :: r(:,:,:)
+         r = opoly_grid3d(6, x, y, z, c)
+      end function laggrid3d
 
       pure function opoly_vander(fam, x, deg) result(v)
          ! Pseudo-Vandermonde matrix: v(i, j+1) = basis function of degree j

@@ -27058,3 +27058,81 @@ def test_xp2f_fft_matrix_transforms(tmp_path: Path) -> None:
         '      np.fft.irfft2(np.fft.rfft2(m, norm="forward"), m.shape, norm="forward"))\n'
         'print(np.fft.irfft(np.array([1.0, 2.0 + 1j, 3.0 - 2j]), 5), np.fft.irfft(np.array([1.0, 2.0 + 1j, 3.0 - 2j]), 3), np.fft.hfft(np.array([1.0, 2.0 + 1j, 0.5]), 5))\n'
     ))
+
+
+def test_xp2f_pad_fill_kinds_and_modes(tmp_path: Path) -> None:
+    # np.pad: the fill value takes the array's kind (a real array padded
+    # with the default 0 built only as integers), constant_values pairs,
+    # matrices, and the edge/wrap/reflect/symmetric modes of a vector.
+    _xp2f_output_matches_numpy(tmp_path, "xpad", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'xi = np.array([3, 1, 4])\n'
+        'm = np.array([[2.0, 1.0], [1.0, 3.0]])\n'
+        'print(np.pad(x, 2), np.pad(x, (1, 3), constant_values=(7, -1)), np.pad(xi, 1, constant_values=2.7))\n'
+        'print(np.pad(m, 1), np.pad(m, ((1, 0), (0, 2)), constant_values=5), np.pad(np.array([[1, 2]]), 1))\n'
+        'print(np.pad(x, (3, 6), mode="edge"), np.pad(xi, 7, mode="edge"), np.pad(np.array([5.0]), 2, mode="edge"))\n'
+        'print(np.pad(x, (3, 6), mode="wrap"), np.pad(xi, 7, mode="wrap"), np.pad(np.array([5.0]), 2, mode="wrap"))\n'
+        'print(np.pad(x, (3, 6), mode="reflect"), np.pad(xi, 7, mode="reflect"), np.pad(np.array([5.0]), 2, mode="reflect"))\n'
+        'print(np.pad(x, (3, 6), mode="symmetric"), np.pad(xi, 7, mode="symmetric"), np.pad(np.array([5.0]), 2, mode="symmetric"))\n'
+    ))
+
+
+def test_xp2f_numpy_polynomial_2d_3d(tmp_path: Path) -> None:
+    # <f>val2d/val3d, <f>grid2d/grid3d for the six families, polyvalfromroots.
+    _xp2f_output_matches_numpy(tmp_path, "xpoly2d", (
+        'import numpy as np\n'
+        'from numpy.polynomial import chebyshev as C, legendre as L, hermite as H, hermite_e as HE, laguerre as LA\n'
+        'from numpy.polynomial import polynomial as P\n'
+        'c2 = np.array([[1.0, 0.5, -0.25], [2.0, -1.0, 0.75]])\n'
+        'c3 = np.arange(12.0).reshape(2, 3, 2) / 7.0 - 0.5\n'
+        'x = np.array([0.1, -0.4, 0.7])\n'
+        'y = np.array([0.3, 0.9, -0.2])\n'
+        'z = np.array([-0.6, 0.2, 0.5])\n'
+        'm1 = np.array([[0.1, 0.2], [0.3, 0.4]])\n'
+        'print(P.polyval2d(x, y, c2), C.chebval2d(x, y, c2), L.legval2d(0.3, -0.5, c2), H.hermval2d(m1, m1.T, c2))\n'
+        'print(HE.hermeval2d(x, y, c2), LA.lagval2d(x, y, c2))\n'
+        'print(P.polyval3d(x, y, z, c3), C.chebval3d(0.2, 0.1, -0.3, c3), L.legval3d(x, y, z, c3), H.hermval3d(x, y, z, c3))\n'
+        'print(HE.hermeval3d(x, y, z, c3), LA.lagval3d(x, y, z, c3))\n'
+        'print(P.polygrid2d(x, y[:2], c2), C.chebgrid2d(x, y, c2), L.leggrid2d(x, 0.5, c2), H.hermgrid2d(x, y, c2))\n'
+        'print(HE.hermegrid2d(x, y, c2), LA.laggrid2d(x, y, c2), C.chebgrid2d(0.2, 0.4, c2))\n'
+        'print(P.polygrid3d(x, y[:2], z, c3), C.chebgrid3d(x, y, z[:1], c3), LA.laggrid3d(x, y, z, c3), HE.hermegrid3d(x, y, z, c3))\n'
+        'print(P.polyvalfromroots(x, np.array([1.0, -2.0, 0.5])), P.polyvalfromroots(0.3, [1.0, 2.0]), P.polyvalfromroots(m1, [0.5]))\n'
+    ))
+
+
+def test_xp2f_histogram_estimators_weights_density(tmp_path: Path) -> None:
+    # histogram_bin_edges, numpy's string bin estimators, weights=, density=.
+    _xp2f_output_matches_numpy(tmp_path, "xhist", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25, 1.5, 2.2, -0.7, 0.9, 4.1, 1.1, 0.3, -1.4])\n'
+        'xi = np.array([3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7])\n'
+        'w = np.linspace(0.5, 2.0, 12)\n'
+        'print(np.histogram_bin_edges(x, bins=3), np.histogram_bin_edges(x, 4, (-3.0, 4.0)), np.histogram_bin_edges(xi))\n'
+        'h, e = np.histogram(x, bins=4, density=True)\n'
+        'print(h, e, h.sum() * (e[1] - e[0]))\n'
+        'h, e = np.histogram(x, bins=np.array([-3.0, 0.0, 1.0, 5.0]), weights=w)\n'
+        'print(h, e, np.histogram(x, 3, weights=w, density=True)[0], np.histogram(x, bins=5, range=(-1.0, 2.0), weights=w)[0])\n'
+        'print(np.histogram_bin_edges(x, "auto"), np.histogram_bin_edges(x, bins="fd"), np.histogram_bin_edges(x, "doane"))\n'
+        'print(np.histogram_bin_edges(x, "scott"), np.histogram_bin_edges(x, "rice"), np.histogram_bin_edges(x, "sturges"))\n'
+        'print(np.histogram_bin_edges(x, "sqrt"), np.histogram(xi, bins="auto")[0], np.histogram(xi, "fd")[1])\n'
+        'print(np.histogram(x, bins="auto", range=(-1.0, 2.0))[0], np.histogram(x, "sturges", density=True)[0])\n'
+    ))
+
+
+def test_xp2f_histogramdd_packbits(tmp_path: Path) -> None:
+    # histogramdd of two coordinate arrays; packbits/unpackbits.
+    _xp2f_output_matches_numpy(tmp_path, "xbits", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25, 1.5, 2.2, -0.7, 0.9])\n'
+        'y = np.array([1.0, -1.0, 0.5, 2.0, 0.0, 1.5, -0.5, 0.25])\n'
+        'b = np.array([True, False, True, True, False, False, True, False, True, True, True])\n'
+        'H = np.histogramdd((x, y), bins=3)[0]\n'
+        'print(H)\n'
+        'H2, (ex, ey) = np.histogramdd(np.stack([x, y], axis=1), bins=[2, 3], range=[(-2.0, 4.0), (-1.0, 2.0)])\n'
+        'print(H2, ex, ey, np.histogramdd(np.column_stack([x, y]), bins=2, density=True)[0])\n'
+        'print(np.packbits(b), np.packbits(b, bitorder="little"), np.packbits(np.array([[1, 0, 1], [0, 2, 0]])))\n'
+        'u = np.array([5, 255, 128], dtype=np.uint8)\n'
+        'print(np.unpackbits(u), np.unpackbits(u, bitorder="little"), np.unpackbits(u, count=10), np.unpackbits(u, count=-3))\n'
+        'print(np.unpackbits(u, count=30), np.unpackbits(np.packbits(b))[:11])\n'
+    ))

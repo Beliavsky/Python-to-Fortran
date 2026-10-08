@@ -7262,6 +7262,91 @@ def rewrite_loadtxt_unpack(tree):
     return tree
 
 
+def _histogramdd_columns(sample):
+    """The coordinate arrays of a histogramdd sample written as a list or
+    tuple of arrays, np.stack([...], axis=1) or np.column_stack([...]),
+    else None."""
+    if isinstance(sample, (ast.List, ast.Tuple)):
+        return list(sample.elts)
+    if (isinstance(sample, ast.Call) and isinstance(sample.func, ast.Attribute)
+            and isinstance(sample.func.value, ast.Name) and sample.func.value.id in ("np", "numpy")
+            and len(sample.args) == 1 and isinstance(sample.args[0], (ast.List, ast.Tuple))):
+        kd = {k.arg: k.value for k in sample.keywords}
+        if sample.func.attr == "column_stack" and not kd:
+            return list(sample.args[0].elts)
+        if sample.func.attr == "stack" and set(kd) == {"axis"} and isinstance(kd["axis"], ast.Constant) \
+                and kd["axis"].value in (1, -1):
+            return list(sample.args[0].elts)
+    return None
+
+
+def rewrite_histogramdd(tree):
+    """np.histogramdd of two coordinate arrays (see _histogramdd_columns) ->
+    np.histogram2d: np.histogramdd(s, ...)[0] and H, (ex, ey) =
+    np.histogramdd(s, ...)."""
+    def convert(call):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "histogramdd"
+                and isinstance(call.func.value, ast.Name) and call.func.value.id in ("np", "numpy") and call.args):
+            return None
+        cols = _histogramdd_columns(call.args[0])
+        if cols is None or len(cols) != 2:
+            return None
+        kws = list(call.keywords)
+        if len(call.args) > 1:
+            kws.append(ast.keyword(arg="bins", value=call.args[1]))
+        return ast.Call(func=ast.Attribute(value=call.func.value, attr="histogram2d", ctx=ast.Load()), args=cols,
+                        keywords=kws)
+
+    class _Rw(ast.NodeTransformer):
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            new = convert(node.value)
+            if new is not None and isinstance(node.slice, ast.Constant) and node.slice.value == 0:
+                node.value = new
+            return node
+
+        def visit_Assign(self, node):
+            self.generic_visit(node)
+            tg = node.targets[0] if len(node.targets) == 1 else None
+            new = convert(node.value)
+            if (new is not None and isinstance(tg, ast.Tuple) and len(tg.elts) == 2
+                    and isinstance(tg.elts[1], (ast.Tuple, ast.List)) and len(tg.elts[1].elts) == 2):
+                node.targets = [ast.Tuple(elts=[tg.elts[0]] + list(tg.elts[1].elts), ctx=ast.Store())]
+                node.value = new
+            return node
+    if not any(isinstance(n, ast.Attribute) and n.attr == "histogramdd" for n in ast.walk(tree)):
+        return tree
+    tree = _Rw().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+def rewrite_histogram_bin_edges(tree):
+    """np.histogram_bin_edges(a, bins, range) -> np.histogram(a, bins,
+    range=range)[1] (weights= only matters for weighted bin estimators,
+    which numpy rejects)."""
+    class _Rw(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            f = node.func
+            if (isinstance(f, ast.Attribute) and f.attr == "histogram_bin_edges" and isinstance(f.value, ast.Name)
+                    and f.value.id in ("np", "numpy") and node.args):
+                kws = [k for k in node.keywords if k.arg != "weights"]
+                args = list(node.args)
+                if len(args) > 2:
+                    kws.append(ast.keyword(arg="range", value=args[2]))
+                    args = args[:2]
+                call = ast.Call(func=ast.Attribute(value=f.value, attr="histogram", ctx=ast.Load()), args=args,
+                                keywords=kws)
+                return ast.copy_location(ast.Subscript(value=call, slice=ast.Constant(value=1), ctx=ast.Load()), node)
+            return node
+    if not any(isinstance(n, ast.Attribute) and n.attr == "histogram_bin_edges" for n in ast.walk(tree)):
+        return tree
+    tree = _Rw().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_indexed_linalg_tuple_calls(tree):
     """np.linalg.eigh(a)[0], np.linalg.svd(a)[1], np.linalg.qr(a)[0],
     np.linalg.slogdet(a)[1], np.linalg.lstsq(a, b)[1], ...: the translator
@@ -17064,6 +17149,7 @@ def detect_needed_helpers(tree):
         "mean": {"mean"},
         "average": {"mean"},
         "histogram": {"histogram_counts", "histogram_counts_edges", "histogram", "histogram_real_edges",
+                      "histogram_np", "np_hist_bin_count",
                       "np_hist_edges"},
         "var": {"var", "mean"},
         "std": {"std", "mean"},
@@ -17101,7 +17187,7 @@ def detect_needed_helpers(tree):
         "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_vector", "loadtxt_int_vector", "loadtxt_logical_vector"},
         "genfromtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
         "savetxt": {"savetxt_real_2d", "np_fmt_number"},
-        "pad": {"pad2d_int", "pad2d_real"},
+        "pad": {"pad2d_int", "pad2d_real", "np_pad_indices", "np_pad_vec"},
         "allclose": {"allclose"},
         "isclose": {"isclose_real", "isclose_scalar_real"},
         "isfinite": {"complex_isfinite"},
@@ -37380,12 +37466,26 @@ class translator(ast.NodeVisitor):
             return f"({value}) /= (0.0_dp, 0.0_dp)"
         return self._coerce_expr_kind(node, value, "logical")
 
+    def _histogram_real_counts(self, call):
+        """True if np.histogram(...)'s counts are float: density=True or
+        float weights."""
+        kd = {k.arg: k.value for k in call.keywords}
+        den = kd.get("density")
+        if den is not None and not (isinstance(den, ast.Constant) and den.value in (False, None)):
+            return True
+        w = kd.get("weights")
+        return w is not None and not (isinstance(w, ast.Constant) and w.value is None)
+
     def _histogram_counts_call(self, node):
         """The np.histogram call of np.histogram(x, bins=...)[0], else None."""
         if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value == 0
                 and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
                 and is_numpy_name_node(node.value.func.value) and node.value.func.attr == "histogram"
-                and node.value.args):
+                and node.value.args and all(kw.arg == "bins" for kw in node.value.keywords)
+                and not (len(node.value.args) > 1 and isinstance(node.value.args[1], ast.Constant)
+                         and isinstance(node.value.args[1].value, str))
+                and not any(isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)
+                            for kw in node.value.keywords)):
             return node.value
         return None
 
@@ -47387,8 +47487,9 @@ class translator(ast.NodeVisitor):
                     if kw.arg == "pad_width":
                         pw = kw.value
                     elif kw.arg == "mode":
-                        if is_const_str(kw.value):
-                            mode_txt = str(kw.value.value).lower()
+                        if not is_const_str(kw.value):
+                            raise NotImplementedError("np.pad: mode must be a literal string")
+                        mode_txt = str(kw.value.value).lower()
                     elif kw.arg == "constant_values":
                         cv = kw.value
                         if isinstance(cv, (ast.Tuple, ast.List)) and len(cv.elts) == 2:
@@ -47414,17 +47515,47 @@ class translator(ast.NodeVisitor):
                     pad_right = self.expr(pw.elts[1])
                 else:
                     raise NotImplementedError("np.pad pad_width must be int or tuple/list")
+                k0 = self._expr_kind(node.args[0])
+                pad_modes = {"edge": 1, "wrap": 2, "reflect": 3, "symmetric": 4}
+                if mode_txt in pad_modes and r0 == 1:
+                    # Index i of the padded vector (from -pad_left) maps to
+                    # an element of the original (np_pad_index).
+                    if any(kw.arg not in {"pad_width", "mode"} for kw in node.keywords):
+                        raise NotImplementedError(f"np.pad(mode='{mode_txt}'): only pad_width is supported")
+                    if not re.fullmatch(r"[A-Za-z_]\w*(?:%\w+)*", a0):
+                        return f"np_pad_vec({a0}, int({pad_left}), int({pad_right}), {pad_modes[mode_txt]})"
+                    return (f"{a0}(np_pad_indices(size({a0}), int({pad_left}), int({pad_right}), "
+                            f"{pad_modes[mode_txt]}))")
                 if mode_txt != "constant":
-                    raise NotImplementedError("np.pad currently supports only mode='constant'")
+                    raise NotImplementedError("np.pad supports mode='constant', and 'edge', 'wrap', 'reflect' and "
+                                              "'symmetric' for a vector")
+                # The fill value takes the array's kind, as numpy casts it.
+                def _cv_kind(txt, node_kind):
+                    if k0 == "real":
+                        return txt if node_kind == "real" else f"real({txt}, kind=dp)"
+                    if k0 == "complex":
+                        return txt if node_kind == "complex" else f"cmplx({txt}, 0.0_dp, kind=dp)"
+                    if k0 == "logical":
+                        return txt if node_kind == "logical" else f"(({txt}) /= 0)"
+                    return txt if node_kind == "int" else f"int({txt})"
+                cv_nodes = [None, None]
+                for kw in node.keywords:
+                    if kw.arg == "constant_values":
+                        cv = kw.value
+                        cv_nodes = list(cv.elts) if isinstance(cv, (ast.Tuple, ast.List)) and len(cv.elts) == 2 \
+                            else [cv, cv]
+                cv_left = _cv_kind(cv_left, "int" if cv_nodes[0] is None else self._expr_kind(cv_nodes[0]))
+                cv_right = _cv_kind(cv_right, "int" if cv_nodes[1] is None else self._expr_kind(cv_nodes[1]))
                 if r0 == 2:
-                    k0 = self._expr_kind(node.args[0])
+                    if cv_nodes[0] is not None and ast.unparse(cv_nodes[0]) != ast.unparse(cv_nodes[1]):
+                        raise NotImplementedError("np.pad of a matrix: constant_values must be a single value")
+                    if k0 not in {"real", "int"}:
+                        raise NotImplementedError("np.pad of a matrix: only real and integer arrays")
                     if k0 == "real":
                         return f"pad2d_real({a0}, int({pad_left}), int({pad_right}), int({pad_left}), int({pad_right}), real({cv_left}, kind=dp))"
                     return f"pad2d_int({a0}, int({pad_left}), int({pad_right}), int({pad_left}), int({pad_right}), int({cv_left}))"
-                return (
-                    f"[(({cv_left}), i_pad = 1, int({pad_left})), {a0}, "
-                    f"(({cv_right}), i_pad = 1, int({pad_right}))]"
-                )
+                return (f"[spread({cv_left}, 1, int({pad_left})), {a0}, "
+                        f"spread({cv_right}, 1, int({pad_right}))]")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -51081,7 +51212,10 @@ class translator(ast.NodeVisitor):
                 ):
                     outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
                     if len(outs) >= 2:
-                        self._mark_alloc_int(outs[0], rank=1)
+                        if self._histogram_real_counts(node.value):
+                            self._mark_alloc_real(outs[0], rank=1)
+                        else:
+                            self._mark_alloc_int(outs[0], rank=1)
                         bins_node = node.value.args[1] if len(node.value.args) >= 2 else None
                         for kw in node.value.keywords:
                             if kw.arg == "bins":
@@ -56956,6 +57090,8 @@ class translator(ast.NodeVisitor):
                 xname = f"real({xname}, kind=dp)"
             bins_node = v.args[1] if len(v.args) >= 2 else ast.Constant(value=10)
             lohi = ""
+            weights_txt = None
+            density_txt = None
             for kw in v.keywords:
                 if kw.arg == "bins":
                     bins_node = kw.value
@@ -56965,9 +57101,31 @@ class translator(ast.NodeVisitor):
                         for e in kw.value.elts)
                 elif kw.arg == "range" and isinstance(kw.value, ast.Constant) and kw.value.value is None:
                     continue
+                elif kw.arg == "weights":
+                    if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                        continue
+                    if self._expr_kind(kw.value) != "real":
+                        raise NotImplementedError("np.histogram: integer weights are not supported (use floats)")
+                    weights_txt = self.expr(kw.value)
+                elif kw.arg == "density":
+                    if not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, (bool, type(None)))):
+                        raise NotImplementedError("np.histogram: density must be True or False")
+                    if kw.value.value:
+                        density_txt = ".true."
                 else:
                     raise NotImplementedError(f"np.histogram keyword '{kw.arg}' is not yet supported")
-            if self._rank_expr(bins_node) == 0:
+            if isinstance(bins_node, ast.Constant) and isinstance(bins_node.value, str):
+                # numpy's bin-count estimators ('auto', 'fd', 'sturges', ...).
+                method = bins_node.value.lower()
+                if method not in {"auto", "fd", "doane", "scott", "rice", "sturges", "sqrt"}:
+                    raise NotImplementedError(f"np.histogram: bins='{bins_node.value}' is not supported")
+                if weights_txt is not None:
+                    raise NotImplementedError("np.histogram: automated bin estimation is not supported for "
+                                              "weighted data (numpy raises TypeError)")
+                is_int = ".true." if self._expr_kind(x_node) in {"int", "logical"} else ".false."
+                nb = f"np_hist_bin_count({xname}, '{method}', {is_int}{lohi})"
+                edges = f"np_hist_edges({xname}, {nb}{lohi})"
+            elif self._rank_expr(bins_node) == 0:
                 # n equal bins: numpy's edges (np.linspace over the data or range).
                 edges = f"np_hist_edges({xname}, int({self.expr(bins_node)}){lohi})"
             else:
@@ -56976,6 +57134,11 @@ class translator(ast.NodeVisitor):
                 edges = self.expr(bins_node)
                 if self._expr_kind(bins_node) != "real":
                     edges = f"real({edges}, kind=dp)"
+            if weights_txt is not None or density_txt is not None:
+                extra = (f", weights={weights_txt}" if weights_txt is not None else "") + \
+                        (f", density={density_txt}" if density_txt is not None else "")
+                self.o.w(f"call histogram_np({xname}, {edges}, {outs[0]}, {outs[1]}{extra})")
+                return
             self.o.w(f"call histogram_real_edges({xname}, {edges}, {outs[0]}, {outs[1]})")
             return
         # tuple unpacking from np.histogram2d(x, y, bins=[xedges, yedges])
@@ -61965,8 +62128,9 @@ class translator(ast.NodeVisitor):
     _WINDOWS = {"hanning", "hamming", "blackman", "bartlett", "kaiser"}
     _EMATH = {"sqrt", "log", "log2", "log10", "logn", "power", "arcsin", "arccos", "arctanh"}
     _B1_ATTRS = _WINDOWS | {"fftshift", "ifftshift", "poly", "polyadd", "polysub", "polymul", "polydiv",
-                            "polyint", "frexp", "modf", "nanmedian", "nanpercentile", "nanquantile"}
-    _B1_HELPERS = {"np_window", "i0_scalar", "np_poly_roots", "np_polyadd", "np_polyadd_real", "np_polyadd_int",
+                            "polyint", "frexp", "modf", "nanmedian", "nanpercentile", "nanquantile", "packbits",
+                            "unpackbits"}
+    _B1_HELPERS = {"np_packbits", "np_unpackbits", "np_window", "i0_scalar", "np_poly_roots", "np_polyadd", "np_polyadd_real", "np_polyadd_int",
                    "np_polymul", "np_polymul_real", "np_polymul_int", "np_polydiv", "np_polyint",
                    "nan_quantile_vec", "nan_quantile_axis_2d", "quantile_linear", "sort_vec"}
 
@@ -61991,7 +62155,8 @@ class translator(ast.NodeVisitor):
     _NPOLY_MODULES = {"polynomial": "poly", "chebyshev": "cheb", "legendre": "leg", "hermite": "herm",
                       "hermite_e": "herme", "laguerre": "lag"}
     _NPOLY_OPS = ("val", "vander", "fit", "der", "int", "companion", "roots", "fromroots", "mulx", "add", "sub",
-                  "mul", "div", "pow", "line", "trim", "gauss", "weight", "2poly")
+                  "mul", "div", "pow", "line", "trim", "gauss", "weight", "2poly", "val2d", "val3d", "grid2d",
+                  "grid3d", "valfromroots")
     _NPOLY_FAMCODE = {"pow": 1, "cheb": 2, "leg": 3, "herm": 4, "herme": 5, "lag": 6}
     _NPOLY_HELPERS = {f"{f}{op}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag")
                       for op in ("val", "vander", "fit", "der", "int")} | {
@@ -62003,7 +62168,10 @@ class translator(ast.NodeVisitor):
         "opoly_trim", "opoly_trimcoef", "opoly_companion", "opoly_roots", "opoly_gauss", "opoly_gauss_part",
         "opoly_normed_herm", "opoly_mulx", "opoly_add", "opoly_convolve", "opoly_c2z", "opoly_z2c", "opoly_mul",
         "opoly_div", "opoly_div_part", "opoly_pow", "opoly_line", "opoly_fromroots", "opoly_to_pow",
-        "opoly_from_pow", "chebpts1", "chebpts2", "linalg_eigvals_real", "linalg_eigvalsh", "linspace", "leggauss"}
+        "opoly_from_pow", "chebpts1", "chebpts2", "linalg_eigvals_real", "linalg_eigvalsh", "linspace", "leggauss"} | {
+        f"{f}{op}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag")
+        for op in ("val2d", "val3d", "grid2d", "grid3d")} | {
+        "opoly_val2d0", "opoly_val3d0", "opoly_grid2d", "opoly_grid3d", "powvalfromroots"}
 
     def _npoly_call(self, node):
         """(Fortran family prefix, operation) of np.polynomial.<module>.<f>(...)."""
@@ -62026,6 +62194,8 @@ class translator(ast.NodeVisitor):
         if op == "gauss" and fam == "leg":
             return None  # leggauss has its own handling
         if op == "2poly" and fam == "pow":
+            return None
+        if op == "valfromroots" and fam != "pow":
             return None
         return fam, op
 
@@ -62056,6 +62226,8 @@ class translator(ast.NodeVisitor):
         extra_ops = self._np_polynomial_more(node, fam, op, npname)
         if extra_ops is not None:
             return extra_ops
+        if op in {"val2d", "val3d", "grid2d", "grid3d", "valfromroots"}:
+            return self._np_polynomial_nd(node, fam, op, npname, real_txt)
         allowed = {"val": {"x", "c", "tensor"}, "vander": {"x", "deg"},
                    "fit": {"x", "y", "deg", "rcond", "full", "w", "domain", "window", "symbol"},
                    "der": {"c", "m", "scl", "axis"}, "int": {"c", "m", "k", "lbnd", "scl", "axis"}}[op]
@@ -62123,6 +62295,47 @@ class translator(ast.NodeVisitor):
             return False
         fc = self._npoly_call(node.value)
         return fc is not None and fc[1] in {"div", "gauss"}
+
+    def _np_polynomial_nd(self, node, fam, op, npname, real_txt):
+        """<f>val2d/val3d (points of one shape), <f>grid2d/grid3d (vectors;
+        scalars), and polyvalfromroots (tensor=True, 1-D roots)."""
+        npts = {"val2d": 2, "grid2d": 2, "val3d": 3, "grid3d": 3, "valfromroots": 1}[op]
+        crank = {"val2d": 2, "grid2d": 2, "val3d": 3, "grid3d": 3, "valfromroots": 1}[op]
+        names = (["x", "y", "z"][:npts] + (["r"] if op == "valfromroots" else ["c"]))
+        kd = {k.arg: k.value for k in node.keywords}
+        if set(kd) - set(names) - ({"tensor"} if op == "valfromroots" else set()):
+            raise NotImplementedError(f"{npname}: unsupported arguments")
+        vals = [node.args[i] if len(node.args) > i else kd.get(nm) for i, nm in enumerate(names)]
+        if any(v is None for v in vals):
+            raise NotImplementedError(f"{npname} takes {', '.join(names)}")
+        pts, c = vals[:-1], vals[-1]
+        if int(self._rank_expr(c) or 0) != crank:
+            raise NotImplementedError(f"{npname}: the {'roots' if op == 'valfromroots' else 'coefficients'} "
+                                      f"must have {crank} dimension{'s' if crank > 1 else ''}")
+        if op == "valfromroots":
+            tn = kd.get("tensor")
+            if tn is not None and not isinstance(tn, ast.Constant):
+                raise NotImplementedError(f"{npname}: tensor must be a literal")
+            if int(self._rank_expr(pts[0]) or 0) > 2:
+                raise NotImplementedError(f"{npname}: x of rank above 2 is not supported")
+            return f"powvalfromroots({real_txt(pts[0])}, {real_txt(c)})"
+        ranks = [int(self._rank_expr(v) or 0) for v in pts]
+        if op.startswith("val"):
+            if len(set(ranks)) != 1 or ranks[0] > (2 if op == "val2d" else 1):
+                raise NotImplementedError(f"{npname}: the points must have one shape (scalars, vectors"
+                                          f"{' or matrices' if op == 'val2d' else ''})")
+            return f"{fam}{op}({', '.join(real_txt(v) for v in pts)}, {real_txt(c)})"
+        if set(ranks) - {0, 1}:
+            raise NotImplementedError(f"{npname}: the points must be scalars or vectors")
+        txt = f"{fam}{op}({', '.join(real_txt(v) if r == 1 else '[' + real_txt(v) + ']' for v, r in zip(pts, ranks))}, " \
+              f"{real_txt(c)})"
+        if sum(ranks) == len(ranks):
+            return txt
+        # Scalar points drop their (length-1) axes.
+        shape = ", ".join(f"size({real_txt(v)})" for v, r in zip(pts, ranks) if r == 1)
+        if sum(ranks) == 0:
+            return f"sum({txt})"
+        return f"reshape({txt}, [{shape}])"
 
     def _np_polynomial_more(self, node, fam, op, npname):
         """companion, roots, fromroots, mulx, add, sub, mul, pow, line, trim,
@@ -62232,9 +62445,12 @@ class translator(ast.NodeVisitor):
             if op == "weight":
                 x = node.args[0] if node.args else None
                 return ("real", int(self._rank_expr(x) or 0) if x is not None else 0)
-            if op == "val":
+            if op in {"val", "val2d", "val3d", "valfromroots"}:
                 x = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "x"), None)
                 return ("real", int(self._rank_expr(x) or 0) if x is not None else 0)
+            if op in {"grid2d", "grid3d"}:
+                pts = node.args[:2 if op == "grid2d" else 3]
+                return ("real", sum(int(self._rank_expr(a) or 0) for a in pts))
             return ("real", 2 if op == "vander" else 1)
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) \
                 and node.slice.value in (0, 1):
@@ -62254,6 +62470,8 @@ class translator(ast.NodeVisitor):
             # Always complex (numpy: complex only for inputs outside the
             # real domain, a choice made at run time).
             return ("complex", max([int(self._rank_expr(a) or 0) for a in call.args] or [0]))
+        if name in {"packbits", "unpackbits"}:
+            return ("int", 1)
         if name in self._WINDOWS or name in {"poly", "polyint"}:
             return ("real", 1)
         if name in {"fftshift", "ifftshift"}:
@@ -62341,6 +62559,35 @@ class translator(ast.NodeVisitor):
             return f"{ {'arcsin': 'asin', 'arccos': 'acos', 'arctanh': 'atanh'}[fn] }({cx(call.args[0])})"
         if name in {"polydiv", "frexp", "modf"}:
             raise NotImplementedError(f"np.{name} returns a tuple: unpack it or index it with [0] or [1]")
+        if name in {"packbits", "unpackbits"}:
+            # axis=None (the flattened array in C order) and bitorder=.
+            kd = {k.arg: k.value for k in call.keywords}
+            allowed = {"axis", "bitorder"} | ({"count"} if name == "unpackbits" else set())
+            if not call.args or len(call.args) > 1 or set(kd) - allowed:
+                raise NotImplementedError(f"np.{name}: supported arguments are a, " + ", ".join(sorted(allowed)))
+            ax = kd.get("axis")
+            r = int(self._rank_expr(call.args[0]) or 0)
+            if ax is not None and not (isinstance(ax, ast.Constant) and (ax.value is None or (ax.value in (0, -1)
+                                                                                              and r == 1))):
+                raise NotImplementedError(f"np.{name}: only axis=None (or 0 for a vector) is supported")
+            bo = kd.get("bitorder", ast.Constant(value="big"))
+            if not (isinstance(bo, ast.Constant) and bo.value in ("big", "little")):
+                raise NotImplementedError(f"np.{name}: bitorder must be 'big' or 'little'")
+            little = ".true." if bo.value == "little" else ".false."
+            a0 = self.expr(call.args[0])
+            if r > 1:
+                a0 = self._c_order_flat(a0, r)
+            if name == "packbits":
+                k0 = self._expr_kind(call.args[0])
+                if k0 != "logical":
+                    a0 = f"({a0} /= 0)"
+                return f"np_packbits({a0}, {little})"
+            if self._expr_kind(call.args[0]) != "int":
+                raise NotImplementedError("np.unpackbits: the array must be of integers (uint8)")
+            cnt = kd.get("count")
+            if cnt is not None and not (isinstance(cnt, ast.Constant) and cnt.value is None):
+                return f"np_unpackbits({a0}, {little}, int({self.expr(cnt)}))"
+            return f"np_unpackbits({a0}, {little})"
         if name in self._WINDOWS:
             if not call.args or call.keywords or len(call.args) != (2 if name == "kaiser" else 1):
                 raise NotImplementedError(f"np.{name} takes M" + (" and beta" if name == "kaiser" else ""))
@@ -84677,6 +84924,8 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_histogramdd(tree)
+    tree = rewrite_histogram_bin_edges(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
@@ -85218,6 +85467,8 @@ def transpile_file(
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_histogramdd(tree)
+    tree = rewrite_histogram_bin_edges(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
@@ -86040,6 +86291,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    tree = rewrite_histogramdd(tree)
+    tree = rewrite_histogram_bin_edges(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
