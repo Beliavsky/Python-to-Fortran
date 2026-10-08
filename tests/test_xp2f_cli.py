@@ -26633,3 +26633,49 @@ def test_xp2f_library_and_local_function_callbacks_on_arrays(tmp_path: Path) -> 
     # numpy prints 8 significant digits.
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)
+
+
+def test_xp2f_numpy_windows_fftshift_poly_frexp_nanquantile(tmp_path: Path) -> None:
+    # Window functions, np.fft.fftshift/ifftshift (also of a matrix and along
+    # axes), np.fft.ifft of a real array, np.poly/polyadd/polysub/polymul/
+    # polydiv/polyint, np.frexp/np.modf (unpacked and indexed), and
+    # nanmedian/nanpercentile/nanquantile (also along an axis).
+    src = tmp_path / "xbatch1.py"
+    src.write_text(
+        'import numpy as np\n'
+        '\n'
+        'def spec(x):\n'
+        '    return np.fft.fftshift(np.abs(np.fft.fft(x)))\n'
+        '\n'
+        'print(np.hanning(5), np.hamming(6), np.blackman(5), np.bartlett(6), np.kaiser(5, 2.5), np.hanning(1), np.hamming(0))\n'
+        'x = np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])\n'
+        'm = np.arange(12.0).reshape(3, 4)\n'
+        'print(np.fft.fftshift(x), np.fft.ifftshift(x), np.fft.ifftshift(np.fft.fftshift(x)))\n'
+        'print(np.fft.fftshift(m))\n'
+        'print(np.fft.fftshift(m, axes=1), np.fft.fftshift(np.fft.fftfreq(6)))\n'
+        'print(spec(np.array([1.0, 2.0, 0.0, -1.0])))\n'
+        'print(np.fft.ifft(np.array([1.0, 2.0, 3.0, 4.0])))\n'
+        'print(np.poly(np.array([1.0, 2.0, -3.0])), np.polyadd([1, 2], [1, 1, 1]), np.polysub(np.array([1.0, 2.0]), [3.0, 1.0, 1.0]))\n'
+        'print(np.polymul([1, 2], [1, -1, 3]), np.polymul(np.array([0.5, 1.0]), np.array([2.0, 0.0])))\n'
+        'q, r = np.polydiv(np.array([1.0, -3.0, 0.0, 2.0]), np.array([1.0, -1.0]))\n'
+        'print(q, r, np.polydiv(np.array([2.0, 3.0, 1.0]), np.array([1.0, 1.0]))[1])\n'
+        'print(np.polyint(np.array([3.0, 2.0, 1.0])), np.polyint(np.array([6.0, 2.0]), 2), np.polyint([1.0, 1.0], k=5.0), np.polyint([2.0], m=2, k=[1.0, 2.0]))\n'
+        'mant, ex = np.frexp(np.array([1.0, 3.0, -0.75, 0.0, 1024.0]))\n'
+        'print(mant, ex, np.frexp(10.0)[0], np.frexp(10.0)[1])\n'
+        'fr, ip = np.modf(np.array([1.5, -2.25, 3.0]))\n'
+        'print(fr, ip, np.modf(-7.5)[0])\n'
+        'xn = np.array([1.0, np.nan, 3.0, 7.0, np.nan, 2.0])\n'
+        'mn = np.array([[1.0, np.nan, 3.0], [4.0, 5.0, np.nan]])\n'
+        'print(np.nanmedian(xn), np.nanpercentile(xn, 30), np.nanquantile(xn, 0.25), np.nanmedian(mn))\n'
+        'print(np.nanmedian(mn, axis=0), np.nanpercentile(mn, 50, axis=1), np.nanquantile(mn, 0.75, axis=-1))\n',
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xbatch1_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints 8 significant digits.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?|nan", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12, nan_ok=True)

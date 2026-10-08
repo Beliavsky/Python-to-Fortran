@@ -264,6 +264,8 @@ public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 public :: np_gradient_1d, np_gradient_2d, np_trapezoid_1d, interp_0d
 public :: interp_periodic_1d, interp_periodic_0d, np_hist_edges, histogram2d_np
+public :: np_window, np_poly_roots, np_polyadd, np_polymul, np_polydiv, np_polyint
+public :: nan_quantile_vec, nan_quantile_axis_2d
 public :: unwrap_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="unwrap 1D phase vector using numpy-like default discontinuity pi"
 public :: bitwise_count_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="population count for each integer element"
 public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="modified Bessel function I0 approximation (elemental)"
@@ -708,6 +710,14 @@ end interface sorted_2d
 interface argsort_2d
    module procedure argsort_real_2d, argsort_int_2d, argsort_complex_2d
 end interface argsort_2d
+
+interface np_polyadd
+   module procedure np_polyadd_real, np_polyadd_int
+end interface np_polyadd
+
+interface np_polymul
+   module procedure np_polymul_real, np_polymul_int
+end interface np_polymul
 
 interface histogram
    module procedure histogram_real_edges, histogram_int_edges
@@ -9477,6 +9487,199 @@ contains
          g(2:n-1) = 0.5_dp * (x(3:n) - x(1:n-2))
          g(n) = x(n) - x(n-1)
       end function gradient_1d
+
+      pure function np_window(kind_name, m, beta) result(w)
+         ! np.hanning / hamming / blackman / bartlett / kaiser(m[, beta]) with
+         ! numpy's formulas (n = arange(1-m, m, 2) for the cosine windows);
+         ! m == 1 gives [1.0] and m < 1 an empty array, as numpy does.
+         character(len=*), intent(in) :: kind_name
+         integer, intent(in) :: m
+         real(kind=dp), intent(in), optional :: beta
+         real(kind=dp), allocatable :: w(:)
+         real(kind=dp) :: pi, alpha, b
+         real(kind=dp), allocatable :: n(:)
+         integer :: i
+         pi = acos(-1.0_dp)
+         if (m < 1) then
+            allocate(w(0))
+            return
+         end if
+         if (m == 1) then
+            w = [1.0_dp]
+            return
+         end if
+         n = [(real(1 - m + 2 * i, kind=dp), i = 0, m - 1)]
+         select case (kind_name)
+         case ("hanning")
+            w = 0.5_dp + 0.5_dp * cos(pi * n / real(m - 1, kind=dp))
+         case ("hamming")
+            w = 0.54_dp + 0.46_dp * cos(pi * n / real(m - 1, kind=dp))
+         case ("blackman")
+            w = 0.42_dp + 0.5_dp * cos(pi * n / real(m - 1, kind=dp)) &
+               + 0.08_dp * cos(2.0_dp * pi * n / real(m - 1, kind=dp))
+         case ("bartlett")
+            w = merge(1.0_dp + n / real(m - 1, kind=dp), 1.0_dp - n / real(m - 1, kind=dp), n <= 0.0_dp)
+         case ("kaiser")
+            b = 0.0_dp
+            if (present(beta)) b = beta
+            alpha = real(m - 1, kind=dp) / 2.0_dp
+            n = [(real(i, kind=dp), i = 0, m - 1)]
+            w = i0_scalar(b * sqrt(1.0_dp - ((n - alpha) / alpha) ** 2)) / i0_scalar(b)
+         case default
+            error stop "np_window: unknown window"
+         end select
+      end function np_window
+
+      pure function np_poly_roots(r) result(c)
+         ! np.poly(roots): the monic polynomial with these roots, highest
+         ! degree first.
+         real(kind=dp), intent(in) :: r(:)
+         real(kind=dp), allocatable :: c(:), nxt(:)
+         integer :: k
+         c = [1.0_dp]
+         do k = 1, size(r)
+            nxt = [c, 0.0_dp]
+            nxt(2:) = nxt(2:) - r(k) * c
+            c = nxt
+         end do
+      end function np_poly_roots
+
+      pure function np_polyadd_real(a, b, sgn) result(c)
+         ! np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the
+         ! shorter is padded with leading zeros.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         integer, intent(in) :: sgn
+         real(kind=dp), allocatable :: c(:)
+         integer :: n
+         n = max(size(a), size(b))
+         allocate(c(n), source=0.0_dp)
+         c(n - size(a) + 1:) = a
+         c(n - size(b) + 1:) = c(n - size(b) + 1:) + real(sgn, kind=dp) * b
+      end function np_polyadd_real
+
+      pure function np_polyadd_int(a, b, sgn) result(c)
+         integer, intent(in) :: a(:), b(:)
+         integer, intent(in) :: sgn
+         integer, allocatable :: c(:)
+         integer :: n
+         n = max(size(a), size(b))
+         allocate(c(n), source=0)
+         c(n - size(a) + 1:) = a
+         c(n - size(b) + 1:) = c(n - size(b) + 1:) + sgn * b
+      end function np_polyadd_int
+
+      pure function np_polymul_real(a, b) result(c)
+         ! np.polymul(a, b): the full convolution of the coefficients.
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), allocatable :: c(:)
+         integer :: i
+         allocate(c(max(size(a) + size(b) - 1, 0)), source=0.0_dp)
+         do i = 1, size(a)
+            c(i:i + size(b) - 1) = c(i:i + size(b) - 1) + a(i) * b
+         end do
+      end function np_polymul_real
+
+      pure function np_polymul_int(a, b) result(c)
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: c(:)
+         integer :: i
+         allocate(c(max(size(a) + size(b) - 1, 0)), source=0)
+         do i = 1, size(a)
+            c(i:i + size(b) - 1) = c(i:i + size(b) - 1) + a(i) * b
+         end do
+      end function np_polymul_int
+
+      pure function np_polydiv(u, v, part) result(res)
+         ! np.polydiv(u, v)[part]: the quotient (part 0) or the remainder
+         ! (part 1), with numpy's algorithm (leading remainder terms close to
+         ! zero, allclose with rtol 1e-14, are dropped).
+         real(kind=dp), intent(in) :: u(:), v(:)
+         integer, intent(in) :: part
+         real(kind=dp), allocatable :: res(:), q(:), r(:)
+         real(kind=dp) :: scale, d
+         integer :: m, n, k
+         m = size(u) - 1
+         n = size(v) - 1
+         if (n < 0) error stop "np.polydiv: the divisor is empty"
+         if (v(1) == 0.0_dp) error stop "np.polydiv: the divisor's leading coefficient is zero"
+         scale = 1.0_dp / v(1)
+         allocate(q(max(m - n + 1, 1)), source=0.0_dp)
+         r = u
+         do k = 1, m - n + 1
+            d = scale * r(k)
+            q(k) = d
+            r(k:k + n) = r(k:k + n) - d * v
+         end do
+         do while (size(r) > 1)
+            if (abs(r(1)) > 1.0e-8_dp) exit   ! numpy: allclose(r[0], 0, rtol=1e-14)
+            r = r(2:)
+         end do
+         if (part == 0) then
+            res = q
+         else
+            res = r
+         end if
+      end function np_polydiv
+
+      pure function np_polyint(p, m, k) result(y)
+         ! np.polyint(p, m, k): m antiderivatives, integration constants k
+         ! (a scalar for all, or one per integration; default 0).
+         real(kind=dp), intent(in) :: p(:)
+         integer, intent(in) :: m
+         real(kind=dp), intent(in), optional :: k(:)
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp) :: kk
+         integer :: j, i, n
+         if (m < 0) error stop "np.polyint: Order of integral must be positive (see polyder)"
+         y = p
+         do j = 1, m
+            kk = 0.0_dp
+            if (present(k)) then
+               if (size(k) == 1) then
+                  kk = k(1)
+               else if (size(k) >= m) then
+                  kk = k(j)
+               else
+                  error stop "np.polyint: k must be a scalar or a rank-1 array of length 1 or >m."
+               end if
+            end if
+            n = size(y)
+            y = [(y(i) / real(n - i + 1, kind=dp), i = 1, n), kk]
+         end do
+      end function np_polyint
+
+      pure function nan_quantile_vec(x, q) result(v)
+         ! np.nanquantile(x, q) of a vector: the quantile of the non-NaN
+         ! values (NaN if there are none, as numpy gives with a warning).
+         real(kind=dp), intent(in) :: x(:), q
+         real(kind=dp) :: v
+         real(kind=dp), allocatable :: y(:)
+         y = pack(x, .not. ieee_is_nan(x))
+         if (size(y) == 0) then
+            v = ieee_value(1.0_dp, ieee_quiet_nan)
+         else
+            v = quantile_linear(y, q)
+         end if
+      end function nan_quantile_vec
+
+      pure function nan_quantile_axis_2d(x, q, dim) result(out)
+         ! np.nanquantile(x, q, axis=dim-1) of a matrix.
+         real(kind=dp), intent(in) :: x(:,:), q
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:)
+         integer :: i
+         if (dim == 1) then
+            allocate(out(size(x, 2)))
+            do i = 1, size(x, 2)
+               out(i) = nan_quantile_vec(x(:, i), q)
+            end do
+         else
+            allocate(out(size(x, 1)))
+            do i = 1, size(x, 1)
+               out(i) = nan_quantile_vec(x(i, :), q)
+            end do
+         end if
+      end function nan_quantile_axis_2d
 
       pure function np_trapezoid_1d(y, dx, x) result(s)
          ! np.trapezoid(y, x=x | dx=dx) of a vector, summed as numpy does:

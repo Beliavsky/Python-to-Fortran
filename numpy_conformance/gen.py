@@ -425,6 +425,24 @@ FIXTURES.update({
 })
 PLACEHOLDERS["Q"] = ["q8", "qu8", "q16", "qu16"]
 
+# Phase 8: windows, FFT shifts, legacy polynomials, frexp/modf, NaN quantiles.
+SPECS["numerics1"] = [
+    "np.hanning(7)", "np.hamming(6)", "np.blackman(5)", "np.bartlett(6)", "np.kaiser(5, 2.5)", "np.hanning(1)",
+    "np.hamming(3) * {N1}[:3]", "np.fft.fftshift({N1})", "np.fft.ifftshift({N1})", "np.fft.fftshift({N2})",
+    "np.fft.fftshift({N2}, axes=1)", "np.fft.ifftshift({N2}, axes=(0,))", "np.fft.fftshift(np.fft.fftfreq(5))",
+    "np.abs(np.fft.ifft({N1}))", "np.poly({N1}[:3])", "np.poly(q1)", "np.polyadd({N1}, q1)", "np.polysub(q1, {N1})",
+    "np.polymul({N1}, q1)", "np.polymul({N1}, [2, -1])", "np.polydiv({N1}, q1)[0]", "np.polydiv({N1}, q1)[1]",
+    "np.polydiv({N1}, np.array([1.0, -2.0]))[1]", "np.polyint({N1})", "np.polyint({N1}, 2)",
+    "np.polyint({N1}, k=3.0)", "np.polyint(q1, m=2, k=[1.0, -1.0])", "np.frexp({N})[0]", "np.frexp({N})[1]",
+    "np.modf({N} * 1.5)[0]", "np.modf({N} * 1.5)[1]", "STMT w1, w2 = np.polydiv({N1}, q1) => w1.sum() + w2.sum()",
+    "STMT w1, w2 = np.frexp({N1} * 3.0) => w1 * w2", "STMT w1, w2 = np.modf({S} * 2.5) => w1 + w2",
+    "np.nanmedian(nn1)", "np.nanpercentile(nn1, 30)", "np.nanquantile(nn1, 0.8)", "np.nanmedian({N1})",
+    "np.nanmedian(nn2)", "np.nanmedian(nn2, axis=0)", "np.nanpercentile(nn2, 25, axis=1)",
+    "np.nanquantile(nn2, 0.5, axis=-1)", "np.nanmedian(n1)",
+]
+FIXTURES["nn1"] = "np.array([1.0, np.nan, 3.0, 7.0, np.nan, 2.0])"
+FIXTURES["nn2"] = "np.array([[1.0, np.nan, 3.0], [4.0, 5.0, np.nan]])"
+
 # Phase 7: numerical calculus on samples (uneven coordinates xc).
 FIXTURES["xc"] = "np.array([0.0, 0.5, 1.5, 3.0, 3.5, 5.0])"
 SPECS["calculus"] = [

@@ -6408,6 +6408,40 @@ def rewrite_function_valued_library_args(tree):
     return tree
 
 
+def rewrite_two_result_numpy_unpack(tree):
+    """q, r = np.polydiv(u, v), m, e = np.frexp(x) and f, i = np.modf(x):
+    one indexed call per target (the translator evaluates np.polydiv(u,
+    v)[k] and the others directly)."""
+    names = {"polydiv", "frexp", "modf"}
+
+    def process(body):
+        out = []
+        for st in body:
+            for field in ("body", "orelse", "finalbody"):
+                if isinstance(getattr(st, field, None), list):
+                    setattr(st, field, process(getattr(st, field)))
+            v = getattr(st, "value", None)
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                    and len(st.targets[0].elts) == 2 and all(isinstance(e, ast.Name) for e in st.targets[0].elts)
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr in names
+                    and isinstance(v.func.value, ast.Name) and v.func.value.id in ("np", "numpy")):
+                tg = [e.id for e in st.targets[0].elts]
+                used = {n.id for n in ast.walk(v) if isinstance(n, ast.Name)}
+                if not (set(tg) & used):
+                    for k, nm in enumerate(tg):
+                        sub = ast.Subscript(value=copy.deepcopy(v), slice=ast.Constant(value=k), ctx=ast.Load())
+                        out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=sub), st))
+                    continue
+            out.append(st)
+        return out
+
+    tree.body = process(tree.body)
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        fn.body = process(fn.body)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_gradient_unpack(tree):
     """gy, gx = np.gradient(m[, dy, dx]): one np.gradient(..., axis=k) per
     target (numpy returns one array per axis)."""
@@ -16468,6 +16502,9 @@ def detect_needed_helpers(tree):
             # Random draws (translator._random_numpy).
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._RNG_ATTRS:
                 needed.update(translator._RNG_HELPERS)
+            # Windows, poly*, nan quantiles (translator._numerics_batch1).
+            if isinstance(node.func, ast.Attribute) and node.func.attr in translator._B1_ATTRS:
+                needed.update(translator._B1_HELPERS)
             # Stacked linear algebra (translator._stacked_linalg): any linalg
             # call or matmul may get a stack of matrices.
             if isinstance(node.func, ast.Attribute) and (
@@ -30616,6 +30653,9 @@ class translator(ast.NodeVisitor):
         _rgp = self._random_parts(node)
         if _rgp is not None:
             return _rgp[0]
+        _b1p = self._numerics_batch1_parts(node)
+        if _b1p is not None:
+            return _b1p[0]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             _k = self._expr_kind(_mg[0])
@@ -36304,6 +36344,9 @@ class translator(ast.NodeVisitor):
         _rgp = self._random_parts(node)
         if _rgp is not None:
             return _rgp[1]
+        _b1p = self._numerics_batch1_parts(node)
+        if _b1p is not None:
+            return _b1p[1]
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             return 2
@@ -38260,6 +38303,9 @@ class translator(ast.NodeVisitor):
         _rg_txt = self._random_numpy(node)
         if _rg_txt is not None:
             return _rg_txt
+        _b1_txt = self._numerics_batch1(node)
+        if _b1_txt is not None:
+            return _b1_txt
         _bare = self._float_dtype_reduction(node)
         if _bare is not None:
             return f"real({self.expr(_bare)}, kind=dp)"
@@ -47499,13 +47545,24 @@ class translator(ast.NodeVisitor):
                 name = node.func.attr
                 if name in {"fft", "ifft", "rfft", "irfft"} and len(node.args) >= 1:
                     a0 = self.expr(node.args[0])
+                    if name == "ifft" and self._expr_kind(node.args[0]) in {"real", "int", "logical"}:
+                        a0 = f"cmplx({a0}, 0.0_dp, kind=dp)" if self._expr_kind(node.args[0]) != "logical" \
+                            else f"cmplx(merge(1.0_dp, 0.0_dp, {a0}), 0.0_dp, kind=dp)"
                     n_txt = None
                     if len(node.args) >= 2:
                         n_txt = self.expr(node.args[1])
+                    if len(node.args) > 2:
+                        raise NotImplementedError(f"np.fft.{name}: only the array and n are supported")
                     for kw in node.keywords:
                         if kw.arg == "n":
                             n_txt = self.expr(kw.value)
-                            break
+                        elif kw.arg == "norm" and (isinstance(kw.value, ast.Constant)
+                                                   and kw.value.value in (None, "backward")):
+                            continue
+                        elif kw.arg == "axis" and self._rank_expr(node.args[0]) <= 1:
+                            continue
+                        else:
+                            raise NotImplementedError(f"np.fft.{name}: unsupported argument {kw.arg}=")
                     if name == "fft":
                         return f"fft_fft({a0}, int({n_txt}))" if n_txt is not None else f"fft_fft({a0})"
                     if name == "ifft":
@@ -60514,6 +60571,185 @@ class translator(ast.NodeVisitor):
 
         stmt_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
         raise NotImplementedError(f"unsupported assign: {stmt_txt}")
+
+    _WINDOWS = {"hanning", "hamming", "blackman", "bartlett", "kaiser"}
+    _B1_ATTRS = _WINDOWS | {"fftshift", "ifftshift", "poly", "polyadd", "polysub", "polymul", "polydiv",
+                            "polyint", "frexp", "modf", "nanmedian", "nanpercentile", "nanquantile"}
+    _B1_HELPERS = {"np_window", "i0_scalar", "np_poly_roots", "np_polyadd", "np_polyadd_real", "np_polyadd_int",
+                   "np_polymul", "np_polymul_real", "np_polymul_int", "np_polydiv", "np_polyint",
+                   "nan_quantile_vec", "nan_quantile_axis_2d", "quantile_linear", "sort_vec"}
+
+    def _b1_call(self, node):
+        """(name, call) of a batch-1 numpy call (np.x / np.fft.x)."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        v = node.func.value
+        if is_numpy_name_node(v):
+            if node.func.attr in self._B1_ATTRS - {"fftshift", "ifftshift"}:
+                return node.func.attr, node
+        elif (isinstance(v, ast.Attribute) and v.attr == "fft" and is_numpy_name_node(v.value)
+              and node.func.attr in {"fftshift", "ifftshift"}):
+            return node.func.attr, node
+        return None
+
+    def _numerics_batch1_parts(self, node):
+        """(kind, rank) of the forms _numerics_batch1 translates, else None."""
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) \
+                and node.slice.value in (0, 1):
+            nc = self._b1_call(node.value)
+            if nc is None or nc[0] not in {"polydiv", "frexp", "modf"}:
+                return None
+            name, call = nc
+            if name == "polydiv":
+                return ("real", 1)
+            r = int(self._rank_expr(call.args[0]) or 0) if call.args else 0
+            return ("int" if name == "frexp" and node.slice.value == 1 else "real", r)
+        nc = self._b1_call(node)
+        if nc is None:
+            return None
+        name, call = nc
+        if name in self._WINDOWS or name in {"poly", "polyint"}:
+            return ("real", 1)
+        if name in {"fftshift", "ifftshift"}:
+            return (self._expr_kind(call.args[0]), int(self._rank_expr(call.args[0]) or 0)) if call.args else None
+        if name in {"polyadd", "polysub", "polymul"}:
+            ks = {self._expr_kind(a) for a in call.args[:2]}
+            return ("int" if ks <= {"int", "logical"} else "real", 1)
+        if name in {"nanmedian", "nanpercentile", "nanquantile"}:
+            ax = self._np_kw(call, "axis", None)
+            q = call.args[1] if name != "nanmedian" and len(call.args) > 1 else self._np_kw(call, "q", None)
+            if ax is None or (isinstance(ax, ast.Constant) and ax.value is None):
+                return ("real", int(self._rank_expr(q) or 0) if q is not None else 0)
+            return ("real", 1)
+        return None
+
+    def _numerics_batch1(self, node):
+        """Window functions, np.fft.fftshift/ifftshift, the legacy poly*
+        functions, np.frexp/np.modf parts, and nanmedian/nanpercentile/
+        nanquantile."""
+        def real_txt(n):
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+
+        def int_const(n):
+            if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool):
+                return n.value
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant):
+                return -n.operand.value
+            return None
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) \
+                and node.slice.value in (0, 1):
+            nc = self._b1_call(node.value)
+            if nc is None or nc[0] not in {"polydiv", "frexp", "modf"}:
+                return None
+            name, call = nc
+            k = node.slice.value
+            if name == "polydiv":
+                if len(call.args) != 2 or call.keywords:
+                    raise NotImplementedError("np.polydiv takes the two coefficient arrays")
+                return f"np_polydiv({real_txt(call.args[0])}, {real_txt(call.args[1])}, {k})"
+            if len(call.args) != 1 or call.keywords:
+                raise NotImplementedError(f"np.{name} takes one array")
+            x = real_txt(call.args[0])
+            if name == "frexp":
+                return f"fraction({x})" if k == 0 else f"exponent({x})"
+            return f"({x} - aint({x}))" if k == 0 else f"aint({x})"
+        nc = self._b1_call(node)
+        if nc is None:
+            return None
+        name, call = nc
+        if name in {"polydiv", "frexp", "modf"}:
+            raise NotImplementedError(f"np.{name} returns a tuple: unpack it or index it with [0] or [1]")
+        if name in self._WINDOWS:
+            if not call.args or call.keywords or len(call.args) != (2 if name == "kaiser" else 1):
+                raise NotImplementedError(f"np.{name} takes M" + (" and beta" if name == "kaiser" else ""))
+            beta = f", beta={real_txt(call.args[1])}" if name == "kaiser" else ""
+            return f'np_window("{name}", int({self.expr(call.args[0])}){beta})'
+        if name in {"fftshift", "ifftshift"}:
+            x = call.args[0]
+            r = int(self._rank_expr(x) or 0)
+            axes = self._np_kw(call, "axes", 1)
+            if r == 0:
+                raise NotImplementedError(f"np.fft.{name} needs an array")
+            if axes is None or (isinstance(axes, ast.Constant) and axes.value is None):
+                dims = list(range(r))
+            else:
+                elts = axes.elts if isinstance(axes, (ast.Tuple, ast.List)) else [axes]
+                dims = [int_const(e) for e in elts]
+                if any(d is None for d in dims):
+                    raise NotImplementedError(f"np.fft.{name}: axes must be literal integers")
+                dims = [d % r for d in dims]
+            txt = self.expr(x)
+            base = txt
+            for d in dims:
+                # roll by n//2 (fftshift) or -(n//2) (ifftshift); cshift(a, s)
+                # is roll(a, -s).
+                half = f"(size({base}, {d + 1}) / 2)"
+                txt = f"cshift({txt}, {'-' if name == 'fftshift' else ''}{half}, dim={d + 1})"
+            return txt
+        if name == "poly":
+            if len(call.args) != 1 or int(self._rank_expr(call.args[0]) or 0) != 1:
+                raise NotImplementedError("np.poly supports a vector of roots (not a matrix)")
+            if self._expr_kind(call.args[0]) == "complex":
+                raise NotImplementedError("np.poly of complex roots is not supported")
+            return f"np_poly_roots({real_txt(call.args[0])})"
+        if name in {"polyadd", "polysub", "polymul"}:
+            if len(call.args) != 2 or call.keywords:
+                raise NotImplementedError(f"np.{name} takes two coefficient arrays")
+            kind = self._numerics_batch1_parts(call)[0]
+            args = []
+            for a in call.args:
+                txt = self.expr(a)
+                if int(self._rank_expr(a) or 0) == 0:
+                    txt = f"[{txt}]"
+                if kind == "real" and self._expr_kind(a) != "real":
+                    txt = f"real({txt}, kind=dp)"
+                args.append(txt)
+            if name == "polymul":
+                return f"np_polymul({args[0]}, {args[1]})"
+            return f"np_polyadd({args[0]}, {args[1]}, {1 if name == 'polyadd' else -1})"
+        if name == "polyint":
+            m_node = self._np_kw(call, "m", 1)
+            k_node = self._np_kw(call, "k", 2)
+            m_val = 1 if m_node is None else int_const(m_node)
+            if m_val is None:
+                raise NotImplementedError("np.polyint: m must be a literal integer")
+            k_txt = ""
+            if k_node is not None and not (isinstance(k_node, ast.Constant) and k_node.value is None):
+                k_txt = real_txt(k_node)
+                if int(self._rank_expr(k_node) or 0) == 0:
+                    k_txt = f"[{k_txt}]"
+                k_txt = f", k={k_txt}"
+            return f"np_polyint({real_txt(call.args[0])}, {m_val}{k_txt})"
+        if name in {"nanmedian", "nanpercentile", "nanquantile"}:
+            x = call.args[0]
+            r = int(self._rank_expr(x) or 0)
+            if name == "nanmedian":
+                q_node, scale = None, None
+            else:
+                q_node = call.args[1] if len(call.args) > 1 else self._np_kw(call, "q", None)
+                if q_node is None:
+                    raise NotImplementedError(f"np.{name} needs q")
+            ax = self._np_kw(call, "axis", 2 if name != "nanmedian" else 1)
+            for kw in call.keywords:
+                if kw.arg not in {"axis", "q"}:
+                    raise NotImplementedError(f"np.{name}: unsupported argument {kw.arg}=")
+            if q_node is None:
+                q_txt = "0.5_dp"
+            else:
+                q_txt = real_txt(q_node)
+                if name == "nanpercentile":
+                    q_txt = f"({q_txt} / 100.0_dp)"
+            if q_node is not None and int(self._rank_expr(q_node) or 0) != 0:
+                raise NotImplementedError(f"np.{name}: q must be a scalar")
+            if ax is None or (isinstance(ax, ast.Constant) and ax.value is None):
+                flat = self._flat_1d(real_txt(x), r) if r > 1 else real_txt(x)
+                return f"nan_quantile_vec({flat}, {q_txt})"
+            axv = int_const(ax)
+            if r != 2 or axv is None:
+                raise NotImplementedError(f"np.{name} with axis= supports a matrix and a literal axis")
+            return f"nan_quantile_axis_2d({real_txt(x)}, {q_txt}, {axv % 2 + 1})"
+        return None
 
     def _np_histogram2d(self, v, outs):
         """H, xedges, yedges = np.histogram2d(x, y, bins=10, range=None,
@@ -82763,6 +82999,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
+    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
@@ -83298,6 +83535,7 @@ def transpile_file(
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
+    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
@@ -84114,6 +84352,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
+    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
