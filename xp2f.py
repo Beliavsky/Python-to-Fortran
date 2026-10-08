@@ -6707,11 +6707,342 @@ def _is_np_polynomial_attr(func):
             and isinstance(v.value.value, ast.Name) and v.value.value.id in ("np", "numpy"))
 
 
+def _numpy_split_pieces(call, count, counter):
+    """(statements, slices) for the parts of np.split/array_split/hsplit/
+    vsplit(x, sections, axis=) with numpy's rules (equal parts; array_split
+    gives the first L % n parts one more element; a list of cut indices),
+    or None. count: the number of parts expected (None: any). A non-name x
+    is first assigned to a temporary."""
+    v = call
+    if not (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"split", "array_split", "hsplit", "vsplit"}
+            and isinstance(v.func.value, ast.Name) and v.func.value.id in ("np", "numpy")):
+        return None
+    arr = v.args[0] if v.args else None
+    sec = v.args[1] if len(v.args) > 1 else next((k.value for k in v.keywords if k.arg == "indices_or_sections"), None)
+    ax_node = next((k.value for k in v.keywords if k.arg == "axis"), None)
+    if ax_node is None:
+        # hsplit: axis 1 (a vector's hsplit, along axis 0, is left to the
+        # translator, which rejects it).
+        axis = {"vsplit": 0, "hsplit": 1}.get(v.func.attr, 0)
+    elif isinstance(ax_node, ast.Constant) and isinstance(ax_node.value, int) and ax_node.value >= 0:
+        axis = ax_node.value
+    else:
+        return None
+    if arr is None or sec is None:
+        return None
+    if isinstance(sec, (ast.List, ast.Tuple)):
+        n = len(sec.elts) + 1
+    elif isinstance(sec, ast.Constant) and isinstance(sec.value, int) and sec.value > 0:
+        n = sec.value
+    else:
+        return None
+    if count is not None and count != n:
+        return None
+    pre = []
+    if not isinstance(arr, ast.Name):
+        counter[0] += 1
+        tmp = f"xp_split{counter[0]}"
+        pre.append(ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=arr))
+        arr = ast.Name(id=tmp, ctx=ast.Load())
+
+    def piece(lo, hi):
+        sl = ast.Slice(lower=lo, upper=hi, step=None)
+        idx = [ast.Slice(lower=None, upper=None, step=None)] * axis + [sl]
+        return ast.Subscript(value=copy.deepcopy(arr), slice=idx[0] if len(idx) == 1 else ast.Tuple(elts=idx, ctx=ast.Load()),
+                             ctx=ast.Load())
+    if isinstance(sec, (ast.List, ast.Tuple)):
+        bounds = [None] + list(sec.elts) + [None]
+        pieces = [piece(copy.deepcopy(bounds[k]), copy.deepcopy(bounds[k + 1])) for k in range(n)]
+    else:
+        ln = f"{ast.unparse(arr)}.shape[{axis}]"
+        if v.func.attr == "array_split":
+            start = lambda k: f"{k} * (({ln}) // {n}) + min({k}, ({ln}) % {n})"
+        else:
+            start = lambda k: f"{k} * (({ln}) // {n})"
+        pieces = [piece(ast.parse(start(k), mode="eval").body, ast.parse(start(k + 1), mode="eval").body)
+                  for k in range(n)]
+    return pre, pieces
+
+
+def _const_index(n):
+    """The value of a literal integer index (also -k), else None."""
+    if isinstance(n, ast.Constant) and type(n.value) is int:
+        return n.value
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant) \
+            and type(n.operand.value) is int:
+        return -n.operand.value
+    return None
+
+
+def rewrite_named_split_lists(tree):
+    """parts = np.split(x, ...) used only as parts[k], for p in parts and
+    len(parts): one variable per part (parts_0, ...), so parts[k] is an
+    ordinary array and for p in parts a loop over [parts_0, ...] (unrolled
+    by rewrite_unroll_array_list_loops)."""
+    counter = [0]
+
+    def scope(body):
+        names = {}
+        for st in body:
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)):
+                made = _numpy_split_pieces(st.value, None, counter)
+                if made is not None:
+                    names.setdefault(st.targets[0].id, []).append((st, made))
+        for name, defs in names.items():
+            if len(defs) != 1:
+                continue
+            st0, (pre, pieces) = defs[0]
+            n = len(pieces)
+            stores = [x for s in body for x in ast.walk(s) if isinstance(x, ast.Name) and x.id == name
+                      and isinstance(x.ctx, ast.Store)]
+            if len(stores) != 1:
+                continue
+            parents = {}
+            for s in body:
+                for par in ast.walk(s):
+                    for ch in ast.iter_child_nodes(par):
+                        parents[id(ch)] = par
+            ok = True
+            for s in body:
+                for x in ast.walk(s):
+                    if not (isinstance(x, ast.Name) and x.id == name and isinstance(x.ctx, ast.Load)):
+                        continue
+                    par = parents.get(id(x))
+                    if isinstance(par, ast.Subscript) and par.value is x and _const_index(par.slice) is not None \
+                            and -n <= _const_index(par.slice) < n:
+                        continue
+                    if isinstance(par, ast.For) and par.iter is x:
+                        continue
+                    if isinstance(par, ast.Call) and isinstance(par.func, ast.Name) and par.func.id == "len" \
+                            and par.args == [x]:
+                        continue
+                    ok = False
+            if not ok:
+                continue
+            part_names = [f"{name}_{k}" for k in range(n)]
+
+            class _Uses(ast.NodeTransformer):
+                def visit_Subscript(self, node):
+                    self.generic_visit(node)
+                    if isinstance(node.value, ast.Name) and node.value.id == name and _const_index(node.slice) is not None:
+                        return ast.copy_location(ast.Name(id=part_names[_const_index(node.slice) % n], ctx=node.ctx),
+                                                 node)
+                    return node
+
+                def visit_Call(self, node):
+                    self.generic_visit(node)
+                    if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1 \
+                            and isinstance(node.args[0], ast.Name) and node.args[0].id == name:
+                        return ast.copy_location(ast.Constant(value=n), node)
+                    return node
+
+                def visit_For(self, node):
+                    self.generic_visit(node)
+                    if isinstance(node.iter, ast.Name) and node.iter.id == name:
+                        node.iter = ast.List(elts=[ast.Name(id=pn, ctx=ast.Load()) for pn in part_names],
+                                             ctx=ast.Load())
+                    return node
+            idx = body.index(st0)
+            new = list(pre) + [ast.Assign(targets=[ast.Name(id=pn, ctx=ast.Store())], value=pc)
+                               for pn, pc in zip(part_names, pieces)]
+            body[idx:idx + 1] = [ast.copy_location(s, st0) for s in new]
+            for i, s in enumerate(body):
+                body[i] = _Uses().visit(s)
+        return body
+
+    tree.body = scope(tree.body)
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        fn.body = scope(fn.body)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+_TRI_INDEX_FUNCS = {"triu_indices", "tril_indices", "diag_indices", "triu_indices_from", "tril_indices_from",
+                    "diag_indices_from"}
+
+
+def _tri_index_call(node):
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _TRI_INDEX_FUNCS
+            and isinstance(node.func.value, ast.Name) and node.func.value.id in ("np", "numpy"))
+
+
+def _tri_index_parts(call):
+    """(kind, rows, cols, k, from_array) of np.triu/tril/diag_indices(_from),
+    or None (an unsupported form)."""
+    name = call.func.attr
+    kind = name.split("_")[0]
+    args, kws = list(call.args), {k.arg: k.value for k in call.keywords}
+
+    def get(pos, key, default=None):
+        return args[pos] if len(args) > pos else kws.get(key, default)
+    shape = lambda a, i: ast.Subscript(value=ast.Attribute(value=copy.deepcopy(a), attr="shape", ctx=ast.Load()),
+                                       slice=ast.Constant(value=i), ctx=ast.Load())
+    if name.endswith("_from"):
+        a = get(0, "arr")
+        if a is None or (kind == "diag" and len(args) + len(kws) > 1):
+            return None
+        k = get(1, "k", ast.Constant(value=0))
+        return kind, shape(a, 0), shape(a, 1), k, a
+    n = get(0, "n")
+    if n is None:
+        return None
+    if kind == "diag":
+        nd = get(1, "ndim")
+        if nd is not None and not (isinstance(nd, ast.Constant) and nd.value == 2):
+            return None
+        return kind, n, copy.deepcopy(n), ast.Constant(value=0), None
+    return kind, n, copy.deepcopy(get(2, "m", n)), get(1, "k", ast.Constant(value=0)), None
+
+
+def _tri_index_mask(kind, rows, cols, k):
+    """A boolean (rows, cols) array, True at the positions the indices name."""
+    if kind == "diag":
+        base = ast.parse("np.eye(R, C)", mode="eval").body
+    else:
+        base = ast.parse(f"np.{kind}(np.ones((R, C)), K)", mode="eval").body
+
+    class _Sub(ast.NodeTransformer):
+        def visit_Name(self, node):
+            return copy.deepcopy({"R": rows, "C": cols, "K": k}.get(node.id, node))
+    return _Sub().visit(base)
+
+
+def rewrite_tri_indices(tree):
+    """X[np.triu_indices(n, k, m)] (also tril, diag, and the _from forms;
+    loaded or stored) -> X[mask], a boolean mask in C order as numpy's index
+    order; i, j = np.triu_indices(...) -> i, j from np.flatnonzero(mask); and
+    idx = np.triu_indices(...) used as X[idx], idx[0] and idx[1]."""
+    counter = [0]
+
+    def subscript_mask(x, call):
+        parts = _tri_index_parts(call)
+        if parts is None:
+            return None
+        kind, rows, cols, k, src = parts
+        shape = lambda i: ast.Subscript(value=ast.Attribute(value=copy.deepcopy(x), attr="shape", ctx=ast.Load()),
+                                        slice=ast.Constant(value=i), ctx=ast.Load())
+        m = _tri_index_mask(kind, shape(0), shape(1), k)
+        if src is None or ast.unparse(src) != ast.unparse(x):
+            # Indices for an n x m corner of a larger X.
+            outer = ast.parse("np.outer(np.where(np.arange(S0) < R, 1.0, 0.0), np.where(np.arange(S1) < C, 1.0, 0.0))",
+                              mode="eval").body
+
+            class _Sub(ast.NodeTransformer):
+                def visit_Name(self, node):
+                    return copy.deepcopy({"S0": shape(0), "S1": shape(1), "R": rows, "C": cols}.get(node.id, node))
+            m = ast.BinOp(left=m, op=ast.Mult(), right=_Sub().visit(outer))
+        return ast.Compare(left=m, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+
+    def unpack(targets, call, at):
+        parts = _tri_index_parts(call)
+        if parts is None:
+            return None
+        kind, rows, cols, k, _ = parts
+        out = []
+        if not isinstance(cols, (ast.Name, ast.Constant)):
+            counter[0] += 1
+            cn = f"xp_tri_cols{counter[0]}"
+            out.append(ast.Assign(targets=[ast.Name(id=cn, ctx=ast.Store())], value=cols))
+            cols = ast.Name(id=cn, ctx=ast.Load())
+        counter[0] += 1
+        tmp = f"xp_tri{counter[0]}"
+        mask = ast.Compare(left=_tri_index_mask(kind, rows, cols, k), ops=[ast.NotEq()],
+                           comparators=[ast.Constant(value=0)])
+        out.append(ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())],
+                              value=ast.Call(func=ast.parse("np.flatnonzero", mode="eval").body, args=[mask],
+                                             keywords=[])))
+        for tg, op in zip(targets, (ast.FloorDiv(), ast.Mod())):
+            out.append(ast.Assign(targets=[tg], value=ast.BinOp(left=ast.Name(id=tmp, ctx=ast.Load()), op=op,
+                                                                  right=copy.deepcopy(cols))))
+        return [ast.copy_location(s, at) for s in out]
+
+    class _Rw(ast.NodeTransformer):
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            if _tri_index_call(node.slice):
+                mask = subscript_mask(node.value, node.slice)
+                if mask is not None:
+                    node.slice = mask
+            return node
+
+        def visit_Assign(self, node):
+            if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple) and len(node.targets[0].elts) == 2
+                    and _tri_index_call(node.value)):
+                new = unpack(list(node.targets[0].elts), node.value, node)
+                if new is not None:
+                    return new
+            self.generic_visit(node)
+            return node
+
+    def scope(body):
+        # idx = np.triu_indices(...) used only as X[idx], idx[0], idx[1].
+        for st in list(body):
+            if not (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                    and _tri_index_call(st.value)):
+                continue
+            name = st.targets[0].id
+            stores = [x for s in body for x in ast.walk(s) if isinstance(x, ast.Name) and x.id == name
+                      and isinstance(x.ctx, ast.Store)]
+            if len(stores) != 1:
+                continue
+            parents = {}
+            for s in body:
+                for par in ast.walk(s):
+                    for ch in ast.iter_child_nodes(par):
+                        parents[id(ch)] = par
+            ok, parts_used = True, False
+            for s in body:
+                for x in ast.walk(s):
+                    if not (isinstance(x, ast.Name) and x.id == name and isinstance(x.ctx, ast.Load)):
+                        continue
+                    par = parents.get(id(x))
+                    if isinstance(par, ast.Subscript) and par.slice is x:
+                        continue
+                    if (isinstance(par, ast.Subscript) and par.value is x and isinstance(par.slice, ast.Constant)
+                            and par.slice.value in (0, 1)):
+                        parts_used = True
+                        continue
+                    ok = False
+            if not ok:
+                continue
+            call = st.value
+
+            class _Uses(ast.NodeTransformer):
+                def visit_Subscript(self, node):
+                    self.generic_visit(node)
+                    if isinstance(node.slice, ast.Name) and node.slice.id == name:
+                        node.slice = copy.deepcopy(call)
+                    elif (isinstance(node.value, ast.Name) and node.value.id == name
+                          and isinstance(node.slice, ast.Constant)):
+                        return ast.copy_location(ast.Name(id=f"{name}_{node.slice.value}", ctx=node.ctx), node)
+                    return node
+            idx = body.index(st)
+            if parts_used:
+                body[idx] = ast.copy_location(ast.Assign(targets=[ast.Tuple(
+                    elts=[ast.Name(id=f"{name}_0", ctx=ast.Store()), ast.Name(id=f"{name}_1", ctx=ast.Store())],
+                    ctx=ast.Store())], value=call), st)
+            else:
+                del body[idx]
+            for i, s in enumerate(body):
+                body[i] = _Uses().visit(s)
+        return body
+
+    if not any(_tri_index_call(n) for n in ast.walk(tree)):
+        return tree
+    tree.body = scope(tree.body)
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        fn.body = scope(fn.body)
+    tree = _Rw().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_two_result_numpy_unpack(tree):
     """q, r = np.polydiv(u, v), m, e = np.frexp(x) and f, i = np.modf(x):
     one indexed call per target (the translator evaluates np.polydiv(u,
     v)[k] and the others directly)."""
-    names = {"polydiv", "frexp", "modf"}
+    names = {"polydiv", "frexp", "modf", "divmod"}
 
     def process(body):
         out = []
@@ -6734,9 +7065,24 @@ def rewrite_two_result_numpy_unpack(tree):
                         sub = ast.Subscript(value=copy.deepcopy(v), slice=ast.Constant(value=k), ctx=ast.Load())
                         out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=sub), st))
                     continue
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                    and all(isinstance(e, ast.Name) for e in st.targets[0].elts)
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                    and v.func.attr in {"split", "array_split", "hsplit", "vsplit", "dsplit"}
+                    and isinstance(v.func.value, ast.Name) and v.func.value.id in ("np", "numpy")):
+                # a, b = np.split(x, [2]): one slice of x per target.
+                made = _numpy_split_pieces(v, len(st.targets[0].elts), counter)
+                if made is not None:
+                    pre, pieces = made
+                    out.extend(ast.copy_location(s, st) for s in pre)
+                    for e, pc in zip(st.targets[0].elts, pieces):
+                        out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=e.id, ctx=ast.Store())],
+                                                                value=pc), st))
+                    continue
             out.append(st)
         return out
 
+    counter = [0]
     tree.body = process(tree.body)
     for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
         fn.body = process(fn.body)
@@ -16374,9 +16720,37 @@ def template_derived_needed_helpers(structured_type_components):
     return detect_needed_helpers(scan_tree)
 
 
+# numpy functions that translator._canonical_batch2 rewrites in terms of
+# others: their helpers are those of the functions they become.
+_CANONICAL_BATCH2_TARGETS = {
+    "nancumsum": ["cumsum", "where", "isnan"], "nancumprod": ["cumprod", "where", "isnan"],
+    "logaddexp2": ["maximum", "log1p", "exp2", "abs", "log"], "sort_complex": ["sort"], "diagflat": ["diag", "ravel"],
+    "choose": ["select"], "compress": ["ravel"], "extract": ["ravel"], "broadcast_to": ["tile", "full"],
+    "rot90": ["transpose"], "cov": ["var", "cov"], "divmod": [], "imag": ["zeros_like"], "asanyarray": ["asarray"],
+    "matrix_rank": ["any", "where"], "vander": ["polyvander", "flip"], "resize": ["tile", "ravel"],
+    "trim_zeros": ["argmax", "any", "where", "flip"], "invert": [], "bitwise_not": [], "left_shift": [], "right_shift": [],
+}
+
+
 def detect_needed_helpers(tree):
     needed = set()
+    extra = []
     for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _CANONICAL_BATCH2_TARGETS):
+            for target in _CANONICAL_BATCH2_TARGETS[node.func.attr]:
+                extra.append(ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=target,
+                                                         ctx=ast.Load()), args=list(node.args), keywords=[]))
+            if node.func.attr in {"left_shift", "right_shift"} and len(node.args) == 2:
+                extra.append(ast.BinOp(left=node.args[0], op=ast.LShift() if node.func.attr == "left_shift"
+                                       else ast.RShift(), right=node.args[1]))
+            if node.func.attr in {"resize", "trim_zeros"}:
+                # A slice of a call result.
+                extra.append(ast.Subscript(value=ast.Call(func=ast.Name(id="f", ctx=ast.Load()), args=[], keywords=[]),
+                                           slice=ast.Slice(upper=ast.Name(id="n", ctx=ast.Load())), ctx=ast.Load()))
+            if node.func.attr == "divmod" and len(node.args) == 2:
+                extra += [ast.BinOp(left=node.args[0], op=op, right=node.args[1]) for op in (ast.FloorDiv(), ast.Mod())]
+    for node in [n for n in ast.walk(tree)] + extra:
         # a @ b may be of stacks of matrices (translator._stacked_linalg).
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
             needed.update({"stack_matmul_ss", "stack_matmul_sm", "stack_matmul_ms", "stack_matmul_sv",
@@ -16477,6 +16851,13 @@ def detect_needed_helpers(tree):
         "geomspace": {"geomspace"},
         "cumsum": {"cumsum", "reversed_vec"},
         "cumprod": {"cumprod"},
+        # Rewritten to other numpy functions (translator._canonical_batch2).
+        "nancumsum": {"cumsum", "reversed_vec"},
+        "nancumprod": {"cumprod"},
+        "diagflat": {"diag", "diag_k"},
+        "sort_complex": {"sort_vec", "sorted_vec", "sorted_2d", "reversed_vec"},
+        "choose": {"select"},
+        "broadcast_to": {"tile"},
         "cumulative_sum": {"cumsum"},
         "cumulative_prod": {"cumprod"},
         "unwrap": {"unwrap_1d"},
@@ -16551,7 +16932,7 @@ def detect_needed_helpers(tree):
         "full": {"arange_int"},
         "nonzero": {"arange_int", "where_axis_2d"},
         "sort": {"sort_vec", "sorted_vec", "sorted_2d", "reversed_vec"},
-        "flip": {"reversed_vec"},
+        "flip": {"reversed_vec", "reversed_mat"},
         "argsort": {"argsort", "argsort_idx", "argsort_2d"},
         "flatnonzero": {"arange_int"},
         "argwhere": {"arange_int"},
@@ -16578,6 +16959,8 @@ def detect_needed_helpers(tree):
         "polyfit": {"polyfit_real"},
         "roots": {"polyroots_real"},
         "digitize": {"digitize_real"},
+        "spacing": {"np_spacing"},
+        "asarray_chkfinite": {"np_chkfinite"},
         "load": {"np_load_1d_real"},
         "save": {"np_save_1d_real"},
         "isin": {"isin_real", "isin_int"},
@@ -18021,6 +18404,8 @@ def detect_needed_helpers(tree):
             self.generic_visit(node)
 
     scan().visit(tree)
+    for node in extra:
+        scan().visit(node)
     if "mean" in needed:
         # The emitter may need the compatibility name to avoid a binding
         # in another scope (not visible in this helper scan). Final USE
@@ -29436,7 +29821,26 @@ class translator(ast.NodeVisitor):
                 self.open_type_rebind_meta.pop()
         return (new_stmt, temps) if temps else None
 
+    def _check_split_list_uses(self, node):
+        """parts = np.split(...) is a list of arrays known only through its
+        parts: a use of parts as a whole (print(parts), len(parts)) is an
+        error rather than a translation of an undefined variable."""
+        if not self.synthetic_slices or not isinstance(node, (ast.Expr, ast.Assign, ast.AugAssign, ast.Return,
+                                                                ast.If, ast.While)):
+            return
+        allowed = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name):
+                allowed.add(id(n.value))
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Name) and n.id in self.synthetic_slices and isinstance(n.ctx, ast.Load)
+                    and id(n) not in allowed):
+                raise NotImplementedError(
+                    f"{n.id} = np.split(...) is a list of arrays: use its parts ({n.id}[0], ...), "
+                    f"unpack it, or loop over it")
+
     def visit(self, node):
+        self._check_split_list_uses(node)
         if (isinstance(node, ast.Expr) and self._rng_call(node.value) is not None
                 and self._rng_call(node.value)[0] == "shuffle" and len(node.value.args) == 1
                 and isinstance(node.value.args[0], ast.Name)):
@@ -30511,6 +30915,18 @@ class translator(ast.NodeVisitor):
                 ast.Subscript(value=where, slice=node.slice, ctx=ast.Load()), node))
             node._xp2f_canonical = new
             return new
+        if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value in (0, 1)
+                and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                and is_numpy_name_node(node.value.func.value) and node.value.func.attr == "divmod"
+                and len(node.value.args) == 2 and not node.value.keywords):
+            # np.divmod(a, b)[0] is a // b, [1] is a % b.
+            cached = getattr(node, "_xp2f_canonical", None)
+            if cached is None:
+                a, b = node.value.args
+                cached = ast.fix_missing_locations(ast.copy_location(ast.BinOp(
+                    left=a, op=ast.FloorDiv() if node.slice.value == 0 else ast.Mod(), right=b), node))
+                node._xp2f_canonical = cached
+            return cached
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             return None
         cached = getattr(node, "_xp2f_canonical", None)
@@ -30875,6 +31291,8 @@ class translator(ast.NodeVisitor):
                                                     ctx=ast.Load()), args=[arr], keywords=[])
                 new = ast.Call(func=func, args=[ravel] + list(node.args[1:]),
                                keywords=[kw for kw in node.keywords if kw.arg != "axis"])
+        if new is None:
+            new = self._canonical_batch2(node)
         if new is not None:
             new = ast.fix_missing_locations(ast.copy_location(new, node))
             if isinstance(new, ast.Call):
@@ -30882,6 +31300,237 @@ class translator(ast.NodeVisitor):
                 new = self._canonical_numpy_call(new) or new
             node._xp2f_canonical = new
         return new
+
+    def _canonical_batch2(self, node):
+        """More numpy calls in terms of supported ones (see the coverage
+        probe): asanyarray, nancumsum/nancumprod, logaddexp2, invert/
+        bitwise_not/left_shift/right_shift, sort_complex, diagflat, choose
+        (a literal list), compress, extract, broadcast_to(x, n), rot90 (a
+        literal k), cov of a matrix with rowvar=True (the default) or of a
+        vector, isscalar/iscomplexobj/isrealobj, imag of a real array,
+        matrix_rank of a vector, irfft of a real array."""
+        func = node.func
+        attr = func.attr
+        kws = list(node.keywords)
+
+        def npf(name, sub=None):
+            base = ast.Name(id="np", ctx=ast.Load())
+            if sub:
+                base = ast.Attribute(value=base, attr=sub, ctx=ast.Load())
+            return ast.Attribute(value=base, attr=name, ctx=ast.Load())
+
+        def call(name, args, keywords=None, sub=None):
+            return ast.Call(func=npf(name, sub), args=list(args), keywords=list(keywords or []))
+
+        def kw(name, pos=None):
+            if pos is not None and len(node.args) > pos:
+                return node.args[pos]
+            return next((k.value for k in kws if k.arg == name), None)
+
+        def lit_int(n):
+            if isinstance(n, ast.Constant) and type(n.value) is int:
+                return n.value
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant) \
+                    and type(n.operand.value) is int:
+                return -n.operand.value
+            return None
+        if (attr == "irfft" and isinstance(func.value, ast.Attribute) and func.value.attr == "fft"
+                and is_numpy_name_node(func.value.value) and node.args
+                and self._expr_kind(node.args[0]) in {"real", "int"}):
+            return ast.Call(func=func, args=[ast.BinOp(left=node.args[0], op=ast.Add(),
+                                                       right=ast.Constant(value=0j))] + list(node.args[1:]),
+                            keywords=kws)
+        if (attr == "matrix_rank" and isinstance(func.value, ast.Attribute) and func.value.attr == "linalg"
+                and is_numpy_name_node(func.value.value) and len(node.args) == 1
+                and int(self._rank_expr(node.args[0]) or 0) == 1):
+            # numpy: the rank of a vector is 1 unless it is all zeros.
+            anyz = call("any", [ast.Compare(left=node.args[0], ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])])
+            return call("where", [anyz, ast.Constant(value=1), ast.Constant(value=0)])
+        if not is_numpy_name_node(func.value):
+            return None
+        args = list(node.args)
+        if attr == "asanyarray":
+            return call("asarray", args, kws)
+        if attr in {"nancumsum", "nancumprod"} and args:
+            x = args[0]
+            if self._expr_kind(x) in {"int", "logical"}:
+                return call(attr[3:], args, kws)
+            neutral = ast.Constant(value=0.0 if attr == "nancumsum" else 1.0)
+            return call(attr[3:], [call("where", [call("isnan", [x]), neutral, x])] + args[1:], kws)
+        if attr == "logaddexp2" and len(args) == 2 and not kws:
+            a, b = args
+            # numpy's formula: max + log1p(2**-|a - b|) / log(2).
+            d = call("abs", [ast.BinOp(left=a, op=ast.Sub(), right=b)])
+            return ast.BinOp(left=call("maximum", [a, b]), op=ast.Add(), right=ast.BinOp(
+                left=call("log1p", [call("exp2", [ast.UnaryOp(op=ast.USub(), operand=d)])]), op=ast.Div(),
+                right=call("log", [ast.Constant(value=2.0)])))
+        if attr in {"invert", "bitwise_not", "bitwise_invert"} and len(args) == 1 and not kws:
+            if self._expr_kind(args[0]) == "logical":
+                return call("logical_not", args)
+            return ast.UnaryOp(op=ast.Invert(), operand=args[0])
+        if attr in {"left_shift", "right_shift", "bitwise_left_shift", "bitwise_right_shift"} and len(args) == 2 \
+                and not kws:
+            return ast.BinOp(left=args[0], op=ast.LShift() if "left" in attr else ast.RShift(), right=args[1])
+        if attr == "sort_complex" and len(args) == 1:
+            x = args[0]
+            if self._expr_kind(x) != "complex":
+                x = ast.BinOp(left=x, op=ast.Add(), right=ast.Constant(value=0j))
+            return call("sort", [x])
+        if attr == "diagflat" and args:
+            return call("diag", [call("ravel", [args[0]])] + args[1:], kws)
+        if attr == "choose" and len(args) == 2 and isinstance(args[1], (ast.List, ast.Tuple)) and not kws:
+            a, choices = args
+            conds = [ast.Compare(left=copy.deepcopy(a), ops=[ast.Eq()], comparators=[ast.Constant(value=i)])
+                     for i in range(len(choices.elts))]
+            # The default is a choice, so it has the choices' kind (numpy
+            # raises for an index out of range).
+            return call("select", [ast.List(elts=conds[1:], ctx=ast.Load()),
+                                   ast.List(elts=list(choices.elts[1:]), ctx=ast.Load())],
+                        [ast.keyword(arg="default", value=choices.elts[0])])
+        if attr == "compress" and len(args) >= 2:
+            cond, a = args[0], args[1]
+            if isinstance(cond, (ast.List, ast.Tuple)):
+                cond = call("array", [cond])
+            ax = kw("axis", 2)
+            axv = None if ax is None or (isinstance(ax, ast.Constant) and ax.value is None) else lit_int(ax)
+            if ax is not None and axv is None and not (isinstance(ax, ast.Constant) and ax.value is None):
+                return None
+            if axv is None:
+                return ast.Subscript(value=call("ravel", [a]), slice=cond, ctx=ast.Load())
+            r = int(self._rank_expr(a) or 0)
+            axv = axv % max(r, 1)
+            if axv == 0:
+                return ast.Subscript(value=a, slice=cond, ctx=ast.Load())
+            if axv == 1 and r == 2:
+                # Columns: the rows of a.T (a column mask is not supported).
+                return call("transpose", [ast.Subscript(value=call("transpose", [a]), slice=cond, ctx=ast.Load())])
+            return None
+        if attr == "extract" and len(args) == 2 and not kws:
+            cond, a = args
+            c = call("ravel", [cond])
+            if self._expr_kind(cond) != "logical":
+                c = ast.Compare(left=c, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+            return ast.Subscript(value=call("ravel", [a]), slice=c, ctx=ast.Load())
+        if attr == "broadcast_to" and len(args) == 2 and int(self._rank_expr(args[1]) or 0) == 0 \
+                and not isinstance(args[1], (ast.Tuple, ast.List)) and not kws:
+            # broadcast_to(x, n): a scalar repeated, or a vector of length 1
+            # or n tiled to n.
+            r = int(self._rank_expr(args[0]) or 0)
+            if r == 0:
+                return call("full", [args[1], args[0]])
+            if r == 1:
+                reps = ast.BinOp(left=args[1], op=ast.FloorDiv(),
+                                 right=ast.Call(func=ast.Name(id="len", ctx=ast.Load()), args=[args[0]], keywords=[]))
+                return call("tile", [args[0], reps])
+            return None
+        if attr == "rot90" and args and int(self._rank_expr(args[0]) or 0) == 2 and not any(k.arg == "axes" for k in kws):
+            kk = kw("k", 1)
+            kv = 1 if kk is None else lit_int(kk)
+            if kv is None:
+                return None
+            m = args[0]
+            kv %= 4
+            if kv == 0:
+                return call("copy", [m])
+            # As slices of m itself (a flip of an expression would index it):
+            # k=1 transpose(m[:, ::-1]), k=2 m[::-1, ::-1], k=3 transpose(m[::-1, :]).
+            rev = ast.Slice(lower=None, upper=None, step=ast.UnaryOp(op=ast.USub(), operand=ast.Constant(value=1)))
+            full = ast.Slice(lower=None, upper=None, step=None)
+
+            def sub(a, b):
+                return ast.Subscript(value=copy.deepcopy(m), slice=ast.Tuple(elts=[copy.deepcopy(a), copy.deepcopy(b)],
+                                                                             ctx=ast.Load()), ctx=ast.Load())
+            if kv == 1:
+                return call("transpose", [sub(full, rev)])
+            if kv == 2:
+                return sub(rev, rev)
+            return call("transpose", [sub(rev, full)])
+        if attr == "cov" and len(args) == 1:
+            rv = next((k.value for k in kws if k.arg == "rowvar"), None)
+            rowvar = rv is None or (isinstance(rv, ast.Constant) and rv.value is True)
+            r = int(self._rank_expr(args[0]) or 0)
+            if r == 1:
+                # One variable: its variance (numpy's 0-d result), ddof 1
+                # unless bias=True or ddof= is given.
+                ddof = next((k.value for k in kws if k.arg == "ddof"), None)
+                bias = next((k.value for k in kws if k.arg == "bias"), None)
+                if ddof is None:
+                    ddof = ast.Constant(value=0 if isinstance(bias, ast.Constant) and bias.value is True else 1)
+                return call("var", [args[0]], [ast.keyword(arg="ddof", value=ddof)])
+            if r == 2 and rowvar and (rv is None or isinstance(rv, ast.Constant)):
+                rest = [k for k in kws if k.arg != "rowvar"]
+                return call("cov", [ast.Attribute(value=args[0], attr="T", ctx=ast.Load())],
+                            rest + [ast.keyword(arg="rowvar", value=ast.Constant(value=False))])
+            return None
+        if attr in {"isscalar", "iscomplexobj", "isrealobj"} and len(args) == 1 and not kws:
+            if attr == "isscalar":
+                return ast.Constant(value=int(self._rank_expr(args[0]) or 0) == 0
+                                    and self._expr_kind(args[0]) in {"int", "real", "complex", "logical", "char"})
+            iscx = self._expr_kind(args[0]) == "complex"
+            return ast.Constant(value=iscx if attr == "iscomplexobj" else not iscx)
+        if attr == "imag" and len(args) == 1 and self._expr_kind(args[0]) in {"int", "real", "logical"}:
+            # The imaginary part of a real array: zeros of its kind.
+            return call("zeros_like", args)
+        if attr == "linspace" and len(args) == 2:
+            # num= (default 50) as the third positional argument.
+            num = next((k.value for k in kws if k.arg == "num"), ast.Constant(value=50))
+            return call("linspace", args + [num], [k for k in kws if k.arg != "num"])
+        if attr == "vander" and args and int(self._rank_expr(args[0]) or 0) == 1:
+            x = args[0]
+            nn = kw("N", 1)
+            inc = kw("increasing", 2)
+            if inc is not None and not isinstance(inc, ast.Constant):
+                return None
+            if nn is None or isinstance(nn, ast.Constant) and nn.value is None:
+                nn = ast.Subscript(value=ast.Attribute(value=copy.deepcopy(x), attr="shape", ctx=ast.Load()),
+                                   slice=ast.Constant(value=0), ctx=ast.Load())
+            v = call("polyvander", [x, ast.BinOp(left=nn, op=ast.Sub(), right=ast.Constant(value=1))],
+                     sub="polynomial")
+            v.func.value = ast.Attribute(value=v.func.value, attr="polynomial", ctx=ast.Load())
+            if not (inc is not None and inc.value):
+                v = call("flip", [v], [ast.keyword(arg="axis", value=ast.Constant(value=1))])
+            if self._expr_kind(x) in {"int", "logical"}:
+                v = ast.Call(func=ast.Attribute(value=v, attr="astype", ctx=ast.Load()),
+                             args=[ast.Name(id="int", ctx=ast.Load())], keywords=[])
+            return v
+        if attr == "resize" and len(args) == 2 and not kws:
+            a, shp = args
+            dims = list(shp.elts) if isinstance(shp, (ast.Tuple, ast.List)) else [shp]
+            if int(self._rank_expr(dims[0]) or 0) != 0 or not 1 <= len(dims) <= 2:
+                return None
+            total = dims[0] if len(dims) == 1 else ast.BinOp(left=dims[0], op=ast.Mult(), right=dims[1])
+            size = ast.Attribute(value=copy.deepcopy(a), attr="size", ctx=ast.Load())
+            # a repeated (in C order) to fill the new size.
+            reps = ast.UnaryOp(op=ast.USub(), operand=ast.BinOp(
+                left=ast.UnaryOp(op=ast.USub(), operand=copy.deepcopy(total)), op=ast.FloorDiv(), right=size))
+            v = ast.Subscript(value=call("tile", [call("ravel", [a]), reps]),
+                              slice=ast.Slice(upper=total), ctx=ast.Load())
+            if len(dims) == 2:
+                v = ast.Call(func=ast.Attribute(value=v, attr="reshape", ctx=ast.Load()),
+                             args=[ast.Tuple(elts=dims, ctx=ast.Load())], keywords=[])
+            return v
+        if attr == "trim_zeros" and args and int(self._rank_expr(args[0]) or 0) == 1:
+            f = args[0]
+            tr = kw("trim", 1)
+            mode = "fb" if tr is None else (tr.value.lower() if isinstance(tr, ast.Constant)
+                                            and isinstance(tr.value, str) else None)
+            if mode is None:
+                return None
+
+            def nz(e):
+                return ast.Compare(left=e, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
+            n = ast.Subscript(value=ast.Attribute(value=copy.deepcopy(f), attr="shape", ctx=ast.Load()),
+                              slice=ast.Constant(value=0), ctx=ast.Load())
+            anyz = call("any", [nz(copy.deepcopy(f))])
+            lo = call("argmax", [nz(copy.deepcopy(f))]) if "f" in mode else ast.Constant(value=0)
+            hi = (ast.BinOp(left=copy.deepcopy(n), op=ast.Sub(), right=call("argmax", [nz(ast.Subscript(
+                value=copy.deepcopy(f), slice=ast.Slice(step=ast.Constant(value=-1)), ctx=ast.Load()))]))
+                  if "b" in mode else copy.deepcopy(n))
+            # All zeros: numpy returns an empty array.
+            lo = call("where", [copy.deepcopy(anyz), lo, ast.Constant(value=0)])
+            hi = call("where", [anyz, hi, ast.Constant(value=0)])
+            return ast.Subscript(value=f, slice=ast.Slice(lower=lo, upper=hi), ctx=ast.Load())
+        return None
 
     # Other numpy functions whose axis= indexes the first argument (or, for
     # the joining functions, each array in it).
@@ -31584,7 +32233,8 @@ class translator(ast.NodeVisitor):
                 idx0 = int(node.slice.value)
                 m = self.synthetic_slices.get(node.value.id, {})
                 if idx0 in m:
-                    return m[idx0]
+                    # The kind of the split array (not the part's slice text).
+                    return self.synthetic_slice_meta.get(node.value.id, {}).get("kind", "real")
             if (
                 isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
@@ -45264,6 +45914,28 @@ class translator(ast.NodeVisitor):
                         a0_kind = self._expr_kind(node.args[0])
                         eq_op = ".eqv." if a0_kind == "logical" else "=="
                         return f"merge({fill}, {fill}, ({a0} {eq_op} {a0}))"
+                    # The result has a0's kind (or dtype=): the fill value is
+                    # converted (an integer array filled with 2.7 holds 2).
+                    tk = self._expr_kind(node)
+                    fk = self._expr_kind(node.args[1])
+                    if tk == "int" and fk in {"real", "complex"}:
+                        fill = f"int({'real(' + fill + ')' if fk == 'complex' else fill})"
+                    elif tk == "real" and fk in {"int", "logical"}:
+                        fill = f"real({'merge(1, 0, ' + fill + ')' if fk == 'logical' else fill}, kind=dp)"
+                    elif tk == "real" and fk == "complex":
+                        fill = f"real({fill}, kind=dp)"
+                    elif tk == "complex" and fk != "complex":
+                        fill = f"cmplx({fill}, 0.0_dp, kind=dp)"
+                    rf = int(self._rank_expr(node.args[1]) or 0)
+                    ra = int(self._rank_expr(node.args[0]) or 0)
+                    if rf > 0:
+                        # An array fill value broadcasts against a0's shape.
+                        if rf == ra:
+                            return f"reshape({fill}, shape({a0}))"
+                        if rf == 1 and ra == 2:
+                            return f"spread({fill}, 1, size({a0}, 1))"
+                        raise NotImplementedError("np.full_like: the fill value must be a scalar or broadcast "
+                                                  "to the array's shape")
                     # Not `fill + 0*a0`: 0*NaN and 0*inf are NaN.
                     return f"reshape(spread({fill}, 1, size({a0})), shape({a0}))"
                 if node.func.attr == "clip":
@@ -46307,6 +46979,13 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "flip" and int(r0) == 2:
                     axis_node = node.args[1] if len(node.args) >= 2 else next(
                         (kw.value for kw in node.keywords if kw.arg == "axis"), None)
+                    if not re.fullmatch(r"[A-Za-z_]\w*(?:%\w+)*", a0):
+                        # An expression can't be subscripted.
+                        dim = {None: 0, 0: 1, 1: 2, -1: 2, -2: 1}.get(
+                            None if axis_node is None else getattr(axis_node, "value", "?"))
+                        if dim is None:
+                            raise NotImplementedError("np.flip of a matrix needs axis None, 0, 1 or -1")
+                        return f"reversed_mat({a0}, {dim})"
                     if axis_node is None or (isinstance(axis_node, ast.Constant) and axis_node.value is None):
                         return f"{a0}(size({a0},1):1:-1, size({a0},2):1:-1)"
                     if isinstance(axis_node, ast.Constant) and axis_node.value == 0:
@@ -48069,7 +48748,23 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "spacing"
                 and len(node.args) == 1
             ):
-                return f"spacing({self.expr(node.args[0])})"
+                # numpy's spacing has the sign of x (spacing(-2.0) < 0) and
+                # spacing(0) is the smallest subnormal; Fortran's SPACING is
+                # always positive.
+                a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) != "real":
+                    a0 = f"real({a0}, kind=dp)"
+                return f"np_spacing({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "asarray_chkfinite"
+                and len(node.args) == 1
+                and self._expr_kind(node.args[0]) in {"real", "int", "logical"}
+            ):
+                # An error (as numpy raises) if a real array has an inf or NaN.
+                a0 = self.expr(node.args[0])
+                return f"np_chkfinite({a0})" if self._expr_kind(node.args[0]) == "real" else a0
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -83617,7 +84312,9 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
@@ -84155,7 +84852,9 @@ def transpile_file(
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
@@ -84974,7 +85673,9 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)

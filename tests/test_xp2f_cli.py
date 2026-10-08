@@ -26859,3 +26859,135 @@ def test_xp2f_numpy_polynomial_roots_gauss_arithmetic(tmp_path: Path) -> None:
     # numpy prints arrays with 8 decimals.
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)
+
+
+def _xp2f_output_matches_numpy(tmp_path: Path, stem: str, code: str) -> None:
+    src = tmp_path / f"{stem}.py"
+    src.write_text(code, encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, "-W", "ignore", str(src)], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    ft = subprocess.run([str(src.with_name(f"{stem}_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)
+
+
+def test_xp2f_spacing_full_like_digitize_split_lists(tmp_path: Path) -> None:
+    # np.spacing has the sign of x; full_like converts the fill value to the
+    # array's kind and broadcasts an array fill; digitize with decreasing
+    # bins; np.split results unpacked, indexed, looped over and counted.
+    _xp2f_output_matches_numpy(tmp_path, "xsilent1", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25, 0.0, -1e-300])\n'
+        'print(np.spacing(x), np.spacing(1.0), np.spacing(-8.0))\n'
+        'a = np.array([1, 2, 3])\n'
+        'm = np.ones((2, 3))\n'
+        'print(np.full_like(a, 2.7), np.full_like(np.array([1.0, 2.0]), 5), np.full_like(a, np.array([7, 8, 9])))\n'
+        'print(np.full_like(m, np.array([1.0, 2.0, 3.0])), np.full_like(a, 4.0, dtype=float))\n'
+        'print(np.digitize(np.array([0.2, 6.4, 3.0, 1.6]), np.array([10.0, 4.0, 2.5, 1.0, 0.0])))\n'
+        'print(np.digitize(np.array([0.2, 6.4, 3.0, 1.6]), np.array([0.0, 1.0, 2.5, 4.0, 10.0]), right=True))\n'
+        'print(np.digitize(np.array([4.0, 2.5]), np.array([10.0, 4.0, 2.5, 1.0, 0.0]), right=True))\n'
+        'x = np.arange(6.0)\n'
+        'parts = np.split(x, 3)\n'
+        'print(parts[0], parts[2])\n'
+        'for p in parts:\n'
+        '    print(np.sum(p))\n'
+        'a, b = np.split(x, [2])\n'
+        'print(a, b)\n'
+        'm = np.arange(12.0).reshape(3, 4)\n'
+        'l, r = np.hsplit(m, 2)\n'
+        'print(l, r)\n'
+        'u, v, w = np.array_split(np.arange(7), 3)\n'
+        'print(u, v, w)\n'
+        't1, t2, t3 = np.vsplit(m, [1, 2])\n'
+        'print(t1, t2, t3)\n'
+        'c1, c2 = np.split(m, 2, axis=1)\n'
+        'print(c1.sum(), c2.sum())\n'
+        'q = np.array_split(np.arange(10.0), 4)\n'
+        'print(len(q), q[3], q[-1], q[0] * 2)\n'
+        'for piece in q:\n'
+        '    print(piece.size, np.max(piece))\n'
+    ))
+    bad = tmp_path / "xdigbad.py"
+    bad.write_text("import numpy as np\nprint(np.digitize(np.array([1.0]), np.array([0.0, 2.0, 1.0])))\n",
+                   encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad), "--compile", "--run"], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert "monotonically increasing or decreasing" in proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_common_gaps_batch(tmp_path: Path) -> None:
+    # nancumsum, logaddexp2, bit shifts, divmod, sort_complex, diagflat,
+    # choose, compress, extract, broadcast_to, rot90, cov, isscalar, imag,
+    # matrix_rank, irfft of a real array.
+    _xp2f_output_matches_numpy(tmp_path, "xgaps2", (
+        'import numpy as np\n'
+        'x = np.array([0.5, np.nan, -2.0, 3.25])\n'
+        'xi = np.array([3, 1, 4, 1])\n'
+        'm = np.array([[2.0, 1.0, 0.5], [1.0, 3.0, -1.0]])\n'
+        'print(np.asanyarray(xi), np.nancumsum(x), np.nancumprod(x), np.nancumsum(xi))\n'
+        'print(np.logaddexp2(np.array([1.0, 2.0]), np.array([3.0, -1.0])), np.logaddexp2(0.5, 0.25))\n'
+        'print(np.invert(xi), np.bitwise_not(xi), np.left_shift(xi, 2), np.right_shift(xi, 1), np.invert(xi > 2))\n'
+        'q, r = np.divmod(np.array([7, -7, 9]), 3)\n'
+        'print(q, r, np.divmod(7.5, 2)[0], np.divmod(np.array([7.5, -1.25]), 2.0)[1])\n'
+        'print(np.sort_complex(np.array([3.0, 1.0, 2.0])), np.sort_complex(np.array([1 + 2j, 1 - 1j, 0.5 + 0j])))\n'
+        'print(np.diagflat(np.array([1.0, 2.0])), np.diagflat(np.array([[1, 2], [3, 4]]), 1))\n'
+        'print(np.choose(np.array([0, 2, 1, 0]), [np.array([1, 2, 3, 4]), np.array([10, 20, 30, 40]), 99]))\n'
+        'print(np.compress(np.array([True, False, True, True]), xi), np.compress([False, True], m, axis=0), np.compress(np.array([True, False, True]), m, axis=1))\n'
+        'print(np.extract(xi > 1, xi), np.extract(np.array([[1, 0, 2], [0, 0, 3]]), m))\n'
+        'print(np.broadcast_to(np.array([2.5]), 3), np.rot90(m), np.rot90(m, 2), np.rot90(m, -1), np.rot90(m, k=3))\n'
+        'print(np.cov(m), np.cov(np.array([1.0, 2.0, 4.0])), np.cov(m, bias=True), np.cov(m.T, rowvar=False))\n'
+        'print(np.isscalar(3.0), np.isscalar(xi), np.iscomplexobj(x), np.isrealobj(x), np.iscomplexobj(x + 1j))\n'
+        'print(np.imag(x[[0, 2]]), np.imag(xi), np.linalg.matrix_rank(np.array([0.0, 1.0])), np.linalg.matrix_rank(np.zeros(3)))\n'
+        'print(np.fft.irfft(np.array([1.0, 2.0, 3.0])))\n'
+    ))
+    # linspace's default num, vander, resize, trim_zeros, asarray_chkfinite,
+    # triu/tril/diag indices (indexing, storing, unpacked, named), in a
+    # function too.
+    _xp2f_output_matches_numpy(tmp_path, "xgaps3", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'xi = np.array([3, 1, 4, 1])\n'
+        'm = np.array([[2.0, 1.0, 4.0], [1.0, 3.0, 5.0], [7.0, 8.0, 9.0]])\n'
+        'g = np.linspace(0.0, 1.0)\n'
+        'print(g.shape[0], g[1], g[-1], np.linspace(0.0, 1.0, num=5), np.linspace(1.0, 2.0, num=4, endpoint=False))\n'
+        'print(np.vander(x), np.vander(x, 3), np.vander(x, 3, increasing=True), np.vander(xi, 2))\n'
+        'print(np.resize(xi, 6), np.resize(m, (2, 5)), np.resize(x, 3))\n'
+        'z = np.array([0, 0, 1, 0, 2, 0])\n'
+        'print(np.trim_zeros(z), np.trim_zeros(z, "f"), np.trim_zeros(z, trim="b"), np.trim_zeros(np.zeros(3)).shape[0])\n'
+        'print(np.asarray_chkfinite(x), np.asarray_chkfinite(xi))\n'
+        'print(m[np.triu_indices(3)], m[np.tril_indices(3, -1)], m[np.diag_indices(3)], m[np.triu_indices(2)])\n'
+        'print(m[np.triu_indices_from(m, 1)], m[np.tril_indices_from(m)], m[np.diag_indices_from(m)])\n'
+        'i, j = np.triu_indices(3, 1)\n'
+        'print(i, j)\n'
+        'a, b = np.tril_indices(4, 0, 3)\n'
+        'print(a, b)\n'
+        'iu = np.triu_indices(3, 1)\n'
+        'print(m[iu], iu[0], iu[1])\n'
+        'c = m.copy()\n'
+        'c[np.tril_indices(3, -1)] = 0.0\n'
+        'c[np.diag_indices(3)] = -1.0\n'
+        'print(c)\n'
+    ))
+    _xp2f_output_matches_numpy(tmp_path, "xgaps4", (
+        'import numpy as np\n'
+        '\n'
+        'def upper_sum(a, k):\n'
+        '    n = a.shape[0]\n'
+        '    iu = np.triu_indices(n, k)\n'
+        '    return a[iu].sum() + np.vander(a[0], 2).sum() + np.trim_zeros(a[1]).shape[0]\n'
+        '\n'
+        'def grid(lo, hi, npts):\n'
+        '    return np.linspace(lo, hi, num=npts)\n'
+        '\n'
+        'm = np.array([[2.0, 0.0, 4.0], [0.0, 3.0, 0.0], [7.0, 8.0, 9.0]])\n'
+        'print(upper_sum(m, 0), upper_sum(m, 1), grid(0.0, 2.0, 5))\n'
+    ))
+    bad = tmp_path / "xfinite.py"
+    bad.write_text("import numpy as np\nprint(np.asarray_chkfinite(np.array([1.0, np.nan])))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad), "--compile", "--run"], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert "must not contain infs or NaNs" in proc.stdout + proc.stderr

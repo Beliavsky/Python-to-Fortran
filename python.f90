@@ -270,6 +270,7 @@ public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 public :: np_gradient_1d, np_gradient_2d, np_trapezoid_1d, interp_0d
 public :: interp_periodic_1d, interp_periodic_0d, np_hist_edges, histogram2d_np
+public :: np_spacing, np_chkfinite
 public :: np_window, np_poly_roots, np_polyadd, np_polymul, np_polydiv, np_polyint
 public :: nan_quantile_vec, nan_quantile_axis_2d
 public :: powval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial, lowest degree first) at x (scalar, vector or matrix x)"
@@ -516,7 +517,7 @@ public :: histogram_counts_edges !@pyapi kind=function ret=integer(:) args=x:rea
 public :: triu
 public :: tril
 public :: quantile_axis_2d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) desc="np.quantile(x, q, axis) of a matrix: linear quantile of each column (dim=1) or row (dim=2)"
-public :: reversed_vec
+public :: reversed_vec, reversed_mat
 public :: sorted_2d
 public :: argsort_2d
 public :: histogram
@@ -747,6 +748,9 @@ end interface tril
 interface reversed_vec
    module procedure reversed_real_vec, reversed_int_vec, reversed_logical_vec, reversed_complex_vec
 end interface reversed_vec
+interface reversed_mat
+   module procedure reversed_real_mat, reversed_int_mat, reversed_logical_mat, reversed_complex_mat
+end interface reversed_mat
 
 interface sorted_2d
    module procedure sorted_real_2d, sorted_int_2d, sorted_complex_2d
@@ -5074,6 +5078,70 @@ contains
          y = x(size(x):1:-1)
       end function reversed_complex_vec
 
+      pure function reversed_real_mat(x, dim) result(y)
+         ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
+         ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: y(:,:)
+         select case (dim)
+         case (1)
+            y = x(size(x, 1):1:-1, :)
+         case (2)
+            y = x(:, size(x, 2):1:-1)
+         case default
+            y = x(size(x, 1):1:-1, size(x, 2):1:-1)
+         end select
+      end function reversed_real_mat
+
+      pure function reversed_int_mat(x, dim) result(y)
+         ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
+         ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
+         integer, intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, allocatable :: y(:,:)
+         select case (dim)
+         case (1)
+            y = x(size(x, 1):1:-1, :)
+         case (2)
+            y = x(:, size(x, 2):1:-1)
+         case default
+            y = x(size(x, 1):1:-1, size(x, 2):1:-1)
+         end select
+      end function reversed_int_mat
+
+      pure function reversed_logical_mat(x, dim) result(y)
+         ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
+         ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
+         logical, intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         logical, allocatable :: y(:,:)
+         select case (dim)
+         case (1)
+            y = x(size(x, 1):1:-1, :)
+         case (2)
+            y = x(:, size(x, 2):1:-1)
+         case default
+            y = x(size(x, 1):1:-1, size(x, 2):1:-1)
+         end select
+      end function reversed_logical_mat
+
+      pure function reversed_complex_mat(x, dim) result(y)
+         ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
+         ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         complex(kind=dp), allocatable :: y(:,:)
+         select case (dim)
+         case (1)
+            y = x(size(x, 1):1:-1, :)
+         case (2)
+            y = x(:, size(x, 2):1:-1)
+         case default
+            y = x(size(x, 1):1:-1, size(x, 2):1:-1)
+         end select
+      end function reversed_complex_mat
+
       pure function repeat_complex(x, reps) result(y)
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: reps
@@ -5457,20 +5525,64 @@ contains
       end function np_bincount_weights
 
       pure integer function np_digitize_scalar(x, bins, right) result(r)
-         ! np.digitize(x, bins, right) for increasing bins: the i with
-         ! bins[i-1] <= x < bins[i] (bins[i-1] < x <= bins[i] if right).
+         ! np.digitize(x, bins, right): for increasing bins the i with
+         ! bins[i-1] <= x < bins[i] (bins[i-1] < x <= bins[i] if right), for
+         ! decreasing bins numpy's len(bins) - searchsorted(bins[::-1], x);
+         ! bins that are neither are an error, as in numpy.
          real(kind=dp), intent(in) :: x
          real(kind=dp), intent(in) :: bins(:)
          logical, intent(in) :: right
+         integer :: n, k
+         logical :: incr
+         n = size(bins)
+         incr = .true.
+         if (n > 1) then
+            if (all(bins(2:) >= bins(:n - 1))) then
+               incr = .true.
+            else if (all(bins(2:) <= bins(:n - 1))) then
+               incr = .false.
+            else
+               error stop "np.digitize: bins must be monotonically increasing or decreasing"
+            end if
+         end if
          if (ieee_is_nan(x)) then
             ! NaN sorts after every bin edge.
-            r = size(bins)
+            k = n
          else if (right) then
-            r = count(bins < x)
+            k = count(bins < x)
          else
-            r = count(bins <= x)
+            k = count(bins <= x)
+         end if
+         if (incr) then
+            r = k
+         else
+            r = n - k
          end if
       end function np_digitize_scalar
+
+      elemental function np_spacing(x) result(s)
+         ! np.spacing(x): the distance from x to the next float away from 0,
+         ! with the sign of x (spacing(0) is the smallest subnormal; NaN for
+         ! inf and NaN).
+         use, intrinsic :: ieee_arithmetic, only: ieee_next_after
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: s
+         if (ieee_is_nan(x) .or. .not. ieee_is_finite(x)) then
+            s = ieee_value(1.0_dp, ieee_quiet_nan)
+         else if (x < 0.0_dp) then
+            s = ieee_next_after(x, -huge(x)) - x
+         else
+            s = ieee_next_after(x, huge(x)) - x
+         end if
+      end function np_spacing
+
+      elemental function np_chkfinite(x) result(y)
+         ! np.asarray_chkfinite(x): x, or an error if it is inf or NaN.
+         real(kind=dp), intent(in) :: x
+         real(kind=dp) :: y
+         if (.not. ieee_is_finite(x)) error stop "array must not contain infs or NaNs"
+         y = x
+      end function np_chkfinite
 
       pure function np_digitize_vec(x, bins, right) result(r)
          real(kind=dp), intent(in) :: x(:)
