@@ -437,8 +437,22 @@ for _mod, _pre in [("polynomial", "poly"), ("chebyshev", "cheb"), ("legendre", "
         f"{_f}vander(xc, 3)", f"{_f}vander(xc, 3)[2]", f"{_f}fit(xc, {{N1}}, 2)", f"{_f}fit(xc, {{N1}}, 3, w=xc + 1.0)",
         f"{_f}der(q1)", f"{_f}der({{N1}}, 2)", f"{_f}der({{N1}}, m=2, scl=0.5)", f"{_f}int(q1)",
         f"{_f}int({{N1}}, m=2, k=[1.0, -2.0], lbnd=0.5)", f"{_f}int(p1, k=3.0, scl=2.0)",
+        # Roots compared through .real/.imag (numpy returns real arrays when
+        # every root is real; the translation is always complex).
+        f"{_f}roots(q1).real", f"{_f}roots(q1).imag", f"np.sort({_f}roots({{N1}}).real)",
+        f"{_f}companion(q1)", f"{_f}companion({{N1}})", f"{_f}fromroots(p1)", f"{_f}fromroots({{N1}}[:4])",
+        f"{_f}mulx({{N1}})", f"{_f}add({{N1}}, q1)", f"{_f}sub(q1, {{N1}})", f"{_f}mul({{N1}}, q1)",
+        f"{_f}div({{N1}}, q1)[0]", f"{_f}div({{N1}}, q1)[1]", f"{_f}pow(q1, 2)", f"{_f}line(1.5, -2.0)",
+        f"{_f}trim(np.array([1.0, 2.0, 1e-12, 0.0]), 1e-10)",
+        f"STMT w1, w2 = {_f}div({{N1}}, q1) => w1.sum() + w2.sum()",
     ]
-SPECS["npoly"] = _npoly
+    if _pre != "poly":
+        _npoly += [f"{_f}2poly({{N1}})", f"np.polynomial.{_mod}.poly2{_pre}({{N1}})", f"{_f}weight(p1)"]
+    if _pre not in ("poly", "leg"):
+        _npoly += [f"{_f}gauss(4)[0]", f"{_f}gauss(5)[1]", f"STMT w1, w2 = {_f}gauss(3) => w1 + w2"]
+_npoly += ["np.polynomial.chebyshev.chebpts1(5)", "np.polynomial.chebyshev.chebpts2(4)"]
+SPECS["npoly_a"] = _npoly[:len(_npoly) // 2]
+SPECS["npoly_b"] = _npoly[len(_npoly) // 2:]
 
 # Phase 8: windows, FFT shifts, legacy polynomials, frexp/modf, NaN quantiles.
 SPECS["numerics1"] = [

@@ -6700,6 +6700,13 @@ def rewrite_unroll_array_list_loops(tree):
     return tree
 
 
+def _is_np_polynomial_attr(func):
+    """np.polynomial.<module>.<name> (or numpy.polynomial...)."""
+    v = func.value if isinstance(func, ast.Attribute) else None
+    return (isinstance(v, ast.Attribute) and isinstance(v.value, ast.Attribute) and v.value.attr == "polynomial"
+            and isinstance(v.value.value, ast.Name) and v.value.value.id in ("np", "numpy"))
+
+
 def rewrite_two_result_numpy_unpack(tree):
     """q, r = np.polydiv(u, v), m, e = np.frexp(x) and f, i = np.modf(x):
     one indexed call per target (the translator evaluates np.polydiv(u,
@@ -6715,8 +6722,11 @@ def rewrite_two_result_numpy_unpack(tree):
             v = getattr(st, "value", None)
             if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
                     and len(st.targets[0].elts) == 2 and all(isinstance(e, ast.Name) for e in st.targets[0].elts)
-                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr in names
-                    and isinstance(v.func.value, ast.Name) and v.func.value.id in ("np", "numpy")):
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                    and ((v.func.attr in names and isinstance(v.func.value, ast.Name)
+                          and v.func.value.id in ("np", "numpy"))
+                         or (_is_np_polynomial_attr(v.func) and v.func.attr != "leggauss"
+                             and (v.func.attr.endswith("div") or v.func.attr.endswith("gauss"))))):
                 tg = [e.id for e in st.targets[0].elts]
                 used = {n.id for n in ast.walk(v) if isinstance(n, ast.Name)}
                 if not (set(tg) & used):
@@ -9643,7 +9653,9 @@ def function_is_pure(fn_node, known_pure_calls=None):
                         self.ok = False
                         return
                     # Least-squares fits use the (impure) LAPACK lstsq.
-                    if leaf == "polyfit" or ("polynomial" in inner and leaf.endswith("fit")):
+                    if leaf in {"polyfit", "roots"} or ("polynomial" in inner and (
+                            leaf.endswith("fit") or leaf.endswith("roots")
+                            or (leaf.endswith("gauss") and leaf != "leggauss"))):
                         self.ok = False
                         return
                     if "linalg" in inner and leaf in {"norm", "matrix_norm"}:
@@ -16802,9 +16814,10 @@ def detect_needed_helpers(tree):
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._B1_ATTRS:
                 needed.update(translator._B1_HELPERS)
             # np.polynomial series functions (translator._np_polynomial).
-            if isinstance(node.func, ast.Attribute) and any(
+            if isinstance(node.func, ast.Attribute) and (any(
                     node.func.attr == pre + op for pre in translator._NPOLY_MODULES.values()
-                    for op in translator._NPOLY_OPS):
+                    for op in translator._NPOLY_OPS) or node.func.attr in {"chebpts1", "chebpts2"}
+                    or node.func.attr.startswith("poly2")):
                 needed.update(translator._NPOLY_HELPERS)
             # Stacked linear algebra (translator._stacked_linalg): any linalg
             # call or matmul may get a stack of matrices.
@@ -60913,11 +60926,20 @@ class translator(ast.NodeVisitor):
 
     _NPOLY_MODULES = {"polynomial": "poly", "chebyshev": "cheb", "legendre": "leg", "hermite": "herm",
                       "hermite_e": "herme", "laguerre": "lag"}
-    _NPOLY_OPS = ("val", "vander", "fit", "der", "int")
+    _NPOLY_OPS = ("val", "vander", "fit", "der", "int", "companion", "roots", "fromroots", "mulx", "add", "sub",
+                  "mul", "div", "pow", "line", "trim", "gauss", "weight", "2poly")
+    _NPOLY_FAMCODE = {"pow": 1, "cheb": 2, "leg": 3, "herm": 4, "herme": 5, "lag": 6}
     _NPOLY_HELPERS = {f"{f}{op}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag")
                       for op in ("val", "vander", "fit", "der", "int")} | {
         f"{f}val_{r}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag") for r in (0, 1, 2)} | {
-        "opoly_val0", "opoly_vander", "opoly_der", "opoly_int", "opoly_fit", "linalg_lstsq_mat"}
+        "opoly_val0", "opoly_vander", "opoly_der", "opoly_int", "opoly_fit", "linalg_lstsq_mat"} | {
+        f"{f}{op}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag")
+        for op in ("companion", "roots", "fromroots", "mulx", "add", "sub", "mul", "div", "pow", "line", "trim",
+                   "gauss", "2poly")} | {f"poly2{f}" for f in ("cheb", "leg", "herm", "herme", "lag")} | {
+        "opoly_trim", "opoly_trimcoef", "opoly_companion", "opoly_roots", "opoly_gauss", "opoly_gauss_part",
+        "opoly_normed_herm", "opoly_mulx", "opoly_add", "opoly_convolve", "opoly_c2z", "opoly_z2c", "opoly_mul",
+        "opoly_div", "opoly_div_part", "opoly_pow", "opoly_line", "opoly_fromroots", "opoly_to_pow",
+        "opoly_from_pow", "chebpts1", "chebpts2", "linalg_eigvals_real", "linalg_eigvalsh", "linspace", "leggauss"}
 
     def _npoly_call(self, node):
         """(Fortran family prefix, operation) of np.polynomial.<module>.<f>(...)."""
@@ -60929,9 +60951,19 @@ class translator(ast.NodeVisitor):
             return None
         pre = self._NPOLY_MODULES[parts[2]]
         name = node.func.attr
+        fam = "pow" if pre == "poly" else pre
+        if pre != "poly" and name == "poly2" + pre:
+            return fam, "frompoly"
+        if pre == "cheb" and name in {"chebpts1", "chebpts2"}:
+            return fam, name
         if not name.startswith(pre) or name[len(pre):] not in self._NPOLY_OPS:
             return None
-        return ("pow" if pre == "poly" else pre), name[len(pre):]
+        op = name[len(pre):]
+        if op == "gauss" and fam == "leg":
+            return None  # leggauss has its own handling
+        if op == "2poly" and fam == "pow":
+            return None
+        return fam, op
 
     def _np_polynomial(self, node):
         """np.polynomial.<family>.<prefix>{val,vander,fit,der,int}(...), with
@@ -60957,6 +60989,9 @@ class translator(ast.NodeVisitor):
 
         def is_none(n):
             return n is None or (isinstance(n, ast.Constant) and n.value is None)
+        extra_ops = self._np_polynomial_more(node, fam, op, npname)
+        if extra_ops is not None:
+            return extra_ops
         allowed = {"val": {"x", "c", "tensor"}, "vander": {"x", "deg"},
                    "fit": {"x", "y", "deg", "rcond", "full", "w", "domain", "window", "symbol"},
                    "der": {"c", "m", "scl", "axis"}, "int": {"c", "m", "k", "lbnd", "scl", "axis"}}[op]
@@ -61018,11 +61053,121 @@ class translator(ast.NodeVisitor):
             extra.append(f"scl={real_txt(scl)}")
         return f"{fam}{op}({vec_txt(c)}" + "".join(f", {e}" for e in extra) + ")"
 
+    def _np_polynomial_part_is(self, node):
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and node.slice.value in (0, 1)):
+            return False
+        fc = self._npoly_call(node.value)
+        return fc is not None and fc[1] in {"div", "gauss"}
+
+    def _np_polynomial_more(self, node, fam, op, npname):
+        """companion, roots, fromroots, mulx, add, sub, mul, pow, line, trim,
+        weight, <f>2poly, poly2<f>, chebpts1/2; div and gauss are tuples
+        (see _np_polynomial_part)."""
+        if op in {"val", "vander", "fit", "der", "int"}:
+            return None
+        code = self._NPOLY_FAMCODE[fam]
+
+        def real_txt(n):
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+
+        def vec_txt(n):
+            txt = real_txt(n)
+            return f"[{txt}]" if int(self._rank_expr(n) or 0) == 0 else txt
+
+        def arg(name, pos):
+            if len(node.args) > pos:
+                return node.args[pos]
+            return next((k.value for k in node.keywords if k.arg == name), None)
+        if op in {"div", "gauss"}:
+            raise NotImplementedError(f"{npname} returns a tuple: unpack it or index it with [0] or [1]")
+        if op in {"companion", "roots", "fromroots", "mulx", "2poly", "frompoly"}:
+            if len(node.args) != 1 or node.keywords:
+                raise NotImplementedError(f"{npname} takes one coefficient array")
+            if int(self._rank_expr(node.args[0]) or 0) > 1:
+                raise NotImplementedError(f"{npname}: the coefficients must be 1-D")
+            c = vec_txt(node.args[0])
+            if op == "roots":
+                return f"opoly_roots({code}, {c})"
+            if op == "2poly":
+                return f"opoly_to_pow({code}, {c})"
+            if op == "frompoly":
+                return f"opoly_from_pow({code}, {c})"
+            return f"opoly_{op}({code}, {c})"
+        if op in {"add", "sub", "mul"}:
+            if len(node.args) != 2 or node.keywords:
+                raise NotImplementedError(f"{npname} takes two coefficient arrays")
+            a, b = vec_txt(node.args[0]), vec_txt(node.args[1])
+            if op == "mul":
+                return f"opoly_mul({code}, {a}, {b})"
+            return f"opoly_add({a}, {b}, {1 if op == 'add' else -1})"
+        if op == "pow":
+            c, pw, mx = arg("c", 0), arg("pow", 1), arg("maxpower", 2)
+            for kw in node.keywords:
+                if kw.arg not in {"c", "pow", "maxpower"}:
+                    raise NotImplementedError(f"{npname}: unsupported argument {kw.arg}=")
+            mx_txt = ""
+            if mx is not None and not (isinstance(mx, ast.Constant) and mx.value is None):
+                mx_txt = f", maxpower=int({self.expr(mx)})"
+            elif mx is not None:
+                mx_txt = ", maxpower=huge(1)"
+            return f"opoly_pow({code}, {vec_txt(c)}, int({self.expr(pw)}){mx_txt})"
+        if op == "line":
+            off, scl = arg("off", 0), arg("scl", 1)
+            return f"opoly_line({code}, {real_txt(off)}, {real_txt(scl)})"
+        if op == "trim":
+            c, tol = arg("c", 0), arg("tol", 1)
+            return f"opoly_trimcoef({vec_txt(c)}" + (f", tol={real_txt(tol)}" if tol is not None else "") + ")"
+        if op in {"chebpts1", "chebpts2"}:
+            return f"{op}(int({self.expr(node.args[0])}))"
+        if op == "weight":
+            if fam == "pow":
+                raise NotImplementedError(f"{npname} is not a numpy function")
+            x = real_txt(node.args[0])
+            return {"cheb": f"(1.0_dp / (sqrt(1.0_dp + {x}) * sqrt(1.0_dp - {x})))",
+                    "leg": f"({x} * 0.0_dp + 1.0_dp)", "herm": f"exp(-{x} ** 2)",
+                    "herme": f"exp(-0.5_dp * {x} ** 2)", "lag": f"exp(-{x})"}[fam]
+        return None
+
+    def _np_polynomial_part(self, node):
+        """<f>div(c1, c2)[k] and <f>gauss(deg)[k]."""
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and node.slice.value in (0, 1)):
+            return None
+        fc = self._npoly_call(node.value)
+        if fc is None or fc[1] not in {"div", "gauss"}:
+            return None
+        fam, op = fc
+        call = node.value
+        code = self._NPOLY_FAMCODE[fam]
+
+        def vec_txt(n):
+            txt = self.expr(n)
+            txt = txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+            return f"[{txt}]" if int(self._rank_expr(n) or 0) == 0 else txt
+        if op == "div":
+            if len(call.args) != 2 or call.keywords:
+                raise NotImplementedError(f"{call.func.attr} takes two coefficient arrays")
+            return f"opoly_div_part({code}, {vec_txt(call.args[0])}, {vec_txt(call.args[1])}, {node.slice.value})"
+        if len(call.args) != 1 or call.keywords:
+            raise NotImplementedError(f"{call.func.attr} takes the degree")
+        return f"opoly_gauss_part({code}, int({self.expr(call.args[0])}), {node.slice.value})"
+
     def _numerics_batch1_parts(self, node):
         """(kind, rank) of the forms _numerics_batch1 translates, else None."""
+        if self._np_polynomial_part_is(node):
+            return ("real", 1)
         fc = self._npoly_call(node)
         if fc is not None:
             op = fc[1]
+            if op == "roots":
+                return ("complex", 1)
+            if op == "companion":
+                return ("real", 2)
+            if op == "weight":
+                x = node.args[0] if node.args else None
+                return ("real", int(self._rank_expr(x) or 0) if x is not None else 0)
             if op == "val":
                 x = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "x"), None)
                 return ("real", int(self._rank_expr(x) or 0) if x is not None else 0)
@@ -61064,7 +61209,9 @@ class translator(ast.NodeVisitor):
         """Window functions, np.fft.fftshift/ifftshift, the legacy poly*
         functions, np.frexp/np.modf parts, nanmedian/nanpercentile/
         nanquantile, np.emath, and np.polynomial's series functions."""
-        _np_poly_txt = self._np_polynomial(node)
+        _np_poly_txt = self._np_polynomial_part(node)
+        if _np_poly_txt is None:
+            _np_poly_txt = self._np_polynomial(node)
         if _np_poly_txt is not None:
             return _np_poly_txt
         def real_txt(n):
@@ -83469,8 +83616,8 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
-    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
@@ -84007,8 +84154,8 @@ def transpile_file(
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
-    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
@@ -84826,8 +84973,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_indexed_linalg_tuple_calls(tree)
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
-    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)

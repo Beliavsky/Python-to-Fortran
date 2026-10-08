@@ -26816,3 +26816,46 @@ def test_xp2f_loop_over_literal_list_of_arrays(tmp_path: Path) -> None:
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad)], cwd=tmp_path, capture_output=True,
                           text=True, check=False)
     assert "is used after the loop" in proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_polynomial_roots_gauss_arithmetic(tmp_path: Path) -> None:
+    # np.polynomial roots (complex), companion matrices, Gauss rules
+    # (unpacked, indexed, and in a function: not PURE), fromroots, basis
+    # arithmetic and division, conversions, Chebyshev points, line, trim,
+    # weights; modules and functions imported under other names.
+    src = tmp_path / "xnpoly2.py"
+    src.write_text(
+        'import numpy as np\n'
+        'from numpy.polynomial import chebyshev as C, hermite as H, laguerre as LA\n'
+        'from numpy.polynomial.legendre import legmul, legdiv\n'
+        '\n'
+        'def gauss_hermite_mean(n, f_coef):\n'
+        '    # E[p(X)] for X ~ N(0, 1) with Gauss-HermiteE quadrature.\n'
+        '    x, w = np.polynomial.hermite_e.hermegauss(n)\n'
+        '    return np.sum(w * np.polynomial.polynomial.polyval(x, f_coef)) / np.sqrt(2.0 * np.pi)\n'
+        '\n'
+        'c = np.array([0.5, -1.0, 2.0, 0.25])\n'
+        'c2 = np.array([1.0, 3.0, -2.0])\n'
+        'r = C.chebroots(c)\n'
+        'print(r.real, r.imag, np.polynomial.polynomial.polyroots([2.0, -3.0, 1.0]).real)\n'
+        'print(C.chebcompanion(c), LA.lagcompanion(c2))\n'
+        'x, w = H.hermgauss(5)\n'
+        'print(x, w, np.sum(w * x ** 2), C.chebgauss(4)[0], LA.laggauss(3)[1])\n'
+        'print(C.chebfromroots([0.5, -0.25]), np.polynomial.polynomial.polyfromroots([1.0, 2.0, 3.0]))\n'
+        'print(C.chebmul(c, c2), legmul(c, c2), H.hermadd(c, c2), LA.lagsub(c2, c), C.chebmulx(c), C.chebpow(c2, 3))\n'
+        'q, rem = legdiv(c, c2)\n'
+        'print(q, rem, C.chebdiv(c, c2)[0], H.hermdiv(c, c2)[1])\n'
+        'print(C.cheb2poly(c), C.poly2cheb(c), np.polynomial.hermite_e.herme2poly(c), LA.poly2lag(c2))\n'
+        'print(C.chebpts1(4), C.chebpts2(5), C.chebline(1.0, 2.0), LA.lagline(1.0, 2.0), C.chebtrim([1.0, 2.0, 1e-12], 1e-10))\n'
+        'print(C.chebweight(np.array([0.0, 0.5])), H.hermweight(1.0), gauss_hermite_mean(6, [1.0, 0.0, 1.0, 0.0, 1.0]))\n',
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xnpoly2_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints arrays with 8 decimals.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)

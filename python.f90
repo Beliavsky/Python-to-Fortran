@@ -1,3 +1,9 @@
+! python_mod: the Fortran runtime of xp2f.py, and numerical routines that can be
+! called directly from Fortran. Code adapted from other projects says so in its
+! own comments; see the "Third-Party Code" section of README.md for the sources
+! and licenses (John Burkardt's prob.f90, pyccel, Alan Miller's dceigv.f90, and
+! numpy's algorithms). Routines that use LAPACK (lapack_d.f90) or roots-fortran
+! (root.f90) need those files linked too.
 module python_mod
 use, intrinsic :: iso_fortran_env, only: real64, int64
 use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_is_nan, ieee_value, ieee_quiet_nan
@@ -297,6 +303,14 @@ public :: lagder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent
 public :: lagint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.laguerre.lagint: integral coefficients"
 public :: lagfit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.laguerre.lagfit: least-squares fit, coefficients lowest degree first"
 public :: opoly_val0, opoly_vander, opoly_der, opoly_int, opoly_fit
+public :: powcompanion, powroots, powrealroots, powfromroots, powmulx, powadd, powsub, powmul, powdiv, powpow, powline, powtrim !@pyapi lib=polynomial desc="np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim"
+public :: chebcompanion, chebroots, chebrealroots, chebfromroots, chebmulx, chebadd, chebsub, chebmul, chebdiv, chebpow, chebline, chebtrim, cheb2poly, poly2cheb, chebgauss !@pyapi lib=polynomial desc="np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim, conversions to and from the power series, Gauss quadrature"
+public :: legcompanion, legroots, legrealroots, legfromroots, legmulx, legadd, legsub, legmul, legdiv, legpow, legline, legtrim, leg2poly, poly2leg !@pyapi lib=polynomial desc="np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim, conversions to and from the power series"
+public :: hermcompanion, hermroots, hermrealroots, hermfromroots, hermmulx, hermadd, hermsub, hermmul, hermdiv, hermpow, hermline, hermtrim, herm2poly, poly2herm, hermgauss !@pyapi lib=polynomial desc="np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim, conversions to and from the power series, Gauss quadrature"
+public :: hermecompanion, hermeroots, hermerealroots, hermefromroots, hermemulx, hermeadd, hermesub, hermemul, hermediv, hermepow, hermeline, hermetrim, herme2poly, poly2herme, hermegauss !@pyapi lib=polynomial desc="np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim, conversions to and from the power series, Gauss quadrature"
+public :: lagcompanion, lagroots, lagrealroots, lagfromroots, lagmulx, lagadd, lagsub, lagmul, lagdiv, lagpow, lagline, lagtrim, lag2poly, poly2lag, laggauss !@pyapi lib=polynomial desc="np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim, conversions to and from the power series, Gauss quadrature"
+public :: chebpts1, chebpts2 !@pyapi lib=polynomial desc="np.polynomial.chebyshev.chebpts1/chebpts2: Chebyshev points of the first/second kind"
+public :: opoly_trim, opoly_trimcoef, opoly_companion, opoly_roots, opoly_realroots, opoly_gauss, opoly_mulx, opoly_add, opoly_mul, opoly_div, opoly_div_part, opoly_pow, opoly_line, opoly_fromroots, opoly_to_pow, opoly_from_pow, opoly_gauss_part
 public :: unwrap_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="unwrap 1D phase vector using numpy-like default discontinuity pi"
 public :: bitwise_count_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="population count for each integer element"
 public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="modified Bessel function I0 approximation (elemental)"
@@ -9830,6 +9844,1348 @@ contains
          call linalg_lstsq_mat(a, b, sol, res, rnk, sv, rc)
          c = sol(:, 1) / scl
       end function opoly_fit
+
+      ! ---- np.polynomial, continued: trimming, companion matrices, roots,
+      ! Gauss quadrature, arithmetic in each basis, conversions -------------
+
+      pure function opoly_trim(c) result(r)
+         ! numpy's polyutils.trimseq: trailing zero coefficients removed,
+         ! keeping at least one.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         integer :: i
+         if (size(c) == 0) then
+            allocate(r(0))
+            return
+         end if
+         do i = size(c), 1, -1
+            if (c(i) /= 0.0_dp) exit
+         end do
+         r = c(1:max(i, 1))
+      end function opoly_trim
+
+      pure function opoly_trimcoef(c, tol) result(r)
+         ! numpy's polyutils.trimcoef (<f>trim): trailing coefficients with
+         ! |c| <= tol removed, keeping at least one (then 0).
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp), allocatable :: r(:), ct(:)
+         real(kind=dp) :: tl
+         integer :: i
+         tl = 0.0_dp
+         if (present(tol)) tl = tol
+         if (tl < 0.0_dp) error stop "np.polynomial: tol must be non-negative"
+         ct = opoly_trim(c)
+         do i = size(ct), 1, -1
+            if (abs(ct(i)) > tl) exit
+         end do
+         if (i < 1) then
+            r = ct(1:1) * 0.0_dp
+         else
+            r = ct(1:i)
+         end if
+      end function opoly_trimcoef
+
+      pure function opoly_companion(fam, c_in) result(mat)
+         ! Scaled companion matrix of the series (numpy's <f>companion).
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c_in(:)
+         real(kind=dp), allocatable :: mat(:,:), c(:), scl(:), top(:)
+         integer :: n, i
+         c = opoly_trim(c_in)
+         if (size(c) < 2) error stop "np.polynomial: Series must have maximum degree of at least 1."
+         n = size(c) - 1
+         allocate(mat(n, n), source=0.0_dp)
+         if (n == 1) then
+            select case (fam)
+            case (4)
+               mat(1, 1) = -0.5_dp * c(1) / c(2)
+            case (6)
+               mat(1, 1) = 1.0_dp + c(1) / c(2)
+            case default
+               mat(1, 1) = -c(1) / c(2)
+            end select
+            return
+         end if
+         allocate(scl(n), top(n - 1))
+         select case (fam)
+         case (1)
+            do i = 1, n - 1
+               mat(i + 1, i) = 1.0_dp
+            end do
+            mat(:, n) = mat(:, n) - c(1:n) / c(n + 1)
+         case (2)
+            scl = sqrt(0.5_dp)
+            scl(1) = 1.0_dp
+            top = 0.5_dp
+            top(1) = sqrt(0.5_dp)
+            do i = 1, n - 1
+               mat(i, i + 1) = top(i)
+               mat(i + 1, i) = top(i)
+            end do
+            mat(:, n) = mat(:, n) - (c(1:n) / c(n + 1)) * (scl / scl(n)) * 0.5_dp
+         case (3)
+            scl = [(1.0_dp / sqrt(real(2 * i + 1, kind=dp)), i = 0, n - 1)]
+            do i = 1, n - 1
+               top(i) = real(i, kind=dp) * scl(i) * scl(i + 1)
+               mat(i, i + 1) = top(i)
+               mat(i + 1, i) = top(i)
+            end do
+            mat(:, n) = mat(:, n) - (c(1:n) / c(n + 1)) * (scl / scl(n)) * &
+               (real(n, kind=dp) / real(2 * n - 1, kind=dp))
+         case (4, 5)
+            ! scl = cumprod([1, 1/sqrt(k(n-1)), ..., 1/sqrt(k*1)])[::-1], k = 2 or 1
+            scl(1) = 1.0_dp
+            do i = 2, n
+               scl(i) = scl(i - 1) / sqrt(merge(2.0_dp, 1.0_dp, fam == 4) * real(n - i + 1, kind=dp))
+            end do
+            scl = scl(n:1:-1)
+            do i = 1, n - 1
+               top(i) = sqrt(merge(0.5_dp, 1.0_dp, fam == 4) * real(i, kind=dp))
+               mat(i, i + 1) = top(i)
+               mat(i + 1, i) = top(i)
+            end do
+            if (fam == 4) then
+               mat(:, n) = mat(:, n) - scl * c(1:n) / (2.0_dp * c(n + 1))
+            else
+               mat(:, n) = mat(:, n) - scl * c(1:n) / c(n + 1)
+            end if
+         case default
+            do i = 1, n - 1
+               mat(i, i + 1) = -real(i, kind=dp)
+               mat(i + 1, i) = -real(i, kind=dp)
+            end do
+            do i = 1, n
+               mat(i, i) = 2.0_dp * real(i - 1, kind=dp) + 1.0_dp
+            end do
+            mat(:, n) = mat(:, n) + (c(1:n) / c(n + 1)) * real(n, kind=dp)
+         end select
+      end function opoly_companion
+
+      function opoly_roots(fam, c_in) result(r)
+         ! Roots of the series (numpy's <f>roots): eigenvalues of the
+         ! companion matrix with rows and columns reversed, sorted by real
+         ! part, then imaginary part. Always complex.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c_in(:)
+         complex(kind=dp), allocatable :: r(:)
+         real(kind=dp), allocatable :: c(:), m(:,:)
+         complex(kind=dp) :: tmp
+         integer :: i, j, n
+         c = opoly_trim(c_in)
+         if (size(c) < 2) then
+            allocate(r(0))
+            return
+         end if
+         if (size(c) == 2) then
+            select case (fam)
+            case (4)
+               r = [cmplx(-0.5_dp * c(1) / c(2), 0.0_dp, kind=dp)]
+            case (6)
+               r = [cmplx(1.0_dp + c(1) / c(2), 0.0_dp, kind=dp)]
+            case default
+               r = [cmplx(-c(1) / c(2), 0.0_dp, kind=dp)]
+            end select
+            return
+         end if
+         m = opoly_companion(fam, c)
+         n = size(m, 1)
+         m = m(n:1:-1, n:1:-1)
+         r = linalg_eigvals_real(m)
+         do i = 2, size(r)
+            tmp = r(i)
+            j = i - 1
+            do while (j >= 1)
+               if (.not. (real(r(j)) > real(tmp) .or. (real(r(j)) == real(tmp) .and. aimag(r(j)) > aimag(tmp)))) exit
+               r(j + 1) = r(j)
+               j = j - 1
+            end do
+            r(j + 1) = tmp
+         end do
+      end function opoly_roots
+
+      function opoly_realroots(fam, c, tol, lo, hi) result(x)
+         ! The real roots of the series, ascending (not a numpy function):
+         ! the roots from opoly_roots whose imaginary part is at most
+         ! tol * max(1, |root|) (default sqrt(epsilon)), polished by a few
+         ! Newton steps on the series, optionally only those in [lo, hi].
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol, lo, hi
+         real(kind=dp), allocatable :: x(:), dc(:)
+         complex(kind=dp), allocatable :: r(:)
+         real(kind=dp) :: tl, xi, fx, dfx, step
+         logical, allocatable :: keep(:)
+         integer :: i, it
+         tl = sqrt(epsilon(1.0_dp))
+         if (present(tol)) tl = tol
+         r = opoly_roots(fam, c)
+         allocate(keep(size(r)))
+         keep = abs(aimag(r)) <= tl * max(1.0_dp, abs(r))
+         x = pack(real(r, kind=dp), keep)
+         dc = opoly_der(fam, opoly_trim(c))
+         do i = 1, size(x)
+            xi = x(i)
+            do it = 1, 3
+               fx = opoly_val0(fam, xi, c)
+               dfx = opoly_val0(fam, xi, dc)
+               if (dfx == 0.0_dp) exit
+               step = fx / dfx
+               ! Keep a polishing step small (a multiple root has dfx ~ 0).
+               if (abs(step) > tl * max(1.0_dp, abs(xi))) exit
+               xi = xi - step
+            end do
+            x(i) = xi
+         end do
+         if (present(lo)) x = pack(x, x >= lo)
+         if (present(hi)) x = pack(x, x <= hi)
+      end function opoly_realroots
+
+      pure function opoly_normed_herm(x, n, e) result(y)
+         ! numpy's _normed_hermite_n (e = .false.) / _normed_hermite_e_n
+         ! (e = .true.): the normalized Hermite function of degree n at x.
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: n
+         logical, intent(in) :: e
+         real(kind=dp) :: y(size(x)), pi, nd
+         real(kind=dp) :: c0(size(x)), c1(size(x)), tmp(size(x))
+         integer :: i
+         pi = acos(-1.0_dp)
+         if (n == 0) then
+            y = 1.0_dp / sqrt(sqrt(merge(2.0_dp * pi, pi, e)))
+            return
+         end if
+         c0 = 0.0_dp
+         c1 = 1.0_dp / sqrt(sqrt(merge(2.0_dp * pi, pi, e)))
+         nd = real(n, kind=dp)
+         do i = 1, n - 1
+            tmp = c0
+            c0 = -c1 * sqrt((nd - 1.0_dp) / nd)
+            if (e) then
+               c1 = tmp + c1 * x * sqrt(1.0_dp / nd)
+            else
+               c1 = tmp + c1 * x * sqrt(2.0_dp / nd)
+            end if
+            nd = nd - 1.0_dp
+         end do
+         if (e) then
+            y = c0 + c1 * x
+         else
+            y = c0 + c1 * x * sqrt(2.0_dp)
+         end if
+      end function opoly_normed_herm
+
+      subroutine opoly_gauss(fam, deg, x, w)
+         ! Gauss quadrature nodes and weights (numpy's <f>gauss) for the
+         ! Chebyshev, Hermite, HermiteE and Laguerre weight functions
+         ! (Legendre: leggauss).
+         integer, intent(in) :: fam, deg
+         real(kind=dp), allocatable, intent(out) :: x(:), w(:)
+         real(kind=dp), allocatable :: c(:), dy(:), df(:), fm(:)
+         real(kind=dp) :: pi
+         integer :: i
+         pi = acos(-1.0_dp)
+         if (deg <= 0) error stop "np.polynomial: deg must be a positive integer"
+         if (fam == 2) then
+            x = [(cos(pi * real(2 * i - 1, kind=dp) / (2.0_dp * real(deg, kind=dp))), i = 1, deg)]
+            allocate(w(deg), source=pi / real(deg, kind=dp))
+            return
+         end if
+         allocate(c(deg + 1), source=0.0_dp)
+         c(deg + 1) = 1.0_dp
+         x = linalg_eigvalsh(opoly_companion(fam, c))
+         select case (fam)
+         case (4, 5)
+            dy = opoly_normed_herm(x, deg, fam == 5)
+            df = opoly_normed_herm(x, deg - 1, fam == 5) * sqrt(merge(2.0_dp, 1.0_dp, fam == 4) * real(deg, kind=dp))
+            x = x - dy / df
+            fm = opoly_normed_herm(x, deg - 1, fam == 5)
+            fm = fm / maxval(abs(fm))
+            w = 1.0_dp / (fm * fm)
+            w = (w + w(deg:1:-1)) / 2.0_dp
+            x = (x - x(deg:1:-1)) / 2.0_dp
+            w = w * (merge(sqrt(pi), sqrt(2.0_dp * pi), fam == 4) / sum(w))
+         case (6)
+            dy = lagval_1(x, c)
+            df = lagval_1(x, opoly_der(6, c))
+            x = x - dy / df
+            fm = lagval_1(x, c(2:))
+            fm = fm / maxval(abs(fm))
+            df = df / maxval(abs(df))
+            w = 1.0_dp / (fm * df)
+            w = w / sum(w)
+         case default
+            error stop "np.polynomial: no Gauss rule for this family"
+         end select
+      end subroutine opoly_gauss
+
+      function opoly_gauss_part(fam, deg, part) result(v)
+         ! <f>gauss(deg)[part]: the nodes (0) or the weights (1).
+         integer, intent(in) :: fam, deg, part
+         real(kind=dp), allocatable :: v(:), x(:), w(:)
+         call opoly_gauss(fam, deg, x, w)
+         if (part == 0) then
+            v = x
+         else
+            v = w
+         end if
+      end function opoly_gauss_part
+
+      pure function opoly_mulx(fam, c_in) result(prd)
+         ! The series times x (numpy's <f>mulx).
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c_in(:)
+         real(kind=dp), allocatable :: prd(:), c(:)
+         integer :: i, n
+         c = opoly_trim(c_in)
+         n = size(c)
+         if (n == 1 .and. c(1) == 0.0_dp) then
+            prd = c
+            return
+         end if
+         allocate(prd(n + 1), source=0.0_dp)
+         select case (fam)
+         case (1)
+            prd(2:) = c
+         case (2)
+            prd(2) = c(1)
+            if (n > 1) then
+               prd(3:) = c(2:) / 2.0_dp
+               prd(1:n - 1) = prd(1:n - 1) + c(2:) / 2.0_dp
+            end if
+         case (3)
+            prd(2) = c(1)
+            do i = 1, n - 1
+               prd(i + 2) = (c(i + 1) * real(i + 1, kind=dp)) / real(2 * i + 1, kind=dp)
+               prd(i) = prd(i) + (c(i + 1) * real(i, kind=dp)) / real(2 * i + 1, kind=dp)
+            end do
+         case (4)
+            prd(2) = c(1) / 2.0_dp
+            do i = 1, n - 1
+               prd(i + 2) = c(i + 1) / 2.0_dp
+               prd(i) = prd(i) + c(i + 1) * real(i, kind=dp)
+            end do
+         case (5)
+            prd(2) = c(1)
+            do i = 1, n - 1
+               prd(i + 2) = c(i + 1)
+               prd(i) = prd(i) + c(i + 1) * real(i, kind=dp)
+            end do
+         case default
+            prd(1) = c(1)
+            prd(2) = -c(1)
+            do i = 1, n - 1
+               prd(i + 2) = -c(i + 1) * real(i + 1, kind=dp)
+               prd(i + 1) = prd(i + 1) + c(i + 1) * real(2 * i + 1, kind=dp)
+               prd(i) = prd(i) - c(i + 1) * real(i, kind=dp)
+            end do
+         end select
+      end function opoly_mulx
+
+      pure function opoly_add(c1_in, c2_in, sgn) result(r)
+         ! numpy's polyutils._add (sgn 1) / _sub (sgn -1): coefficients added
+         ! term by term (lowest degree first), trimmed.
+         real(kind=dp), intent(in) :: c1_in(:), c2_in(:)
+         integer, intent(in) :: sgn
+         real(kind=dp), allocatable :: r(:), c1(:), c2(:)
+         c1 = opoly_trim(c1_in)
+         c2 = opoly_trim(c2_in)
+         if (size(c1) > size(c2)) then
+            r = c1
+            r(1:size(c2)) = r(1:size(c2)) + real(sgn, kind=dp) * c2
+         else
+            r = real(sgn, kind=dp) * c2
+            r(1:size(c1)) = r(1:size(c1)) + c1
+         end if
+         r = opoly_trim(r)
+      end function opoly_add
+
+      pure function opoly_convolve(a, b) result(c)
+         real(kind=dp), intent(in) :: a(:), b(:)
+         real(kind=dp), allocatable :: c(:)
+         integer :: i
+         allocate(c(size(a) + size(b) - 1), source=0.0_dp)
+         do i = 1, size(a)
+            c(i:i + size(b) - 1) = c(i:i + size(b) - 1) + a(i) * b
+         end do
+      end function opoly_convolve
+
+      pure function opoly_c2z(c) result(zs)
+         ! numpy's chebyshev._cseries_to_zseries.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: zs(:)
+         integer :: n
+         n = size(c)
+         allocate(zs(2 * n - 1), source=0.0_dp)
+         zs(n:) = c / 2.0_dp
+         zs = zs + zs(2 * n - 1:1:-1)
+      end function opoly_c2z
+
+      pure function opoly_z2c(zs) result(c)
+         ! numpy's chebyshev._zseries_to_cseries.
+         real(kind=dp), intent(in) :: zs(:)
+         real(kind=dp), allocatable :: c(:)
+         integer :: n
+         n = (size(zs) + 1) / 2
+         c = zs(n:)
+         c(2:n) = c(2:n) * 2.0_dp
+      end function opoly_z2c
+
+      recursive pure function opoly_mul(fam, c1_in, c2_in) result(r)
+         ! Product of two series in the same basis (numpy's <f>mul).
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c1_in(:), c2_in(:)
+         real(kind=dp), allocatable :: r(:), c(:), xs(:), c0(:), c1(:), tmp(:), a(:), b(:)
+         real(kind=dp) :: nd
+         integer :: i, n
+         a = opoly_trim(c1_in)
+         b = opoly_trim(c2_in)
+         if (fam == 1) then
+            r = opoly_trim(opoly_convolve(a, b))
+            return
+         end if
+         if (fam == 2) then
+            r = opoly_trim(opoly_z2c(opoly_convolve(opoly_c2z(a), opoly_c2z(b))))
+            return
+         end if
+         if (size(a) > size(b)) then
+            c = b
+            xs = a
+         else
+            c = a
+            xs = b
+         end if
+         n = size(c)
+         if (n == 1) then
+            c0 = c(1) * xs
+            c1 = [0.0_dp]
+         else if (n == 2) then
+            c0 = c(1) * xs
+            c1 = c(2) * xs
+         else
+            nd = real(n, kind=dp)
+            c0 = c(n - 1) * xs
+            c1 = c(n) * xs
+            do i = 3, n
+               tmp = c0
+               nd = nd - 1.0_dp
+               select case (fam)
+               case (3)
+                  c0 = opoly_add(c(n - i + 1) * xs, (c1 * (nd - 1.0_dp)) / nd, -1)
+                  c1 = opoly_add(tmp, (opoly_mulx(3, c1) * (2.0_dp * nd - 1.0_dp)) / nd, 1)
+               case (4)
+                  c0 = opoly_add(c(n - i + 1) * xs, c1 * (2.0_dp * (nd - 1.0_dp)), -1)
+                  c1 = opoly_add(tmp, opoly_mulx(4, c1) * 2.0_dp, 1)
+               case (5)
+                  c0 = opoly_add(c(n - i + 1) * xs, c1 * (nd - 1.0_dp), -1)
+                  c1 = opoly_add(tmp, opoly_mulx(5, c1), 1)
+               case default
+                  c0 = opoly_add(c(n - i + 1) * xs, (c1 * (nd - 1.0_dp)) / nd, -1)
+                  c1 = opoly_add(tmp, opoly_add((2.0_dp * nd - 1.0_dp) * c1, opoly_mulx(6, c1), -1) / nd, 1)
+               end select
+            end do
+         end if
+         select case (fam)
+         case (3, 5)
+            r = opoly_add(c0, opoly_mulx(fam, c1), 1)
+         case (4)
+            r = opoly_add(c0, opoly_mulx(4, c1) * 2.0_dp, 1)
+         case default
+            r = opoly_add(c0, opoly_add(c1, opoly_mulx(6, c1), -1), 1)
+         end select
+      end function opoly_mul
+
+      pure subroutine opoly_div(fam, c1_in, c2_in, quo, rem)
+         ! Quotient and remainder of two series in the same basis (numpy's
+         ! <f>div).
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c1_in(:), c2_in(:)
+         real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
+         real(kind=dp), allocatable :: c1(:), c2(:), z1(:), z2(:), p(:), e(:), qz(:)
+         real(kind=dp) :: scl, q, rr
+         integer :: lc1, lc2, i, j, dlen
+         c1 = opoly_trim(c1_in)
+         c2 = opoly_trim(c2_in)
+         if (c2(size(c2)) == 0.0_dp) error stop "np.polynomial: division by zero"
+         lc1 = size(c1)
+         lc2 = size(c2)
+         if (lc1 < lc2) then
+            quo = c1(1:1) * 0.0_dp
+            rem = c1
+            return
+         end if
+         if (lc2 == 1) then
+            quo = c1 / c2(lc2)
+            rem = c1(1:1) * 0.0_dp
+            return
+         end if
+         select case (fam)
+         case (1)
+            dlen = lc1 - lc2
+            scl = c2(lc2)
+            c2 = c2(1:lc2 - 1) / scl
+            i = dlen
+            j = lc1 - 1
+            do while (i >= 0)
+               c1(i + 1:j) = c1(i + 1:j) - c2 * c1(j + 1)
+               i = i - 1
+               j = j - 1
+            end do
+            quo = c1(j + 2:) / scl
+            rem = opoly_trim(c1(1:j + 1))
+         case (2)
+            z1 = opoly_c2z(c1)
+            z2 = opoly_c2z(c2)
+            ! numpy's chebyshev._zseries_div
+            dlen = size(z1) - size(z2)
+            scl = z2(1)
+            z2 = z2 / scl
+            allocate(qz(dlen + 1))
+            i = 0
+            j = dlen
+            do while (i < j)
+               rr = z1(i + 1)
+               qz(i + 1) = z1(i + 1)
+               qz(dlen - i + 1) = rr
+               z1(i + 1:i + size(z2)) = z1(i + 1:i + size(z2)) - rr * z2
+               z1(j + 1:j + size(z2)) = z1(j + 1:j + size(z2)) - rr * z2
+               i = i + 1
+               j = j - 1
+            end do
+            rr = z1(i + 1)
+            qz(i + 1) = rr
+            z1(i + 1:i + size(z2)) = z1(i + 1:i + size(z2)) - rr * z2
+            qz = qz / scl
+            quo = opoly_trim(opoly_z2c(qz))
+            rem = opoly_trim(opoly_z2c(z1(i + 2:i + size(z2) - 1)))
+         case default
+            ! numpy's polyutils._div with the basis product.
+            allocate(quo(lc1 - lc2 + 1))
+            rem = c1
+            do i = lc1 - lc2, 0, -1
+               allocate(e(i + 1), source=0.0_dp)
+               e(i + 1) = 1.0_dp
+               p = opoly_mul(fam, e, c2)
+               deallocate(e)
+               q = rem(size(rem)) / p(size(p))
+               rem = rem(1:size(rem) - 1) - q * p(1:size(p) - 1)
+               quo(i + 1) = q
+            end do
+            rem = opoly_trim(rem)
+         end select
+      end subroutine opoly_div
+
+      pure function opoly_div_part(fam, c1, c2, part) result(r)
+         ! <f>div(c1, c2)[part]: the quotient (0) or the remainder (1).
+         integer, intent(in) :: fam, part
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:), q(:), rm(:)
+         call opoly_div(fam, c1, c2, q, rm)
+         if (part == 0) then
+            r = q
+         else
+            r = rm
+         end if
+      end function opoly_div_part
+
+      pure function opoly_pow(fam, c_in, power, maxpower) result(prd)
+         ! The series to a non-negative integer power (numpy's <f>pow;
+         ! maxpower defaults to 16, none for the power series).
+         integer, intent(in) :: fam, power
+         real(kind=dp), intent(in) :: c_in(:)
+         integer, intent(in), optional :: maxpower
+         real(kind=dp), allocatable :: prd(:), c(:), zs(:)
+         integer :: i, mx
+         mx = merge(huge(1), 16, fam == 1)
+         if (present(maxpower)) mx = maxpower
+         c = opoly_trim(c_in)
+         if (power < 0) error stop "np.polynomial: Power must be a non-negative integer."
+         if (power > mx) error stop "np.polynomial: Power is too large"
+         if (power == 0) then
+            prd = [1.0_dp]
+            return
+         end if
+         if (power == 1) then
+            prd = c
+            return
+         end if
+         if (fam == 1) then
+            prd = c
+            do i = 2, power
+               prd = opoly_convolve(prd, c)
+            end do
+         else if (fam == 2) then
+            zs = opoly_c2z(c)
+            prd = zs
+            do i = 2, power
+               prd = opoly_convolve(prd, zs)
+            end do
+            prd = opoly_z2c(prd)
+         else
+            prd = c
+            do i = 2, power
+               prd = opoly_mul(fam, prd, c)
+            end do
+         end if
+      end function opoly_pow
+
+      pure function opoly_line(fam, off, scl) result(c)
+         ! The series of off + scl*x (numpy's <f>line).
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: off, scl
+         real(kind=dp), allocatable :: c(:)
+         if (scl == 0.0_dp) then
+            c = [off]
+         else if (fam == 4) then
+            c = [off, scl / 2.0_dp]
+         else if (fam == 6) then
+            c = [off + scl, -scl]
+         else
+            c = [off, scl]
+         end if
+      end function opoly_line
+
+      pure function opoly_fromroots(fam, roots_in) result(c)
+         ! The series with these real roots (numpy's <f>fromroots): the
+         ! factors x - r are multiplied pairwise, as numpy does.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: roots_in(:)
+         real(kind=dp), allocatable :: c(:), roots(:), flat(:), tmpf(:)
+         integer, allocatable :: start(:), len_(:), tstart(:), tlen(:)
+         real(kind=dp) :: t
+         integer :: n, m, rr, i, j, k, pos
+         if (size(roots_in) == 0) then
+            c = [1.0_dp]
+            return
+         end if
+         roots = roots_in
+         do i = 2, size(roots)
+            t = roots(i)
+            j = i - 1
+            do while (j >= 1)
+               if (.not. roots(j) > t) exit
+               roots(j + 1) = roots(j)
+               j = j - 1
+            end do
+            roots(j + 1) = t
+         end do
+         ! The factors, stored back to back in flat.
+         n = size(roots)
+         allocate(start(n), len_(n))
+         flat = [real(kind=dp) ::]
+         do i = 1, n
+            tmpf = opoly_line(fam, -roots(i), 1.0_dp)
+            start(i) = size(flat) + 1
+            len_(i) = size(tmpf)
+            flat = [flat, tmpf]
+         end do
+         do while (n > 1)
+            m = n / 2
+            rr = mod(n, 2)
+            allocate(tstart(m), tlen(m))
+            tmpf = [real(kind=dp) ::]
+            do i = 1, m
+               c = opoly_mul(fam, flat(start(i):start(i) + len_(i) - 1), &
+                  flat(start(i + m):start(i + m) + len_(i + m) - 1))
+               if (i == 1 .and. rr == 1) c = opoly_mul(fam, c, flat(start(n):start(n) + len_(n) - 1))
+               tstart(i) = size(tmpf) + 1
+               tlen(i) = size(c)
+               tmpf = [tmpf, c]
+            end do
+            flat = tmpf
+            start = tstart
+            len_ = tlen
+            deallocate(tstart, tlen)
+            n = m
+         end do
+         c = flat(start(1):start(1) + len_(1) - 1)
+         k = 0
+         pos = 0
+      end function opoly_fromroots
+
+      pure function opoly_to_pow(fam, c_in) result(r)
+         ! <f>2poly: the same polynomial as a power series.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c_in(:)
+         real(kind=dp), allocatable :: r(:), c(:), c0(:), c1(:), tmp(:)
+         integer :: n, i
+         c = opoly_trim(c_in)
+         n = size(c)
+         if (fam == 1) then
+            r = c
+            return
+         end if
+         if (n == 1) then
+            r = c
+            return
+         end if
+         if (n == 2) then
+            select case (fam)
+            case (4)
+               r = [c(1), 2.0_dp * c(2)]
+               return
+            case (2, 3, 5)
+               r = c
+               return
+            end select
+         end if
+         c0 = [c(n - 1)]
+         c1 = [c(n)]
+         do i = n - 1, 2, -1
+            tmp = c0
+            select case (fam)
+            case (2)
+               c0 = opoly_add([c(i - 1)], c1, -1)
+               c1 = opoly_add(tmp, opoly_mulx(1, c1) * 2.0_dp, 1)
+            case (3)
+               c0 = opoly_add([c(i - 1)], (c1 * real(i - 1, kind=dp)) / real(i, kind=dp), -1)
+               c1 = opoly_add(tmp, (opoly_mulx(1, c1) * real(2 * i - 1, kind=dp)) / real(i, kind=dp), 1)
+            case (4)
+               c0 = opoly_add([c(i - 1)], c1 * real(2 * (i - 1), kind=dp), -1)
+               c1 = opoly_add(tmp, opoly_mulx(1, c1) * 2.0_dp, 1)
+            case (5)
+               c0 = opoly_add([c(i - 1)], c1 * real(i - 1, kind=dp), -1)
+               c1 = opoly_add(tmp, opoly_mulx(1, c1), 1)
+            case default
+               c0 = opoly_add([c(i - 1)], (c1 * real(i - 1, kind=dp)) / real(i, kind=dp), -1)
+               c1 = opoly_add(tmp, opoly_add(real(2 * i - 1, kind=dp) * c1, opoly_mulx(1, c1), -1) &
+                  / real(i, kind=dp), 1)
+            end select
+         end do
+         select case (fam)
+         case (4)
+            r = opoly_add(c0, opoly_mulx(1, c1) * 2.0_dp, 1)
+         case (6)
+            r = opoly_add(c0, opoly_add(c1, opoly_mulx(1, c1), -1), 1)
+         case default
+            r = opoly_add(c0, opoly_mulx(1, c1), 1)
+         end select
+      end function opoly_to_pow
+
+      pure function opoly_from_pow(fam, pol_in) result(res)
+         ! poly2<f>: a power series in the basis of family fam.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: pol_in(:)
+         real(kind=dp), allocatable :: res(:), pol(:)
+         integer :: i
+         pol = opoly_trim(pol_in)
+         if (fam == 1) then
+            res = pol
+            return
+         end if
+         res = [0.0_dp]
+         do i = size(pol), 1, -1
+            res = opoly_add(opoly_mulx(fam, res), [pol(i)], 1)
+         end do
+      end function opoly_from_pow
+
+      pure function chebpts1(npts) result(x)
+         ! Chebyshev points of the first kind (numpy's chebpts1).
+         integer, intent(in) :: npts
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         if (npts < 1) error stop "np.polynomial: npts must be >= 1"
+         x = [(sin(0.5_dp * acos(-1.0_dp) / real(npts, kind=dp) * real(-npts + 1 + 2 * i, kind=dp)), &
+            i = 0, npts - 1)]
+      end function chebpts1
+
+      pure function chebpts2(npts) result(x)
+         ! Chebyshev points of the second kind (numpy's chebpts2).
+         integer, intent(in) :: npts
+         real(kind=dp), allocatable :: x(:)
+         if (npts < 2) error stop "np.polynomial: npts must be >= 2"
+         x = cos(linspace(-acos(-1.0_dp), 0.0_dp, npts))
+      end function chebpts2
+
+      pure function powcompanion(c) result(m)
+         ! Scaled companion matrix of the power series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: m(:,:)
+         m = opoly_companion(1, c)
+      end function powcompanion
+
+      function powroots(c) result(r)
+         ! Roots of the power series, complex, sorted as numpy sorts them.
+         real(kind=dp), intent(in) :: c(:)
+         complex(kind=dp), allocatable :: r(:)
+         r = opoly_roots(1, c)
+      end function powroots
+
+      function powrealroots(c, tol, lo, hi) result(x)
+         ! Real roots of the power series, ascending, polished (not in numpy).
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol, lo, hi
+         real(kind=dp), allocatable :: x(:)
+         x = opoly_realroots(1, c, tol, lo, hi)
+      end function powrealroots
+
+      pure function powfromroots(roots) result(c)
+         ! The power series with these real roots.
+         real(kind=dp), intent(in) :: roots(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fromroots(1, roots)
+      end function powfromroots
+
+      pure function powmulx(c) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mulx(1, c)
+      end function powmulx
+
+      pure function powadd(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, 1)
+      end function powadd
+
+      pure function powsub(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, -1)
+      end function powsub
+
+      pure function powmul(c1, c2) result(r)
+         ! Product of two power series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mul(1, c1, c2)
+      end function powmul
+
+      pure subroutine powdiv(c1, c2, quo, rem)
+         ! Quotient and remainder of two power series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
+         call opoly_div(1, c1, c2, quo, rem)
+      end subroutine powdiv
+
+      pure function powpow(c, power, maxpower) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in) :: power
+         integer, intent(in), optional :: maxpower
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_pow(1, c, power, maxpower)
+      end function powpow
+
+      pure function powline(off, scl) result(c)
+         real(kind=dp), intent(in) :: off, scl
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_line(1, off, scl)
+      end function powline
+
+      pure function powtrim(c, tol) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_trimcoef(c, tol)
+      end function powtrim
+
+      pure function chebcompanion(c) result(m)
+         ! Scaled companion matrix of the Chebyshev series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: m(:,:)
+         m = opoly_companion(2, c)
+      end function chebcompanion
+
+      function chebroots(c) result(r)
+         ! Roots of the Chebyshev series, complex, sorted as numpy sorts them.
+         real(kind=dp), intent(in) :: c(:)
+         complex(kind=dp), allocatable :: r(:)
+         r = opoly_roots(2, c)
+      end function chebroots
+
+      function chebrealroots(c, tol, lo, hi) result(x)
+         ! Real roots of the Chebyshev series, ascending, polished (not in numpy).
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol, lo, hi
+         real(kind=dp), allocatable :: x(:)
+         x = opoly_realroots(2, c, tol, lo, hi)
+      end function chebrealroots
+
+      pure function chebfromroots(roots) result(c)
+         ! The Chebyshev series with these real roots.
+         real(kind=dp), intent(in) :: roots(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fromroots(2, roots)
+      end function chebfromroots
+
+      pure function chebmulx(c) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mulx(2, c)
+      end function chebmulx
+
+      pure function chebadd(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, 1)
+      end function chebadd
+
+      pure function chebsub(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, -1)
+      end function chebsub
+
+      pure function chebmul(c1, c2) result(r)
+         ! Product of two Chebyshev series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mul(2, c1, c2)
+      end function chebmul
+
+      pure subroutine chebdiv(c1, c2, quo, rem)
+         ! Quotient and remainder of two Chebyshev series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
+         call opoly_div(2, c1, c2, quo, rem)
+      end subroutine chebdiv
+
+      pure function chebpow(c, power, maxpower) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in) :: power
+         integer, intent(in), optional :: maxpower
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_pow(2, c, power, maxpower)
+      end function chebpow
+
+      pure function chebline(off, scl) result(c)
+         real(kind=dp), intent(in) :: off, scl
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_line(2, off, scl)
+      end function chebline
+
+      pure function chebtrim(c, tol) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_trimcoef(c, tol)
+      end function chebtrim
+
+      pure function cheb2poly(c) result(r)
+         ! The Chebyshev series as a power series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_to_pow(2, c)
+      end function cheb2poly
+
+      pure function poly2cheb(pol) result(r)
+         ! A power series as a Chebyshev series.
+         real(kind=dp), intent(in) :: pol(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_from_pow(2, pol)
+      end function poly2cheb
+
+      subroutine chebgauss(deg, x, w)
+         ! Gauss quadrature nodes and weights for the Chebyshev series weight.
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable, intent(out) :: x(:), w(:)
+         call opoly_gauss(2, deg, x, w)
+      end subroutine chebgauss
+
+      pure function legcompanion(c) result(m)
+         ! Scaled companion matrix of the Legendre series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: m(:,:)
+         m = opoly_companion(3, c)
+      end function legcompanion
+
+      function legroots(c) result(r)
+         ! Roots of the Legendre series, complex, sorted as numpy sorts them.
+         real(kind=dp), intent(in) :: c(:)
+         complex(kind=dp), allocatable :: r(:)
+         r = opoly_roots(3, c)
+      end function legroots
+
+      function legrealroots(c, tol, lo, hi) result(x)
+         ! Real roots of the Legendre series, ascending, polished (not in numpy).
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol, lo, hi
+         real(kind=dp), allocatable :: x(:)
+         x = opoly_realroots(3, c, tol, lo, hi)
+      end function legrealroots
+
+      pure function legfromroots(roots) result(c)
+         ! The Legendre series with these real roots.
+         real(kind=dp), intent(in) :: roots(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fromroots(3, roots)
+      end function legfromroots
+
+      pure function legmulx(c) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mulx(3, c)
+      end function legmulx
+
+      pure function legadd(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, 1)
+      end function legadd
+
+      pure function legsub(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, -1)
+      end function legsub
+
+      pure function legmul(c1, c2) result(r)
+         ! Product of two Legendre series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mul(3, c1, c2)
+      end function legmul
+
+      pure subroutine legdiv(c1, c2, quo, rem)
+         ! Quotient and remainder of two Legendre series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
+         call opoly_div(3, c1, c2, quo, rem)
+      end subroutine legdiv
+
+      pure function legpow(c, power, maxpower) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in) :: power
+         integer, intent(in), optional :: maxpower
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_pow(3, c, power, maxpower)
+      end function legpow
+
+      pure function legline(off, scl) result(c)
+         real(kind=dp), intent(in) :: off, scl
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_line(3, off, scl)
+      end function legline
+
+      pure function legtrim(c, tol) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_trimcoef(c, tol)
+      end function legtrim
+
+      pure function leg2poly(c) result(r)
+         ! The Legendre series as a power series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_to_pow(3, c)
+      end function leg2poly
+
+      pure function poly2leg(pol) result(r)
+         ! A power series as a Legendre series.
+         real(kind=dp), intent(in) :: pol(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_from_pow(3, pol)
+      end function poly2leg
+
+      pure function hermcompanion(c) result(m)
+         ! Scaled companion matrix of the Hermite series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: m(:,:)
+         m = opoly_companion(4, c)
+      end function hermcompanion
+
+      function hermroots(c) result(r)
+         ! Roots of the Hermite series, complex, sorted as numpy sorts them.
+         real(kind=dp), intent(in) :: c(:)
+         complex(kind=dp), allocatable :: r(:)
+         r = opoly_roots(4, c)
+      end function hermroots
+
+      function hermrealroots(c, tol, lo, hi) result(x)
+         ! Real roots of the Hermite series, ascending, polished (not in numpy).
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol, lo, hi
+         real(kind=dp), allocatable :: x(:)
+         x = opoly_realroots(4, c, tol, lo, hi)
+      end function hermrealroots
+
+      pure function hermfromroots(roots) result(c)
+         ! The Hermite series with these real roots.
+         real(kind=dp), intent(in) :: roots(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fromroots(4, roots)
+      end function hermfromroots
+
+      pure function hermmulx(c) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mulx(4, c)
+      end function hermmulx
+
+      pure function hermadd(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, 1)
+      end function hermadd
+
+      pure function hermsub(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, -1)
+      end function hermsub
+
+      pure function hermmul(c1, c2) result(r)
+         ! Product of two Hermite series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mul(4, c1, c2)
+      end function hermmul
+
+      pure subroutine hermdiv(c1, c2, quo, rem)
+         ! Quotient and remainder of two Hermite series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
+         call opoly_div(4, c1, c2, quo, rem)
+      end subroutine hermdiv
+
+      pure function hermpow(c, power, maxpower) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in) :: power
+         integer, intent(in), optional :: maxpower
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_pow(4, c, power, maxpower)
+      end function hermpow
+
+      pure function hermline(off, scl) result(c)
+         real(kind=dp), intent(in) :: off, scl
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_line(4, off, scl)
+      end function hermline
+
+      pure function hermtrim(c, tol) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_trimcoef(c, tol)
+      end function hermtrim
+
+      pure function herm2poly(c) result(r)
+         ! The Hermite series as a power series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_to_pow(4, c)
+      end function herm2poly
+
+      pure function poly2herm(pol) result(r)
+         ! A power series as a Hermite series.
+         real(kind=dp), intent(in) :: pol(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_from_pow(4, pol)
+      end function poly2herm
+
+      subroutine hermgauss(deg, x, w)
+         ! Gauss quadrature nodes and weights for the Hermite series weight.
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable, intent(out) :: x(:), w(:)
+         call opoly_gauss(4, deg, x, w)
+      end subroutine hermgauss
+
+      pure function hermecompanion(c) result(m)
+         ! Scaled companion matrix of the HermiteE series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: m(:,:)
+         m = opoly_companion(5, c)
+      end function hermecompanion
+
+      function hermeroots(c) result(r)
+         ! Roots of the HermiteE series, complex, sorted as numpy sorts them.
+         real(kind=dp), intent(in) :: c(:)
+         complex(kind=dp), allocatable :: r(:)
+         r = opoly_roots(5, c)
+      end function hermeroots
+
+      function hermerealroots(c, tol, lo, hi) result(x)
+         ! Real roots of the HermiteE series, ascending, polished (not in numpy).
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol, lo, hi
+         real(kind=dp), allocatable :: x(:)
+         x = opoly_realroots(5, c, tol, lo, hi)
+      end function hermerealroots
+
+      pure function hermefromroots(roots) result(c)
+         ! The HermiteE series with these real roots.
+         real(kind=dp), intent(in) :: roots(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fromroots(5, roots)
+      end function hermefromroots
+
+      pure function hermemulx(c) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mulx(5, c)
+      end function hermemulx
+
+      pure function hermeadd(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, 1)
+      end function hermeadd
+
+      pure function hermesub(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, -1)
+      end function hermesub
+
+      pure function hermemul(c1, c2) result(r)
+         ! Product of two HermiteE series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mul(5, c1, c2)
+      end function hermemul
+
+      pure subroutine hermediv(c1, c2, quo, rem)
+         ! Quotient and remainder of two HermiteE series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
+         call opoly_div(5, c1, c2, quo, rem)
+      end subroutine hermediv
+
+      pure function hermepow(c, power, maxpower) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in) :: power
+         integer, intent(in), optional :: maxpower
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_pow(5, c, power, maxpower)
+      end function hermepow
+
+      pure function hermeline(off, scl) result(c)
+         real(kind=dp), intent(in) :: off, scl
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_line(5, off, scl)
+      end function hermeline
+
+      pure function hermetrim(c, tol) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_trimcoef(c, tol)
+      end function hermetrim
+
+      pure function herme2poly(c) result(r)
+         ! The HermiteE series as a power series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_to_pow(5, c)
+      end function herme2poly
+
+      pure function poly2herme(pol) result(r)
+         ! A power series as a HermiteE series.
+         real(kind=dp), intent(in) :: pol(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_from_pow(5, pol)
+      end function poly2herme
+
+      subroutine hermegauss(deg, x, w)
+         ! Gauss quadrature nodes and weights for the HermiteE series weight.
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable, intent(out) :: x(:), w(:)
+         call opoly_gauss(5, deg, x, w)
+      end subroutine hermegauss
+
+      pure function lagcompanion(c) result(m)
+         ! Scaled companion matrix of the Laguerre series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: m(:,:)
+         m = opoly_companion(6, c)
+      end function lagcompanion
+
+      function lagroots(c) result(r)
+         ! Roots of the Laguerre series, complex, sorted as numpy sorts them.
+         real(kind=dp), intent(in) :: c(:)
+         complex(kind=dp), allocatable :: r(:)
+         r = opoly_roots(6, c)
+      end function lagroots
+
+      function lagrealroots(c, tol, lo, hi) result(x)
+         ! Real roots of the Laguerre series, ascending, polished (not in numpy).
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol, lo, hi
+         real(kind=dp), allocatable :: x(:)
+         x = opoly_realroots(6, c, tol, lo, hi)
+      end function lagrealroots
+
+      pure function lagfromroots(roots) result(c)
+         ! The Laguerre series with these real roots.
+         real(kind=dp), intent(in) :: roots(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fromroots(6, roots)
+      end function lagfromroots
+
+      pure function lagmulx(c) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mulx(6, c)
+      end function lagmulx
+
+      pure function lagadd(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, 1)
+      end function lagadd
+
+      pure function lagsub(c1, c2) result(r)
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_add(c1, c2, -1)
+      end function lagsub
+
+      pure function lagmul(c1, c2) result(r)
+         ! Product of two Laguerre series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_mul(6, c1, c2)
+      end function lagmul
+
+      pure subroutine lagdiv(c1, c2, quo, rem)
+         ! Quotient and remainder of two Laguerre series coefficient arrays.
+         real(kind=dp), intent(in) :: c1(:), c2(:)
+         real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
+         call opoly_div(6, c1, c2, quo, rem)
+      end subroutine lagdiv
+
+      pure function lagpow(c, power, maxpower) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in) :: power
+         integer, intent(in), optional :: maxpower
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_pow(6, c, power, maxpower)
+      end function lagpow
+
+      pure function lagline(off, scl) result(c)
+         real(kind=dp), intent(in) :: off, scl
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_line(6, off, scl)
+      end function lagline
+
+      pure function lagtrim(c, tol) result(r)
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_trimcoef(c, tol)
+      end function lagtrim
+
+      pure function lag2poly(c) result(r)
+         ! The Laguerre series as a power series.
+         real(kind=dp), intent(in) :: c(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_to_pow(6, c)
+      end function lag2poly
+
+      pure function poly2lag(pol) result(r)
+         ! A power series as a Laguerre series.
+         real(kind=dp), intent(in) :: pol(:)
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_from_pow(6, pol)
+      end function poly2lag
+
+      subroutine laggauss(deg, x, w)
+         ! Gauss quadrature nodes and weights for the Laguerre series weight.
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable, intent(out) :: x(:), w(:)
+         call opoly_gauss(6, deg, x, w)
+      end subroutine laggauss
 
       pure function powval_0(x, c) result(y)
          ! Value of the power series (np.polynomial.polynomial, lowest degree first) with coefficients c at x.

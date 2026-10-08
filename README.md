@@ -536,6 +536,40 @@ Important caveats:
 - `xsummarize_xp2f_progress.py`: summarizes progress from `burkardt_python_results*.txt` files.
 - `tests/`: focused tests for the Python-to-Fortran tooling.
 
+## Third-Party Code
+
+Some Fortran sources in this repository come from other projects, kept with
+their original notices. Each file's header records what was changed.
+
+| File | Source | Author(s) | License | Used for |
+| --- | --- | --- | --- | --- |
+| `lapack_d.f90` (also `lapack_mod.f90`) | [LAPACK](https://www.netlib.org/lapack/) reference routines, with a few utilities from [John Burkardt](https://people.sc.fsu.edu/~jburkardt/) | Univ. of Tennessee, Univ. of California Berkeley, Univ. of Colorado Denver, NAG; John Burkardt | modified BSD ([LAPACK license](https://www.netlib.org/lapack/LICENSE.txt)); MIT (Burkardt) | `numpy.linalg`, `scipy.linalg`, least squares |
+| `root.f90` | [roots-fortran](https://github.com/jacobwilliams/roots-fortran) | Jacob Williams | BSD-3-Clause | `scipy.optimize.brentq` |
+| `fmin.f90` | [fmin](https://github.com/jacobwilliams/fmin) (a port of netlib `fmin.f`, Forsythe, Malcolm and Moler, after Brent) | Jacob Williams | BSD-3-Clause | `scipy.optimize.minimize_scalar` |
+| `lbfgsb.f90` | [lbfgsb](https://github.com/jacobwilliams/lbfgsb) (a refactoring of L-BFGS-B by Byrd, Lu, Nocedal and Zhu) | Jacob Williams | BSD-3-Clause | `scipy.optimize.minimize(method="L-BFGS-B")` |
+| `minpack.f90` | [fortran-lang/minpack](https://github.com/fortran-lang/minpack) (MINPACK by Garbow, Hillstrom and Moré, Argonne National Laboratory) | Jacob Williams and fortran-lang contributors | MINPACK license (BSD-style) | `scipy.optimize.fsolve`, `leastsq`, `curve_fit` |
+| `bfgs.f90` | [GARCH-BFGS](https://github.com/Beliavsky/GARCH-BFGS) | Beliavsky | MIT | `scipy.optimize.minimize(method="BFGS")` |
+
+Code inside `python.f90` adapted from elsewhere (each routine's comments name
+its source):
+
+- Several random-variate samplers (geometric, Pareto, power, Rayleigh,
+  Gumbel, inverse Gaussian, noncentral chi-square, triangular, log-series,
+  Dirichlet, multinomial): adapted from John Burkardt's
+  [prob.f90](https://people.sc.fsu.edu/~jburkardt/f_src/prob/prob.html) (MIT
+  license).
+- Rounding and math helpers (`round`, complex `sign`, `expm1`, `amax`, ...):
+  adapted from [pyccel](https://github.com/pyccel/pyccel)'s
+  `stdlib/math/pyc_math_f90.F90` (MIT license).
+- The complex eigensolver (`dceigv` and its `dc*` helpers): adapted from
+  [Alan Miller's `dceigv.f90`](https://jblevins.org/mirror/amiller/dceigv.f90),
+  from the NSWC Mathematics Library, based on EISPACK.
+- Gauss-Legendre nodes and weights (`leggauss`): the classic Newton
+  iteration (as in Numerical Recipes' `gauleg`), written independently.
+- The `np.polynomial` series routines and many other numpy functions port the
+  algorithms of [numpy](https://github.com/numpy/numpy) (BSD-3-Clause) so
+  that results agree with numpy.
+
 ## Testing
 
 ### Standalone Fortran runtime tests
