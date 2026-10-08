@@ -6408,6 +6408,79 @@ def rewrite_function_valued_library_args(tree):
     return tree
 
 
+def rewrite_numpy_polynomial_aliases(tree):
+    """`import numpy.polynomial.chebyshev as C`, `from numpy.polynomial import
+    chebyshev as C` (C.chebval(...)) and `from numpy.polynomial.chebyshev
+    import chebval` (chebval(...)): spelled np.polynomial.chebyshev.chebval
+    for the translator (adding `import numpy as np` when missing)."""
+    mods = {"polynomial", "chebyshev", "legendre", "hermite", "hermite_e", "laguerre"}
+    mod_alias = {}   # local name -> module
+    func_alias = {}  # local name -> (module, function)
+    keep = []
+    changed = False
+    for st in tree.body:
+        if isinstance(st, ast.Import):
+            rest = []
+            for a in st.names:
+                parts = a.name.split(".")
+                if len(parts) == 3 and parts[:2] == ["numpy", "polynomial"] and parts[2] in mods and a.asname:
+                    mod_alias[a.asname] = parts[2]
+                    changed = True
+                else:
+                    rest.append(a)
+            if rest:
+                st.names = rest
+                keep.append(st)
+            continue
+        if isinstance(st, ast.ImportFrom) and st.module == "numpy.polynomial":
+            rest = []
+            for a in st.names:
+                if a.name in mods:
+                    mod_alias[a.asname or a.name] = a.name
+                    changed = True
+                else:
+                    rest.append(a)
+            if rest:
+                st.names = rest
+                keep.append(st)
+            continue
+        if isinstance(st, ast.ImportFrom) and st.module and st.module.startswith("numpy.polynomial.") \
+                and st.module.split(".")[2] in mods and len(st.module.split(".")) == 3:
+            mod = st.module.split(".")[2]
+            for a in st.names:
+                func_alias[a.asname or a.name] = (mod, a.name)
+            changed = True
+            continue
+        keep.append(st)
+    if not changed:
+        return tree
+    tree.body = keep
+    if not any(isinstance(st, ast.Import) and any(a.name == "numpy" and (a.asname or "numpy") == "np" for a in st.names)
+               for st in tree.body):
+        tree.body.insert(0, ast.Import(names=[ast.alias(name="numpy", asname="np")]))
+
+    def chain(mod, attr):
+        base = ast.Attribute(value=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="polynomial",
+                                                 ctx=ast.Load()), attr=mod, ctx=ast.Load())
+        return ast.Attribute(value=base, attr=attr, ctx=ast.Load())
+
+    class _Canon(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            if isinstance(node.value, ast.Name) and node.value.id in mod_alias:
+                return ast.copy_location(chain(mod_alias[node.value.id], node.attr), node)
+            return node
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and node.id in func_alias:
+                return ast.copy_location(chain(*func_alias[node.id]), node)
+            return node
+
+    _Canon().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_two_result_numpy_unpack(tree):
     """q, r = np.polydiv(u, v), m, e = np.frexp(x) and f, i = np.modf(x):
     one indexed call per target (the translator evaluates np.polydiv(u,
@@ -9348,6 +9421,10 @@ def function_is_pure(fn_node, known_pure_calls=None):
                         "det", "inv", "solve", "lstsq", "eigvals", "eig", "cholesky", "cond", "eigvalsh", "eigh",
                         "matrix_power", "pinv", "qr", "svd", "slogdet", "matrix_rank",
                     }:
+                        self.ok = False
+                        return
+                    # Least-squares fits use the (impure) LAPACK lstsq.
+                    if leaf == "polyfit" or ("polynomial" in inner and leaf.endswith("fit")):
                         self.ok = False
                         return
                     if "linalg" in inner and leaf in {"norm", "matrix_norm"}:
@@ -16505,6 +16582,11 @@ def detect_needed_helpers(tree):
             # Windows, poly*, nan quantiles (translator._numerics_batch1).
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._B1_ATTRS:
                 needed.update(translator._B1_HELPERS)
+            # np.polynomial series functions (translator._np_polynomial).
+            if isinstance(node.func, ast.Attribute) and any(
+                    node.func.attr == pre + op for pre in translator._NPOLY_MODULES.values()
+                    for op in translator._NPOLY_OPS):
+                needed.update(translator._NPOLY_HELPERS)
             # Stacked linear algebra (translator._stacked_linalg): any linalg
             # call or matmul may get a stack of matrices.
             if isinstance(node.func, ast.Attribute) and (
@@ -28756,7 +28838,7 @@ class translator(ast.NodeVisitor):
             return None
         rank = int(self._rank_expr(node.value) or 0)
         fancy = any(not isinstance(q, ast.Slice) and int(self._rank_expr(q) or 0) > 0 for q in parts)
-        if not self._needs_hoisting(node.value, rank, fancy) or len(parts) > rank:
+        if not self._needs_hoisting(node.value, rank, fancy, parts) or len(parts) > rank:
             return None
         kind = self._expr_kind(node.value)
         if kind not in {"int", "real", "complex", "logical"}:
@@ -28946,15 +29028,27 @@ class translator(ast.NodeVisitor):
 
     _HOIST_STMTS = (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Return, ast.If, ast.For, ast.While)
 
+    _TUPLE_RESULT_ATTRS = {"meshgrid", "histogram", "histogram2d", "unique", "nonzero", "where", "indices",
+                           "broadcast_arrays", "split", "array_split", "hsplit", "vsplit", "gradient", "frexp",
+                           "modf", "polydiv", "divmod", "leggauss", "eig", "eigh", "svd", "qr", "slogdet", "lstsq",
+                           "unravel_index", "tril_indices", "triu_indices", "diag_indices", "ogrid", "mgrid"}
+
     @staticmethod
-    def _needs_hoisting(base, rank, fancy=False):
+    def _needs_hoisting(base, rank, fancy=False, parts=None):
         """Whether indexing array expression base needs a temporary: rank 3
         or more, a rank-2 expression other than a call (index1/index2
-        cover calls up to rank 2), or a vector expression indexed by an
+        cover elements of calls up to rank 2), a row or column of a rank-2
+        call (chebvander(x, 3)[2]), or a vector expression indexed by an
         index array (np.ravel(m)[[5, 0]]). A subscript of a variable
         (x[i][j], a list of lists' row) is indexed directly."""
         if isinstance(base, ast.Subscript):
             return False
+        if (rank == 2 and isinstance(base, ast.Call) and parts is not None
+                and (len(parts) < 2 or any(isinstance(q, ast.Slice) for q in parts))
+                and not (isinstance(base.func, (ast.Attribute, ast.Name))
+                         and getattr(base.func, "attr", getattr(base.func, "id", None))
+                         in translator._TUPLE_RESULT_ATTRS)):
+            return True
         return rank >= 3 or (rank == 2 and not isinstance(base, ast.Call)) or (rank == 1 and fancy)
 
     def _hoist_indexed_expressions(self, stmt):
@@ -29089,7 +29183,7 @@ class translator(ast.NodeVisitor):
             kind = self._expr_kind(base)
             _parts = list(n.slice.elts) if isinstance(n.slice, ast.Tuple) else [n.slice]
             fancy = any(not isinstance(q, ast.Slice) and int(self._rank_expr(q) or 0) > 0 for q in _parts)
-            if not self._needs_hoisting(base, rank, fancy) or kind not in {"int", "real", "complex", "logical"}:
+            if not self._needs_hoisting(base, rank, fancy, _parts) or kind not in {"int", "real", "complex", "logical"}:
                 return
             if not safe:
                 unsupported("in a while condition, a conditional expression, a later and/or operand, "
@@ -60598,8 +60692,122 @@ class translator(ast.NodeVisitor):
             return "emath:" + node.func.attr, node
         return None
 
+    _NPOLY_MODULES = {"polynomial": "poly", "chebyshev": "cheb", "legendre": "leg", "hermite": "herm",
+                      "hermite_e": "herme", "laguerre": "lag"}
+    _NPOLY_OPS = ("val", "vander", "fit", "der", "int")
+    _NPOLY_HELPERS = {f"{f}{op}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag")
+                      for op in ("val", "vander", "fit", "der", "int")} | {
+        f"{f}val_{r}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag") for r in (0, 1, 2)} | {
+        "opoly_val0", "opoly_vander", "opoly_der", "opoly_int", "opoly_fit", "linalg_lstsq_mat"}
+
+    def _npoly_call(self, node):
+        """(Fortran family prefix, operation) of np.polynomial.<module>.<f>(...)."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        parts = self._attr_chain_parts(node.func.value)
+        if not (parts and len(parts) == 3 and parts[0] in {"np", "numpy"} and parts[1] == "polynomial"
+                and parts[2] in self._NPOLY_MODULES):
+            return None
+        pre = self._NPOLY_MODULES[parts[2]]
+        name = node.func.attr
+        if not name.startswith(pre) or name[len(pre):] not in self._NPOLY_OPS:
+            return None
+        return ("pow" if pre == "poly" else pre), name[len(pre):]
+
+    def _np_polynomial(self, node):
+        """np.polynomial.<family>.<prefix>{val,vander,fit,der,int}(...), with
+        numpy's arguments; coefficients are 1-D, lowest degree first."""
+        fc = self._npoly_call(node)
+        if fc is None:
+            return None
+        fam, op = fc
+        npname = node.func.attr
+
+        def real_txt(n):
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+
+        def vec_txt(n):
+            txt = real_txt(n)
+            return f"[{txt}]" if int(self._rank_expr(n) or 0) == 0 else txt
+
+        def arg(name, pos, default=None):
+            v = node.args[pos] if pos is not None and len(node.args) > pos else next(
+                (k.value for k in node.keywords if k.arg == name), None)
+            return default if v is None else v
+
+        def is_none(n):
+            return n is None or (isinstance(n, ast.Constant) and n.value is None)
+        allowed = {"val": {"x", "c", "tensor"}, "vander": {"x", "deg"},
+                   "fit": {"x", "y", "deg", "rcond", "full", "w", "domain", "window", "symbol"},
+                   "der": {"c", "m", "scl", "axis"}, "int": {"c", "m", "k", "lbnd", "scl", "axis"}}[op]
+        for kw in node.keywords:
+            if kw.arg not in allowed:
+                raise NotImplementedError(f"{npname}: unsupported argument {kw.arg}=")
+        if op == "val":
+            x, c = arg("x", 0), arg("c", 1)
+            if x is None or c is None:
+                raise NotImplementedError(f"{npname} takes x and c")
+            if int(self._rank_expr(c) or 0) > 1:
+                raise NotImplementedError(f"{npname}: c must be 1-D (one series)")
+            if int(self._rank_expr(x) or 0) > 2:
+                raise NotImplementedError(f"{npname}: x of rank above 2 is not supported")
+            return f"{fam}val({real_txt(x)}, {vec_txt(c)})"
+        if op == "vander":
+            x, deg = arg("x", 0), arg("deg", 1)
+            if int(self._rank_expr(x) or 0) != 1:
+                raise NotImplementedError(f"{npname}: x must be a vector")
+            return f"{fam}vander({real_txt(x)}, int({self.expr(deg)}))"
+        if op == "fit":
+            x, y, deg = arg("x", 0), arg("y", 1), arg("deg", 2)
+            if int(self._rank_expr(y) or 0) != 1:
+                raise NotImplementedError(f"{npname}: y must be a vector")
+            if deg is None or int(self._rank_expr(deg) or 0) != 0 or isinstance(deg, (ast.List, ast.Tuple)):
+                raise NotImplementedError(f"{npname}: deg must be an integer (not a list of degrees)")
+            full = arg("full", 4)
+            if not (full is None or (isinstance(full, ast.Constant) and full.value is False)):
+                raise NotImplementedError(f"{npname}: full=True is not supported")
+            extra = []
+            rc = arg("rcond", 3)
+            if not is_none(rc):
+                extra.append(f"rcond={real_txt(rc)}")
+            w = arg("w", 5)
+            if not is_none(w):
+                extra.append(f"w={real_txt(w)}")
+            return f"{fam}fit({real_txt(x)}, {real_txt(y)}, int({self.expr(deg)})" + "".join(f", {e}" for e in extra) + ")"
+        c = arg("c", 0)
+        if c is None or int(self._rank_expr(c) or 0) > 1:
+            raise NotImplementedError(f"{npname}: c must be 1-D (one series)")
+        ax = arg("axis", None)
+        if not (ax is None or (isinstance(ax, ast.Constant) and ax.value in (0, -1))):
+            raise NotImplementedError(f"{npname}: axis is not supported")
+        extra = []
+        m = arg("m", 1)
+        if m is not None:
+            extra.append(f"m=int({self.expr(m)})")
+        if op == "int":
+            k = arg("k", 2)
+            if not (k is None or (isinstance(k, (ast.List, ast.Tuple)) and not k.elts)):
+                extra.append(f"k={vec_txt(k)}")
+            lb = arg("lbnd", 3)
+            if lb is not None:
+                extra.append(f"lbnd={real_txt(lb)}")
+            scl = arg("scl", 4)
+        else:
+            scl = arg("scl", 2)
+        if scl is not None:
+            extra.append(f"scl={real_txt(scl)}")
+        return f"{fam}{op}({vec_txt(c)}" + "".join(f", {e}" for e in extra) + ")"
+
     def _numerics_batch1_parts(self, node):
         """(kind, rank) of the forms _numerics_batch1 translates, else None."""
+        fc = self._npoly_call(node)
+        if fc is not None:
+            op = fc[1]
+            if op == "val":
+                x = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "x"), None)
+                return ("real", int(self._rank_expr(x) or 0) if x is not None else 0)
+            return ("real", 2 if op == "vander" else 1)
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) \
                 and node.slice.value in (0, 1):
             nc = self._b1_call(node.value)
@@ -60635,8 +60843,11 @@ class translator(ast.NodeVisitor):
 
     def _numerics_batch1(self, node):
         """Window functions, np.fft.fftshift/ifftshift, the legacy poly*
-        functions, np.frexp/np.modf parts, and nanmedian/nanpercentile/
-        nanquantile."""
+        functions, np.frexp/np.modf parts, nanmedian/nanpercentile/
+        nanquantile, np.emath, and np.polynomial's series functions."""
+        _np_poly_txt = self._np_polynomial(node)
+        if _np_poly_txt is not None:
+            return _np_poly_txt
         def real_txt(n):
             txt = self.expr(n)
             return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
@@ -83040,6 +83251,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_numpy_polynomial_aliases(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
@@ -83576,6 +83788,7 @@ def transpile_file(
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_numpy_polynomial_aliases(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)
@@ -84393,6 +84606,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_numpy_polynomial_aliases(tree)
     tree = rewrite_function_valued_library_args(tree)
     tree = npsmallint.rewrite_small_int_dtypes(tree)
     tree = rewrite_split_subscript_to_temp(tree)

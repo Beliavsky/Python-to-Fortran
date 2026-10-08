@@ -425,6 +425,21 @@ FIXTURES.update({
 })
 PLACEHOLDERS["Q"] = ["q8", "qu8", "q16", "qu16"]
 
+# Phase 9: np.polynomial series (power, Chebyshev, Legendre, Hermite, HermiteE,
+# Laguerre): evaluation, pseudo-Vandermonde matrices, fits, derivatives and
+# integrals.
+_npoly = []
+for _mod, _pre in [("polynomial", "poly"), ("chebyshev", "cheb"), ("legendre", "leg"), ("hermite", "herm"),
+                   ("hermite_e", "herme"), ("laguerre", "lag")]:
+    _f = f"np.polynomial.{_mod}.{_pre}"
+    _npoly += [
+        f"{_f}val({{N1}}, q1)", f"{_f}val({{S}}, p1)", f"{_f}val({{N2}}, q1)", f"{_f}val(xc, {{N1}})",
+        f"{_f}vander(xc, 3)", f"{_f}vander(xc, 3)[2]", f"{_f}fit(xc, {{N1}}, 2)", f"{_f}fit(xc, {{N1}}, 3, w=xc + 1.0)",
+        f"{_f}der(q1)", f"{_f}der({{N1}}, 2)", f"{_f}der({{N1}}, m=2, scl=0.5)", f"{_f}int(q1)",
+        f"{_f}int({{N1}}, m=2, k=[1.0, -2.0], lbnd=0.5)", f"{_f}int(p1, k=3.0, scl=2.0)",
+    ]
+SPECS["npoly"] = _npoly
+
 # Phase 8: windows, FFT shifts, legacy polynomials, frexp/modf, NaN quantiles.
 SPECS["numerics1"] = [
     "np.hanning(7)", "np.hamming(6)", "np.blackman(5)", "np.bartlett(6)", "np.kaiser(5, 2.5)", "np.hanning(1)",
@@ -548,7 +563,15 @@ def parse_case(case):
 
 def _local_names(case, cid, ctx):
     """case with its local names (w, w1, ...) made unique to cid/ctx."""
-    return re.sub(r"\bw(\d*)\b", lambda m: f"w{m.group(1)}_{cid}{ctx}", case)
+    def rename(m):
+        # Not a keyword argument named w (np.polynomial...fit(x, y, deg, w=...)):
+        # after "(" or "," and followed by a single "=".
+        before = case[:m.start()].rstrip()
+        depth = before.count("(") - before.count(")")
+        if depth > 0 and before.endswith(("(", ",")) and re.match(r"\s*=(?!=)", case[m.end():]):
+            return m.group(0)
+        return f"w{m.group(1)}_{cid}{ctx}"
+    return re.sub(r"\bw(\d*)\b", rename, case)
 
 
 def evaluate(case, env):

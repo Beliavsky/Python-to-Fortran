@@ -26712,3 +26712,45 @@ def test_xp2f_numpy_emath_is_complex_with_numpy_branches(tmp_path: Path) -> None
     # numpy prints 8 significant digits.
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)
+
+
+def test_xp2f_numpy_polynomial_series_functions(tmp_path: Path) -> None:
+    # np.polynomial's power, Chebyshev, Legendre, Hermite, HermiteE and
+    # Laguerre series: val (scalar, vector, matrix x), vander (and a row of
+    # it), fit (weights), der, int (m, k, lbnd, scl), with the module or
+    # function imported under another name, and a fit inside a function
+    # (not PURE: lstsq).
+    src = tmp_path / "xnpoly.py"
+    src.write_text(
+        'import numpy as np\n'
+        'import numpy.polynomial.legendre as L\n'
+        'from numpy.polynomial import hermite as H, laguerre\n'
+        'from numpy.polynomial.chebyshev import chebval, chebfit\n'
+        '\n'
+        'def approx_err(f_vals, x, deg):\n'
+        '    c = chebfit(x, f_vals, deg)\n'
+        '    return np.max(np.abs(chebval(x, c) - f_vals))\n'
+        '\n'
+        'x = np.linspace(-1.0, 1.0, 9)\n'
+        'y = np.exp(x) * np.cos(3.0 * x)\n'
+        'c = np.array([0.5, -1.0, 2.0, 0.25])\n'
+        'print(chebval(0.3, c), chebval(x, c), L.legval(x, [1, 2, 3]), H.hermval(0.5, c), laguerre.lagval(x, c))\n'
+        'print(np.polynomial.hermite_e.hermeval(np.array([[0.0, 1.0], [2.0, -1.0]]), c))\n'
+        'print(np.polynomial.polynomial.polyval(2.0, c), np.polynomial.polynomial.polyfit(x, y, 3))\n'
+        'print(chebfit(x, y, 5), L.legfit(x, y, 4, w=1.0 + x * x), H.hermfit(x, y, 3), laguerre.lagfit(x, y, 2))\n'
+        'print(np.polynomial.chebyshev.chebder(c), np.polynomial.chebyshev.chebint(c, m=2, k=[1.0, 2.0], lbnd=0.5))\n'
+        'print(L.legder(c, 2), L.legint(c, k=3), H.hermder(c, scl=2.0), H.hermint(c), laguerre.lagder(c), laguerre.lagint(c, lbnd=1.0))\n'
+        'print(np.polynomial.polynomial.polyder(c), np.polynomial.polynomial.polyint(c, 3), np.polynomial.hermite_e.hermeint(c))\n'
+        'print(np.polynomial.chebyshev.chebvander(x, 3)[2], L.legvander(x[:3], 2))\n'
+        'print(approx_err(y, x, 4), approx_err(y, x, 8))\n',
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xnpoly_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints arrays with 8 decimals.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)

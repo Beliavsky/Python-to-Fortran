@@ -266,6 +266,37 @@ public :: np_gradient_1d, np_gradient_2d, np_trapezoid_1d, interp_0d
 public :: interp_periodic_1d, interp_periodic_0d, np_hist_edges, histogram2d_np
 public :: np_window, np_poly_roots, np_polyadd, np_polymul, np_polydiv, np_polyint
 public :: nan_quantile_vec, nan_quantile_axis_2d
+public :: powval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial, lowest degree first) at x (scalar, vector or matrix x)"
+public :: powvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.polynomial.polyvander: pseudo-Vandermonde matrix"
+public :: powder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.polynomial.polyder: derivative coefficients"
+public :: powint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.polynomial.polyint: integral coefficients"
+public :: powfit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.polynomial.polyfit: least-squares fit, coefficients lowest degree first"
+public :: chebval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.chebyshev.chebval: value of the Chebyshev series (np.polynomial.chebyshev) at x (scalar, vector or matrix x)"
+public :: chebvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.chebyshev.chebvander: pseudo-Vandermonde matrix"
+public :: chebder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.chebyshev.chebder: derivative coefficients"
+public :: chebint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.chebyshev.chebint: integral coefficients"
+public :: chebfit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.chebyshev.chebfit: least-squares fit, coefficients lowest degree first"
+public :: legval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.legendre.legval: value of the Legendre series (np.polynomial.legendre) at x (scalar, vector or matrix x)"
+public :: legvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.legendre.legvander: pseudo-Vandermonde matrix"
+public :: legder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.legendre.legder: derivative coefficients"
+public :: legint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.legendre.legint: integral coefficients"
+public :: legfit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.legendre.legfit: least-squares fit, coefficients lowest degree first"
+public :: hermval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.hermite.hermval: value of the physicists' Hermite series (np.polynomial.hermite) at x (scalar, vector or matrix x)"
+public :: hermvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.hermite.hermvander: pseudo-Vandermonde matrix"
+public :: hermder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.hermite.hermder: derivative coefficients"
+public :: hermint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.hermite.hermint: integral coefficients"
+public :: hermfit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.hermite.hermfit: least-squares fit, coefficients lowest degree first"
+public :: hermeval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.hermite_e.hermeval: value of the probabilists' Hermite series (np.polynomial.hermite_e) at x (scalar, vector or matrix x)"
+public :: hermevander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.hermite_e.hermevander: pseudo-Vandermonde matrix"
+public :: hermeder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.hermite_e.hermeder: derivative coefficients"
+public :: hermeint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.hermite_e.hermeint: integral coefficients"
+public :: hermefit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.hermite_e.hermefit: least-squares fit, coefficients lowest degree first"
+public :: lagval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.laguerre.lagval: value of the Laguerre series (np.polynomial.laguerre) at x (scalar, vector or matrix x)"
+public :: lagvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.laguerre.lagvander: pseudo-Vandermonde matrix"
+public :: lagder !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.laguerre.lagder: derivative coefficients"
+public :: lagint !@pyapi kind=function ret=real(dp)(:) args=c:real(dp)(:):intent(in),m:integer:intent(in):optional,k:real(dp)(:):intent(in):optional,lbnd:real(dp):intent(in):optional,scl:real(dp):intent(in):optional lib=polynomial desc="np.polynomial.laguerre.lagint: integral coefficients"
+public :: lagfit !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in),rcond:real(dp):intent(in):optional,w:real(dp)(:):intent(in):optional lib=polynomial desc="np.polynomial.laguerre.lagfit: least-squares fit, coefficients lowest degree first"
+public :: opoly_val0, opoly_vander, opoly_der, opoly_int, opoly_fit
 public :: unwrap_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="unwrap 1D phase vector using numpy-like default discontinuity pi"
 public :: bitwise_count_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="population count for each integer element"
 public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="modified Bessel function I0 approximation (elemental)"
@@ -710,6 +741,30 @@ end interface sorted_2d
 interface argsort_2d
    module procedure argsort_real_2d, argsort_int_2d, argsort_complex_2d
 end interface argsort_2d
+
+interface powval
+   module procedure powval_0, powval_1, powval_2
+end interface powval
+
+interface chebval
+   module procedure chebval_0, chebval_1, chebval_2
+end interface chebval
+
+interface legval
+   module procedure legval_0, legval_1, legval_2
+end interface legval
+
+interface hermval
+   module procedure hermval_0, hermval_1, hermval_2
+end interface hermval
+
+interface hermeval
+   module procedure hermeval_0, hermeval_1, hermeval_2
+end interface hermeval
+
+interface lagval
+   module procedure lagval_0, lagval_1, lagval_2
+end interface lagval
 
 interface np_polyadd
    module procedure np_polyadd_real, np_polyadd_int
@@ -9487,6 +9542,684 @@ contains
          g(2:n-1) = 0.5_dp * (x(3:n) - x(1:n-2))
          g(n) = x(n) - x(n-1)
       end function gradient_1d
+
+      ! ---- np.polynomial: orthogonal and power series ----------------------
+      ! Families: 1 power series (coefficients lowest degree first, unlike
+      ! np.polyval), 2 Chebyshev, 3 Legendre, 4 Hermite (physicists'),
+      ! 5 HermiteE (probabilists'), 6 Laguerre. The algorithms are numpy's
+      ! (Clenshaw-style evaluation, the three-term recurrences for the
+      ! Vandermonde matrices, numpy's derivative and integral recurrences, and
+      ! numpy's column-scaled least-squares fit), so results agree with numpy
+      ! to rounding.
+
+      pure function opoly_val0(fam, x, c) result(y)
+         ! Value at x of the series with coefficients c in family fam.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: x, c(:)
+         real(kind=dp) :: y, c0, c1, tmp, x2, nd
+         integer :: n, i
+         n = size(c)
+         if (n == 0) error stop "np.polynomial: the coefficient array is empty"
+         if (fam == 1) then
+            c0 = c(n)
+            do i = 2, n
+               c0 = c(n - i + 1) + c0 * x
+            end do
+            y = c0
+            return
+         end if
+         x2 = 2.0_dp * x
+         if (n == 1) then
+            c0 = c(1)
+            c1 = 0.0_dp
+         else if (n == 2) then
+            c0 = c(1)
+            c1 = c(2)
+         else
+            nd = real(n, kind=dp)
+            c0 = c(n - 1)
+            c1 = c(n)
+            do i = 3, n
+               tmp = c0
+               select case (fam)
+               case (2)
+                  c0 = c(n - i + 1) - c1
+                  c1 = tmp + c1 * x2
+               case (3)
+                  nd = nd - 1.0_dp
+                  c0 = c(n - i + 1) - (c1 * (nd - 1.0_dp)) / nd
+                  c1 = tmp + (c1 * x * (2.0_dp * nd - 1.0_dp)) / nd
+               case (4)
+                  nd = nd - 1.0_dp
+                  c0 = c(n - i + 1) - c1 * (2.0_dp * (nd - 1.0_dp))
+                  c1 = tmp + c1 * x2
+               case (5)
+                  nd = nd - 1.0_dp
+                  c0 = c(n - i + 1) - c1 * (nd - 1.0_dp)
+                  c1 = tmp + c1 * x
+               case default
+                  nd = nd - 1.0_dp
+                  c0 = c(n - i + 1) - (c1 * (nd - 1.0_dp)) / nd
+                  c1 = tmp + (c1 * ((2.0_dp * nd - 1.0_dp) - x)) / nd
+               end select
+            end do
+         end if
+         select case (fam)
+         case (4)
+            y = c0 + c1 * x2
+         case (6)
+            y = c0 + c1 * (1.0_dp - x)
+         case default
+            y = c0 + c1 * x
+         end select
+      end function opoly_val0
+
+      pure function opoly_vander(fam, x, deg) result(v)
+         ! Pseudo-Vandermonde matrix: v(i, j+1) = basis function of degree j
+         ! at x(i), j = 0..deg.
+         integer, intent(in) :: fam, deg
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: v(:,:)
+         integer :: i
+         real(kind=dp) :: ri
+         if (deg < 0) error stop "np.polynomial: deg must be non-negative"
+         allocate(v(size(x), deg + 1))
+         v(:, 1) = x * 0.0_dp + 1.0_dp
+         if (deg == 0) return
+         select case (fam)
+         case (1, 2, 3, 5)
+            v(:, 2) = x
+         case (4)
+            v(:, 2) = x * 2.0_dp
+         case default
+            v(:, 2) = 1.0_dp - x
+         end select
+         do i = 2, deg
+            ri = real(i, kind=dp)
+            select case (fam)
+            case (1)
+               v(:, i + 1) = v(:, i) * x
+            case (2)
+               v(:, i + 1) = v(:, i) * (2.0_dp * x) - v(:, i - 1)
+            case (3)
+               v(:, i + 1) = (v(:, i) * x * (2.0_dp * ri - 1.0_dp) - v(:, i - 1) * (ri - 1.0_dp)) / ri
+            case (4)
+               v(:, i + 1) = v(:, i) * (x * 2.0_dp) - v(:, i - 1) * (2.0_dp * (ri - 1.0_dp))
+            case (5)
+               v(:, i + 1) = v(:, i) * x - v(:, i - 1) * (ri - 1.0_dp)
+            case default
+               v(:, i + 1) = (v(:, i) * (2.0_dp * ri - 1.0_dp - x) - v(:, i - 1) * (ri - 1.0_dp)) / ri
+            end select
+         end do
+      end function opoly_vander
+
+      pure function opoly_der(fam, c_in, m, scl) result(c)
+         ! m-th derivative of the series, each differentiation multiplied by
+         ! scl (default 1).
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c_in(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: scl
+         real(kind=dp), allocatable :: c(:), der(:)
+         real(kind=dp) :: s
+         integer :: cnt, n, i, j
+         cnt = 1
+         if (present(m)) cnt = m
+         s = 1.0_dp
+         if (present(scl)) s = scl
+         if (cnt < 0) error stop "np.polynomial: The order of derivation must be non-negative"
+         c = c_in
+         if (cnt == 0) return
+         n = size(c)
+         if (cnt >= n) then
+            c = c(1:1) * 0.0_dp
+            return
+         end if
+         do i = 1, cnt
+            n = n - 1
+            c = c * s
+            allocate(der(n))
+            select case (fam)
+            case (1)
+               do j = n, 1, -1
+                  der(j) = real(j, kind=dp) * c(j + 1)
+               end do
+            case (2)
+               do j = n, 3, -1
+                  der(j) = real(2 * j, kind=dp) * c(j + 1)
+                  c(j - 1) = c(j - 1) + (real(j, kind=dp) * c(j + 1)) / real(j - 2, kind=dp)
+               end do
+               if (n > 1) der(2) = 4.0_dp * c(3)
+               der(1) = c(2)
+            case (3)
+               do j = n, 3, -1
+                  der(j) = real(2 * j - 1, kind=dp) * c(j + 1)
+                  c(j - 1) = c(j - 1) + c(j + 1)
+               end do
+               if (n > 1) der(2) = 3.0_dp * c(3)
+               der(1) = c(2)
+            case (4)
+               do j = n, 1, -1
+                  der(j) = real(2 * j, kind=dp) * c(j + 1)
+               end do
+            case (5)
+               do j = n, 1, -1
+                  der(j) = real(j, kind=dp) * c(j + 1)
+               end do
+            case default
+               do j = n, 2, -1
+                  der(j) = -c(j + 1)
+                  c(j) = c(j) + c(j + 1)
+               end do
+               der(1) = -c(2)
+            end select
+            c = der
+            deallocate(der)
+         end do
+      end function opoly_der
+
+      pure function opoly_int(fam, c_in, m, k, lbnd, scl) result(c)
+         ! m-th integral of the series: integration constants k (missing ones
+         ! 0), the value of each integral at lbnd being k, each integration
+         ! multiplied by scl.
+         integer, intent(in) :: fam
+         real(kind=dp), intent(in) :: c_in(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: k(:), lbnd, scl
+         real(kind=dp), allocatable :: c(:), tmp(:), kk(:)
+         real(kind=dp) :: s, lb, t
+         integer :: cnt, n, i, j
+         cnt = 1
+         if (present(m)) cnt = m
+         s = 1.0_dp
+         if (present(scl)) s = scl
+         lb = 0.0_dp
+         if (present(lbnd)) lb = lbnd
+         if (cnt < 0) error stop "np.polynomial: The order of integration must be non-negative"
+         allocate(kk(max(cnt, 0)), source=0.0_dp)
+         if (present(k)) then
+            if (size(k) > cnt) error stop "np.polynomial: Too many integration constants"
+            kk(1:size(k)) = k
+         end if
+         c = c_in
+         do i = 1, cnt
+            n = size(c)
+            c = c * s
+            if (n == 1 .and. c(1) == 0.0_dp) then
+               c(1) = c(1) + kk(i)
+               cycle
+            end if
+            allocate(tmp(n + 1), source=0.0_dp)
+            select case (fam)
+            case (1)
+               tmp(2) = c(1)
+               do j = 1, n - 1
+                  tmp(j + 2) = c(j + 1) / real(j + 1, kind=dp)
+               end do
+            case (2)
+               tmp(2) = c(1)
+               if (n > 1) tmp(3) = c(2) / 4.0_dp
+               do j = 2, n - 1
+                  tmp(j + 2) = c(j + 1) / real(2 * (j + 1), kind=dp)
+                  tmp(j) = tmp(j) - c(j + 1) / real(2 * (j - 1), kind=dp)
+               end do
+            case (3)
+               tmp(2) = c(1)
+               if (n > 1) tmp(3) = c(2) / 3.0_dp
+               do j = 2, n - 1
+                  t = c(j + 1) / real(2 * j + 1, kind=dp)
+                  tmp(j + 2) = t
+                  tmp(j) = tmp(j) - t
+               end do
+            case (4)
+               tmp(2) = c(1) / 2.0_dp
+               do j = 1, n - 1
+                  tmp(j + 2) = c(j + 1) / real(2 * (j + 1), kind=dp)
+               end do
+            case (5)
+               tmp(2) = c(1)
+               do j = 1, n - 1
+                  tmp(j + 2) = c(j + 1) / real(j + 1, kind=dp)
+               end do
+            case default
+               tmp(1) = c(1)
+               tmp(2) = -c(1)
+               do j = 1, n - 1
+                  tmp(j + 1) = tmp(j + 1) + c(j + 1)
+                  tmp(j + 2) = -c(j + 1)
+               end do
+            end select
+            tmp(1) = tmp(1) + (kk(i) - opoly_val0(fam, lb, tmp))
+            c = tmp
+            deallocate(tmp)
+         end do
+      end function opoly_int
+
+      function opoly_fit(fam, x, y, deg, rcond, w) result(c)
+         ! Least-squares fit of degree deg as numpy does it: the columns of
+         ! the pseudo-Vandermonde matrix (rows weighted by w) are scaled to
+         ! unit norm, solved with lstsq (rcond default size(x) * eps), and the
+         ! scaling is undone.
+         integer, intent(in) :: fam, deg
+         real(kind=dp), intent(in) :: x(:), y(:)
+         real(kind=dp), intent(in), optional :: rcond, w(:)
+         real(kind=dp), allocatable :: c(:), a(:,:), b(:,:), sol(:,:), res(:), sv(:), scl(:)
+         real(kind=dp) :: rc
+         integer :: rnk, j
+         if (size(x) == 0) error stop "np.polynomial: expected non-empty vector for x"
+         if (size(x) /= size(y)) error stop "np.polynomial: expected x and y to have same length"
+         if (deg < 0) error stop "np.polynomial: expected deg >= 0"
+         a = opoly_vander(fam, x, deg)
+         allocate(b(size(y), 1))
+         b(:, 1) = y
+         if (present(w)) then
+            if (size(w) /= size(x)) error stop "np.polynomial: expected x and w to have same length"
+            do j = 1, size(a, 2)
+               a(:, j) = a(:, j) * w
+            end do
+            b(:, 1) = b(:, 1) * w
+         end if
+         rc = real(size(x), kind=dp) * epsilon(1.0_dp)
+         if (present(rcond)) rc = rcond
+         allocate(scl(size(a, 2)))
+         do j = 1, size(a, 2)
+            scl(j) = sqrt(sum(a(:, j) ** 2))
+            if (scl(j) == 0.0_dp) scl(j) = 1.0_dp
+            a(:, j) = a(:, j) / scl(j)
+         end do
+         call linalg_lstsq_mat(a, b, sol, res, rnk, sv, rc)
+         c = sol(:, 1) / scl
+      end function opoly_fit
+
+      pure function powval_0(x, c) result(y)
+         ! Value of the power series (np.polynomial.polynomial, lowest degree first) with coefficients c at x.
+         real(kind=dp), intent(in) :: x, c(:)
+         real(kind=dp) :: y
+         y = opoly_val0(1, x, c)
+      end function powval_0
+
+      pure function powval_1(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:), c(:)
+         real(kind=dp) :: y(size(x))
+         integer :: i
+         do i = 1, size(x)
+            y(i) = opoly_val0(1, x(i), c)
+         end do
+      end function powval_1
+
+      pure function powval_2(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:,:), c(:)
+         real(kind=dp) :: y(size(x, 1), size(x, 2))
+         integer :: i, j
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               y(i, j) = opoly_val0(1, x(i, j), c)
+            end do
+         end do
+      end function powval_2
+
+      pure function powvander(x, deg) result(v)
+         ! Pseudo-Vandermonde matrix of the power series (np.polynomial.polynomial, lowest degree first): v(i, j+1) is the basis
+         ! function of degree j at x(i).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable :: v(:,:)
+         v = opoly_vander(1, x, deg)
+      end function powvander
+
+      pure function powder(c, m, scl) result(d)
+         ! m-th derivative (default 1) of the power series (np.polynomial.polynomial, lowest degree first), scaled by scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: scl
+         real(kind=dp), allocatable :: d(:)
+         d = opoly_der(1, c, m, scl)
+      end function powder
+
+      pure function powint(c, m, k, lbnd, scl) result(r)
+         ! m-th integral (default 1) of the power series (np.polynomial.polynomial, lowest degree first); constants k, lower bound
+         ! lbnd, scale scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: k(:), lbnd, scl
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_int(1, c, m, k, lbnd, scl)
+      end function powint
+
+      function powfit(x, y, deg, rcond, w) result(c)
+         ! Least-squares fit of the power series (np.polynomial.polynomial, lowest degree first) of degree deg to (x, y),
+         ! optionally weighted by w; coefficients lowest degree first.
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in) :: deg
+         real(kind=dp), intent(in), optional :: rcond, w(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fit(1, x, y, deg, rcond, w)
+      end function powfit
+
+      pure function chebval_0(x, c) result(y)
+         ! Value of the Chebyshev series (np.polynomial.chebyshev) with coefficients c at x.
+         real(kind=dp), intent(in) :: x, c(:)
+         real(kind=dp) :: y
+         y = opoly_val0(2, x, c)
+      end function chebval_0
+
+      pure function chebval_1(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:), c(:)
+         real(kind=dp) :: y(size(x))
+         integer :: i
+         do i = 1, size(x)
+            y(i) = opoly_val0(2, x(i), c)
+         end do
+      end function chebval_1
+
+      pure function chebval_2(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:,:), c(:)
+         real(kind=dp) :: y(size(x, 1), size(x, 2))
+         integer :: i, j
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               y(i, j) = opoly_val0(2, x(i, j), c)
+            end do
+         end do
+      end function chebval_2
+
+      pure function chebvander(x, deg) result(v)
+         ! Pseudo-Vandermonde matrix of the Chebyshev series (np.polynomial.chebyshev): v(i, j+1) is the basis
+         ! function of degree j at x(i).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable :: v(:,:)
+         v = opoly_vander(2, x, deg)
+      end function chebvander
+
+      pure function chebder(c, m, scl) result(d)
+         ! m-th derivative (default 1) of the Chebyshev series (np.polynomial.chebyshev), scaled by scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: scl
+         real(kind=dp), allocatable :: d(:)
+         d = opoly_der(2, c, m, scl)
+      end function chebder
+
+      pure function chebint(c, m, k, lbnd, scl) result(r)
+         ! m-th integral (default 1) of the Chebyshev series (np.polynomial.chebyshev); constants k, lower bound
+         ! lbnd, scale scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: k(:), lbnd, scl
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_int(2, c, m, k, lbnd, scl)
+      end function chebint
+
+      function chebfit(x, y, deg, rcond, w) result(c)
+         ! Least-squares fit of the Chebyshev series (np.polynomial.chebyshev) of degree deg to (x, y),
+         ! optionally weighted by w; coefficients lowest degree first.
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in) :: deg
+         real(kind=dp), intent(in), optional :: rcond, w(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fit(2, x, y, deg, rcond, w)
+      end function chebfit
+
+      pure function legval_0(x, c) result(y)
+         ! Value of the Legendre series (np.polynomial.legendre) with coefficients c at x.
+         real(kind=dp), intent(in) :: x, c(:)
+         real(kind=dp) :: y
+         y = opoly_val0(3, x, c)
+      end function legval_0
+
+      pure function legval_1(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:), c(:)
+         real(kind=dp) :: y(size(x))
+         integer :: i
+         do i = 1, size(x)
+            y(i) = opoly_val0(3, x(i), c)
+         end do
+      end function legval_1
+
+      pure function legval_2(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:,:), c(:)
+         real(kind=dp) :: y(size(x, 1), size(x, 2))
+         integer :: i, j
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               y(i, j) = opoly_val0(3, x(i, j), c)
+            end do
+         end do
+      end function legval_2
+
+      pure function legvander(x, deg) result(v)
+         ! Pseudo-Vandermonde matrix of the Legendre series (np.polynomial.legendre): v(i, j+1) is the basis
+         ! function of degree j at x(i).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable :: v(:,:)
+         v = opoly_vander(3, x, deg)
+      end function legvander
+
+      pure function legder(c, m, scl) result(d)
+         ! m-th derivative (default 1) of the Legendre series (np.polynomial.legendre), scaled by scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: scl
+         real(kind=dp), allocatable :: d(:)
+         d = opoly_der(3, c, m, scl)
+      end function legder
+
+      pure function legint(c, m, k, lbnd, scl) result(r)
+         ! m-th integral (default 1) of the Legendre series (np.polynomial.legendre); constants k, lower bound
+         ! lbnd, scale scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: k(:), lbnd, scl
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_int(3, c, m, k, lbnd, scl)
+      end function legint
+
+      function legfit(x, y, deg, rcond, w) result(c)
+         ! Least-squares fit of the Legendre series (np.polynomial.legendre) of degree deg to (x, y),
+         ! optionally weighted by w; coefficients lowest degree first.
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in) :: deg
+         real(kind=dp), intent(in), optional :: rcond, w(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fit(3, x, y, deg, rcond, w)
+      end function legfit
+
+      pure function hermval_0(x, c) result(y)
+         ! Value of the physicists' Hermite series (np.polynomial.hermite) with coefficients c at x.
+         real(kind=dp), intent(in) :: x, c(:)
+         real(kind=dp) :: y
+         y = opoly_val0(4, x, c)
+      end function hermval_0
+
+      pure function hermval_1(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:), c(:)
+         real(kind=dp) :: y(size(x))
+         integer :: i
+         do i = 1, size(x)
+            y(i) = opoly_val0(4, x(i), c)
+         end do
+      end function hermval_1
+
+      pure function hermval_2(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:,:), c(:)
+         real(kind=dp) :: y(size(x, 1), size(x, 2))
+         integer :: i, j
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               y(i, j) = opoly_val0(4, x(i, j), c)
+            end do
+         end do
+      end function hermval_2
+
+      pure function hermvander(x, deg) result(v)
+         ! Pseudo-Vandermonde matrix of the physicists' Hermite series (np.polynomial.hermite): v(i, j+1) is the basis
+         ! function of degree j at x(i).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable :: v(:,:)
+         v = opoly_vander(4, x, deg)
+      end function hermvander
+
+      pure function hermder(c, m, scl) result(d)
+         ! m-th derivative (default 1) of the physicists' Hermite series (np.polynomial.hermite), scaled by scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: scl
+         real(kind=dp), allocatable :: d(:)
+         d = opoly_der(4, c, m, scl)
+      end function hermder
+
+      pure function hermint(c, m, k, lbnd, scl) result(r)
+         ! m-th integral (default 1) of the physicists' Hermite series (np.polynomial.hermite); constants k, lower bound
+         ! lbnd, scale scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: k(:), lbnd, scl
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_int(4, c, m, k, lbnd, scl)
+      end function hermint
+
+      function hermfit(x, y, deg, rcond, w) result(c)
+         ! Least-squares fit of the physicists' Hermite series (np.polynomial.hermite) of degree deg to (x, y),
+         ! optionally weighted by w; coefficients lowest degree first.
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in) :: deg
+         real(kind=dp), intent(in), optional :: rcond, w(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fit(4, x, y, deg, rcond, w)
+      end function hermfit
+
+      pure function hermeval_0(x, c) result(y)
+         ! Value of the probabilists' Hermite series (np.polynomial.hermite_e) with coefficients c at x.
+         real(kind=dp), intent(in) :: x, c(:)
+         real(kind=dp) :: y
+         y = opoly_val0(5, x, c)
+      end function hermeval_0
+
+      pure function hermeval_1(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:), c(:)
+         real(kind=dp) :: y(size(x))
+         integer :: i
+         do i = 1, size(x)
+            y(i) = opoly_val0(5, x(i), c)
+         end do
+      end function hermeval_1
+
+      pure function hermeval_2(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:,:), c(:)
+         real(kind=dp) :: y(size(x, 1), size(x, 2))
+         integer :: i, j
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               y(i, j) = opoly_val0(5, x(i, j), c)
+            end do
+         end do
+      end function hermeval_2
+
+      pure function hermevander(x, deg) result(v)
+         ! Pseudo-Vandermonde matrix of the probabilists' Hermite series (np.polynomial.hermite_e): v(i, j+1) is the basis
+         ! function of degree j at x(i).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable :: v(:,:)
+         v = opoly_vander(5, x, deg)
+      end function hermevander
+
+      pure function hermeder(c, m, scl) result(d)
+         ! m-th derivative (default 1) of the probabilists' Hermite series (np.polynomial.hermite_e), scaled by scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: scl
+         real(kind=dp), allocatable :: d(:)
+         d = opoly_der(5, c, m, scl)
+      end function hermeder
+
+      pure function hermeint(c, m, k, lbnd, scl) result(r)
+         ! m-th integral (default 1) of the probabilists' Hermite series (np.polynomial.hermite_e); constants k, lower bound
+         ! lbnd, scale scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: k(:), lbnd, scl
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_int(5, c, m, k, lbnd, scl)
+      end function hermeint
+
+      function hermefit(x, y, deg, rcond, w) result(c)
+         ! Least-squares fit of the probabilists' Hermite series (np.polynomial.hermite_e) of degree deg to (x, y),
+         ! optionally weighted by w; coefficients lowest degree first.
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in) :: deg
+         real(kind=dp), intent(in), optional :: rcond, w(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fit(5, x, y, deg, rcond, w)
+      end function hermefit
+
+      pure function lagval_0(x, c) result(y)
+         ! Value of the Laguerre series (np.polynomial.laguerre) with coefficients c at x.
+         real(kind=dp), intent(in) :: x, c(:)
+         real(kind=dp) :: y
+         y = opoly_val0(6, x, c)
+      end function lagval_0
+
+      pure function lagval_1(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:), c(:)
+         real(kind=dp) :: y(size(x))
+         integer :: i
+         do i = 1, size(x)
+            y(i) = opoly_val0(6, x(i), c)
+         end do
+      end function lagval_1
+
+      pure function lagval_2(x, c) result(y)
+         real(kind=dp), intent(in) :: x(:,:), c(:)
+         real(kind=dp) :: y(size(x, 1), size(x, 2))
+         integer :: i, j
+         do j = 1, size(x, 2)
+            do i = 1, size(x, 1)
+               y(i, j) = opoly_val0(6, x(i, j), c)
+            end do
+         end do
+      end function lagval_2
+
+      pure function lagvander(x, deg) result(v)
+         ! Pseudo-Vandermonde matrix of the Laguerre series (np.polynomial.laguerre): v(i, j+1) is the basis
+         ! function of degree j at x(i).
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: deg
+         real(kind=dp), allocatable :: v(:,:)
+         v = opoly_vander(6, x, deg)
+      end function lagvander
+
+      pure function lagder(c, m, scl) result(d)
+         ! m-th derivative (default 1) of the Laguerre series (np.polynomial.laguerre), scaled by scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: scl
+         real(kind=dp), allocatable :: d(:)
+         d = opoly_der(6, c, m, scl)
+      end function lagder
+
+      pure function lagint(c, m, k, lbnd, scl) result(r)
+         ! m-th integral (default 1) of the Laguerre series (np.polynomial.laguerre); constants k, lower bound
+         ! lbnd, scale scl per step.
+         real(kind=dp), intent(in) :: c(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), intent(in), optional :: k(:), lbnd, scl
+         real(kind=dp), allocatable :: r(:)
+         r = opoly_int(6, c, m, k, lbnd, scl)
+      end function lagint
+
+      function lagfit(x, y, deg, rcond, w) result(c)
+         ! Least-squares fit of the Laguerre series (np.polynomial.laguerre) of degree deg to (x, y),
+         ! optionally weighted by w; coefficients lowest degree first.
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in) :: deg
+         real(kind=dp), intent(in), optional :: rcond, w(:)
+         real(kind=dp), allocatable :: c(:)
+         c = opoly_fit(6, x, y, deg, rcond, w)
+      end function lagfit
 
       pure function np_window(kind_name, m, beta) result(w)
          ! np.hanning / hamming / blackman / bartlett / kaiser(m[, beta]) with
