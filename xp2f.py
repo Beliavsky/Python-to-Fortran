@@ -7038,6 +7038,108 @@ def rewrite_tri_indices(tree):
     return tree
 
 
+_UNIQUE_FAMILY = {
+    "unique_values": ([], ["values"]),
+    "unique_counts": (["return_counts"], ["values", "counts"]),
+    "unique_inverse": (["return_inverse"], ["values", "inverse_indices"]),
+    "unique_all": (["return_index", "return_inverse", "return_counts"],
+                   ["values", "indices", "inverse_indices", "counts"]),
+}
+
+
+def rewrite_numpy2_names(tree):
+    """numpy 2 names in terms of the older ones: concat -> concatenate,
+    permute_dims -> transpose, matrix_transpose -> linalg.matrix_transpose,
+    linalg.matmul/tensordot -> matmul/tensordot, np.astype(x, t) ->
+    x.astype(t), and unique_values/counts/inverse/all -> np.unique with the
+    matching return_* flags (their fields .values, .counts, ... as the
+    tuple's items)."""
+    def is_np(n):
+        return isinstance(n, ast.Name) and n.id in ("np", "numpy")
+
+    def is_np_linalg(n):
+        return isinstance(n, ast.Attribute) and n.attr == "linalg" and is_np(n.value)
+
+    def unique_call(node):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_np(node.func.value)
+                and node.func.attr in _UNIQUE_FAMILY and len(node.args) == 1 and not node.keywords):
+            flags, _ = _UNIQUE_FAMILY[node.func.attr]
+            return ast.Call(func=ast.Attribute(value=node.func.value, attr="unique", ctx=ast.Load()),
+                            args=list(node.args),
+                            keywords=[ast.keyword(arg=f, value=ast.Constant(value=True)) for f in flags])
+        return None
+
+    class _Rw(ast.NodeTransformer):
+        def visit_Attribute(self, node):
+            # np.unique_counts(x).counts -> np.unique(x, return_counts=True)[1]
+            if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute) \
+                    and node.value.func.attr in _UNIQUE_FAMILY and is_np(node.value.func.value):
+                fields = _UNIQUE_FAMILY[node.value.func.attr][1]
+                new = unique_call(node.value)
+                if new is not None and node.attr in fields:
+                    self.generic_visit(new)
+                    if len(fields) == 1:
+                        return ast.copy_location(new, node)
+                    return ast.copy_location(ast.Subscript(value=new, slice=ast.Constant(value=fields.index(node.attr)),
+                                                           ctx=ast.Load()), node)
+            self.generic_visit(node)
+            return node
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            f = node.func
+            if not isinstance(f, ast.Attribute):
+                return node
+            if is_np(f.value):
+                if f.attr == "concat":
+                    f.attr = "concatenate"
+                elif f.attr == "permute_dims":
+                    f.attr = "transpose"
+                elif f.attr == "matrix_transpose":
+                    f.value = ast.Attribute(value=f.value, attr="linalg", ctx=ast.Load())
+                elif f.attr == "astype" and len(node.args) == 2:
+                    return ast.copy_location(ast.Call(func=ast.Attribute(value=node.args[0], attr="astype",
+                                                                         ctx=ast.Load()),
+                                                      args=[node.args[1]], keywords=list(node.keywords)), node)
+                elif f.attr in _UNIQUE_FAMILY and f.attr == "unique_values":
+                    new = unique_call(node)
+                    if new is not None:
+                        return ast.copy_location(new, node)
+            elif is_np_linalg(f.value) and f.attr in {"matmul", "tensordot"}:
+                f.value = f.value.value
+            return node
+
+        def visit_Assign(self, node):
+            # u, c = np.unique_counts(x)
+            new = unique_call(node.value)
+            if new is not None and len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple):
+                node.value = new
+            self.generic_visit(node)
+            v = node.value
+            # u, i = np.unique(x, return_index=True): one indexed call per
+            # target (every combination of return_* flags is translated
+            # indexed, not every one unpacked).
+            if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple)
+                    and all(isinstance(e, ast.Name) for e in node.targets[0].elts)
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and is_np(v.func.value)
+                    and v.func.attr == "unique" and len(v.args) == 1 and isinstance(v.args[0], ast.Name)
+                    and v.keywords and all(k.arg in {"return_index", "return_inverse", "return_counts"}
+                                           and isinstance(k.value, ast.Constant) for k in v.keywords)
+                    and 1 + sum(bool(k.value.value) for k in v.keywords) == len(node.targets[0].elts)):
+                return [ast.copy_location(ast.Assign(targets=[tg], value=ast.Subscript(
+                    value=copy.deepcopy(v), slice=ast.Constant(value=i), ctx=ast.Load())), node)
+                    for i, tg in enumerate(node.targets[0].elts)]
+            return node
+
+    if not any(isinstance(n, ast.Attribute) and n.attr in {"concat", "permute_dims", "matrix_transpose", "astype",
+                                                            "matmul", "tensordot", "unique"} | set(_UNIQUE_FAMILY)
+               for n in ast.walk(tree)):
+        return tree
+    tree = _Rw().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_two_result_numpy_unpack(tree):
     """q, r = np.polydiv(u, v), m, e = np.frexp(x) and f, i = np.modf(x):
     one indexed call per target (the translator evaluates np.polydiv(u,
@@ -12876,6 +12978,48 @@ def _callee_dummy_intent_is_in(lines, callee, arg_index):
     return False
 
 
+_DOMAIN_INTRINSIC_RE = re.compile(r"\b(?:sqrt|log|log10|asin|acos|acosh|atanh|gamma|log_gamma)\s*\(",
+                                  flags=re.IGNORECASE)
+
+
+def _name_in_domain_folded_expr(lines, name, tdecl, start, end):
+    """True if a real or complex `name` is read inside sqrt, log, log10,
+    asin, acos, acosh, atanh, gamma or log_gamma, or in a statement with
+    `**`, in `lines[start:end]`. A constant-promotion pass then leaves it
+    a variable: with `name` a parameter, gfortran evaluates the call at
+    compile time and rejects an argument outside the domain (sqrt(-2.0)),
+    where numpy returns NaN with a warning."""
+    if not re.match(r"^\s*(?:real|complex)\b", tdecl, flags=re.IGNORECASE):
+        return False
+    tok = re.compile(rf"\b{re.escape(name)}\b", flags=re.IGNORECASE)
+    stmts, cur = [], ""
+    for ln in lines[start:end]:
+        code = ln.split("!", 1)[0].rstrip()
+        s = code.lstrip()
+        if s.startswith("&"):
+            s = s[1:]
+        if s.endswith("&"):
+            cur += s[:-1]
+            continue
+        stmts.append(cur + s)
+        cur = ""
+    for st in stmts:
+        if not tok.search(st):
+            continue
+        # A negative base is only an error with a real exponent.
+        if any(not re.match(r"\s*\(?\s*[-+]?\d+\s*\)?(?![\w.])", st[m.end():])
+               for m in re.finditer(r"\*\*", st)):
+            return True
+        for m in _DOMAIN_INTRINSIC_RE.finditer(st):
+            depth, k = 1, m.end()
+            while k < len(st) and depth:
+                depth += {"(": 1, ")": -1}.get(st[k], 0)
+                k += 1
+            if tok.search(st[m.end():k]):
+                return True
+    return False
+
+
 def _name_used_as_call_arg(lines, name, start, end):
     """True if `name` is passed, as a bare actual argument (not merely
     read inside a larger expression -- Fortran can't bind an expression
@@ -13306,6 +13450,8 @@ def promote_immediate_scalar_constants(lines):
                 break
         if not reassigned and _name_used_as_call_arg(out, nm, j + 1, scope_end):
             reassigned = True
+        if not reassigned and _name_in_domain_folded_expr(out, nm, tdecl, j + 1, scope_end):
+            reassigned = True
         if reassigned:
             i += 1
             continue
@@ -13556,6 +13702,8 @@ def promote_immediate_array_constants(lines):
                 mutated = True
                 break
         if not mutated and _name_used_as_call_arg(out, nm, j + 1, scope_end):
+            mutated = True
+        if not mutated and _name_in_domain_folded_expr(out, nm, tdecl, j + 1, scope_end):
             mutated = True
         if mutated:
             i += 1
@@ -13822,6 +13970,8 @@ def promote_immediate_2d_array_constants(lines):
                 mutated = True
                 break
         if not mutated and _name_used_as_call_arg(out, nm, end_idx + 1, scope_end):
+            mutated = True
+        if not mutated and _name_in_domain_folded_expr(out, nm, tdecl, end_idx + 1, scope_end):
             mutated = True
         if mutated:
             i += 1
@@ -16728,7 +16878,10 @@ _CANONICAL_BATCH2_TARGETS = {
     "choose": ["select"], "compress": ["ravel"], "extract": ["ravel"], "broadcast_to": ["tile", "full"],
     "rot90": ["transpose"], "cov": ["var", "cov"], "divmod": [], "imag": ["zeros_like"], "asanyarray": ["asarray"],
     "matrix_rank": ["any", "where"], "vander": ["polyvander", "flip"], "resize": ["tile", "ravel"],
-    "trim_zeros": ["argmax", "any", "where", "flip"], "invert": [], "bitwise_not": [], "left_shift": [], "right_shift": [],
+    "trim_zeros": ["argmax", "any", "where", "flip"],
+    "diagonal": ["diagonal"], "cross": ["cross"], "trace": ["trace"], "outer": ["outer"],
+    "vecdot": ["sum", "conj"], "matvec": ["matmul", "dot"], "vecmat": ["matmul", "dot", "conj"],
+    "cumulative_sum": ["cumsum", "concatenate", "zeros"], "cumulative_prod": ["cumprod", "concatenate", "ones"], "invert": [], "bitwise_not": [], "left_shift": [], "right_shift": [],
 }
 
 
@@ -18061,6 +18214,10 @@ def detect_needed_helpers(tree):
                     needed.add("fft_rfft")
                 elif node.func.attr == "irfft":
                     needed.add("fft_irfft")
+                if node.func.attr in {"fft", "ifft", "rfft", "irfft", "fft2", "ifft2", "rfft2", "irfft2", "fftn",
+                                      "ifftn", "rfftn", "irfftn", "hfft", "ihfft"}:
+                    needed.update({"fft_fft", "fft_ifft", "fft_rfft", "fft_irfft", "fft_axis_2d", "rfft_axis_2d",
+                                   "irfft_axis_2d", "fft2", "ifft2", "rfft2", "irfft2"})
                 elif node.func.attr == "fftfreq":
                     needed.add("fft_fftfreq")
                 elif node.func.attr == "rfftfreq":
@@ -31301,6 +31458,165 @@ class translator(ast.NodeVisitor):
             node._xp2f_canonical = new
         return new
 
+    _FFT_FORWARD = {"fft", "rfft", "fft2", "rfft2"}
+    _FFT_ALL = {"fft", "ifft", "rfft", "irfft", "fft2", "ifft2", "rfft2", "irfft2"}
+
+    def _canonical_fft(self, node):
+        """np.fft calls in terms of fft/ifft/rfft/irfft (a vector or, with
+        axis=, a matrix) and fft2/ifft2/rfft2/irfft2 (a matrix): fftn and
+        relatives, hfft/ihfft, and norm="ortho"/"forward" as a scaling of
+        the default ("backward") transform."""
+        func = node.func
+        attr = func.attr
+        args, kws = list(node.args), list(node.keywords)
+        kd = {k.arg: k.value for k in kws}
+
+        def fftf(name, a, keywords):
+            return ast.Call(func=ast.Attribute(value=func.value, attr=name, ctx=ast.Load()), args=a,
+                            keywords=keywords)
+
+        def shape(x, i):
+            return ast.Subscript(value=ast.Attribute(value=copy.deepcopy(x), attr="shape", ctx=ast.Load()),
+                                 slice=ast.Constant(value=i), ctx=ast.Load())
+        if not args:
+            return None
+        x = args[0]
+        r = int(self._rank_expr(x) or 0)
+        if attr in {"fftn", "ifftn", "rfftn", "irfftn"}:
+            s = args[1] if len(args) > 1 else kd.get("s")
+            axes = args[2] if len(args) > 2 else kd.get("axes")
+            if axes is not None and not (isinstance(axes, ast.Constant) and axes.value is None):
+                return None
+            if s is not None and not (isinstance(s, (ast.Tuple, ast.List)) and len(s.elts) == r):
+                return None
+            rest = [k for k in kws if k.arg == "norm"]
+            base = attr[:-1]
+            if r == 1:
+                return fftf(base, [x] + ([s.elts[0]] if s is not None else []), rest)
+            if r == 2:
+                return fftf(base + "2", [x] + ([s] if s is not None else []), rest)
+            return None
+        if attr in {"hfft", "ihfft"} and r == 1 and len(args) <= 2 and set(kd) <= {"n"}:
+            n = args[1] if len(args) > 1 else kd.get("n")
+            if attr == "hfft":
+                # The FFT of a Hermitian-symmetric signal given by its first
+                # half: n * irfft(conj(a), n).
+                nn = n if n is not None else ast.BinOp(left=ast.Constant(value=2), op=ast.Mult(), right=ast.BinOp(
+                    left=shape(x, 0), op=ast.Sub(), right=ast.Constant(value=1)))
+                cx = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="conj", ctx=ast.Load()),
+                              args=[ast.BinOp(left=x, op=ast.Add(), right=ast.Constant(value=0j))], keywords=[])
+                return ast.BinOp(left=fftf("irfft", [cx, copy.deepcopy(nn)], []), op=ast.Mult(), right=nn)
+            nn = n if n is not None else shape(x, 0)
+            cx = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="conj", ctx=ast.Load()),
+                          args=[fftf("rfft", [x] + ([n] if n is not None else []), [])], keywords=[])
+            return ast.BinOp(left=cx, op=ast.Div(), right=copy.deepcopy(nn))
+        if attr in self._FFT_ALL and "norm" in kd:
+            nv = kd["norm"]
+            if not isinstance(nv, ast.Constant):
+                return None
+            rest = [k for k in kws if k.arg != "norm"]
+            if nv.value in (None, "backward"):
+                return fftf(attr, args, rest)
+            if nv.value not in ("ortho", "forward"):
+                return None
+            # N: the product of the real-space lengths of the transformed axes.
+            if attr.endswith("2"):
+                if r != 2:
+                    return None
+                s = args[1] if len(args) > 1 else kd.get("s")
+                if isinstance(s, ast.Constant) and s.value is None:
+                    s = None
+                if s is not None and isinstance(s, (ast.Tuple, ast.List)) and len(s.elts) != 2:
+                    return None
+                lens = [(copy.deepcopy(s.elts[i]) if isinstance(s, (ast.Tuple, ast.List)) else
+                         ast.Subscript(value=copy.deepcopy(s), slice=ast.Constant(value=i), ctx=ast.Load()))
+                        if s is not None else shape(x, i) for i in (0, 1)]
+                if attr == "irfft2" and s is None:
+                    lens[1] = ast.BinOp(left=ast.Constant(value=2), op=ast.Mult(),
+                                        right=ast.BinOp(left=shape(x, 1), op=ast.Sub(), right=ast.Constant(value=1)))
+                big_n = ast.BinOp(left=lens[0], op=ast.Mult(), right=lens[1])
+            else:
+                n = args[1] if len(args) > 1 else kd.get("n")
+                ax = kd.get("axis", ast.Constant(value=-1))
+                axv = getattr(ax, "value", None) if isinstance(ax, ast.Constant) else (
+                    -ax.operand.value if isinstance(ax, ast.UnaryOp) and isinstance(ax.operand, ast.Constant) else None)
+                if not isinstance(axv, int) or r < 1:
+                    return None
+                axv %= r
+                if n is not None and not (isinstance(n, ast.Constant) and n.value is None):
+                    big_n = copy.deepcopy(n)
+                elif attr == "irfft":
+                    big_n = ast.BinOp(left=ast.Constant(value=2), op=ast.Mult(),
+                                      right=ast.BinOp(left=shape(x, axv), op=ast.Sub(), right=ast.Constant(value=1)))
+                else:
+                    big_n = shape(x, axv)
+            scale = big_n if nv.value == "forward" else ast.Call(
+                func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="sqrt", ctx=ast.Load()),
+                args=[big_n], keywords=[])
+            return ast.BinOp(left=fftf(attr, args, rest), op=ast.Div() if attr in self._FFT_FORWARD else ast.Mult(),
+                             right=scale)
+        return None
+
+    def _fft_matrix_expr(self, node):
+        """np.fft.fft2/ifft2/rfft2/irfft2 of a matrix, or fft/ifft/rfft/irfft
+        of a matrix along axis= (default -1)."""
+        name = node.func.attr
+        x = node.args[0]
+        if int(self._rank_expr(x) or 0) != 2:
+            raise NotImplementedError(f"np.fft.{name}: only a matrix is supported")
+        kx = self._expr_kind(x)
+        a0 = self.expr(x)
+        want = "real" if name in {"rfft", "rfft2"} else ("complex" if name in {"ifft", "irfft", "ifft2", "irfft2"}
+                                                         else None)
+        if kx == "logical":
+            a0, kx = f"merge(1.0_dp, 0.0_dp, {a0})", "real"
+        elif kx == "int":
+            a0, kx = f"real({a0}, kind=dp)", "real"
+        if want == "complex" and kx != "complex":
+            a0 = f"cmplx({a0}, 0.0_dp, kind=dp)"
+        elif want == "real" and kx == "complex":
+            raise NotImplementedError(f"np.fft.{name} of a complex array is not supported")
+        kd = {k.arg: k.value for k in node.keywords}
+        if name.endswith("2"):
+            s = node.args[1] if len(node.args) > 1 else kd.get("s")
+            axes = node.args[2] if len(node.args) > 2 else kd.get("axes")
+            if axes is not None and not (isinstance(axes, ast.Constant) and axes.value is None) and not (
+                    isinstance(axes, (ast.Tuple, ast.List)) and [getattr(e, "value", None) if isinstance(e, ast.Constant)
+                                                                   else None for e in axes.elts] in ([0, 1],)
+                    or isinstance(axes, (ast.Tuple, ast.List)) and ast.unparse(axes) in ("(-2, -1)", "[-2, -1]")):
+                raise NotImplementedError(f"np.fft.{name}: axes must be the two axes in order")
+            if set(kd) - {"s", "axes", "norm"} or len(node.args) > 3:
+                raise NotImplementedError(f"np.fft.{name}: unsupported arguments")
+            sizes = ""
+            if s is not None and not (isinstance(s, ast.Constant) and s.value is None):
+                if isinstance(s, (ast.Tuple, ast.List)):
+                    if len(s.elts) != 2:
+                        raise NotImplementedError(f"np.fft.{name}: s must be a pair")
+                    s0, s1 = s.elts
+                else:
+                    # s=m.shape and the like.
+                    s0, s1 = (ast.Subscript(value=s, slice=ast.Constant(value=i), ctx=ast.Load()) for i in (0, 1))
+                sizes = f", int({self.expr(s0)}), int({self.expr(s1)})"
+            fn = {"fft2": "fft2", "ifft2": "ifft2", "rfft2": "rfft2", "irfft2": "irfft2"}[name]
+            return f"{fn}({a0}{sizes})"
+        n = node.args[1] if len(node.args) > 1 else kd.get("n")
+        ax = node.args[2] if len(node.args) > 2 else kd.get("axis", ast.Constant(value=-1))
+        axv = _signed_int_constant(ax)
+        if axv not in (0, 1, -1, -2) or set(kd) - {"n", "axis", "norm"}:
+            raise NotImplementedError(f"np.fft.{name} of a matrix: axis must be 0, 1 or -1")
+        dim = 1 if axv in (0, -2) else 2
+        n_txt = "" if n is None or (isinstance(n, ast.Constant) and n.value is None) else f", int({self.expr(n)})"
+        if name == "fft":
+            if kx != "complex":
+                a0 = f"cmplx({a0}, 0.0_dp, kind=dp)"
+            return f"fft_axis_2d({a0}, {dim}{n_txt})"
+        if name == "ifft":
+            return f"fft_axis_2d({a0}, {dim}{n_txt}, inverse=.true.)" if n_txt else \
+                f"fft_axis_2d({a0}, {dim}, inverse=.true.)"
+        if name == "rfft":
+            return f"rfft_axis_2d({a0}, {dim}{n_txt})"
+        return f"irfft_axis_2d({a0}, {dim}{n_txt})"
+
     def _canonical_batch2(self, node):
         """More numpy calls in terms of supported ones (see the coverage
         probe): asanyarray, nancumsum/nancumprod, logaddexp2, invert/
@@ -31334,6 +31650,10 @@ class translator(ast.NodeVisitor):
                     and type(n.operand.value) is int:
                 return -n.operand.value
             return None
+        if isinstance(func.value, ast.Attribute) and func.value.attr == "fft" and is_numpy_name_node(func.value.value):
+            new = self._canonical_fft(node)
+            if new is not None:
+                return new
         if (attr == "irfft" and isinstance(func.value, ast.Attribute) and func.value.attr == "fft"
                 and is_numpy_name_node(func.value.value) and node.args
                 and self._expr_kind(node.args[0]) in {"real", "int"}):
@@ -31471,6 +31791,45 @@ class translator(ast.NodeVisitor):
         if attr == "imag" and len(args) == 1 and self._expr_kind(args[0]) in {"int", "real", "logical"}:
             # The imaginary part of a real array: zeros of its kind.
             return call("zeros_like", args)
+        if attr in {"cumulative_sum", "cumulative_prod"} and len(args) == 1 and kws:
+            # numpy 2: include_initial=True puts the identity (0 or 1) first.
+            kd = {k.arg: k.value for k in kws}
+            if not set(kd) <= {"axis", "include_initial"}:
+                return None
+            r = int(self._rank_expr(args[0]) or 0)
+            ax = kd.get("axis")
+            if ax is not None and isinstance(ax, ast.Constant) and ax.value is None:
+                ax = None
+            inc = kd.get("include_initial")
+            if inc is not None and not isinstance(inc, ast.Constant):
+                return None
+            base_name = "cumsum" if attr == "cumulative_sum" else "cumprod"
+            base = call(base_name, args, [] if ax is None else [ast.keyword(arg="axis", value=ax)])
+            if not (inc is not None and inc.value):
+                return base
+            if r != 1:
+                return None
+            k0 = self._expr_kind(args[0])
+            first = call("zeros" if attr == "cumulative_sum" else "ones", [ast.Constant(value=1)],
+                         [ast.keyword(arg="dtype", value=ast.Name(id="int" if k0 in {"int", "logical"} else
+                                                                   "complex" if k0 == "complex" else "float",
+                                                                   ctx=ast.Load()))])
+            return call("concatenate", [ast.Tuple(elts=[first, base], ctx=ast.Load())])
+        if attr in {"matvec", "vecmat"} and len(args) == 2 and not kws:
+            a, b = args
+            ra, rb = int(self._rank_expr(a) or 0), int(self._rank_expr(b) or 0)
+            if attr == "matvec" and (ra, rb) == (2, 1):
+                return ast.BinOp(left=a, op=ast.MatMult(), right=b)
+            if attr == "vecmat" and (ra, rb) == (1, 2):
+                # vecmat conjugates the vector.
+                if self._expr_kind(a) == "complex":
+                    a = call("conj", [a])
+                return ast.BinOp(left=a, op=ast.MatMult(), right=b)
+            return None
+        if attr == "vecdot" and len(args) == 2:
+            new = copy.copy(node)
+            new.func = npf("vecdot", "linalg")
+            return new
         if attr == "linspace" and len(args) == 2:
             # num= (default 50) as the third positional argument.
             num = next((k.value for k in kws if k.arg == "num"), ast.Constant(value=50))
@@ -33169,9 +33528,9 @@ class translator(ast.NodeVisitor):
                 and node.func.value.value.id == "np"
                 and node.func.value.attr == "fft"
             ):
-                if node.func.attr in {"fft", "ifft", "rfft"}:
+                if node.func.attr in {"fft", "ifft", "rfft", "fft2", "ifft2", "rfft2"}:
                     return "complex"
-                if node.func.attr in {"irfft", "fftfreq", "rfftfreq"}:
+                if node.func.attr in {"irfft", "irfft2", "fftfreq", "rfftfreq"}:
                     return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -38203,8 +38562,14 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
                 and node.func.value.attr == "fft"
-                and node.func.attr in {"fft", "ifft", "rfft", "irfft", "fftfreq", "rfftfreq"}
+                and node.func.attr in {"fft", "ifft", "rfft", "irfft", "fftfreq", "rfftfreq", "fft2", "ifft2", "rfft2",
+                                       "irfft2"}
             ):
+                if node.func.attr.endswith("2"):
+                    return 2
+                if node.func.attr in {"fft", "ifft", "rfft", "irfft"} and node.args \
+                        and int(self._rank_expr(node.args[0]) or 0) == 2:
+                    return 2
                 return 1
             if self._is_linalg_call(node.func, {"norm"}) and len(node.args) >= 1:
                 axis_node = None
@@ -48305,6 +48670,7 @@ class translator(ast.NodeVisitor):
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"cumulative_sum", "cumulative_prod"}
                 and len(node.args) == 1
+                and not node.keywords
             ):
                 a0 = self.expr(node.args[0])
                 fn = "cumsum" if node.func.attr == "cumulative_sum" else "cumprod"
@@ -48548,6 +48914,9 @@ class translator(ast.NodeVisitor):
                 and node.func.value.attr == "fft"
             ):
                 name = node.func.attr
+                if name in {"fft", "ifft", "rfft", "irfft", "fft2", "ifft2", "rfft2", "irfft2"} and node.args \
+                        and (name.endswith("2") or int(self._rank_expr(node.args[0]) or 0) == 2):
+                    return self._fft_matrix_expr(node)
                 if name in {"fft", "ifft", "rfft", "irfft"} and len(node.args) >= 1:
                     a0 = self.expr(node.args[0])
                     if name == "ifft" and self._expr_kind(node.args[0]) in {"real", "int", "logical"}:
@@ -84312,6 +84681,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_named_split_lists(tree)
@@ -84852,6 +85222,7 @@ def transpile_file(
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_named_split_lists(tree)
@@ -85673,6 +86044,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_named_split_lists(tree)

@@ -391,6 +391,13 @@ public :: fft_rfft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):i
 public :: fft_irfft !@pyapi kind=function ret=real(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like irfft for 1D Hermitian spectrum"
 public :: fft_fftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional desc="numpy-like fftfreq(n,d)"
 public :: fft_rfftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional desc="numpy-like rfftfreq(n,d)"
+public :: fft_axis_2d !@pyapi kind=function ret=complex(dp)(:,:) args=x:complex(dp)(:,:):intent(in),dim:integer:intent(in),n:integer:intent(in):optional,inverse:logical:intent(in):optional lib=fft desc="FFT (or inverse) of each column (dim=1) or row (dim=2) of a matrix, cropped or zero-padded to n"
+public :: rfft_axis_2d !@pyapi kind=function ret=complex(dp)(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in),n:integer:intent(in):optional lib=fft desc="np.fft.rfft of each column (dim=1) or row (dim=2) of a real matrix"
+public :: irfft_axis_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:complex(dp)(:,:):intent(in),dim:integer:intent(in),n:integer:intent(in):optional lib=fft desc="np.fft.irfft of each column (dim=1) or row (dim=2) of a matrix"
+public :: fft2 !@pyapi kind=function ret=complex(dp)(:,:) args=x:real(dp)(:,:):intent(in),n1:integer:intent(in):optional,n2:integer:intent(in):optional lib=fft desc="np.fft.fft2 of a real or complex matrix (s=(n1, n2))"
+public :: ifft2 !@pyapi kind=function ret=complex(dp)(:,:) args=x:complex(dp)(:,:):intent(in),n1:integer:intent(in):optional,n2:integer:intent(in):optional lib=fft desc="np.fft.ifft2 of a matrix"
+public :: rfft2 !@pyapi kind=function ret=complex(dp)(:,:) args=x:real(dp)(:,:):intent(in),n1:integer:intent(in):optional,n2:integer:intent(in):optional lib=fft desc="np.fft.rfft2 of a real matrix"
+public :: irfft2 !@pyapi kind=function ret=real(dp)(:,:) args=x:complex(dp)(:,:):intent(in),n1:integer:intent(in):optional,n2:integer:intent(in):optional lib=fft desc="np.fft.irfft2: inverse of rfft2"
 
 public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
 public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
@@ -948,6 +955,9 @@ interface slice1
    module procedure slice1_char
 end interface slice1
 
+interface fft2
+   module procedure fft2_real, fft2_complex
+end interface fft2
 interface fft_fft
    module procedure fft_fft_real
    module procedure fft_fft_complex
@@ -14418,7 +14428,9 @@ contains
          end if
          m = min(size(x), nn / 2 + 1)
          if (m > 0) full(1:m) = x(1:m)
-         do k = 2, m - 1
+         ! Mirror the positive frequencies 1 .. (nn - 1)/2 (for an even nn,
+         ! the Nyquist term nn/2 is its own mirror).
+         do k = 2, min(m, (nn + 1) / 2)
             idx = nn - k + 2
             if (1 <= idx .and. idx <= nn) then
                full(idx) = conjg(x(k))
@@ -14428,6 +14440,131 @@ contains
          allocate(y(nn))
          y = real(ctmp, kind=dp)
       end function fft_irfft
+
+
+      pure function fft_axis_2d(x, dim, n, inverse) result(y)
+         ! The complex FFT (inverse if inverse) of each column (dim=1, numpy
+         ! axis 0) or row (dim=2, axis 1) of x, cropped or zero-padded to
+         ! length n (default: unchanged).
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, intent(in), optional :: n
+         logical, intent(in), optional :: inverse
+         complex(kind=dp), allocatable :: y(:,:)
+         integer :: i, nn
+         logical :: inv
+         inv = .false.
+         if (present(inverse)) inv = inverse
+         nn = size(x, dim)
+         if (present(n)) nn = max(0, n)
+         if (dim == 1) then
+            allocate(y(nn, size(x, 2)))
+            do i = 1, size(x, 2)
+               if (inv) then
+                  y(:, i) = fft_ifft(x(:, i), nn)
+               else
+                  y(:, i) = fft_fft_complex(x(:, i), nn)
+               end if
+            end do
+         else
+            allocate(y(size(x, 1), nn))
+            do i = 1, size(x, 1)
+               if (inv) then
+                  y(i, :) = fft_ifft(x(i, :), nn)
+               else
+                  y(i, :) = fft_fft_complex(x(i, :), nn)
+               end if
+            end do
+         end if
+      end function fft_axis_2d
+
+      pure function rfft_axis_2d(x, dim, n) result(y)
+         ! np.fft.rfft of each column (dim=1) or row (dim=2) of a real x:
+         ! the n/2 + 1 nonnegative-frequency terms (n default size(x, dim)).
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, intent(in), optional :: n
+         complex(kind=dp), allocatable :: y(:,:)
+         integer :: i, nn
+         nn = size(x, dim)
+         if (present(n)) nn = max(0, n)
+         if (dim == 1) then
+            allocate(y(nn / 2 + 1, size(x, 2)))
+            do i = 1, size(x, 2)
+               y(:, i) = fft_rfft(x(:, i), nn)
+            end do
+         else
+            allocate(y(size(x, 1), nn / 2 + 1))
+            do i = 1, size(x, 1)
+               y(i, :) = fft_rfft(x(i, :), nn)
+            end do
+         end if
+      end function rfft_axis_2d
+
+      pure function irfft_axis_2d(x, dim, n) result(y)
+         ! np.fft.irfft of each column (dim=1) or row (dim=2) of x: real
+         ! signals of length n (default 2*(size(x, dim) - 1)).
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: dim
+         integer, intent(in), optional :: n
+         real(kind=dp), allocatable :: y(:,:)
+         integer :: i, nn
+         nn = 2 * max(0, size(x, dim) - 1)
+         if (present(n)) nn = max(0, n)
+         if (dim == 1) then
+            allocate(y(nn, size(x, 2)))
+            do i = 1, size(x, 2)
+               y(:, i) = fft_irfft(x(:, i), nn)
+            end do
+         else
+            allocate(y(size(x, 1), nn))
+            do i = 1, size(x, 1)
+               y(i, :) = fft_irfft(x(i, :), nn)
+            end do
+         end if
+      end function irfft_axis_2d
+
+      pure function fft2_complex(x, n1, n2) result(y)
+         ! np.fft.fft2 (or fftn) of a matrix, each axis cropped or padded to
+         ! n1, n2 (numpy's s=).
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in), optional :: n1, n2
+         complex(kind=dp), allocatable :: y(:,:)
+         y = fft_axis_2d(fft_axis_2d(x, 2, n2), 1, n1)
+      end function fft2_complex
+
+      pure function fft2_real(x, n1, n2) result(y)
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in), optional :: n1, n2
+         complex(kind=dp), allocatable :: y(:,:)
+         y = fft2_complex(cmplx(x, 0.0_dp, kind=dp), n1, n2)
+      end function fft2_real
+
+      pure function ifft2(x, n1, n2) result(y)
+         ! np.fft.ifft2 (or ifftn) of a matrix.
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in), optional :: n1, n2
+         complex(kind=dp), allocatable :: y(:,:)
+         y = fft_axis_2d(fft_axis_2d(x, 2, n2, .true.), 1, n1, .true.)
+      end function ifft2
+
+      pure function rfft2(x, n1, n2) result(y)
+         ! np.fft.rfft2 (or rfftn) of a real matrix: rfft along axis 1, then
+         ! fft along axis 0; size(y, 2) = n2/2 + 1.
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in), optional :: n1, n2
+         complex(kind=dp), allocatable :: y(:,:)
+         y = fft_axis_2d(rfft_axis_2d(x, 2, n2), 1, n1)
+      end function rfft2
+
+      pure function irfft2(x, n1, n2) result(y)
+         ! np.fft.irfft2 (or irfftn): the inverse of rfft2; n2 (default
+         ! 2*(size(x, 2) - 1)) is the length of the real signal's axis 1.
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in), optional :: n1, n2
+         real(kind=dp), allocatable :: y(:,:)
+         y = irfft_axis_2d(fft_axis_2d(x, 1, n1, .true.), 2, n2)
+      end function irfft2
 
 
       pure function fft_fftfreq(n, d) result(f)

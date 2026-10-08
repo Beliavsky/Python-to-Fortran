@@ -26991,3 +26991,70 @@ def test_xp2f_numpy_common_gaps_batch(tmp_path: Path) -> None:
     proc = subprocess.run([sys.executable, str(XP2F_PATH), str(bad), "--compile", "--run"], cwd=tmp_path,
                           capture_output=True, text=True, check=False)
     assert "must not contain infs or NaNs" in proc.stdout + proc.stderr
+
+
+def test_xp2f_domain_error_literal_array_not_parameter(tmp_path: Path) -> None:
+    # A literal array passed to sqrt/log/arcsin/** stays a variable: as a
+    # parameter gfortran would fold the call and reject a negative value.
+    # Without the invalid trap the results are numpy's NaNs.
+    src = tmp_path / "xdomain.py"
+    src.write_text("import numpy as np\nx = np.array([0.5, -2.0, 4.0])\n"
+                   "print(np.sqrt(x), np.log(x - 1.0), np.arcsin(x / 2), np.power(x, 1.5))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", "--run", "--compiler",
+                           "gfortran -O0 -g -fcheck=all -fbacktrace"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "parameter :: x" not in src.with_name("xdomain_p.f90").read_text(encoding="utf-8")
+    assert out.count("NaN") == 5, out
+
+
+def test_xp2f_numpy2_names(tmp_path: Path) -> None:
+    # concat, permute_dims, matrix_transpose, vecdot, matvec, vecmat,
+    # linalg.matmul/diagonal/tensordot/cross, cumulative_sum/prod with
+    # include_initial and axis, unique_values/counts/inverse/all, np.astype.
+    _xp2f_output_matches_numpy(tmp_path, "xnp2", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'xi = np.array([3, 1, 4, 1, 3])\n'
+        'm = np.array([[2.0, 1.0], [1.0, 3.0]])\n'
+        'mr = np.array([[2.0, 1.0, 0.5], [1.0, 3.0, -1.0]])\n'
+        'print(np.concat([x, x]), np.concat((m, m), axis=1), np.permute_dims(mr), np.permute_dims(mr, (1, 0)))\n'
+        'print(np.matrix_transpose(mr), np.vecdot(x, x), np.vecdot(mr, mr), np.matvec(mr, x[:3]), np.vecmat(x[:2], mr))\n'
+        'print(np.linalg.matmul(m, mr), np.linalg.diagonal(mr), np.linalg.tensordot(m, m), np.linalg.cross(x[:3], x[1:]))\n'
+        'print(np.cumulative_sum(x, include_initial=True), np.cumulative_prod(xi, include_initial=True),\n'
+        '      np.cumulative_sum(m, axis=1), np.cumulative_sum(xi), np.cumulative_prod(m, axis=0))\n'
+        'print(np.unique_values(xi), np.unique_counts(xi).counts, np.unique_counts(xi).values, np.astype(xi, float) / 2)\n'
+        'v, c = np.unique_counts(xi)\n'
+        'print(v, c)\n'
+        'v, inv = np.unique_inverse(xi)\n'
+        'print(v, inv)\n'
+        'v, idx, inv, c = np.unique_all(xi)\n'
+        'print(v, idx, inv, c)\n'
+    ))
+
+
+def test_xp2f_fft_matrix_transforms(tmp_path: Path) -> None:
+    # fft2/ifft2/rfft2/irfft2 and the n-d names on matrices (s=), the 1-D
+    # transforms of a matrix along axis=, hfft/ihfft, norm="ortho" and
+    # "forward", and irfft to an odd length.
+    _xp2f_output_matches_numpy(tmp_path, "xfft2", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25, 1.0])\n'
+        'm = np.array([[2.0, 1.0, 0.5, 4.0], [1.0, 3.0, -1.0, 0.0], [0.0, 2.0, 5.0, -3.0]])\n'
+        'mi = np.array([[1, 2], [3, 4]])\n'
+        'f = np.fft.fft2(m)\n'
+        'print(f.real, f.imag)\n'
+        'g = np.fft.ifft2(f)\n'
+        'print(g.real, np.abs(g.imag).max() < 1e-12)\n'
+        'print(np.fft.fft2(mi).real, np.fft.fft2(m, s=(2, 6)).imag, np.fft.fftn(m).real, np.fft.ifftn(f).real)\n'
+        'r = np.fft.rfft2(m)\n'
+        'print(r.real, r.imag, np.fft.irfft2(r, s=m.shape), np.fft.rfftn(m).imag, np.fft.irfftn(r).shape[1])\n'
+        'print(np.fft.fft(m).imag, np.fft.fft(m, axis=0).real, np.fft.ifft(m, axis=0).imag, np.fft.rfft(m, axis=0).real)\n'
+        'print(np.fft.irfft(np.fft.rfft(m), n=4), np.fft.fft(m, 6, axis=1).real)\n'
+        'print(np.fft.fftn(x).real, np.fft.hfft(np.array([1.0, 2.0 + 1j, 0.5])), np.fft.hfft(x, 6), np.fft.ihfft(x).imag)\n'
+        'print(np.fft.fft(x, norm="ortho").real, np.fft.ifft(x, norm="forward").imag, np.fft.rfft(x, norm="forward").real)\n'
+        'print(np.fft.irfft(np.fft.rfft(x, norm="ortho"), 5, norm="ortho"), np.fft.fft2(m, norm="ortho").real,\n'
+        '      np.fft.irfft2(np.fft.rfft2(m, norm="forward"), m.shape, norm="forward"))\n'
+        'print(np.fft.irfft(np.array([1.0, 2.0 + 1j, 3.0 - 2j]), 5), np.fft.irfft(np.array([1.0, 2.0 + 1j, 3.0 - 2j]), 3), np.fft.hfft(np.array([1.0, 2.0 + 1j, 0.5]), 5))\n'
+    ))
