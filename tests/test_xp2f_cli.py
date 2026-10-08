@@ -26679,3 +26679,36 @@ def test_xp2f_numpy_windows_fftshift_poly_frexp_nanquantile(tmp_path: Path) -> N
     # numpy prints 8 significant digits.
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?|nan", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12, nan_ok=True)
+
+
+def test_xp2f_numpy_emath_is_complex_with_numpy_branches(tmp_path: Path) -> None:
+    # np.emath (np.lib.scimath) functions are always complex in the
+    # translation (x + 0j, a positive zero imaginary part, so a real x
+    # outside the domain takes numpy's branch: arcsin(-2) = -pi/2 + 1.317j).
+    src = tmp_path / "xemath.py"
+    src.write_text(
+        "import numpy as np\n"
+        "def f(x):\n"
+        "    return np.emath.sqrt(x) + np.emath.log10(x)\n"
+        "x = np.array([-4.0, 0.25, 9.0, -1.0])\n"
+        "y = np.array([2.0, -2.0, 0.5])\n"
+        "a = np.emath.sqrt(x)\n"
+        "b = np.emath.log(x) + np.emath.log2(x) * 1j + np.emath.logn(2, x)\n"
+        "c = np.emath.power(x, 0.5)\n"
+        "d = np.emath.arcsin(y) + 2.0 * np.emath.arccos(y) + 3.0 * np.emath.arctanh(y)\n"
+        "e = f(x)\n"
+        "print(np.real(a), np.imag(a), np.real(b), np.imag(b), np.real(c), np.imag(c))\n"
+        "print(np.real(d), np.imag(d), np.real(e), np.imag(e))\n"
+        "s = np.lib.scimath.sqrt(-9.0)\n"
+        "print(s.real, s.imag)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, str(src)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    ft = subprocess.run([str(src.with_name("xemath_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    # numpy prints 8 significant digits.
+    nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+    assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-12)

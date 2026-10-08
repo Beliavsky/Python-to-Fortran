@@ -60573,6 +60573,7 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError(f"unsupported assign: {stmt_txt}")
 
     _WINDOWS = {"hanning", "hamming", "blackman", "bartlett", "kaiser"}
+    _EMATH = {"sqrt", "log", "log2", "log10", "logn", "power", "arcsin", "arccos", "arctanh"}
     _B1_ATTRS = _WINDOWS | {"fftshift", "ifftshift", "poly", "polyadd", "polysub", "polymul", "polydiv",
                             "polyint", "frexp", "modf", "nanmedian", "nanpercentile", "nanquantile"}
     _B1_HELPERS = {"np_window", "i0_scalar", "np_poly_roots", "np_polyadd", "np_polyadd_real", "np_polyadd_int",
@@ -60590,6 +60591,11 @@ class translator(ast.NodeVisitor):
         elif (isinstance(v, ast.Attribute) and v.attr == "fft" and is_numpy_name_node(v.value)
               and node.func.attr in {"fftshift", "ifftshift"}):
             return node.func.attr, node
+        elif node.func.attr in self._EMATH and (
+                (isinstance(v, ast.Attribute) and v.attr == "emath" and is_numpy_name_node(v.value))
+                or (isinstance(v, ast.Attribute) and v.attr == "scimath" and isinstance(v.value, ast.Attribute)
+                    and v.value.attr == "lib" and is_numpy_name_node(v.value.value))):
+            return "emath:" + node.func.attr, node
         return None
 
     def _numerics_batch1_parts(self, node):
@@ -60608,6 +60614,10 @@ class translator(ast.NodeVisitor):
         if nc is None:
             return None
         name, call = nc
+        if name.startswith("emath:"):
+            # Always complex (numpy: complex only for inputs outside the
+            # real domain, a choice made at run time).
+            return ("complex", max([int(self._rank_expr(a) or 0) for a in call.args] or [0]))
         if name in self._WINDOWS or name in {"poly", "polyint"}:
             return ("real", 1)
         if name in {"fftshift", "ifftshift"}:
@@ -60658,6 +60668,36 @@ class translator(ast.NodeVisitor):
         if nc is None:
             return None
         name, call = nc
+        if name.startswith("emath:"):
+            fn = name.split(":", 1)[1]
+            nargs = 2 if fn in {"logn", "power"} else 1
+            if len(call.args) != nargs or call.keywords:
+                raise NotImplementedError(f"np.emath.{fn} takes {nargs} argument" + ("s" if nargs > 1 else ""))
+
+            def cx(n):
+                # x + 0j, with a positive zero imaginary part, which picks the
+                # same branch as numpy for a real x outside the domain.
+                txt = self.expr(n)
+                k = self._expr_kind(n)
+                if k == "complex":
+                    return txt
+                if k == "logical":
+                    txt = f"merge(1.0_dp, 0.0_dp, {txt})"
+                return f"cmplx({txt}, 0.0_dp, kind=dp)"
+            if fn == "sqrt":
+                return f"sqrt({cx(call.args[0])})"
+            if fn == "log":
+                return f"log({cx(call.args[0])})"
+            if fn in {"log2", "log10"}:
+                return f"(log({cx(call.args[0])}) / log({'2' if fn == 'log2' else '10'}.0_dp))"
+            if fn == "logn":
+                return f"(log({cx(call.args[1])}) / log({cx(call.args[0])}))"
+            if fn == "power":
+                p_txt = self.expr(call.args[1])
+                if self._expr_kind(call.args[1]) == "logical":
+                    p_txt = f"merge(1, 0, {p_txt})"
+                return f"({cx(call.args[0])} ** {p_txt})"
+            return f"{ {'arcsin': 'asin', 'arccos': 'acos', 'arctanh': 'atanh'}[fn] }({cx(call.args[0])})"
         if name in {"polydiv", "frexp", "modf"}:
             raise NotImplementedError(f"np.{name} returns a tuple: unpack it or index it with [0] or [1]")
         if name in self._WINDOWS:

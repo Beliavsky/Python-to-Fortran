@@ -439,6 +439,11 @@ SPECS["numerics1"] = [
     "np.nanmedian(nn1)", "np.nanpercentile(nn1, 30)", "np.nanquantile(nn1, 0.8)", "np.nanmedian({N1})",
     "np.nanmedian(nn2)", "np.nanmedian(nn2, axis=0)", "np.nanpercentile(nn2, 25, axis=1)",
     "np.nanquantile(nn2, 0.5, axis=-1)", "np.nanmedian(n1)",
+    # np.emath of inputs with values outside the real domain (complex in
+    # numpy too; the translation is always complex).
+    "np.emath.sqrt({N1})", "np.emath.log({N1})", "np.emath.log2(f1)", "np.emath.log10({N1})",
+    "np.emath.logn(3, f1)", "np.emath.power(f1, 0.5)", "np.emath.arcsin(f1)", "np.emath.arccos(f1)",
+    "np.emath.arctanh(f1)", "np.emath.sqrt({N1}) * 2.0 + 1.0", "np.emath.sqrt(j0 * 1.0)",
 ]
 FIXTURES["nn1"] = "np.array([1.0, np.nan, 3.0, 7.0, np.nan, 2.0])"
 FIXTURES["nn2"] = "np.array([[1.0, np.nan, 3.0], [4.0, 5.0, np.nan]])"
