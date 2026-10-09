@@ -6,9 +6,9 @@
 |---|---|
 | DIFF | 6 |
 | BUILD-FAIL | 4 |
-| XLATE-FAIL | 43 |
+| XLATE-FAIL | 47 |
 | NOARGS | 58 |
-| MATCH | 417 |
+| MATCH | 413 |
 
 ## BUILD-FAIL
 
@@ -64,6 +64,10 @@
 ## Known differences
 
 - `np.argpartition` (XLATE-FAIL): numpy's introselect order is not reproduced
+- `np.bartlett` (XLATE-FAIL): the probe's float M is rejected (M must be an integer)
+- `np.blackman` (XLATE-FAIL): the probe's float M is rejected (M must be an integer)
+- `np.hamming` (XLATE-FAIL): the probe's float M is rejected (M must be an integer)
+- `np.hanning` (XLATE-FAIL): the probe's float M is rejected (M must be an integer)
 - `np.linalg.eig` (DIFF): always complex in the translation
 - `np.linalg.eigvals` (DIFF): always complex in the translation
 - `np.partition` (XLATE-FAIL): numpy's introselect order is not reproduced

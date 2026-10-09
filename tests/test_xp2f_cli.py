@@ -26861,10 +26861,12 @@ def test_xp2f_numpy_polynomial_roots_gauss_arithmetic(tmp_path: Path) -> None:
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)
 
 
-def _xp2f_output_matches_numpy(tmp_path: Path, stem: str, code: str) -> None:
+def _xp2f_output_matches_numpy(tmp_path: Path, stem: str, code: str, compiler: str | None = None,
+                               check_kinds: bool = False) -> None:
     src = tmp_path / f"{stem}.py"
     src.write_text(code, encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+    extra = ["--compiler", compiler] if compiler else []
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"] + extra,
                           cwd=tmp_path, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     py = subprocess.run([sys.executable, "-W", "ignore", str(src)], cwd=tmp_path, capture_output=True, text=True,
@@ -26873,6 +26875,12 @@ def _xp2f_output_matches_numpy(tmp_path: Path, stem: str, code: str) -> None:
                         check=True).stdout
     nums = lambda s: [float(v) for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
     assert nums(ft) == pytest.approx(nums(py), rel=1e-7, abs=1e-8)
+    if check_kinds:
+        # Integers where numpy prints integers (no point or exponent).
+        def kinds(s):
+            return ["float" if re.search(r"[.eE]", v) else "int"
+                    for v in re.findall(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", s)]
+        assert kinds(ft) == kinds(py)
 
 
 def test_xp2f_spacing_full_like_digitize_split_lists(tmp_path: Path) -> None:
@@ -27184,3 +27192,79 @@ def test_xp2f_coverage_probe_fixes(tmp_path: Path) -> None:
         'mt = np.flip(np.outer(x, xi), axis=1)\n'
         'print(mt, np.flip(np.outer(x, xi), axis=0), np.flip(np.outer(x, xi)))\n'
     ))
+
+
+# Without the debug -ffpe-trap, to compare NaN and inf results.
+_NO_TRAP = "gfortran -O0 -g -fcheck=all -fbacktrace"
+
+
+def test_xp2f_variant_probe_silent_fixes(tmp_path: Path) -> None:
+    # Found by numpy_conformance/coverage_probe.py genvar: bitwise_count of
+    # negatives, float_power and reciprocal of integers, nan_to_num of
+    # infinities (and nan=/posinf=/neginf=), heaviside and clip of NaN,
+    # isclose/allclose of infinities, corrcoef of a constant or NaN vector,
+    # frexp/modf of inf, eigh/eigvalsh reading the lower triangle (and
+    # UPLO=), polyder of a constant.
+    _xp2f_output_matches_numpy(tmp_path, "xvarfix", (
+        'import numpy as np\n'
+        'x = np.array([0.5, np.nan, -2.0, np.inf, -np.inf, 0.0])\n'
+        'xi = np.array([3, 1, -4, 2, -1, 7])\n'
+        'm = np.array([[1.0, 1.0], [0.0, 1.0]])\n'
+        'mn = np.array([[2.0, np.nan], [1.0, 3.0]])\n'
+        'print(np.bitwise_count(np.array([-1, -2, 5, -7])), np.float_power(xi, xi), np.reciprocal(xi))\n'
+        'print(np.nan_to_num(x), np.nan_to_num(x, nan=-9.0, posinf=1e10, neginf=-1e10), np.nan_to_num(xi))\n'
+        'print(np.heaviside(x, 0.5), np.clip(x, -1.0, 1.0), np.clip(x, None, 0.25), np.clip(x, a_min=-1.0, a_max=None))\n'
+        'print(np.isclose(x, x), np.isclose(x, np.array([0.5, 0.0, -2.0, np.inf, np.inf, 1e-9])), np.allclose(x[2:5], x[2:5]))\n'
+        'print(np.corrcoef(np.array([1.0, 2.0, 4.0])), np.corrcoef(np.array([1.0, np.nan, 4.0])), np.corrcoef(np.ones(3)))\n'
+        'f, e = np.frexp(np.array([0.5, -2.0, 3.0, 0.0]))\n'
+        'mf, mi = np.modf(x)\n'
+        'print(f, e, mf, mi, np.frexp(np.array([np.inf, np.nan]))[0])\n'
+        'print(np.linalg.eigvalsh(m), np.linalg.eigh(mn)[0], np.linalg.eigvalsh(m, UPLO="U"), np.linalg.eigh(mn, UPLO="L")[0])\n'
+        'print(np.polyder(np.array([2.5])).shape[0], np.polyder(np.array([1.0, 2.0, 3.0]), 3).shape[0], np.polyder(np.array([1.0, 2.0, 3.0])))\n'
+    ), compiler=_NO_TRAP)
+
+
+def test_xp2f_variant_probe_integer_kinds(tmp_path: Path) -> None:
+    # Integer arrays keep integer results: tensordot, squeeze,
+    # asarray_chkfinite, resize, cumulative_sum/prod (also of booleans),
+    # polyval, polyder, real, real_if_close, nan_to_num; tensordot's rank.
+    _xp2f_output_matches_numpy(tmp_path, "xvarkind", (
+        'import numpy as np\n'
+        'x = np.array([3, 1, -4, 2])\n'
+        'xf = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'm = np.array([[2, 1], [1, 3]])\n'
+        'b = np.array([True, False, True])\n'
+        'r1 = np.tensordot(m, m)\n'
+        'r2 = np.squeeze(x)\n'
+        'r3 = np.asarray_chkfinite(x)\n'
+        'r4 = np.resize(x, 2)\n'
+        'r5 = np.cumulative_sum(x)\n'
+        'r6 = np.polyval(x, x)\n'
+        'r7 = np.polyder(x)\n'
+        'r8 = np.real(x)\n'
+        'r9 = np.real_if_close(x)\n'
+        'r10 = np.nan_to_num(x)\n'
+        'r11 = np.cumulative_sum(b)\n'
+        'r12 = np.linalg.tensordot(m, m, axes=1)\n'
+        'print(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12)\n'
+        'print(r2 // 2, r6 % 7, np.real(xf), np.polyval(xf, x), np.polyder(xf), np.squeeze(xf), np.tensordot(m, xf[:2], axes=1))\n'
+    ), check_kinds=True)
+
+
+def test_xp2f_variant_probe_integer_args_and_inf(tmp_path: Path) -> None:
+    # nan-functions of integers as the plain ones; fft, linalg, correlate,
+    # sinc, signbit, i0, logaddexp, isposinf of integers; median/quantile
+    # next to an infinity; sort_complex with NaN and inf; vander at NaN.
+    _xp2f_output_matches_numpy(tmp_path, "xvarint", (
+        'import numpy as np\n'
+        'xi = np.array([3, 1, -4, 2])\n'
+        'mi = np.array([[2, 1], [1, 3]])\n'
+        'x = np.array([0.5, np.nan, -2.0, np.inf])\n'
+        'print(np.nansum(xi), np.nanmax(xi), np.nanargmin(xi), np.nanmean(xi), np.nanstd(xi), np.nanmedian(xi), np.nanprod(xi))\n'
+        'print(np.fft.rfft(xi).real, np.fft.fft(xi).imag, np.linalg.eigvalsh(mi), np.linalg.svd(mi)[1], np.linalg.det(mi))\n'
+        'print(np.correlate(xi, xi[:2]), np.sinc(xi), np.signbit(xi), np.i0(xi), np.logaddexp(xi, 1), np.isposinf(xi))\n'
+        'print(np.nanmedian(x), np.median(np.array([1.0, np.inf])), np.median(np.array([1.0, 2.0, np.inf])))\n'
+        'print(np.quantile(np.array([1.0, 2.0, 3.0, 4.0]), 0.3), np.percentile(np.array([1.0, 5.0, 2.0]), 75))\n'
+        's = np.sort_complex(x)\n'
+        'print(s.real, np.vander(x, 3))\n'
+    ), compiler=_NO_TRAP)

@@ -13075,13 +13075,13 @@ def _callee_dummy_intent_is_in(lines, callee, arg_index):
     return False
 
 
-_DOMAIN_INTRINSIC_RE = re.compile(r"\b(?:sqrt|log|log10|asin|acos|acosh|atanh|gamma|log_gamma)\s*\(",
+_DOMAIN_INTRINSIC_RE = re.compile(r"\b(?:sqrt|log|log10|asin|acos|acosh|atanh|gamma|log_gamma|atan2)\s*\(",
                                   flags=re.IGNORECASE)
 
 
 def _name_in_domain_folded_expr(lines, name, tdecl, start, end):
     """True if a real or complex `name` is read inside sqrt, log, log10,
-    asin, acos, acosh, atanh, gamma or log_gamma, or in a statement with
+    asin, acos, acosh, atanh, gamma, log_gamma or atan2, or in a statement with
     `**`, in `lines[start:end]`. A constant-promotion pass then leaves it
     a variable: with `name` a parameter, gfortran evaluates the call at
     compile time and rejects an argument outside the domain (sqrt(-2.0)),
@@ -16976,6 +16976,9 @@ _CANONICAL_BATCH2_TARGETS = {
     "rot90": ["transpose"], "cov": ["var", "cov"], "divmod": [], "imag": ["zeros_like"], "asanyarray": ["asarray"],
     "matrix_rank": ["any", "where"], "vander": ["polyvander", "flip"], "resize": ["tile", "ravel"],
     "trim_zeros": ["argmax", "any", "where", "flip"],
+    "nansum": ["sum"], "nanprod": ["prod"], "nanmax": ["max"], "nanmin": ["min"], "nanargmax": ["argmax"],
+    "nanargmin": ["argmin"], "nanmean": ["mean"], "nanstd": ["std"], "nanvar": ["var"], "nanmedian": ["median"],
+    "nanpercentile": ["percentile"], "nanquantile": ["quantile"], "correlate": ["rint"],
     "diagonal": ["diagonal"], "cross": ["cross"], "trace": ["trace"], "outer": ["outer"],
     "vecdot": ["sum", "conj"], "matvec": ["matmul", "dot"], "vecmat": ["matmul", "dot", "conj"],
     "cumulative_sum": ["cumsum", "concatenate", "zeros"], "cumulative_prod": ["cumprod", "concatenate", "ones"], "invert": [], "bitwise_not": [], "left_shift": [], "right_shift": [], "bitwise_left_shift": [], "bitwise_right_shift": [],
@@ -31781,6 +31784,55 @@ class translator(ast.NodeVisitor):
             return f"rfft_axis_2d({a0}, {dim}{n_txt})"
         return f"irfft_axis_2d({a0}, {dim}{n_txt})"
 
+    # nan-functions of integer arrays (no NaN to skip): the plain ones.
+    _NAN_TO_PLAIN = {"nansum": "sum", "nanprod": "prod", "nanmax": "max", "nanmin": "min", "nanargmax": "argmax",
+                     "nanargmin": "argmin", "nanmean": "mean", "nanstd": "std", "nanvar": "var",
+                     "nanmedian": "median", "nanpercentile": "percentile", "nanquantile": "quantile"}
+    # Functions computed in floats: integer (and boolean) arguments are
+    # converted (the helpers take real arrays).
+    _FLOAT_ARGS = {"np": {"i0": 1, "sinc": 1, "signbit": 1, "logaddexp": 2, "logaddexp2": 2, "nextafter": 2,
+                          "isposinf": 1, "isneginf": 1, "correlate": 2},
+                   "fft": {n: 1 for n in ("fft", "ifft", "rfft", "irfft", "hfft", "ihfft", "fft2", "ifft2", "rfft2",
+                                          "irfft2", "fftn", "ifftn", "rfftn", "irfftn")},
+                   "linalg": {n: 1 for n in ("eigh", "eigvalsh", "qr", "svd", "svdvals", "slogdet", "pinv", "det",
+                                             "inv", "eig", "eigvals", "cholesky", "lstsq",
+                                             "solve", "norm", "cond")}}
+
+    def _canonical_int_args(self, node):
+        """numpy calls of integer arrays in terms of supported ones (see
+        _NAN_TO_PLAIN and _FLOAT_ARGS), else None."""
+        func = node.func
+        attr = func.attr
+        if is_numpy_name_node(func.value):
+            group = "np"
+        elif isinstance(func.value, ast.Attribute) and func.value.attr in {"fft", "linalg"} \
+                and is_numpy_name_node(func.value.value):
+            group = func.value.attr
+        else:
+            return None
+        if not node.args:
+            return None
+        kinds = [self._expr_kind(a) for a in node.args]
+        if group == "np" and attr in self._NAN_TO_PLAIN and kinds[0] in {"int", "logical"}:
+            return ast.Call(func=ast.Attribute(value=func.value, attr=self._NAN_TO_PLAIN[attr], ctx=ast.Load()),
+                            args=list(node.args), keywords=list(node.keywords))
+        nconv = self._FLOAT_ARGS[group].get(attr)
+        if nconv is None or not any(k in {"int", "logical"} for k in kinds[:nconv]):
+            return None
+
+        def astype_float(a):
+            return ast.Call(func=ast.Attribute(value=a, attr="astype", ctx=ast.Load()),
+                            args=[ast.Name(id="float", ctx=ast.Load())], keywords=[])
+        args = [astype_float(a) if i < nconv and k in {"int", "logical"} else a
+                for i, (a, k) in enumerate(zip(node.args, kinds))]
+        new = ast.Call(func=func, args=args, keywords=list(node.keywords))
+        if group == "np" and attr == "correlate" and all(k in {"int", "logical"} for k in kinds[:2]):
+            # numpy correlates integers in integers (exact in floats here).
+            new = ast.Call(func=ast.Attribute(value=ast.Call(func=ast.Attribute(
+                value=ast.Name(id="np", ctx=ast.Load()), attr="rint", ctx=ast.Load()), args=[new], keywords=[]),
+                attr="astype", ctx=ast.Load()), args=[ast.Name(id="int", ctx=ast.Load())], keywords=[])
+        return new
+
     def _canonical_batch2(self, node):
         """More numpy calls in terms of supported ones (see the coverage
         probe): asanyarray, nancumsum/nancumprod, logaddexp2, invert/
@@ -31789,6 +31841,9 @@ class translator(ast.NodeVisitor):
         literal k), cov of a matrix with rowvar=True (the default) or of a
         vector, isscalar/iscomplexobj/isrealobj, imag of a real array,
         matrix_rank of a vector, irfft of a real array."""
+        _ia = self._canonical_int_args(node)
+        if _ia is not None:
+            return _ia
         func = node.func
         attr = func.attr
         kws = list(node.keywords)
@@ -31830,6 +31885,20 @@ class translator(ast.NodeVisitor):
             # numpy: the rank of a vector is 1 unless it is all zeros.
             anyz = call("any", [ast.Compare(left=node.args[0], ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])])
             return call("where", [anyz, ast.Constant(value=1), ast.Constant(value=0)])
+        if (attr in {"eigh", "eigvalsh"} and isinstance(func.value, ast.Attribute) and func.value.attr == "linalg"
+                and is_numpy_name_node(func.value.value) and len(node.args) == 1 and kws):
+            args = list(node.args)
+            up = next((k.value for k in kws if k.arg == "UPLO"), None)
+            if up is None or not (isinstance(up, ast.Constant) and up.value in ("L", "U")) or len(kws) > 1:
+                return None
+            a = args[0]
+            if up.value == "U":
+                # The upper triangle of a is the lower triangle of a.T
+                # (the translation reads the lower one, as numpy's default).
+                if self._expr_kind(a) == "complex":
+                    return None
+                a = ast.Attribute(value=a, attr="T", ctx=ast.Load())
+            return ast.Call(func=func, args=[a], keywords=[])
         if (attr in {"tensorsolve", "tensorinv"} and isinstance(func.value, ast.Attribute)
                 and func.value.attr == "linalg" and is_numpy_name_node(func.value.value)):
             args = list(node.args)
@@ -31972,7 +32041,7 @@ class translator(ast.NodeVisitor):
         if attr == "imag" and len(args) == 1 and self._expr_kind(args[0]) in {"int", "real", "logical"}:
             # The imaginary part of a real array: zeros of its kind.
             return call("zeros_like", args)
-        if attr in {"cumulative_sum", "cumulative_prod"} and len(args) == 1 and kws:
+        if attr in {"cumulative_sum", "cumulative_prod"} and len(args) == 1:
             # numpy 2: include_initial=True puts the identity (0 or 1) first.
             kd = {k.arg: k.value for k in kws}
             if not set(kd) <= {"axis", "include_initial"}:
@@ -32184,6 +32253,41 @@ class translator(ast.NodeVisitor):
             return None
         return max(ks, key=self._KIND_ORDER.index)
 
+    _KIND_SAME = {"squeeze", "asarray_chkfinite", "trim_zeros", "resize", "nan_to_num", "reciprocal"}
+    _KIND_REAL_PART = {"real", "real_if_close"}
+    _KIND_INT_SUMS = {"cumulative_sum", "cumulative_prod"}
+    _KIND_PROMOTED = {"tensordot", "polyval", "polyder"}
+
+    def _kind_preserving_kind(self, node):
+        """The kind of numpy calls whose result keeps the kind of their
+        arguments (an integer array gives integers), else None:
+        squeeze/asarray_chkfinite/trim_zeros/resize/nan_to_num (the array's
+        kind), real/real_if_close (real for complex), cumulative_sum/prod
+        (int for booleans), tensordot/polyval/polyder (the promoted kind)."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args):
+            return None
+        attr = node.func.attr
+        v = node.func.value
+        if not (is_numpy_name_node(v) or (attr == "tensordot" and isinstance(v, ast.Attribute)
+                                          and v.attr == "linalg" and is_numpy_name_node(v.value))):
+            return None
+        if attr in self._KIND_SAME:
+            return self._expr_kind(node.args[0])
+        if attr in self._KIND_REAL_PART:
+            k = self._expr_kind(node.args[0])
+            return "real" if k == "complex" else k
+        if attr in self._KIND_INT_SUMS:
+            k = self._expr_kind(node.args[0])
+            return "int" if k == "logical" else k
+        if attr in self._KIND_PROMOTED:
+            ks = [self._expr_kind(a) for a in node.args[: 1 if attr == "polyder" else 2]]
+            if any(k is None for k in ks):
+                return None
+            if all(k in {"int", "logical"} for k in ks):
+                return "int"
+            return "complex" if "complex" in ks else "real"
+        return None
+
     def _expr_kind(self, node):
         self._normalize_negative_axis(node)
         _ixr = self._indexed_expression_kind_rank(node)
@@ -32212,6 +32316,9 @@ class translator(ast.NodeVisitor):
             return "int" if self._expr_kind(node.args[0]) in {"int", "logical"} else "real"
         if self._histogram_counts_call(node) is not None:
             return "int"
+        _kp = self._kind_preserving_kind(node)
+        if _kp is not None:
+            return _kp
         if (
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and is_numpy_name_node(node.func.value) and node.func.attr == "kron" and len(node.args) == 2
@@ -39012,7 +39119,9 @@ class translator(ast.NodeVisitor):
                     for _kw in node.keywords:
                         if _kw.arg == "axes" and isinstance(_kw.value, ast.Constant) and isinstance(_kw.value.value, int):
                             _axes = _kw.value.value
-                    return 0 if _axes >= 2 else 2
+                    # rank(a) + rank(b) - 2 * axes.
+                    return max(0, int(self._rank_expr(node.args[0]) or 0) + int(self._rank_expr(node.args[1]) or 0)
+                               - 2 * _axes)
                 if node.func.attr in {"matmul", "dot"} and len(node.args) >= 2:
                     r1 = self._rank_expr(node.args[0])
                     r2 = self._rank_expr(node.args[1])
@@ -45167,7 +45276,8 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "polyval"
                 and len(node.args) >= 2
             ):
-                return f"polyval(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp))"
+                pv = f"polyval(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp))"
+                return f"nint({pv})" if self._expr_kind(node) == "int" else pv
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -45194,8 +45304,11 @@ class translator(ast.NodeVisitor):
                         m_expr = self.expr(kw.value)
                         break
                 if m_expr is not None:
-                    return f"polyder(real({self.expr(node.args[0])}, kind=dp), int({m_expr}))"
-                return f"polyder(real({self.expr(node.args[0])}, kind=dp))"
+                    pd = f"polyder(real({self.expr(node.args[0])}, kind=dp), int({m_expr}))"
+                else:
+                    pd = f"polyder(real({self.expr(node.args[0])}, kind=dp))"
+                # Integer coefficients have integer derivatives.
+                return f"nint({pd})" if self._expr_kind(node) == "int" else pd
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -46187,12 +46300,20 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
-                nan_fill = "0.0_dp"
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    return a0
+                fills = {"nan": "0.0_dp", "posinf": "huge(0.0_dp)", "neginf": "(-huge(0.0_dp))"}
                 for kw in node.keywords:
-                    if kw.arg == "nan":
-                        nan_fill = self.expr(kw.value)
-                        break
-                return f"merge({nan_fill}, {a0}, ieee_is_nan({a0}))"
+                    if kw.arg in fills and not is_none(kw.value):
+                        v = self.expr(kw.value)
+                        fills[kw.arg] = v if self._expr_kind(kw.value) == "real" else f"real({v}, kind=dp)"
+                    elif kw.arg not in fills and kw.arg != "copy":
+                        raise NotImplementedError(f"np.nan_to_num: unsupported argument {kw.arg}=")
+                # numpy's defaults: 0 for NaN, the largest and the most
+                # negative float for +inf and -inf.
+                return (f"merge({fills['nan']}, merge({fills['posinf']}, merge({fills['neginf']}, {a0}, "
+                        f"{a0} < -huge(0.0_dp)), "
+                        f"{a0} > huge(0.0_dp)), ieee_is_nan({a0}))")
             np_attr = self._numpy_call_attr(node.func)
             if np_attr in {"mod", "remainder", "floor_divide"} and len(node.args) == 2 and not node.keywords:
                 # Python's floored division and modulo, same as `a // b` and
@@ -46549,6 +46670,21 @@ class translator(ast.NodeVisitor):
                                                   "to the array's shape")
                     # Not `fill + 0*a0`: 0*NaN and 0*inf are NaN.
                     return f"reshape(spread({fill}, 1, size({a0})), shape({a0}))"
+                if node.func.attr == "clip" and self._expr_kind(node.args[0]) == "real" and len(node.args) <= 3 \
+                        and all(kw.arg in {"a_min", "a_max", "min", "max"} for kw in node.keywords):
+                    # NaN stays NaN; a missing (None) bound is no bound (an
+                    # infinity stays infinite).
+                    bnd = [node.args[1] if len(node.args) > 1 else None, node.args[2] if len(node.args) > 2 else None]
+                    for kw in node.keywords:
+                        bnd[0 if kw.arg in {"a_min", "min"} else 1] = kw.value
+
+                    def _b(n, inf):
+                        if n is None or is_none(n):
+                            return f"ieee_value(1.0_dp, {inf})"
+                        v = self.expr(n)
+                        return v if self._expr_kind(n) == "real" else f"real({v}, kind=dp)"
+                    return (f"np_clip({self.expr(node.args[0])}, {_b(bnd[0], 'ieee_negative_inf')}, "
+                            f"{_b(bnd[1], 'ieee_positive_inf')})")
                 if node.func.attr == "clip":
                     a0 = self.expr(node.args[0])
                     a0_kind = self._expr_kind(node.args[0])
@@ -47750,7 +47886,11 @@ class translator(ast.NodeVisitor):
             ):
                 if len(node.args) == 1:
                     if self._rank_expr(node.args[0]) <= 1:
-                        return "reshape([1.0_dp], [1, 1])"
+                        # c / sqrt(c * c) for c = var(x): 1, or NaN for a
+                        # constant or non-finite x.
+                        v = self.expr(node.args[0])
+                        return (f"reshape([merge(1.0_dp, ieee_value(1.0_dp, ieee_quiet_nan), "
+                                f"all(ieee_is_finite({v})) .and. maxval({v}) > minval({v}))], [1, 1])")
                     rowvar = True
                     for kw in node.keywords:
                         if kw.arg == "rowvar" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
@@ -49020,7 +49160,11 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
-                if k0 in {"int", "logical"}:
+                if k0 == "int":
+                    # numpy's integer reciprocal is integer division (1 / 3
+                    # is 0).
+                    return f"(1 / ({a0}))"
+                if k0 == "logical":
                     a0 = f"real({a0}, kind=dp)"
                 return f"((1.0_dp / ({a0})))"
             if (
@@ -49270,7 +49414,13 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 b0 = self.expr(node.args[1])
-                return f"merge(1.0_dp, merge({b0}, 0.0_dp, ({a0}) == 0.0_dp), ({a0}) > 0.0_dp)"
+                if self._expr_kind(node.args[0]) != "real":
+                    a0 = f"real({a0}, kind=dp)"
+                if self._expr_kind(node.args[1]) != "real":
+                    b0 = f"real({b0}, kind=dp)"
+                # NaN stays NaN.
+                return (f"merge({a0}, merge(1.0_dp, merge({b0}, 0.0_dp, ({a0}) == 0.0_dp), ({a0}) > 0.0_dp), "
+                        f"ieee_is_nan({a0}))")
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -49289,6 +49439,8 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "real_if_close"
                 and len(node.args) == 1
             ):
+                if self._expr_kind(node.args[0]) != "complex":
+                    return self.expr(node.args[0])
                 return f"real({self.expr(node.args[0])}, kind=dp)"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -49351,6 +49503,10 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 if node.func.attr == "real":
+                    if self._expr_kind(node.args[0]) != "complex":
+                        # The real part of a real (or integer) array is the
+                        # array, of its own kind.
+                        return a0
                     return f"real({a0}, kind=dp)"
                 return f"aimag({a0})"
             if (
@@ -49378,7 +49534,15 @@ class translator(ast.NodeVisitor):
                     return f"(({a0}) * ({b0}))"
                 if node.func.attr in {"divide", "true_divide"}:
                     return f"(({a0}) / ({b0}))"
-                if node.func.attr in {"power", "pow", "float_power"}:
+                if node.func.attr == "float_power":
+                    # Always computed in floats (an integer to a negative
+                    # integer power is not 0).
+                    if self._expr_kind(node.args[0]) != "real":
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) not in {"real", "int"}:
+                        b0 = f"real({b0}, kind=dp)"
+                    return f"(({a0}) ** ({b0}))"
+                if node.func.attr in {"power", "pow"}:
                     return f"(({a0}) ** ({b0}))"
                 if node.func.attr in {"fmod", "remainder"}:
                     ak = self._expr_kind(node.args[0])
@@ -62691,8 +62855,15 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError(f"np.{name} takes one array")
             x = real_txt(call.args[0])
             if name == "frexp":
-                return f"fraction({x})" if k == 0 else f"exponent({x})"
-            return f"({x} - aint({x}))" if k == 0 else f"aint({x})"
+                # inf and NaN: the mantissa is x, the exponent 0 (as the C
+                # library on Linux; numpy's exponent is platform-dependent).
+                if k == 0:
+                    return f"merge(fraction({x}), {x}, ieee_is_finite({x}))"
+                return f"merge(exponent({x}), 0, ieee_is_finite({x}))"
+            # modf(+-inf) is (+-0, +-inf).
+            if k == 0:
+                return f"merge({x} - aint({x}), sign(0.0_dp, {x}), ieee_is_finite({x}) .or. ieee_is_nan({x}))"
+            return f"merge(aint({x}), {x}, ieee_is_finite({x}))"
         nc = self._b1_call(node)
         if nc is None:
             return None
