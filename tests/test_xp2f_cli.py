@@ -27136,3 +27136,51 @@ def test_xp2f_histogramdd_packbits(tmp_path: Path) -> None:
         'print(np.unpackbits(u), np.unpackbits(u, bitorder="little"), np.unpackbits(u, count=10), np.unpackbits(u, count=-3))\n'
         'print(np.unpackbits(u, count=30), np.unpackbits(np.packbits(b))[:11])\n'
     ))
+
+
+def test_xp2f_ix_block_broadcast_multi_dot(tmp_path: Path) -> None:
+    # X[np.ix_(rows, cols)] read and assigned (integer and boolean index
+    # vectors; scalar, row and matrix values), np.block, broadcast_shapes,
+    # broadcast_arrays of scalars with an array, multi_dot with vectors at
+    # the ends, tensorsolve and tensorinv of a matrix.
+    _xp2f_output_matches_numpy(tmp_path, "xixblock", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'm = np.array([[2.0, 1.0], [1.0, 3.0]])\n'
+        'm3 = np.arange(12.0).reshape(3, 4)\n'
+        'mi = np.arange(12).reshape(3, 4)\n'
+        'print(m3[np.ix_([0, 2], [1, 3])], mi[np.ix_(np.array([2, 0]), np.array([0]))], m3[np.ix_([True, False, True], [3, 0])])\n'
+        'rows = [1, 2]\n'
+        'c = m3.copy()\n'
+        'c[np.ix_(rows, [0, 2])] = -1.0\n'
+        'c[np.ix_([0], [1, 3])] = np.array([[7.0, 8.0]])\n'
+        'c[np.ix_([0, 2], [2, 3])] = np.array([5.0, 6.0])\n'
+        'ci = mi.copy()\n'
+        'ci[np.ix_([1], [0, 1])] = 9\n'
+        'print(c, ci, np.sum(m3[np.ix_(rows, rows)]))\n'
+        'print(np.block([[m, m], [m, 2 * m]]), np.block([[m, np.zeros((2, 1))], [np.ones((1, 2)), np.eye(1)]]), np.block([x[:2], x]))\n'
+        'print(np.broadcast_shapes((2, 1), (1, 3)), np.broadcast_shapes((4,), (3, 1)))\n'
+        'print(np.linalg.multi_dot([m, m, m]), np.linalg.multi_dot([x[:2], m, x[:2]]), np.linalg.multi_dot([x[:2], m, m]))\n'
+        'print(np.linalg.tensorsolve(m, x[:2]), np.linalg.tensorinv(m, ind=1))\n'
+        'A, B = np.broadcast_arrays(m, 2.5)\n'
+        'print(A, B, np.broadcast_arrays(3, x)[0], np.broadcast_arrays(x, 1)[1], np.broadcast_arrays(x, 2.0)[0])\n'
+    ))
+
+
+def test_xp2f_coverage_probe_fixes(tmp_path: Path) -> None:
+    # Found by numpy_conformance/coverage.py: r = np.flip(matrix expression,
+    # axis=) (np.vander), np.compress with a non-boolean condition (its
+    # truth values, not indices), asarray_chkfinite's rank, the helpers of
+    # bitwise_right_shift/bitwise_left_shift and np.resize.
+    _xp2f_output_matches_numpy(tmp_path, "xprobefix", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 0.0, -2.0, 3.25])\n'
+        'xi = np.array([3, 1, 4, 1])\n'
+        'r = np.vander(x)\n'
+        'print(r, np.vander(x, 3, increasing=True))\n'
+        'print(np.compress(x, x), np.compress(xi - 1, xi), np.compress([1, 0, 2], x))\n'
+        'c = np.asarray_chkfinite(x)\n'
+        'print(c, np.bitwise_right_shift(xi, 1), np.bitwise_left_shift(xi, 2), np.resize(x, 2), np.resize(xi, 7))\n'
+        'mt = np.flip(np.outer(x, xi), axis=1)\n'
+        'print(mt, np.flip(np.outer(x, xi), axis=0), np.flip(np.outer(x, xi)))\n'
+    ))

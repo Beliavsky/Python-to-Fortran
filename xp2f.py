@@ -6869,7 +6869,10 @@ def _tri_index_call(node):
 
 def _tri_index_parts(call):
     """(kind, rows, cols, k, from_array) of np.triu/tril/diag_indices(_from),
-    or None (an unsupported form)."""
+    or None (an unsupported form, such as a float n)."""
+    if any(isinstance(a, ast.Constant) and isinstance(a.value, float)
+           for a in list(call.args) + [k.value for k in call.keywords]):
+        return None
     name = call.func.attr
     kind = name.split("_")[0]
     args, kws = list(call.args), {k.arg: k.value for k in call.keywords}
@@ -7110,6 +7113,14 @@ def rewrite_numpy2_names(tree):
             return node
 
         def visit_Assign(self, node):
+            v = node.value
+            if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple)
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and is_np(v.func.value)
+                    and v.func.attr == "broadcast_arrays" and len(v.args) == len(node.targets[0].elts)):
+                # A, B = np.broadcast_arrays(a, b): one indexed call each.
+                return [ast.copy_location(ast.Assign(targets=[tg], value=ast.Subscript(
+                    value=copy.deepcopy(v), slice=ast.Constant(value=i), ctx=ast.Load())), node)
+                    for i, tg in enumerate(node.targets[0].elts)]
             # u, c = np.unique_counts(x)
             new = unique_call(node.value)
             if new is not None and len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple):
@@ -7132,7 +7143,8 @@ def rewrite_numpy2_names(tree):
             return node
 
     if not any(isinstance(n, ast.Attribute) and n.attr in {"concat", "permute_dims", "matrix_transpose", "astype",
-                                                            "matmul", "tensordot", "unique"} | set(_UNIQUE_FAMILY)
+                                                            "matmul", "tensordot", "unique", "broadcast_arrays"}
+                                                            | set(_UNIQUE_FAMILY)
                for n in ast.walk(tree)):
         return tree
     tree = _Rw().visit(tree)
@@ -16966,7 +16978,7 @@ _CANONICAL_BATCH2_TARGETS = {
     "trim_zeros": ["argmax", "any", "where", "flip"],
     "diagonal": ["diagonal"], "cross": ["cross"], "trace": ["trace"], "outer": ["outer"],
     "vecdot": ["sum", "conj"], "matvec": ["matmul", "dot"], "vecmat": ["matmul", "dot", "conj"],
-    "cumulative_sum": ["cumsum", "concatenate", "zeros"], "cumulative_prod": ["cumprod", "concatenate", "ones"], "invert": [], "bitwise_not": [], "left_shift": [], "right_shift": [],
+    "cumulative_sum": ["cumsum", "concatenate", "zeros"], "cumulative_prod": ["cumprod", "concatenate", "ones"], "invert": [], "bitwise_not": [], "left_shift": [], "right_shift": [], "bitwise_left_shift": [], "bitwise_right_shift": [],
 }
 
 
@@ -16979,9 +16991,12 @@ def detect_needed_helpers(tree):
             for target in _CANONICAL_BATCH2_TARGETS[node.func.attr]:
                 extra.append(ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=target,
                                                          ctx=ast.Load()), args=list(node.args), keywords=[]))
-            if node.func.attr in {"left_shift", "right_shift"} and len(node.args) == 2:
-                extra.append(ast.BinOp(left=node.args[0], op=ast.LShift() if node.func.attr == "left_shift"
+            if node.func.attr in {"left_shift", "right_shift", "bitwise_left_shift", "bitwise_right_shift"}                     and len(node.args) == 2:
+                extra.append(ast.BinOp(left=node.args[0], op=ast.LShift() if "left" in node.func.attr
                                        else ast.RShift(), right=node.args[1]))
+            if node.func.attr == "resize":
+                extra.append(ast.BinOp(left=ast.Name(id="n", ctx=ast.Load()), op=ast.FloorDiv(),
+                                       right=ast.Name(id="m", ctx=ast.Load())))
             if node.func.attr in {"resize", "trim_zeros"}:
                 # A slice of a call result.
                 extra.append(ast.Subscript(value=ast.Call(func=ast.Name(id="f", ctx=ast.Load()), args=[], keywords=[]),
@@ -31094,6 +31109,33 @@ class translator(ast.NodeVisitor):
             return
         node.slice.elts = list(elts) + [ast.Slice() for _ in range(r - len(elts))]
 
+    def _ix_parts(self, node):
+        """(X, [rows, cols]) of X[np.ix_(rows, cols)] for a matrix X, the
+        index vectors made 0-based integer arrays (a boolean mask through
+        np.flatnonzero), else None."""
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Call)
+                and isinstance(node.slice.func, ast.Attribute) and node.slice.func.attr == "ix_"
+                and is_numpy_name_node(node.slice.func.value)):
+            return None
+        call = node.slice
+        if len(call.args) != 2 or call.keywords:
+            raise NotImplementedError("np.ix_: only two index vectors (rows and columns) are supported")
+        if int(self._rank_expr(node.value) or 0) != 2:
+            raise NotImplementedError("X[np.ix_(rows, cols)]: X must be a matrix")
+        idx = []
+        for a in call.args:
+            if isinstance(a, (ast.List, ast.Tuple)):
+                a = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="array", ctx=ast.Load()),
+                             args=[a], keywords=[])
+            k = self._expr_kind(a)
+            if int(self._rank_expr(a) or 0) != 1 or k not in {"int", "logical"}:
+                raise NotImplementedError("np.ix_: the indices must be integer or boolean vectors")
+            if k == "logical":
+                a = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="flatnonzero",
+                                                ctx=ast.Load()), args=[a], keywords=[])
+            idx.append(a)
+        return node.value, idx
+
     def _canonical_numpy_call(self, node):
         """An equivalent, more directly translatable form of a numpy call
         or array method, or None: x.cumsum(axis=0) -> np.cumsum(x, axis=0);
@@ -31168,6 +31210,42 @@ class translator(ast.NodeVisitor):
                 a, b = node.value.args
                 cached = ast.fix_missing_locations(ast.copy_location(ast.BinOp(
                     left=a, op=ast.FloorDiv() if node.slice.value == 0 else ast.Mod(), right=b), node))
+                node._xp2f_canonical = cached
+            return cached
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "broadcast_arrays"
+                and is_numpy_name_node(node.value.func.value) and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int) and not node.value.keywords):
+            # Scalars broadcast against arrays of one rank; arrays of one
+            # rank whose shapes can only be compared at run time are left.
+            arrs = node.value.args
+            ranks = [int(self._rank_expr(a) or 0) for a in arrs]
+            k = node.slice.value
+            if not -len(arrs) <= k < len(arrs):
+                return None
+            k %= len(arrs)
+            big = [a for a, r in zip(arrs, ranks) if r > 0]
+            if len({r for r in ranks if r > 0}) > 1 or len(big) > 1:
+                raise NotImplementedError("np.broadcast_arrays: only scalars with arrays of one shape are supported")
+            if not big or ranks[k] > 0:
+                return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="copy",
+                                                   ctx=ast.Load()), args=[arrs[k]], keywords=[]) if big else arrs[k]
+            kind = self._expr_kind(arrs[k])
+            dt = {"int": "int", "logical": "bool", "complex": "complex"}.get(kind, "float")
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="full_like",
+                                               ctx=ast.Load()), args=[big[0], arrs[k]],
+                            keywords=[ast.keyword(arg="dtype", value=ast.Name(id=dt, ctx=ast.Load()))])
+        ix = self._ix_parts(node)
+        if ix is not None and isinstance(node.ctx, ast.Load):
+            cached = getattr(node, "_xp2f_canonical", None)
+            if cached is None:
+                x, (r, c) = ix
+
+                def take(a, idx, axis):
+                    return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="take",
+                                                       ctx=ast.Load()), args=[a, idx],
+                                    keywords=[ast.keyword(arg="axis", value=ast.Constant(value=axis))])
+                cached = ast.fix_missing_locations(ast.copy_location(take(take(x, r, 0), c, 1), node))
                 node._xp2f_canonical = cached
             return cached
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
@@ -31752,6 +31830,19 @@ class translator(ast.NodeVisitor):
             # numpy: the rank of a vector is 1 unless it is all zeros.
             anyz = call("any", [ast.Compare(left=node.args[0], ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])])
             return call("where", [anyz, ast.Constant(value=1), ast.Constant(value=0)])
+        if (attr in {"tensorsolve", "tensorinv"} and isinstance(func.value, ast.Attribute)
+                and func.value.attr == "linalg" and is_numpy_name_node(func.value.value)):
+            args = list(node.args)
+            if attr == "tensorsolve" and len(args) == 2 and not kws and int(self._rank_expr(args[0]) or 0) == 2 \
+                    and int(self._rank_expr(args[1]) or 0) == 1:
+                # A matrix and a vector: an ordinary linear system.
+                return ast.Call(func=ast.Attribute(value=func.value, attr="solve", ctx=ast.Load()), args=args,
+                                keywords=[])
+            if attr == "tensorinv" and len(args) == 1 and int(self._rank_expr(args[0]) or 0) == 2 and all(
+                    k.arg == "ind" and isinstance(k.value, ast.Constant) and k.value.value == 1 for k in kws):
+                return ast.Call(func=ast.Attribute(value=func.value, attr="inv", ctx=ast.Load()), args=args,
+                                keywords=[])
+            return None
         if not is_numpy_name_node(func.value):
             return None
         args = list(node.args)
@@ -31797,6 +31888,10 @@ class translator(ast.NodeVisitor):
             cond, a = args[0], args[1]
             if isinstance(cond, (ast.List, ast.Tuple)):
                 cond = call("array", [cond])
+            if self._expr_kind(cond) != "logical":
+                # numpy takes the condition's truth values (nonzero), not
+                # indices.
+                cond = ast.Compare(left=cond, ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])
             ax = kw("axis", 2)
             axv = None if ax is None or (isinstance(ax, ast.Constant) and ax.value is None) else lit_int(ax)
             if ax is not None and axv is None and not (isinstance(ax, ast.Constant) and ax.value is None):
@@ -31916,6 +32011,36 @@ class translator(ast.NodeVisitor):
             new = copy.copy(node)
             new.func = npf("vecdot", "linalg")
             return new
+        if attr == "block" and len(args) == 1 and not kws and isinstance(args[0], (ast.List, ast.Tuple)):
+            rows = args[0].elts
+            if rows and all(isinstance(r, (ast.List, ast.Tuple)) for r in rows):
+                # [[A, B], [C, D]]: each row joined along axis 1, then the
+                # rows along axis 0 (blocks must be matrices).
+                parts = []
+                for r in rows:
+                    if any(int(self._rank_expr(e) or 0) != 2 for e in r.elts):
+                        return None
+                    parts.append(r.elts[0] if len(r.elts) == 1 else call(
+                        "concatenate", [ast.Tuple(elts=list(r.elts), ctx=ast.Load())],
+                        [ast.keyword(arg="axis", value=ast.Constant(value=1))]))
+                return parts[0] if len(parts) == 1 else call("concatenate", [ast.Tuple(elts=parts, ctx=ast.Load())])
+            if any(int(self._rank_expr(e) or 0) != 1 for e in rows):
+                return None
+            return call("concatenate", [ast.Tuple(elts=list(rows), ctx=ast.Load())])
+        if attr == "broadcast_shapes" and args and all(isinstance(a, (ast.Tuple, ast.List)) for a in args):
+            shapes = [list(a.elts) for a in args]
+            nd = max(len(s) for s in shapes)
+            out = []
+            for i in range(nd):
+                dims = [s[len(s) - nd + i] for s in shapes if len(s) - nd + i >= 0]
+                lits = [d.value for d in dims if isinstance(d, ast.Constant) and isinstance(d.value, int)]
+                if len(lits) != len(dims):
+                    return None
+                big = {v for v in lits if v != 1}
+                if len(big) > 1:
+                    raise NotImplementedError(f"np.broadcast_shapes: shapes {ast.unparse(node)} do not broadcast")
+                out.append(ast.Constant(value=big.pop() if big else 1))
+            return ast.Tuple(elts=out, ctx=ast.Load())
         if attr == "linspace" and len(args) == 2:
             # num= (default 50) as the third positional argument.
             num = next((k.value for k in kws if k.arg == "num"), ast.Constant(value=50))
@@ -38943,7 +39068,7 @@ class translator(ast.NodeVisitor):
                     return 2 if r0 <= 1 else r0
                 if node.func.attr == "unravel_index" and len(node.args) >= 2:
                     return 1
-                if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "atan", "asin", "acos", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh", "angle", "real", "imag", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor", "degrees", "radians", "deg2rad", "rad2deg", "exp2", "cbrt", "square", "reciprocal", "positive", "negative", "unwrap", "cumulative_sum", "cumulative_prod", "bitwise_count", "nancumsum", "nancumprod", "ediff1d", "expm1", "log1p", "sinc", "i0", "signbit", "spacing", "amax", "amin", "nan_to_num", "real_if_close", "interp"} and len(node.args) >= 1:
+                if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "atan", "asin", "acos", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh", "angle", "real", "imag", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor", "degrees", "radians", "deg2rad", "rad2deg", "exp2", "cbrt", "square", "reciprocal", "positive", "negative", "unwrap", "cumulative_sum", "cumulative_prod", "bitwise_count", "nancumsum", "nancumprod", "ediff1d", "expm1", "log1p", "sinc", "i0", "signbit", "spacing", "asarray_chkfinite", "amax", "amin", "nan_to_num", "real_if_close", "interp"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"logaddexp", "logaddexp2", "ldexp", "nextafter", "gcd", "lcm", "add", "subtract", "multiply", "divide", "true_divide", "power", "pow", "float_power", "fmod", "remainder", "fmax", "fmin", "heaviside"} and len(node.args) >= 2:
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
@@ -39144,6 +39269,12 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "eigvalsh" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "multi_dot" and len(node.args) >= 1:
+                    # A 1-D first (last) array is a row (column) vector:
+                    # the result loses that axis.
+                    _md = node.args[0]
+                    if isinstance(_md, (ast.List, ast.Tuple)) and len(_md.elts) >= 2:
+                        return int(int(self._rank_expr(_md.elts[0]) or 0) == 2) + int(
+                            int(self._rank_expr(_md.elts[-1]) or 0) == 2)
                     return 2
             if self._pandas_df_row_reduction_spec(node) is not None:
                 # X.sum(axis=1)/etc. on a DataFrame (or a chained
@@ -39723,6 +39854,14 @@ class translator(ast.NodeVisitor):
                 a0 = f"merge(1, 0, {a0})"
             k_txt = "" if k_node is None else f", int({self.expr(k_node)})"
             return f"{node.func.attr}({a0}{k_txt})"
+        _ix = self._ix_parts(node)
+        if _ix is not None:
+            # X[np.ix_(rows, cols)]: Fortran vector subscripts (the
+            # canonical np.take form serves the kind and rank).
+            _xt = self.expr(_ix[0])
+            if not re.fullmatch(r"[A-Za-z_]\w*(?:%\w+)*", _xt):
+                raise NotImplementedError("X[np.ix_(rows, cols)]: X must be a named array")
+            return f"{_xt}({self.expr(_ix[1][0])} + 1, {self.expr(_ix[1][1])} + 1)"
         _canon = self._canonical_numpy_call(node)
         if _canon is not None:
             return self.expr(_canon)
@@ -45497,8 +45636,15 @@ class translator(ast.NodeVisitor):
                 if not isinstance(_mats, (ast.List, ast.Tuple)) or len(_mats.elts) < 2:
                     raise NotImplementedError("np.linalg.multi_dot requires a literal list/tuple of at least 2 matrices")
                 _chain = self.expr(_mats.elts[0])
+                _crank = int(self._rank_expr(_mats.elts[0]) or 0)
                 for _m in _mats.elts[1:]:
-                    _chain = f"matmul({_chain}, {self.expr(_m)})"
+                    _mrank = int(self._rank_expr(_m) or 0)
+                    if _crank == 1 and _mrank == 1:
+                        _chain = f"dot_product({_chain}, {self.expr(_m)})"
+                        _crank = 0
+                    else:
+                        _chain = f"matmul({_chain}, {self.expr(_m)})"
+                        _crank = _crank + _mrank - 2
                 return _chain
             if self._is_linalg_call(node.func, {"cond"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
@@ -47167,6 +47313,8 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "tri"
                 and len(node.args) >= 1
             ):
+                if any(self._expr_kind(a) not in {"int", "logical"} for a in node.args[:3]):
+                    raise NotImplementedError("np.tri: N, M and k must be integers")
                 n0 = self.expr(node.args[0])
                 m0 = self.expr(node.args[1]) if len(node.args) >= 2 else n0
                 k0 = self.expr(node.args[2]) if len(node.args) >= 3 else "0"
@@ -54749,6 +54897,25 @@ class translator(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
+        if len(node.targets) == 1 and self._ix_parts(node.targets[0]) is not None:
+            # X(rows + 1, cols + 1) = v: Fortran's vector subscripts (numpy
+            # also assigns repeated indices in order, the last value winning).
+            x, (r, c) = self._ix_parts(node.targets[0])
+            xt = self.expr(x)
+            rt, ct = self.expr(r), self.expr(c)
+            v = node.value
+            vt = self.expr(v)
+            kx, kv = self._expr_kind(x), self._expr_kind(v)
+            if kx == "real" and kv in {"int", "logical"}:
+                vt = f"real({vt}, kind=dp)"
+            elif kx == "int" and kv == "real":
+                vt = f"int({vt})"
+            rv = int(self._rank_expr(v) or 0)
+            if rv == 1:
+                # A row broadcast over the selected rows.
+                vt = f"spread({vt}, 1, size({rt}))"
+            self.o.w(f"{xt}({rt} + 1, {ct} + 1) = {vt}")
+            return
         for _tgt in node.targets:
             self._pad_partial_index(_tgt)
         if isinstance(node.value, (ast.Call, ast.Subscript)) and not (
@@ -61305,6 +61472,9 @@ class translator(ast.NodeVisitor):
                 isinstance(v.args[0], ast.Name)
                 or (isinstance(v.args[0], ast.Subscript) and isinstance(v.args[0].slice, ast.Slice))
             )
+            # np.flip of a numeric expression (any axis=) is translated by
+            # expr (reversed_vec / reversed_mat).
+            and (v.func.attr == "flipud" or self._expr_kind(v.args[0]) == "char")
         ):
             name = t.id
             r0 = int(self._rank_expr(v.args[0]))
@@ -62591,6 +62761,9 @@ class translator(ast.NodeVisitor):
         if name in self._WINDOWS:
             if not call.args or call.keywords or len(call.args) != (2 if name == "kaiser" else 1):
                 raise NotImplementedError(f"np.{name} takes M" + (" and beta" if name == "kaiser" else ""))
+            if self._expr_kind(call.args[0]) not in {"int", "logical"}:
+                # numpy takes a float M as arange(M) does (ceil(M) points).
+                raise NotImplementedError(f"np.{name}: M must be an integer")
             beta = f", beta={real_txt(call.args[1])}" if name == "kaiser" else ""
             return f'np_window("{name}", int({self.expr(call.args[0])}){beta})'
         if name in {"fftshift", "ifftshift"}:
