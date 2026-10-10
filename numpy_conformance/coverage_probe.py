@@ -7,6 +7,9 @@ through xp2f.py and compared with numpy.
     python numpy_conformance/coverage_probe.py genvar
     python numpy_conformance/coverage_probe.py run --variants [START STOP] ...
     python numpy_conformance/coverage_probe.py report --variants
+    python numpy_conformance/coverage_probe.py genops
+    python numpy_conformance/coverage_probe.py run --ops [START STOP] ...
+    python numpy_conformance/coverage_probe.py report --ops
 
 gen picks, for each public function of numpy, numpy.linalg, numpy.fft and
 the six numpy.polynomial modules, the first argument list from a fixed
@@ -41,6 +44,12 @@ a variant is kept when numpy accepts it without a warning. They are run
 and reported with --variants (coverage/variant_results.txt,
 coverage/variant_report.md).
 
+genops makes cases of array methods, operators (broadcasting, scalars,
+integer and boolean operands, in-place operators) and indexing (reads,
+writes, views) from the statement templates of ops_cases.py, for the
+base fixtures and each variant set; run and report them with --ops
+(coverage/ops_results.txt, coverage/ops_report.md).
+
 The work files (the programs and executables) are in coverage/work.
 """
 
@@ -66,6 +75,11 @@ XP2F = HERE.parent / "xp2f.py"
 CASES = OUT / "cases.json"
 RESULTS = OUT / "results.txt"
 VCASES = OUT / "variants.json"
+OCASES = OUT / "ops.json"
+ORESULTS = OUT / "ops_results.txt"
+# Scratch names of the statement templates (ops_cases.py), renamed per case
+# in a grouped program as the fixtures are.
+SCRATCH = ("y", "z", "r")
 # Without -ffpe-trap: compare the values a build without the debug traps
 # computes (numpy returns NaN and inf where the trap would stop).
 BUILD = ["--compile", "--compiler", "gfortran -O0 -g -fcheck=all -fbacktrace"]
@@ -145,6 +159,10 @@ KNOWN.update({
     "np.resize[empty]": "resizing an empty array",
     "np.vander[empty]": "an empty array",
 })
+# Ops cases: numpy's default (unstable) sort orders ties differently.
+for _a in ("x", "xi", "m", "mr"):
+    for _s in (f"r = {_a}.argsort() [ties]", f"r = {_a}.argsort(axis=1) [ties]"):
+        KNOWN[_s] = "the order of ties: numpy's default sort is not stable (the translation's is)"
 for _n in ("pinv", "qr", "svd", "svdvals"):
     KNOWN[f"np.linalg.{_n}[empty]"] = "empty matrices are not supported (LAPACK reports an illegal argument)"
 for _n in ("fft", "ifft", "rfft", "fftn", "ifftn", "rfftn", "ihfft", "fft2", "ifft2", "rfft2"):
@@ -245,7 +263,44 @@ def gen_variants() -> None:
     print(len(out), "variants of", len({o["name"].split("[")[0] for o in out}), "functions")
 
 
+def gen_ops() -> None:
+    """Statement cases (ops_cases.templates): methods, operators and
+    indexing, for the base fixtures and each VARIANTS set, kept when numpy
+    runs them without a warning and r is a small numeric array; grouped
+    12 to a program by kind."""
+    import numpy as np
+    sys.path.insert(0, str(HERE))
+    import ops_cases
+    out, per_group = [], {}
+    for g, stmts in ops_cases.templates():
+        for v, fx in [("base", {})] + list(VARIANTS.items()):
+            env = {"np": np}
+            for k, src in dict(FIX, **fx).items():
+                env[k] = eval(src, env)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    exec("\n".join(stmts), env)
+            except Exception:
+                continue
+            r = env.get("r")
+            if isinstance(r, tuple) or _numeric_parts(r) is None:
+                continue
+            k = per_group.get(g, 0)
+            per_group[g] = k + 1
+            out.append({"name": f"{'; '.join(stmts)} [{v}]", "stmts": stmts, "fixtures": fx,
+                        "group": f"{g}_{k // 12}"})
+    OCASES.write_text(json.dumps(out, indent=0), encoding="utf-8")
+    print(len(out), "cases from", len(ops_cases.templates()), "templates")
+
+
+def _rename(line: str, names, k) -> str:
+    return re.sub(r"(?<![.\w])(" + "|".join(names) + r")\b", lambda mm: f"{mm.group(1)}_{k}", line) if names else line
+
+
 def _program(case) -> str:
+    if "stmts" in case:
+        return _header(case.get("fixtures")) + "\n".join(case["stmts"]) + "\nprint(r)\n"
     head = _header(case.get("fixtures"))
     k = case.get("parts", 0)
     if k:
@@ -343,6 +398,16 @@ def _group_program(cases) -> tuple[str, list[tuple[int, int]]]:
     for k, c in enumerate(cases):
         first = len(lines) + 1
         fx = dict(FIX, **(c.get("fixtures") or {}))
+        if "stmts" in c:
+            code = "\n".join(c["stmts"])
+            used = [n for n in fx if re.search(rf"(?<![.\w]){n}\b", code)]
+            for n in used:
+                lines.append(f"{n}_{k} = {fx[n]}")
+            lines.append(f'print("{MARK} {k}")')
+            lines += [_rename(s, used + list(SCRATCH), k) for s in c["stmts"]]
+            lines.append(f"print(r_{k})")
+            spans.append((first, len(lines)))
+            continue
         expr = c["expr"]
         used = [n for n in fx if re.search(rf"\b{n}\b", expr)]
         for n in used:
@@ -393,9 +458,10 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
     translate (the error names its line) or stops the program is recorded
     and the program built again without it; a build error falls back to
     one program per case."""
-    if len(cases) == 1:
+    if len(cases) == 1 and "stmts" not in cases[0]:
         return {cases[0]["name"]: _run_one(cases[0])}
-    tag = re.sub(r"\W", "_", cases[0]["name"].split("[")[0].replace("np.", "")).strip("_") + "_var"
+    tag = (cases[0]["group"] if "group" in cases[0] else
+           re.sub(r"\W", "_", cases[0]["name"].split("[")[0].replace("np.", "")).strip("_") + "_var")
     res = {}
     todo = list(cases)
     try:
@@ -417,6 +483,12 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
                 del todo[bad]
                 continue
             if "Build: FAIL" in out:
+                if len(todo) > 2:
+                    # Bisect: a build error can't be placed in a case.
+                    half = len(todo) // 2
+                    for part, suffix in ((todo[:half], "a"), (todo[half:], "b")):
+                        res.update(_run_group([dict(c, group=f"{c.get('group', tag)}{suffix}") for c in part]))
+                    todo = []
                 break
             exe = WORK / f"cv_{tag}_p.exe"
             r = subprocess.run([str(exe)], cwd=WORK, capture_output=True, text=True, timeout=120)
@@ -434,12 +506,40 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
                 res[todo[stopped]["name"]] = ("RUN-FAIL", (r.stderr.strip().splitlines() or [""])[0][:160])
                 todo = todo[stopped + 1:]
         for c in todo:
-            res[c["name"]] = _run_one(c)
+            res[c["name"]] = _run_one(c) if "stmts" not in c else _run_group_single(c)
     finally:
         for f in WORK.glob(f"cv_{tag}_p*"):
             if f.suffix not in {".f90", ".py"}:
                 f.unlink(missing_ok=True)
     return res
+
+
+def _run_group_single(case) -> tuple[str, str]:
+    """A statement case run alone (a one-case group program)."""
+    c = dict(case, group=case.get("group", "ops") + "_1")
+    src_txt, _ = _group_program([c])
+    src = WORK / f"cv_{c['group']}.py"
+    src.write_text(src_txt, encoding="utf-8")
+    try:
+        py = subprocess.run([sys.executable, "-W", "ignore", src.name], cwd=WORK, capture_output=True, text=True)
+        p = _xp2f(src)
+        out = p.stdout + p.stderr
+        if "Transpile: FAIL" in out or (p.returncode != 0 and "Build:" not in out):
+            m = re.search(r"Transpile: FAIL \((.*?)(?: at line \d+.*)?\)\s*$", out, re.M)
+            tail = out.strip().splitlines()
+            return "XLATE-FAIL", (m.group(1) if m else (tail[-1] if tail else "?"))[:160]
+        if "Build: FAIL" in out:
+            m = re.search(r"Error: (.*)", out)
+            return "BUILD-FAIL", (m.group(1) if m else "")[:160]
+        r = subprocess.run([str(WORK / f"cv_{c['group']}_p.exe")], cwd=WORK, capture_output=True, text=True,
+                           timeout=60)
+        if r.returncode != 0:
+            return "RUN-FAIL", (r.stderr.strip().splitlines() or [""])[0][:160]
+        return _compare(_blocks(py.stdout).get(0, ""), _blocks(r.stdout).get(0, ""))
+    finally:
+        for f in WORK.glob(f"cv_{c['group']}_p*"):
+            if f.suffix not in {".f90", ".py"}:
+                f.unlink(missing_ok=True)
 
 
 def _read_results(path: Path) -> dict[str, tuple[str, str]]:
@@ -451,8 +551,9 @@ def _read_results(path: Path) -> dict[str, tuple[str, str]]:
     return res
 
 
-def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool = False) -> None:
-    cases_path, results = (VCASES, VRESULTS) if variants else (CASES, RESULTS)
+def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool = False, ops: bool = False) -> None:
+    cases_path, results = (OCASES, ORESULTS) if ops else (VCASES, VRESULTS) if variants else (CASES, RESULTS)
+    variants = variants or ops
     cases = json.loads(cases_path.read_text(encoding="utf-8"))[start:stop]
     WORK.mkdir(parents=True, exist_ok=True)
     done = _read_results(results)
@@ -473,7 +574,7 @@ def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool
     # the time).
     groups = {}
     for c in todo:
-        groups.setdefault(c["name"].split("[")[0] if variants else c["name"], []).append(c)
+        groups.setdefault(c.get("group") or (c["name"].split("[")[0] if variants else c["name"]), []).append(c)
 
     def one(group):
         try:
@@ -490,12 +591,13 @@ def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool
     print(f"{len(todo)} run:", dict(counts))
 
 
-def report(variants: bool = False) -> None:
-    res = _read_results(VRESULTS if variants else RESULTS)
+def report(variants: bool = False, ops: bool = False) -> None:
+    res = _read_results(ORESULTS if ops else VRESULTS if variants else RESULTS)
     counts = Counter(st for st, _ in res.values())
     order = ["DIFF", "KIND", "RUN-FAIL", "BUILD-FAIL", "XLATE-FAIL", "PROBE-ERROR", "NOARGS", "MATCH"]
-    title = "numpy coverage probe: input variants" if variants else "numpy coverage probe"
-    lines = [f"# {title}", "", f"{len(res)} {'variants' if variants else 'functions'}.", "",
+    title = ("numpy coverage probe: methods, operators, indexing" if ops else
+             "numpy coverage probe: input variants" if variants else "numpy coverage probe")
+    lines = [f"# {title}", "", f"{len(res)} {'cases' if ops else 'variants' if variants else 'functions'}.", "",
              "| status | count |", "|---|---|"]
     lines += [f"| {st} | {counts[st]} |" for st in order if counts[st]]
     for st in order[:-2]:
@@ -507,11 +609,11 @@ def report(variants: bool = False) -> None:
     if known:
         lines += ["", "## Known differences", ""] + [f"- `{n}` ({res[n][0]}): {KNOWN.get(n) or KNOWN[n.split('[')[0]]}"
                                                        for n in known]
-    if not variants:
+    if not variants and not ops:
         lines += ["", "## NOARGS", "", ", ".join(f"`{n}`" for n in sorted(n for n, v in res.items()
                                                                           if v[0] == "NOARGS"))]
-    (OUT / ("variant_report.md" if variants else "report.md")).write_text("\n".join(lines) + "\n",
-                                                                         encoding="utf-8")
+    (OUT / ("ops_report.md" if ops else "variant_report.md" if variants else "report.md")).write_text(
+        "\n".join(lines) + "\n", encoding="utf-8")
     print(dict(counts))
 
 
@@ -520,23 +622,28 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("gen")
     sub.add_parser("genvar")
+    sub.add_parser("genops")
     pr = sub.add_parser("run")
     pr.add_argument("start", nargs="?", type=int, default=0)
     pr.add_argument("stop", nargs="?", type=int, default=None)
     pr.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     pr.add_argument("--redo", nargs="*", default=[])
     pr.add_argument("--variants", action="store_true", help="run the variants (genvar) instead")
+    pr.add_argument("--ops", action="store_true", help="run the methods/operators/indexing cases (genops)")
     rp = sub.add_parser("report")
     rp.add_argument("--variants", action="store_true")
+    rp.add_argument("--ops", action="store_true")
     args = ap.parse_args()
     if args.cmd == "gen":
         gen()
     elif args.cmd == "genvar":
         gen_variants()
+    elif args.cmd == "genops":
+        gen_ops()
     elif args.cmd == "run":
-        run(args.start, args.stop, args.jobs, args.redo, args.variants)
+        run(args.start, args.stop, args.jobs, args.redo, args.variants, args.ops)
     else:
-        report(args.variants)
+        report(args.variants, args.ops)
     return 0
 
 

@@ -27268,3 +27268,166 @@ def test_xp2f_variant_probe_integer_args_and_inf(tmp_path: Path) -> None:
         's = np.sort_complex(x)\n'
         'print(s.real, np.vander(x, 3))\n'
     ), compiler=_NO_TRAP)
+
+
+def test_xp2f_ops_probe_methods(tmp_path: Path) -> None:
+    # Found by coverage_probe.py genops: clip(min=)/clip(max=), x.imag of a
+    # real array, method kinds (transpose, ndim, dot, real, cumsum()[k]),
+    # round/repeat/nonzero/argsort/take/squeeze methods, x.mean().round(),
+    # x.nonzero()[0] (the index array, not its first element), sort() of a
+    # matrix, astype(bool) and dot of booleans, swapaxes, repeat of a matrix.
+    for k, code in enumerate([(
+        'import numpy as np\n'
+        'x = np.array([3, 1, -4, 2])\n'
+        'xf = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'm = np.array([[2, 1], [1, 3]])\n'
+        'b = np.array([True, False, True])\n'
+        'r1 = x.clip(min=0)\n'
+        'r2 = x.clip(max=2)\n'
+        'r3 = xf.clip(min=0)\n'
+        'r4 = x.transpose()\n'
+        'r5 = x.ndim\n'
+        'r6 = x.dot(x)\n'
+        'r7 = x.real\n'
+        'r8 = x.imag\n'
+        'r9 = xf.imag\n'
+        'r10 = x.cumsum()[-1]\n'
+        'r11 = m.T.dot(m)\n'
+        'r12 = b.sum()\n'
+        'r13 = x.squeeze()\n'
+        'r14 = xf.real\n'
+        'print(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, m.size, x.size + 1)\n'
+    ), (
+        'import numpy as np\n'
+        'x = np.array([0.55, 1.5, -2.25, 3.25])\n'
+        'xi = np.array([3, 1, 4, 1])\n'
+        'b = np.array([True, False, True, True])\n'
+        'm = np.array([[2.0, 1.0], [1.0, 3.0]])\n'
+        'r1 = x.round(1)\n'
+        'r2 = xi.round()\n'
+        'r3 = x.repeat(2)\n'
+        'r4 = xi.nonzero()[0]\n'
+        'r5 = x.argsort()\n'
+        'r6 = x.take([0, 1])\n'
+        'r7 = x.mean().round(3)\n'
+        'r8 = xi.squeeze()\n'
+        'r9 = b.repeat(2)\n'
+        'r10 = m.round()\n'
+        'r11 = b.argsort()\n'
+        'print(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, xi.argsort(), m.argsort(axis=1), x.round())\n'
+    ), (
+        'import numpy as np\n'
+        'm = np.array([[3.0, 1.0, 2.0], [0.5, -1.0, 4.0]])\n'
+        'mi = np.array([[3, 1], [0, -2]])\n'
+        'b = np.array([True, False, True])\n'
+        'c = np.array([False, False, True])\n'
+        'y = m.copy()\n'
+        'y.sort()\n'
+        'z = m.copy()\n'
+        'z.sort(axis=0)\n'
+        'w = mi.copy()\n'
+        'w.sort(axis=1)\n'
+        'r1 = b.astype(bool)\n'
+        'r2 = b.dot(c)\n'
+        'r3 = b.dot(~b)\n'
+        'print(y, z, w, r1, r2, r3)\n'
+    ), (
+        'import numpy as np\n'
+        'm = np.array([[3.0, 1.0, 2.0], [0.5, -1.0, 4.0]])\n'
+        'col = np.array([[1.0], [2.0], [5.0]])\n'
+        'r = col.T\n'
+        'print(m.swapaxes(0, 1), m.repeat(2), np.repeat(m, 2), col.squeeze(axis=1), np.squeeze(r, axis=0), r.squeeze(0))\n'
+    )]):
+        _xp2f_output_matches_numpy(tmp_path, f"xopsm{k}", code, check_kinds=True)
+
+
+def test_xp2f_ops_probe_operators(tmp_path: Path) -> None:
+    # Integer / with broadcasting is true division; // of floats with NaN
+    # and inf as numpy's floor_divide; booleans in arithmetic are 0/1;
+    # %= and **= with Python's %; keepdims reductions as columns and rows;
+    # negative fancy indices.
+    _xp2f_output_matches_numpy(tmp_path, "xopso0", (
+        'import numpy as np\n'
+        'm = np.array([[2, 1], [1, 3]])\n'
+        'xi = np.array([3, 1, -4, 2])\n'
+        'x = np.array([0.5, np.nan, -2.0, np.inf, -7.5, 1e20])\n'
+        'r1 = m / xi[:2]\n'
+        'r2 = xi[:2] / m\n'
+        'r3 = 2.5 // x\n'
+        'r4 = x // 2.0\n'
+        'r5 = -7.0 // 2.0\n'
+        'print(r1, r2, r3, r4, r5, x // -3.0, np.floor_divide(x, 4.0))\n'
+    ), compiler=_NO_TRAP)
+    _xp2f_output_matches_numpy(tmp_path, "xopso1", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'xi = np.array([3, 1, -4, 2])\n'
+        'b = np.array([True, False, True, True])\n'
+        'r1 = b * x\n'
+        'r2 = x * b\n'
+        'r3 = b + xi\n'
+        'r4 = b / x\n'
+        'r5 = xi - b\n'
+        'r6 = (x > 0) * x\n'
+        'r7 = 2 * b\n'
+        'print(r1, r2, r3, r4, r5, r6, r7, b * 1.5, (b * x).sum(), x[b] * b[b], b // xi, xi % (b + 1))\n'
+    ), check_kinds=True)
+    _xp2f_output_matches_numpy(tmp_path, "xopso2", (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'xi = np.array([3, -1, 4, -2])\n'
+        'm = np.array([[2.0, 1.0, 4.0], [1.0, 3.0, 5.0]])\n'
+        'i = np.array([-1, 0, 2])\n'
+        'y = xi.copy()\n'
+        'y %= 3\n'
+        'z = x.copy()\n'
+        'z %= 1.5\n'
+        'w = x.copy()\n'
+        'w **= 2\n'
+        'v = xi.copy()\n'
+        'v **= 2\n'
+        'r1 = m / m.sum(axis=1, keepdims=True)\n'
+        'r2 = m - m.mean(axis=0, keepdims=True)\n'
+        'r3 = m - np.max(m, axis=1, keepdims=True)\n'
+        'print(y, z, w, v, r1, r2, r3, x[[-1, 0, 0]], x[i], x[np.array([-2, 1])], (m > m.mean(axis=1, keepdims=True)).sum())\n'
+    ))
+
+
+def test_xp2f_ops_probe_broadcast_indexing(tmp_path: Path) -> None:
+    # Column and row vectors made with reshape (inline and named, also in
+    # comparisons), the outer combination x[:, None] - y, x[None],
+    # np.newaxis and x[...].
+    for k, code in enumerate([(
+        'import numpy as np\n'
+        'm = np.array([[2.0, 1.0, 4.0], [1.0, 3.0, 5.0]])\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'c = x[:2].reshape(-1, 1)\n'
+        'r1 = m - x[:2].reshape(-1, 1)\n'
+        'r2 = m * np.reshape(x[:2], (2, 1))\n'
+        'r3 = x[:3].reshape(1, -1) + m\n'
+        'r4 = m / c\n'
+        'r5 = x[:2].reshape(-1, 1) * x[:3].reshape(1, -1)\n'
+        'print(r1, r2, r3, r4, r5, m - x[:2].reshape((-1, 1)), (m > x[:2].reshape(-1, 1)).sum())\n'
+    ), (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'y = np.array([1.0, 2.0, 4.0])\n'
+        'r1 = x[:, None] - y\n'
+        'r2 = y - x[:, None]\n'
+        'r3 = x[:, None] * x\n'
+        'r4 = x[:, None] < y\n'
+        'r5 = np.abs(x[:, None] - x)\n'
+        'c = x.reshape(-1, 1)\n'
+        'r6 = c + y\n'
+        'print(r1, r2, r3, r4, r5, r6, (x[:, None] - y).sum(), x[:, None] / y, x[:, np.newaxis] ** 2 + y)\n'
+    ), (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, -2.0])\n'
+        'm = np.array([[1.0, 2.0], [3.0, 4.0]])\n'
+        'r = x[np.newaxis]\n'
+        's = x[...]\n'
+        'c = m.copy()\n'
+        'c[...] = 2.0\n'
+        'print(r, s, x[...] * 2, r.shape[1], x[:, np.newaxis] - x, c, m[..., 0] if False else 0)\n'
+    )]):
+        _xp2f_output_matches_numpy(tmp_path, f"xopsb{k}", code)

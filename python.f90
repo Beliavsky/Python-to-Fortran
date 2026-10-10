@@ -4787,12 +4787,24 @@ contains
       end function c_lt
 
       elemental logical function c_le(a, b)
-         ! numpy's ordering of complex numbers: by real part, then imaginary part.
+         ! numpy's ordering of complex numbers: by real part, then imaginary
+         ! part, a NaN after every number (as np.sort places them).
          complex(kind=dp), intent(in) :: a, b
-         if (real(a, kind=dp) == real(b, kind=dp)) then
-            c_le = aimag(a) <= aimag(b)
+         real(kind=dp) :: ra, rb, ia, ib
+         ra = real(a, kind=dp)
+         rb = real(b, kind=dp)
+         ia = aimag(a)
+         ib = aimag(b)
+         if (ieee_is_nan(ra) .neqv. ieee_is_nan(rb)) then
+            c_le = ieee_is_nan(rb)
+         else if (.not. ieee_is_nan(ra) .and. ra /= rb) then
+            c_le = ra < rb
+         else if (ieee_is_nan(ia) .neqv. ieee_is_nan(ib)) then
+            c_le = ieee_is_nan(ib)
+         else if (ieee_is_nan(ia)) then
+            c_le = .true.
          else
-            c_le = real(a, kind=dp) < real(b, kind=dp)
+            c_le = ia <= ib
          end if
       end function c_le
 
@@ -10525,7 +10537,8 @@ contains
          real(kind=dp) :: ri
          if (deg < 0) error stop "np.polynomial: deg must be non-negative"
          allocate(v(size(x), deg + 1))
-         v(:, 1) = x * 0.0_dp + 1.0_dp
+         ! Degree 0 is 1, also at NaN and inf.
+         v(:, 1) = 1.0_dp
          if (deg == 0) return
          select case (fam)
          case (1, 2, 3, 5)
@@ -10573,7 +10586,8 @@ contains
          if (cnt == 0) return
          n = size(c)
          if (cnt >= n) then
-            c = c(1:1) * 0.0_dp
+            ! numpy's c[:1] * 0 (empty for an empty c).
+            c = c(1:min(1, n)) * 0.0_dp
             return
          end if
          do i = 1, cnt
@@ -12802,7 +12816,8 @@ contains
          integer :: i
          allocate(y(size(x)))
          do i = 1, size(x)
-            y(i) = popcnt(x(i))
+            ! numpy counts the 1 bits of abs(x).
+            y(i) = popcnt(abs(x(i)))
          end do
       end function bitwise_count_int
 
@@ -13452,16 +13467,17 @@ contains
          end interface
          n = size(a,1)
          if (size(a,2) /= n) stop "linalg_eigh: matrix must be square"
+         ! As numpy (UPLO='L'), only the lower triangle of a is read.
          allocate(ac(1:n,1:n), source=a)
          allocate(w(1:n))
          allocate(work(1))
          lwork = -1
-         call dsyev('V', 'U', n, ac, n, w, work, lwork, info)
+         call dsyev('V', 'L', n, ac, n, w, work, lwork, info)
          if (info /= 0) stop "linalg_eigh: dsyev workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
-         call dsyev('V', 'U', n, ac, n, w, work, lwork, info)
+         call dsyev('V', 'L', n, ac, n, w, work, lwork, info)
          if (info /= 0) stop "linalg_eigh: dsyev failed"
          allocate(v(1:n,1:n), source=ac)
       end subroutine linalg_eigh
@@ -13489,12 +13505,12 @@ contains
          allocate(w(1:n))
          allocate(work(1))
          lwork = -1
-         call dsyev('N', 'U', n, ac, n, w, work, lwork, info)
+         call dsyev('N', 'L', n, ac, n, w, work, lwork, info)
          if (info /= 0) stop "linalg_eigvalsh: dsyev workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
-         call dsyev('N', 'U', n, ac, n, w, work, lwork, info)
+         call dsyev('N', 'L', n, ac, n, w, work, lwork, info)
          if (info /= 0) stop "linalg_eigvalsh: dsyev failed"
       end function linalg_eigvalsh
 
@@ -13766,7 +13782,18 @@ contains
          lo = int(floor(pos))
          hi = min(n, lo + 1)
          frac = pos - real(lo, kind=dp)
-         quantile_linear = (1.0_dp - frac) * xs(lo) + frac * xs(hi)
+         ! numpy's interpolation, exact at the data points (so an infinite
+         ! neighbour does not give NaN); halfway, the mean of the two, as
+         ! np.median takes.
+         if (frac == 0.0_dp) then
+            quantile_linear = xs(lo)
+         else if (frac == 0.5_dp) then
+            quantile_linear = (xs(lo) + xs(hi)) / 2.0_dp
+         else if (frac < 0.5_dp) then
+            quantile_linear = xs(lo) + (xs(hi) - xs(lo)) * frac
+         else
+            quantile_linear = xs(hi) - (xs(hi) - xs(lo)) * (1.0_dp - frac)
+         end if
       end function quantile_linear
 
       pure function quantile_linear_vec(x, q) result(out)
@@ -14157,7 +14184,13 @@ contains
                   allclose_real = .false.
                   return
                end if
-            else
+            else if (a(i) /= b(i)) then
+               ! Equal values (also equal infinities) are close; a
+               ! non-finite value otherwise is not (numpy's rule).
+               if (.not. (ieee_is_finite(a(i)) .and. ieee_is_finite(b(i)))) then
+                  allclose_real = .false.
+                  return
+               end if
                if (abs(a(i) - b(i)) > atolv + rtolv * abs(b(i))) then
                   allclose_real = .false.
                   return
@@ -14232,6 +14265,11 @@ contains
             end if
             if (ieee_is_nan(av) .or. ieee_is_nan(bv)) then
                mask(i) = eqnan .and. ieee_is_nan(av) .and. ieee_is_nan(bv)
+            else if (av == bv) then
+               ! Also equal infinities.
+               mask(i) = .true.
+            else if (.not. (ieee_is_finite(av) .and. ieee_is_finite(bv))) then
+               mask(i) = .false.
             else
                mask(i) = abs(av - bv) <= atolv + rtolv * abs(bv)
             end if
@@ -14262,6 +14300,10 @@ contains
          if (present(equal_nan)) eqnan = equal_nan
          if (ieee_is_nan(a) .or. ieee_is_nan(b)) then
             is_close = eqnan .and. ieee_is_nan(a) .and. ieee_is_nan(b)
+         else if (a == b) then
+            is_close = .true.
+         else if (.not. (ieee_is_finite(a) .and. ieee_is_finite(b))) then
+            is_close = .false.
          else
             is_close = abs(a - b) <= atolv + rtolv * abs(b)
          end if
@@ -14896,20 +14938,15 @@ contains
             dpcoef = p
             return
          end if
-         if (size(p) <= 1 .or. order >= size(p)) then
-            allocate(dpcoef(1))
-            dpcoef = 0.0_dp
+         if (order >= size(p)) then
+            ! numpy: the derivative of a constant is an empty array.
+            allocate(dpcoef(0))
             return
          end if
          allocate(cur(size(p)))
          cur = p
          do k = 1, order
             ncur = size(cur) - 1
-            if (ncur <= 0) then
-               allocate(dpcoef(1))
-               dpcoef = 0.0_dp
-               return
-            end if
             allocate(nxt(ncur))
             do i = 1, ncur
                nxt(i) = cur(i) * real(ncur - i + 1, kind=dp)
@@ -15800,7 +15837,27 @@ contains
          ! what plain Fortran "/" gives.
          real(kind=dp), intent(in) :: x, y
          real(kind=dp) :: q
-         q = real(floor(x / y, kind=int64), kind=dp)
+         real(kind=dp) :: md, dv
+         ! numpy's floor_divide (npy_divmod), in floats: x // 0 is x / 0,
+         ! inf // y is NaN, x // inf is 0 or -1.
+         if (y == 0.0_dp) then
+            q = x / y
+            return
+         end if
+         if (ieee_is_finite(x) .and. .not. ieee_is_finite(y) .and. .not. ieee_is_nan(y)) then
+            md = x
+         else
+            md = mod(x, y)
+         end if
+         dv = (x - md) / y
+         if (md /= 0.0_dp .and. ((y < 0.0_dp) .neqv. (md < 0.0_dp))) dv = dv - 1.0_dp
+         if (dv /= 0.0_dp) then
+            q = aint(dv)
+            if (q > dv) q = q - 1.0_dp
+            if (dv - q > 0.5_dp) q = q + 1.0_dp
+         else
+            q = sign(0.0_dp, x / y)
+         end if
       end function floor_div_real
 
       pure elemental integer function py_round_int32(x, mold) result(r)

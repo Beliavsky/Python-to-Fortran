@@ -7073,6 +7073,24 @@ def rewrite_numpy2_names(tree):
         return None
 
     class _Rw(ast.NodeTransformer):
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            # x[np.newaxis] is x[None]; x[...] is x[:] (all of x, any rank).
+            def fix(e):
+                if isinstance(e, ast.Attribute) and e.attr == "newaxis" and is_np(e.value):
+                    return ast.copy_location(ast.Constant(value=None), e)
+                return e
+            if isinstance(node.slice, ast.Tuple):
+                node.slice.elts = [fix(e) for e in node.slice.elts]
+            else:
+                node.slice = fix(node.slice)
+            if isinstance(node.slice, ast.Constant) and node.slice.value is Ellipsis:
+                node.slice = ast.copy_location(ast.Slice(), node.slice)
+            elif isinstance(node.slice, ast.Constant) and node.slice.value is None:
+                # x[None] is x[None, :] (a new leading axis).
+                node.slice = ast.copy_location(ast.Tuple(elts=[node.slice, ast.Slice()], ctx=ast.Load()), node.slice)
+            return node
+
         def visit_Attribute(self, node):
             # np.unique_counts(x).counts -> np.unique(x, return_counts=True)[1]
             if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute) \
@@ -7142,7 +7160,10 @@ def rewrite_numpy2_names(tree):
                     for i, tg in enumerate(node.targets[0].elts)]
             return node
 
-    if not any(isinstance(n, ast.Attribute) and n.attr in {"concat", "permute_dims", "matrix_transpose", "astype",
+    if not any((isinstance(n, ast.Attribute) and n.attr == "newaxis")
+               or (isinstance(n, ast.Constant) and n.value is Ellipsis)
+               or (isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and n.slice.value is None)
+               or isinstance(n, ast.Attribute) and n.attr in {"concat", "permute_dims", "matrix_transpose", "astype",
                                                             "matmul", "tensordot", "unique", "broadcast_arrays"}
                                                             | set(_UNIQUE_FAMILY)
                for n in ast.walk(tree)):
@@ -16989,6 +17010,17 @@ def detect_needed_helpers(tree):
     needed = set()
     extra = []
     for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in translator._METHODS_AS_NUMPY_FUNCTIONS | {"sort"}
+                and not (isinstance(node.func.value, ast.Name) and node.func.value.id in ("np", "numpy"))):
+            # x.round(1) etc. are translated as np.round(x, 1).
+            extra.append(ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=node.func.attr,
+                                                     ctx=ast.Load()), args=[node.func.value] + list(node.args),
+                                  keywords=list(node.keywords)))
+        if isinstance(node, ast.Attribute) and node.attr == "imag" and isinstance(node.ctx, ast.Load):
+            # x.imag of a real array is np.zeros_like(x).
+            extra.append(ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="zeros_like",
+                                                     ctx=ast.Load()), args=[node.value], keywords=[]))
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in _CANONICAL_BATCH2_TARGETS):
             for target in _CANONICAL_BATCH2_TARGETS[node.func.attr]:
@@ -30388,7 +30420,8 @@ class translator(ast.NodeVisitor):
     # (x.mean(axis=0) as np.mean(x, axis=0)), where that form is the more
     # complete translation.
     _METHODS_AS_NUMPY_FUNCTIONS = {"mean", "std", "var", "cumsum", "cumprod", "clip", "ptp", "trace", "diagonal",
-                                   "conjugate", "conj"}
+                                   "conjugate", "conj", "squeeze", "round", "repeat", "nonzero", "argsort",
+                                   "take", "swapaxes"}
     # Array methods of a bool array translated through the numpy function
     # (whose bool handling is below).
     _BOOL_METHODS_AS_NUMPY_FUNCTIONS = {
@@ -31145,6 +31178,28 @@ class translator(ast.NodeVisitor):
         np.mean(m) of a 2-D m -> np.mean(np.ravel(m)); np.sort(m, axis=None)
         -> np.sort(np.ravel(m))."""
         self._pad_partial_index(node)
+        if (isinstance(node, ast.BinOp)
+                and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow))
+                and not SOURCE_USES_PANDAS):
+            # A boolean array in arithmetic with numbers is 0/1 (b * x).
+            cached = getattr(node, "_xp2f_canonical", None)
+            if cached is not None:
+                return cached
+            lk, rk = self._expr_kind(node.left), self._expr_kind(node.right)
+            num = {"int", "real", "complex"}
+            sides = None
+            if lk == "logical" and rk in num and int(self._rank_expr(node.left) or 0) >= 1:
+                sides = ("left",)
+            elif rk == "logical" and lk in num and int(self._rank_expr(node.right) or 0) >= 1:
+                sides = ("right",)
+            if sides:
+                new = ast.BinOp(left=node.left, op=node.op, right=node.right)
+                side = getattr(new, sides[0])
+                setattr(new, sides[0], ast.Call(func=ast.Attribute(value=side, attr="astype", ctx=ast.Load()),
+                                                args=[ast.Name(id="int", ctx=ast.Load())], keywords=[]))
+                cached = ast.fix_missing_locations(ast.copy_location(new, node))
+                node._xp2f_canonical = cached
+                return cached
         # a @ b / a.dot(b) of vectors with a complex operand: no conjugation
         # (Fortran's dot_product conjugates a).
         _dot_pair = None
@@ -31238,6 +31293,31 @@ class translator(ast.NodeVisitor):
             return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="full_like",
                                                ctx=ast.Load()), args=[big[0], arrs[k]],
                             keywords=[ast.keyword(arg="dtype", value=ast.Name(id=dt, ctx=ast.Load()))])
+        if (isinstance(node, ast.Attribute) and node.attr in {"real", "imag"} and isinstance(node.ctx, ast.Load)
+                and not is_numpy_name_node(node.value) and not SOURCE_USES_PANDAS
+                and int(self._rank_expr(node.value) or 0) >= 1
+                and self._expr_kind(node.value) in {"int", "real", "logical"}):
+            # The real part of a real array is the array; its imaginary
+            # part, zeros of its kind.
+            if node.attr == "real":
+                return node.value
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="zeros_like",
+                                               ctx=ast.Load()), args=[node.value], keywords=[])
+        if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr in self._METHODS_AS_NUMPY_FUNCTIONS
+                and not is_numpy_name_node(node.value.func.value)):
+            # x.nonzero()[0] is np.nonzero(x)[0] (a tuple's item, not an
+            # element of an array).
+            cached = getattr(node, "_xp2f_canonical", None)
+            if cached is not None:
+                return cached
+            inner = self._canonical_numpy_call(node.value)
+            if inner is not None:
+                cached = ast.fix_missing_locations(ast.copy_location(
+                    ast.Subscript(value=inner, slice=node.slice, ctx=ast.Load()), node))
+                node._xp2f_canonical = cached
+                return cached
         ix = self._ix_parts(node)
         if ix is not None and isinstance(node.ctx, ast.Load):
             cached = getattr(node, "_xp2f_canonical", None)
@@ -31287,6 +31367,14 @@ class translator(ast.NodeVisitor):
             and recv_kind in {"int", "real", "logical", "complex"}
         ):
             new = ast.Call(func=np_func(attr), args=[func.value] + list(node.args), keywords=list(node.keywords))
+        elif (
+            not is_numpy_name_node(func.value) and attr == "round" and not SOURCE_USES_PANDAS
+            and int(self._rank_expr(func.value) or 0) == 0 and recv_kind in {"int", "real"}
+            and isinstance(func.value, ast.Call)
+        ):
+            # x.mean().round(3): a numpy scalar's round (Python numbers have
+            # no round method).
+            new = ast.Call(func=np_func("round"), args=[func.value] + list(node.args), keywords=list(node.keywords))
         elif is_numpy_name_node(func.value) and node.args and self._expr_kind(node.args[0]) == "logical" and (
             attr in self._BOOL_AS_INT | {"min", "max", "amin", "amax", "sort", "unique", "full_like"}
         ):
@@ -31844,6 +31932,18 @@ class translator(ast.NodeVisitor):
         _ia = self._canonical_int_args(node)
         if _ia is not None:
             return _ia
+        if (attr_ := node.func.attr) == "astype" and len(node.args) == 1 and not node.keywords \
+                and isinstance(node.args[0], ast.Name) and node.args[0].id == "bool" \
+                and self._expr_kind(node.func.value) == "logical":
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="copy", ctx=ast.Load()),
+                            args=[node.func.value], keywords=[])
+        if attr_ == "dot" and len(node.args) == 1 and not node.keywords and not is_numpy_name_node(node.func.value) \
+                and self._expr_kind(node.func.value) == "logical" and self._expr_kind(node.args[0]) == "logical" \
+                and int(self._rank_expr(node.func.value) or 0) == 1 and int(self._rank_expr(node.args[0]) or 0) == 1:
+            # numpy: the dot product of booleans is a boolean, any(a & b).
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="any", ctx=ast.Load()),
+                            args=[ast.BinOp(left=node.func.value, op=ast.BitAnd(), right=node.args[0])],
+                            keywords=[])
         func = node.func
         attr = func.attr
         kws = list(node.keywords)
@@ -31915,6 +32015,24 @@ class translator(ast.NodeVisitor):
         if not is_numpy_name_node(func.value):
             return None
         args = list(node.args)
+        if attr == "squeeze" and args and int(self._rank_expr(args[0]) or 0) == 2:
+            ax = kw("axis", 1)
+            axv = None if ax is None else lit_int(ax)
+            if ax is None or axv is None:
+                # The result's rank depends on the run-time shape.
+                raise NotImplementedError("np.squeeze of a matrix needs axis= (the result's rank would depend on "
+                                          "its shape)")
+            # Drop axis axv (numpy requires its length to be 1).
+            if not isinstance(args[0], ast.Name):
+                raise NotImplementedError("np.squeeze(a, axis=) of a matrix expression: assign it to a name first")
+            idx = [ast.Constant(value=0), ast.Slice()] if axv % 2 == 0 else [ast.Slice(), ast.Constant(value=0)]
+            return ast.Subscript(value=args[0], slice=ast.Tuple(elts=idx, ctx=ast.Load()), ctx=ast.Load())
+        if attr == "repeat" and len(args) == 2 and not kws and int(self._rank_expr(args[0]) or 0) == 2:
+            # No axis: the flattened array (in C order) repeated.
+            return call("repeat", [call("ravel", [args[0]]), args[1]])
+        if attr in {"conj", "conjugate"} and len(args) == 1 and not kws                 and self._expr_kind(args[0]) in {"int", "real", "logical"}:
+            # The conjugate of a non-complex array is the array.
+            return call("copy", args)
         if attr == "asanyarray":
             return call("asarray", args, kws)
         if attr in {"nancumsum", "nancumprod"} and args:
@@ -32258,6 +32376,49 @@ class translator(ast.NodeVisitor):
     _KIND_INT_SUMS = {"cumulative_sum", "cumulative_prod"}
     _KIND_PROMOTED = {"tensordot", "polyval", "polyder"}
 
+    # Array methods whose result has the receiver's kind (a bool receiver
+    # gives int for the arithmetic ones).
+    _METHOD_SAME_KIND = {"transpose", "squeeze", "ravel", "flatten", "reshape", "copy", "repeat", "take",
+                         "swapaxes", "diagonal", "clip", "min", "max", "sort", "conj", "conjugate"}
+    _METHOD_INT_FOR_BOOL = {"sum", "prod", "cumsum", "cumprod", "trace", "dot"}
+
+    def _method_kind(self, node):
+        """The kind of x.method(...) and of x.ndim/x.size/x.real/x.imag for
+        a numeric array x, else None."""
+        num = {"int", "real", "logical", "complex"}
+        if isinstance(node, ast.Attribute) and not is_numpy_name_node(node.value) and not SOURCE_USES_PANDAS:
+            if node.attr in {"ndim", "size", "itemsize", "nbytes"} and int(self._rank_expr(node.value) or 0) >= 1:
+                return "int"
+            if node.attr in {"real", "imag"} and int(self._rank_expr(node.value) or 0) >= 1:
+                k = self._expr_kind(node.value)
+                if k in num:
+                    return "real" if k == "complex" else k
+            return None
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)) or SOURCE_USES_PANDAS:
+            return None
+        recv = node.func.value
+        if is_numpy_name_node(recv) or isinstance(recv, ast.Name) and recv.id in {"np", "numpy", "math", "random"}:
+            return None
+        if int(self._rank_expr(recv) or 0) < 1:
+            return None
+        k = self._expr_kind(recv)
+        if k not in num:
+            return None
+        attr = node.func.attr
+        if attr in self._METHOD_SAME_KIND:
+            return k
+        if attr in self._METHOD_INT_FOR_BOOL:
+            if attr == "dot" and node.args:
+                k2 = self._expr_kind(node.args[0])
+                if k2 not in num:
+                    return None
+                ks = {k, k2}
+                if ks == {"logical"}:
+                    return "logical"
+                return "complex" if "complex" in ks else "real" if "real" in ks else "int"
+            return "int" if k == "logical" else k
+        return None
+
     def _kind_preserving_kind(self, node):
         """The kind of numpy calls whose result keeps the kind of their
         arguments (an integer array gives integers), else None:
@@ -32319,6 +32480,12 @@ class translator(ast.NodeVisitor):
         _kp = self._kind_preserving_kind(node)
         if _kp is not None:
             return _kp
+        _mk = self._method_kind(node)
+        if _mk is None and isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call):
+            # x.cumsum()[-1]: an element of the method's result.
+            _mk = self._method_kind(node.value)
+        if _mk is not None:
+            return _mk
         if (
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and is_numpy_name_node(node.func.value) and node.func.attr == "kron" and len(node.args) == 2
@@ -39494,8 +39661,56 @@ class translator(ast.NodeVisitor):
                 return 2
         return 0
 
+    def _keepdims_axis(self, node):
+        """The axis (0 or 1) of a reduction of a matrix with keepdims=True
+        (m.sum(axis=1, keepdims=True), np.max(m, axis=0, keepdims=True)),
+        else None."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        kd = {k.arg: k.value for k in node.keywords}
+        kp = kd.get("keepdims")
+        if not (isinstance(kp, ast.Constant) and kp.value is True):
+            return None
+        if node.func.attr not in {"sum", "mean", "max", "min", "std", "var", "prod", "any", "all", "median",
+                                  "argmax", "argmin", "nansum", "nanmean", "nanmax", "nanmin", "ptp"}:
+            return None
+        src = node.args[0] if is_numpy_name_node(node.func.value) and node.args else node.func.value
+        if is_numpy_name_node(node.func.value):
+            ax = node.args[1] if len(node.args) > 1 else kd.get("axis")
+        else:
+            ax = node.args[0] if node.args else kd.get("axis")
+        axv = _signed_int_constant(ax) if ax is not None else None
+        if axv is None or int(self._rank_expr(src) or 0) != 2:
+            return None
+        return axv % 2
+
+    def _reshape_2d_dims(self, node):
+        """(d0, d1) of v.reshape(d0, d1) / v.reshape((d0, d1)) /
+        np.reshape(v, (d0, d1)) of a vector v (literal ints, or None), else
+        None."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "reshape"):
+            return None
+        if is_numpy_name_node(node.func.value):
+            if len(node.args) != 2:
+                return None
+            src, dims = node.args[0], [node.args[1]]
+        else:
+            src, dims = node.func.value, list(node.args)
+        if len(dims) == 1 and isinstance(dims[0], (ast.Tuple, ast.List)):
+            dims = list(dims[0].elts)
+        if len(dims) != 2 or int(self._rank_expr(src) or 0) != 1:
+            return None
+        return tuple(_signed_int_constant(d) for d in dims)
+
     def _is_row2_expr(self, node):
         if isinstance(node, ast.Name) and node.id in self.broadcast_row2:
+            return True
+        _rd = self._reshape_2d_dims(node)
+        if _rd is not None and _rd[0] == 1 and _rd[1] != 1:
+            # v.reshape(1, -1): a row vector (1, n).
+            return True
+        if self._keepdims_axis(node) == 0:
+            # m.sum(axis=0, keepdims=True): one value per column, (1, m).
             return True
         if isinstance(node, ast.UnaryOp):
             return self._is_row2_expr(node.operand)
@@ -39557,6 +39772,13 @@ class translator(ast.NodeVisitor):
 
     def _is_col2_expr(self, node):
         if isinstance(node, ast.Name) and node.id in self.broadcast_col2:
+            return True
+        _rd = self._reshape_2d_dims(node)
+        if _rd is not None and _rd[1] == 1 and _rd[0] != 1:
+            # v.reshape(-1, 1): a column vector (n, 1).
+            return True
+        if self._keepdims_axis(node) == 1:
+            # m.sum(axis=1, keepdims=True): one value per row, (n, 1).
             return True
         if isinstance(node, ast.UnaryOp):
             return self._is_col2_expr(node.operand)
@@ -41630,7 +41852,16 @@ class translator(ast.NodeVisitor):
             a = a0
             b = b0
             # Limited broadcasting for comparisons: rank-2 with rank-1.
-            if self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1:
+            if (self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1
+                    and self._is_col2_expr(node.left) and not self._is_col2_expr(node.comparators[0])):
+                # x[:, None] < y: the (n, m) outer comparison.
+                a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0}))"
+                b = f"spread({b0}, dim=1, ncopies=size({a0},1))"
+            elif (self._rank_expr(node.left) == 1 and self._rank_expr(node.comparators[0]) == 2
+                    and self._is_col2_expr(node.comparators[0]) and not self._is_col2_expr(node.left)):
+                a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
+                b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
+            elif self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1:
                 if self._is_col2_expr(node.comparators[0]):
                     b = f"spread({b0}, dim=2, ncopies=size({a0},2))"
                 else:
@@ -41640,6 +41871,17 @@ class translator(ast.NodeVisitor):
                     a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
                 else:
                     a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
+            elif self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 2:
+                # A (n, 1) column or (1, m) row against a matrix.
+                rgt = node.comparators[0]
+                if self._is_col2_expr(rgt) and not self._is_col2_expr(node.left):
+                    b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0},2))"
+                elif self._is_row2_expr(rgt) and not self._is_row2_expr(node.left):
+                    b = f"spread(reshape({b0}, [size({b0},2)]), dim=1, ncopies=size({a0},1))"
+                elif self._is_col2_expr(node.left) and not self._is_col2_expr(rgt):
+                    a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0},2))"
+                elif self._is_row2_expr(node.left) and not self._is_row2_expr(rgt):
+                    a = f"spread(reshape({a0}, [size({a0},2)]), dim=1, ncopies=size({b0},1))"
             # A NaN operand (e.g. the vacated row from a .shift() on a
             # real array) would otherwise trip -ffpe-trap=invalid: ordered
             # comparisons all signal on NaN in Fortran, unlike Python/
@@ -42301,6 +42543,18 @@ class translator(ast.NodeVisitor):
                 if self._rank_expr(node.slice) > 1:
                     s = self.expr(node.slice)
                     return f"reshape({base}(reshape({s} + 1, [size({s})])), shape({s}))"
+                _lits = None
+                _sl = node.slice
+                if isinstance(_sl, ast.Call) and is_numpy_name_node(getattr(_sl.func, "value", None))                         and getattr(_sl.func, "attr", "") == "array" and len(_sl.args) == 1:
+                    _sl = _sl.args[0]
+                if isinstance(_sl, (ast.List, ast.Tuple)):
+                    _lits = [_signed_int_constant(e) for e in _sl.elts]
+                if _lits and all(v is not None for v in _lits) and any(v < 0 for v in _lits):
+                    # Negative indices count from the end (x[[-1, 0]]).
+                    return f"{base}([{', '.join(f'size({base}) + ({v} + 1)' if v < 0 else str(v + 1) for v in _lits)}])"
+                if isinstance(node.slice, ast.Name) and self._expr_kind(node.slice) == "int":
+                    s = self.expr(node.slice)
+                    return f"{base}(merge({s} + 1 + size({base}), {s} + 1, {s} < 0))"
                 return f"{base}(({self.expr(node.slice)} + 1))"
             # Python emitters in this project use 0-based forms like (i)-1;
             # map those back to natural Fortran 1-based indexing.
@@ -46696,14 +46950,26 @@ class translator(ast.NodeVisitor):
                     # on a real array a) previously passed straight
                     # through unconverted, a type mismatch against a0's
                     # own (real) kind.
-                    if len(node.args) >= 2 and not is_none(node.args[1]):
-                        lo = self.expr(node.args[1])
-                        if a0_kind == "real" and self._expr_kind(node.args[1]) in {"int", "logical"}:
+                    bnd = [node.args[1] if len(node.args) > 1 else None, node.args[2] if len(node.args) > 2 else None]
+                    for kw in node.keywords:
+                        if kw.arg in {"a_min", "min"}:
+                            bnd[0] = kw.value
+                        elif kw.arg in {"a_max", "max"}:
+                            bnd[1] = kw.value
+                        else:
+                            raise NotImplementedError(f"np.clip: unsupported argument {kw.arg}=")
+                    if bnd[0] is not None and not is_none(bnd[0]):
+                        lo = self.expr(bnd[0])
+                        if a0_kind == "real" and self._expr_kind(bnd[0]) in {"int", "logical"}:
                             lo = f"real({lo}, kind=dp)"
-                    if len(node.args) >= 3 and not is_none(node.args[2]):
-                        hi = self.expr(node.args[2])
-                        if a0_kind == "real" and self._expr_kind(node.args[2]) in {"int", "logical"}:
+                        elif a0_kind == "int" and self._expr_kind(bnd[0]) == "real":
+                            raise NotImplementedError("np.clip of an integer array with a float bound")
+                    if bnd[1] is not None and not is_none(bnd[1]):
+                        hi = self.expr(bnd[1])
+                        if a0_kind == "real" and self._expr_kind(bnd[1]) in {"int", "logical"}:
                             hi = f"real({hi}, kind=dp)"
+                        elif a0_kind == "int" and self._expr_kind(bnd[1]) == "real":
+                            raise NotImplementedError("np.clip of an integer array with a float bound")
                     return f"min(max({a0}, {lo}), {hi})"
                 if node.func.attr == "linspace" and len(node.args) >= 3:
                     start_node = node.args[0]
@@ -53176,6 +53442,13 @@ class translator(ast.NodeVisitor):
                         self.broadcast_row2.add(t.id)
                     if isinstance(a1, ast.Constant) and a1.value == 1:
                         self.broadcast_col2.add(t.id)
+                if isinstance(t, ast.Name) and self._reshape_2d_dims(v) is not None:
+                    # c = v.reshape(-1, 1) / v.reshape(1, -1).
+                    _rd = self._reshape_2d_dims(v)
+                    if _rd[1] == 1 and _rd[0] != 1:
+                        self.broadcast_col2.add(t.id)
+                    elif _rd[0] == 1 and _rd[1] != 1:
+                        self.broadcast_row2.add(t.id)
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Subscript)
@@ -55061,6 +55334,14 @@ class translator(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            # c = v.reshape(-1, 1) / v.reshape(1, -1): c broadcasts as a
+            # column / row vector in later statements.
+            _rd = self._reshape_2d_dims(node.value)
+            if _rd is not None and _rd[1] == 1 and _rd[0] != 1:
+                self.broadcast_col2.add(node.targets[0].id)
+            elif _rd is not None and _rd[0] == 1 and _rd[1] != 1:
+                self.broadcast_row2.add(node.targets[0].id)
         if len(node.targets) == 1 and self._ix_parts(node.targets[0]) is not None:
             # X(rows + 1, cols + 1) = v: Fortran's vector subscripts (numpy
             # also assigns repeated indices in order, the last value winning).
@@ -62316,7 +62597,15 @@ class translator(ast.NodeVisitor):
                 if op_txt is not None and ((lr == 2 and rr == 1) or (lr == 1 and rr == 2)):
                     a = self.expr(v.left)
                     b = self.expr(v.right)
-                    if lr == 2 and rr == 1:
+                    if lr == 2 and rr == 1 and self._is_col2_expr(v.left) and not self._is_col2_expr(v.right):
+                        # x[:, None] - y: a column against a vector, the
+                        # (n, m) outer combination.
+                        a, b = (f"spread(reshape({a}, [size({a},1)]), dim=2, ncopies=size({b}))",
+                                f"spread({b}, dim=1, ncopies=size({a},1))")
+                    elif lr == 1 and rr == 2 and self._is_col2_expr(v.right) and not self._is_col2_expr(v.left):
+                        a, b = (f"spread({a}, dim=1, ncopies=size({b},1))",
+                                f"spread(reshape({b}, [size({b},1)]), dim=2, ncopies=size({a}))")
+                    elif lr == 2 and rr == 1:
                         if self._is_col2_expr(v.right):
                             b = f"spread({b}, dim=2, ncopies=size({a},2))"
                         else:
@@ -62326,6 +62615,12 @@ class translator(ast.NodeVisitor):
                             a = f"spread({a}, dim=2, ncopies=size({b},2))"
                         else:
                             a = f"spread({a}, dim=1, ncopies=size({b},1))"
+                    if op_txt == "/":
+                        # True division, also of integers (numpy's /).
+                        if self._expr_kind(v.left) in {"int", "logical"}:
+                            a = f"real({a}, kind=dp)"
+                        if self._expr_kind(v.right) in {"int", "logical"}:
+                            b = f"real({b}, kind=dp)"
                     self.o.w(f"{lname} = ({a} {op_txt} {b})")
                     return
                 if (
@@ -63374,12 +63669,16 @@ class translator(ast.NodeVisitor):
             else:
                 self.o.w(f"{lhs} = floor_div_int({lhs}, {rhs})")
             return
-        if isinstance(node.op, ast.Mod):
-            lk = self._expr_kind(node.target)
-            rk = self._expr_kind(node.value)
-            if lk == "real" and rk in {"int", "logical"}:
-                rhs = f"real({rhs}, kind=dp)"
-            self.o.w(f"{lhs} = mod({lhs}, {rhs})")
+        if isinstance(node.op, (ast.Mod, ast.Pow)):
+            # y %= v and y **= v as y = y % v and y = y ** v (Python's %
+            # takes the sign of v; Fortran's mod that of y).
+            tgt_load = copy.deepcopy(node.target)
+            for _n in ast.walk(tgt_load):
+                if hasattr(_n, "ctx"):
+                    _n.ctx = ast.Load()
+            binop = ast.fix_missing_locations(ast.copy_location(
+                ast.BinOp(left=tgt_load, op=node.op, right=node.value), node))
+            self.o.w(f"{lhs} = {self.expr(binop)}")
             return
         if isinstance(node.op, ast.LShift):
             self.o.w(f"{lhs} = ishft({lhs}, int({rhs}))")
@@ -65328,6 +65627,18 @@ class translator(ast.NodeVisitor):
             return
         if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             # Ignore docstring / standalone string literal expressions.
+            return
+        if (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr == "sort"
+                and isinstance(v.func.value, ast.Name) and not SOURCE_USES_PANDAS
+                and int(self._rank_expr(v.func.value) or 0) == 2
+                and self._expr_kind(v.func.value) in {"int", "real", "logical", "complex"}
+                and all(kw.arg in {"axis", "kind"} for kw in v.keywords) and len(v.args) <= 1):
+            ax = v.args[0] if v.args else next((kw.value for kw in v.keywords if kw.arg == "axis"),
+                                               ast.Constant(value=-1))
+            srt = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="sort", ctx=ast.Load()),
+                           args=[ast.Name(id=v.func.value.id, ctx=ast.Load())],
+                           keywords=[ast.keyword(arg="axis", value=ax)])
+            self.o.w(f"{self.expr(v.func.value)} = {self.expr(ast.fix_missing_locations(ast.copy_location(srt, v)))}")
             return
         if isinstance(node.value, ast.Attribute):
             # Harmless standalone attribute probes such as `A.shape`.
