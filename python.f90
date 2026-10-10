@@ -22,11 +22,11 @@ type :: strvec_t
    character(len=:), allocatable :: v(:)
 end type strvec_t
 
-public :: isqrt_int       !@pyapi kind=function ret=integer args=x:integer:intent(in) desc="integer square root: return floor(sqrt(x)) for x >= 0"
-public :: mod_pow_int !@pyapi kind=function ret=integer args=base:integer:intent(in),exp:integer:intent(in),modulus:integer:intent(in) desc="modular exponentiation: pow(base, exp, modulus) for integer inputs"
-public :: factorial_int !@pyapi kind=function ret=integer args=x:integer:intent(in) desc="factorial for nonnegative integers"
-public :: comb_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in) desc="binomial coefficient for integer inputs"
-public :: perm_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in):optional desc="permutations nPk for integer inputs"
+public :: isqrt_int       !@pyapi kind=function ret=integer args=x:integer:intent(in) lib=integers desc="integer square root: return floor(sqrt(x)) for x >= 0"
+public :: mod_pow_int !@pyapi kind=function ret=integer args=base:integer:intent(in),exp:integer:intent(in),modulus:integer:intent(in) lib=integers desc="modular exponentiation: pow(base, exp, modulus) for integer inputs"
+public :: factorial_int !@pyapi kind=function ret=integer args=x:integer:intent(in) lib=integers desc="factorial for nonnegative integers"
+public :: comb_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in) lib=integers desc="binomial coefficient for integer inputs"
+public :: perm_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in):optional lib=integers desc="permutations nPk for integer inputs"
 public :: print_int_list  !@pyapi kind=subroutine args=a:integer(:):intent(in),n:integer:intent(in) desc="print integer list a(1:n) in python-style [..] format"
 public :: print_char_list  !@pyapi kind=subroutine args=a:character(:):intent(in),n:integer:intent(in) desc="print character list a(1:n) in python-style [..] format"
 public :: grow_and_set_char !@pyapi kind=subroutine args=arr:character(:)(:):intent(inout),idx:integer:intent(in),item:character(*):intent(in) desc="grow allocatable character list arr (size and/or declared length) so index idx and item both fit, then set arr(idx) = item"
@@ -34,116 +34,116 @@ public :: insert_char !@pyapi kind=subroutine args=arr:character(:)(:):intent(in
 public :: print_real_list  !@pyapi kind=subroutine args=a:real(dp)(:):intent(in),n:integer:intent(in) desc="print real list a(1:n) in python-style [..] format"
 public :: print_log_list  !@pyapi kind=subroutine args=a:logical(:):intent(in),n:integer:intent(in) desc="print logical list a(1:n) in python-style [..] format"
 public :: str_int_list  !@pyapi kind=function ret=character args=a:integer(:):intent(in),n:integer:intent(in) desc="return integer list a(1:n) in python-style [..] format"
-public :: seed_rng !@pyapi kind=subroutine args=seed:integer:intent(in):optional desc="seed intrinsic RNG; deterministic stream when seed is provided"
-public :: random_normal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out) desc="fill x with N(0,1) variates using Box-Muller"
+public :: seed_rng !@pyapi kind=subroutine args=seed:integer:intent(in):optional lib=random desc="seed intrinsic RNG; deterministic stream when seed is provided"
+public :: random_normal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out) lib=random desc="fill x with N(0,1) variates using Box-Muller"
 public :: runif !@pyapi kind=function ret=real(dp) args=n:integer:intent(in):optional,m:integer:intent(in):optional desc="uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)"
 public :: rnorm !@pyapi kind=function ret=real(dp) args=n:integer:intent(in):optional,m:integer:intent(in):optional desc="normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)"
 public :: random_randrange_int !@pyapi kind=function ret=integer args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="random integer from range(start, stop, step)"
-public :: random_exponential !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional desc="sample scalar exponential with scale (default 1)"
-public :: random_exponential_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional desc="fill x with exponential samples with scale (default 1)"
-public :: random_gamma !@pyapi kind=function ret=real(dp) args=shape:real(dp):intent(in),scale:real(dp):intent(in):optional desc="sample scalar gamma(shape, scale), shape>0"
-public :: random_gamma_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),shape:real(dp):intent(in),scale:real(dp):intent(in):optional desc="fill x with gamma samples"
-public :: random_student_t !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in) desc="sample scalar Student t(df)"
-public :: random_student_t_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in) desc="fill x with Student t(df) samples"
-public :: random_f !@pyapi kind=function ret=real(dp) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in) desc="sample scalar F(dfnum,dfden)"
-public :: random_f_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),dfnum:real(dp):intent(in),dfden:real(dp):intent(in) desc="fill x with F samples"
-public :: random_poisson !@pyapi kind=function ret=integer args=mu:real(dp):intent(in) desc="sample scalar Poisson(mu)"
-public :: random_poisson_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),mu:real(dp):intent(in) desc="fill x with Poisson(mu) samples"
-public :: random_geometric !@pyapi kind=function ret=integer args=p:real(dp):intent(in) desc="sample scalar Geometric(p), support on {1,2,...}"
-public :: random_geometric_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),p:real(dp):intent(in) desc="fill x with Geometric(p) samples"
-public :: random_binomial !@pyapi kind=function ret=integer args=n:integer:intent(in),p:real(dp):intent(in) desc="sample scalar Binomial(n,p)"
-public :: random_binomial_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),n:integer:intent(in),p:real(dp):intent(in) desc="fill x with Binomial(n,p) samples"
-public :: random_hypergeometric !@pyapi kind=function ret=integer args=ngood:integer:intent(in),nbad:integer:intent(in),nsample:integer:intent(in) desc="sample scalar Hypergeometric(ngood,nbad,nsample)"
-public :: random_hypergeometric_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),ngood:integer:intent(in),nbad:integer:intent(in),nsample:integer:intent(in) desc="fill x with hypergeometric samples"
-public :: random_zipf !@pyapi kind=function ret=integer args=a:real(dp):intent(in) desc="sample scalar Zipf(a), a>1"
-public :: random_zipf_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),a:real(dp):intent(in) desc="fill x with Zipf(a) samples"
-public :: random_weibull !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) desc="sample scalar Weibull(a)"
-public :: random_weibull_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) desc="fill x with Weibull(a) samples"
-public :: random_neg_binomial !@pyapi kind=function ret=integer args=sk:real(dp):intent(in),p:real(dp):intent(in) desc="sample scalar negative binomial failures before sk successes"
-public :: random_neg_binomial_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),sk:real(dp):intent(in),p:real(dp):intent(in) desc="fill x with negative binomial samples"
-public :: random_von_mises !@pyapi kind=function ret=real(dp) args=kappa:real(dp):intent(in) desc="sample scalar von Mises with concentration kappa"
-public :: random_von_mises_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),kappa:real(dp):intent(in) desc="fill x with von Mises samples"
-public :: random_pareto !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) desc="sample scalar Pareto(a) in NumPy convention"
-public :: random_pareto_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) desc="fill x with Pareto(a) samples"
-public :: random_power !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) desc="sample scalar Power(a) in NumPy convention"
-public :: random_power_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) desc="fill x with Power(a) samples"
-public :: random_rayleigh !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional desc="sample scalar Rayleigh(scale), default scale=1"
-public :: random_rayleigh_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional desc="fill x with Rayleigh samples"
-public :: random_gumbel !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Gumbel(loc,scale)"
-public :: random_gumbel_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Gumbel samples"
-public :: random_wald !@pyapi kind=function ret=real(dp) args=mean:real(dp):intent(in),scale:real(dp):intent(in) desc="sample scalar Wald(mean,scale)"
-public :: random_wald_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),mean:real(dp):intent(in),scale:real(dp):intent(in) desc="fill x with Wald samples"
-public :: random_noncentral_chisquare !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in),nonc:real(dp):intent(in) desc="sample scalar noncentral chisquare(df,nonc)"
-public :: random_noncentral_chisquare_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in),nonc:real(dp):intent(in) desc="fill x with noncentral chisquare samples"
-public :: random_noncentral_f !@pyapi kind=function ret=real(dp) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in),nonc:real(dp):intent(in) desc="sample scalar noncentral F(dfnum,dfden,nonc)"
-public :: random_noncentral_f_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),dfnum:real(dp):intent(in),dfden:real(dp):intent(in),nonc:real(dp):intent(in) desc="fill x with noncentral F samples"
-public :: random_triangular !@pyapi kind=function ret=real(dp) args=left:real(dp):intent(in),mode:real(dp):intent(in),right:real(dp):intent(in) desc="sample scalar triangular(left,mode,right)"
-public :: random_triangular_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),left:real(dp):intent(in),mode:real(dp):intent(in),right:real(dp):intent(in) desc="fill x with triangular samples"
-public :: random_logseries !@pyapi kind=function ret=integer args=p:real(dp):intent(in) desc="sample scalar logarithmic-series(p)"
-public :: random_logseries_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),p:real(dp):intent(in) desc="fill x with logarithmic-series samples"
-public :: random_dirichlet !@pyapi kind=subroutine args=alpha:real(dp)(:):intent(in),x:real(dp)(:):intent(out) desc="sample one Dirichlet(alpha) vector"
-public :: random_dirichlet_samples !@pyapi kind=subroutine args=alpha:real(dp)(:):intent(in),x:real(dp)(:,:):intent(out) desc="fill rows of x with Dirichlet(alpha) samples"
-public :: random_multinomial !@pyapi kind=subroutine args=n:integer:intent(in),p:real(dp)(:):intent(in),x:integer(:):intent(out) desc="sample one Multinomial(n,p) count vector"
-public :: random_multinomial_samples !@pyapi kind=subroutine args=n:integer:intent(in),p:real(dp)(:):intent(in),x:integer(:,:):intent(out) desc="fill rows of x with Multinomial(n,p) samples"
-public :: random_multivariate_hypergeometric !@pyapi kind=subroutine args=ngood:integer(:):intent(in),nsample:integer:intent(in),x:integer(:):intent(out) desc="sample one multivariate hypergeometric count vector"
-public :: random_multivariate_hypergeometric_samples !@pyapi kind=subroutine args=ngood:integer(:):intent(in),nsample:integer:intent(in),x:integer(:,:):intent(out) desc="fill rows of x with multivariate hypergeometric samples"
-public :: random_beta !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in),b:real(dp):intent(in) desc="sample scalar beta(a,b), a,b>0"
-public :: random_beta_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in),b:real(dp):intent(in) desc="fill x with beta samples"
-public :: random_lognormal !@pyapi kind=function ret=real(dp) args=meanlog:real(dp):intent(in):optional,sdlog:real(dp):intent(in):optional desc="sample scalar lognormal exp(N(meanlog,sdlog^2))"
-public :: random_lognormal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),meanlog:real(dp):intent(in):optional,sdlog:real(dp):intent(in):optional desc="fill x with lognormal samples"
-public :: random_chisquare !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in) desc="sample scalar chi-square(df)"
-public :: random_chisquare_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in) desc="fill x with chi-square samples"
-public :: random_laplace !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Laplace(loc,scale)"
-public :: random_laplace_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Laplace samples"
-public :: random_logistic !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Logistic(loc,scale)"
-public :: random_logistic_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Logistic samples"
-public :: random_cauchy !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Cauchy(loc,scale)"
-public :: random_cauchy_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Cauchy samples"
-public :: random_mvn_samples !@pyapi kind=subroutine args=mean:real(dp)(:):intent(in),cov:real(dp)(:,:):intent(in),x:real(dp)(:,:):intent(out) desc="fill x(nsamp,ndim) with multivariate-normal samples using Cholesky factorization"
-public :: random_choice2 !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in {0,1} with probabilities p(1:2)"
-public :: random_choice_norep !@pyapi kind=subroutine args=npop:integer:intent(in),nsamp:integer:intent(in),z:integer(:):intent(out) desc="sample nsamp unique labels from 0..npop-1 without replacement"
-public :: random_choice_prob !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in 0..size(p)-1 with probabilities p"
+public :: random_exponential !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional lib=random desc="sample scalar exponential with scale (default 1)"
+public :: random_exponential_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional lib=random desc="fill x with exponential samples with scale (default 1)"
+public :: random_gamma !@pyapi kind=function ret=real(dp) args=shape:real(dp):intent(in),scale:real(dp):intent(in):optional lib=random desc="sample scalar gamma(shape, scale), shape>0"
+public :: random_gamma_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),shape:real(dp):intent(in),scale:real(dp):intent(in):optional lib=random desc="fill x with gamma samples"
+public :: random_student_t !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in) lib=random desc="sample scalar Student t(df)"
+public :: random_student_t_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in) lib=random desc="fill x with Student t(df) samples"
+public :: random_f !@pyapi kind=function ret=real(dp) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in) lib=random desc="sample scalar F(dfnum,dfden)"
+public :: random_f_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),dfnum:real(dp):intent(in),dfden:real(dp):intent(in) lib=random desc="fill x with F samples"
+public :: random_poisson !@pyapi kind=function ret=integer args=mu:real(dp):intent(in) lib=random desc="sample scalar Poisson(mu)"
+public :: random_poisson_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),mu:real(dp):intent(in) lib=random desc="fill x with Poisson(mu) samples"
+public :: random_geometric !@pyapi kind=function ret=integer args=p:real(dp):intent(in) lib=random desc="sample scalar Geometric(p), support on {1,2,...}"
+public :: random_geometric_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),p:real(dp):intent(in) lib=random desc="fill x with Geometric(p) samples"
+public :: random_binomial !@pyapi kind=function ret=integer args=n:integer:intent(in),p:real(dp):intent(in) lib=random desc="sample scalar Binomial(n,p)"
+public :: random_binomial_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),n:integer:intent(in),p:real(dp):intent(in) lib=random desc="fill x with Binomial(n,p) samples"
+public :: random_hypergeometric !@pyapi kind=function ret=integer args=ngood:integer:intent(in),nbad:integer:intent(in),nsample:integer:intent(in) lib=random desc="sample scalar Hypergeometric(ngood,nbad,nsample)"
+public :: random_hypergeometric_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),ngood:integer:intent(in),nbad:integer:intent(in),nsample:integer:intent(in) lib=random desc="fill x with hypergeometric samples"
+public :: random_zipf !@pyapi kind=function ret=integer args=a:real(dp):intent(in) lib=random desc="sample scalar Zipf(a), a>1"
+public :: random_zipf_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),a:real(dp):intent(in) lib=random desc="fill x with Zipf(a) samples"
+public :: random_weibull !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) lib=random desc="sample scalar Weibull(a)"
+public :: random_weibull_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) lib=random desc="fill x with Weibull(a) samples"
+public :: random_neg_binomial !@pyapi kind=function ret=integer args=sk:real(dp):intent(in),p:real(dp):intent(in) lib=random desc="sample scalar negative binomial failures before sk successes"
+public :: random_neg_binomial_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),sk:real(dp):intent(in),p:real(dp):intent(in) lib=random desc="fill x with negative binomial samples"
+public :: random_von_mises !@pyapi kind=function ret=real(dp) args=kappa:real(dp):intent(in) lib=random desc="sample scalar von Mises with concentration kappa"
+public :: random_von_mises_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),kappa:real(dp):intent(in) lib=random desc="fill x with von Mises samples"
+public :: random_pareto !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) lib=random desc="sample scalar Pareto(a) in NumPy convention"
+public :: random_pareto_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) lib=random desc="fill x with Pareto(a) samples"
+public :: random_power !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) lib=random desc="sample scalar Power(a) in NumPy convention"
+public :: random_power_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) lib=random desc="fill x with Power(a) samples"
+public :: random_rayleigh !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional lib=random desc="sample scalar Rayleigh(scale), default scale=1"
+public :: random_rayleigh_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional lib=random desc="fill x with Rayleigh samples"
+public :: random_gumbel !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="sample scalar Gumbel(loc,scale)"
+public :: random_gumbel_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="fill x with Gumbel samples"
+public :: random_wald !@pyapi kind=function ret=real(dp) args=mean:real(dp):intent(in),scale:real(dp):intent(in) lib=random desc="sample scalar Wald(mean,scale)"
+public :: random_wald_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),mean:real(dp):intent(in),scale:real(dp):intent(in) lib=random desc="fill x with Wald samples"
+public :: random_noncentral_chisquare !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in),nonc:real(dp):intent(in) lib=random desc="sample scalar noncentral chisquare(df,nonc)"
+public :: random_noncentral_chisquare_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in),nonc:real(dp):intent(in) lib=random desc="fill x with noncentral chisquare samples"
+public :: random_noncentral_f !@pyapi kind=function ret=real(dp) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in),nonc:real(dp):intent(in) lib=random desc="sample scalar noncentral F(dfnum,dfden,nonc)"
+public :: random_noncentral_f_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),dfnum:real(dp):intent(in),dfden:real(dp):intent(in),nonc:real(dp):intent(in) lib=random desc="fill x with noncentral F samples"
+public :: random_triangular !@pyapi kind=function ret=real(dp) args=left:real(dp):intent(in),mode:real(dp):intent(in),right:real(dp):intent(in) lib=random desc="sample scalar triangular(left,mode,right)"
+public :: random_triangular_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),left:real(dp):intent(in),mode:real(dp):intent(in),right:real(dp):intent(in) lib=random desc="fill x with triangular samples"
+public :: random_logseries !@pyapi kind=function ret=integer args=p:real(dp):intent(in) lib=random desc="sample scalar logarithmic-series(p)"
+public :: random_logseries_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),p:real(dp):intent(in) lib=random desc="fill x with logarithmic-series samples"
+public :: random_dirichlet !@pyapi kind=subroutine args=alpha:real(dp)(:):intent(in),x:real(dp)(:):intent(out) lib=random desc="sample one Dirichlet(alpha) vector"
+public :: random_dirichlet_samples !@pyapi kind=subroutine args=alpha:real(dp)(:):intent(in),x:real(dp)(:,:):intent(out) lib=random desc="fill rows of x with Dirichlet(alpha) samples"
+public :: random_multinomial !@pyapi kind=subroutine args=n:integer:intent(in),p:real(dp)(:):intent(in),x:integer(:):intent(out) lib=random desc="sample one Multinomial(n,p) count vector"
+public :: random_multinomial_samples !@pyapi kind=subroutine args=n:integer:intent(in),p:real(dp)(:):intent(in),x:integer(:,:):intent(out) lib=random desc="fill rows of x with Multinomial(n,p) samples"
+public :: random_multivariate_hypergeometric !@pyapi kind=subroutine args=ngood:integer(:):intent(in),nsample:integer:intent(in),x:integer(:):intent(out) lib=random desc="sample one multivariate hypergeometric count vector"
+public :: random_multivariate_hypergeometric_samples !@pyapi kind=subroutine args=ngood:integer(:):intent(in),nsample:integer:intent(in),x:integer(:,:):intent(out) lib=random desc="fill rows of x with multivariate hypergeometric samples"
+public :: random_beta !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in),b:real(dp):intent(in) lib=random desc="sample scalar beta(a,b), a,b>0"
+public :: random_beta_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in),b:real(dp):intent(in) lib=random desc="fill x with beta samples"
+public :: random_lognormal !@pyapi kind=function ret=real(dp) args=meanlog:real(dp):intent(in):optional,sdlog:real(dp):intent(in):optional lib=random desc="sample scalar lognormal exp(N(meanlog,sdlog^2))"
+public :: random_lognormal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),meanlog:real(dp):intent(in):optional,sdlog:real(dp):intent(in):optional lib=random desc="fill x with lognormal samples"
+public :: random_chisquare !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in) lib=random desc="sample scalar chi-square(df)"
+public :: random_chisquare_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in) lib=random desc="fill x with chi-square samples"
+public :: random_laplace !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="sample scalar Laplace(loc,scale)"
+public :: random_laplace_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="fill x with Laplace samples"
+public :: random_logistic !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="sample scalar Logistic(loc,scale)"
+public :: random_logistic_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="fill x with Logistic samples"
+public :: random_cauchy !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="sample scalar Cauchy(loc,scale)"
+public :: random_cauchy_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional lib=random desc="fill x with Cauchy samples"
+public :: random_mvn_samples !@pyapi kind=subroutine args=mean:real(dp)(:):intent(in),cov:real(dp)(:,:):intent(in),x:real(dp)(:,:):intent(out) lib=random desc="fill x(nsamp,ndim) with multivariate-normal samples using Cholesky factorization"
+public :: random_choice2 !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) lib=random desc="sample n labels in {0,1} with probabilities p(1:2)"
+public :: random_choice_norep !@pyapi kind=subroutine args=npop:integer:intent(in),nsamp:integer:intent(in),z:integer(:):intent(out) lib=random desc="sample nsamp unique labels from 0..npop-1 without replacement"
+public :: random_choice_prob !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) lib=random desc="sample n labels in 0..size(p)-1 with probabilities p"
 public :: random_choice_char !@pyapi kind=function ret=character args=a:character(:):intent(in) desc="choose one string from a character vector"
 public :: random_choices_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),k:integer:intent(in) desc="choose k strings with replacement"
 public :: random_sample_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),k:integer:intent(in) desc="choose k unique strings without replacement"
-public :: sort_real_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(inout) desc="sort real vector x in ascending order"
-public :: sort_int_vec !@pyapi kind=subroutine args=x:integer(:):intent(inout) desc="sort integer vector x in ascending order"
+public :: sort_real_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(inout) lib=sorting desc="sort real vector x in ascending order"
+public :: sort_int_vec !@pyapi kind=subroutine args=x:integer(:):intent(inout) lib=sorting desc="sort integer vector x in ascending order"
 public :: sort_char_vec !@pyapi kind=subroutine args=x:character(:)(:):intent(inout) desc="sort character vector x in ascending order"
-public :: argsort_real !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of real vector"
-public :: argsort_int !@pyapi kind=subroutine args=x:integer(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of integer vector"
-public :: argsort_idx_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in) desc="argsort indices (0-based) of real vector"
-public :: argsort_idx_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="argsort indices (0-based) of integer vector"
-public :: sorted_real_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="np.sort of a real vector: a sorted copy"
-public :: sorted_int_vec !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="np.sort of an integer vector: a sorted copy"
-public :: sorted_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in) desc="np.sort of a real matrix along dimension dim (1 = down columns)"
-public :: sorted_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),dim:integer:intent(in) desc="np.sort of an integer matrix along dimension dim (1 = down columns)"
-public :: argsort_real_2d !@pyapi kind=function ret=integer(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in) desc="np.argsort (0-based) of a real matrix along dimension dim"
-public :: argsort_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),dim:integer:intent(in) desc="np.argsort (0-based) of an integer matrix along dimension dim"
-public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="integer arange(start, stop, step)"
-public :: np_insert_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in),val:real(dp):intent(in) desc="numpy insert for rank-1 real array and scalar value"
-public :: np_delete_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in) desc="numpy delete for rank-1 real array and scalar index"
-public :: linspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in) desc="linspace(start, stop, num)"
-public :: logspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional,base:real(dp):intent(in):optional desc="logspace(start, stop, num=50, endpoint=True, base=10)"
-public :: geomspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional desc="geomspace(start, stop, num=50, endpoint=True)"
+public :: argsort_real !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) lib=sorting desc="argsort indices (0-based) of real vector"
+public :: argsort_int !@pyapi kind=subroutine args=x:integer(:):intent(in),idx:integer(:):intent(out) lib=sorting desc="argsort indices (0-based) of integer vector"
+public :: argsort_idx_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in) lib=sorting desc="argsort indices (0-based) of real vector"
+public :: argsort_idx_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=sorting desc="argsort indices (0-based) of integer vector"
+public :: sorted_real_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=sorting desc="np.sort of a real vector: a sorted copy"
+public :: sorted_int_vec !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=sorting desc="np.sort of an integer vector: a sorted copy"
+public :: sorted_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in) lib=sorting desc="np.sort of a real matrix along dimension dim (1 = down columns)"
+public :: sorted_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),dim:integer:intent(in) lib=sorting desc="np.sort of an integer matrix along dimension dim (1 = down columns)"
+public :: argsort_real_2d !@pyapi kind=function ret=integer(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in) lib=sorting desc="np.argsort (0-based) of a real matrix along dimension dim"
+public :: argsort_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),dim:integer:intent(in) lib=sorting desc="np.argsort (0-based) of an integer matrix along dimension dim"
+public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) lib=arrays desc="integer arange(start, stop, step)"
+public :: np_insert_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in),val:real(dp):intent(in) lib=arrays desc="numpy insert for rank-1 real array and scalar value"
+public :: np_delete_real_1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer:intent(in) lib=arrays desc="numpy delete for rank-1 real array and scalar index"
+public :: linspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in) lib=arrays desc="linspace(start, stop, num)"
+public :: logspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional,base:real(dp):intent(in):optional lib=arrays desc="logspace(start, stop, num=50, endpoint=True, base=10)"
+public :: geomspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional lib=arrays desc="geomspace(start, stop, num=50, endpoint=True)"
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
-public :: weighted_mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),w:real(dp)(:):intent(in) desc="weighted mean of 1D real vector"
+public :: weighted_mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),w:real(dp)(:):intent(in) lib=statistics desc="weighted mean of 1D real vector"
 public :: var_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
-public :: skew_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="pandas-style bias-corrected (adjusted Fisher-Pearson) sample skewness of 1D real vector"
-public :: kurt_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="pandas-style bias-corrected (adjusted Fisher-Pearson) excess sample kurtosis of 1D real vector"
-public :: statistics_quantiles_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in) desc="statistics.quantiles default exclusive method for 1D real vector"
-public :: median_1d_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="median of 1D real vector"
-public :: median_low_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="median_low of 1D integer vector"
-public :: median_high_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="median_high of 1D integer vector"
-public :: mode_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="mode of 1D integer vector"
-public :: mode_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mode of 1D real vector"
-public :: multimode_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="multimode of 1D integer vector"
+public :: skew_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="pandas-style bias-corrected (adjusted Fisher-Pearson) sample skewness of 1D real vector"
+public :: kurt_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="pandas-style bias-corrected (adjusted Fisher-Pearson) excess sample kurtosis of 1D real vector"
+public :: statistics_quantiles_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in) lib=statistics desc="statistics.quantiles default exclusive method for 1D real vector"
+public :: median_1d_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="median of 1D real vector"
+public :: median_low_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) lib=statistics desc="median_low of 1D integer vector"
+public :: median_high_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) lib=statistics desc="median_high of 1D integer vector"
+public :: mode_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) lib=statistics desc="mode of 1D integer vector"
+public :: mode_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="mode of 1D real vector"
+public :: multimode_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=statistics desc="multimode of 1D integer vector"
 public :: zeros_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 0"
 public :: ones_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 1"
 public :: zeros_complex !@pyapi kind=function ret=complex(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n complex array initialized to 0"
 public :: ones_complex !@pyapi kind=function ret=complex(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n complex array initialized to 1"
-public :: complex_isfinite !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) desc="elemental finiteness test for complex values"
-public :: complex_isinf !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) desc="elemental infinity test for complex values"
-public :: complex_isnan !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) desc="elemental NaN test for complex values"
+public :: complex_isfinite !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) lib=arrays desc="elemental finiteness test for complex values"
+public :: complex_isinf !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) lib=arrays desc="elemental infinity test for complex values"
+public :: complex_isnan !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) lib=arrays desc="elemental NaN test for complex values"
 public :: zeros_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) desc="allocate and return length-n integer array initialized to 0"
 public :: ones_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) desc="allocate and return length-n integer array initialized to 1"
 public :: zeros_logical !@pyapi kind=function ret=logical(:) args=n:integer:intent(in) desc="allocate and return length-n logical array initialized to .false."
@@ -157,10 +157,10 @@ public :: str_format_real_sci !@pyapi kind=function ret=character args=x:real(dp
 public :: py_float !@pyapi kind=function ret=real(dp) args=s:character:intent(in) desc="parse string to real(dp), NaN on read failure"
 public :: py_int !@pyapi kind=function ret=integer args=s:character:intent(in) desc="parse string to integer, 0 on read failure"
 public :: digits_of_str !@pyapi kind=function ret=integer(:) args=s:character:intent(in) desc="return decimal digits in a string as an integer vector"
-public :: special_factorial !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial approximation via gamma(x+1)"
-public :: special_factorial2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial2 for integer-like x"
-public :: special_binom !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in) desc="binomial coefficient via gamma"
-public :: special_comb !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in),exact:logical:intent(in):optional,repetition:logical:intent(in):optional desc="scipy.special.comb(n,k,exact=False,repetition=False)"
+public :: special_factorial !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="scipy.special.factorial approximation via gamma(x+1)"
+public :: special_factorial2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="scipy.special.factorial2 for integer-like x"
+public :: special_binom !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in) lib=special desc="binomial coefficient via gamma"
+public :: special_comb !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in),exact:logical:intent(in):optional,repetition:logical:intent(in):optional lib=special desc="scipy.special.comb(n,k,exact=False,repetition=False)"
 public :: to_lower !@pyapi kind=function ret=character args=s:character:intent(in) desc="lowercase string"
 public :: to_upper !@pyapi kind=function ret=character args=s:character:intent(in) desc="uppercase string"
 public :: str_strip !@pyapi kind=function ret=character args=s:character:intent(in),chars:character:intent(in):optional desc="strip leading/trailing characters"
@@ -195,94 +195,107 @@ public :: slice1
 public :: py_slice_bound
 public :: py_rshift
 
-public :: rank_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='min') for a plain 1D real vector"
-public :: rank_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='max') for a plain 1D real vector"
-public :: rank_average_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='average') for a plain 1D real vector"
-public :: rank_first_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='first') for a plain 1D real vector"
-public :: rank_dense_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="pandas-style Series.rank(method='dense') for a plain 1D real vector"
-public :: cumsum_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative sum of real vector"
-public :: cumsum_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative sum of real matrix along axis 0"
-public :: cumsum_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative sum of real matrix along axis 1"
-public :: unique_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="sorted unique values of integer vector"
+public :: rank_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=statistics desc="pandas-style Series.rank(method='min') for a plain 1D real vector"
+public :: rank_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=statistics desc="pandas-style Series.rank(method='max') for a plain 1D real vector"
+public :: rank_average_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=statistics desc="pandas-style Series.rank(method='average') for a plain 1D real vector"
+public :: rank_first_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=statistics desc="pandas-style Series.rank(method='first') for a plain 1D real vector"
+public :: rank_dense_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=statistics desc="pandas-style Series.rank(method='dense') for a plain 1D real vector"
+public :: cumsum_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=arrays desc="cumulative sum of real vector"
+public :: cumsum_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="cumulative sum of real matrix along axis 0"
+public :: cumsum_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="cumulative sum of real matrix along axis 1"
+public :: unique_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=sorting desc="sorted unique values of integer vector"
 public :: unique_char !@pyapi kind=function ret=character(:) args=x:character(:):intent(in) desc="unique values of character vector (first-occurrence order)"
-public :: tile_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="tile integer vector reps times"
-public :: tile_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile integer matrix reps0 x reps1 times"
-public :: diag_from_vec_int !@pyapi kind=function ret=integer(:,:) args=v:integer(:):intent(in) desc="return diagonal matrix from integer vector"
-public :: diagonal !@pyapi kind=function ret=any args=a:any:intent(in),offset:integer:intent(in):optional desc="numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays"
-public :: cumprod_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative product of integer vector"
-public :: repeat_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="repeat each integer element reps times"
-public :: repeat_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) desc="repeat rows of integer matrix reps times"
-public :: repeat_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) desc="repeat columns of integer matrix reps times"
-public :: diag_from_mat_real !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) desc="return main diagonal of real matrix"
-public :: cumsum_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative sum of integer vector"
-public :: cumsum_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative sum of integer matrix along axis 0"
-public :: cumsum_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative sum of integer matrix along axis 1"
-public :: cumprod_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative product of real matrix along axis 0"
-public :: cumprod_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="cumulative product of real matrix along axis 1"
-public :: cumprod_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative product of integer matrix along axis 0"
-public :: cumprod_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) desc="cumulative product of integer matrix along axis 1"
+public :: tile_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) lib=arrays desc="tile integer vector reps times"
+public :: tile_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) lib=arrays desc="tile integer matrix reps0 x reps1 times"
+public :: diag_from_vec_int !@pyapi kind=function ret=integer(:,:) args=v:integer(:):intent(in) lib=arrays desc="return diagonal matrix from integer vector"
+public :: diagonal !@pyapi kind=function ret=any args=a:any:intent(in),offset:integer:intent(in):optional lib=arrays desc="numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays"
+public :: cumprod_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=arrays desc="cumulative product of integer vector"
+public :: repeat_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat each integer element reps times"
+public :: repeat_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat rows of integer matrix reps times"
+public :: repeat_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat columns of integer matrix reps times"
+public :: diag_from_mat_real !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) lib=arrays desc="return main diagonal of real matrix"
+public :: cumsum_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=arrays desc="cumulative sum of integer vector"
+public :: cumsum_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative sum of integer matrix along axis 0"
+public :: cumsum_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative sum of integer matrix along axis 1"
+public :: cumprod_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="cumulative product of real matrix along axis 0"
+public :: cumprod_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="cumulative product of real matrix along axis 1"
+public :: cumprod_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative product of integer matrix along axis 0"
+public :: cumprod_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative product of integer matrix along axis 1"
 public :: itertools_product2_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="itertools.product(a,b) for integer vectors"
 public :: itertools_combinations_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations(x,r) for integer vectors (r=2 currently)"
 public :: itertools_combinations_wr_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations_with_replacement(x,r) for integer vectors (r=2 currently)"
 public :: itertools_permutations_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.permutations(x,r) for integer vectors (r=2 currently)"
-public :: diag_from_vec_real !@pyapi kind=function ret=real(dp)(:,:) args=v:real(dp)(:):intent(in) desc="return diagonal matrix from real vector"
-public :: repeat_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="repeat each real element reps times"
-public :: repeat_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps:integer:intent(in) desc="repeat rows of real matrix reps times"
-public :: repeat_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps:integer:intent(in) desc="repeat columns of real matrix reps times"
-public :: repeat_logical !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),reps:integer:intent(in) desc="repeat each logical element reps times"
-public :: repeat_logical_axis0_2d !@pyapi kind=function ret=logical(:,:) args=x:logical(:,:):intent(in),reps:integer:intent(in) desc="repeat rows of logical matrix reps times"
-public :: repeat_logical_axis1_2d !@pyapi kind=function ret=logical(:,:) args=x:logical(:,:):intent(in),reps:integer:intent(in) desc="repeat columns of logical matrix reps times"
-public :: diag_from_mat_int !@pyapi kind=function ret=integer(:) args=a:integer(:,:):intent(in) desc="return main diagonal of integer matrix"
-public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="tile real vector reps times"
-public :: tile_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile real matrix reps0 x reps1 times"
-public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional,k:integer:intent(in):optional desc="return n x m matrix with ones on diagonal k (default m=n, k=0)"
-public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="sorted unique values of real vector"
-public :: bincount_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),minlength:integer:intent(in):optional desc="count occurrences of nonnegative integers"
-public :: searchsorted_left_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted left indices for integer vectors"
-public :: searchsorted_right_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted right indices for integer vectors"
-public :: searchsorted_left_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) desc="searchsorted left index for scalar integer query"
-public :: searchsorted_right_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) desc="searchsorted right index for scalar integer query"
-public :: setdiff1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique values in a not in b"
-public :: intersect1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique intersection of a and b"
+public :: diag_from_vec_real !@pyapi kind=function ret=real(dp)(:,:) args=v:real(dp)(:):intent(in) lib=arrays desc="return diagonal matrix from real vector"
+public :: repeat_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat each real element reps times"
+public :: repeat_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat rows of real matrix reps times"
+public :: repeat_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat columns of real matrix reps times"
+public :: repeat_logical !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat each logical element reps times"
+public :: repeat_logical_axis0_2d !@pyapi kind=function ret=logical(:,:) args=x:logical(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat rows of logical matrix reps times"
+public :: repeat_logical_axis1_2d !@pyapi kind=function ret=logical(:,:) args=x:logical(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat columns of logical matrix reps times"
+public :: diag_from_mat_int !@pyapi kind=function ret=integer(:) args=a:integer(:,:):intent(in) lib=arrays desc="return main diagonal of integer matrix"
+public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) lib=arrays desc="tile real vector reps times"
+public :: tile_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) lib=arrays desc="tile real matrix reps0 x reps1 times"
+public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional,k:integer:intent(in):optional lib=arrays desc="return n x m matrix with ones on diagonal k (default m=n, k=0)"
+public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=sorting desc="sorted unique values of real vector"
+public :: bincount_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),minlength:integer:intent(in):optional lib=statistics desc="count occurrences of nonnegative integers"
+public :: searchsorted_left_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) lib=sorting desc="searchsorted left indices for integer vectors"
+public :: searchsorted_right_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) lib=sorting desc="searchsorted right indices for integer vectors"
+public :: searchsorted_left_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) lib=sorting desc="searchsorted left index for scalar integer query"
+public :: searchsorted_right_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) lib=sorting desc="searchsorted right index for scalar integer query"
+public :: setdiff1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) lib=sorting desc="sorted unique values in a not in b"
+public :: intersect1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) lib=sorting desc="sorted unique intersection of a and b"
 public :: setdiff1d_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),b:character(:):intent(in) desc="unique values in a not in b (character)"
 public :: intersect1d_char !@pyapi kind=function ret=character(:) args=a:character(:):intent(in),b:character(:):intent(in) desc="unique intersection of a and b (character)"
-public :: unique_int_inv_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),inv:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with inverse and counts"
-public :: unique_int_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with counts"
-public :: lexsort2_int !@pyapi kind=function ret=integer(:) args=key0:integer(:):intent(in),key1:integer(:):intent(in) desc="lexsort((key0,key1)): sort by key1 then key0, return 0-based indices"
-public :: lexsort2_real !@pyapi kind=function ret=integer(:) args=key0:real(dp)(:):intent(in),key1:real(dp)(:):intent(in) desc="lexsort((key0,key1)) for real keys: sort by key1 then key0, return 0-based indices"
-public :: ravel_multi_index_2d !@pyapi kind=function ret=integer args=rc:integer(:):intent(in),shape:integer(:):intent(in) desc="2D ravel_multi_index"
-public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:intent(in),shape:integer(:):intent(in) desc="2D unravel_index"
-public :: kron_2d !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),b:integer(:,:):intent(in) desc="2D Kronecker product for integer matrices"
-public :: histogram_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:integer(:):intent(out),edges:real(dp)(:):intent(out) desc="1D histogram with explicit real bin edges"
-public :: histogram_int_edges !@pyapi kind=subroutine args=x:integer(:):intent(in),bins:integer(:):intent(in),h:integer(:):intent(out),edges:integer(:):intent(out) desc="1D histogram with explicit integer bin edges"
-public :: histogram2d_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),xbins:real(dp)(:):intent(in),ybins:real(dp)(:):intent(in),h:integer(:,:):intent(out) desc="2D histogram with explicit real bin edges on both axes"
-public :: reduceat_add_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for real vector"
-public :: reduceat_add_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for integer vector"
-public :: reduceat_mul_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.multiply.reduceat for real vector"
-public :: reduceat_mul_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.multiply.reduceat for integer vector"
-public :: reduceat_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.minimum.reduceat for real vector"
-public :: reduceat_min_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.minimum.reduceat for integer vector"
-public :: reduceat_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.maximum.reduceat for real vector"
-public :: reduceat_max_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) desc="np.maximum.reduceat for integer vector"
-public :: reduceat_logical_and !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),idx:integer(:):intent(in) desc="np.logical_and.reduceat for logical vector"
-public :: reduceat_logical_or !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),idx:integer(:):intent(in) desc="np.logical_or.reduceat for logical vector"
-public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
-public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
-public :: np_gradient_1d, np_gradient_2d, np_trapezoid_1d, interp_0d
-public :: interp_periodic_1d, interp_periodic_0d, np_hist_edges, histogram2d_np
-public :: histogram_np !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:real(dp)(:):intent(out),edges:real(dp)(:):intent(out),weights:real(dp)(:):intent(in):optional,density:logical:intent(in):optional lib=statistics desc="np.histogram with bin edges, weights= and density=: float counts"
+public :: unique_int_inv_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),inv:integer(:):intent(out),cnt:integer(:):intent(out) lib=sorting desc="unique values with inverse and counts"
+public :: unique_int_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),cnt:integer(:):intent(out) lib=sorting desc="unique values with counts"
+public :: lexsort2_int !@pyapi kind=function ret=integer(:) args=key0:integer(:):intent(in),key1:integer(:):intent(in) lib=sorting desc="lexsort((key0,key1)): sort by key1 then key0, return 0-based indices"
+public :: lexsort2_real !@pyapi kind=function ret=integer(:) args=key0:real(dp)(:):intent(in),key1:real(dp)(:):intent(in) lib=sorting desc="lexsort((key0,key1)) for real keys: sort by key1 then key0, return 0-based indices"
+public :: ravel_multi_index_2d !@pyapi kind=function ret=integer args=rc:integer(:):intent(in),shape:integer(:):intent(in) lib=arrays desc="2D ravel_multi_index"
+public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:intent(in),shape:integer(:):intent(in) lib=arrays desc="2D unravel_index"
+public :: kron_2d !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),b:integer(:,:):intent(in) lib=linalg desc="2D Kronecker product for integer matrices"
+public :: histogram_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:integer(:):intent(out),edges:real(dp)(:):intent(out) lib=statistics desc="1D histogram with explicit real bin edges"
+public :: histogram_int_edges !@pyapi kind=subroutine args=x:integer(:):intent(in),bins:integer(:):intent(in),h:integer(:):intent(out),edges:integer(:):intent(out) lib=statistics desc="1D histogram with explicit integer bin edges"
+public :: histogram2d_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),xbins:real(dp)(:):intent(in),ybins:real(dp)(:):intent(in),h:integer(:,:):intent(out) lib=statistics desc="2D histogram with explicit real bin edges on both axes"
+public :: reduceat_add_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.add.reduceat for real vector"
+public :: reduceat_add_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.add.reduceat for integer vector"
+public :: reduceat_mul_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.multiply.reduceat for real vector"
+public :: reduceat_mul_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.multiply.reduceat for integer vector"
+public :: reduceat_min_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.minimum.reduceat for real vector"
+public :: reduceat_min_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.minimum.reduceat for integer vector"
+public :: reduceat_max_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.maximum.reduceat for real vector"
+public :: reduceat_max_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.maximum.reduceat for integer vector"
+public :: reduceat_logical_and !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.logical_and.reduceat for logical vector"
+public :: reduceat_logical_or !@pyapi kind=function ret=logical(:) args=x:logical(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.logical_or.reduceat for logical vector"
+public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=arrays desc="cumulative product of real vector"
+public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=calculus desc="1D gradient with unit spacing (numpy-style edge handling)"
+public :: np_gradient_1d !@pyapi lib=calculus
+public :: np_gradient_2d !@pyapi lib=calculus
+public :: np_trapezoid_1d !@pyapi lib=calculus
+public :: interp_0d !@pyapi lib=calculus
+public :: interp_periodic_1d !@pyapi lib=calculus
+public :: interp_periodic_0d !@pyapi lib=calculus
+public :: np_hist_edges !@pyapi lib=statistics
+public :: histogram2d_np !@pyapi lib=statistics
+public :: histogram_np !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:real(dp)(:):intent(out),edges:real(dp)(:):intent(out),weights:real(dp)(:):intent(in):optional,density:logical:intent(in):optional desc="np.histogram with bin edges, weights= and density=: float counts"
 public :: np_hist_bin_count !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in),method:character(*):intent(in),integer_data:logical:intent(in),lo_in:real(dp):intent(in):optional,hi_in:real(dp):intent(in):optional lib=statistics desc="number of histogram bins chosen by numpy's estimators auto, fd, doane, scott, rice, sturges, sqrt"
-public :: np_spacing, np_chkfinite
+public :: np_spacing !@pyapi lib=arrays
+public :: np_chkfinite !@pyapi lib=arrays
 public :: np_nan_to_num !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),nan:real(dp):intent(in),posinf:real(dp):intent(in),neginf:real(dp):intent(in) lib=arrays desc="np.nan_to_num: NaN and infinities replaced (elemental)"
 public :: np_heaviside !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),h0:real(dp):intent(in) lib=arrays desc="np.heaviside step function, NaN at NaN (elemental)"
-public :: np_corrcoef_1
+public :: np_corrcoef_1 !@pyapi lib=statistics
 public :: np_packbits !@pyapi kind=function ret=integer(:) args=bits:logical(:):intent(in),little:logical:intent(in) lib=arrays desc="np.packbits: pack a logical vector into bytes (values 0..255), big- or little-endian bit order"
 public :: np_unpackbits !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),little:logical:intent(in),count:integer:intent(in):optional lib=arrays desc="np.unpackbits: the bits (0/1) of bytes 0..255, with numpy's count="
 public :: np_pad_indices !@pyapi kind=function ret=integer(:) args=n:integer:intent(in),before:integer:intent(in),after:integer:intent(in),mode:integer:intent(in) lib=arrays desc="np.pad: 1-based source indices of a vector of size n padded by before/after elements (mode 1 edge, 2 wrap, 3 reflect, 4 symmetric)"
 public :: np_pad_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),before:integer:intent(in),after:integer:intent(in),mode:integer:intent(in) lib=arrays desc="np.pad of a real, integer, complex or logical vector with mode 1 edge, 2 wrap, 3 reflect, 4 symmetric"
 public :: np_pad_index !@pyapi kind=function ret=integer args=i:integer:intent(in),n:integer:intent(in),mode:integer:intent(in) lib=arrays desc="np.pad index map: 0-based source index of padded position i for mode 1 edge, 2 wrap, 3 reflect, 4 symmetric"
-public :: np_window, np_poly_roots, np_polyadd, np_polymul, np_polydiv, np_polyint
-public :: nan_quantile_vec, nan_quantile_axis_2d
+public :: np_window !@pyapi lib=signal
+public :: np_poly_roots !@pyapi lib=polynomial
+public :: np_polyadd !@pyapi lib=polynomial
+public :: np_polymul !@pyapi lib=polynomial
+public :: np_polydiv !@pyapi lib=polynomial
+public :: np_polyint !@pyapi lib=polynomial
+public :: nan_quantile_vec
+public :: nan_quantile_axis_2d !@pyapi lib=statistics
 public :: powval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial, lowest degree first) at x (scalar, vector or matrix x)"
 public :: powvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.polynomial.polyvander: pseudo-Vandermonde matrix"
 public :: powval2d !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in),c:real(dp)(:,:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval2d: 2-D series value at points (x, y) (scalars, vectors or matrices)"
@@ -348,85 +361,87 @@ public :: hermecompanion, hermeroots, hermerealroots, hermefromroots, hermemulx,
 public :: lagcompanion, lagroots, lagrealroots, lagfromroots, lagmulx, lagadd, lagsub, lagmul, lagdiv, lagpow, lagline, lagtrim, lag2poly, poly2lag, laggauss !@pyapi lib=polynomial desc="np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim, conversions to and from the power series, Gauss quadrature"
 public :: chebpts1, chebpts2 !@pyapi lib=polynomial desc="np.polynomial.chebyshev.chebpts1/chebpts2: Chebyshev points of the first/second kind"
 public :: opoly_trim, opoly_trimcoef, opoly_companion, opoly_roots, opoly_realroots, opoly_gauss, opoly_mulx, opoly_add, opoly_mul, opoly_div, opoly_div_part, opoly_pow, opoly_line, opoly_fromroots, opoly_to_pow, opoly_from_pow, opoly_gauss_part
-public :: unwrap_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="unwrap 1D phase vector using numpy-like default discontinuity pi"
-public :: bitwise_count_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="population count for each integer element"
-public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="modified Bessel function I0 approximation (elemental)"
-public :: sinc_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="normalized sinc(x) = sin(pi*x)/(pi*x) with sinc(0)=1"
-public :: signbit_real !@pyapi kind=function ret=logical args=x:real(dp):intent(in) desc="true when IEEE sign bit is set (including -0.0)"
-public :: gcd_int_scalar !@pyapi kind=function ret=integer args=a:integer:intent(in),b:integer:intent(in) desc="greatest common divisor"
-public :: lcm_int_scalar !@pyapi kind=function ret=integer args=a:integer:intent(in),b:integer:intent(in) desc="least common multiple"
-public :: gcd_int !@pyapi kind=function ret=integer args=a:integer(:):intent(in) desc="greatest common divisor of integer array"
-public :: lcm_int !@pyapi kind=function ret=integer args=a:integer(:):intent(in) desc="least common multiple of integer array"
-public :: interp_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),xp:real(dp)(:):intent(in),fp:real(dp)(:):intent(in) desc="1D linear interpolation with endpoint clamping"
-public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in) desc="solve linear system A x = b using LAPACK DGESV"
-public :: linalg_solve_safe !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in),x:real(dp)(:):intent(out),ok:logical:intent(out) desc="solve linear system A x = b using LAPACK DGESV and return success status"
-public :: linalg_cholesky !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="lower-triangular Cholesky factor using LAPACK DPOTRF"
-public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="determinant of square matrix using LAPACK DGETRF"
-public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="matrix inverse using LAPACK DGETRF/DGETRI"
-public :: linalg_cond !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="2-norm condition number using SVD singular values"
-public :: linalg_matrix_rank !@pyapi kind=function ret=integer args=a:real(dp)(:,:):intent(in) desc="numerical matrix rank using SVD singular values and NumPy-like tolerance"
-public :: linalg_eigvals !@pyapi kind=function ret=complex(dp)(:) args=a:real(dp)(:,:):intent(in) desc="eigenvalues of real or complex square matrix"
-public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:complex(dp)(:):intent(out),v:complex(dp)(:,:):intent(out) desc="complex right eigenpairs of real square matrix using LAPACK DGEEV"
-public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
-public :: linalg_eigvalsh !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) desc="eigenvalues only of real symmetric matrix using LAPACK DSYEV (jobz='N')"
-public :: linalg_pinv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="Moore-Penrose pseudo-inverse via economy SVD"
-public :: linalg_matrix_power !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),p:integer:intent(in) desc="integer matrix power (identity at p=0, repeated matmul of inv(a) for p<0)"
-public :: linalg_qr_reduced !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),q:real(dp)(:,:):intent(out),r:real(dp)(:,:):intent(out) desc="reduced QR factorization using LAPACK DGEQRF/DORGQR"
-public :: matrix_norm2 !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="matrix spectral norm"
-public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="full SVD using LAPACK DGESVD"
-public :: linalg_svd_econ !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="economy/reduced SVD (full_matrices=False) using LAPACK DGESVD"
-public :: leggauss !@pyapi kind=subroutine args=n:integer:intent(in),x:real(dp)(:):intent(out),w:real(dp)(:):intent(out) desc="Gauss-Legendre quadrature nodes x and weights w on [-1,1] for degree n, matching numpy.polynomial.legendre.leggauss"
-public :: quantile_linear !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),q:real(dp):intent(in) desc="1D quantile with linear interpolation (NumPy-like default)"
-public :: quantile_linear_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),q:real(dp)(:):intent(in) desc="1D quantiles at multiple probabilities with linear interpolation (NumPy-like default)"
-public :: tri_int !@pyapi kind=function ret=integer(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
-public :: tri_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
-public :: moveaxis3_int !@pyapi kind=function ret=integer(:,:,:) args=a:integer(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 integer arrays (NumPy-style indices)"
-public :: moveaxis3_real !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 real arrays (NumPy-style indices)"
-public :: moveaxis3_logical !@pyapi kind=function ret=logical(:,:,:) args=a:logical(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 logical arrays (NumPy-style indices)"
-public :: pad2d_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:integer:intent(in) desc="2D constant pad for integer matrix"
-public :: pad2d_real !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:real(dp):intent(in) desc="2D constant pad for real matrix"
-public :: allclose !@pyapi kind=function ret=logical args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="NumPy-like allclose on 1D arrays"
-public :: isclose_real !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="element-wise version of allclose (NumPy's isclose), a or b may have length 1 to broadcast"
-public :: isclose_scalar_real !@pyapi kind=function ret=logical args=a:real(dp):intent(in),b:real(dp):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional desc="scalar counterpart of isclose_real, for np.isclose() with two scalar arguments"
-public :: allclose_integer !@pyapi kind=function ret=logical args=a:integer(:):intent(in),b:integer(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional desc="NumPy-like allclose on 1D integer arrays"
-public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="2x2 covariance matrix for two real vectors"
-public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional desc="covariance matrix for observations in rows (numpy rowvar=False)"
-public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
-public :: corrcoef_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="correlation matrix for observations in rows (numpy rowvar=False)"
-public :: autocorr_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),lag:integer:intent(in):optional desc="pandas-style lag-k serial autocorrelation of a 1D real vector"
-public :: corr2_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="Pearson correlation of two 1D real vectors as a plain scalar"
-public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D convolution with mode full/same/valid"
-public :: diff_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="first difference along axis 0 for a real matrix"
-public :: diff_axis1_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) desc="first difference along axis 1 for a real matrix"
-public :: sliding_window_view_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:):intent(in),window:integer:intent(in) desc="axis-0 sliding window view for a real matrix"
-public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional desc="1D integer convolution with mode full/same/valid"
-public :: correlate_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D cross-correlation with mode full/same/valid (scipy.signal.correlate)"
-public :: lfilter_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="1D IIR/FIR filter, zero initial conditions (scipy.signal.lfilter)"
-public :: filtfilt_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="zero-phase forward-backward filter, no edge padding (scipy.signal.filtfilt)"
-public :: lfilter_zi_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in) desc="steady-state IIR filter initial state for a unit step input (scipy.signal.lfilter_zi)"
-public :: detrend_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),dtype:character:intent(in):optional desc="remove linear or constant trend (scipy.signal.detrend)"
-public :: find_peaks_int !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),height:real(dp):intent(in):optional,distance:integer:intent(in):optional desc="0-based local-maxima indices (scipy.signal.find_peaks, indices only)"
-public :: loadtxt_real_vector, loadtxt_int_vector, loadtxt_logical_vector
-public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load real matrix text file with basic numpy-like options"
-public :: loadtxt_real_1d !@pyapi kind=function ret=real(dp)(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected real column as vector"
-public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load integer matrix from text file"
-public :: loadtxt_int_1d !@pyapi kind=function ret=integer(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected integer column as vector"
-public :: loadtxt_logical_2d !@pyapi kind=function ret=logical(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load logical matrix from text file (nonzero=>true)"
-public :: loadtxt_logical_1d !@pyapi kind=function ret=logical(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected logical column as vector (nonzero=>true)"
+public :: unwrap_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=signal desc="unwrap 1D phase vector using numpy-like default discontinuity pi"
+public :: bitwise_count_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=integers desc="population count for each integer element"
+public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="modified Bessel function I0 approximation (elemental)"
+public :: sinc_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="normalized sinc(x) = sin(pi*x)/(pi*x) with sinc(0)=1"
+public :: signbit_real !@pyapi kind=function ret=logical args=x:real(dp):intent(in) lib=arrays desc="true when IEEE sign bit is set (including -0.0)"
+public :: gcd_int_scalar !@pyapi kind=function ret=integer args=a:integer:intent(in),b:integer:intent(in) lib=integers desc="greatest common divisor"
+public :: lcm_int_scalar !@pyapi kind=function ret=integer args=a:integer:intent(in),b:integer:intent(in) lib=integers desc="least common multiple"
+public :: gcd_int !@pyapi kind=function ret=integer args=a:integer(:):intent(in) lib=integers desc="greatest common divisor of integer array"
+public :: lcm_int !@pyapi kind=function ret=integer args=a:integer(:):intent(in) lib=integers desc="least common multiple of integer array"
+public :: interp_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),xp:real(dp)(:):intent(in),fp:real(dp)(:):intent(in) lib=calculus desc="1D linear interpolation with endpoint clamping"
+public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in) lib=linalg desc="solve linear system A x = b using LAPACK DGESV"
+public :: linalg_solve_safe !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in),x:real(dp)(:):intent(out),ok:logical:intent(out) lib=linalg desc="solve linear system A x = b using LAPACK DGESV and return success status"
+public :: linalg_cholesky !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) lib=linalg desc="lower-triangular Cholesky factor using LAPACK DPOTRF"
+public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) lib=linalg desc="determinant of square matrix using LAPACK DGETRF"
+public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) lib=linalg desc="matrix inverse using LAPACK DGETRF/DGETRI"
+public :: linalg_cond !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) lib=linalg desc="2-norm condition number using SVD singular values"
+public :: linalg_matrix_rank !@pyapi kind=function ret=integer args=a:real(dp)(:,:):intent(in) lib=linalg desc="numerical matrix rank using SVD singular values and NumPy-like tolerance"
+public :: linalg_eigvals !@pyapi kind=function ret=complex(dp)(:) args=a:real(dp)(:,:):intent(in) lib=linalg desc="eigenvalues of real or complex square matrix"
+public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:complex(dp)(:):intent(out),v:complex(dp)(:,:):intent(out) lib=linalg desc="complex right eigenpairs of real square matrix using LAPACK DGEEV"
+public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) lib=linalg desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
+public :: linalg_eigvalsh !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) lib=linalg desc="eigenvalues only of real symmetric matrix using LAPACK DSYEV (jobz='N')"
+public :: linalg_pinv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) lib=linalg desc="Moore-Penrose pseudo-inverse via economy SVD"
+public :: linalg_matrix_power !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),p:integer:intent(in) lib=linalg desc="integer matrix power (identity at p=0, repeated matmul of inv(a) for p<0)"
+public :: linalg_qr_reduced !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),q:real(dp)(:,:):intent(out),r:real(dp)(:,:):intent(out) lib=linalg desc="reduced QR factorization using LAPACK DGEQRF/DORGQR"
+public :: matrix_norm2 !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) lib=linalg desc="matrix spectral norm"
+public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) lib=linalg desc="full SVD using LAPACK DGESVD"
+public :: linalg_svd_econ !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) lib=linalg desc="economy/reduced SVD (full_matrices=False) using LAPACK DGESVD"
+public :: leggauss !@pyapi kind=subroutine args=n:integer:intent(in),x:real(dp)(:):intent(out),w:real(dp)(:):intent(out) lib=polynomial desc="Gauss-Legendre quadrature nodes x and weights w on [-1,1] for degree n, matching numpy.polynomial.legendre.leggauss"
+public :: quantile_linear !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),q:real(dp):intent(in) lib=statistics desc="1D quantile with linear interpolation (NumPy-like default)"
+public :: quantile_linear_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),q:real(dp)(:):intent(in) lib=statistics desc="1D quantiles at multiple probabilities with linear interpolation (NumPy-like default)"
+public :: tri_int !@pyapi kind=function ret=integer(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional lib=arrays desc="lower-triangular ones matrix with diagonal offset k"
+public :: tri_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional lib=arrays desc="lower-triangular ones matrix with diagonal offset k"
+public :: moveaxis3_int !@pyapi kind=function ret=integer(:,:,:) args=a:integer(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) lib=arrays desc="move one axis for rank-3 integer arrays (NumPy-style indices)"
+public :: moveaxis3_real !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) lib=arrays desc="move one axis for rank-3 real arrays (NumPy-style indices)"
+public :: moveaxis3_logical !@pyapi kind=function ret=logical(:,:,:) args=a:logical(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) lib=arrays desc="move one axis for rank-3 logical arrays (NumPy-style indices)"
+public :: pad2d_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:integer:intent(in) lib=arrays desc="2D constant pad for integer matrix"
+public :: pad2d_real !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:real(dp):intent(in) lib=arrays desc="2D constant pad for real matrix"
+public :: allclose !@pyapi kind=function ret=logical args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional lib=arrays desc="NumPy-like allclose on 1D arrays"
+public :: isclose_real !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional lib=arrays desc="element-wise version of allclose (NumPy's isclose), a or b may have length 1 to broadcast"
+public :: isclose_scalar_real !@pyapi kind=function ret=logical args=a:real(dp):intent(in),b:real(dp):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional,equal_nan:logical:intent(in):optional lib=arrays desc="scalar counterpart of isclose_real, for np.isclose() with two scalar arguments"
+public :: allclose_integer !@pyapi kind=function ret=logical args=a:integer(:):intent(in),b:integer(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional lib=arrays desc="NumPy-like allclose on 1D integer arrays"
+public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="2x2 covariance matrix for two real vectors"
+public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="covariance matrix for observations in rows (numpy rowvar=False)"
+public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) lib=statistics desc="2x2 correlation matrix for two real vectors"
+public :: corrcoef_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=statistics desc="correlation matrix for observations in rows (numpy rowvar=False)"
+public :: autocorr_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),lag:integer:intent(in):optional lib=timeseries desc="pandas-style lag-k serial autocorrelation of a 1D real vector"
+public :: corr2_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) lib=statistics desc="Pearson correlation of two 1D real vectors as a plain scalar"
+public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional lib=signal desc="1D convolution with mode full/same/valid"
+public :: diff_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="first difference along axis 0 for a real matrix"
+public :: diff_axis1_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="first difference along axis 1 for a real matrix"
+public :: sliding_window_view_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:):intent(in),window:integer:intent(in) lib=arrays desc="axis-0 sliding window view for a real matrix"
+public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional lib=signal desc="1D integer convolution with mode full/same/valid"
+public :: correlate_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),mode:character:intent(in):optional lib=signal desc="1D cross-correlation with mode full/same/valid (scipy.signal.correlate)"
+public :: lfilter_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) lib=signal desc="1D IIR/FIR filter, zero initial conditions (scipy.signal.lfilter)"
+public :: filtfilt_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) lib=signal desc="zero-phase forward-backward filter, no edge padding (scipy.signal.filtfilt)"
+public :: lfilter_zi_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in) lib=signal desc="steady-state IIR filter initial state for a unit step input (scipy.signal.lfilter_zi)"
+public :: detrend_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),dtype:character:intent(in):optional lib=signal desc="remove linear or constant trend (scipy.signal.detrend)"
+public :: find_peaks_int !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),height:real(dp):intent(in):optional,distance:integer:intent(in):optional lib=signal desc="0-based local-maxima indices (scipy.signal.find_peaks, indices only)"
+public :: loadtxt_real_vector !@pyapi lib=io
+public :: loadtxt_int_vector !@pyapi lib=io
+public :: loadtxt_logical_vector !@pyapi lib=io
+public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional lib=io desc="load real matrix text file with basic numpy-like options"
+public :: loadtxt_real_1d !@pyapi kind=function ret=real(dp)(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional lib=io desc="load one selected real column as vector"
+public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional lib=io desc="load integer matrix from text file"
+public :: loadtxt_int_1d !@pyapi kind=function ret=integer(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional lib=io desc="load one selected integer column as vector"
+public :: loadtxt_logical_2d !@pyapi kind=function ret=logical(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional lib=io desc="load logical matrix from text file (nonzero=>true)"
+public :: loadtxt_logical_1d !@pyapi kind=function ret=logical(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional lib=io desc="load one selected logical column as vector (nonzero=>true)"
 public :: np_fmt_number
-public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in),delimiter:character:intent(in):optional,fmt:character:intent(in):optional desc="write real matrix text file with basic delimiter/fmt options"
+public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in),delimiter:character:intent(in):optional,fmt:character:intent(in):optional lib=io desc="write real matrix text file with basic delimiter/fmt options"
 public :: print_matrix !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),label:character:intent(in):optional desc="print 2D real matrix with aligned columns"
 public :: print_array_3d !@pyapi kind=subroutine args=a:real(dp)(:,:,:):intent(in),label:character:intent(in):optional desc="print 3D real array with numpy-style nested brackets"
-public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
-public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
-public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional desc="m-th derivative coefficients for descending-order polynomial"
-public :: polyroots_real !@pyapi kind=function ret=complex(dp)(:) args=p:real(dp)(:):intent(in) desc="roots of real-coefficient polynomial (descending order) via LAPACK DGEEV"
-public :: fft_fft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like fft for 1D real/complex input (naive DFT backend)"
-public :: fft_ifft !@pyapi kind=function ret=complex(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like ifft for 1D complex input (naive DFT backend)"
-public :: fft_rfft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like rfft for 1D real input"
-public :: fft_irfft !@pyapi kind=function ret=real(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like irfft for 1D Hermitian spectrum"
-public :: fft_fftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional desc="numpy-like fftfreq(n,d)"
-public :: fft_rfftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional desc="numpy-like rfftfreq(n,d)"
+public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) lib=polynomial desc="evaluate polynomial with descending coefficients at scalar x"
+public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) lib=polynomial desc="evaluate polynomial with descending coefficients at vector x"
+public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional lib=polynomial desc="m-th derivative coefficients for descending-order polynomial"
+public :: polyroots_real !@pyapi kind=function ret=complex(dp)(:) args=p:real(dp)(:):intent(in) lib=polynomial desc="roots of real-coefficient polynomial (descending order) via LAPACK DGEEV"
+public :: fft_fft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional lib=fft desc="numpy-like fft for 1D real/complex input (naive DFT backend)"
+public :: fft_ifft !@pyapi kind=function ret=complex(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional lib=fft desc="numpy-like ifft for 1D complex input (naive DFT backend)"
+public :: fft_rfft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional lib=fft desc="numpy-like rfft for 1D real input"
+public :: fft_irfft !@pyapi kind=function ret=real(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional lib=fft desc="numpy-like irfft for 1D Hermitian spectrum"
+public :: fft_fftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional lib=fft desc="numpy-like fftfreq(n,d)"
+public :: fft_rfftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional lib=fft desc="numpy-like rfftfreq(n,d)"
 public :: fft_axis_2d !@pyapi kind=function ret=complex(dp)(:,:) args=x:complex(dp)(:,:):intent(in),dim:integer:intent(in),n:integer:intent(in):optional,inverse:logical:intent(in):optional lib=fft desc="FFT (or inverse) of each column (dim=1) or row (dim=2) of a matrix, cropped or zero-padded to n"
 public :: rfft_axis_2d !@pyapi kind=function ret=complex(dp)(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in),n:integer:intent(in):optional lib=fft desc="np.fft.rfft of each column (dim=1) or row (dim=2) of a real matrix"
 public :: irfft_axis_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:complex(dp)(:,:):intent(in),dim:integer:intent(in),n:integer:intent(in):optional lib=fft desc="np.fft.irfft of each column (dim=1) or row (dim=2) of a matrix"
@@ -435,18 +450,18 @@ public :: ifft2 !@pyapi kind=function ret=complex(dp)(:,:) args=x:complex(dp)(:,
 public :: rfft2 !@pyapi kind=function ret=complex(dp)(:,:) args=x:real(dp)(:,:):intent(in),n1:integer:intent(in):optional,n2:integer:intent(in):optional lib=fft desc="np.fft.rfft2 of a real matrix"
 public :: irfft2 !@pyapi kind=function ret=real(dp)(:,:) args=x:complex(dp)(:,:):intent(in),n1:integer:intent(in):optional,n2:integer:intent(in):optional lib=fft desc="np.fft.irfft2: inverse of rfft2"
 
-public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
-public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
-public :: std !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="standard deviation of 1D real vector with optional ddof (numpy-style)"
-public :: log2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="base-2 logarithm"
-public :: nansum !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="sum ignoring NaN values"
-public :: nanmean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean ignoring NaN values"
-public :: nanvar !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance ignoring NaN values with optional ddof"
-public :: nanstd !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="standard deviation ignoring NaN values with optional ddof"
-public :: nanmin !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="minimum ignoring NaN values"
-public :: nanmax !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="maximum ignoring NaN values"
-public :: nanargmin !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmin ignoring NaN values; -1 when all NaN"
-public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmax ignoring NaN values; -1 when all NaN"
+public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="variance of 1D real vector with optional ddof (numpy-style)"
+public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="mean of 1D real vector"
+public :: std !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="standard deviation of 1D real vector with optional ddof (numpy-style)"
+public :: log2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="base-2 logarithm"
+public :: nansum !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="sum ignoring NaN values"
+public :: nanmean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="mean ignoring NaN values"
+public :: nanvar !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="variance ignoring NaN values with optional ddof"
+public :: nanstd !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="standard deviation ignoring NaN values with optional ddof"
+public :: nanmin !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="minimum ignoring NaN values"
+public :: nanmax !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) lib=statistics desc="maximum ignoring NaN values"
+public :: nanargmin !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) lib=statistics desc="0-based argmin ignoring NaN values; -1 when all NaN"
+public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) lib=statistics desc="0-based argmax ignoring NaN values; -1 when all NaN"
 public :: optval !@pyapi kind=function ret=scalar args=x:scalar:intent(in):optional,default:scalar:intent(in) desc="return x when present, otherwise default"
 public :: exec_cmd_status !@pyapi kind=function ret=integer args=cmd:character:intent(in) desc="execute shell command via execute_command_line and return exit status"
 public :: py_time !@pyapi kind=function ret=real args= desc="wall-clock seconds from system_clock (Python time.time approximation)"
@@ -459,18 +474,18 @@ public :: py_format_g_real !@pyapi kind=function ret=character args=x:real(dp):i
 public :: py_format_real
 public :: py_format_int
 public :: narrow_int
-public :: cumsum
-public :: cumprod
-public :: eye
-public :: diag
-public :: repeat
-public :: tile
-public :: unique
-public :: sort_vec
-public :: argsort
-public :: argsort_idx
-public :: sorted_vec
-public :: diag_k
+public :: cumsum !@pyapi lib=arrays
+public :: cumprod !@pyapi lib=arrays
+public :: eye !@pyapi lib=arrays
+public :: diag !@pyapi lib=arrays
+public :: repeat !@pyapi lib=arrays
+public :: tile !@pyapi lib=arrays
+public :: unique !@pyapi lib=sorting
+public :: sort_vec !@pyapi lib=sorting
+public :: argsort !@pyapi lib=sorting
+public :: argsort_idx !@pyapi lib=sorting
+public :: sorted_vec !@pyapi lib=sorting
+public :: diag_k !@pyapi lib=arrays
 public :: rng_pick
 public :: rng_take_values
 public :: rng_integers_v
@@ -496,112 +511,142 @@ public :: rng_rayleigh_v
 public :: rng_poisson_v
 public :: rng_binomial_v
 public :: rng_geometric_v
-public :: stack_inv
-public :: stack_cholesky
-public :: stack_pinv
-public :: stack_matrix_power
-public :: stack_det
-public :: stack_cond
-public :: stack_matrix_rank
-public :: stack_norm2
-public :: stack_normm2
-public :: stack_eigvalsh
-public :: stack_eigvals
-public :: stack_trace
-public :: stack_diagonal
-public :: stack_fro
-public :: stack_solve_v
-public :: stack_solve_m
-public :: stack_solve_s
-public :: stack_matmul_ss
-public :: stack_matmul_sm
-public :: stack_matmul_ms
-public :: stack_matmul_sv
-public :: stack_matmul_vs
-public :: stack_eigh
-public :: stack_eig
-public :: stack_qr
-public :: stack_svd
-public :: stack_svd_econ
-public :: np_kron2, np_cross3, matrix_normm2_real
-public :: np_searchsorted
-public :: np_union1d
-public :: np_intersect1d
-public :: np_setdiff1d
-public :: np_setxor1d
-public :: np_isin1
-public :: np_unique_counts
-public :: np_unique_index
-public :: np_unique_inverse
-public :: np_gather2d
-public :: np_bincount_weights, np_digitize
-public :: c_lt, c_le, c_gt, c_ge, c_maximum, c_minimum, c_round
-public :: c_amin, c_amax, c_argmin, c_argmax
-public :: cumsum_complex, cumprod_complex, cumsum_complex_2d, cumprod_complex_2d
-public :: sorted_complex_vec, sorted_complex_2d, argsort_complex_vec, argsort_complex_2d
-public :: sort_complex_vec, unique_complex, median_complex, median_complex_2d
-public :: reversed_complex_vec
-public :: repeat_complex, tile_complex, diag_k_vec_complex, diag_k_mat_complex
-public :: sort_axis_3d
-public :: argsort_axis_3d
-public :: cumsum_axis_3d
-public :: cumprod_axis_3d
-public :: trace_3d
-public :: concat_3d
-public :: nonzero_3d
-public :: quantile_axis_3d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) desc="np.quantile(x, q, axis) of a rank-3 array"
-public :: np_amin
-public :: np_amax
-public :: np_argmin
-public :: np_argmax
-public :: np_maximum, np_minimum, np_clip, np_floor, np_ceil, np_sign
-public :: histogram_counts !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),nbins:integer:intent(in) desc="np.histogram(x, bins=n)[0]: counts in n equal bins spanning min(x)..max(x)"
-public :: histogram_counts_edges !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),edges:real(dp)(:):intent(in) desc="np.histogram(x, bins=edges)[0]"
-public :: triu
-public :: tril
-public :: quantile_axis_2d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) desc="np.quantile(x, q, axis) of a matrix: linear quantile of each column (dim=1) or row (dim=2)"
-public :: reversed_vec, reversed_mat
-public :: sorted_2d
-public :: argsort_2d
-public :: histogram
-public :: reduceat_add
-public :: reduceat_mul
-public :: reduceat_min
-public :: reduceat_max
-public :: polyval
-public :: polyder
-public :: polyfit_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in) desc="least-squares polynomial fit (deg+1 coefficients, highest degree first), matching numpy.polyfit"
-public :: digitize_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in) desc="bin index of each x(i) against increasing bin edges, matching numpy.digitize (right=False)"
-public :: isin_real !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) desc="element-wise membership test, matching numpy.isin (and numpy.in1d) for real arrays"
-public :: isin_int !@pyapi kind=function ret=logical(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="element-wise membership test, matching numpy.isin (and numpy.in1d) for integer arrays"
-public :: np_save_1d_real !@pyapi kind=subroutine args=filename:character(*):intent(in),x:real(dp)(:):intent(in) desc="write a 1D real array to a binary .npy file, matching numpy.save"
-public :: np_load_1d_real !@pyapi kind=function ret=real(dp)(:) args=filename:character(*):intent(in) desc="read a 1D real array from a binary .npy file, matching numpy.load"
+public :: stack_inv !@pyapi lib=linalg
+public :: stack_cholesky !@pyapi lib=linalg
+public :: stack_pinv !@pyapi lib=linalg
+public :: stack_matrix_power !@pyapi lib=linalg
+public :: stack_det !@pyapi lib=linalg
+public :: stack_cond !@pyapi lib=linalg
+public :: stack_matrix_rank !@pyapi lib=linalg
+public :: stack_norm2 !@pyapi lib=linalg
+public :: stack_normm2 !@pyapi lib=linalg
+public :: stack_eigvalsh !@pyapi lib=linalg
+public :: stack_eigvals !@pyapi lib=linalg
+public :: stack_trace !@pyapi lib=linalg
+public :: stack_diagonal !@pyapi lib=linalg
+public :: stack_fro !@pyapi lib=linalg
+public :: stack_solve_v !@pyapi lib=linalg
+public :: stack_solve_m !@pyapi lib=linalg
+public :: stack_solve_s !@pyapi lib=linalg
+public :: stack_matmul_ss !@pyapi lib=linalg
+public :: stack_matmul_sm !@pyapi lib=linalg
+public :: stack_matmul_ms !@pyapi lib=linalg
+public :: stack_matmul_sv !@pyapi lib=linalg
+public :: stack_matmul_vs !@pyapi lib=linalg
+public :: stack_eigh !@pyapi lib=linalg
+public :: stack_eig !@pyapi lib=linalg
+public :: stack_qr !@pyapi lib=linalg
+public :: stack_svd !@pyapi lib=linalg
+public :: stack_svd_econ !@pyapi lib=linalg
+public :: np_kron2 !@pyapi lib=linalg
+public :: np_cross3 !@pyapi lib=linalg
+public :: matrix_normm2_real !@pyapi lib=linalg
+public :: np_searchsorted !@pyapi lib=sorting
+public :: np_union1d !@pyapi lib=sorting
+public :: np_intersect1d !@pyapi lib=sorting
+public :: np_setdiff1d !@pyapi lib=sorting
+public :: np_setxor1d !@pyapi lib=sorting
+public :: np_isin1 !@pyapi lib=sorting
+public :: np_unique_counts !@pyapi lib=sorting
+public :: np_unique_index !@pyapi lib=sorting
+public :: np_unique_inverse !@pyapi lib=sorting
+public :: np_gather2d !@pyapi lib=arrays
+public :: np_bincount_weights !@pyapi lib=statistics
+public :: np_digitize !@pyapi lib=statistics
+public :: c_lt !@pyapi lib=arrays
+public :: c_le !@pyapi lib=arrays
+public :: c_gt !@pyapi lib=arrays
+public :: c_ge !@pyapi lib=arrays
+public :: c_maximum !@pyapi lib=arrays
+public :: c_minimum !@pyapi lib=arrays
+public :: c_round !@pyapi lib=arrays
+public :: c_amin !@pyapi lib=arrays
+public :: c_amax !@pyapi lib=arrays
+public :: c_argmin !@pyapi lib=arrays
+public :: c_argmax !@pyapi lib=arrays
+public :: cumsum_complex !@pyapi lib=arrays
+public :: cumprod_complex !@pyapi lib=arrays
+public :: cumsum_complex_2d !@pyapi lib=arrays
+public :: cumprod_complex_2d !@pyapi lib=arrays
+public :: sorted_complex_vec !@pyapi lib=sorting
+public :: sorted_complex_2d !@pyapi lib=sorting
+public :: argsort_complex_vec !@pyapi lib=sorting
+public :: argsort_complex_2d !@pyapi lib=sorting
+public :: sort_complex_vec !@pyapi lib=sorting
+public :: unique_complex !@pyapi lib=sorting
+public :: median_complex !@pyapi lib=statistics
+public :: median_complex_2d !@pyapi lib=statistics
+public :: reversed_complex_vec !@pyapi lib=arrays
+public :: repeat_complex !@pyapi lib=arrays
+public :: tile_complex !@pyapi lib=arrays
+public :: diag_k_vec_complex !@pyapi lib=arrays
+public :: diag_k_mat_complex !@pyapi lib=arrays
+public :: sort_axis_3d !@pyapi lib=sorting
+public :: argsort_axis_3d !@pyapi lib=sorting
+public :: cumsum_axis_3d !@pyapi lib=arrays
+public :: cumprod_axis_3d !@pyapi lib=arrays
+public :: trace_3d !@pyapi lib=arrays
+public :: concat_3d !@pyapi lib=arrays
+public :: nonzero_3d !@pyapi lib=arrays
+public :: quantile_axis_3d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) lib=statistics desc="np.quantile(x, q, axis) of a rank-3 array"
+public :: np_amin !@pyapi lib=arrays
+public :: np_amax !@pyapi lib=arrays
+public :: np_argmin !@pyapi lib=arrays
+public :: np_argmax !@pyapi lib=arrays
+public :: np_maximum !@pyapi lib=arrays
+public :: np_minimum !@pyapi lib=arrays
+public :: np_clip !@pyapi lib=arrays
+public :: np_floor !@pyapi lib=arrays
+public :: np_ceil !@pyapi lib=arrays
+public :: np_sign !@pyapi lib=arrays
+public :: histogram_counts !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),nbins:integer:intent(in) lib=statistics desc="np.histogram(x, bins=n)[0]: counts in n equal bins spanning min(x)..max(x)"
+public :: histogram_counts_edges !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),edges:real(dp)(:):intent(in) lib=statistics desc="np.histogram(x, bins=edges)[0]"
+public :: triu !@pyapi lib=arrays
+public :: tril !@pyapi lib=arrays
+public :: quantile_axis_2d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) lib=statistics desc="np.quantile(x, q, axis) of a matrix: linear quantile of each column (dim=1) or row (dim=2)"
+public :: reversed_vec !@pyapi lib=arrays
+public :: reversed_mat !@pyapi lib=arrays
+public :: sorted_2d !@pyapi lib=sorting
+public :: argsort_2d !@pyapi lib=sorting
+public :: histogram !@pyapi lib=statistics
+public :: reduceat_add !@pyapi lib=arrays
+public :: reduceat_mul !@pyapi lib=arrays
+public :: reduceat_min !@pyapi lib=arrays
+public :: reduceat_max !@pyapi lib=arrays
+public :: polyval !@pyapi lib=polynomial
+public :: polyder !@pyapi lib=polynomial
+public :: polyfit_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="least-squares polynomial fit (deg+1 coefficients, highest degree first), matching numpy.polyfit"
+public :: digitize_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in) lib=statistics desc="bin index of each x(i) against increasing bin edges, matching numpy.digitize (right=False)"
+public :: isin_real !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=sorting desc="element-wise membership test, matching numpy.isin (and numpy.in1d) for real arrays"
+public :: isin_int !@pyapi kind=function ret=logical(:) args=a:integer(:):intent(in),b:integer(:):intent(in) lib=sorting desc="element-wise membership test, matching numpy.isin (and numpy.in1d) for integer arrays"
+public :: np_save_1d_real !@pyapi kind=subroutine args=filename:character(*):intent(in),x:real(dp)(:):intent(in) lib=io desc="write a 1D real array to a binary .npy file, matching numpy.save"
+public :: np_load_1d_real !@pyapi kind=function ret=real(dp)(:) args=filename:character(*):intent(in) lib=io desc="read a 1D real array from a binary .npy file, matching numpy.load"
 
-public :: rolling_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in) desc="rolling mean over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
-public :: rolling_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in),ddof:integer:intent(in) desc="rolling sample standard deviation over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
-public :: expanding_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="expanding (growing-window, min_periods=1) running mean"
-public :: expanding_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="expanding (growing-window) sample standard deviation"
-public :: ewm_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) desc="exponentially weighted moving average (adjust=True, pandas' default)"
-public :: ewm_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) desc="exponentially weighted sample standard deviation (adjust=True, bias=False, pandas' defaults)"
-public :: shift_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),periods:integer:intent(in):optional,fill_value:real(dp):intent(in):optional desc="pandas-style Series.shift(periods, fill_value) for a plain 1D real vector"
+public :: rolling_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in) lib=timeseries desc="rolling mean over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
+public :: rolling_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),window:integer:intent(in),ddof:integer:intent(in) lib=timeseries desc="rolling sample standard deviation over a trailing window (NaN until the window fills), Alan Miller's online update/downdate algorithm"
+public :: expanding_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=timeseries desc="expanding (growing-window, min_periods=1) running mean"
+public :: expanding_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional lib=timeseries desc="expanding (growing-window) sample standard deviation"
+public :: ewm_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) lib=timeseries desc="exponentially weighted moving average (adjust=True, pandas' default)"
+public :: ewm_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) lib=timeseries desc="exponentially weighted sample standard deviation (adjust=True, bias=False, pandas' defaults)"
+public :: shift_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),periods:integer:intent(in):optional,fill_value:real(dp):intent(in):optional lib=timeseries desc="pandas-style Series.shift(periods, fill_value) for a plain 1D real vector"
 
 public :: py_round_ndigits !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),ndigits:integer:intent(in) desc="Python 3 round(x, ndigits): ties round to even (banker's rounding)"
-public :: floor_div_real !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) desc="Python-style real floor division (x // y, floor of the quotient, result stays real)"
-public :: np_rint !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="numpy rint/round: nearest integer, ties to even"
+public :: floor_div_real !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) lib=arrays desc="Python-style real floor division (x // y, floor of the quotient, result stays real)"
+public :: np_rint !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=arrays desc="numpy rint/round: nearest integer, ties to even"
 public :: py_round_int !@pyapi kind=function ret=integer args=x:real(dp):intent(in) desc="Python 3 round(x) with no ndigits: banker's rounding to the nearest integer"
-public :: csign_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.sign() for complex input: x / abs(x), 0 at the origin"
-public :: floor_div_int !@pyapi kind=function ret=integer args=x:integer:intent(in),y:integer:intent(in) desc="Python-style integer floor division (x // y, floors toward negative infinity)"
+public :: csign_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) lib=arrays desc="np.sign() for complex input: x / abs(x), 0 at the origin"
+public :: floor_div_int !@pyapi kind=function ret=integer args=x:integer:intent(in),y:integer:intent(in) lib=integers desc="Python-style integer floor division (x // y, floors toward negative infinity)"
 
-public :: log1p !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="log(1 + x), full precision for small abs(x) via the C library's own log1p()"
-public :: expm1 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="exp(x) - 1, full precision for small abs(x) via the C library's own expm1()"
+public :: log1p !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="log(1 + x), full precision for small abs(x) via the C library's own log1p()"
+public :: expm1 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="exp(x) - 1, full precision for small abs(x) via the C library's own expm1()"
 
 public :: math_remainder !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) desc="Python 3 math.remainder(x, y): IEEE 754 remainder, x - round(x/y)*y with ties to even"
 
-public :: expm1_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.expm1 for complex input: exp(x) - 1, precise for small abs(real(x))"
-public :: log1p_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) desc="np.log1p for complex input: log(1 + x)"
+public :: expm1_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) lib=special desc="np.expm1 for complex input: exp(x) - 1, precise for small abs(real(x))"
+public :: log1p_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) lib=special desc="np.log1p for complex input: log(1 + x)"
 
-public :: complex_amin !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) desc="np.amin/np.min on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MINVAL can't do since it rejects complex operands entirely"
-public :: complex_amax !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) desc="np.amax/np.max on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MAXVAL can't do since it rejects complex operands entirely"
+public :: complex_amin !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) lib=arrays desc="np.amin/np.min on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MINVAL can't do since it rejects complex operands entirely"
+public :: complex_amax !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) lib=arrays desc="np.amax/np.max on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MAXVAL can't do since it rejects complex operands entirely"
 
 interface cumsum
    module procedure cumsum_real, cumsum_int
@@ -949,22 +994,24 @@ interface linalg_solve
    module procedure linalg_solve_complex_vec, linalg_solve_complex_mat
 end interface linalg_solve
 
-public :: where_indices_2d, where_axis_2d
-public :: where_pair_2d
-public :: gather_where2d
+public :: where_indices_2d !@pyapi lib=arrays
+public :: where_axis_2d !@pyapi lib=arrays
+public :: where_pair_2d !@pyapi lib=arrays
+public :: gather_where2d !@pyapi lib=arrays
 interface gather_where2d
    module procedure gather_where2d_real, &
       & gather_where2d_int, &
       & gather_where2d_complex, &
       & gather_where2d_logical
 end interface gather_where2d
-public :: lexsort_keys
+public :: lexsort_keys !@pyapi lib=sorting
 interface lexsort_keys
    module procedure lexsort_keys_int, lexsort_keys_real
    module procedure lexsort_packed_int, lexsort_packed_real
 end interface lexsort_keys
 
-public :: linalg_lstsq, linalg_lstsq_x
+public :: linalg_lstsq !@pyapi lib=linalg
+public :: linalg_lstsq_x !@pyapi lib=linalg
 interface linalg_lstsq
    module procedure linalg_lstsq_vec, linalg_lstsq_mat
 end interface linalg_lstsq

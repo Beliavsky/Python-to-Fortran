@@ -6,6 +6,13 @@ module, with everything they use, for a separate library repository.
     python xextract_fortran_lib.py [--src python.f90] [--out fortran_lib]
                                    [--module numpy_fortran] [--topics a,b]
                                    [--no-compile]
+    python xextract_fortran_lib.py --apply-topics topics.tsv [--src python.f90]
+
+--apply-topics edits python.f90's tags from a table (routine<TAB>topic,
+'#' comment lines and a "routine" header skipped): the topic becomes the
+tag's lib= (replacing one there); 'exclude' and 'internal' remove it. A
+public name without a tag gets a public line of its own with a minimal
+tag (!@pyapi lib=<topic>).
 
 Writes, in the output directory:
   <module>.f90  the module: the tagged routines and generic interfaces
@@ -40,6 +47,9 @@ IFACE_END = re.compile(r"^\s*end\s*interface\b", re.I)
 TYPE_START = re.compile(r"^\s*type\s*(?:,[^:]*)?(?:::)?\s*([a-z_]\w*)\s*$", re.I)
 TYPE_END = re.compile(r"^\s*end\s*type\b", re.I)
 WORD = re.compile(r"\b[a-z_]\w*\b", re.I)
+INTRINSIC_SUBROUTINES = {"move_alloc", "random_number", "random_seed", "get_environment_variable", "cpu_time",
+                         "system_clock", "date_and_time", "execute_command_line", "get_command_argument",
+                         "get_command", "mvbits"}
 TAG = re.compile(r"^public\s*::\s*([a-z_]\w*)\s*!@pyapi(.*)$", re.I)
 
 
@@ -84,10 +94,11 @@ def parse(src: str):
             while not IFACE_END.match(strip_comment(lines[j])):
                 j += 1
             procs = []
-            for k in range(i + 1, j):
-                mp = re.match(r"^\s*module\s+procedure\s+(.*)$", strip_comment(lines[k]), re.I)
-                if mp:
-                    procs += [p.strip().lower() for p in mp.group(1).split(",") if p.strip()]
+            # The body with continuation lines joined.
+            body = " ".join(strip_comment(lines[k]).strip() for k in range(i + 1, j))
+            body = re.sub(r"&\s*&?", " ", body)
+            for mp in re.finditer(r"module\s+procedure\s+([\w\s,]+?)(?=module\s+procedure|$)", body, re.I):
+                procs += [p.strip().lower() for p in mp.group(1).split(",") if p.strip()]
             ifaces[m_i.group(1).lower()] = (lines[i:j + 1], procs)
             i = j + 1
             continue
@@ -133,6 +144,50 @@ def tag_field(tag: str, key: str) -> str | None:
     return m.group(2) if m.group(2) is not None else m.group(1)
 
 
+def apply_topics(src: Path, table: Path) -> int:
+    topics = {}
+    for line in table.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#") or line.startswith("routine\t"):
+            continue
+        f = line.split("\t")
+        if len(f) >= 2 and f[1].strip():
+            topics[f[0].strip().lower()] = f[1].strip()
+    lines = src.read_text(encoding="utf-8").splitlines()
+    out, changed, added, untouched = [], 0, 0, set(topics)
+    for line in lines:
+        mt = TAG.match(line.strip())
+        if mt and mt.group(1).lower() in topics:
+            name = mt.group(1).lower()
+            untouched.discard(name)
+            topic = topics[name]
+            new = re.sub(r"\s+lib=\S+", "", line)
+            if topic not in {"exclude", "internal"}:
+                new = (re.sub(r"(\s+desc=)", rf" lib={topic}\1", new, count=1) if " desc=" in new
+                       else new.rstrip() + f" lib={topic}")
+            changed += new != line
+            out.append(new)
+            continue
+        m = re.match(r"^public\s*::\s*([^!]*)$", line.strip(), re.I)
+        if m and "@pyapi" not in line:
+            names = [n.strip() for n in m.group(1).split(",") if n.strip()]
+            keep, own = [], []
+            for n in names:
+                untouched.discard(n.lower())
+                tp = topics.get(n.lower())
+                (own if tp and tp not in {"exclude", "internal"} else keep).append((n, tp))
+            if own:
+                if keep:
+                    out.append("public :: " + ", ".join(n for n, _ in keep))
+                for n, tp in own:
+                    out.append(f"public :: {n} !@pyapi lib={tp}")
+                    added += 1
+                continue
+        out.append(line)
+    src.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+    print(f"tags changed: {changed}; tags added: {added}; table names not found: {sorted(untouched)}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", type=Path, default=HERE / "python.f90")
@@ -140,7 +195,10 @@ def main() -> int:
     ap.add_argument("--module", default="numpy_fortran")
     ap.add_argument("--topics", default="", help="comma-separated lib= topics (default: all)")
     ap.add_argument("--no-compile", action="store_true")
+    ap.add_argument("--apply-topics", type=Path, help="set the tags' lib= topics from this table and stop")
     args = ap.parse_args()
+    if args.apply_topics:
+        return apply_topics(args.src, args.apply_topics)
     lines, uses, decls, types, ifaces, tags, procs, order = parse(args.src.read_text(encoding="utf-8"))
     topics = {t for t in args.topics.split(",") if t}
     lib = {n: t for n, t in tags.items() if tag_field(t, "lib") and (not topics or tag_field(t, "lib") in topics)}
@@ -183,7 +241,7 @@ def main() -> int:
     for n in need_procs:
         for l in procs[n]:
             m = re.match(r"^\s*call\s+([a-z_]\w*)", strip_comment(l), re.I)
-            if m and m.group(1).lower() not in defined:
+            if m and m.group(1).lower() not in defined | INTRINSIC_SUBROUTINES:
                 externals.add(m.group(1).lower())
     args.out.mkdir(parents=True, exist_ok=True)
     o = [f"! {args.module}: numerical routines (numpy's algorithms) extracted from python.f90",
