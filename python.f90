@@ -273,6 +273,9 @@ public :: interp_periodic_1d, interp_periodic_0d, np_hist_edges, histogram2d_np
 public :: histogram_np !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:real(dp)(:):intent(out),edges:real(dp)(:):intent(out),weights:real(dp)(:):intent(in):optional,density:logical:intent(in):optional lib=statistics desc="np.histogram with bin edges, weights= and density=: float counts"
 public :: np_hist_bin_count !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in),method:character(*):intent(in),integer_data:logical:intent(in),lo_in:real(dp):intent(in):optional,hi_in:real(dp):intent(in):optional lib=statistics desc="number of histogram bins chosen by numpy's estimators auto, fd, doane, scott, rice, sturges, sqrt"
 public :: np_spacing, np_chkfinite
+public :: np_nan_to_num !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),nan:real(dp):intent(in),posinf:real(dp):intent(in),neginf:real(dp):intent(in) lib=arrays desc="np.nan_to_num: NaN and infinities replaced (elemental)"
+public :: np_heaviside !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),h0:real(dp):intent(in) lib=arrays desc="np.heaviside step function, NaN at NaN (elemental)"
+public :: np_corrcoef_1
 public :: np_packbits !@pyapi kind=function ret=integer(:) args=bits:logical(:):intent(in),little:logical:intent(in) lib=arrays desc="np.packbits: pack a logical vector into bytes (values 0..255), big- or little-endian bit order"
 public :: np_unpackbits !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),little:logical:intent(in),count:integer:intent(in):optional lib=arrays desc="np.unpackbits: the bits (0/1) of bytes 0..255, with numpy's count="
 public :: np_pad_indices !@pyapi kind=function ret=integer(:) args=n:integer:intent(in),before:integer:intent(in),after:integer:intent(in),mode:integer:intent(in) lib=arrays desc="np.pad: 1-based source indices of a vector of size n padded by before/after elements (mode 1 edge, 2 wrap, 3 reflect, 4 symmetric)"
@@ -5791,6 +5794,49 @@ contains
             if (btest(x(j), b)) bits(i) = 1
          end do
       end function np_unpackbits
+
+      elemental function np_nan_to_num(x, nan, posinf, neginf) result(y)
+         ! np.nan_to_num(x, nan=, posinf=, neginf=): NaN, +inf and -inf
+         ! replaced (no ordered comparison of a NaN, which would raise the
+         ! invalid-operation flag).
+         real(kind=dp), intent(in) :: x, nan, posinf, neginf
+         real(kind=dp) :: y
+         if (ieee_is_nan(x)) then
+            y = nan
+         else if (ieee_is_finite(x)) then
+            y = x
+         else if (x > 0.0_dp) then
+            y = posinf
+         else
+            y = neginf
+         end if
+      end function np_nan_to_num
+
+      elemental function np_heaviside(x, h0) result(y)
+         ! np.heaviside(x, h0): 0 for x < 0, h0 at 0, 1 for x > 0, NaN at NaN.
+         real(kind=dp), intent(in) :: x, h0
+         real(kind=dp) :: y
+         if (ieee_is_nan(x)) then
+            y = x
+         else if (x < 0.0_dp) then
+            y = 0.0_dp
+         else if (x > 0.0_dp) then
+            y = 1.0_dp
+         else
+            y = h0
+         end if
+      end function np_heaviside
+
+      pure function np_corrcoef_1(x) result(r)
+         ! np.corrcoef of one vector: 1, or NaN for a constant or non-finite
+         ! vector (var / sqrt(var * var)).
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp) :: r
+         r = ieee_value(1.0_dp, ieee_quiet_nan)
+         if (size(x) == 0) return
+         if (.not. all(ieee_is_finite(x))) return
+         if (maxval(x) > minval(x)) r = 1.0_dp
+      end function np_corrcoef_1
 
       elemental function np_chkfinite(x) result(y)
          ! np.asarray_chkfinite(x): x, or an error if it is inf or NaN.

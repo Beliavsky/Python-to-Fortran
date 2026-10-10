@@ -152,3 +152,49 @@ def test_polynomial_roots_gauss_arithmetic_called_from_fortran(tmp_path: Path) -
     ref += list(C.chebpts1(5)) + list(C.chebpts2(5)) + list(C.chebtrim([1, 2, 1e-12, 0], 1e-10)) + list(P.polytrim([3, 0]))
     ref += realr(C.chebroots(C.chebfromroots([-0.5, 0.25, 0.75]))) + realr(P.polyroots([2, 0, 1]))         + realr(C.chebroots(c), -1, 1)
     assert got == pytest.approx(ref, rel=1e-12, abs=1e-13)
+
+
+EXTRACTED_PROGRAM = """program use_lib
+   ! The routines of the extracted, standalone module (no python_mod).
+   use numpy_fortran
+   implicit none
+   integer, parameter :: dp = kind(1.0d0)
+   real(dp) :: x(5), c(3), m(2, 3)
+   complex(dp), allocatable :: f(:,:)
+   x = [0.0_dp, 0.25_dp, 0.5_dp, 0.75_dp, 1.0_dp]
+   c = [1.0_dp, -2.0_dp, 0.5_dp]
+   print "(*(es24.16))", chebval(x, c)
+   print "(*(es24.16))", chebfit(x, chebval(x, c), 2)
+   m = reshape([1.0_dp, 2.0_dp, 3.0_dp, 4.0_dp, 5.0_dp, 6.0_dp], [2, 3])
+   f = fft2(m)
+   print "(*(es24.16))", real(f), aimag(f)
+   print "(*(es24.16))", np_pad_vec(x(1:3), 2, 1, 3)
+   print "(*(es24.16))", legval2d(0.3_dp, -0.2_dp, reshape([1.0_dp, 0.5_dp, -1.0_dp, 2.0_dp], [2, 2]))
+end program use_lib
+"""
+
+
+@pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran required")
+def test_extracted_fortran_library_standalone(tmp_path: Path) -> None:
+    # xextract_fortran_lib.py writes a module of the lib=-tagged routines
+    # that compiles without python_mod; a program using it (linked with
+    # LAPACK for the fits) agrees with numpy.
+    out = tmp_path / "lib"
+    proc = subprocess.run(["python", str(ROOT / "xextract_fortran_lib.py"), "--out", str(out)], capture_output=True,
+                          text=True, check=False)
+    assert proc.returncode == 0 and "compile: PASS" in proc.stdout, proc.stdout + proc.stderr
+    assert (out / "ROUTINES.md").read_text(encoding="utf-8").count("| `") > 50
+    (out / "use_lib.f90").write_text(EXTRACTED_PROGRAM, encoding="utf-8")
+    subprocess.run(["gfortran", "-c", str(ROOT / "lapack_d.f90"), "-o", "lapack_d.o"], cwd=out, check=True)
+    subprocess.run(["gfortran", "numpy_fortran.f90", "use_lib.f90", "lapack_d.o", "-o", "use_lib.exe"], cwd=out,
+                   check=True)
+    got = [[float(v) for v in line.split()] for line in
+           subprocess.run([str(out / "use_lib.exe")], capture_output=True, text=True, check=True).stdout.splitlines()]
+    x = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    c = np.array([1.0, -2.0, 0.5])
+    f = np.fft.fft2(np.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]]))
+    want = [C.chebval(x, c), C.chebfit(x, C.chebval(x, c), 2),
+            np.concatenate([f.real.T.ravel(), f.imag.T.ravel()]), np.pad(x[:3], (2, 1), mode="reflect"),
+            [L.legval2d(0.3, -0.2, np.array([[1.0, -1.0], [0.5, 2.0]]))]]
+    for g, w in zip(got, want):
+        assert g == pytest.approx(list(np.ravel(w)), rel=1e-10, abs=1e-12)

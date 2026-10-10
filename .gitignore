@@ -29,3 +29,6 @@ temp.txt
 
 # Commercial market data (Databento etc.) -- never commit.
 spy_5min_databento.csv
+
+# xextract_fortran_lib.py output (for the separate library repository).
+fortran_lib/

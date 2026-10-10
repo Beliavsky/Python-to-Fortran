@@ -17231,7 +17231,7 @@ def detect_needed_helpers(tree):
         "moveaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
         "rollaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
         "cov": {"cov2_real", "cov_matrix_rows_real"},
-        "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real"},
+        "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real", "np_corrcoef_1"},
         "convolve": {"convolve_real", "convolve_int"},
         "correlate": {"correlate_real"},
         "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_vector", "loadtxt_int_vector", "loadtxt_logical_vector"},
@@ -17250,6 +17250,8 @@ def detect_needed_helpers(tree):
         "digitize": {"digitize_real"},
         "spacing": {"np_spacing"},
         "asarray_chkfinite": {"np_chkfinite"},
+        "nan_to_num": {"np_nan_to_num"},
+        "heaviside": {"np_heaviside"},
         "load": {"np_load_1d_real"},
         "save": {"np_save_1d_real"},
         "isin": {"isin_real", "isin_int"},
@@ -31172,6 +31174,26 @@ class translator(ast.NodeVisitor):
             idx.append(a)
         return node.value, idx
 
+    def _maybe_logical(self, n):
+        """Whether n may be a boolean array (a syntactic test, no kinds)."""
+        while isinstance(n, ast.Subscript):
+            n = n.value
+        if isinstance(n, (ast.Compare, ast.BoolOp)):
+            return True
+        if isinstance(n, ast.UnaryOp):
+            return isinstance(n.op, (ast.Not, ast.Invert)) or self._maybe_logical(n.operand)
+        if isinstance(n, ast.Name):
+            return n.id in self.logs or n.id in self.alloc_logs
+        if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
+            return True
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            return (n.func.attr in {"isnan", "isfinite", "isinf", "isclose", "logical_and", "logical_or", "logical_not",
+                                    "logical_xor", "signbit", "isin", "isposinf", "isneginf", "astype", "copy",
+                                    "all", "any", "greater", "less", "equal", "not_equal", "greater_equal",
+                                    "less_equal", "isreal", "iscomplex"}
+                    or self._maybe_logical(n.func.value))
+        return False
+
     def _canonical_numpy_call(self, node):
         """An equivalent, more directly translatable form of a numpy call
         or array method, or None: x.cumsum(axis=0) -> np.cumsum(x, axis=0);
@@ -31185,6 +31207,10 @@ class translator(ast.NodeVisitor):
             cached = getattr(node, "_xp2f_canonical", None)
             if cached is not None:
                 return cached
+            # Only when an operand may be boolean (a cheap syntactic test
+            # first: the kinds of nested operands are costly to recompute).
+            if not (self._maybe_logical(node.left) or self._maybe_logical(node.right)):
+                return None
             lk, rk = self._expr_kind(node.left), self._expr_kind(node.right)
             num = {"int", "real", "complex"}
             sides = None
@@ -32397,6 +32423,9 @@ class translator(ast.NodeVisitor):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)) or SOURCE_USES_PANDAS:
             return None
         recv = node.func.value
+        attr = node.func.attr
+        if attr not in self._METHOD_SAME_KIND and attr not in self._METHOD_INT_FOR_BOOL:
+            return None
         if is_numpy_name_node(recv) or isinstance(recv, ast.Name) and recv.id in {"np", "numpy", "math", "random"}:
             return None
         if int(self._rank_expr(recv) or 0) < 1:
@@ -32404,7 +32433,6 @@ class translator(ast.NodeVisitor):
         k = self._expr_kind(recv)
         if k not in num:
             return None
-        attr = node.func.attr
         if attr in self._METHOD_SAME_KIND:
             return k
         if attr in self._METHOD_INT_FOR_BOOL:
@@ -46565,9 +46593,7 @@ class translator(ast.NodeVisitor):
                         raise NotImplementedError(f"np.nan_to_num: unsupported argument {kw.arg}=")
                 # numpy's defaults: 0 for NaN, the largest and the most
                 # negative float for +inf and -inf.
-                return (f"merge({fills['nan']}, merge({fills['posinf']}, merge({fills['neginf']}, {a0}, "
-                        f"{a0} < -huge(0.0_dp)), "
-                        f"{a0} > huge(0.0_dp)), ieee_is_nan({a0}))")
+                return f"np_nan_to_num({a0}, {fills['nan']}, {fills['posinf']}, {fills['neginf']})"
             np_attr = self._numpy_call_attr(node.func)
             if np_attr in {"mod", "remainder", "floor_divide"} and len(node.args) == 2 and not node.keywords:
                 # Python's floored division and modulo, same as `a // b` and
@@ -48155,8 +48181,9 @@ class translator(ast.NodeVisitor):
                         # c / sqrt(c * c) for c = var(x): 1, or NaN for a
                         # constant or non-finite x.
                         v = self.expr(node.args[0])
-                        return (f"reshape([merge(1.0_dp, ieee_value(1.0_dp, ieee_quiet_nan), "
-                                f"all(ieee_is_finite({v})) .and. maxval({v}) > minval({v}))], [1, 1])")
+                        if self._expr_kind(node.args[0]) != "real":
+                            v = f"real({v}, kind=dp)"
+                        return f"reshape([np_corrcoef_1({v})], [1, 1])"
                     rowvar = True
                     for kw in node.keywords:
                         if kw.arg == "rowvar" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
@@ -49685,8 +49712,7 @@ class translator(ast.NodeVisitor):
                 if self._expr_kind(node.args[1]) != "real":
                     b0 = f"real({b0}, kind=dp)"
                 # NaN stays NaN.
-                return (f"merge({a0}, merge(1.0_dp, merge({b0}, 0.0_dp, ({a0}) == 0.0_dp), ({a0}) > 0.0_dp), "
-                        f"ieee_is_nan({a0}))")
+                return f"np_heaviside({a0}, {b0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
