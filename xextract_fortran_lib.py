@@ -7,12 +7,19 @@ module, with everything they use, for a separate library repository.
                                    [--module numpy_fortran] [--topics a,b]
                                    [--no-compile]
     python xextract_fortran_lib.py --apply-topics topics.tsv [--src python.f90]
+    python xextract_fortran_lib.py --fill-tags [--src python.f90]
 
 --apply-topics edits python.f90's tags from a table (routine<TAB>topic,
 '#' comment lines and a "routine" header skipped): the topic becomes the
 tag's lib= (replacing one there); 'exclude' and 'internal' remove it. A
 public name without a tag gets a public line of its own with a minimal
 tag (!@pyapi lib=<topic>).
+
+--fill-tags completes the tags that have lib= but no kind=/args=: kind=,
+ret= (a function's result), args= (each dummy argument's type, rank,
+intent and optional) from the procedure's declarations, and desc= from
+the comment that follows its header (for a generic interface, those of
+its first specific procedure, and the list of specifics).
 
 Writes, in the output directory:
   <module>.f90  the module: the tagged routines and generic interfaces
@@ -144,6 +151,210 @@ def tag_field(tag: str, key: str) -> str | None:
     return m.group(2) if m.group(2) is not None else m.group(1)
 
 
+def _split_top(s: str) -> list[str]:
+    """s split at commas outside parentheses."""
+    out, depth, cur = [], 0, ""
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return [x.strip() for x in out if x.strip()]
+
+
+def _statements(body: list[str]) -> list[str]:
+    """The code of body as statements (continuations joined, comments
+    dropped), up to an internal contains."""
+    out, cur = [], ""
+    for line in body:
+        code = strip_comment(line).rstrip()
+        s = code.lstrip()
+        if s.startswith("&"):
+            s = s[1:]
+        if s.endswith("&"):
+            cur += s[:-1] + " "
+            continue
+        stmt = (cur + s).strip()
+        cur = ""
+        if re.match(r"^contains\b", stmt, re.I):
+            break
+        if stmt:
+            out.append(stmt)
+    return out
+
+
+def _type_text(spec: str) -> str:
+    spec = re.sub(r"\s+", "", spec.lower())
+    m = re.match(r"^(real|integer|complex|logical)(?:\((?:kind=)?(\w+)\))?$", spec)
+    if m:
+        return m.group(1) + (f"({m.group(2)})" if m.group(2) and m.group(2) != "4" else "")
+    m = re.match(r"^character(?:\((?:len=)?([*:\w]+)\))?$", spec)
+    if m:
+        return f"character({m.group(1) or '1'})"
+    m = re.match(r"^type\((\w+)\)$", spec)
+    if m:
+        return f"type({m.group(1)})"
+    return spec
+
+
+def signature(body: list[str]):
+    """(kind, ret, args) of a procedure's lines, args as name:type(dims):
+    intent(...):optional entries, ret a function's result type and dims."""
+    stmts = _statements(body)
+    head = stmts[0]
+    m = re.match(r"^(.*?)\b(function|subroutine)\s+(\w+)\s*(?:\(([^)]*)\))?\s*(?:result\s*\(\s*(\w+)\s*\))?",
+                 head, re.I)
+    if not m:
+        return None
+    prefix, kind, name, dummies, result = m.groups()
+    dummies = [d.strip().lower() for d in (dummies or "").split(",") if d.strip()]
+    result = (result or name).lower()
+    info = {}
+    for s in stmts[1:]:
+        if "::" not in s:
+            continue
+        spec, ents = s.split("::", 1)
+        parts = _split_top(spec)
+        typ = _type_text(parts[0])
+        attrs = [a.strip().lower() for a in parts[1:]]
+        dims_attr = next((a[len("dimension"):] for a in attrs if a.startswith("dimension")), "")
+        intent = next((re.sub(r"\s+", "", a) for a in attrs if a.startswith("intent")), "")
+        optional = "optional" in attrs
+        for e in _split_top(ents):
+            mm = re.match(r"^(\w+)\s*(\([^=]*\))?", e)
+            if not mm:
+                continue
+            nm = mm.group(1).lower()
+            dims = re.sub(r"\s+", "", mm.group(2) or dims_attr)
+            if dims:
+                # Only the rank: x(n, 2) and x(:,:) are both (:,:).
+                dims = "(" + ",".join(":" for _ in _split_top(dims[1:-1])) + ")"
+            info[nm] = (typ + dims, intent, optional)
+    args = []
+    for d in dummies:
+        typ, intent, optional = info.get(d, ("?", "", False))
+        args.append(":".join([d, typ] + ([intent] if intent else []) + (["optional"] if optional else [])))
+    ret = None
+    if kind.lower() == "function":
+        ptype = re.search(r"\b(real|integer|complex|logical|character)\b(\s*\([^)]*\))?", prefix or "", re.I)
+        if result in info:
+            ret = info[result][0]
+        elif ptype:
+            ret = _type_text(ptype.group(0))
+    return kind.lower(), ret, args
+
+
+# Descriptions of public routines whose source has no comment to take one
+# from (used by --fill-tags).
+DESC_OVERRIDES = {
+    "interp_periodic_0d": "np.interp(x, xp, fp, period=p) at a scalar x",
+    "loadtxt_real_vector": "np.loadtxt of a one-column (or flattened) text file as a real vector",
+    "loadtxt_int_vector": "np.loadtxt(..., dtype=int) of a text file as an integer vector",
+    "loadtxt_logical_vector": "np.loadtxt(..., dtype=bool) of a text file as a logical vector (nonzero is true)",
+    "c_minimum": "np.minimum of complex numbers in numpy's order (real part, then imaginary part)",
+    "cumsum_complex": "cumulative sum of a complex vector",
+    "cumprod_complex": "cumulative product of a complex vector",
+    "sorted_complex_vec": "np.sort of a complex vector (by real part, then imaginary part, NaN last): a sorted copy",
+    "sorted_complex_2d": "np.sort of a complex matrix along dimension dim (1 = down columns)",
+    "argsort_complex_2d": "np.argsort (0-based) of a complex matrix along dimension dim",
+    "median_complex_2d": "np.median of a complex matrix along dimension dim",
+    "repeat_complex": "np.repeat of a complex vector: each element reps times",
+    "tile_complex": "np.tile of a complex vector reps times",
+    "np_ceil": "np.ceil of a float: NaN and infinities unchanged, no integer conversion",
+    "where_indices_2d": "np.argwhere of a logical matrix: the 0-based (row, column) of each true element, in C order",
+    "where_axis_2d": "np.nonzero(mask)[axis] of a logical matrix: 0-based row (axis 0) or column (axis 1) indices "
+                     "of the true elements, in C order",
+    "where_pair_2d": "pair 0-based row and column index vectors (a length-1 one broadcast) as a 2 x n index array",
+}
+
+
+def _first_sentence(text: str) -> str:
+    """text up to its first '. ' outside parentheses (at least 20
+    characters), at most about 180 characters."""
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if ch == "." and depth == 0 and i >= 20 and (i + 1 == len(text) or text[i + 1] == " "):
+            text = text[:i]
+            break
+    if len(text) > 180:
+        text = text[:177].rsplit(" ", 1)[0] + " ..."
+    return text.strip().rstrip(";,:").replace('"', "'")
+
+
+def leading_comment(body: list[str], before: list[str] | None = None) -> str:
+    """The comment lines after a procedure's header (else the ones just
+    before it), as one sentence."""
+    i = 0
+    while i < len(body) and strip_comment(body[i]).rstrip().endswith("&"):
+        i += 1
+    words = []
+    for line in body[i + 1:]:
+        s = line.strip()
+        if not s.startswith("!"):
+            break
+        words.append(s.lstrip("!").strip())
+    if not words and before:
+        for line in reversed(before):
+            s = line.strip()
+            if not s.startswith("!"):
+                break
+            words.insert(0, s.lstrip("!").strip())
+    return _first_sentence(re.sub(r"\s+", " ", " ".join(words)).strip())
+
+
+def fill_tags(src: Path) -> int:
+    text = src.read_text(encoding="utf-8")
+    lines, uses, decls, types, ifaces, tags, procs, order = parse(text)
+    out, filled, nodesc = [], 0, []
+    for line in text.splitlines():
+        mt = TAG.match(line.strip())
+        if not (mt and tag_field(mt.group(2), "lib") and not tag_field(mt.group(2), "args")
+                and not tag_field(mt.group(2), "kind")):
+            out.append(line)
+            continue
+        name = mt.group(1).lower()
+        generic = None
+        body = procs.get(name)
+        if body is None and name in ifaces:
+            generic = ifaces[name][1]
+            body = procs.get(generic[0]) if generic else None
+        if body is None:
+            out.append(line)
+            continue
+        sig = signature(body)
+        if sig is None:
+            out.append(line)
+            continue
+        kind, ret, args = sig
+        first = generic[0] if generic else name
+        # The comment block just above the procedure, if any.
+        start = next((k for k, l in enumerate(lines) if lines[k:k + len(body)] == body), None)
+        before = lines[max(0, start - 6):start] if start else []
+        desc = (DESC_OVERRIDES.get(name) or DESC_OVERRIDES.get(first)
+                or (tag_field(tags[first], "desc") if generic and first in tags else None)
+                or leading_comment(body, before))
+        if generic:
+            desc = (desc + " " if desc else "") + f"(generic: {', '.join(generic)})"
+        if not desc:
+            nodesc.append(name)
+        lib = tag_field(mt.group(2), "lib")
+        parts = [f"kind={kind}"] + ([f"ret={ret}"] if ret else []) + [f"args={','.join(args)}", f"lib={lib}"]
+        if desc:
+            parts.append(f'desc="{desc}"')
+        out.append(f"public :: {mt.group(1)} !@pyapi " + " ".join(parts))
+        filled += 1
+    src.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+    print(f"tags filled: {filled}; without a description: {len(nodesc)} {nodesc}")
+    return 0
+
+
 def apply_topics(src: Path, table: Path) -> int:
     topics = {}
     for line in table.read_text(encoding="utf-8").splitlines():
@@ -196,9 +407,12 @@ def main() -> int:
     ap.add_argument("--topics", default="", help="comma-separated lib= topics (default: all)")
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--apply-topics", type=Path, help="set the tags' lib= topics from this table and stop")
+    ap.add_argument("--fill-tags", action="store_true", help="complete tags that have only lib= and stop")
     args = ap.parse_args()
     if args.apply_topics:
         return apply_topics(args.src, args.apply_topics)
+    if args.fill_tags:
+        return fill_tags(args.src)
     lines, uses, decls, types, ifaces, tags, procs, order = parse(args.src.read_text(encoding="utf-8"))
     topics = {t for t in args.topics.split(",") if t}
     lib = {n: t for n, t in tags.items() if tag_field(t, "lib") and (not topics or tag_field(t, "lib") in topics)}
