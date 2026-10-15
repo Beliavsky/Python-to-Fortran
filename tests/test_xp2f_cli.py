@@ -27487,3 +27487,101 @@ def test_xp2f_mutators_and_flat_indices(tmp_path: Path) -> None:
         'print(np.roll(m, (1, 2), axis=(0, 1)), np.tril(x), rg)\n'
     )]):
         _xp2f_output_matches_numpy(tmp_path, f"xmut{k}", code)
+
+
+def test_xp2f_complex_and_rank3_inputs(tmp_path: Path) -> None:
+    # Silent before: an array literal mixing floats and complex numbers was
+    # declared real; np.add/np.multiply of a real and a complex array were
+    # real; np.divide of integers divided as integers; complex ordering
+    # comparisons with broadcasting kept one operand's shape; complex
+    # np.diagonal/np.triu were real; np.apply_along_axis(np.sum, ...) of a
+    # complex matrix shared an integer wrapper; np.diagonal of a rank-3
+    # array took the diagonal over the wrong axes; np.tensordot of rank-3
+    # arrays was sum(a * b).
+    for k, code in enumerate([(
+        'import numpy as np\n'
+        'x = np.array([0.5 + 1.0j, 1.5, -2.0 - 0.5j, 3.25j])\n'
+        'm = np.array([[2.0 + 1.0j, 1.0 + 0.0j], [1.0 - 1.0j, 3.0 + 0.5j]])\n'
+        'mr = np.array([[2.0 + 0.0j, 1.0j, 0.5 + 0.5j], [1.0 + 0.0j, 3.0 - 1.0j, -1.0 + 0.0j]])\n'
+        'y = np.array([1.0, 2.0, 3.0, 4.0])\n'
+        'xi = np.array([3, 1, 4, 1])\n'
+        'b = np.array([True, False, True, True])\n'
+        'a1 = np.add(y, x)\n'
+        'a2 = np.divide(x, y)\n'
+        'a3 = np.float_power(x, 2)\n'
+        'd = mr.diagonal()\n'
+        'u = np.triu(m)\n'
+        's = np.apply_along_axis(np.sum, 0, mr)\n'
+        'p = np.piecewise(x, [x < 0, x >= 0], [lambda t: -t, lambda t: t ** 2])\n'
+        'for v in (x, a1, a2, a3, d, u, s, p, m.std(axis=0, keepdims=True), m[..., 0]):\n'
+        '    print(v.real, v.imag)\n'
+        'print(np.divide(xi, 2), np.divide(b, 2), m.mean().round(1).imag)\n'
+        'print(m < x[:2].reshape(-1, 1), m >= x[:2], x[:, None] <= x, b < x)\n'
+        'print(x[:3].reshape(-1, 1) < x[:2].reshape(1, -1), y.reshape(1, -1) > y.reshape(-1, 1))\n'
+    ), (
+        'import numpy as np\n'
+        't = np.array([[[2.0, 1.0], [0.5, 1.0], [3.0, -1.0]], [[1.5, 0.0], [-2.0, 2.5], [1.0, 4.0]]])\n'
+        'c = np.array([[[2.0, 1.0], [1.0, 3.0]], [[0.5, -1.0], [4.0, 2.5]]])\n'
+        'a2 = np.array([[1.0, 2.0], [3.0, 4.0]])\n'
+        'v = np.array([1.0, -1.0])\n'
+        'print(np.diagonal(t), t.diagonal(1), np.diagonal(t, -1, axis1=1, axis2=2))\n'
+        'print(np.tensordot(c, c), np.tensordot(c, c, axes=3), np.tensordot(t, a2, axes=1))\n'
+        'print(np.tensordot(a2, c, 1), np.tensordot(c, v, 1), np.tensordot(v, v, 0))\n'
+        'print(t[..., 0], t[0, ...], t[1, ..., 1], t.repeat(2), a2[..., 1:])\n'
+    )]):
+        _xp2f_output_matches_numpy(tmp_path, f"xcplx{k}", code)
+    # A numpy function without complex support stops instead of dropping
+    # the imaginary part.
+    for k, line in enumerate(["r = np.polynomial.chebyshev.chebval(x, x)",
+                              "q, r = np.polynomial.legendre.legdiv(x, x)", "r = np.real_if_close(x)",
+                              "r = np.histogram_bin_edges(x)"]):
+        src = tmp_path / f"xcplx_guard{k}.py"
+        src.write_text(f"import numpy as np\nx = np.array([0.5 + 1.0j, 1.5, 2.0])\n{line}\nprint(r)\n",
+                       encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path, capture_output=True,
+                              text=True, check=False)
+        assert "would drop the imaginary part" in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+
+
+def test_xp2f_numpy_functions_of_complex_arrays(tmp_path: Path) -> None:
+    # numpy functions of complex arrays, through rewrites in terms of the
+    # complex operations (linear ones by parts, convolutions through the
+    # real and imaginary parts, the NaN functions through a complex isnan)
+    # and complex python_mod helpers (polyval, polydiv, triu/tril). Also
+    # silent before for real arrays: np.convolve/np.correlate with
+    # mode="same" kept the first array's length and centered an
+    # even-length kernel one place late.
+    for k, code in enumerate([(
+        'import numpy as np\n'
+        'x = np.array([0.5 + 1.0j, 1.5 + 0.0j, -2.0 - 0.5j, 3.25j])\n'
+        'xn = np.array([0.5 + 1.0j, complex(np.nan, 1.0), -2.0 - 0.5j, 2.0 + 0.0j])\n'
+        'xf = np.array([0.5 + 1.0j, complex(np.nan, 1.0), complex(np.inf, 0.0)])\n'
+        'mn = np.array([[2.0 + 1.0j, complex(0.0, np.nan)], [1.0 - 1.0j, 3.0 + 0.5j]])\n'
+        'm = np.array([[2.0 + 1.0j, 1.0 + 0.0j], [1.0 - 1.0j, 3.0 + 0.5j]])\n'
+        'print(np.less(x, x[::-1]), np.greater_equal(m, x[:2]), np.isnan(xf), np.isinf(xf), np.isfinite(mn))\n'
+        'for v in (np.nansum(mn, axis=1), np.nanmean(mn, axis=0), np.nanprod(xn), np.nanmax(xn), np.nanmin(xn),\n'
+        '          np.nanmedian(xn), np.nan_to_num(xf, posinf=9.0), np.clip(x, 0, 1), np.rint(x * 1.3),\n'
+        '          np.log2(m), np.sinc(x), np.triu(m), np.tril(m, -1)):\n'
+        '    print(np.real(v), np.imag(v))\n'
+        'print(np.nanargmax(xn), np.nanargmin(xn), np.nanstd(xn), np.nanvar(xn, ddof=1), np.where(m))\n'
+    ), (
+        'import numpy as np\n'
+        'x = np.array([0.5 + 1.0j, 1.5 + 0.0j, -2.0 - 0.5j, 3.25j])\n'
+        'y = np.array([1.0, 2.0, 3.0])\n'
+        'q, rr = np.polydiv(y, x[:2])\n'
+        'for v in (np.convolve(x, y, "same"), np.correlate(y, x, mode="same"), np.correlate(x, x, mode="full"),\n'
+        '          np.polyval(x, x), np.polyval(y, x), np.polyadd(y, x), np.polysub(x, x[:2]), np.polymul(x[:2], x),\n'
+        '          np.polyder(x, 2), np.polyint(x), q, rr, np.vander(x, 3), np.vander(x, increasing=True),\n'
+        '          np.trapezoid(x, dx=0.5), np.gradient(x, 0.5)):\n'
+        '    print(np.real(v), np.imag(v))\n'
+    ), (
+        'import numpy as np\n'
+        'a = np.array([1.0, 2.0, 3.0])\n'
+        'b = np.array([0.5, -1.0, 2.0, 4.0])\n'
+        'c2 = np.array([1.0, 1.0])\n'
+        'ai = np.array([1, 2, 3, 4])\n'
+        'print(np.convolve(a, b, "same"), np.convolve(b, a, "same"), np.convolve(b, c2, "same"), np.convolve(c2, b, "same"))\n'
+        'print(np.correlate(a, b, "same"), np.correlate(b, a, "same"), np.correlate(c2, b, "same"), np.correlate(b, c2, "same"))\n'
+        'print(np.convolve(ai, ai[:2], "same"), np.correlate(ai, ai[:2], "same"), np.correlate(a, b), np.convolve(a, b, "valid"))\n'
+    )]):
+        _xp2f_output_matches_numpy(tmp_path, f"xcfun{k}", code)

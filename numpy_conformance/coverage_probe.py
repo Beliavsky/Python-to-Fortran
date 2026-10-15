@@ -107,6 +107,11 @@ VARIANTS = {
             "mr": "np.array([[1.0, -2.0, 0.5]])", "b": "np.array([True])"},
     "empty": {"x": "np.array([])", "xi": "np.array([], dtype=int)", "m": "np.zeros((0, 2))",
               "mr": "np.zeros((2, 0))", "b": "np.array([], dtype=bool)"},
+    "complex": {"x": "np.array([0.5 + 1.0j, 1.5 + 0.0j, -2.0 - 0.5j, 3.25j])",
+                "m": "np.array([[2.0 + 1.0j, 1.0 + 0.0j], [1.0 - 1.0j, 3.0 + 0.5j]])",
+                "mr": "np.array([[2.0 + 0.0j, 1.0j, 0.5 + 0.5j], [1.0 + 0.0j, 3.0 - 1.0j, -1.0 + 0.0j]])"},
+    "3d": {"m": "np.array([[[2.0, 1.0], [1.0, 3.0]], [[0.5, -1.0], [4.0, 2.5]]])",
+           "mr": "np.array([[[2.0, 1.0], [0.5, 1.0], [3.0, -1.0]], [[1.5, 0.0], [-2.0, 2.5], [1.0, 4.0]]])"},
 }
 # Keyword variants: added to a call with a matrix argument.
 KW_VARIANTS = {"axis0": "axis=0", "axis1": "axis=1", "axism1": "axis=-1", "keepdims": "axis=0, keepdims=True",
@@ -158,19 +163,14 @@ KNOWN.update({
     "np.polymul[empty]": "empty coefficient arrays",
     "np.resize[empty]": "resizing an empty array",
     "np.vander[empty]": "an empty array",
+    "np.cov[complex]": "a real number (numpy's complex result of a vector has a zero imaginary part)",
 })
 # Ops cases: numpy's default (unstable) sort orders ties differently.
 for _a in ("x", "xi", "m", "mr"):
     for _s in (f"r = {_a}.argsort() [ties]", f"r = {_a}.argsort(axis=1) [ties]"):
         KNOWN[_s] = "the order of ties: numpy's default sort is not stable (the translation's is)"
-    for _v in ("base", "int", "ties"):
+    for _v in ("base", "int", "ties", "3d"):
         KNOWN[f"r = np.unravel_index(np.argsort({_a}, axis=None), {_a}.shape)[1] [{_v}]"] =             "the order of ties: numpy's default sort is not stable (the translation's is)"
-# A numpy function passed to np.apply_along_axis becomes one wrapper per
-# program: real when real arrays also use it (the probe groups cases).
-for _a in ("m", "mr"):
-    for _f in ("sum", "sort"):
-        for _ax in (0, 1):
-            KNOWN[f"r = np.apply_along_axis(np.{_f}, {_ax}, {_a}) [int]"] =                 "one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)"
 for _n in ("pinv", "qr", "svd", "svdvals"):
     KNOWN[f"np.linalg.{_n}[empty]"] = "empty matrices are not supported (LAPACK reports an illegal argument)"
 for _n in ("fft", "ifft", "rfft", "fftn", "ifftn", "rfftn", "ihfft", "fft2", "ifft2", "rfft2"):
@@ -181,6 +181,15 @@ for _w in ("bartlett", "blackman", "hamming", "hanning"):
         KNOWN[f"np.{_w}[{_v}]"] = "the probe's float M is rejected (M must be an integer)"
 NUM = (r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?|\bTrue\b|\bFalse\b|\bT\b|\bF\b|\bnan\b|\bNaN\b"
        r"|\binf\b|\bInf\b|\bInfinity\b")
+_FNUM = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?|[-+]?(?:nan|inf)"
+# A Python complex literal: 3.75j, (1.5+0j), 0.5+1.j (an array element).
+_PYCOMPLEX = re.compile(rf"(?:({_FNUM})\s*(?=[-+]))?({_FNUM})j")
+
+
+def _complex_parts(s: str) -> str:
+    """Python's complex numbers as two floats (the real part, 0 when it
+    prints none, then the imaginary), as Fortran prints them."""
+    return _PYCOMPLEX.sub(lambda mm: f" {float(mm.group(1) or 0)!r} {float(mm.group(2))!r} ", s)
 
 
 def _numeric_parts(v):
@@ -281,7 +290,12 @@ def gen_ops() -> None:
     import ops_cases
     out, per_group = [], {}
     for g, stmts in ops_cases.templates():
+        code = "\n".join(stmts)
         for v, fx in [("base", {})] + list(VARIANTS.items()):
+            if fx and not any(re.search(rf"(?<![.\w]){n}\b", code) for n in fx):
+                # The template uses none of the rebound fixtures: the base
+                # case again.
+                continue
             env = {"np": np}
             for k, src in dict(FIX, **fx).items():
                 env[k] = eval(src, env)
@@ -320,6 +334,7 @@ def _program(case) -> str:
 def _kinds(s: str) -> list[str]:
     """bool/float/int of each number printed (numpy prints floats with a
     point or exponent, Fortran too; nan and inf are floats)."""
+    s = _complex_parts(s)
     out = []
     for tok in re.findall(NUM, s):
         if tok in {"True", "False", "T", "F"}:
@@ -333,6 +348,7 @@ def _kinds(s: str) -> list[str]:
 
 def _numbers(s: str) -> list[float]:
     conv = {"True": "1", "False": "0", "T": "1", "F": "0", "NaN": "nan", "Infinity": "inf", "Inf": "inf"}
+    s = _complex_parts(s)
     return [float(conv.get(t, t)) for t in re.findall(NUM, s)]
 
 
@@ -601,6 +617,12 @@ def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool
 
 def report(variants: bool = False, ops: bool = False) -> None:
     res = _read_results(ORESULTS if ops else VRESULTS if variants else RESULTS)
+    # Only the cases generated now (a template or variant since dropped
+    # keeps its old result line).
+    cases_path = OCASES if ops else VCASES if variants else CASES
+    if cases_path.exists():
+        current = {c["name"] for c in json.loads(cases_path.read_text(encoding="utf-8"))}
+        res = {n: v for n, v in res.items() if n in current}
     counts = Counter(st for st, _ in res.values())
     order = ["DIFF", "KIND", "RUN-FAIL", "BUILD-FAIL", "XLATE-FAIL", "PROBE-ERROR", "NOARGS", "MATCH"]
     title = ("numpy coverage probe: methods, operators, indexing" if ops else

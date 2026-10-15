@@ -6392,7 +6392,12 @@ def rewrite_function_valued_library_args(tree):
                 # getattr(np, "permute_dims", np.transpose): an alias the
                 # translator resolves itself, not a callback.
                 return call
-            call.args = [ast.copy_location(ast.Name(id=w, ctx=ast.Load()), a) if (w := wrapper_for(a)) else a
+            # np.apply_along_axis(np.sum, ...) calls a numpy function on each
+            # slice itself (one wrapper would fix one kind for every call).
+            skip = (call.args[:1] if isinstance(call.func, ast.Attribute) and call.func.attr == "apply_along_axis"
+                    and isinstance(call.func.value, ast.Name) and aliases.get(call.func.value.id) == "numpy" else [])
+            call.args = [ast.copy_location(ast.Name(id=w, ctx=ast.Load()), a)
+                         if all(a is not s for s in skip) and (w := wrapper_for(a)) else a
                          for a in call.args]
             for kw in call.keywords:
                 w = wrapper_for(kw.value)
@@ -17113,6 +17118,10 @@ def detect_needed_helpers(tree):
                                            slice=ast.Slice(upper=ast.Name(id="n", ctx=ast.Load())), ctx=ast.Load()))
             if node.func.attr == "divmod" and len(node.args) == 2:
                 extra += [ast.BinOp(left=node.args[0], op=op, right=node.args[1]) for op in (ast.FloorDiv(), ast.Mod())]
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "apply_along_axis" and len(node.args) >= 3):
+            # The function applied to each slice.
+            extra.append(ast.Call(func=node.args[0], args=[node.args[2]], keywords=[]))
     for node in [n for n in ast.walk(tree)] + extra:
         # a @ b may be of stacks of matrices (translator._stacked_linalg).
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
@@ -17553,6 +17562,13 @@ def detect_needed_helpers(tree):
             # Complex ordering and friends (translator._complex_numpy).
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._COMPLEX_ATTRS:
                 needed.update(translator._COMPLEX_HELPERS)
+            # numpy functions of complex arrays rewritten in terms of others
+            # (translator._complex_canonical); unused names are pruned.
+            if isinstance(node.func, ast.Attribute) and node.func.attr in translator._COMPLEX_REWRITES:
+                needed.update(translator._COMPLEX_HELPERS | translator._NAN_HELPERS)
+                needed.update({"arange_int", "np_nan_to_num", "convolve_real", "convolve_int"})
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "polydiv":
+                needed.add("np_polydiv_complex")
             # Set/search functions (translator._setsearch_numpy).
             if isinstance(node.func, ast.Attribute) and node.func.attr in translator._SETSEARCH_ATTRS:
                 needed.update(translator._SETSEARCH_HELPERS)
@@ -30210,6 +30226,53 @@ class translator(ast.NodeVisitor):
                     f"unpack it, or loop over it")
 
     def visit(self, node):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Return)):
+            return self._visit_stmt(node)
+        n0 = len(self.o.lines)
+        res = self._visit_stmt(node)
+        self._check_stmt_complex_args(node, self.o.lines[n0:])
+        return res
+
+    def _check_stmt_complex_args(self, node, lines):
+        """Stop when the Fortran of a statement takes the real part of a
+        complex argument of a numpy function (real(x, kind=dp)) -- the
+        statement forms that do not go through expr()'s own check (tuple
+        unpacking, subroutine calls)."""
+        names, real_of = {}, set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Attribute) and n.attr in {"real", "imag"} and isinstance(n.value, ast.Name):
+                real_of.add(n.value.id)
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+                continue
+            parts = self._attr_chain_parts(n.func)
+            if not parts or parts[0] not in {"np", "numpy"}:
+                continue
+            for a in list(n.args) + [k.value for k in n.keywords]:
+                if isinstance(a, ast.Subscript):
+                    a = a.value
+                if not isinstance(a, ast.Name):
+                    continue
+                if parts[-1] in self._REAL_OF_COMPLEX_OK:
+                    real_of.add(a.id)
+                else:
+                    names.setdefault(a.id, ".".join(parts))
+        real_of |= self._real_part_names(node)
+        names = {k: v for k, v in names.items() if k not in real_of}
+        if not names:
+            return
+        txt = re.sub(r"&\s*\n\s*&?", "", "\n".join(lines))
+        if "real(" not in txt:
+            return
+        for name, fn in names.items():
+            if self._expr_kind(ast.Name(id=name, ctx=ast.Load())) != "complex":
+                continue
+            at = re.escape(self._aliased_name(name))
+            if re.search(r"\breal\(\s*" + at + r"\b(?:\([^()]*\))?\s*,\s*(?:kind\s*=\s*)?dp\s*\)", txt,
+                         re.IGNORECASE):
+                raise NotImplementedError(f"{fn} of a complex array is not supported "
+                                          "(the translation would drop the imaginary part)")
+
+    def _visit_stmt(self, node):
         self._check_split_list_uses(node)
         if (isinstance(node, ast.Expr) and self._rng_call(node.value) is not None
                 and self._rng_call(node.value)[0] == "shuffle" and len(node.value.args) == 1
@@ -30531,6 +30594,53 @@ class translator(ast.NodeVisitor):
         "repeat", "tile", "diag"}
     _COMPLEX_ORDER_OPS = {ast.Lt: "c_lt", ast.LtE: "c_le", ast.Gt: "c_gt", ast.GtE: "c_ge"}
 
+    def _compare_broadcast(self, left, right, a0, b0):
+        """The operand texts of an elementwise comparison of left and right
+        (texts a0 and b0), spread to a common shape: limited broadcasting
+        of a vector against a matrix, a column against a row, and a column
+        or row against a matrix."""
+        a = a0
+        b = b0
+        # Limited broadcasting for comparisons: rank-2 with rank-1.
+        if (self._rank_expr(left) == 2 and self._rank_expr(right) == 1
+                and self._is_col2_expr(left) and not self._is_col2_expr(right)):
+            # x[:, None] < y: the (n, m) outer comparison.
+            a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0}))"
+            b = f"spread({b0}, dim=1, ncopies=size({a0},1))"
+        elif (self._rank_expr(left) == 1 and self._rank_expr(right) == 2
+                and self._is_col2_expr(right) and not self._is_col2_expr(left)):
+            a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
+            b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
+        elif self._rank_expr(left) == 2 and self._rank_expr(right) == 1:
+            if self._is_col2_expr(right):
+                b = f"spread({b0}, dim=2, ncopies=size({a0},2))"
+            else:
+                b = f"spread({b0}, dim=1, ncopies=size({a0},1))"
+        elif self._rank_expr(left) == 1 and self._rank_expr(right) == 2:
+            if self._is_col2_expr(left):
+                a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
+            else:
+                a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
+        elif self._rank_expr(left) == 2 and self._rank_expr(right) == 2:
+            # A (n, 1) column or (1, m) row against a matrix, or a column
+            # against a row (the outer comparison).
+            rgt = right
+            if self._is_col2_expr(left) and self._is_row2_expr(rgt):
+                a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0},2))"
+                b = f"spread(reshape({b0}, [size({b0},2)]), dim=1, ncopies=size({a0},1))"
+            elif self._is_row2_expr(left) and self._is_col2_expr(rgt):
+                a = f"spread(reshape({a0}, [size({a0},2)]), dim=1, ncopies=size({b0},1))"
+                b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0},2))"
+            elif self._is_col2_expr(rgt) and not self._is_col2_expr(left):
+                b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0},2))"
+            elif self._is_row2_expr(rgt) and not self._is_row2_expr(left):
+                b = f"spread(reshape({b0}, [size({b0},2)]), dim=1, ncopies=size({a0},1))"
+            elif self._is_col2_expr(left) and not self._is_col2_expr(rgt):
+                a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0},2))"
+            elif self._is_row2_expr(left) and not self._is_row2_expr(rgt):
+                a = f"spread(reshape({a0}, [size({a0},2)]), dim=1, ncopies=size({b0},1))"
+        return a, b
+
     def _complex_numpy(self, node):
         """Fortran for numpy operations on complex arrays that need numpy's
         lexicographic ordering of complex numbers (comparisons, min/max,
@@ -30539,7 +30649,10 @@ class translator(ast.NodeVisitor):
         np.where; None to use the general translation."""
         def ctxt(n):
             txt = self.expr(n)
-            return txt if self._expr_kind(n) == "complex" else f"cmplx({txt}, 0.0_dp, kind=dp)"
+            k = self._expr_kind(n)
+            if k == "logical":
+                txt = f"merge(1.0_dp, 0.0_dp, {txt})"
+            return txt if k == "complex" else f"cmplx({txt}, 0.0_dp, kind=dp)"
 
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or type(node.ops[0]) not in self._COMPLEX_ORDER_OPS:
@@ -30547,7 +30660,8 @@ class translator(ast.NodeVisitor):
             a, b = node.left, node.comparators[0]
             if "complex" not in {self._expr_kind(a), self._expr_kind(b)}:
                 return None
-            return f"{self._COMPLEX_ORDER_OPS[type(node.ops[0])]}({ctxt(a)}, {ctxt(b)})"
+            at, bt = self._compare_broadcast(a, b, ctxt(a), ctxt(b))
+            return f"{self._COMPLEX_ORDER_OPS[type(node.ops[0])]}({at}, {bt})"
         if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute) and is_numpy_name_node(node.value.func.value)
                 and node.value.func.attr == "where" and len(node.value.args) == 1
@@ -30575,6 +30689,11 @@ class translator(ast.NodeVisitor):
             return f"{fn}({ctxt(node.args[0])}, {ctxt(node.args[1])})"
         if self._expr_kind(x) != "complex":
             return None
+        if attr in {"round", "around"}:
+            # c_round is elemental: scalars and arrays of any rank.
+            d = node.args[1] if len(node.args) >= 2 else next(
+                (kw.value for kw in node.keywords if kw.arg == "decimals"), None)
+            return f"c_round({self.expr(x)}, {0 if d is None else 'int(' + self.expr(d) + ')'})"
         r0 = int(self._rank_expr(x) or 0)
         if r0 not in (1, 2):
             return None
@@ -31269,12 +31388,189 @@ class translator(ast.NodeVisitor):
                     or self._maybe_logical(n.func.value))
         return False
 
+    # numpy functions of complex arrays rewritten by _complex_canonical.
+    _COMPLEX_REWRITES = {
+        "less", "less_equal", "greater", "greater_equal", "isnan", "isinf", "isfinite", "nansum", "nanprod",
+        "nanmean", "nanmax", "nanmin", "nanargmax", "nanargmin", "nanvar", "nanstd", "nanmedian", "nan_to_num",
+        "where", "clip", "rint", "log2", "sinc", "convolve", "correlate", "polyadd", "polysub", "polymul",
+        "polyder", "polyint", "vander", "trapezoid", "trapz", "gradient"}
+
+    def _complex_canonical(self, node):
+        """numpy functions of complex arrays in terms of operations the
+        translation has for complex numbers: linear functions as
+        f(x.real) + 1j * f(x.imag), convolutions through the real and
+        imaginary parts, the NaN-aware functions through a complex isnan
+        (either part NaN), and others by their definitions; None when the
+        call is not one of them or has no complex argument."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value) and node.func.attr in self._COMPLEX_REWRITES
+                and node.args):
+            return None
+        cached = getattr(node, "_xp2f_complex_canonical", None)
+        if cached is not None:
+            return cached
+        attr, args, kws = node.func.attr, list(node.args), list(node.keywords)
+        cx = [self._expr_kind(a) == "complex" for a in args]
+        if not any(cx) and not any(self._expr_kind(k.value) == "complex" for k in kws):
+            return None
+
+        def np_(name, *a, kw=()):
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name, ctx=ast.Load()),
+                            args=list(a), keywords=list(kw))
+
+        def part(n, which):
+            return ast.Attribute(value=n, attr=which, ctx=ast.Load())
+
+        def c(v):
+            return ast.Constant(value=v)
+
+        def binop(a, op, b):
+            return ast.BinOp(left=a, op=op, right=b)
+
+        def isnan(x):
+            return binop(np_("isnan", part(x, "real")), ast.BitOr(), np_("isnan", part(x, "imag")))
+
+        def notnan(x):
+            return ast.UnaryOp(op=ast.Invert(), operand=isnan(x))
+
+        def j(e):
+            return binop(c(1j), ast.Mult(), e)
+
+        def split(fn, pos, rest_kws=None):
+            # fn linear in the arguments at positions pos: f(re) + 1j*f(im),
+            # a real argument giving zeros for the imaginary part.
+            def with_parts(which):
+                a2 = list(args)
+                for i in pos:
+                    if cx[i]:
+                        a2[i] = part(args[i], which)
+                    elif which == "imag":
+                        a2[i] = np_("zeros", np_("size", args[i]))
+                return np_(fn, *a2, kw=kws if rest_kws is None else rest_kws)
+            return binop(with_parts("real"), ast.Add(), j(with_parts("imag")))
+
+        x = args[0]
+        new = None
+        ops = {"less": ast.Lt, "less_equal": ast.LtE, "greater": ast.Gt, "greater_equal": ast.GtE}
+        if attr in ops and len(args) == 2 and not kws:
+            new = ast.Compare(left=args[0], ops=[ops[attr]()], comparators=[args[1]])
+        elif attr in {"isnan", "isinf"} and len(args) == 1 and not kws and cx[0]:
+            new = binop(np_(attr, part(x, "real")), ast.BitOr(), np_(attr, part(x, "imag")))
+        elif attr == "isfinite" and len(args) == 1 and not kws and cx[0]:
+            new = binop(np_(attr, part(x, "real")), ast.BitAnd(), np_(attr, part(x, "imag")))
+        elif attr in {"nansum", "nanprod"} and len(args) == 1 and cx[0]:
+            new = np_(attr[3:], np_("where", isnan(x), c(0 if attr == "nansum" else 1), x), kw=kws)
+        elif attr == "nanmean" and len(args) == 1 and cx[0] and all(k.arg == "axis" for k in kws):
+            new = binop(np_("sum", np_("where", isnan(x), c(0), x), kw=kws), ast.Div(),
+                        np_("sum", notnan(x), kw=kws))
+        elif attr in {"nanmax", "nanmin", "nanmedian"} and len(args) == 1 and cx[0] and not kws:
+            new = np_({"nanmax": "max", "nanmin": "min", "nanmedian": "median"}[attr],
+                      ast.Subscript(value=x, slice=notnan(x), ctx=ast.Load()))
+        elif attr in {"nanargmax", "nanargmin"} and len(args) == 1 and cx[0] and not kws:
+            fill = ast.UnaryOp(op=ast.USub(), operand=part(ast.Name(id="np", ctx=ast.Load()), "inf")) \
+                if attr == "nanargmax" else part(ast.Name(id="np", ctx=ast.Load()), "inf")
+            new = np_(attr[3:], np_("where", isnan(x), fill, x))
+        elif attr in {"nanvar", "nanstd"} and len(args) == 1 and cx[0] and all(k.arg == "ddof" for k in kws):
+            # numpy: the mean of |x - mean|**2 over the non-NaN values.
+            ddof = kws[0].value if kws else c(0)
+            dev = binop(np_("abs", binop(x, ast.Sub(), np_("nanmean", x))), ast.Pow(), c(2))
+            var = binop(np_("nansum", dev), ast.Div(), binop(np_("sum", notnan(x)), ast.Sub(), ddof))
+            new = var if attr == "nanvar" else np_("sqrt", var)
+        elif attr == "nan_to_num" and len(args) == 1 and cx[0]:
+            # Of the real and imaginary parts separately.
+            new = binop(np_(attr, part(x, "real"), kw=kws), ast.Add(), j(np_(attr, part(x, "imag"), kw=kws)))
+        elif attr == "where" and len(args) == 1 and cx[0] and not kws:
+            new = np_("where", ast.Compare(left=x, ops=[ast.NotEq()], comparators=[c(0)]))
+        elif attr == "clip" and cx[0] and not kws and len(args) in (1, 3):
+            # numpy's lexicographic order of complex numbers.
+            new = x
+            if len(args) == 3:
+                if not is_none(args[1]):
+                    new = np_("maximum", new, args[1])
+                if not is_none(args[2]):
+                    new = np_("minimum", new, args[2])
+            if new is x:
+                new = np_("copy", x)
+        elif attr == "rint" and len(args) == 1 and cx[0] and not kws:
+            new = np_("round", x)
+        elif attr == "log2" and len(args) == 1 and cx[0] and not kws:
+            new = binop(np_("log", x), ast.Div(), np_("log", c(2.0)))
+        elif attr == "sinc" and len(args) == 1 and cx[0] and not kws:
+            zero = ast.Compare(left=x, ops=[ast.Eq()], comparators=[c(0)])
+            pix = binop(part(ast.Name(id="np", ctx=ast.Load()), "pi"), ast.Mult(), np_("where", zero, c(1.0), x))
+            new = np_("where", zero, c(1.0 + 0j), binop(np_("sin", pix), ast.Div(), pix))
+        elif attr in {"convolve", "correlate"} and len(args) in (2, 3) and all(k.arg == "mode" for k in kws)                 and any(cx[:2]):
+            a, v = args[:2]
+            if len(args) == 3:
+                kws = [ast.keyword(arg="mode", value=args[2])]
+            ar, ai = (part(a, "real"), part(a, "imag")) if cx[0] else (a, None)
+            vr, vi = (part(v, "real"), part(v, "imag")) if cx[1] else (v, None)
+
+            def f(p, q):
+                return np_(attr, p, q, kw=kws)
+
+            def combine(terms):
+                out = None
+                for sign, p, q in terms:
+                    if p is None or q is None:
+                        continue
+                    e = f(p, q)
+                    if out is None:
+                        out = e if sign > 0 else ast.UnaryOp(op=ast.USub(), operand=e)
+                    else:
+                        out = binop(out, ast.Add() if sign > 0 else ast.Sub(), e)
+                return out
+            if attr == "convolve":
+                re_ = combine([(1, ar, vr), (-1, ai, vi)])
+                im_ = combine([(1, ar, vi), (1, ai, vr)])
+            else:
+                # correlate(a, v)[k] = sum a[n + k] * conj(v[n]).
+                re_ = combine([(1, ar, vr), (1, ai, vi)])
+                im_ = combine([(1, ai, vr), (-1, ar, vi)])
+            new = binop(re_, ast.Add(), j(im_))
+        elif attr in {"polyadd", "polysub"} and len(args) == 2 and not kws \
+                and all(int(self._rank_expr(a) or 0) == 1 for a in args):
+            new = split(attr, (0, 1))
+        elif attr == "polymul" and len(args) == 2 and not kws:
+            new = np_("convolve", *args)
+        elif attr == "polyder" and cx[0]:
+            new = split(attr, (0,))
+        elif attr == "polyint" and cx[0] and not any(k.arg == "k" for k in kws) and len(args) <= 2:
+            new = split(attr, (0,))
+        elif attr in {"trapezoid", "trapz"} and cx[0] and not any(cx[1:]) \
+                and not any(self._expr_kind(k.value) == "complex" for k in kws):
+            new = split(attr, (0,))
+        elif attr == "gradient" and cx[0] and not any(cx[1:]) \
+                and not any(self._expr_kind(k.value) == "complex" for k in kws):
+            new = split(attr, (0,))
+        elif attr == "vander" and len(args) <= 2 and cx[0] and all(k.arg in {"N", "increasing"} for k in kws) \
+                and int(self._rank_expr(x) or 0) == 1:
+            n = args[1] if len(args) == 2 else next((k.value for k in kws if k.arg == "N"), None)
+            if n is None or is_none(n):
+                n = np_("size", x)
+            inc = next((k.value for k in kws if k.arg == "increasing"), c(False))
+            if not isinstance(inc, ast.Constant):
+                return None
+            powers = np_("arange", n) if inc.value else np_("arange", binop(n, ast.Sub(), c(1)), c(-1), c(-1))
+            col = ast.Call(func=ast.Attribute(value=x, attr="reshape", ctx=ast.Load()), args=[c(-1), c(1)],
+                           keywords=[])
+            new = binop(col, ast.Pow(), ast.Call(func=ast.Attribute(value=powers, attr="reshape", ctx=ast.Load()),
+                                                 args=[c(1), c(-1)], keywords=[]))
+        if new is None:
+            return None
+        new = ast.fix_missing_locations(ast.copy_location(new, node))
+        node._xp2f_complex_canonical = new
+        return new
+
     def _canonical_numpy_call(self, node):
         """An equivalent, more directly translatable form of a numpy call
         or array method, or None: x.cumsum(axis=0) -> np.cumsum(x, axis=0);
         np.mean(m) of a 2-D m -> np.mean(np.ravel(m)); np.sort(m, axis=None)
         -> np.sort(np.ravel(m))."""
         self._pad_partial_index(node)
+        _cxc = self._complex_canonical(node)
+        if _cxc is not None:
+            return _cxc
         if (isinstance(node, ast.BinOp)
                 and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow))
                 and not SOURCE_USES_PANDAS):
@@ -31470,7 +31766,7 @@ class translator(ast.NodeVisitor):
             new = ast.Call(func=np_func(attr), args=[func.value] + list(node.args), keywords=list(node.keywords))
         elif (
             not is_numpy_name_node(func.value) and attr == "round" and not SOURCE_USES_PANDAS
-            and int(self._rank_expr(func.value) or 0) == 0 and recv_kind in {"int", "real"}
+            and int(self._rank_expr(func.value) or 0) == 0 and recv_kind in {"int", "real", "complex"}
             and isinstance(func.value, ast.Call)
         ):
             # x.mean().round(3): a numpy scalar's round (Python numbers have
@@ -31505,8 +31801,19 @@ class translator(ast.NodeVisitor):
             is_numpy_name_node(func.value) and attr in {"var", "std"} and len(node.args) == 1
             and self._expr_kind(node.args[0]) == "complex"
         ):
+            _kd = next((kw.value for kw in node.keywords if kw.arg == "keepdims"), None)
+            _ax = next((kw.value for kw in node.keywords if kw.arg == "axis"), None)
+            if (_kd is not None and isinstance(_kd, ast.Constant) and _kd.value is True and _ax is not None
+                    and not is_none(_ax)):
+                # keepdims=True: the reduction with the axis put back.
+                inner = ast.Call(func=func, args=list(node.args),
+                                 keywords=[kw for kw in node.keywords if kw.arg != "keepdims"])
+                new = ast.fix_missing_locations(ast.copy_location(
+                    ast.Call(func=np_func("expand_dims"), args=[inner, _ax], keywords=[]), node))
+                node._xp2f_canonical = new
+                return new
             if any(kw.arg not in {"ddof", "axis"} for kw in node.keywords):
-                raise NotImplementedError(f"np.{attr} of a complex array supports only ddof= and axis=")
+                raise NotImplementedError(f"np.{attr} of a complex array supports only ddof=, axis= and keepdims=")
             # numpy: var = sum(|x - mean(x)|**2) / (n - ddof), std its root;
             # with axis=, along that axis (the mean kept as a size-1 axis).
             x = node.args[0]
@@ -32128,7 +32435,7 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("np.squeeze(a, axis=) of a matrix expression: assign it to a name first")
             idx = [ast.Constant(value=0), ast.Slice()] if axv % 2 == 0 else [ast.Slice(), ast.Constant(value=0)]
             return ast.Subscript(value=args[0], slice=ast.Tuple(elts=idx, ctx=ast.Load()), ctx=ast.Load())
-        if attr == "repeat" and len(args) == 2 and not kws and int(self._rank_expr(args[0]) or 0) == 2:
+        if attr == "repeat" and len(args) == 2 and not kws and int(self._rank_expr(args[0]) or 0) >= 2:
             # No axis: the flattened array (in C order) repeated.
             return call("repeat", [call("ravel", [args[0]]), args[1]])
         if attr in {"conj", "conjugate"} and len(args) == 1 and not kws                 and self._expr_kind(args[0]) in {"int", "real"}:
@@ -32578,7 +32885,8 @@ class translator(ast.NodeVisitor):
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and is_numpy_name_node(node.func.value) and node.func.attr in {"triu", "tril", "diagonal"} and node.args
         ):
-            return "int" if self._expr_kind(node.args[0]) in {"int", "logical"} else "real"
+            _k0 = self._expr_kind(node.args[0])
+            return "int" if _k0 in {"int", "logical"} else "complex" if _k0 == "complex" else "real"
         if self._histogram_counts_call(node) is not None:
             return "int"
         _kp = self._kind_preserving_kind(node)
@@ -32790,10 +33098,10 @@ class translator(ast.NodeVisitor):
             kinds.discard(None)
             if not kinds:
                 return None
-            if "real" in kinds:
-                return "real"
             if "complex" in kinds:
                 return "complex"
+            if "real" in kinds:
+                return "real"
             if kinds == {"int"}:
                 return "int"
             if kinds == {"logical"}:
@@ -32808,10 +33116,10 @@ class translator(ast.NodeVisitor):
             kinds.discard(None)
             if not kinds:
                 return None
-            if "real" in kinds:
-                return "real"
             if "complex" in kinds:
                 return "complex"
+            if "real" in kinds:
+                return "real"
             if kinds == {"int"}:
                 return "int"
             if kinds == {"logical"}:
@@ -32933,10 +33241,10 @@ class translator(ast.NodeVisitor):
             kinds.discard(None)
             if not kinds:
                 return None
-            if "real" in kinds:
-                return "real"
             if "complex" in kinds:
                 return "complex"
+            if "real" in kinds:
+                return "real"
             if kinds == {"int"}:
                 return "int"
             if kinds == {"logical"}:
@@ -33528,12 +33836,12 @@ class translator(ast.NodeVisitor):
             ):
                 k0 = self._expr_kind(node.args[0])
                 k1 = self._expr_kind(node.args[1])
+                if "complex" in {k0, k1}:
+                    return "complex"
                 if node.func.attr in {"divide", "true_divide", "float_power"}:
                     return "real"
                 if "real" in {k0, k1}:
                     return "real"
-                if "complex" in {k0, k1}:
-                    return "complex"
                 return k0 or k1 or "int"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -33583,9 +33891,9 @@ class translator(ast.NodeVisitor):
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"select", "piecewise"}
             ):
-                if node.func.attr == "piecewise" and node.args and self._expr_kind(node.args[0]) == "int":
+                if node.func.attr == "piecewise" and node.args and self._expr_kind(node.args[0]) in ("int", "complex"):
                     # numpy's result has x's dtype.
-                    return "int"
+                    return self._expr_kind(node.args[0])
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -38282,6 +38590,9 @@ class translator(ast.NodeVisitor):
         return f"reshape({self._reverse_axes(x, rank)}, [size({x})])"
 
     def _rank_expr(self, node):
+        _ell = self._expand_ellipsis(node)
+        if _ell is not None:
+            return self._rank_expr(_ell)
         self._normalize_negative_axis(node)
         _ixr = self._indexed_expression_kind_rank(node)
         if _ixr is not None:
@@ -38319,8 +38630,8 @@ class translator(ast.NodeVisitor):
                 return 1 if int(self._rank_expr(node.args[1]) or 0) >= 1 else 0
             if _attr in {"triu", "tril"} and node.args:
                 return 2
-            if _attr == "diagonal" and node.args and int(self._rank_expr(node.args[0]) or 0) == 2:
-                return 1
+            if _attr == "diagonal" and node.args and int(self._rank_expr(node.args[0]) or 0) in (2, 3):
+                return int(self._rank_expr(node.args[0])) - 1
             if _attr == "diag" and node.args:
                 # An unknown input rank must stay unresolved: diag builds a
                 # matrix from a vector, but extracts a vector from a matrix.
@@ -40270,7 +40581,75 @@ class translator(ast.NodeVisitor):
             return fstr("")
         return " // ".join(parts)
 
+    # numpy functions whose result is the real part of a complex argument.
+    _REAL_OF_COMPLEX_OK = {"real", "abs", "absolute", "angle", "iscomplex", "isreal", "iscomplexobj", "isrealobj"}
+
     def expr(self, node):
+        txt = self._expr_text(node)
+        if isinstance(node, ast.Call) and "real(" in txt:
+            self._check_complex_args_kept(node, txt)
+        return txt
+
+    def _real_part_names(self, node):
+        """Names whose .real/.imag (or np.real etc.) node -- or the complex
+        rewrite of a call in it -- takes."""
+        out, todo = set(), [node]
+        while todo:
+            n0 = todo.pop()
+            for n in ast.walk(n0):
+                if isinstance(n, ast.Attribute) and n.attr in {"real", "imag"} and isinstance(n.value, ast.Name):
+                    out.add(n.value.id)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                        and n.func.attr in self._REAL_OF_COMPLEX_OK and is_numpy_name_node(n.func.value):
+                    out.update(a.id for a in n.args if isinstance(a, ast.Name))
+                cx = getattr(n, "_xp2f_complex_canonical", None)
+                if cx is not None:
+                    todo.append(cx)
+        return out
+
+    def _check_complex_args_kept(self, node, txt):
+        """Stop when a numpy function's translation takes the real part
+        of a complex argument (real(x, kind=dp)): a numpy function without
+        complex support here would otherwise drop the imaginary part."""
+        parts = self._attr_chain_parts(node.func) if isinstance(node.func, ast.Attribute) else None
+        if not parts or parts[0] not in {"np", "numpy"} or parts[-1] in self._REAL_OF_COMPLEX_OK:
+            return
+        _skip = self._real_part_names(node)
+        for a in list(node.args) + [k.value for k in node.keywords]:
+            if not (isinstance(a, ast.Name) or (isinstance(a, ast.Subscript) and isinstance(a.value, ast.Name))):
+                continue
+            if (a.id if isinstance(a, ast.Name) else a.value.id) in _skip:
+                continue
+            if self._expr_kind(a) != "complex":
+                continue
+            at = self.expr(a)
+            if re.search(r"\breal\(\s*" + re.escape(at) + r"\s*,\s*(?:kind\s*=\s*)?dp\s*\)", txt):
+                raise NotImplementedError(f"{'.'.join(parts)} of a complex array is not supported "
+                                          "(the translation would drop the imaginary part)")
+
+    def _expand_ellipsis(self, node):
+        """a[..., 0] and a[0, ...]: the Ellipsis as the full slices it
+        stands for (a's rank known); None when there is none to expand."""
+        if not (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Tuple)):
+            return None
+        elts = node.slice.elts
+        pos = [i for i, e in enumerate(elts) if isinstance(e, ast.Constant) and e.value is Ellipsis]
+        if len(pos) != 1:
+            return None
+        r = int(self._rank_expr(node.value) or 0)
+        used = sum(1 for e in elts if not (isinstance(e, ast.Constant) and e.value in (Ellipsis, None)))
+        if r == 0 or used > r:
+            return None
+        full = [ast.Slice() for _ in range(r - used)]
+        new = elts[:pos[0]] + full + elts[pos[0] + 1:]
+        sl = new[0] if len(new) == 1 else ast.Tuple(elts=new, ctx=ast.Load())
+        return ast.fix_missing_locations(ast.copy_location(
+            ast.Subscript(value=node.value, slice=sl, ctx=node.ctx), node))
+
+    def _expr_text(self, node):
+        _ell = self._expand_ellipsis(node)
+        if _ell is not None:
+            return self.expr(_ell)
         validate_numpy_atleast_call(node)
         self._normalize_negative_axis(node)
         if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
@@ -41993,37 +42372,7 @@ class translator(ast.NodeVisitor):
                 b0 = f"merge(1, 0, {b0})"
             a = a0
             b = b0
-            # Limited broadcasting for comparisons: rank-2 with rank-1.
-            if (self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1
-                    and self._is_col2_expr(node.left) and not self._is_col2_expr(node.comparators[0])):
-                # x[:, None] < y: the (n, m) outer comparison.
-                a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0}))"
-                b = f"spread({b0}, dim=1, ncopies=size({a0},1))"
-            elif (self._rank_expr(node.left) == 1 and self._rank_expr(node.comparators[0]) == 2
-                    and self._is_col2_expr(node.comparators[0]) and not self._is_col2_expr(node.left)):
-                a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
-                b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
-            elif self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 1:
-                if self._is_col2_expr(node.comparators[0]):
-                    b = f"spread({b0}, dim=2, ncopies=size({a0},2))"
-                else:
-                    b = f"spread({b0}, dim=1, ncopies=size({a0},1))"
-            elif self._rank_expr(node.left) == 1 and self._rank_expr(node.comparators[0]) == 2:
-                if self._is_col2_expr(node.left):
-                    a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
-                else:
-                    a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
-            elif self._rank_expr(node.left) == 2 and self._rank_expr(node.comparators[0]) == 2:
-                # A (n, 1) column or (1, m) row against a matrix.
-                rgt = node.comparators[0]
-                if self._is_col2_expr(rgt) and not self._is_col2_expr(node.left):
-                    b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0},2))"
-                elif self._is_row2_expr(rgt) and not self._is_row2_expr(node.left):
-                    b = f"spread(reshape({b0}, [size({b0},2)]), dim=1, ncopies=size({a0},1))"
-                elif self._is_col2_expr(node.left) and not self._is_col2_expr(rgt):
-                    a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0},2))"
-                elif self._is_row2_expr(node.left) and not self._is_row2_expr(rgt):
-                    a = f"spread(reshape({a0}, [size({a0},2)]), dim=1, ncopies=size({b0},1))"
+            a, b = self._compare_broadcast(node.left, node.comparators[0], a0, b0)
             # A NaN operand (e.g. the vacated row from a .shift() on a
             # real array) would otherwise trip -ffpe-trap=invalid: ordered
             # comparisons all signal on NaN in Fortran, unlike Python/
@@ -45674,6 +46023,10 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "polyval"
                 and len(node.args) >= 2
             ):
+                if "complex" in {self._expr_kind(node.args[0]), self._expr_kind(node.args[1])}:
+                    _pvc = [self.expr(a) if self._expr_kind(a) == "complex" else
+                            f"cmplx({self.expr(a)}, 0.0_dp, kind=dp)" for a in node.args[:2]]
+                    return f"polyval({_pvc[0]}, {_pvc[1]})"
                 pv = f"polyval(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp))"
                 return f"nint({pv})" if self._expr_kind(node) == "int" else pv
             if (
@@ -46247,6 +46600,34 @@ class translator(ast.NodeVisitor):
                     if not (isinstance(_axes_node, ast.Constant) and isinstance(_axes_node.value, int)):
                         raise NotImplementedError("np.tensordot currently supports only a literal integer axes")
                     _axes = _axes_node.value
+                _ra = int(self._rank_expr(node.args[0]) or 0)
+                _rb = int(self._rank_expr(node.args[1]) or 0)
+                if (_ra, _rb) != (2, 2) and _ra >= 1 and _rb >= 1:
+                    # Any ranks: the last axes of a against the first of b,
+                    # as a matrix product of a.reshape(M, K) and
+                    # b.reshape(K, N) shaped back to a's leading and b's
+                    # trailing axes.
+                    if not 0 <= _axes <= min(_ra, _rb):
+                        raise NotImplementedError("np.tensordot: axes is larger than an operand's rank")
+                    _out = [f"A.shape[{i}]" for i in range(_ra - _axes)] + [f"B.shape[{i}]" for i in range(_axes, _rb)]
+                    if len(_out) > 3:
+                        raise NotImplementedError("np.tensordot: results of rank above 3 are not supported")
+
+                    def _prod(dims):
+                        return " * ".join(dims) or "1"
+                    _m = _prod([f"A.shape[{i}]" for i in range(_ra - _axes)])
+                    _k = _prod([f"A.shape[{i}]" for i in range(_ra - _axes, _ra)])
+                    _n = _prod([f"B.shape[{i}]" for i in range(_axes, _rb)])
+                    _src = f"(A.reshape({_m}, {_k}) @ B.reshape({_k}, {_n}))"
+                    _src = ("np.sum(A * B)" if not _out else f"{_src}.reshape(-1)" if len(_out) == 1
+                            else f"{_src}.reshape({', '.join(_out)})")
+                    _new = ast.parse(_src, mode="eval").body
+
+                    class _Sub(ast.NodeTransformer):
+                        def visit_Name(s, n):
+                            return node.args[0] if n.id == "A" else node.args[1] if n.id == "B" else n
+                    _new = ast.fix_missing_locations(ast.copy_location(_Sub().visit(_new), node))
+                    return self.expr(_new)
                 _a0 = self.expr(node.args[0])
                 _a1 = self.expr(node.args[1])
                 if _axes == 1:
@@ -46330,8 +46711,8 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("np.piecewise: funclist must have one entry per condition, or one more")
                 _x_txt = self.expr(_x_node)
                 _xk = self._expr_kind(_x_node)
-                if _xk not in ("int", "real"):
-                    raise NotImplementedError("np.piecewise supports integer and real arrays")
+                if _xk not in ("int", "real", "complex"):
+                    raise NotImplementedError("np.piecewise supports integer, real and complex arrays")
 
                 def _as_x_kind(_n):
                     _txt = self.expr(_n)
@@ -46340,6 +46721,8 @@ class translator(ast.NodeVisitor):
                         return f"int({_txt})"
                     if _xk == "real" and _k != "real":
                         return f"real({_txt}, kind=dp)"
+                    if _xk == "complex" and _k != "complex":
+                        return f"cmplx({_txt}, 0.0_dp, kind=dp)"
                     return _txt
 
                 def _value(_fn):
@@ -46361,10 +46744,10 @@ class translator(ast.NodeVisitor):
 
                 _conds = [self.expr(c) if self._expr_kind(c) == "logical" else f"({self.expr(c)} /= 0)"
                           for c in _condlist.elts]
-                _zero = "0" if _xk == "int" else "0.0_dp"
+                _zero = {"int": "0", "complex": "(0.0_dp, 0.0_dp)"}.get(_xk, "0.0_dp")
                 # A start shaped like x: zeros (not 0 * x, which is NaN at
                 # NaN and inf), or the default where no condition holds.
-                _decl = "integer" if _xk == "int" else "real(kind=dp)"
+                _decl = {"int": "integer", "complex": "complex(kind=dp)"}.get(_xk, "real(kind=dp)")
                 _result = f"reshape([{_decl} ::], shape({_x_txt}), pad=[{_zero}])"
                 if _nf == _nc + 1:
                     _none = " .or. ".join(f"({c})" for c in _conds)
@@ -47444,24 +47827,25 @@ class translator(ast.NodeVisitor):
                     offset_txt = str(offset_val)
                 a1 = 0 if axis1 is None else self._const_int_value(axis1)
                 a2 = 1 if axis2 is None else self._const_int_value(axis2)
-                if isinstance(a1, int) and isinstance(a2, int):
-                    if a1 == 0 and a2 == 1:
-                        if offset_txt is None:
-                            return f"diagonal({a0})"
-                        return f"diagonal({a0}, {offset_txt})"
-                    if a1 == 1 and a2 == 2:
-                        if offset_txt is None:
-                            return f"diagonal({a0})"
-                        return f"diagonal({a0}, {offset_txt})"
-                if src_rank == 2:
-                    if offset_txt is None:
-                        return f"diagonal({a0})"
-                    return f"diagonal({a0}, {offset_txt})"
-                if src_rank == 3:
-                    if offset_txt is None:
-                        return f"diagonal({a0})"
-                    return f"diagonal({a0}, {offset_txt})"
-                raise NotImplementedError("np.diagonal currently supports only axis1=0,axis2=1 or axis1=1,axis2=2")
+                if isinstance(a1, int) and isinstance(a2, int) and src_rank in (2, 3):
+                    a1 %= src_rank
+                    a2 %= src_rank
+                off = "" if offset_txt is None else f", {offset_txt}"
+                if src_rank == 2 and (a1, a2) == (0, 1):
+                    return f"diagonal({a0}{off})"
+                if src_rank == 3 and (a1, a2) == (1, 2):
+                    # The python_mod helper: out[i, j] = a[i, j, j + offset].
+                    return f"diagonal({a0}{off})"
+                if src_rank == 3 and (a1, a2) == (0, 1):
+                    # numpy: out[i, j] = a[j, j + offset, i] -- the helper's
+                    # diagonal of a with its last axis moved first.
+                    moved = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="transpose",
+                                                        ctx=ast.Load()), args=[node.args[0], ast.Tuple(
+                        elts=[ast.Constant(value=2), ast.Constant(value=0), ast.Constant(value=1)],
+                        ctx=ast.Load())], keywords=[])
+                    return f"diagonal({self.expr(ast.fix_missing_locations(ast.copy_location(moved, node)))}{off})"
+                raise NotImplementedError("np.diagonal supports a matrix (axis1=0, axis2=1) and a rank-3 array "
+                                          "(axes 0, 1 or 1, 2)")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -48397,6 +48781,8 @@ class translator(ast.NodeVisitor):
                     mode_arg = f', "{mode_txt}"'
                 k0 = self._expr_kind(node.args[0])
                 k1 = self._expr_kind(node.args[1])
+                if mode_txt == "same":
+                    mode_arg += ", np_same=.true."
                 if k0 == "int" and k1 == "int":
                     return f"convolve_int({self.expr(node.args[0])}, {self.expr(node.args[1])}{mode_arg})"
                 return f"convolve_real({self.expr(node.args[0])}, {self.expr(node.args[1])}{mode_arg})"
@@ -48419,7 +48805,8 @@ class translator(ast.NodeVisitor):
                     if kw.arg == "mode" and is_const_str(kw.value):
                         mode_txt = str(kw.value.value)
                         break
-                return f'correlate_real({self.expr(node.args[0])}, {self.expr(node.args[1])}, "{mode_txt}")'
+                _nps = ", np_same=.true." if mode_txt == "same" else ""
+                return f'correlate_real({self.expr(node.args[0])}, {self.expr(node.args[1])}, "{mode_txt}"{_nps})'
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -50010,13 +50397,21 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "multiply":
                     return f"(({a0}) * ({b0}))"
                 if node.func.attr in {"divide", "true_divide"}:
+                    # True division: of integers too.
+                    _dk = {self._expr_kind(node.args[0]), self._expr_kind(node.args[1])}
+                    if self._expr_kind(node.args[0]) == "logical":
+                        a0 = f"merge(1.0_dp, 0.0_dp, {a0})"
+                    elif not _dk & {"real", "complex"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) == "logical":
+                        b0 = f"merge(1.0_dp, 0.0_dp, {b0})"
                     return f"(({a0}) / ({b0}))"
                 if node.func.attr == "float_power":
                     # Always computed in floats (an integer to a negative
                     # integer power is not 0).
-                    if self._expr_kind(node.args[0]) != "real":
+                    if self._expr_kind(node.args[0]) not in {"real", "complex"}:
                         a0 = f"real({a0}, kind=dp)"
-                    if self._expr_kind(node.args[1]) not in {"real", "int"}:
+                    if self._expr_kind(node.args[1]) not in {"real", "int", "complex"}:
                         b0 = f"real({b0}, kind=dp)"
                     return f"(({a0}) ** ({b0}))"
                 if node.func.attr in {"power", "pow"}:
@@ -63351,7 +63746,7 @@ class translator(ast.NodeVisitor):
                 return None
             name, call = nc
             if name == "polydiv":
-                return ("real", 1)
+                return ("complex" if "complex" in {self._expr_kind(a) for a in call.args} else "real", 1)
             r = int(self._rank_expr(call.args[0]) or 0) if call.args else 0
             return ("int" if name == "frexp" and node.slice.value == 1 else "real", r)
         nc = self._b1_call(node)
@@ -63408,6 +63803,10 @@ class translator(ast.NodeVisitor):
             if name == "polydiv":
                 if len(call.args) != 2 or call.keywords:
                     raise NotImplementedError("np.polydiv takes the two coefficient arrays")
+                if "complex" in {self._expr_kind(a) for a in call.args}:
+                    _pdc = [self.expr(a) if self._expr_kind(a) == "complex" else
+                            f"cmplx({self.expr(a)}, 0.0_dp, kind=dp)" for a in call.args]
+                    return f"np_polydiv_complex({_pdc[0]}, {_pdc[1]}, {k})"
                 return f"np_polydiv({real_txt(call.args[0])}, {real_txt(call.args[1])}, {k})"
             if len(call.args) != 1 or call.keywords:
                 raise NotImplementedError(f"np.{name} takes one array")

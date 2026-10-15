@@ -295,6 +295,7 @@ public :: np_window !@pyapi kind=function ret=real(dp)(:) args=kind_name:charact
 public :: np_poly_roots !@pyapi kind=function ret=real(dp)(:) args=r:real(dp)(:):intent(in) lib=polynomial desc="np.poly(roots): the monic polynomial with these roots, highest degree first"
 public :: np_polyadd !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),sgn:integer:intent(in) lib=polynomial desc="np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the shorter is padded with leading zeros (generic: np_polyadd_real, np_polyadd_int)"
 public :: np_polymul !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=polynomial desc="np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real, np_polymul_int)"
+public :: np_polydiv_complex !@pyapi kind=function ret=complex(dp)(:) args=u:complex(dp)(:):intent(in),v:complex(dp)(:):intent(in),part:integer:intent(in) lib=polynomial desc="np.polydiv(u, v)[part] of complex polynomials: the quotient (part 0) or the remainder (part 1), as np_polydiv"
 public :: np_polydiv !@pyapi kind=function ret=real(dp)(:) args=u:real(dp)(:):intent(in),v:real(dp)(:):intent(in),part:integer:intent(in) lib=polynomial desc="np.polydiv(u, v)[part]: the quotient (part 0) or the remainder (part 1), with numpy's algorithm (leading remainder terms close to zero, allclose with rtol 1e-14, are dropped)"
 public :: np_polyint !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in),k:real(dp)(:):intent(in):optional lib=polynomial desc="np.polyint(p, m, k): m antiderivatives, integration constants k (a scalar for all, or one per integration; default 0)"
 public :: nan_quantile_vec
@@ -413,12 +414,12 @@ public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)
 public :: corrcoef_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=statistics desc="correlation matrix for observations in rows (numpy rowvar=False)"
 public :: autocorr_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),lag:integer:intent(in):optional lib=timeseries desc="pandas-style lag-k serial autocorrelation of a 1D real vector"
 public :: corr2_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) lib=statistics desc="Pearson correlation of two 1D real vectors as a plain scalar"
-public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional lib=signal desc="1D convolution with mode full/same/valid"
+public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional,np_same:logical:intent(in):optional lib=signal desc="1D convolution with mode full/same/valid (same: scipy's, or np.convolve's with np_same)"
 public :: diff_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="first difference along axis 0 for a real matrix"
 public :: diff_axis1_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="first difference along axis 1 for a real matrix"
 public :: sliding_window_view_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:):intent(in),window:integer:intent(in) lib=arrays desc="axis-0 sliding window view for a real matrix"
-public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional lib=signal desc="1D integer convolution with mode full/same/valid"
-public :: correlate_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),mode:character:intent(in):optional lib=signal desc="1D cross-correlation with mode full/same/valid (scipy.signal.correlate)"
+public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional,np_same:logical:intent(in):optional lib=signal desc="1D integer convolution with mode full/same/valid"
+public :: correlate_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),mode:character:intent(in):optional,np_same:logical:intent(in):optional lib=signal desc="1D cross-correlation with mode full/same/valid (scipy.signal.correlate; np.correlate's same with np_same)"
 public :: lfilter_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) lib=signal desc="1D IIR/FIR filter, zero initial conditions (scipy.signal.lfilter)"
 public :: filtfilt_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) lib=signal desc="zero-phase forward-backward filter, no edge padding (scipy.signal.filtfilt)"
 public :: lfilter_zi_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in) lib=signal desc="steady-state IIR filter initial state for a unit step input (scipy.signal.lfilter_zi)"
@@ -606,8 +607,8 @@ public :: np_ceil !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) 
 public :: np_sign !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=arrays desc="np.sign of a float: -1, 0 or 1, NaN for NaN"
 public :: histogram_counts !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),nbins:integer:intent(in) lib=statistics desc="np.histogram(x, bins=n)[0]: counts in n equal bins spanning min(x)..max(x)"
 public :: histogram_counts_edges !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),edges:real(dp)(:):intent(in) lib=statistics desc="np.histogram(x, bins=edges)[0]"
-public :: triu !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),k:integer:intent(in):optional lib=arrays desc="np.triu(a, k): zero below diagonal k (generic: triu_real, triu_int)"
-public :: tril !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),k:integer:intent(in):optional lib=arrays desc="np.tril(a, k): zero above diagonal k (generic: tril_real, tril_int)"
+public :: triu !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),k:integer:intent(in):optional lib=arrays desc="np.triu(a, k): zero below diagonal k (generic: triu_real, triu_int, triu_complex)"
+public :: tril !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),k:integer:intent(in):optional lib=arrays desc="np.tril(a, k): zero above diagonal k (generic: tril_real, tril_int, tril_complex)"
 public :: quantile_axis_2d_q !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),q:real(dp)(:):intent(in),dim:integer:intent(in) lib=statistics desc="np.quantile(x, q, axis=dim-1) of a matrix at several probabilities: row k for q(k)"
 public :: quantile_axis_2d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) lib=statistics desc="np.quantile(x, q, axis) of a matrix: linear quantile of each column (dim=1) or row (dim=2)"
 public :: reversed_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=arrays desc="x[::-1] / np.flip(x) of a vector expression (a function result can't be subscripted in Fortran) (generic: reversed_real_vec, reversed_int_vec, reversed_logical_vec, reversed_complex_vec)"
@@ -619,7 +620,7 @@ public :: reduceat_add !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):
 public :: reduceat_mul !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.multiply.reduceat for real vector (generic: reduceat_mul_real, reduceat_mul_int)"
 public :: reduceat_min !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.minimum.reduceat for real vector (generic: reduceat_min_real, reduceat_min_int)"
 public :: reduceat_max !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=arrays desc="np.maximum.reduceat for real vector (generic: reduceat_max_real, reduceat_max_int)"
-public :: polyval !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) lib=polynomial desc="evaluate polynomial with descending coefficients at scalar x (generic: polyval_real_scalar, polyval_real_vec)"
+public :: polyval !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) lib=polynomial desc="evaluate polynomial with descending coefficients at scalar x (generic: polyval_real_scalar, polyval_real_vec, polyval_complex_scalar, polyval_complex_vec)"
 public :: polyder !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional lib=polynomial desc="m-th derivative coefficients for descending-order polynomial (generic: polyder_real)"
 public :: polyfit_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="least-squares polynomial fit (deg+1 coefficients, highest degree first), matching numpy.polyfit"
 public :: digitize_real !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in) lib=statistics desc="bin index of each x(i) against increasing bin edges, matching numpy.digitize (right=False)"
@@ -681,7 +682,7 @@ interface diag
 end interface diag
 
 interface diagonal
-   module procedure diagonal_int_2d, diagonal_real_2d
+   module procedure diagonal_int_2d, diagonal_real_2d, diagonal_complex_2d
    module procedure diagonal_int_3d_axis12, diagonal_real_3d_axis12
 end interface diagonal
 
@@ -832,11 +833,11 @@ interface diag_k
 end interface diag_k
 
 interface triu
-   module procedure triu_real, triu_int
+   module procedure triu_real, triu_int, triu_complex
 end interface triu
 
 interface tril
-   module procedure tril_real, tril_int
+   module procedure tril_real, tril_int, tril_complex
 end interface tril
 
 interface reversed_vec
@@ -946,7 +947,7 @@ interface reduceat_max
 end interface reduceat_max
 
 interface polyval
-   module procedure polyval_real_scalar, polyval_real_vec
+   module procedure polyval_real_scalar, polyval_real_vec, polyval_complex_scalar, polyval_complex_vec
 end interface polyval
 
 interface polyder
@@ -7135,6 +7136,22 @@ contains
          end do
       end function triu_real
 
+      pure function triu_complex(a, k) result(b)
+         ! np.triu(a, k): zero below diagonal k.
+         complex(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in), optional :: k
+         complex(kind=dp), allocatable :: b(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         b = a
+         do j = 1, size(a,2)
+            do i = 1, size(a,1)
+               if (j - i < kk) b(i, j) = (0.0_dp, 0.0_dp)
+            end do
+         end do
+      end function triu_complex
+
       pure function tril_real(a, k) result(b)
          ! np.tril(a, k): zero above diagonal k.
          real(kind=dp), intent(in) :: a(:,:)
@@ -7150,6 +7167,22 @@ contains
             end do
          end do
       end function tril_real
+
+      pure function tril_complex(a, k) result(b)
+         ! np.tril(a, k): zero above diagonal k.
+         complex(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in), optional :: k
+         complex(kind=dp), allocatable :: b(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         b = a
+         do j = 1, size(a,2)
+            do i = 1, size(a,1)
+               if (j - i > kk) b(i, j) = (0.0_dp, 0.0_dp)
+            end do
+         end do
+      end function tril_complex
 
       pure function diag_k_vec_int(v, k) result(a)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.
@@ -9773,6 +9806,28 @@ contains
             end do
          end if
       end function diagonal_real_2d
+
+      pure function diagonal_complex_2d(a, offset) result(v)
+         complex(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in), optional :: offset
+         complex(kind=dp), allocatable :: v(:)
+         integer :: i, n, k
+         k = 0
+         if (present(offset)) k = offset
+         if (k >= 0) then
+            n = min(size(a,1), max(0, size(a,2) - k))
+            allocate(v(1:n))
+            do i = 1, n
+               v(i) = a(i, i + k)
+            end do
+         else
+            n = min(max(0, size(a,1) + k), size(a,2))
+            allocate(v(1:n))
+            do i = 1, n
+               v(i) = a(i - k, i)
+            end do
+         end if
+      end function diagonal_complex_2d
 
       pure function cumsum_int(x) result(y)
          integer, intent(in) :: x(:)
@@ -12795,6 +12850,38 @@ contains
          end if
       end function np_polydiv
 
+      pure function np_polydiv_complex(u, v, part) result(res)
+         ! np.polydiv(u, v)[part] of complex polynomials: the quotient (part 0) or the remainder
+         ! (part 1), with numpy's algorithm (leading remainder terms close to
+         ! zero, allclose with rtol 1e-14, are dropped).
+         complex(kind=dp), intent(in) :: u(:), v(:)
+         integer, intent(in) :: part
+         complex(kind=dp), allocatable :: res(:), q(:), r(:)
+         complex(kind=dp) :: scale, d
+         integer :: m, n, k
+         m = size(u) - 1
+         n = size(v) - 1
+         if (n < 0) error stop "np.polydiv: the divisor is empty"
+         if (v(1) == (0.0_dp, 0.0_dp)) error stop "np.polydiv: the divisor's leading coefficient is zero"
+         scale = (1.0_dp, 0.0_dp) / v(1)
+         allocate(q(max(m - n + 1, 1)), source=(0.0_dp, 0.0_dp))
+         r = u
+         do k = 1, m - n + 1
+            d = scale * r(k)
+            q(k) = d
+            r(k:k + n) = r(k:k + n) - d * v
+         end do
+         do while (size(r) > 1)
+            if (abs(r(1)) > 1.0e-8_dp) exit   ! numpy: allclose(r[0], 0, rtol=1e-14)
+            r = r(2:)
+         end do
+         if (part == 0) then
+            res = q
+         else
+            res = r
+         end if
+      end function np_polydiv_complex
+
       pure function np_polyint(p, m, k) result(y)
          ! np.polyint(p, m, k): m antiderivatives, integration constants k
          ! (a scalar for all, or one per integration; default 0).
@@ -14630,9 +14717,13 @@ contains
          end do
       end function corrcoef_matrix_rows_real
 
-      function convolve_real(x, h, mode) result(y)
+      function convolve_real(x, h, mode, np_same) result(y)
+         ! 1-D convolution, mode full/same/valid. "same": the length of x,
+         ! centered (scipy.signal.convolve), or with np_same numpy's
+         ! np.convolve: the longer length, from (min(nx, nh) - 1) / 2.
          real(kind=dp), intent(in) :: x(:), h(:)
          character(len=*), intent(in), optional :: mode
+         logical, intent(in), optional :: np_same
          real(kind=dp), allocatable :: y(:), full(:)
          integer :: i, j, nx, nh, ny, start, stop
          character(len=:), allocatable :: m
@@ -14657,7 +14748,13 @@ contains
          end if
          if (m == "same") then
             ny = nx
-            start = nh / 2 + 1
+            start = (nh - 1) / 2 + 1
+            if (present(np_same)) then
+               if (np_same) then
+                  ny = max(nx, nh)
+                  start = (min(nx, nh) - 1) / 2 + 1
+               end if
+            end if
             stop = start + ny - 1
             y = full(start:stop)
             return
@@ -14718,9 +14815,13 @@ contains
       end function sliding_window_view_axis0_real_2d
 
 
-      function convolve_int(x, h, mode) result(y)
+      function convolve_int(x, h, mode, np_same) result(y)
+         ! 1-D convolution, mode full/same/valid. "same": the length of x,
+         ! centered (scipy.signal.convolve), or with np_same numpy's
+         ! np.convolve: the longer length, from (min(nx, nh) - 1) / 2.
          integer, intent(in) :: x(:), h(:)
          character(len=*), intent(in), optional :: mode
+         logical, intent(in), optional :: np_same
          integer, allocatable :: y(:), full(:)
          integer :: i, j, nx, nh, ny, start, stop
          character(len=:), allocatable :: m
@@ -14745,7 +14846,13 @@ contains
          end if
          if (m == "same") then
             ny = nx
-            start = nh / 2 + 1
+            start = (nh - 1) / 2 + 1
+            if (present(np_same)) then
+               if (np_same) then
+                  ny = max(nx, nh)
+                  start = (min(nx, nh) - 1) / 2 + 1
+               end if
+            end if
             stop = start + ny - 1
             y = full(start:stop)
             return
@@ -14764,12 +14871,30 @@ contains
          y = full
       end function convolve_int
 
-      function correlate_real(x, y, mode) result(out)
+      function correlate_real(x, y, mode, np_same) result(out)
          ! scipy.signal.correlate(x, y) = convolve(x, conj(y[::-1])) for
-         ! real inputs -- reuse convolve_real with y time-reversed.
+         ! real inputs -- reuse convolve_real with y time-reversed. "same"
+         ! with np_same: np.correlate's, the longer length, from
+         ! (k - 1) / 2 of the full correlation (k / 2 when x is the
+         ! shorter, k = min(nx, ny)).
          real(kind=dp), intent(in) :: x(:), y(:)
          character(len=*), intent(in), optional :: mode
-         real(kind=dp), allocatable :: out(:)
+         logical, intent(in), optional :: np_same
+         real(kind=dp), allocatable :: out(:), full(:)
+         integer :: k, start
+         logical :: nps
+         nps = .false.
+         if (present(np_same)) nps = np_same
+         if (present(mode) .and. nps .and. size(x) > 0 .and. size(y) > 0) then
+            if (to_lower(trim(mode)) == "same") then
+               full = convolve_real(x, y(size(y):1:-1))
+               k = min(size(x), size(y))
+               start = (k - 1) / 2
+               if (size(x) < size(y)) start = k / 2
+               out = full(start + 1:start + max(size(x), size(y)))
+               return
+            end if
+         end if
          if (present(mode)) then
             out = convolve_real(x, y(size(y):1:-1), mode)
          else
@@ -14994,6 +15119,30 @@ contains
             y(i) = polyval_real_scalar(p, x(i))
          end do
       end function polyval_real_vec
+
+      pure complex(kind=dp) function polyval_complex_scalar(p, x) result(y)
+         ! np.polyval(p, x) of complex coefficients or a complex x (Horner).
+         complex(kind=dp), intent(in) :: p(:)
+         complex(kind=dp), intent(in) :: x
+         integer :: i
+         y = (0.0_dp, 0.0_dp)
+         if (size(p) <= 0) return
+         y = p(1)
+         do i = 2, size(p)
+            y = y * x + p(i)
+         end do
+      end function polyval_complex_scalar
+
+      pure function polyval_complex_vec(p, x) result(y)
+         complex(kind=dp), intent(in) :: p(:)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), allocatable :: y(:)
+         integer :: i
+         allocate(y(size(x)))
+         do i = 1, size(x)
+            y(i) = polyval_complex_scalar(p, x(i))
+         end do
+      end function polyval_complex_vec
 
       function polyfit_real(x, y, deg) result(coeffs)
          ! Least-squares polynomial fit, matching numpy.polyfit(x, y, deg):
