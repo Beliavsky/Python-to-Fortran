@@ -27431,3 +27431,59 @@ def test_xp2f_ops_probe_broadcast_indexing(tmp_path: Path) -> None:
         'print(r, s, x[...] * 2, r.shape[1], x[:, np.newaxis] - x, c, m[..., 0] if False else 0)\n'
     )]):
         _xp2f_output_matches_numpy(tmp_path, f"xopsb{k}", code)
+
+
+def test_xp2f_mutators_and_flat_indices(tmp_path: Path) -> None:
+    # Silent before: a.ravel(order='F') gave the C-order flattening; np.put
+    # stopped at the shorter of indices and values (numpy repeats values);
+    # np.piecewise let an earlier condition win where conditions overlap
+    # (numpy: the later one); np.copyto of a length-1 row shrank the
+    # target; np.unravel_index parts were real. Also np.put/np.place/
+    # np.putmask/np.put_along_axis/np.fill_diagonal on matrices (C order),
+    # a.flat[i] and a.ravel()[i] writes, vector unravel_index/
+    # ravel_multi_index with order='F', percentile with several q.
+    for k, code in enumerate([(
+        'import numpy as np\n'
+        'mr = np.array([[2.0, 1.0, 0.5], [1.0, 3.0, -1.0]])\n'
+        'x = np.array([0.5, 1.5, -2.0, 3.25])\n'
+        'y1 = mr.copy()\n'
+        'np.put(y1, [1, 4, -1], [9, 8])\n'
+        'y2 = x.copy()\n'
+        'np.put(y2, [0, 2, 3], [7])\n'
+        'y3 = mr.copy()\n'
+        'np.place(y3, y3 > 0.7, [7, 8])\n'
+        'y4 = mr.copy()\n'
+        'np.putmask(y4, y4 > 0.7, [7, 8, 9])\n'
+        'y5 = mr.copy()\n'
+        'y5.flat[4] = 9\n'
+        'y5.ravel()[0] = -9\n'
+        'y6 = np.zeros((5, 2))\n'
+        'np.fill_diagonal(y6, [1, 2, 3], wrap=True)\n'
+        'y7 = np.zeros((2, 3))\n'
+        'np.copyto(y7, x[:1])\n'
+        'y8 = mr.copy()\n'
+        'np.put_along_axis(y8, np.argmax(y8, axis=1)[:, None], 0, axis=1)\n'
+        'print(y1, y2, y3, y4, y5, y6, y7, y8, mr.ravel(order="F"), mr.flatten(order="F"), mr.flat[4])\n'
+    ), (
+        'import numpy as np\n'
+        'mr = np.array([[2.0, 1.0, 0.5], [1.0, 3.0, -1.0]])\n'
+        'i, j = np.unravel_index(mr.argmin(), mr.shape)\n'
+        'r = np.unravel_index([1, 4], (2, 3), order="F")[0]\n'
+        'q = np.ravel_multi_index(([0, 1], [2, 0]), (2, 3), order="F")\n'
+        'f = np.ravel_multi_index(np.nonzero(mr > 0.7), mr.shape)\n'
+        'print(i + 1, j * 2, r, q, f, np.unravel_index(7, (2, 3, 2))[2])\n'
+        'for a, b in np.argwhere(mr > 1):\n'
+        '    print(a, b)\n'
+    ), (
+        'import numpy as np\n'
+        'x = np.array([0.5, 1.5, 2.5, -1.0, 7.0])\n'
+        'xi = np.array([3, 1, -4, 1])\n'
+        'm = np.array([[2.0, np.nan, 0.5], [1.0, 3.0, -1.0], [4.0, 0.0, 2.0]])\n'
+        'lo, hi = np.percentile(x, [5, 95])\n'
+        'print(np.piecewise(x, [x < 1, x < 2], [10, 20, 30]), np.piecewise(xi, [xi < 2], [0.7, lambda t: t * 1.5]))\n'
+        'print(lo, hi, np.percentile(x, [25, 75]), np.nanpercentile(m, [25, 75], axis=0))\n'
+        'print(np.nanquantile(m, [0.1, 0.9]), np.quantile(np.nan_to_num(m), [0.5, 0.75], axis=1))\n'
+        'rg = np.apply_along_axis(lambda v: v.max() - v.min(), 0, m)\n'
+        'print(np.roll(m, (1, 2), axis=(0, 1)), np.tril(x), rg)\n'
+    )]):
+        _xp2f_output_matches_numpy(tmp_path, f"xmut{k}", code)

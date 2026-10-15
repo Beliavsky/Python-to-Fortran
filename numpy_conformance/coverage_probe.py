@@ -163,6 +163,14 @@ KNOWN.update({
 for _a in ("x", "xi", "m", "mr"):
     for _s in (f"r = {_a}.argsort() [ties]", f"r = {_a}.argsort(axis=1) [ties]"):
         KNOWN[_s] = "the order of ties: numpy's default sort is not stable (the translation's is)"
+    for _v in ("base", "int", "ties"):
+        KNOWN[f"r = np.unravel_index(np.argsort({_a}, axis=None), {_a}.shape)[1] [{_v}]"] =             "the order of ties: numpy's default sort is not stable (the translation's is)"
+# A numpy function passed to np.apply_along_axis becomes one wrapper per
+# program: real when real arrays also use it (the probe groups cases).
+for _a in ("m", "mr"):
+    for _f in ("sum", "sort"):
+        for _ax in (0, 1):
+            KNOWN[f"r = np.apply_along_axis(np.{_f}, {_ax}, {_a}) [int]"] =                 "one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)"
 for _n in ("pinv", "qr", "svd", "svdvals"):
     KNOWN[f"np.linalg.{_n}[empty]"] = "empty matrices are not supported (LAPACK reports an illegal argument)"
 for _n in ("fft", "ifft", "rfft", "fftn", "ifftn", "rfftn", "ihfft", "fft2", "ifft2", "rfft2"):

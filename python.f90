@@ -250,8 +250,11 @@ public :: unique_int_inv_counts !@pyapi kind=subroutine args=a:integer(:):intent
 public :: unique_int_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),cnt:integer(:):intent(out) lib=sorting desc="unique values with counts"
 public :: lexsort2_int !@pyapi kind=function ret=integer(:) args=key0:integer(:):intent(in),key1:integer(:):intent(in) lib=sorting desc="lexsort((key0,key1)): sort by key1 then key0, return 0-based indices"
 public :: lexsort2_real !@pyapi kind=function ret=integer(:) args=key0:real(dp)(:):intent(in),key1:real(dp)(:):intent(in) lib=sorting desc="lexsort((key0,key1)) for real keys: sort by key1 then key0, return 0-based indices"
-public :: ravel_multi_index_2d !@pyapi kind=function ret=integer args=rc:integer(:):intent(in),shape:integer(:):intent(in) lib=arrays desc="2D ravel_multi_index"
-public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:intent(in),shape:integer(:):intent(in) lib=arrays desc="2D unravel_index"
+public :: ravel_multi_index_2d !@pyapi kind=function ret=integer args=rc:integer(:):intent(in),shape:integer(:):intent(in),forder:logical:intent(in):optional lib=arrays desc="np.ravel_multi_index(tuple(rc), shape): the flat index (C order, or Fortran order with forder) of a 0-based multi-index"
+public :: ravel_multi_index_vec !@pyapi kind=function ret=integer(:) args=rc:integer(:,:):intent(in),shape:integer(:):intent(in),forder:logical:intent(in):optional lib=arrays desc="np.ravel_multi_index of index arrays, rc(k, :) the k-th coordinates"
+public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:intent(in),shape:integer(:):intent(in),forder:logical:intent(in):optional lib=arrays desc="np.unravel_index(i, shape): the 0-based multi-index of a flat index (C order, or Fortran order with forder)"
+public :: unravel_index_part !@pyapi kind=function ret=integer(:) args=i:integer(:):intent(in),shape:integer(:):intent(in),k:integer:intent(in),forder:logical:intent(in):optional lib=arrays desc="np.unravel_index(i, shape)[k-1]: the k-th coordinate array of a vector of flat indices"
+public :: unravel_index_vec !@pyapi kind=function ret=integer(:,:) args=i:integer(:):intent(in),shape:integer(:):intent(in),forder:logical:intent(in):optional lib=arrays desc="np.unravel_index of a vector of flat indices: row k the k-th coordinate array"
 public :: kron_2d !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),b:integer(:,:):intent(in) lib=linalg desc="2D Kronecker product for integer matrices"
 public :: histogram_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:integer(:):intent(out),edges:real(dp)(:):intent(out) lib=statistics desc="1D histogram with explicit real bin edges"
 public :: histogram_int_edges !@pyapi kind=subroutine args=x:integer(:):intent(in),bins:integer(:):intent(in),h:integer(:):intent(out),edges:integer(:):intent(out) lib=statistics desc="1D histogram with explicit integer bin edges"
@@ -295,6 +298,8 @@ public :: np_polymul !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):in
 public :: np_polydiv !@pyapi kind=function ret=real(dp)(:) args=u:real(dp)(:):intent(in),v:real(dp)(:):intent(in),part:integer:intent(in) lib=polynomial desc="np.polydiv(u, v)[part]: the quotient (part 0) or the remainder (part 1), with numpy's algorithm (leading remainder terms close to zero, allclose with rtol 1e-14, are dropped)"
 public :: np_polyint !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in),k:real(dp)(:):intent(in):optional lib=polynomial desc="np.polyint(p, m, k): m antiderivatives, integration constants k (a scalar for all, or one per integration; default 0)"
 public :: nan_quantile_vec
+public :: nan_quantile_qvec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),q:real(dp)(:):intent(in) lib=statistics desc="np.nanquantile(x, q) of a vector at several probabilities q"
+public :: nan_quantile_axis_2d_q !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),q:real(dp)(:):intent(in),dim:integer:intent(in) lib=statistics desc="np.nanquantile(x, q, axis=dim-1) of a matrix at several probabilities: row k for q(k)"
 public :: nan_quantile_axis_2d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) lib=statistics desc="np.nanquantile(x, q, axis=dim-1) of a matrix"
 public :: powval !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),c:real(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial, lowest degree first) at x (scalar, vector or matrix x)"
 public :: powvander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),deg:integer:intent(in) lib=polynomial desc="np.polynomial.polynomial.polyvander: pseudo-Vandermonde matrix"
@@ -603,6 +608,7 @@ public :: histogram_counts !@pyapi kind=function ret=integer(:) args=x:real(dp)(
 public :: histogram_counts_edges !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),edges:real(dp)(:):intent(in) lib=statistics desc="np.histogram(x, bins=edges)[0]"
 public :: triu !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),k:integer:intent(in):optional lib=arrays desc="np.triu(a, k): zero below diagonal k (generic: triu_real, triu_int)"
 public :: tril !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),k:integer:intent(in):optional lib=arrays desc="np.tril(a, k): zero above diagonal k (generic: tril_real, tril_int)"
+public :: quantile_axis_2d_q !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),q:real(dp)(:):intent(in),dim:integer:intent(in) lib=statistics desc="np.quantile(x, q, axis=dim-1) of a matrix at several probabilities: row k for q(k)"
 public :: quantile_axis_2d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:,:):intent(in),q:real(dp):intent(in),dim:integer:intent(in) lib=statistics desc="np.quantile(x, q, axis) of a matrix: linear quantile of each column (dim=1) or row (dim=2)"
 public :: reversed_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=arrays desc="x[::-1] / np.flip(x) of a vector expression (a function result can't be subscripted in Fortran) (generic: reversed_real_vec, reversed_int_vec, reversed_logical_vec, reversed_complex_vec)"
 public :: reversed_mat !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),dim:integer:intent(in) lib=arrays desc="np.flip(x, axis) of a matrix expression: dim 1 reverses the rows (axis=0), 2 the columns (axis=1), 0 both (axis=None) (generic: reversed_real_mat, reversed_int_mat, reversed_logical_mat, reversed_complex_mat)"
@@ -7268,6 +7274,19 @@ contains
          end if
       end function quantile_axis_2d
 
+      pure function quantile_axis_2d_q(x, q, dim) result(out)
+         ! np.quantile(x, q, axis=dim-1) of a matrix for a vector q: numpy's
+         ! shape (size(q), the other extent), row k for q(k).
+         real(kind=dp), intent(in) :: x(:,:), q(:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:,:)
+         integer :: k
+         allocate(out(size(q), size(x, 3 - dim)))
+         do k = 1, size(q)
+            out(k, :) = quantile_axis_2d(x, q(k), dim)
+         end do
+      end function quantile_axis_2d_q
+
       pure function sorted_real_vec(x) result(y)
          ! np.sort(x) of a vector: a sorted copy.
          real(kind=dp), intent(in) :: x(:)
@@ -7780,22 +7799,94 @@ contains
          end do
       end function lexsort2_real
 
-      pure function ravel_multi_index_2d(rc, shape) result(i)
+      pure function ravel_multi_index_2d(rc, shape, forder) result(i)
+         ! np.ravel_multi_index(tuple(rc), shape): the flat index (C order, or
+         ! Fortran order with forder) of the 0-based multi-index rc.
          integer, intent(in) :: rc(:), shape(:)
-         integer :: i
-         if (size(rc) < 2 .or. size(shape) < 2) error stop 'ravel_multi_index_2d: expected rank-2 inputs'
-         i = rc(1) * shape(2) + rc(2)
+         logical, intent(in), optional :: forder
+         integer :: i, k
+         logical :: f
+         f = .false.
+         if (present(forder)) f = forder
+         if (size(rc) /= size(shape)) error stop 'ravel_multi_index: parameter multi_index must be a sequence of length ndim'
+         do k = 1, size(rc)
+            if (rc(k) < 0 .or. rc(k) >= shape(k)) error stop 'ravel_multi_index: invalid entry in coordinates array'
+         end do
+         i = 0
+         if (f) then
+            do k = size(rc), 1, -1
+               i = i * shape(k) + rc(k)
+            end do
+         else
+            do k = 1, size(rc)
+               i = i * shape(k) + rc(k)
+            end do
+         end if
       end function ravel_multi_index_2d
 
-      pure function unravel_index_2d(i, shape) result(rc)
+      pure function ravel_multi_index_vec(rc, shape, forder) result(i)
+         ! np.ravel_multi_index of index arrays: rc(k, :) holds the k-th
+         ! coordinate of each multi-index.
+         integer, intent(in) :: rc(:,:), shape(:)
+         logical, intent(in), optional :: forder
+         integer :: i(size(rc, 2))
+         integer :: j
+         do j = 1, size(rc, 2)
+            i(j) = ravel_multi_index_2d(rc(:, j), shape, forder)
+         end do
+      end function ravel_multi_index_vec
+
+      pure function unravel_index_2d(i, shape, forder) result(rc)
+         ! np.unravel_index(i, shape): the 0-based multi-index of flat index i
+         ! (C order, or Fortran order with forder).
          integer, intent(in) :: i
          integer, intent(in) :: shape(:)
+         logical, intent(in), optional :: forder
          integer, allocatable :: rc(:)
-         if (size(shape) < 2) error stop 'unravel_index_2d: expected shape rank 2'
-         allocate(rc(1:2))
-         rc(1) = i / shape(2)
-         rc(2) = mod(i, shape(2))
+         integer :: k, r
+         logical :: f
+         f = .false.
+         if (present(forder)) f = forder
+         if (i < 0 .or. i >= product(shape)) error stop 'unravel_index: index is out of bounds for array with size'
+         allocate(rc(size(shape)))
+         r = i
+         if (f) then
+            do k = 1, size(shape)
+               rc(k) = mod(r, shape(k))
+               r = r / shape(k)
+            end do
+         else
+            do k = size(shape), 1, -1
+               rc(k) = mod(r, shape(k))
+               r = r / shape(k)
+            end do
+         end if
       end function unravel_index_2d
+
+      pure function unravel_index_vec(i, shape, forder) result(rc)
+         ! np.unravel_index of a vector of flat indices: rc(k, :) is the
+         ! k-th coordinate array.
+         integer, intent(in) :: i(:), shape(:)
+         logical, intent(in), optional :: forder
+         integer :: rc(size(shape), size(i))
+         integer :: j
+         do j = 1, size(i)
+            rc(:, j) = unravel_index_2d(i(j), shape, forder)
+         end do
+      end function unravel_index_vec
+
+      pure function unravel_index_part(i, shape, k, forder) result(v)
+         ! np.unravel_index(i, shape)[k-1] of a vector of flat indices.
+         integer, intent(in) :: i(:), shape(:), k
+         logical, intent(in), optional :: forder
+         integer :: v(size(i))
+         integer :: j
+         integer, allocatable :: rc(:)
+         do j = 1, size(i)
+            rc = unravel_index_2d(i(j), shape, forder)
+            v(j) = rc(k)
+         end do
+      end function unravel_index_part
 
       pure function kron_2d(a, b) result(k)
          integer, intent(in) :: a(:,:), b(:,:)
@@ -12763,6 +12854,29 @@ contains
             end do
          end if
       end function nan_quantile_axis_2d
+
+      pure function nan_quantile_qvec(x, q) result(v)
+         ! np.nanquantile(x, q) of a vector at each probability of q.
+         real(kind=dp), intent(in) :: x(:), q(:)
+         real(kind=dp) :: v(size(q))
+         integer :: k
+         do k = 1, size(q)
+            v(k) = nan_quantile_vec(x, q(k))
+         end do
+      end function nan_quantile_qvec
+
+      pure function nan_quantile_axis_2d_q(x, q, dim) result(out)
+         ! np.nanquantile(x, q, axis=dim-1) of a matrix for a vector q: numpy's
+         ! shape (size(q), the other extent), row k for q(k).
+         real(kind=dp), intent(in) :: x(:,:), q(:)
+         integer, intent(in) :: dim
+         real(kind=dp), allocatable :: out(:,:)
+         integer :: k
+         allocate(out(size(q), size(x, 3 - dim)))
+         do k = 1, size(q)
+            out(k, :) = nan_quantile_axis_2d(x, q(k), dim)
+         end do
+      end function nan_quantile_axis_2d_q
 
       pure function np_trapezoid_1d(y, dx, x) result(s)
          ! np.trapezoid(y, x=x | dx=dx) of a vector, summed as numpy does:

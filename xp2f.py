@@ -6388,6 +6388,10 @@ def rewrite_function_valued_library_args(tree):
     class _Args(ast.NodeTransformer):
         def visit_Call(self, call):
             self.generic_visit(call)
+            if isinstance(call.func, ast.Name) and call.func.id in {"getattr", "hasattr"}:
+                # getattr(np, "permute_dims", np.transpose): an alias the
+                # translator resolves itself, not a callback.
+                return call
             call.args = [ast.copy_location(ast.Name(id=w, ctx=ast.Load()), a) if (w := wrapper_for(a)) else a
                          for a in call.args]
             for kw in call.keywords:
@@ -7084,6 +7088,12 @@ def rewrite_numpy2_names(tree):
                 node.slice.elts = [fix(e) for e in node.slice.elts]
             else:
                 node.slice = fix(node.slice)
+            if (isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Attribute) and node.value.attr == "flat"
+                    and not isinstance(node.slice, (ast.Slice, ast.Tuple))):
+                # a.flat[i] reads the C-order flattened array: a.ravel()[i].
+                node.value = ast.copy_location(ast.Call(func=ast.Attribute(value=node.value.value, attr="ravel",
+                                                                           ctx=ast.Load()), args=[], keywords=[]),
+                                               node.value)
             if isinstance(node.slice, ast.Constant) and node.slice.value is Ellipsis:
                 node.slice = ast.copy_location(ast.Slice(), node.slice)
             elif isinstance(node.slice, ast.Constant) and node.slice.value is None:
@@ -7111,6 +7121,17 @@ def rewrite_numpy2_names(tree):
             f = node.func
             if not isinstance(f, ast.Attribute):
                 return node
+            order = next((k for k in node.keywords if k.arg == "order"), None)
+            if (f.attr in {"ravel", "flatten"} and order is not None and isinstance(order.value, ast.Constant)
+                    and order.value.value in ("C", "F")):
+                # a.ravel(order='F') is a.T.ravel(): .T reverses the axes.
+                node.keywords = [k for k in node.keywords if k is not order]
+                if order.value.value == "F":
+                    if is_np(f.value) and f.attr == "ravel" and len(node.args) == 1:
+                        node.args = [ast.Attribute(value=node.args[0], attr="T", ctx=ast.Load())]
+                    elif not is_np(f.value):
+                        f.value = ast.Attribute(value=f.value, attr="T", ctx=ast.Load())
+                return node
             if is_np(f.value):
                 if f.attr == "concat":
                     f.attr = "concatenate"
@@ -7130,8 +7151,40 @@ def rewrite_numpy2_names(tree):
                 f.value = f.value.value
             return node
 
+        def visit_Expr(self, node):
+            self.generic_visit(node)
+            c = node.value
+            if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name)
+                    and not is_np(c.func.value) and not c.keywords):
+                if c.func.attr == "put" and len(c.args) == 2:
+                    # a.put(ind, v) is np.put(a, ind, v).
+                    obj = c.func.value
+                    c.func = ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="put", ctx=ast.Load())
+                    c.args = [ast.Name(id=obj.id, ctx=ast.Load())] + list(c.args)
+                elif c.func.attr == "fill" and len(c.args) == 1:
+                    # a.fill(v) is a[...] = v.
+                    return ast.copy_location(ast.Assign(targets=[ast.Subscript(
+                        value=ast.Name(id=c.func.value.id, ctx=ast.Load()), slice=ast.Slice(), ctx=ast.Store())],
+                        value=c.args[0]), node)
+            return node
+
         def visit_Assign(self, node):
             v = node.value
+            tg = node.targets[0] if len(node.targets) == 1 else None
+            ravel_view = (isinstance(tg, ast.Subscript) and isinstance(tg.value, ast.Call)
+                          and isinstance(tg.value.func, ast.Attribute) and tg.value.func.attr == "ravel"
+                          and isinstance(tg.value.func.value, ast.Name) and not tg.value.args
+                          and not tg.value.keywords)
+            if ((ravel_view or isinstance(tg, ast.Subscript) and isinstance(tg.value, ast.Attribute)
+                 and tg.value.attr == "flat")
+                    and not isinstance(tg.slice, (ast.Slice, ast.Tuple))):
+                # a.flat[i] = v and a.ravel()[i] = v (a view of a) are
+                # np.put(a, i, v) (C-order flat indices).
+                self.generic_visit(node)
+                base = tg.value.func.value if ravel_view else tg.value.value
+                call = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="put", ctx=ast.Load()),
+                                args=[base, tg.slice, node.value], keywords=[])
+                return ast.copy_location(ast.Expr(value=call), node)
             if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple)
                     and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and is_np(v.func.value)
                     and v.func.attr == "broadcast_arrays" and len(v.args) == len(node.targets[0].elts)):
@@ -7163,8 +7216,10 @@ def rewrite_numpy2_names(tree):
     if not any((isinstance(n, ast.Attribute) and n.attr == "newaxis")
                or (isinstance(n, ast.Constant) and n.value is Ellipsis)
                or (isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and n.slice.value is None)
+               or (isinstance(n, ast.keyword) and n.arg == "order")
                or isinstance(n, ast.Attribute) and n.attr in {"concat", "permute_dims", "matrix_transpose", "astype",
-                                                            "matmul", "tensordot", "unique", "broadcast_arrays"}
+                                                            "matmul", "tensordot", "unique", "broadcast_arrays",
+                                                            "flat", "put", "fill", "ravel"}
                                                             | set(_UNIQUE_FAMILY)
                for n in ast.walk(tree)):
         return tree
@@ -7193,6 +7248,19 @@ def rewrite_two_result_numpy_unpack(tree):
                           and v.func.value.id in ("np", "numpy"))
                          or (_is_np_polynomial_attr(v.func) and v.func.attr != "leggauss"
                              and (v.func.attr.endswith("div") or v.func.attr.endswith("gauss"))))):
+                tg = [e.id for e in st.targets[0].elts]
+                used = {n.id for n in ast.walk(v) if isinstance(n, ast.Name)}
+                if not (set(tg) & used):
+                    for k, nm in enumerate(tg):
+                        sub = ast.Subscript(value=copy.deepcopy(v), slice=ast.Constant(value=k), ctx=ast.Load())
+                        out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=sub), st))
+                    continue
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                    and all(isinstance(e, ast.Name) for e in st.targets[0].elts)
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "unravel_index" and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id in ("np", "numpy")):
+                # i, j = np.unravel_index(k, shape): one indexed call each.
                 tg = [e.id for e in st.targets[0].elts]
                 used = {n.id for n in ast.walk(v) if isinstance(n, ast.Name)}
                 if not (set(tg) & used):
@@ -10467,7 +10535,7 @@ def simplify_size_dim_for_rank1_arrays(src_text):
             j += 1
         if j >= n:
             break
-        rank1 = set()
+        rank1, other = set(), set()
         for k in range(i, j + 1):
             m = decl_re.search(lines[k])
             if not m:
@@ -10476,6 +10544,13 @@ def simplify_size_dim_for_rank1_arrays(src_text):
                 mm = re.match(r"^\s*([A-Za-z_]\w*)\s*\(\s*:\s*\)\s*$", part)
                 if mm:
                     rank1.add(mm.group(1))
+                else:
+                    mo = re.match(r"^\s*([A-Za-z_]\w*)", part)
+                    if mo:
+                        other.add(mo.group(1))
+        # A name declared again in a block with another rank is not rank 1
+        # everywhere in the unit.
+        rank1 -= other
         if rank1:
             for k in range(i, j + 1):
                 ln = out[k]
@@ -17167,9 +17242,9 @@ def detect_needed_helpers(tree):
         "diag": {"diag", "diag_k"},
         "triu": {"triu"},
         "tril": {"tril"},
-        "quantile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
-        "median": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
-        "percentile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d"},
+        "quantile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d", "quantile_axis_2d_q"},
+        "median": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d", "quantile_axis_2d_q"},
+        "percentile": {"quantile_linear", "quantile_linear_vec", "quantile_axis_2d", "quantile_axis_3d", "quantile_axis_2d_q"},
         "diagonal": {"diagonal"},
         "einsum": {"diagonal"},
         "repeat": {
@@ -17192,8 +17267,8 @@ def detect_needed_helpers(tree):
         "setdiff1d": {"setdiff1d_int"},
         "intersect1d": {"intersect1d_int"},
         "lexsort": {"lexsort_keys", "lexsort2_int", "lexsort2_real"},
-        "ravel_multi_index": {"ravel_multi_index_2d"},
-        "unravel_index": {"unravel_index_2d"},
+        "ravel_multi_index": {"ravel_multi_index_2d", "ravel_multi_index_vec"},
+        "unravel_index": {"unravel_index_2d", "unravel_index_vec", "unravel_index_part"},
         "kron": {"kron_2d", "np_kron2"},
         "cross": {"np_cross3"},
         "mean": {"mean"},
@@ -17224,7 +17299,7 @@ def detect_needed_helpers(tree):
         "flip": {"reversed_vec", "reversed_mat"},
         "argsort": {"argsort", "argsort_idx", "argsort_2d"},
         "flatnonzero": {"arange_int"},
-        "argwhere": {"arange_int"},
+        "argwhere": {"arange_int", "where_indices_2d"},
         "where": {"arange_int", "where_indices_2d", "where_axis_2d", "gather_where2d", "where_pair_2d"},
         "union1d": {"unique_int"},
         "tri": {"tri_int", "tri_real"},
@@ -32056,8 +32131,9 @@ class translator(ast.NodeVisitor):
         if attr == "repeat" and len(args) == 2 and not kws and int(self._rank_expr(args[0]) or 0) == 2:
             # No axis: the flattened array (in C order) repeated.
             return call("repeat", [call("ravel", [args[0]]), args[1]])
-        if attr in {"conj", "conjugate"} and len(args) == 1 and not kws                 and self._expr_kind(args[0]) in {"int", "real", "logical"}:
-            # The conjugate of a non-complex array is the array.
+        if attr in {"conj", "conjugate"} and len(args) == 1 and not kws                 and self._expr_kind(args[0]) in {"int", "real"}:
+            # The conjugate of a non-complex array is the array (of a
+            # boolean one, an int8 array: left to the conj codegen).
             return call("copy", args)
         if attr == "asanyarray":
             return call("asarray", args, kws)
@@ -32536,6 +32612,14 @@ class translator(ast.NodeVisitor):
         ):
             # lstsq(...)[0] solution, [1] residuals, [3] singular values: float.
             return "real"
+        if (
+            isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute) and is_numpy_name_node(node.value.func.value)
+            and node.value.func.attr in {"unravel_index", "nonzero", "tril_indices", "triu_indices", "diag_indices",
+                                         "tril_indices_from", "triu_indices_from", "diag_indices_from"}
+        ):
+            # A part of a tuple of index arrays.
+            return "int"
         if (
             isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and is_numpy_name_node(node.func.value) and node.func.attr == "append" and len(node.args) >= 2
@@ -33499,6 +33583,9 @@ class translator(ast.NodeVisitor):
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"select", "piecewise"}
             ):
+                if node.func.attr == "piecewise" and node.args and self._expr_kind(node.args[0]) == "int":
+                    # numpy's result has x's dtype.
+                    return "int"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -33506,7 +33593,9 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "apply_along_axis"
                 and len(node.args) >= 3
             ):
-                return "real"
+                _one = self._apply_along_axis_one(node)
+                _k = self._expr_kind(_one) if _one is not None else None
+                return _k if _k in ("int", "logical", "complex") else "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -38226,7 +38315,7 @@ class translator(ast.NodeVisitor):
             if _attr == "quantile" and len(node.args) >= 2:
                 _has_axis = len(node.args) >= 3 or any(kw.arg == "axis" for kw in node.keywords)
                 if _has_axis and int(self._rank_expr(node.args[0]) or 0) >= 2:
-                    return int(self._rank_expr(node.args[0])) - 1
+                    return int(self._rank_expr(node.args[0])) - (int(self._rank_expr(node.args[1]) or 0) == 0)
                 return 1 if int(self._rank_expr(node.args[1]) or 0) >= 1 else 0
             if _attr in {"triu", "tril"} and node.args:
                 return 2
@@ -39300,7 +39389,9 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "load" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "apply_along_axis" and len(node.args) >= 3:
-                    return max(0, self._rank_expr(node.args[2]) - 1)
+                    _one = self._apply_along_axis_one(node)
+                    _r1 = int(self._rank_expr(_one) or 0) if _one is not None else 0
+                    return max(0, self._rank_expr(node.args[2]) - 1) + _r1
                 if node.func.attr == "select" and len(node.args) >= 2 and isinstance(node.args[1], (ast.List, ast.Tuple)) and node.args[1].elts:
                     return self._rank_expr(node.args[1].elts[0])
                 if node.func.attr == "piecewise" and len(node.args) >= 1:
@@ -39366,12 +39457,13 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"trapezoid", "trapz"} and len(node.args) >= 1:
                     return 0
                 if node.func.attr == "ravel_multi_index" and len(node.args) >= 1:
-                    return 0
+                    parts = self._multi_index_parts(node)
+                    return 1 if parts and any(int(self._rank_expr(p) or 0) >= 1 for p in parts) else 0
                 if node.func.attr == "argwhere" and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
                     return 2 if r0 <= 1 else r0
                 if node.func.attr == "unravel_index" and len(node.args) >= 2:
-                    return 1
+                    return 2 if int(self._rank_expr(node.args[0]) or 0) >= 1 else 1
                 if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "atan", "asin", "acos", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh", "angle", "real", "imag", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor", "degrees", "radians", "deg2rad", "rad2deg", "exp2", "cbrt", "square", "reciprocal", "positive", "negative", "unwrap", "cumulative_sum", "cumulative_prod", "bitwise_count", "nancumsum", "nancumprod", "ediff1d", "expm1", "log1p", "sinc", "i0", "signbit", "spacing", "asarray_chkfinite", "amax", "amin", "nan_to_num", "real_if_close", "interp"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"logaddexp", "logaddexp2", "ldexp", "nextafter", "gcd", "lcm", "add", "subtract", "multiply", "divide", "true_divide", "power", "pow", "float_power", "fmod", "remainder", "fmax", "fmin", "heaviside"} and len(node.args) >= 2:
@@ -40181,6 +40273,25 @@ class translator(ast.NodeVisitor):
     def expr(self, node):
         validate_numpy_atleast_call(node)
         self._normalize_negative_axis(node)
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute) and is_numpy_name_node(node.value.func.value)
+                and node.value.func.attr == "unravel_index" and len(node.value.args) >= 2
+                and int(self._rank_expr(node.value.args[0]) or 0) >= 1
+                and _signed_int_constant(node.slice) is not None):
+            # np.unravel_index(indices, shape)[k]: the k-th coordinate array.
+            call = node.value
+            k = _signed_int_constant(node.slice)
+            nd = self._shape_ndim(call.args[1])
+            if k < 0:
+                if nd is None:
+                    raise NotImplementedError("np.unravel_index(...)[k] needs k >= 0 for this shape")
+                k += nd
+            idx = self.expr(call.args[0])
+            r = int(self._rank_expr(call.args[0]))
+            if r > 1:
+                idx = self._flat_1d(idx, r)
+            return (f"unravel_index_part({idx}, {self.expr(call.args[1])}, {k + 1}"
+                    f"{self._flat_order_arg(call, 'unravel_index')})")
         _mg = self._meshgrid_part(node)
         if _mg is not None:
             vals, other, dim, _ = _mg
@@ -40211,6 +40322,9 @@ class translator(ast.NodeVisitor):
             a0 = self.expr(node.args[0])
             if self._expr_kind(node.args[0]) == "logical":
                 a0 = f"merge(1, 0, {a0})"
+            if int(self._rank_expr(node.args[0]) or 0) == 1:
+                # numpy takes a vector as the rows of a square matrix.
+                a0 = f"spread({a0}, 1, size({a0}))"
             k_txt = "" if k_node is None else f", int({self.expr(k_node)})"
             return f"{node.func.attr}({a0}{k_txt})"
         _ix = self._ix_parts(node)
@@ -45363,7 +45477,9 @@ class translator(ast.NodeVisitor):
                             and 0 <= axis_node.value < _r0):
                         raise NotImplementedError("np.quantile/np.median needs a constant axis")
                     if int(self._rank_expr(node.args[1])) >= 1:
-                        raise NotImplementedError("np.quantile with an axis takes one quantile")
+                        if _r0 != 2:
+                            raise NotImplementedError("np.quantile with an axis and several quantiles supports a matrix")
+                        return f"quantile_axis_2d_q({a0}, {q0}, {int(axis_node.value) + 1})"
                     return f"quantile_axis_{_r0}d({a0}, {q0}, {int(axis_node.value) + 1})"
                 if int(self._rank_expr(node.args[1])) >= 1:
                     return f"quantile_linear_vec({self._flat_1d(a0, self._rank_expr(node.args[0]))}, {q0})"
@@ -46188,29 +46304,73 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "piecewise"
                 and len(node.args) >= 3
             ):
-                # np.piecewise(x, condlist, funclist): same merge-chain
-                # idea as np.select, but each "choice" is func(x) for a
-                # local function referenced by name in funclist (a
-                # literal list at the call site) -- relies on
-                # local_elemental_funcs already allowing an elemental
-                # local function to be called directly on an array
-                # argument. The condlist/funclist-length-plus-one
-                # "trailing default value/function" numpy form is not
-                # handled.
+                # np.piecewise(x, condlist, funclist): numpy starts from
+                # zeros of x's dtype and, for each condition in order, sets
+                # out[cond] = f(x[cond]) -- a later condition wins where
+                # they overlap; a funclist one longer than condlist gives
+                # the value where no condition holds. An entry is a function
+                # name (an elemental local function), a one-argument lambda
+                # (inlined) or a constant. Built as a merge() chain, each
+                # entry evaluated on all of x.
                 _x_node = node.args[0]
                 _condlist = node.args[1]
                 _funclist = node.args[2]
-                if not (isinstance(_condlist, (ast.List, ast.Tuple)) and isinstance(_funclist, (ast.List, ast.Tuple))):
-                    raise NotImplementedError("np.piecewise currently requires condlist and funclist as literal lists at the call site")
-                if len(_condlist.elts) != len(_funclist.elts) or not _condlist.elts:
-                    raise NotImplementedError("np.piecewise currently requires condlist and funclist of the same non-zero length (no trailing default)")
-                for _fn in _funclist.elts:
-                    if not isinstance(_fn, ast.Name):
-                        raise NotImplementedError("np.piecewise funclist entries must be plain function names")
+                if node.keywords or len(node.args) > 3:
+                    raise NotImplementedError("np.piecewise: extra arguments for the functions are not supported")
+                if not isinstance(_condlist, (ast.List, ast.Tuple)) or not _condlist.elts:
+                    if int(self._rank_expr(_condlist) or 0) >= 1 and self._expr_kind(_condlist) == "logical":
+                        # A single boolean array is one condition.
+                        _condlist = ast.List(elts=[_condlist], ctx=ast.Load())
+                    else:
+                        raise NotImplementedError("np.piecewise currently requires condlist as a literal list at the call site")
+                if not isinstance(_funclist, (ast.List, ast.Tuple)):
+                    raise NotImplementedError("np.piecewise currently requires funclist as a literal list at the call site")
+                _nc, _nf = len(_condlist.elts), len(_funclist.elts)
+                if _nf not in (_nc, _nc + 1):
+                    raise NotImplementedError("np.piecewise: funclist must have one entry per condition, or one more")
                 _x_txt = self.expr(_x_node)
-                _result = "0.0_dp"
-                for _cond, _fn in zip(reversed(_condlist.elts), reversed(_funclist.elts)):
-                    _result = f"merge({_fn.id}({_x_txt}), {_result}, {self.expr(_cond)})"
+                _xk = self._expr_kind(_x_node)
+                if _xk not in ("int", "real"):
+                    raise NotImplementedError("np.piecewise supports integer and real arrays")
+
+                def _as_x_kind(_n):
+                    _txt = self.expr(_n)
+                    _k = self._expr_kind(_n)
+                    if _xk == "int" and _k == "real":
+                        return f"int({_txt})"
+                    if _xk == "real" and _k != "real":
+                        return f"real({_txt}, kind=dp)"
+                    return _txt
+
+                def _value(_fn):
+                    if isinstance(_fn, ast.Lambda):
+                        _body = _subst_lambda_expr_body(_fn, ast.Call(func=_fn, args=[_x_node], keywords=[]))
+                        if _body is None or len(_fn.args.args) != 1:
+                            raise NotImplementedError("np.piecewise: a lambda must take one argument")
+                        return _as_x_kind(_body)
+                    if isinstance(_fn, ast.Name) and _fn.id in self.local_elemental_funcs:
+                        return _as_x_kind(ast.Call(func=_fn, args=[_x_node], keywords=[]))
+                    if isinstance(_fn, ast.Name) and _fn.id not in self.local_elemental_funcs \
+                            and int(self._rank_expr(_fn) or 0) == 0 and self._expr_kind(_fn) in ("int", "real"):
+                        return _as_x_kind(_fn)
+                    if isinstance(_fn, ast.Name):
+                        return _as_x_kind(ast.Call(func=_fn, args=[_x_node], keywords=[]))
+                    if int(self._rank_expr(_fn) or 0) == 0:
+                        return _as_x_kind(_fn)
+                    raise NotImplementedError("np.piecewise funclist entries must be functions, lambdas or scalars")
+
+                _conds = [self.expr(c) if self._expr_kind(c) == "logical" else f"({self.expr(c)} /= 0)"
+                          for c in _condlist.elts]
+                _zero = "0" if _xk == "int" else "0.0_dp"
+                # A start shaped like x: zeros (not 0 * x, which is NaN at
+                # NaN and inf), or the default where no condition holds.
+                _decl = "integer" if _xk == "int" else "real(kind=dp)"
+                _result = f"reshape([{_decl} ::], shape({_x_txt}), pad=[{_zero}])"
+                if _nf == _nc + 1:
+                    _none = " .or. ".join(f"({c})" for c in _conds)
+                    _result = f"merge({_value(_funclist.elts[-1])}, {_result}, .not. ({_none}))"
+                for _cond, _fn in zip(_conds, _funclist.elts[:_nc]):
+                    _result = f"merge({_value(_fn)}, {_result}, {_cond})"
                 return _result
             if (
                 isinstance(node.func, ast.Attribute)
@@ -47782,6 +47942,11 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 mask = a0 if self._expr_kind(node.args[0]) == "logical" else f"({a0} /= 0)"
+                if int(self._rank_expr(node.args[0]) or 0) == 2:
+                    # One row (i, j) per true element, in C order.
+                    return f"transpose(where_indices_2d({mask}))"
+                if int(self._rank_expr(node.args[0]) or 0) > 2:
+                    raise NotImplementedError("np.argwhere supports vectors and matrices")
                 return f"reshape(pack(arange_int(int(0), int(size({a0})), int(1)), {mask}), [count({mask}), 1])"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -47849,7 +48014,7 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "ravel_multi_index"
                 and len(node.args) >= 2
             ):
-                return f"ravel_multi_index_2d({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                return self._np_ravel_multi_index(node)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -47857,7 +48022,7 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "unravel_index"
                 and len(node.args) >= 2
             ):
-                return f"unravel_index_2d(int({self.expr(node.args[0])}), {self.expr(node.args[1])})"
+                return self._np_unravel_index(node)
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "reduceat"
@@ -47955,8 +48120,28 @@ class translator(ast.NodeVisitor):
                         axis_node = kw.value
                 if sh_node is None:
                     raise NotImplementedError("np.roll needs a shift")
-                if isinstance(sh_node, (ast.Tuple, ast.List)):
-                    raise NotImplementedError("np.roll with several shifts is not supported")
+                if isinstance(sh_node, (ast.Tuple, ast.List)) or isinstance(axis_node, (ast.Tuple, ast.List)):
+                    # np.roll(a, (s0, s1), axis=(a0, a1)): one roll per axis (a
+                    # scalar shift or axis is broadcast against the other).
+                    shs = list(sh_node.elts) if isinstance(sh_node, (ast.Tuple, ast.List)) else None
+                    axs = list(axis_node.elts) if isinstance(axis_node, (ast.Tuple, ast.List)) else None
+                    if axs is None and axis_node is not None:
+                        axs = [axis_node] * len(shs)
+                    if axs is None:
+                        raise NotImplementedError("np.roll with several shifts needs an axis for each")
+                    if shs is None:
+                        shs = [sh_node] * len(axs)
+                    if len(shs) != len(axs):
+                        raise NotImplementedError("np.roll: shift and axis must have the same length")
+                    txt = a0
+                    for s, ax_n in zip(shs, axs):
+                        ax = _signed_int_constant(ax_n)
+                        if ax is None:
+                            raise NotImplementedError("np.roll axis must be a constant integer")
+                        if ax < 0:
+                            ax += max(1, r0)
+                        txt = f"cshift({txt}, -int({self.expr(s)}), dim={ax + 1})"
+                    return txt
                 # np.roll(x, k) moves elements k places forward: CSHIFT by -k.
                 sh = f"-int({self.expr(sh_node)})"
                 if axis_node is None or (isinstance(axis_node, ast.Constant) and axis_node.value is None):
@@ -50715,7 +50900,7 @@ class translator(ast.NodeVisitor):
                 ):
                     _lhs_elts = list(_m.targets[0].elts)
                     _attr = _m.value.func.attr
-                    if _attr == "quantile":
+                    if _attr in {"quantile", "percentile", "nanquantile", "nanpercentile"}:
                         for _e in _lhs_elts:
                             if isinstance(_e, ast.Name):
                                 self._mark_real(_e.id)
@@ -54837,6 +55022,25 @@ class translator(ast.NodeVisitor):
                         self._mark_int(tnm)
                 elif (
                     isinstance(node.target, (ast.Tuple, ast.List))
+                    and all(isinstance(t, ast.Name) for t in node.target.elts)
+                    and not isinstance(node.iter, (ast.List, ast.Tuple))
+                    and int(self._rank_expr(node.iter) or 0) == 2
+                ):
+                    # for a, b in matrix: one scalar per column of each row.
+                    kk = self._expr_kind(node.iter)
+                    for tnm in node.target.elts:
+                        if tnm.id == "_":
+                            continue
+                        if kk == "real":
+                            self._mark_real(tnm.id)
+                        elif kk == "logical":
+                            self._mark_log(tnm.id)
+                        elif kk == "complex":
+                            self._mark_complex(tnm.id)
+                        else:
+                            self._mark_int(tnm.id)
+                elif (
+                    isinstance(node.target, (ast.Tuple, ast.List))
                     and (
                         isinstance(node.iter, (ast.List, ast.Tuple))
                         or (isinstance(node.iter, ast.Name) and node.iter.id in self.tuple_loop_literals)
@@ -57439,7 +57643,16 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{rn} = abs({z0})")
             self.o.w(f"{tn} = atan2(aimag({z0}), real({z0}, kind=dp))")
             return
-        # tuple unpacking from np.quantile(x, [q0, q1, ...])
+        # tuple unpacking from np.quantile(x, [q0, q1, ...]) (and
+        # np.percentile, rewritten to np.quantile(x, np.asarray([...]) / 100.0))
+        def _quantile_list(q):
+            if isinstance(q, (ast.Tuple, ast.List)):
+                return list(q.elts)
+            if (isinstance(q, ast.BinOp) and isinstance(q.op, ast.Div) and isinstance(q.left, ast.Call)
+                    and isinstance(q.left.func, ast.Attribute) and q.left.func.attr == "asarray"
+                    and len(q.left.args) == 1 and isinstance(q.left.args[0], (ast.Tuple, ast.List))):
+                return [ast.BinOp(left=e, op=ast.Div(), right=q.right) for e in q.left.args[0].elts]
+            return None
         if (
             isinstance(t, (ast.Tuple, ast.List))
             and isinstance(v, ast.Call)
@@ -57447,10 +57660,11 @@ class translator(ast.NodeVisitor):
             and isinstance(v.func.value, ast.Name)
             and v.func.value.id == "np"
             and v.func.attr == "quantile"
-            and len(v.args) >= 2
-            and isinstance(v.args[1], (ast.Tuple, ast.List))
+            and len(v.args) == 2
+            and not v.keywords
+            and _quantile_list(v.args[1]) is not None
         ):
-            qelts = list(v.args[1].elts)
+            qelts = _quantile_list(v.args[1])
             if len(t.elts) != len(qelts):
                 raise NotImplementedError("np.quantile tuple unpack requires the same number of targets and quantiles")
             a0 = self.expr(v.args[0])
@@ -59629,23 +59843,44 @@ class translator(ast.NodeVisitor):
             and v.func.attr == "apply_along_axis"
             and len(v.args) >= 3
         ):
-            _func_node, _axis_node, _arr_node = v.args[0], v.args[1], v.args[2]
-            if not isinstance(_func_node, ast.Name):
-                raise NotImplementedError("np.apply_along_axis currently requires a plain function name")
-            if not (isinstance(_axis_node, ast.Constant) and isinstance(_axis_node.value, int) and _axis_node.value in (0, 1)):
-                raise NotImplementedError("np.apply_along_axis currently requires a literal axis of 0 or 1")
+            # numpy: func(slice) for each slice along axis; a scalar result
+            # makes a vector, a vector result one row (axis=1) or column
+            # (axis=0) per slice.
+            _axis_node, _arr_node = v.args[1], v.args[2]
+            if int(self._rank_expr(_arr_node) or 0) != 2:
+                raise NotImplementedError("np.apply_along_axis currently supports a matrix")
+            _one = self._apply_along_axis_one(v)
+            if _one is None:
+                raise NotImplementedError("np.apply_along_axis currently requires a function name, a numpy "
+                                          "function or a one-argument lambda, and a literal axis")
+            _ax = _signed_int_constant(_axis_node) % 2
             _name = self._aliased_name(t.id)
             _arr_txt = self.expr(_arr_node)
-            _n_txt = f"size({_arr_txt}, 1)" if _axis_node.value == 1 else f"size({_arr_txt}, 2)"
-            _slice_txt = f"{_arr_txt}(i_apply_axis, :)" if _axis_node.value == 1 else f"{_arr_txt}(:, i_apply_axis)"
+            _n_txt = f"size({_arr_txt},1)" if _ax == 1 else f"size({_arr_txt},2)"
+            _k = self._expr_kind(v)
+            _one_txt = self.expr(_one)
+            _one_k = self._expr_kind(_one)
+            if _k == "real" and _one_k in ("int", "logical"):
+                _one_txt = f"real({_one_txt}, kind=dp)" if _one_k == "int" else f"merge(1.0_dp, 0.0_dp, {_one_txt})"
+            _vec = int(self._rank_expr(_one) or 0) == 1
             self.o.w("block")
             self.o.push()
             self.o.w("integer :: i_apply_axis")
+            if _vec:
+                _decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(_k, "real(kind=dp)")
+                self.o.w(f"{_decl}, allocatable :: v_apply_axis(:)")
             self.o.w(f"if (allocated({_name})) deallocate({_name})")
-            self.o.w(f"allocate({_name}(1:{_n_txt}))")
-            self.o.w(f"do i_apply_axis = 1, {_n_txt}")
+            if not _vec:
+                self.o.w(f"allocate({_name}(1:{_n_txt}))")
+            self.o.w(f"do i_apply_axis = 0, {_n_txt} - 1")
             self.o.push()
-            self.o.w(f"{_name}(i_apply_axis) = {_func_node.id}({_slice_txt})")
+            if _vec:
+                self.o.w(f"v_apply_axis = {_one_txt}")
+                self.o.w(f"if (.not. allocated({_name})) allocate({_name}("
+                         + (f"{_n_txt}, size(v_apply_axis)" if _ax == 1 else f"size(v_apply_axis), {_n_txt}") + "))")
+                self.o.w(f"{_name}({'i_apply_axis + 1, :' if _ax == 1 else ':, i_apply_axis + 1'}) = v_apply_axis")
+            else:
+                self.o.w(f"{_name}(i_apply_axis + 1) = {_one_txt}")
             self.o.pop()
             self.o.w("end do")
             self.o.pop()
@@ -61637,6 +61872,7 @@ class translator(ast.NodeVisitor):
             and v.func.value.id == "np"
             and v.func.attr in {"triu", "tril"}
             and len(v.args) >= 1
+            and int(self._rank_expr(v.args[0]) or 0) != 1
         ):
             name = t.id
             a0 = self.expr(v.args[0])
@@ -62787,7 +63023,8 @@ class translator(ast.NodeVisitor):
                             "unpackbits"}
     _B1_HELPERS = {"np_packbits", "np_unpackbits", "np_window", "i0_scalar", "np_poly_roots", "np_polyadd", "np_polyadd_real", "np_polyadd_int",
                    "np_polymul", "np_polymul_real", "np_polymul_int", "np_polydiv", "np_polyint",
-                   "nan_quantile_vec", "nan_quantile_axis_2d", "quantile_linear", "sort_vec"}
+                   "nan_quantile_vec", "nan_quantile_axis_2d", "nan_quantile_qvec", "nan_quantile_axis_2d_q",
+                   "quantile_axis_2d", "quantile_linear", "sort_vec"}
 
     def _b1_call(self, node):
         """(name, call) of a batch-1 numpy call (np.x / np.fft.x)."""
@@ -63139,7 +63376,7 @@ class translator(ast.NodeVisitor):
             q = call.args[1] if name != "nanmedian" and len(call.args) > 1 else self._np_kw(call, "q", None)
             if ax is None or (isinstance(ax, ast.Constant) and ax.value is None):
                 return ("real", int(self._rank_expr(q) or 0) if q is not None else 0)
-            return ("real", 1)
+            return ("real", 1 + (q is not None and int(self._rank_expr(q) or 0) >= 1))
         return None
 
     def _numerics_batch1(self, node):
@@ -63333,16 +63570,98 @@ class translator(ast.NodeVisitor):
                 q_txt = real_txt(q_node)
                 if name == "nanpercentile":
                     q_txt = f"({q_txt} / 100.0_dp)"
-            if q_node is not None and int(self._rank_expr(q_node) or 0) != 0:
-                raise NotImplementedError(f"np.{name}: q must be a scalar")
+            qvec = q_node is not None and int(self._rank_expr(q_node) or 0) >= 1
+            if q_node is not None and int(self._rank_expr(q_node) or 0) > 1:
+                raise NotImplementedError(f"np.{name}: q must be a scalar or a vector")
             if ax is None or (isinstance(ax, ast.Constant) and ax.value is None):
                 flat = self._flat_1d(real_txt(x), r) if r > 1 else real_txt(x)
-                return f"nan_quantile_vec({flat}, {q_txt})"
+                return f"nan_quantile_{'q' if qvec else ''}vec({flat}, {q_txt})"
             axv = int_const(ax)
             if r != 2 or axv is None:
                 raise NotImplementedError(f"np.{name} with axis= supports a matrix and a literal axis")
-            return f"nan_quantile_axis_2d({real_txt(x)}, {q_txt}, {axv % 2 + 1})"
+            return f"nan_quantile_axis_2d{'_q' if qvec else ''}({real_txt(x)}, {q_txt}, {axv % 2 + 1})"
         return None
+
+    def _apply_along_axis_one(self, call):
+        """func applied to one slice of np.apply_along_axis(func, axis, arr)
+        (arr a matrix; the slice indexed by i_apply_axis, 0-based), as an
+        expression, or None."""
+        if len(call.args) < 3 or int(self._rank_expr(call.args[2]) or 0) != 2:
+            return None
+        ax = _signed_int_constant(call.args[1])
+        if ax is None or ax not in (0, 1, -1, -2):
+            return None
+        ax %= 2
+        i = ast.Name(id="i_apply_axis", ctx=ast.Load())
+        sl = ast.Subscript(value=call.args[2], ctx=ast.Load(),
+                           slice=ast.Tuple(elts=[i, ast.Slice()] if ax == 1 else [ast.Slice(), i], ctx=ast.Load()))
+        fn = call.args[0]
+        if isinstance(fn, ast.Lambda):
+            if len(fn.args.args) != 1:
+                return None
+            return _subst_lambda_expr_body(fn, ast.Call(func=fn, args=[sl], keywords=[]))
+        if isinstance(fn, (ast.Name, ast.Attribute)):
+            return ast.Call(func=fn, args=[sl], keywords=list(call.keywords))
+        return None
+
+    def _flat_order_arg(self, node, name):
+        """', forder=.true.' for order='F', '' for order='C' (or none)."""
+        order = next((k.value for k in node.keywords if k.arg == "order"), None)
+        if any(k.arg != "order" for k in node.keywords):
+            raise NotImplementedError(f"np.{name}: only order= is supported as a keyword")
+        if order is None:
+            return ""
+        if not (isinstance(order, ast.Constant) and order.value in ("C", "F")):
+            raise NotImplementedError(f"np.{name}: order must be 'C' or 'F'")
+        return ", forder=.true." if order.value == "F" else ""
+
+    def _shape_ndim(self, shape):
+        """The number of dimensions of a shape argument, or None."""
+        if isinstance(shape, (ast.Tuple, ast.List)):
+            return len(shape.elts)
+        if isinstance(shape, ast.Attribute) and shape.attr == "shape":
+            return int(self._rank_expr(shape.value) or 0) or None
+        return None
+
+    def _multi_index_parts(self, node):
+        """The coordinate arrays (or scalars) of np.ravel_multi_index's
+        multi_index argument, or None."""
+        mi = node.args[0]
+        if isinstance(mi, (ast.Tuple, ast.List)):
+            return list(mi.elts)
+        nd = self._shape_ndim(node.args[1]) if len(node.args) >= 2 else None
+        if nd is None:
+            return None
+        return [ast.Subscript(value=mi, slice=ast.Constant(value=k), ctx=ast.Load()) for k in range(nd)]
+
+    def _np_ravel_multi_index(self, node):
+        """np.ravel_multi_index(multi_index, dims, order=)."""
+        parts = self._multi_index_parts(node)
+        if not parts:
+            raise NotImplementedError("np.ravel_multi_index needs a tuple of coordinates and a shape")
+        f = self._flat_order_arg(node, "ravel_multi_index")
+        shape = self.expr(node.args[1])
+        if all(int(self._rank_expr(p) or 0) == 0 for p in parts):
+            coords = ", ".join(f"int({self.expr(p)})" for p in parts)
+            return f"ravel_multi_index_2d([{coords}], {shape}{f})"
+        if any(int(self._rank_expr(p) or 0) != 1 for p in parts):
+            raise NotImplementedError("np.ravel_multi_index supports coordinates that are all scalars or all vectors")
+        txt = [self.expr(p) for p in parts]
+        return (f"ravel_multi_index_vec(transpose(reshape([{', '.join(txt)}], [size({txt[0]}), {len(txt)}])), "
+                f"{shape}{f})")
+
+    def _np_unravel_index(self, node):
+        """np.unravel_index(indices, shape, order=): a vector (scalar
+        indices) or a matrix whose row k is the k-th coordinate array."""
+        f = self._flat_order_arg(node, "unravel_index")
+        shape = self.expr(node.args[1])
+        r = int(self._rank_expr(node.args[0]) or 0)
+        if r == 0:
+            return f"unravel_index_2d(int({self.expr(node.args[0])}), {shape}{f})"
+        idx = self.expr(node.args[0])
+        if r > 1:
+            idx = self._flat_1d(idx, r)
+        return f"unravel_index_vec({idx}, {shape}{f})"
 
     def _np_histogram2d(self, v, outs):
         """H, xedges, yedges = np.histogram2d(x, y, bins=10, range=None,
@@ -65395,7 +65714,6 @@ class translator(ast.NodeVisitor):
                 if not all(isinstance(t, ast.Name) for t in tgt_elts):
                     raise NotImplementedError("tuple-target for loops require name targets")
                 it_expr = self.expr(node.iter)
-                iv = self._fresh_scoped_names("i")
                 k_it = self._expr_kind(node.iter)
                 for _t in tgt_elts:
                     if _t.id == "_":
@@ -65410,9 +65728,19 @@ class translator(ast.NodeVisitor):
                         self._mark_char(_t.id)
                     else:
                         self._mark_int(_t.id)
+                # After the targets are known, so the counter is not one of them.
+                iv = self._fresh_scoped_names("i")
                 self.o.w("block")
                 self.o.push()
                 self.o.w(f"integer :: {iv}")
+                if not isinstance(node.iter, ast.Name):
+                    # An expression: rows of a temporary, evaluated once.
+                    decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(
+                        k_it, "real(kind=dp)")
+                    tmp = self._fresh_scoped_names("rows")
+                    self.o.w(f"{decl}, allocatable :: {tmp}(:,:)")
+                    self.o.w(f"{tmp} = {it_expr}")
+                    it_expr = tmp
                 self.o.w(f"do {iv} = 1, size({it_expr}, 1)")
                 self.o.push()
                 for j, _t in enumerate(tgt_elts, start=1):
@@ -65866,15 +66194,44 @@ class translator(ast.NodeVisitor):
             src_expr = self.expr(src_node)
             dst_rank = max(0, int(self._rank_expr(dst_node)))
             src_rank = max(0, int(self._rank_expr(src_node)))
-            if dst_rank == 2 and src_rank == 1:
-                src_expr = f"spread({src_expr}, dim=1, ncopies=size({dst_expr},1))"
-            elif dst_rank == 1 and src_rank == 0:
-                pass
-            elif dst_rank == 2 and src_rank == 0:
-                pass
-            elif dst_rank != src_rank:
+            if src_rank > dst_rank or dst_rank > 2:
                 raise NotImplementedError("np.copyto currently supports scalar, same-rank, or 1D->2D broadcast")
             where_node = next((kw.value for kw in c.keywords if kw.arg == "where"), None)
+            block = src_rank >= 1
+            if block:
+                # src broadcast to dst's shape (a length-1 axis stretched), in
+                # a temporary: src may overlap dst.
+                kind = self._expr_kind(dst_node)
+                decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(kind, "real(kind=dp)")
+                dims = "(:)" if dst_rank == 1 else "(:,:)"
+                self.o.w("block")
+                self.o.push()
+                self.o.w(f"{decl}, allocatable :: src_ct{dims}, b_ct{dims}")
+                if dst_rank == 2 and src_rank == 1:
+                    self.o.w(f"{decl}, allocatable :: v_ct(:)")
+                self.o.w(f"integer :: i_ct{', j_ct' if dst_rank == 2 else ''}")
+                self.o.w(f"{'v_ct' if dst_rank == 2 and src_rank == 1 else 'src_ct'} = {src_expr}")
+                if dst_rank == 1:
+                    self.o.w(f"if (size(src_ct) /= 1 .and. size(src_ct) /= size({dst_expr})) "
+                             "error stop 'np.copyto: could not broadcast input array'")
+                    self.o.w(f"allocate(b_ct(size({dst_expr})))")
+                    self.o.w(f"do i_ct = 1, size({dst_expr})")
+                    self.o.w("   b_ct(i_ct) = src_ct(min(i_ct, size(src_ct)))")
+                    self.o.w("end do")
+                else:
+                    if src_rank == 1:
+                        self.o.w("src_ct = reshape(v_ct, [1, size(v_ct)])")
+                    self.o.w(f"if ((size(src_ct,1) /= 1 .and. size(src_ct,1) /= size({dst_expr},1)) .or. "
+                             f"(size(src_ct,2) /= 1 .and. size(src_ct,2) /= size({dst_expr},2))) "
+                             "error stop 'np.copyto: could not broadcast input array'")
+                    self.o.w(f"if (allocated(b_ct)) deallocate(b_ct)")
+                    self.o.w(f"allocate(b_ct(size({dst_expr},1), size({dst_expr},2)))")
+                    self.o.w(f"do j_ct = 1, size({dst_expr},2)")
+                    self.o.w(f"   do i_ct = 1, size({dst_expr},1)")
+                    self.o.w("      b_ct(i_ct, j_ct) = src_ct(min(i_ct, size(src_ct,1)), min(j_ct, size(src_ct,2)))")
+                    self.o.w("   end do")
+                    self.o.w("end do")
+                src_expr = "b_ct"
             if where_node is not None:
                 self.o.w(f"where ({self.expr(where_node)})")
                 self.o.push()
@@ -65883,6 +66240,9 @@ class translator(ast.NodeVisitor):
                 self.o.w("end where")
             else:
                 self.o.w(f"{dst_expr} = {src_expr}")
+            if block:
+                self.o.pop()
+                self.o.w("end block")
             return
         if (
             isinstance(c.func, ast.Attribute)
@@ -65963,48 +66323,182 @@ class translator(ast.NodeVisitor):
             and c.func.attr == "put"
             and len(c.args) >= 3
         ):
+            # np.put(a, ind, v): a.flat[ind] = v in C order, v repeated
+            # cyclically, negative indices from the end.
+            if c.keywords:
+                raise NotImplementedError("np.put: mode= is not supported")
             arr = self.expr(c.args[0])
-            idx = self.expr(c.args[1])
+            arr_rank = int(self._rank_expr(c.args[0]) or 0)
+            if arr_rank not in (1, 2) or int(self._rank_expr(c.args[1]) or 0) > 1                     or int(self._rank_expr(c.args[2]) or 0) > 1:
+                raise NotImplementedError("np.put supports a vector or matrix and vector (or scalar) indices and values")
+            arr_kind = self._expr_kind(c.args[0])
             vals = self.expr(c.args[2])
-            idx_rank = self._rank_expr(c.args[1])
-            vals_rank = self._rank_expr(c.args[2])
             vals_kind = self._expr_kind(c.args[2])
+            decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(arr_kind, "real(kind=dp)")
+            if arr_kind == "logical" and vals_kind != "logical":
+                vals = f"({vals}) /= 0"
+            elif arr_kind == "int" and vals_kind not in ("int", None):
+                vals = f"int({vals})"
+            elif arr_kind == "real" and vals_kind == "logical":
+                vals = f"merge(1.0_dp, 0.0_dp, {vals})"
             self.o.w("block")
             self.o.push()
-            self.o.w("integer :: i_put, n_put")
-            if idx_rank > 0:
-                self.o.w("integer, allocatable :: idx_put(:)")
-            if vals_rank > 0:
-                if vals_kind == "int":
-                    self.o.w("integer, allocatable :: vals_put(:)")
-                elif vals_kind == "logical":
-                    self.o.w("logical, allocatable :: vals_put(:)")
-                else:
-                    self.o.w("real(kind=dp), allocatable :: vals_put(:)")
-            if idx_rank > 0:
-                self.o.w(f"idx_put = {idx}")
-            if vals_rank > 0:
-                self.o.w(f"vals_put = {vals}")
-            if idx_rank > 0:
-                self.o.w("n_put = size(idx_put)")
-            else:
-                self.o.w("n_put = 1")
-            if vals_rank > 0:
-                self.o.w("n_put = min(n_put, size(vals_put))")
-            self.o.w("do i_put = 1, n_put")
+            self.o.w("integer :: i_put, k_put")
+            self.o.w("integer, allocatable :: idx_put(:)")
+            self.o.w(f"{decl}, allocatable :: vals_put(:)")
+            self.o.w(f"idx_put = [{self.expr(c.args[1])}]")
+            self.o.w(f"vals_put = [{vals}]")
+            self.o.w("if (size(vals_put) > 0) then")
             self.o.push()
-            if vals_rank > 0:
-                if idx_rank > 0:
-                    self.o.w(f"{arr}(idx_put(i_put) + 1) = vals_put(i_put)")
-                else:
-                    self.o.w(f"{arr}({idx} + 1) = vals_put(i_put)")
-            else:
-                if idx_rank > 0:
-                    self.o.w(f"{arr}(idx_put(i_put) + 1) = {vals}")
-                else:
-                    self.o.w(f"{arr}({idx} + 1) = {vals}")
+            self.o.w("do i_put = 1, size(idx_put)")
+            self.o.push()
+            self.o.w(f"k_put = idx_put(i_put)")
+            self.o.w(f"if (k_put < 0) k_put = k_put + size({arr})")
+            tgt = f"{arr}(k_put + 1)" if arr_rank == 1 else                 f"{arr}(k_put / size({arr},2) + 1, mod(k_put, size({arr},2)) + 1)"
+            self.o.w(f"{tgt} = vals_put(mod(i_put - 1, size(vals_put)) + 1)")
             self.o.pop()
             self.o.w("end do")
+            self.o.pop()
+            self.o.w("end if")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and is_numpy_name_node(c.func.value)
+            and c.func.attr == "put_along_axis"
+            and len(c.args) >= 3
+        ):
+            # np.put_along_axis(a, ind, v, axis): a[..., ind[...], ...] = v
+            # along axis, ind and v broadcast against a in the other axes.
+            ax_node = c.args[3] if len(c.args) >= 4 else next((k.value for k in c.keywords if k.arg == "axis"), None)
+            ax = _signed_int_constant(ax_node) if ax_node is not None else None
+            r = int(self._rank_expr(c.args[0]) or 0)
+            if ax is None or r not in (1, 2) or int(self._rank_expr(c.args[1]) or 0) != r                     or int(self._rank_expr(c.args[2]) or 0) > r:
+                raise NotImplementedError("np.put_along_axis supports a vector or matrix, an index array of the "
+                                          "same rank and a literal axis")
+            ax %= r
+            arr = self.expr(c.args[0])
+            kind = self._expr_kind(c.args[0])
+            decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(kind, "real(kind=dp)")
+            vals = self.expr(c.args[2])
+            vr = int(self._rank_expr(c.args[2]) or 0)
+            if kind == "int" and self._expr_kind(c.args[2]) not in ("int", None):
+                vals = f"int({vals})"
+            self.o.w("block")
+            self.o.push()
+            if r == 1:
+                self.o.w("integer :: i_pa, k_pa")
+                self.o.w("integer, allocatable :: ix_pa(:)")
+                self.o.w(f"{decl}, allocatable :: v_pa(:)")
+                self.o.w(f"ix_pa = {self.expr(c.args[1])}")
+                self.o.w(f"v_pa = [{vals}]")
+                self.o.w("do i_pa = 1, size(ix_pa)")
+                self.o.push()
+                self.o.w(f"k_pa = ix_pa(i_pa)")
+                self.o.w(f"if (k_pa < 0) k_pa = k_pa + size({arr})")
+                self.o.w(f"{arr}(k_pa + 1) = v_pa(min(i_pa, size(v_pa)))")
+            else:
+                self.o.w("integer :: i_pa, j_pa, k_pa")
+                self.o.w("integer, allocatable :: ix_pa(:,:)")
+                self.o.w(f"{decl}, allocatable :: v_pa(:,:)")
+                self.o.w(f"ix_pa = {self.expr(c.args[1])}")
+                if vr == 0:
+                    self.o.w(f"v_pa = reshape([{vals}], [1, 1])")
+                elif vr == 1:
+                    self.o.w(f"v_pa = reshape({vals}, [1, size({vals})])")
+                else:
+                    self.o.w(f"v_pa = {vals}")
+                # Loop over a's extent in the other axis and ind's along axis.
+                if ax == 1:
+                    self.o.w(f"do i_pa = 1, size({arr},1)")
+                    self.o.push()
+                    self.o.w("do j_pa = 1, size(ix_pa,2)")
+                    self.o.push()
+                    self.o.w("k_pa = ix_pa(min(i_pa, size(ix_pa,1)), j_pa)")
+                    self.o.w(f"if (k_pa < 0) k_pa = k_pa + size({arr},2)")
+                    self.o.w(f"{arr}(i_pa, k_pa + 1) = v_pa(min(i_pa, size(v_pa,1)), min(j_pa, size(v_pa,2)))")
+                else:
+                    self.o.w(f"do j_pa = 1, size({arr},2)")
+                    self.o.push()
+                    self.o.w("do i_pa = 1, size(ix_pa,1)")
+                    self.o.push()
+                    self.o.w("k_pa = ix_pa(i_pa, min(j_pa, size(ix_pa,2)))")
+                    self.o.w(f"if (k_pa < 0) k_pa = k_pa + size({arr},1)")
+                    self.o.w(f"{arr}(k_pa + 1, j_pa) = v_pa(min(i_pa, size(v_pa,1)), min(j_pa, size(v_pa,2)))")
+                self.o.pop()
+                self.o.w("end do")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and is_numpy_name_node(c.func.value)
+            and c.func.attr in {"place", "putmask"}
+            and len(c.args) == 3
+            and not c.keywords
+        ):
+            # np.place(a, mask, v): the k-th true element (C order) gets
+            # v[k % len(v)]; np.putmask(a, mask, v): element at flat (C order)
+            # index n gets v[n % len(v)]. The mask is evaluated first.
+            arr = self.expr(c.args[0])
+            arr_rank = int(self._rank_expr(c.args[0]) or 0)
+            if arr_rank not in (1, 2) or int(self._rank_expr(c.args[2]) or 0) > 1:
+                raise NotImplementedError(f"np.{c.func.attr} supports a vector or matrix and vector (or scalar) values")
+            arr_kind = self._expr_kind(c.args[0])
+            vals = self.expr(c.args[2])
+            vals_kind = self._expr_kind(c.args[2])
+            decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(arr_kind, "real(kind=dp)")
+            if arr_kind == "logical" and vals_kind != "logical":
+                vals = f"({vals}) /= 0"
+            elif arr_kind == "int" and vals_kind not in ("int", None):
+                vals = f"int({vals})"
+            elif arr_kind == "real" and vals_kind == "logical":
+                vals = f"merge(1.0_dp, 0.0_dp, {vals})"
+            mask = self.expr(c.args[1])
+            if self._expr_kind(c.args[1]) != "logical":
+                mask = f"({mask}) /= 0"
+            dims = "(:)" if arr_rank == 1 else "(:,:)"
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: i_pm, j_pm, k_pm")
+            self.o.w(f"logical, allocatable :: mask_pm{dims}")
+            self.o.w(f"{decl}, allocatable :: vals_pm(:)")
+            self.o.w(f"mask_pm = {mask}")
+            self.o.w(f"vals_pm = [{vals}]")
+            self.o.w("k_pm = 0")
+            self.o.w("if (size(vals_pm) > 0) then")
+            self.o.push()
+            put = c.func.attr == "putmask"
+            if arr_rank == 1:
+                self.o.w(f"do i_pm = 1, size({arr})")
+                self.o.push()
+                el, msk = f"{arr}(i_pm)", "mask_pm(i_pm)"
+            else:
+                self.o.w(f"do i_pm = 1, size({arr},1)")
+                self.o.push()
+                self.o.w(f"do j_pm = 1, size({arr},2)")
+                self.o.push()
+                el, msk = f"{arr}(i_pm, j_pm)", "mask_pm(i_pm, j_pm)"
+            if put:
+                self.o.w(f"if ({msk}) {el} = vals_pm(mod(k_pm, size(vals_pm)) + 1)")
+                self.o.w("k_pm = k_pm + 1")
+            else:
+                self.o.w(f"if ({msk}) then")
+                self.o.push()
+                self.o.w(f"{el} = vals_pm(mod(k_pm, size(vals_pm)) + 1)")
+                self.o.w("k_pm = k_pm + 1")
+                self.o.pop()
+                self.o.w("end if")
+            for _ in range(arr_rank):
+                self.o.pop()
+                self.o.w("end do")
+            self.o.pop()
+            self.o.w("end if")
             self.o.pop()
             self.o.w("end block")
             return
@@ -66061,14 +66555,41 @@ class translator(ast.NodeVisitor):
             and c.func.attr == "fill_diagonal"
             and len(c.args) >= 2
         ):
-            arr = self.expr(c.args[0])
+            # Every (ncol + 1)-th element in C order from the first (up to the
+            # end of the leading square, or of the array with wrap=True); a
+            # vector of values is repeated cyclically.
+            wrap = next((k.value for k in c.keywords if k.arg == "wrap"), None)
+            if any(k.arg != "wrap" for k in c.keywords) or not (
+                    wrap is None or isinstance(wrap, ast.Constant) and isinstance(wrap.value, bool)):
+                raise NotImplementedError("np.fill_diagonal: wrap must be a literal True or False")
+            wrap = wrap is not None and wrap.value
+            target = c.args[0]
+            if isinstance(target, ast.Attribute) and target.attr == "T" and not wrap:
+                # The diagonal of a.T is the diagonal of a.
+                target = target.value
+            if int(self._rank_expr(target) or 0) != 2 or int(self._rank_expr(c.args[1]) or 0) > 1:
+                raise NotImplementedError("np.fill_diagonal supports a matrix and a scalar or vector value")
+            arr = self.expr(target)
             val = self.expr(c.args[1])
+            vec = int(self._rank_expr(c.args[1]) or 0) == 1
             self.o.w("block")
             self.o.push()
-            self.o.w("integer :: i_diag")
-            self.o.w(f"do i_diag = 1, min(size({arr},1), size({arr},2))")
+            self.o.w("integer :: i_diag, k_diag, n_diag")
+            if vec:
+                kind = self._expr_kind(target)
+                decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(kind, "real(kind=dp)")
+                self.o.w(f"{decl}, allocatable :: v_diag(:)")
+                self.o.w(f"v_diag = {val}")
+                val = "v_diag(mod(i_diag, size(v_diag)) + 1)"
+            end = f"size({arr})" if wrap else f"min(size({arr}), size({arr},2) * size({arr},2))"
+            self.o.w(f"n_diag = ({end} - 1) / (size({arr},2) + 1) + 1")
+            if vec:
+                self.o.w("if (size(v_diag) == 0) n_diag = 0")
+            self.o.w(f"if (size({arr}) == 0) n_diag = 0")
+            self.o.w("do i_diag = 0, n_diag - 1")
             self.o.push()
-            self.o.w(f"{arr}(i_diag, i_diag) = {val}")
+            self.o.w(f"k_diag = i_diag * (size({arr},2) + 1)")
+            self.o.w(f"{arr}(k_diag / size({arr},2) + 1, mod(k_diag, size({arr},2)) + 1) = {val}")
             self.o.pop()
             self.o.w("end do")
             self.o.pop()

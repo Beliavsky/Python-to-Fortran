@@ -2290,6 +2290,20 @@ def inline_python_mod_helpers(trimmed_text: str):
         if mm is not None:
             use_line = "\n   use, intrinsic :: ieee_arithmetic, only: " + ", ".join(missing)
             new_text = new_text[: mm.end()] + use_line + new_text[mm.end() :]
+    # Likewise the iso_fortran_env kind names they use (e.g. seed_rng's
+    # int64 arithmetic), which the trimmed module may not import.
+    kinds_used = sorted({n.lower() for n in re.findall(r"\b(int8|int16|int32|int64|real32|real64|real128)\b",
+                                                        "\n".join(inlined_body), re.IGNORECASE)})
+    imported = set()
+    for um in re.finditer(r"(?im)^\s*use\s*,\s*intrinsic\s*::\s*iso_fortran_env\b(.*(?:&\s*\n.*)*)", new_text):
+        imported |= {n.lower() for n in re.findall(r"\w+", um.group(1).split(":", 1)[-1])}
+    missing = [n for n in kinds_used if n not in imported]
+    if missing:
+        mod_re = re.compile(r"^\s*module\s+(?!procedure\b)\w+\s*$", re.IGNORECASE | re.MULTILINE)
+        mm = mod_re.search(new_text)
+        if mm is not None:
+            use_line = "\n   use, intrinsic :: iso_fortran_env, only: " + ", ".join(missing)
+            new_text = new_text[: mm.end()] + use_line + new_text[mm.end() :]
     return new_text, unresolved
 
 

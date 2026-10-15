@@ -9,10 +9,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class OddIrfftBug(AssertionError):
-    """Only the known missing odd-length Hermitian frequency is xfailed."""
-
-
 @pytest.fixture(scope='module', params=['gfortran', 'ifx'])
 def compiled_runtime(request, tmp_path_factory):
     compiler = request.param
@@ -53,16 +49,10 @@ def build_and_run(tmp_path, compiled_runtime, sizes):
                       n_lstsq_rows=1, n_lstsq_cols=1, n_grid=2, n_quadrature=1), id='minimum'),
     pytest.param(dict(n_stats=7, n_array=9, n_random=23, n_fft=10, n_matrix=8,
                       n_lstsq_rows=13, n_lstsq_cols=5, n_grid=10, n_quadrature=3), id='varied-non-power-two'),
-    pytest.param(dict(n_fft=7), id='odd-real-fft', marks=pytest.mark.xfail(
-        strict=True, raises=OddIrfftBug,
-        reason='fft_irfft omits the last conjugate frequency for odd output lengths')),
+    pytest.param(dict(n_fft=7), id='odd-real-fft'),
 ])
 def test_standalone_python_runtime(tmp_path, compiled_runtime, sizes):
     run = build_and_run(tmp_path, compiled_runtime, sizes)
-    failed_checks = [line.strip() for line in run.stdout.splitlines() if line.strip().startswith('FAIL ')]
-    if (sizes.get('n_fft') == 7 and run.returncode != 0 and
-            failed_checks == ['FAIL real FFT round trip'] and '; failures: 1' in run.stdout):
-        raise OddIrfftBug(run.stdout + run.stderr)
     assert run.returncode == 0, run.stdout + run.stderr
     assert 'PASS python_mod standalone tests' in run.stdout
     assert '; failures: 0' in run.stdout

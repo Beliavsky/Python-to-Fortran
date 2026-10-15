@@ -1,13 +1,14 @@
 # numpy coverage probe: methods, operators, indexing
 
-5325 cases.
+6021 cases.
 
 | status | count |
 |---|---|
-| DIFF | 1 |
+| DIFF | 4 |
+| KIND | 8 |
 | BUILD-FAIL | 97 |
 | XLATE-FAIL | 62 |
-| MATCH | 5165 |
+| MATCH | 5850 |
 
 ## BUILD-FAIL
 
@@ -176,4 +177,15 @@
 
 ## Known differences
 
+- `r = np.apply_along_axis(np.sort, 0, m) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.apply_along_axis(np.sort, 0, mr) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.apply_along_axis(np.sort, 1, m) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.apply_along_axis(np.sort, 1, mr) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.apply_along_axis(np.sum, 0, m) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.apply_along_axis(np.sum, 0, mr) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.apply_along_axis(np.sum, 1, m) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.apply_along_axis(np.sum, 1, mr) [int]` (KIND): one wrapper of a numpy function passed as an argument per program (real when real arrays use it too)
+- `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [base]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
+- `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [int]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
+- `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [ties]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
 - `r = xi.argsort() [ties]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)

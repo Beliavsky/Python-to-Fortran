@@ -125,9 +125,57 @@ def _indexing() -> list[tuple[str, list[str]]]:
     return out
 
 
+def _mutators() -> list[tuple[str, list[str]]]:
+    """In-place mutating functions and flat (C-order) index helpers, where a
+    column-major slip would be silent."""
+    out = []
+    for a in ("x", "xi", "m", "mr"):
+        for s in ("np.put(y, [0, 2], [9, 8])", "np.put(y, [-1], 5)", "np.put(y, 1, 7)", "np.put(y, [1, 3], 6)",
+                  "y.put([0, 1], [5, 6])", "y.put([2], 7)", "np.place(y, y > 1, [7, 8])", "np.place(y, y > 1, 0)",
+                  "np.putmask(y, y > 1, [7, 8, 9])", "np.putmask(y, y > 1, 0)", "np.copyto(y, 2)",
+                  "np.copyto(y, y[::-1])", "np.copyto(y, -y, where=y > 1)", "y.fill(4)", "y.flat[3] = 9",
+                  "y.flat[[0, 2]] = -1", "y.ravel()[1] = 5", "np.fill_diagonal(y, 7)",
+                  "np.fill_diagonal(y, [1, 2])"):
+            out.append(("mutate", [f"y = {a}.copy()", s, "r = y"]))
+    for a in ("m", "mr"):
+        for s in ("np.copyto(y, x[:y.shape[1]])", "np.copyto(y, 0, where=y > 1)",
+                  "np.put_along_axis(y, np.argmax(y, axis=1)[:, None], 0, axis=1)",
+                  "np.put_along_axis(y, np.argmin(y, axis=0)[None, :], -1, axis=0)",
+                  "np.fill_diagonal(y.T, 5)"):
+            out.append(("mutate", [f"y = {a}.copy()", s, "r = y"]))
+        out += [("flat-index", [f"r = {a}.flat[4]"]), ("flat-index", [f"r = {a}.ravel()[3]"]),
+                ("flat-index", [f"r = {a}.flatten(order='F')"]), ("flat-index", [f"r = {a}.ravel(order='F')"]),
+                ("flat-index", [f"r = np.unravel_index({a}.argmax(), {a}.shape)[0]"]),
+                ("flat-index", [f"r = np.unravel_index({a}.argmax(), {a}.shape)[1]"]),
+                ("flat-index", [f"y, z = np.unravel_index({a}.argmin(), {a}.shape)", "r = np.array([y, z])"]),
+                ("flat-index", [f"r = np.unravel_index(np.argsort({a}, axis=None), {a}.shape)[1]"]),
+                ("flat-index", [f"r = {a}.reshape(-1, order='F')"]),
+                ("flat-index", [f"r = {a}.reshape({a}.shape[1], -1)"]),
+                ("flat-index", [f"r = np.take({a}, [0, 3])"]),
+                ("flat-index", [f"r = np.argwhere({a} > 1)"])]
+    out += [("flat-index", ["r = np.unravel_index(5, (2, 3))[0]"]),
+            ("flat-index", ["r = np.unravel_index(5, (2, 3))[1]"]),
+            ("flat-index", ["r = np.unravel_index([1, 4], (2, 3))[1]"]),
+            ("flat-index", ["r = np.unravel_index([1, 4], (2, 3), order='F')[0]"]),
+            ("flat-index", ["r = np.ravel_multi_index(([0, 1], [2, 0]), (2, 3))"]),
+            ("flat-index", ["r = np.ravel_multi_index((1, 2), (2, 3))"]),
+            ("flat-index", ["r = np.ravel_multi_index(([0, 1], [2, 0]), (2, 3), order='F')"]),
+            ("flat-index", ["r = np.ravel_multi_index(np.nonzero(mr > 0.5), mr.shape)"])]
+    for a in ("x", "xi"):
+        out += [("callable", [f"r = np.piecewise({a}, [{a} < 0, {a} >= 0], [lambda t: -t, lambda t: t ** 2])"]),
+                ("callable", [f"r = np.piecewise({a}, [{a} < 1], [0, 1])"]),
+                ("callable", [f"r = np.piecewise({a}, [{a} < 0, {a} > 2], [-1, 1, 0])"])]
+    for a in ("m", "mr"):
+        for ax in (0, 1):
+            out += [("callable", [f"r = np.apply_along_axis(np.sum, {ax}, {a})"]),
+                    ("callable", [f"r = np.apply_along_axis(lambda v: v.max() - v.min(), {ax}, {a})"]),
+                    ("callable", [f"r = np.apply_along_axis(np.sort, {ax}, {a})"])]
+    return out
+
+
 def templates() -> list[tuple[str, list[str]]]:
     seen, out = set(), []
-    for g, stmts in _methods() + _operators() + _indexing():
+    for g, stmts in _methods() + _operators() + _indexing() + _mutators():
         key = tuple(stmts)
         if key not in seen:
             seen.add(key)

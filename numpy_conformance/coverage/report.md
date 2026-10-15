@@ -5,17 +5,15 @@
 | status | count |
 |---|---|
 | DIFF | 6 |
-| BUILD-FAIL | 4 |
+| BUILD-FAIL | 2 |
 | XLATE-FAIL | 47 |
 | NOARGS | 58 |
-| MATCH | 413 |
+| MATCH | 415 |
 
 ## BUILD-FAIL
 
 - `np.percentile`: Rank mismatch in argument 'q' at (1) (rank-1 and rank-2)
 - `np.roll`: 'shift' argument of 'cshift' intrinsic at (1) must be a scalar
-- `np.tril`: Rank mismatch in array reference at (1) (2/1)
-- `np.triu`: Rank mismatch in array reference at (1) (2/1)
 
 ## XLATE-FAIL
 
@@ -38,7 +36,7 @@
 - `np.linalg.tensorsolve`: unsupported call: np.linalg.tensorsolve(0.7, 0.4)
 - `np.matvec`: unsupported call: np.matvec(m, m)
 - `np.meshgrid`: unsupported call: np.meshgrid(x)
-- `np.nanpercentile`: np.nanpercentile: q must be a scalar
+- `np.nanpercentile`: np.nanpercentile: q must be a scalar or a vector
 - `np.polynomial.chebyshev.chebgrid2d`: chebgrid2d: the coefficients must have 2 dimensions
 - `np.polynomial.chebyshev.chebval2d`: chebval2d: the coefficients must have 2 dimensions
 - `np.polynomial.hermite.hermgrid2d`: hermgrid2d: the coefficients must have 2 dimensions
