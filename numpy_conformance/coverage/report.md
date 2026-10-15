@@ -4,11 +4,10 @@
 
 | status | count |
 |---|---|
-| DIFF | 6 |
 | BUILD-FAIL | 2 |
 | XLATE-FAIL | 47 |
 | NOARGS | 58 |
-| MATCH | 415 |
+| MATCH | 421 |
 
 ## BUILD-FAIL
 
@@ -66,13 +65,7 @@
 - `np.blackman` (XLATE-FAIL): the probe's float M is rejected (M must be an integer)
 - `np.hamming` (XLATE-FAIL): the probe's float M is rejected (M must be an integer)
 - `np.hanning` (XLATE-FAIL): the probe's float M is rejected (M must be an integer)
-- `np.linalg.eig` (DIFF): always complex in the translation
-- `np.linalg.eigvals` (DIFF): always complex in the translation
 - `np.partition` (XLATE-FAIL): numpy's introselect order is not reproduced
-- `np.polynomial.chebyshev.chebroots` (DIFF): always complex in the translation
-- `np.polynomial.hermite.hermroots` (DIFF): always complex in the translation
-- `np.polynomial.hermite_e.hermeroots` (DIFF): always complex in the translation
-- `np.polynomial.laguerre.lagroots` (DIFF): always complex in the translation
 
 ## NOARGS
 

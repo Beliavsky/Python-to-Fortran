@@ -27585,3 +27585,28 @@ def test_xp2f_numpy_functions_of_complex_arrays(tmp_path: Path) -> None:
         'print(np.convolve(ai, ai[:2], "same"), np.correlate(ai, ai[:2], "same"), np.correlate(a, b), np.convolve(a, b, "valid"))\n'
     )]):
         _xp2f_output_matches_numpy(tmp_path, f"xcfun{k}", code)
+
+
+def test_xp2f_eig_and_roots_real_when_imaginary_parts_are_zero(tmp_path: Path) -> None:
+    # numpy returns real eigenvalues/eigenvectors and roots when the input
+    # is real and every imaginary part is 0 (complex ones otherwise); the
+    # translation's are complex, so a print of them chooses at run time.
+    # np.roots strips leading and trailing zero coefficients and puts the
+    # zero roots last.
+    _xp2f_output_matches_numpy(tmp_path, "xeigreal", (
+        'import numpy as np\n'
+        'a = np.array([[2.0, 1.0], [1.0, 3.0]])\n'
+        'b = np.array([[0.0, -1.0], [1.0, 0.0]])\n'
+        'w = np.linalg.eigvals(a)\n'
+        'w2, v2 = np.linalg.eig(b)\n'
+        'w3, v3 = np.linalg.eig(a)\n'
+        'print(w, w2, v2)\n'
+        'print(w3, v3)\n'
+        'print(np.roots([2.0, -2.0, 2.0, 0.0]), np.roots([0.0, 1.0, -3.0, 2.0, 0.0, 0.0]))\n'
+        'print(np.roots([1.0, 0.0, 1.0]), np.polynomial.chebyshev.chebroots([1.0, 2.0, 3.0]))\n'
+        'def f(m):\n'
+        '    e = np.linalg.eigvals(m)\n'
+        '    print(e)\n'
+        '    return e.real.sum()\n'
+        'print(f(np.array([[1.0, 2.0], [-2.0, 1.0]])), f(np.array([[1.0, 2.0], [0.5, 1.0]])))\n'
+    ))

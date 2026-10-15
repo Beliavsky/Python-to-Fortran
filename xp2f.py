@@ -7233,6 +7233,132 @@ def rewrite_numpy2_names(tree):
     return tree
 
 
+_POLY_ROOTS = {"polyroots", "chebroots", "legroots", "hermroots", "hermeroots", "lagroots"}
+
+
+def _dynamic_real_eig_call(node):
+    """(input, n_results) when node is np.linalg.eig/eigvals, np.roots or
+    an np.polynomial *roots call -- results numpy makes real when the input
+    is real and every eigenvalue's imaginary part is 0 -- else None."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and len(node.args) == 1
+            and not node.keywords):
+        return None
+    parts, f = [], node.func
+    while isinstance(f, ast.Attribute):
+        parts.insert(0, f.attr)
+        f = f.value
+    if not isinstance(f, ast.Name) or f.id not in {"np", "numpy"}:
+        return None
+    if parts in (["linalg", "eigvals"], ["roots"]) or (len(parts) == 3 and parts[0] == "polynomial"
+                                                       and parts[2] in _POLY_ROOTS):
+        return node.args[0], 1
+    if parts == ["linalg", "eig"]:
+        return node.args[0], 2
+    return None
+
+
+def rewrite_dynamic_real_eig_prints(tree):
+    """numpy returns real eigenvalues (and eigenvectors) and roots when the
+    input is real and every imaginary part is 0, complex ones otherwise; the
+    translation's are always complex. print(w) of such a result becomes
+        if np.all(np.imag(w) == 0) and not np.iscomplexobj(a): print(np.real(w))
+        else: print(w)
+    (a call printed directly is assigned to a temporary first). Names
+    assigned anything else in the same scope are left alone."""
+    import copy as _copy
+    counter = [0]
+
+    def scope(body):
+        tracked, other = {}, set()
+
+        def scan(stmts):
+            for st in stmts:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(st, ast.Assign) and len(st.targets) == 1:
+                    tg, info = st.targets[0], _dynamic_real_eig_call(st.value)
+                    if info is not None and isinstance(tg, ast.Name) and info[1] == 1:
+                        tracked.setdefault(tg.id, []).append((tg.id, info[0]))
+                        continue
+                    if (info is not None and info[1] == 2 and isinstance(tg, ast.Tuple) and len(tg.elts) == 2
+                            and all(isinstance(e, ast.Name) for e in tg.elts)):
+                        w = tg.elts[0].id
+                        for e in tg.elts:
+                            tracked.setdefault(e.id, []).append((w, info[0]))
+                        continue
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                        other.add(n.id)
+                    if isinstance(n, ast.arg):
+                        other.add(n.arg)
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        scan(sub)
+                for h in getattr(st, "handlers", []) or []:
+                    scan(h.body)
+        scan(body)
+        good = {n: v[0] for n, v in tracked.items() if n not in other and len({(a, ast.dump(b)) for a, b in v}) == 1}
+
+        def rewrite(stmts):
+            out = []
+            for st in stmts:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    st.body = scope(st.body)
+                    out.append(st)
+                    continue
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        setattr(st, field, rewrite(sub))
+                for h in getattr(st, "handlers", []) or []:
+                    h.body = rewrite(h.body)
+                if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+                        and isinstance(st.value.func, ast.Name) and st.value.func.id == "print"):
+                    out.append(st)
+                    continue
+                call = st.value
+                flags, pre, args = {}, [], []
+                for a in call.args:
+                    info = _dynamic_real_eig_call(a)
+                    if info is not None and info[1] == 1:
+                        counter[0] += 1
+                        tmp = f"xp_eig_result_{counter[0]}"
+                        pre.append(ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=a))
+                        a = ast.Name(id=tmp, ctx=ast.Load())
+                        flags[tmp] = (tmp, info[0])
+                    elif isinstance(a, ast.Name) and a.id in good:
+                        flags[a.id] = good[a.id]
+                    args.append(a)
+                conds = {}
+                for name, (flag, inp) in flags.items():
+                    conds.setdefault(flag, (inp, []))[1].append(name)
+                if not conds or len(conds) > 3:
+                    out.append(st)
+                    continue
+                out += pre
+
+                def branch(items, real_names):
+                    if not items:
+                        new_args = [ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="real",
+                                                                ctx=ast.Load()), args=[a], keywords=[])
+                                    if isinstance(a, ast.Name) and a.id in real_names else a for a in args]
+                        return [ast.Expr(value=ast.Call(func=call.func, args=new_args, keywords=call.keywords))]
+                    (flag, (inp, names)), rest = items[0], items[1:]
+                    cond = ast.parse(f"np.all(np.imag({flag}) == 0) and not np.iscomplexobj(INPUT)",
+                                     mode="eval").body
+                    cond.values[1].operand.args[0] = _copy.deepcopy(inp)
+                    return [ast.If(test=cond, body=branch(rest, real_names | set(names)),
+                                   orelse=branch(rest, real_names))]
+                out += branch(list(conds.items()), set())
+            return out
+        return rewrite(body)
+
+    tree.body = scope(tree.body)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_two_result_numpy_unpack(tree):
     """q, r = np.polydiv(u, v), m, e = np.frexp(x) and f, i = np.modf(x):
     one indexed call per target (the translator evaluates np.polydiv(u,
@@ -86534,6 +86660,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_dynamic_real_eig_prints(tree)
     tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
@@ -87077,6 +87204,7 @@ def transpile_file(
     tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_dynamic_real_eig_prints(tree)
     tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
@@ -87901,6 +88029,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
+    tree = rewrite_dynamic_real_eig_prints(tree)
     tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)

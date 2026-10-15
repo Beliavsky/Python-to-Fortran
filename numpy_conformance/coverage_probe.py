@@ -137,23 +137,15 @@ SKIP = {"info", "show_config", "show_runtime", "get_include", "set_printoptions"
 # Differences that are deliberate (see python_to_fortran_syntax_guide.md);
 # report lists them apart from the others.
 KNOWN = {
-    "np.linalg.eig": "always complex in the translation",
-    "np.linalg.eigvals": "always complex in the translation",
     "np.argpartition": "numpy's introselect order is not reproduced",
     "np.partition": "numpy's introselect order is not reproduced",
 }
-for _f in ("poly", "cheb", "leg", "herm", "herme", "lag"):
-    _mod = {"poly": "polynomial", "cheb": "chebyshev", "leg": "legendre", "herm": "hermite", "herme": "hermite_e",
-            "lag": "laguerre"}[_f]
-    KNOWN[f"np.polynomial.{_mod}.{_f}roots"] = "always complex in the translation"
-KNOWN["np.roots"] = "always complex in the translation"
 # Variants: NaN propagation details, platform-dependent values, and the
 # probe's own limits.
 KNOWN.update({
     "np.empty_like": "uninitialized values",
     "np.empty_like[int]": "uninitialized values",
     "np.linalg.solve[nan]": "NaN propagation through the LAPACK factorization differs",
-    "np.roots[ties]": "the roots in another order (eigenvalue order)",
     "np.setxor1d[nan]": "NaN treated as one value",
     "np.frexp[nan]": "the exponent of inf and NaN is platform-dependent (0 here, numpy on Windows -1)",
     "np.interp[nan]": "xp with NaN and inf (not increasing, as numpy requires)",

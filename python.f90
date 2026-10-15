@@ -15313,11 +15313,14 @@ contains
          dpcoef = cur
       end function polyder_real
 
-      function polyroots_real(p) result(r)
-         real(kind=dp), intent(in) :: p(:)
+      function polyroots_real(p_in) result(r)
+         ! np.roots(p): leading and trailing zero coefficients are
+         ! stripped, the roots of the rest are the eigenvalues of its
+         ! companion matrix, and a zero root follows for each trailing zero.
+         real(kind=dp), intent(in) :: p_in(:)
          complex(kind=dp), allocatable :: r(:)
-         real(kind=dp), allocatable :: ac(:,:), wr(:), wi(:), work(:), vl_dummy(:,:), vr_dummy(:,:)
-         integer :: n, i, info, lwork
+         real(kind=dp), allocatable :: p(:), ac(:,:), wr(:), wi(:), work(:), vl_dummy(:,:), vr_dummy(:,:)
+         integer :: n, i, info, lwork, first, last, ntrail
          interface
             subroutine dgeev(jobvl, jobvr, n, a, lda, wr, wi, vl, ldvl, vr, ldvr, work, lwork, info)
                character(len=1), intent(in) :: jobvl, jobvr
@@ -15328,12 +15331,25 @@ contains
             end subroutine dgeev
          end interface
 
-         n = size(p) - 1
-         if (n <= 0) then
+         first = 0
+         last = 0
+         do i = 1, size(p_in)
+            if (p_in(i) /= 0.0_dp) then
+               if (first == 0) first = i
+               last = i
+            end if
+         end do
+         if (first == 0) then
             allocate(r(0))
             return
          end if
-         if (abs(p(1)) <= tiny(1.0_dp)) stop "polyroots_real: leading coefficient must be nonzero"
+         ntrail = size(p_in) - last
+         p = p_in(first:last)
+         n = size(p) - 1
+         if (n <= 0) then
+            allocate(r(ntrail), source=(0.0_dp, 0.0_dp))
+            return
+         end if
 
          allocate(ac(n, n), source=0.0_dp)
          ac(1, :) = -p(2:n + 1) / p(1)
@@ -15353,7 +15369,7 @@ contains
          call dgeev('N', 'N', n, ac, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
          if (info /= 0) stop "polyroots_real: dgeev failed"
 
-         allocate(r(n))
+         allocate(r(n + ntrail), source=(0.0_dp, 0.0_dp))
          do i = 1, n
             r(i) = cmplx(wr(i), wi(i), kind=dp)
          end do

@@ -1,19 +1,20 @@
 # numpy coverage probe: input variants
 
-2597 variants.
+2626 variants.
 
 | status | count |
 |---|---|
-| DIFF | 24 |
+| DIFF | 22 |
 | RUN-FAIL | 3 |
-| BUILD-FAIL | 11 |
-| XLATE-FAIL | 104 |
-| MATCH | 2455 |
+| BUILD-FAIL | 12 |
+| XLATE-FAIL | 109 |
+| MATCH | 2480 |
 
 ## BUILD-FAIL
 
 - `np.linalg.cond[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
 - `np.linalg.det[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
+- `np.linalg.eig[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
 - `np.linalg.eigh[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
 - `np.linalg.eigvalsh[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
 - `np.linalg.inv[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
@@ -42,6 +43,7 @@
 - `np.polynomial.chebyshev.chebmul[complex]`: np.polynomial.chebyshev.chebmul of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.chebyshev.chebmulx[complex]`: np.polynomial.chebyshev.chebmulx of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.chebyshev.chebpow[complex]`: np.polynomial.chebyshev.chebpow of a complex array is not supported (the translation would drop the imaginary part)
+- `np.polynomial.chebyshev.chebroots[complex]`: np.polynomial.chebyshev.chebroots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.chebyshev.chebsub[complex]`: np.polynomial.chebyshev.chebsub of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.chebyshev.chebtrim[complex]`: np.polynomial.chebyshev.chebtrim of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.chebyshev.chebval[complex]`: np.polynomial.chebyshev.chebval of a complex array is not supported (the translation would drop the imaginary part)
@@ -57,6 +59,7 @@
 - `np.polynomial.hermite.hermmul[complex]`: np.polynomial.hermite.hermmul of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite.hermmulx[complex]`: np.polynomial.hermite.hermmulx of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite.hermpow[complex]`: np.polynomial.hermite.hermpow of a complex array is not supported (the translation would drop the imaginary part)
+- `np.polynomial.hermite.hermroots[complex]`: np.polynomial.hermite.hermroots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite.hermsub[complex]`: np.polynomial.hermite.hermsub of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite.hermtrim[complex]`: np.polynomial.hermite.hermtrim of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite.hermval[complex]`: np.polynomial.hermite.hermval of a complex array is not supported (the translation would drop the imaginary part)
@@ -73,6 +76,7 @@
 - `np.polynomial.hermite_e.hermemul[complex]`: np.polynomial.hermite_e.hermemul of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite_e.hermemulx[complex]`: np.polynomial.hermite_e.hermemulx of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite_e.hermepow[complex]`: np.polynomial.hermite_e.hermepow of a complex array is not supported (the translation would drop the imaginary part)
+- `np.polynomial.hermite_e.hermeroots[complex]`: np.polynomial.hermite_e.hermeroots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite_e.hermesub[complex]`: np.polynomial.hermite_e.hermesub of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite_e.hermetrim[complex]`: np.polynomial.hermite_e.hermetrim of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.hermite_e.hermeval[complex]`: np.polynomial.hermite_e.hermeval of a complex array is not supported (the translation would drop the imaginary part)
@@ -89,6 +93,7 @@
 - `np.polynomial.laguerre.lagmul[complex]`: np.polynomial.laguerre.lagmul of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.laguerre.lagmulx[complex]`: np.polynomial.laguerre.lagmulx of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.laguerre.lagpow[complex]`: np.polynomial.laguerre.lagpow of a complex array is not supported (the translation would drop the imaginary part)
+- `np.polynomial.laguerre.lagroots[complex]`: np.polynomial.laguerre.lagroots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.laguerre.lagsub[complex]`: np.polynomial.laguerre.lagsub of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.laguerre.lagtrim[complex]`: np.polynomial.laguerre.lagtrim of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.laguerre.lagval[complex]`: np.polynomial.laguerre.lagval of a complex array is not supported (the translation would drop the imaginary part)
@@ -105,6 +110,7 @@
 - `np.polynomial.legendre.legmul[complex]`: np.polynomial.legendre.legmul of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.legendre.legmulx[complex]`: np.polynomial.legendre.legmulx of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.legendre.legpow[complex]`: np.polynomial.legendre.legpow of a complex array is not supported (the translation would drop the imaginary part)
+- `np.polynomial.legendre.legroots[complex]`: np.polynomial.legendre.legroots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.legendre.legsub[complex]`: np.polynomial.legendre.legsub of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.legendre.legtrim[complex]`: np.polynomial.legendre.legtrim of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.legendre.legval[complex]`: np.polynomial.legendre.legval of a complex array is not supported (the translation would drop the imaginary part)
@@ -120,12 +126,14 @@
 - `np.polynomial.polynomial.polymul[complex]`: np.polynomial.polynomial.polymul of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polymulx[complex]`: np.polynomial.polynomial.polymulx of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polypow[complex]`: np.polynomial.polynomial.polypow of a complex array is not supported (the translation would drop the imaginary part)
+- `np.polynomial.polynomial.polyroots[complex]`: np.polynomial.polynomial.polyroots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polysub[complex]`: np.polynomial.polynomial.polysub of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polytrim[complex]`: np.polynomial.polynomial.polytrim of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polyval[complex]`: np.polynomial.polynomial.polyval of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polyvalfromroots[complex]`: np.polynomial.polynomial.polyvalfromroots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polyvander[complex]`: np.polynomial.polynomial.polyvander of a complex array is not supported (the translation would drop the imaginary part)
 - `np.real_if_close[complex]`: np.real_if_close of a complex array is not supported (the translation would drop the imaginary part)
+- `np.roots[complex]`: np.roots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.searchsorted[complex]`: np.searchsorted of complex numbers is not supported
 
 ## Known differences
@@ -147,16 +155,12 @@
 - `np.interp[nan]` (DIFF): xp with NaN and inf (not increasing, as numpy requires)
 - `np.linalg.pinv[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
 - `np.linalg.qr[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
-- `np.linalg.solve[nan]` (DIFF): NaN propagation through the LAPACK factorization differs
+- `np.linalg.solve[nan]` (XLATE-FAIL): NaN propagation through the LAPACK factorization differs
 - `np.linalg.svd[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
 - `np.linalg.svdvals[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
 - `np.nonzero[empty]` (DIFF): the probe reads numpy's dtype=int64 as a number
 - `np.polymul[empty]` (DIFF): empty coefficient arrays
-- `np.polynomial.legendre.legroots[complex]` (XLATE-FAIL): always complex in the translation
-- `np.polynomial.polynomial.polyroots[complex]` (XLATE-FAIL): always complex in the translation
 - `np.resize[empty]` (RUN-FAIL): resizing an empty array
-- `np.roots[complex]` (XLATE-FAIL): always complex in the translation
-- `np.roots[ties]` (DIFF): the roots in another order (eigenvalue order)
 - `np.setxor1d[nan]` (DIFF): NaN treated as one value
 - `np.vander[empty]` (RUN-FAIL): an empty array
 - `np.where[empty]` (DIFF): the probe reads numpy's dtype=int64 as a number
