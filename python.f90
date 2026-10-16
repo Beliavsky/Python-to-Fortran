@@ -295,6 +295,8 @@ public :: np_window !@pyapi kind=function ret=real(dp)(:) args=kind_name:charact
 public :: np_poly_roots !@pyapi kind=function ret=real(dp)(:) args=r:real(dp)(:):intent(in) lib=polynomial desc="np.poly(roots): the monic polynomial with these roots, highest degree first"
 public :: np_polyadd !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),sgn:integer:intent(in) lib=polynomial desc="np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the shorter is padded with leading zeros (generic: np_polyadd_real, np_polyadd_int)"
 public :: np_polymul !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=polynomial desc="np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real, np_polymul_int)"
+public :: powfromroots_complex !@pyapi kind=function ret=complex(dp)(:) args=r:complex(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyfromroots of complex roots: the coefficients, lowest degree first, of the product of (x - r(k))"
+public :: opoly_cx !@pyapi kind=function ret=complex(dp)(:) args=re:real(dp)(:):intent(in),im:real(dp)(:):intent(in),trim:logical:intent(in) lib=polynomial desc="complex series coefficients re + 1j*im of two real series (the shorter padded with zeros), trailing zeros dropped with trim (numpy trimseq)"
 public :: np_polydiv_complex !@pyapi kind=function ret=complex(dp)(:) args=u:complex(dp)(:):intent(in),v:complex(dp)(:):intent(in),part:integer:intent(in) lib=polynomial desc="np.polydiv(u, v)[part] of complex polynomials: the quotient (part 0) or the remainder (part 1), as np_polydiv"
 public :: np_polydiv !@pyapi kind=function ret=real(dp)(:) args=u:real(dp)(:):intent(in),v:real(dp)(:):intent(in),part:integer:intent(in) lib=polynomial desc="np.polydiv(u, v)[part]: the quotient (part 0) or the remainder (part 1), with numpy's algorithm (leading remainder terms close to zero, allclose with rtol 1e-14, are dropped)"
 public :: np_polyint !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in),k:real(dp)(:):intent(in):optional lib=polynomial desc="np.polyint(p, m, k): m antiderivatives, integration constants k (a scalar for all, or one per integration; default 0)"
@@ -385,6 +387,15 @@ public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:
 public :: linalg_cond !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) lib=linalg desc="2-norm condition number using SVD singular values"
 public :: linalg_matrix_rank !@pyapi kind=function ret=integer args=a:real(dp)(:,:):intent(in) lib=linalg desc="numerical matrix rank using SVD singular values and NumPy-like tolerance"
 public :: linalg_eigvals !@pyapi kind=function ret=complex(dp)(:) args=a:real(dp)(:,:):intent(in) lib=linalg desc="eigenvalues of real or complex square matrix"
+public :: complex_embed !@pyapi kind=function ret=real(dp)(:,:) args=a:complex(dp)(:,:):intent(in) lib=linalg desc="the real matrix [Re(A), -Im(A); Im(A), Re(A)] of a complex matrix A"
+public :: linalg_inv_complex !@pyapi kind=function ret=complex(dp)(:,:) args=a:complex(dp)(:,:):intent(in) lib=linalg desc="np.linalg.inv of a complex matrix (through its real embedding)"
+public :: linalg_pinv_complex !@pyapi kind=function ret=complex(dp)(:,:) args=a:complex(dp)(:,:):intent(in) lib=linalg desc="np.linalg.pinv of a complex matrix (through its real embedding)"
+public :: linalg_cond_complex !@pyapi kind=function ret=real(dp) args=a:complex(dp)(:,:):intent(in) lib=linalg desc="np.linalg.cond (2-norm) of a complex matrix"
+public :: linalg_eigvalsh_complex !@pyapi kind=function ret=real(dp)(:) args=a:complex(dp)(:,:):intent(in) lib=linalg desc="np.linalg.eigvalsh of a complex Hermitian matrix (its lower triangle)"
+public :: linalg_det_complex !@pyapi kind=function ret=complex(dp) args=a:complex(dp)(:,:):intent(in) lib=linalg desc="np.linalg.det of a complex matrix (LU with partial pivoting)"
+public :: linalg_matrix_power_complex !@pyapi kind=function ret=complex(dp)(:,:) args=a:complex(dp)(:,:):intent(in),p:integer:intent(in) lib=linalg desc="np.linalg.matrix_power of a complex matrix"
+public :: linalg_cholesky_complex !@pyapi kind=function ret=complex(dp)(:,:) args=a:complex(dp)(:,:):intent(in) lib=linalg desc="np.linalg.cholesky of a complex Hermitian positive-definite matrix: lower L with a real positive diagonal"
+public :: linalg_eig_complex !@pyapi kind=subroutine args=a:complex(dp)(:,:):intent(in),w:complex(dp)(:):intent(out),v:complex(dp)(:,:):intent(out) lib=linalg desc="np.linalg.eig of a complex matrix, eigenvectors normalized as zgeev (unit norm, largest component real)"
 public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:complex(dp)(:):intent(out),v:complex(dp)(:,:):intent(out) lib=linalg desc="complex right eigenpairs of real square matrix using LAPACK DGEEV"
 public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) lib=linalg desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
 public :: linalg_eigvalsh !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) lib=linalg desc="eigenvalues only of real symmetric matrix using LAPACK DSYEV (jobz='N')"
@@ -13527,6 +13538,178 @@ contains
          end do
       end function linalg_cholesky
 
+      pure function complex_embed(a) result(e)
+         ! The real matrix [Re(A), -Im(A); Im(A), Re(A)] of a complex A: sums,
+         ! products, inverses, conjugate transposes and pseudo-inverses of
+         ! complex matrices are those of their embeddings.
+         complex(dp), intent(in) :: a(:,:)
+         real(dp), allocatable :: e(:,:)
+         integer :: m, n
+         m = size(a, 1)
+         n = size(a, 2)
+         allocate(e(2*m, 2*n))
+         e(1:m, 1:n) = real(a, dp)
+         e(1:m, n+1:2*n) = -aimag(a)
+         e(m+1:2*m, 1:n) = aimag(a)
+         e(m+1:2*m, n+1:2*n) = real(a, dp)
+      end function complex_embed
+
+      pure function complex_unembed(e, m, n) result(a)
+         ! The complex m-by-n matrix whose embedding is e.
+         real(dp), intent(in) :: e(:,:)
+         integer, intent(in) :: m, n
+         complex(dp), allocatable :: a(:,:)
+         a = cmplx(e(1:m, 1:n), e(m+1:2*m, 1:n), dp)
+      end function complex_unembed
+
+      function linalg_inv_complex(a) result(ai)
+         ! np.linalg.inv of a complex matrix (through its real embedding).
+         complex(dp), intent(in) :: a(:,:)
+         complex(dp), allocatable :: ai(:,:)
+         if (size(a, 1) /= size(a, 2)) error stop "linalg_inv: matrix must be square"
+         ai = complex_unembed(linalg_inv(complex_embed(a)), size(a, 1), size(a, 1))
+      end function linalg_inv_complex
+
+      function linalg_pinv_complex(a) result(ap)
+         ! np.linalg.pinv of a complex matrix (through its real embedding,
+         ! whose singular values are A's, each twice).
+         complex(dp), intent(in) :: a(:,:)
+         complex(dp), allocatable :: ap(:,:)
+         ap = complex_unembed(linalg_pinv(complex_embed(a)), size(a, 2), size(a, 1))
+      end function linalg_pinv_complex
+
+      function linalg_cond_complex(a) result(cnd)
+         ! np.linalg.cond (2-norm) of a complex matrix.
+         complex(dp), intent(in) :: a(:,:)
+         real(dp) :: cnd
+         cnd = linalg_cond(complex_embed(a))
+      end function linalg_cond_complex
+
+      function linalg_eigvalsh_complex(a) result(w)
+         ! np.linalg.eigvalsh of a complex Hermitian matrix (its lower
+         ! triangle, as numpy): the embedding is symmetric, with each
+         ! eigenvalue twice.
+         complex(dp), intent(in) :: a(:,:)
+         real(dp), allocatable :: w(:), w2(:)
+         complex(dp), allocatable :: h(:,:)
+         integer :: i, j, n
+         n = size(a, 1)
+         if (size(a, 2) /= n) error stop "linalg_eigvalsh: matrix must be square"
+         allocate(h(n, n))
+         do j = 1, n
+            h(j, j) = cmplx(real(a(j, j), dp), 0.0_dp, dp)
+            do i = j + 1, n
+               h(i, j) = a(i, j)
+               h(j, i) = conjg(a(i, j))
+            end do
+         end do
+         w2 = linalg_eigvalsh(complex_embed(h))
+         w = w2(1:2*n:2)
+      end function linalg_eigvalsh_complex
+
+      pure function linalg_det_complex(a) result(detv)
+         ! np.linalg.det of a complex matrix: LU with partial pivoting.
+         complex(dp), intent(in) :: a(:,:)
+         complex(dp) :: detv
+         complex(dp), allocatable :: lu(:,:), row(:)
+         integer :: n, k, p
+         n = size(a, 1)
+         if (size(a, 2) /= n) error stop "linalg_det: matrix must be square"
+         lu = a
+         detv = (1.0_dp, 0.0_dp)
+         do k = 1, n
+            p = k - 1 + maxloc(abs(real(lu(k:n, k), dp)) + abs(aimag(lu(k:n, k))), 1)
+            if (lu(p, k) == (0.0_dp, 0.0_dp)) then
+               detv = (0.0_dp, 0.0_dp)
+               return
+            end if
+            if (p /= k) then
+               row = lu(k, :)
+               lu(k, :) = lu(p, :)
+               lu(p, :) = row
+               detv = -detv
+            end if
+            detv = detv * lu(k, k)
+            if (k < n) then
+               lu(k+1:n, k) = lu(k+1:n, k) / lu(k, k)
+               lu(k+1:n, k+1:n) = lu(k+1:n, k+1:n) - matmul(lu(k+1:n, k:k), lu(k:k, k+1:n))
+            end if
+         end do
+      end function linalg_det_complex
+
+      function linalg_matrix_power_complex(a, p) result(ap)
+         ! np.linalg.matrix_power of a complex matrix (by squaring; a
+         ! negative power of the inverse).
+         complex(dp), intent(in) :: a(:,:)
+         integer, intent(in) :: p
+         complex(dp), allocatable :: ap(:,:), b(:,:)
+         integer :: n, k, i
+         n = size(a, 1)
+         if (size(a, 2) /= n) error stop "linalg_matrix_power: matrix must be square"
+         allocate(ap(n, n), source=(0.0_dp, 0.0_dp))
+         do i = 1, n
+            ap(i, i) = (1.0_dp, 0.0_dp)
+         end do
+         if (p < 0) then
+            b = linalg_inv_complex(a)
+         else
+            b = a
+         end if
+         k = abs(p)
+         do while (k > 0)
+            if (mod(k, 2) == 1) ap = matmul(ap, b)
+            k = k / 2
+            if (k > 0) b = matmul(b, b)
+         end do
+      end function linalg_matrix_power_complex
+
+      function linalg_cholesky_complex(a) result(l)
+         ! np.linalg.cholesky of a complex Hermitian positive-definite
+         ! matrix (its lower triangle): lower L, real positive diagonal.
+         complex(dp), intent(in) :: a(:,:)
+         complex(dp), allocatable :: l(:,:)
+         real(dp) :: d
+         integer :: n, i, j
+         n = size(a, 1)
+         if (size(a, 2) /= n) error stop "linalg_cholesky: matrix must be square"
+         allocate(l(n, n), source=(0.0_dp, 0.0_dp))
+         do j = 1, n
+            d = real(a(j, j), dp) - sum(abs(l(j, 1:j-1))**2)
+            if (.not. (d > 0.0_dp)) error stop "linalg_cholesky: Matrix is not positive definite"
+            l(j, j) = cmplx(sqrt(d), 0.0_dp, dp)
+            do i = j + 1, n
+               l(i, j) = (a(i, j) - sum(l(i, 1:j-1) * conjg(l(j, 1:j-1)))) / l(j, j)
+            end do
+         end do
+      end function linalg_cholesky_complex
+
+      subroutine linalg_eig_complex(a, w, v)
+         ! np.linalg.eig of a complex matrix (dceigv), the eigenvectors
+         ! normalized as LAPACK's zgeev does: unit norm, the (first)
+         ! largest component real and positive.
+         complex(dp), intent(in) :: a(:,:)
+         complex(dp), allocatable, intent(out) :: w(:), v(:,:)
+         real(dp), allocatable :: ar(:,:), ai(:,:), wr(:), wi(:), zr(:,:), zi(:,:)
+         integer :: n, ierr, j, k
+         n = size(a, 1)
+         if (size(a, 2) /= n) error stop "linalg_eig: matrix must be square"
+         allocate(w(n), v(n, n))
+         if (n == 0) return
+         ar = real(a, dp)
+         ai = aimag(a)
+         allocate(wr(n), wi(n), zr(n, n), zi(n, n))
+         call dceigv(.true., ar, ai, n, wr, wi, zr, zi, ierr)
+         if (ierr /= 0) error stop "linalg_eig: dceigv failed to converge"
+         w = cmplx(wr, wi, dp)
+         v = cmplx(zr, zi, dp)
+         do j = 1, n
+            v(:, j) = v(:, j) / sqrt(sum(abs(v(:, j))**2))
+            k = maxloc(abs(v(:, j))**2, 1)
+            v(:, j) = v(:, j) * (conjg(v(k, j)) / abs(v(k, j)))
+            v(k, j) = cmplx(real(v(k, j), dp), 0.0_dp, dp)
+         end do
+      end subroutine linalg_eig_complex
+
       function linalg_det(a) result(detv)
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp) :: detv
@@ -15119,6 +15302,43 @@ contains
             y(i) = polyval_real_scalar(p, x(i))
          end do
       end function polyval_real_vec
+
+      pure function powfromroots_complex(r) result(c)
+         ! np.polynomial.polynomial.polyfromroots of complex roots: the
+         ! coefficients (lowest degree first) of the product of (x - r(k)).
+         complex(kind=dp), intent(in) :: r(:)
+         complex(kind=dp), allocatable :: c(:)
+         integer :: k, n
+         allocate(c(size(r) + 1), source=(0.0_dp, 0.0_dp))
+         c(1) = (1.0_dp, 0.0_dp)
+         n = 1
+         do k = 1, size(r)
+            c(2:n + 1) = c(1:n) - r(k) * c(2:n + 1)
+            c(1) = -r(k) * c(1)
+            n = n + 1
+         end do
+      end function powfromroots_complex
+
+      pure function opoly_cx(re, im, trim) result(z)
+         ! The complex coefficients re + 1j*im of two real series of
+         ! possibly different lengths (the shorter padded with zeros), with
+         ! trim the trailing zero coefficients dropped (at least one kept),
+         ! as numpy's trimseq.
+         real(kind=dp), intent(in) :: re(:), im(:)
+         logical, intent(in) :: trim
+         complex(kind=dp), allocatable :: z(:)
+         integer :: n
+         n = max(size(re), size(im))
+         allocate(z(n), source=(0.0_dp, 0.0_dp))
+         z(1:size(re)) = z(1:size(re)) + re
+         z(1:size(im)) = z(1:size(im)) + cmplx(0.0_dp, im, kind=dp)
+         if (trim) then
+            do while (size(z) > 1)
+               if (z(size(z)) /= (0.0_dp, 0.0_dp)) exit
+               z = z(1:size(z) - 1)
+            end do
+         end if
+      end function opoly_cx
 
       pure complex(kind=dp) function polyval_complex_scalar(p, x) result(y)
          ! np.polyval(p, x) of complex coefficients or a complex x (Horner).

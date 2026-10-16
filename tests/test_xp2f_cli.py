@@ -27532,7 +27532,7 @@ def test_xp2f_complex_and_rank3_inputs(tmp_path: Path) -> None:
         _xp2f_output_matches_numpy(tmp_path, f"xcplx{k}", code)
     # A numpy function without complex support stops instead of dropping
     # the imaginary part.
-    for k, line in enumerate(["r = np.polynomial.chebyshev.chebval(x, x)",
+    for k, line in enumerate(["r = np.polynomial.chebyshev.chebroots(x)",
                               "q, r = np.polynomial.legendre.legdiv(x, x)", "r = np.real_if_close(x)",
                               "r = np.histogram_bin_edges(x)"]):
         src = tmp_path / f"xcplx_guard{k}.py"
@@ -27609,4 +27609,53 @@ def test_xp2f_eig_and_roots_real_when_imaginary_parts_are_zero(tmp_path: Path) -
         '    print(e)\n'
         '    return e.real.sum()\n'
         'print(f(np.array([[1.0, 2.0], [-2.0, 1.0]])), f(np.array([[1.0, 2.0], [0.5, 1.0]])))\n'
+    ))
+
+
+def test_xp2f_polynomial_series_of_complex_coefficients(tmp_path: Path) -> None:
+    # np.polynomial series functions of complex coefficients (or points):
+    # linear operations by parts with numpy's trailing-zero trimming where
+    # numpy trims, mul as the bilinear combination, pow as repeated mul,
+    # fromroots (python_mod powfromroots_complex), val at complex points,
+    # vander, valfromroots, weight and trim.
+    P = "np.polynomial."
+    _xp2f_output_matches_numpy(tmp_path, "xnpolyc", (
+        'import numpy as np\n'
+        'x = np.array([0.5 + 1.0j, 1.5 + 0.0j, -2.0 - 0.5j, 3.25j])\n'
+        'xt = np.array([1.0 + 0.0j, 2.0 + 0.0j, 1.0j, 0.0 + 0.0j])\n'
+        'y = np.array([1.0, 2.0, 3.0])\n'
+        't = np.array([0.25, -0.5])\n'
+        f'for v in ({P}polynomial.polyadd(x, y), {P}chebyshev.chebsub(xt, xt.real), {P}legendre.legadd(y, xt),\n'
+        f'          {P}polynomial.polymul(x, y), {P}chebyshev.chebmul(x, x), {P}hermite_e.hermemul(xt, x[:2]),\n'
+        f'          {P}legendre.legpow(x, 2), {P}polynomial.polypow(x[:2], 3), {P}chebyshev.chebmulx(xt),\n'
+        f'          {P}laguerre.lagder(x), {P}hermite.hermint(x, m=2, k=[1.0, 2.0], lbnd=0.5),\n'
+        f'          {P}chebyshev.cheb2poly(x), {P}legendre.poly2leg(xt), {P}chebyshev.chebval(t, x),\n'
+        f'          {P}polynomial.polyval(x, x)):\n'
+        '    print(np.real(v), np.imag(v))\n'
+        f'for v in ({P}chebyshev.chebval(x, x), {P}laguerre.lagval(x, y), {P}polynomial.polyvander(x, 2), {P}polynomial.polyvalfromroots(x, x),\n'
+        f'          {P}polynomial.polyfromroots(x), {P}legendre.legfromroots(x), {P}hermite.hermweight(x),\n'
+        f'          {P}chebyshev.chebweight(x), {P}polynomial.polytrim(xt), {P}chebyshev.chebtrim(x, 2.0)):\n'
+        '    print(np.real(v), np.imag(v))\n'
+    ))
+
+
+def test_xp2f_complex_linear_algebra(tmp_path: Path) -> None:
+    # np.linalg of complex matrices: inv, pinv, cond, eigvalsh and the
+    # singular values through the real embedding [Re, -Im; Im, Re]; det and
+    # slogdet by a complex LU; cholesky (lower and upper); matrix_power; eig
+    # with eigenvectors normalized as LAPACK's zgeev (unit norm, largest
+    # component real).
+    _xp2f_output_matches_numpy(tmp_path, "xcla", (
+        'import numpy as np\n'
+        'm = np.array([[2.0 + 1.0j, 1.0 + 0.0j], [1.0 - 1.0j, 3.0 + 0.5j]])\n'
+        'mr = np.array([[2.0 + 0.0j, 1.0j, 0.5 + 0.5j], [1.0 + 0.0j, 3.0 - 1.0j, -1.0 + 0.0j]])\n'
+        'h = np.array([[4.0 + 0.0j, 1.0 - 2.0j, 0.5j], [1.0 + 2.0j, 5.0 + 0.0j, 1.0], [-0.5j, 1.0, 3.0 + 0.0j]])\n'
+        'd = np.linalg.det(m)\n'
+        's, ld = np.linalg.slogdet(h)\n'
+        'w, v = np.linalg.eig(m)\n'
+        'for a in (np.linalg.inv(m), np.linalg.pinv(mr), np.linalg.matrix_power(m, 3), np.linalg.matrix_power(m, -2),\n'
+        '          np.linalg.cholesky(h), np.linalg.cholesky(h, upper=True), v):\n'
+        '    print(np.real(a), np.imag(a))\n'
+        'print(d.real, d.imag, s.real, s.imag, ld, w.real, w.imag)\n'
+        'print(np.linalg.cond(m), np.linalg.eigvalsh(h), np.linalg.svdvals(m), np.linalg.svd(mr, compute_uv=False))\n'
     ))

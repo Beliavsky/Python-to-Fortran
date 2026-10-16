@@ -18641,6 +18641,19 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_matrix_power")
                 elif node.func.attr == "eigvalsh":
                     needed.add("linalg_eigvalsh")
+            if (isinstance(node.func, ast.Attribute) and node.func.attr in translator._LINALG_COMPLEX
+                    and (_is_linalg_module_attr(node.func.value)
+                         or (isinstance(node.func.value, ast.Name) and node.func.value.id in linalg_aliases))):
+                # The complex versions (pruned when unused).
+                needed.add(f"linalg_{node.func.attr}_complex")
+            if (isinstance(node.func, ast.Attribute) and node.func.attr in {"svd", "svdvals"}
+                    and (_is_linalg_module_attr(node.func.value)
+                         or (isinstance(node.func.value, ast.Name) and node.func.value.id in linalg_aliases))):
+                needed.update({"complex_embed", "linalg_svd_econ"})
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "slogdet"
+                    and (_is_linalg_module_attr(node.func.value)
+                         or (isinstance(node.func.value, ast.Name) and node.func.value.id in linalg_aliases))):
+                needed.add("linalg_det_complex")
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "leggauss"
@@ -30708,6 +30721,10 @@ class translator(ast.NodeVisitor):
         "nanvar", "nancumsum", "nancumprod", "nanmedian", "unique",
     }
 
+    # np.linalg functions with a complex version in python_mod
+    # (linalg_<name>_complex).
+    _LINALG_COMPLEX = {"inv", "pinv", "cond", "eigvalsh", "det", "matrix_power", "cholesky", "eig"}
+
     _COMPLEX_HELPERS = {
         "c_lt", "c_le", "c_gt", "c_ge", "c_maximum", "c_minimum", "c_round", "c_amin", "c_amax", "c_argmin",
         "c_argmax", "cumsum_complex", "cumprod_complex", "cumsum_complex_2d", "cumprod_complex_2d",
@@ -31521,6 +31538,145 @@ class translator(ast.NodeVisitor):
         "where", "clip", "rint", "log2", "sinc", "convolve", "correlate", "polyadd", "polysub", "polymul",
         "polyder", "polyint", "vander", "trapezoid", "trapz", "gradient"}
 
+    def _npoly_complex_canonical(self, node):
+        """np.polynomial.<module>.<f>(...) with a complex argument: the
+        series operations linear in the coefficients by parts (combined by
+        python_mod opoly_cx, numpy's trailing-zero trimming where numpy
+        trims), mul as the bilinear combination of the parts' products, pow
+        (a literal power) as repeated mul, the power series' val and vander
+        at complex points, valfromroots, weight and trim by their
+        definitions; None for the rest (companion, roots, fromroots, div)."""
+        fc = self._npoly_call(node)
+        if fc is None:
+            return None
+        fam, op = fc
+        args, kws = list(node.args), list(node.keywords)
+        cx = [self._expr_kind(a) == "complex" for a in args]
+        kcx = {k.arg: self._expr_kind(k.value) == "complex" for k in kws}
+        if not any(cx) and not any(kcx.values()):
+            return None
+        mod = node.func.value
+        pre = {"pow": "poly"}.get(fam, fam)
+
+        def F(name, *a, kw=()):
+            return ast.Call(func=ast.Attribute(value=mod, attr=pre + name if name != "frompoly" else "poly2" + pre,
+                                               ctx=ast.Load()), args=list(a), keywords=list(kw))
+
+        def np_(name, *a, kw=()):
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name, ctx=ast.Load()),
+                            args=list(a), keywords=list(kw))
+
+        def c(v):
+            return ast.Constant(value=v)
+
+        def parts(n, is_cx):
+            if is_cx:
+                return ast.Attribute(value=n, attr="real", ctx=ast.Load()), ast.Attribute(value=n, attr="imag",
+                                                                                           ctx=ast.Load())
+            return n, None
+
+        def cxs(re, im, trim):
+            if im is None:
+                im = np_("zeros", c(1))
+            if re is None:
+                re = np_("zeros", c(1))
+            return ast.Call(func=ast.Name(id="xp_opoly_cx", ctx=ast.Load()), args=[re, im, c(trim)], keywords=[])
+
+        def binop(a, o, b):
+            return ast.BinOp(left=a, op=o, right=b)
+        if op in {"add", "sub"} and len(args) == 2 and not kws:
+            (ar, ai), (br, bi) = parts(args[0], cx[0]), parts(args[1], cx[1])
+            zero = np_("zeros", c(1))
+            return cxs(F(op, ar, br), F(op, ai if ai is not None else zero, bi if bi is not None else zero), True)
+        if op == "mul" and len(args) == 2 and not kws:
+            (ar, ai), (br, bi) = parts(args[0], cx[0]), parts(args[1], cx[1])
+
+            def comb(terms):
+                out = None
+                for sign, p, q in terms:
+                    if p is None or q is None:
+                        continue
+                    e = F("mul", p, q)
+                    out = e if out is None and sign > 0 else F("sub", np_("zeros", c(1)), e) if out is None else \
+                        F("add" if sign > 0 else "sub", out, e)
+                return out
+            return cxs(comb([(1, ar, br), (-1, ai, bi)]), comb([(1, ar, bi), (1, ai, br)]), True)
+        if op == "pow" and len(args) == 2 and not kws and cx[0] and isinstance(args[1], ast.Constant) \
+                and isinstance(args[1].value, int) and not isinstance(args[1].value, bool) and 0 <= args[1].value <= 16:
+            n = args[1].value
+            if n == 0:
+                return binop(np_("ones", c(1)), ast.Add(), c(0j))
+            out = F("add", args[0], np_("zeros", c(1)))
+            for _ in range(n - 1):
+                out = F("mul", out, args[0])
+            return out
+        if op in {"mulx", "der", "2poly", "frompoly"} and len(args) >= 1 and cx[0] and not any(cx[1:]) \
+                and not any(kcx.values()):
+            re, im = parts(args[0], True)
+            return cxs(F(op, re, *args[1:], kw=kws), F(op, im, *args[1:], kw=kws), op in {"2poly", "frompoly"})
+        if op == "int" and len(args) == 1 and cx[0] and not any(kcx.values()):
+            # Linear in c and k: the constants go with the real part.
+            re, im = parts(args[0], True)
+            return cxs(F(op, re, kw=kws), F(op, im, kw=[k for k in kws if k.arg != "k"]), False)
+        if op == "val" and len(args) == 2 and not kws:
+            x, cc = args
+            if not cx[0]:
+                re, im = parts(cc, True)
+                return binop(F("val", x, re), ast.Add(), binop(c(1j), ast.Mult(), F("val", x, im)))
+            if int(self._rank_expr(x) or 0) <= 1 and int(self._rank_expr(cc) or 0) == 1:
+                if fam == "pow":
+                    return np_("polyval", ast.Subscript(value=cc, slice=ast.Slice(step=c(-1)), ctx=ast.Load()), x)
+                # At complex points: the same series in the power basis.
+                return np_("polyval", np_("flip", F("2poly", cc)), x)
+            return None
+        if op == "vander" and fam == "pow" and len(args) == 2 and not kws and cx[0] \
+                and int(self._rank_expr(args[0]) or 0) == 1:
+            col = ast.Call(func=ast.Attribute(value=args[0], attr="reshape", ctx=ast.Load()), args=[c(-1), c(1)],
+                           keywords=[])
+            row = ast.Call(func=ast.Attribute(value=np_("arange", binop(args[1], ast.Add(), c(1))), attr="reshape",
+                                              ctx=ast.Load()), args=[c(1), c(-1)], keywords=[])
+            return binop(col, ast.Pow(), row)
+        if op == "valfromroots" and len(args) == 2 and not kws and int(self._rank_expr(args[1]) or 0) == 1:
+            x, r = args
+            rx = int(self._rank_expr(x) or 0)
+            if rx == 0:
+                return np_("prod", binop(x, ast.Sub(), r))
+            if rx == 1:
+                d = binop(ast.Call(func=ast.Attribute(value=x, attr="reshape", ctx=ast.Load()), args=[c(-1), c(1)],
+                                   keywords=[]), ast.Sub(),
+                          ast.Call(func=ast.Attribute(value=r, attr="reshape", ctx=ast.Load()), args=[c(1), c(-1)],
+                                   keywords=[]))
+                return np_("prod", d, kw=[ast.keyword(arg="axis", value=c(1))])
+            return None
+        if op == "fromroots" and len(args) == 1 and not kws and cx[0] and int(self._rank_expr(args[0]) or 0) == 1:
+            pw = ast.Call(func=ast.Name(id="xp_powfromroots_cx", ctx=ast.Load()), args=[args[0]], keywords=[])
+            return pw if fam == "pow" else F("frompoly", pw)
+        if op == "weight" and len(args) == 1 and not kws and cx[0]:
+            x = args[0]
+            if fam == "cheb":
+                # numpy: 1/(sqrt(1 + x) * sqrt(1 - x)).
+                return binop(c(1.0), ast.Div(), binop(np_("sqrt", binop(c(1.0), ast.Add(), x)), ast.Mult(),
+                                                      np_("sqrt", binop(c(1.0), ast.Sub(), x))))
+            if fam == "leg":
+                return binop(binop(x, ast.Mult(), c(0.0)), ast.Add(), c(1.0))
+            if fam == "herm":
+                return np_("exp", ast.UnaryOp(op=ast.USub(), operand=binop(x, ast.Pow(), c(2))))
+            if fam == "herme":
+                return np_("exp", binop(c(-0.5), ast.Mult(), binop(x, ast.Pow(), c(2))))
+            if fam == "lag":
+                return np_("exp", ast.UnaryOp(op=ast.USub(), operand=x))
+            return None
+        if op == "trim" and cx[0] and len(args) <= 2 and all(k.arg == "tol" for k in kws) \
+                and int(self._rank_expr(args[0]) or 0) == 1:
+            # numpy: up to the last |c| > tol, or [0] when there is none.
+            tol = args[1] if len(args) == 2 else next((k.value for k in kws if k.arg == "tol"), c(0))
+            ab = np_("abs", args[0])
+            n = np_("size", F("trim", ab, tol))
+            head = ast.Subscript(value=args[0], slice=ast.Slice(upper=n), ctx=ast.Load())
+            return np_("where", np_("any", ast.Compare(left=np_("abs", args[0]), ops=[ast.Gt()], comparators=[tol])),
+                       head, c(0j))
+        return None
+
     def _complex_canonical(self, node):
         """numpy functions of complex arrays in terms of operations the
         translation has for complex numbers: linear functions as
@@ -31528,6 +31684,16 @@ class translator(ast.NodeVisitor):
         imaginary parts, the NaN-aware functions through a complex isnan
         (either part NaN), and others by their definitions; None when the
         call is not one of them or has no complex argument."""
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args
+                and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in self._NPOLY_MODULES):
+            cached = getattr(node, "_xp2f_complex_canonical", None)
+            if cached is not None:
+                return cached
+            new = self._npoly_complex_canonical(node)
+            if new is not None:
+                new = ast.fix_missing_locations(ast.copy_location(new, node))
+                node._xp2f_complex_canonical = new
+            return new
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value) and node.func.attr in self._COMPLEX_REWRITES
                 and node.args):
@@ -32987,6 +33153,14 @@ class translator(ast.NodeVisitor):
         return None
 
     def _expr_kind(self, node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in {"xp_opoly_cx", "xp_powfromroots_cx"}:
+            return "complex"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in self._NPOLY_MODULES):
+            _npc = self._complex_canonical(node)
+            if _npc is not None:
+                return self._expr_kind(_npc)
         self._normalize_negative_axis(node)
         _ixr = self._indexed_expression_kind_rank(node)
         if _ixr is not None:
@@ -34117,6 +34291,9 @@ class translator(ast.NodeVisitor):
                 return "complex"
             if self._is_linalg_call(node.func, {"solve"}) and len(node.args) >= 2:
                 return "complex" if any(self._expr_kind(arg) == "complex" for arg in node.args[:2]) else "real"
+            if (self._is_linalg_call(node.func, {"cholesky", "det", "inv", "pinv", "matrix_power"}) and node.args
+                    and self._expr_kind(node.args[0]) == "complex"):
+                return "complex"
             if self._is_linalg_call(node.func, {"solve", "cholesky", "det", "inv", "cond", "eig", "eigh", "svd", "qr", "lstsq", "pinv", "matrix_power", "eigvalsh", "multi_dot"}):
                 return "real"
             if (
@@ -38716,6 +38893,14 @@ class translator(ast.NodeVisitor):
         return f"reshape({self._reverse_axes(x, rank)}, [size({x})])"
 
     def _rank_expr(self, node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in {"xp_opoly_cx", "xp_powfromroots_cx"}:
+            return 1
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in self._NPOLY_MODULES):
+            _npc = self._complex_canonical(node)
+            if _npc is not None:
+                return self._rank_expr(_npc)
         _ell = self._expand_ellipsis(node)
         if _ell is not None:
             return self._rank_expr(_ell)
@@ -40723,8 +40908,10 @@ class translator(ast.NodeVisitor):
         while todo:
             n0 = todo.pop()
             for n in ast.walk(n0):
-                if isinstance(n, ast.Attribute) and n.attr in {"real", "imag"} and isinstance(n.value, ast.Name):
-                    out.add(n.value.id)
+                if isinstance(n, ast.Attribute) and n.attr in {"real", "imag"}:
+                    base = n.value.value if isinstance(n.value, ast.Subscript) else n.value
+                    if isinstance(base, ast.Name):
+                        out.add(base.id)
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
                         and n.func.attr in self._REAL_OF_COMPLEX_OK and is_numpy_name_node(n.func.value):
                     out.update(a.id for a in n.args if isinstance(a, ast.Name))
@@ -40773,6 +40960,11 @@ class translator(ast.NodeVisitor):
             ast.Subscript(value=node.value, slice=sl, ctx=node.ctx), node))
 
     def _expr_text(self, node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "xp_opoly_cx":
+            _cre, _cim, _ctrim = node.args
+            return f"opoly_cx({self.expr(_cre)}, {self.expr(_cim)}, {'.true.' if _ctrim.value else '.false.'})"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "xp_powfromroots_cx":
+            return f"powfromroots_complex({self.expr(node.args[0])})"
         _ell = self._expand_ellipsis(node)
         if _ell is not None:
             return self.expr(_ell)
@@ -46578,8 +46770,14 @@ class translator(ast.NodeVisitor):
                     and any("complex" in ast.unparse(value).lower() for value in
                             (list(cholesky_arg.args[:1]) + [kw.value for kw in cholesky_arg.keywords if kw.arg == "dtype"]))
                 )
-                if self._expr_kind(cholesky_arg) == "complex" or complex_cast:
-                    raise NotImplementedError("complex Cholesky is not supported by the real-valued helper")
+                if complex_cast:
+                    raise NotImplementedError("complex Cholesky of an astype(complex) argument: assign it first")
+                if self._expr_kind(cholesky_arg) == "complex":
+                    _ca = self.expr(cholesky_arg)
+                    if upper:
+                        # The upper factor U = L^H of the upper triangle.
+                        return f"conjg(transpose(linalg_cholesky_complex(conjg(transpose({_ca})))))"
+                    return f"linalg_cholesky_complex({_ca})"
                 _a0 = self.expr(node.args[0])
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
@@ -46591,26 +46789,36 @@ class translator(ast.NodeVisitor):
                 return f"linalg_cholesky({_a0})"
             if self._is_linalg_call(node.func, {"det"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex" and len(node.args) == 1 and not node.keywords:
+                    return f"linalg_det_complex({_a0})"
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
                 return f"linalg_det({_a0})"
             if self._is_linalg_call(node.func, {"inv"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex" and len(node.args) == 1 and not node.keywords:
+                    return f"linalg_inv_complex({_a0})"
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
                 return f"linalg_inv({_a0})"
             if self._is_linalg_call(node.func, {"pinv"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex" and len(node.args) == 1 and not node.keywords:
+                    return f"linalg_pinv_complex({_a0})"
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
                 return f"linalg_pinv({_a0})"
             if self._is_linalg_call(node.func, {"eigvalsh"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex" and len(node.args) == 1 and not node.keywords:
+                    return f"linalg_eigvalsh_complex({_a0})"
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
                 return f"linalg_eigvalsh({_a0})"
             if self._is_linalg_call(node.func, {"matrix_power"}) and len(node.args) >= 2:
                 _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex":
+                    return f"linalg_matrix_power_complex({_a0}, int({self.expr(node.args[1])}))"
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
                 if self._expr_kind(node.args[0]) in {"int", "logical"}:
@@ -46638,6 +46846,8 @@ class translator(ast.NodeVisitor):
                 return _chain
             if self._is_linalg_call(node.func, {"cond"}) and len(node.args) >= 1:
                 _a0 = self.expr(node.args[0])
+                if self._expr_kind(node.args[0]) == "complex" and len(node.args) == 1 and not node.keywords:
+                    return f"linalg_cond_complex({_a0})"
                 if self._rank_expr(node.args[0]) > 0 and self._expr_kind(node.args[0]) in {"int", "logical"}:
                     _a0 = f"real({_a0}, kind=dp)"
                 return f"linalg_cond({_a0})"
@@ -51658,9 +51868,15 @@ class translator(ast.NodeVisitor):
             ):
                 # One sign and log|det| per matrix of a stack.
                 _sl_b = max(0, int(self._rank_expr(node.value.args[0]) or 0) - 2) if node.value.args else 0
-                for _e in node.targets[0].elts[:2]:
+                _sl_cx = bool(node.value.args) and self._expr_kind(node.value.args[0]) == "complex"
+                for _k, _e in enumerate(node.targets[0].elts[:2]):
                     if isinstance(_e, ast.Name):
-                        if _sl_b:
+                        if _sl_cx and not _sl_b:
+                            if _k == 0:
+                                self._mark_complex(_e.id)
+                            else:
+                                self._mark_real(_e.id)
+                        elif _sl_b:
                             self._mark_alloc_real(self._aliased_name(_e.id), rank=_sl_b)
                         else:
                             self._mark_real(_e.id)
@@ -58317,13 +58533,14 @@ class translator(ast.NodeVisitor):
                 eig_arg = self.expr(v.args[0])
                 if self._expr_kind(v.args[0]) == "int":
                     eig_arg = f"real({eig_arg}, kind=dp)"
+                _eig_sub = "linalg_eig_complex" if self._expr_kind(v.args[0]) == "complex" else "linalg_eig"
                 if out0 != "_" and out1 != "_":
-                    self.o.w(f"call linalg_eig({eig_arg}, {out0}, {out1})")
+                    self.o.w(f"call {_eig_sub}({eig_arg}, {out0}, {out1})")
                 else:
                     self.o.w("block")
                     self.o.push()
                     self.o.w("complex(kind=dp), allocatable :: w_eig_tmp(:), v_eig_tmp(:,:)")
-                    self.o.w(f"call linalg_eig({eig_arg}, w_eig_tmp, v_eig_tmp)")
+                    self.o.w(f"call {_eig_sub}({eig_arg}, w_eig_tmp, v_eig_tmp)")
                     if out0 != "_":
                         self.o.w(f"{out0} = w_eig_tmp")
                     if out1 != "_":
@@ -58331,6 +58548,11 @@ class translator(ast.NodeVisitor):
                     self.o.pop()
                     self.o.w("end block")
                 return
+            if v.func.attr in {"eigh", "qr"} and v.args and self._expr_kind(v.args[0]) == "complex":
+                raise NotImplementedError(
+                    f"np.linalg.{v.func.attr} of a complex matrix is not supported (numpy's "
+                    + ("eigenvector phases come from LAPACK's zheevd; np.linalg.eigvalsh gives the eigenvalues)"
+                       if v.func.attr == "eigh" else "Q and R phases come from LAPACK's zgeqrf)"))
             if v.func.attr == "eigh" and len(v.args) >= 1 and len(outs) >= 2:
                 out0, out1 = outs[0], outs[1]
                 if out0 != "_" and out1 != "_":
@@ -58371,6 +58593,23 @@ class translator(ast.NodeVisitor):
                     self.o.pop()
                     self.o.w("end block")
                 return
+            if v.func.attr == "svd" and len(v.args) >= 1 and len(outs) >= 3 \
+                    and self._expr_kind(v.args[0]) == "complex":
+                # The singular values of a complex matrix (np.linalg.svdvals,
+                # svd(compute_uv=False)): its real embedding's, each twice.
+                # U and V (arbitrary phases) are not supported.
+                if not (outs[0].startswith("xp_la") and outs[2].startswith("xp_la")):
+                    raise NotImplementedError("np.linalg.svd of a complex matrix supports only the singular values "
+                                              "(svdvals or compute_uv=False)")
+                self.o.w("block")
+                self.o.push()
+                self.o.w("real(kind=dp), allocatable :: u_svd_tmp(:,:), s_svd_tmp(:), vt_svd_tmp(:,:)")
+                self.o.w(f"call linalg_svd_econ(complex_embed({self.expr(v.args[0])}), u_svd_tmp, s_svd_tmp, "
+                         "vt_svd_tmp)")
+                self.o.w(f"{outs[1]} = s_svd_tmp(1:size(s_svd_tmp):2)")
+                self.o.pop()
+                self.o.w("end block")
+                return
             if v.func.attr == "svd" and len(v.args) >= 1 and len(outs) >= 3:
                 svd_fn = "linalg_svd_econ" if _svd_call_wants_economy(v) else "linalg_svd"
                 out0, out1, out2 = outs[0], outs[1], outs[2]
@@ -58391,6 +58630,25 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"{out2} = vt_svd_tmp")
                     self.o.pop()
                     self.o.w("end block")
+                return
+            if (v.func.attr == "slogdet" and len(v.args) >= 1 and len(outs) >= 2
+                    and self._expr_kind(v.args[0]) == "complex"):
+                # numpy: sign = det / |det| (0 for a singular matrix), and
+                # log|det|.
+                self.o.w("block")
+                self.o.push()
+                self.o.w("complex(kind=dp) :: xp_slogdet_d")
+                self.o.w(f"xp_slogdet_d = linalg_det_complex({self.expr(v.args[0])})")
+                if outs[0] != "_":
+                    self.o.w("if (abs(xp_slogdet_d) > 0.0_dp) then")
+                    self.o.w(f"   {outs[0]} = xp_slogdet_d / abs(xp_slogdet_d)")
+                    self.o.w("else")
+                    self.o.w(f"   {outs[0]} = (0.0_dp, 0.0_dp)")
+                    self.o.w("end if")
+                if outs[1] != "_":
+                    self.o.w(f"{outs[1]} = log(abs(xp_slogdet_d))")
+                self.o.pop()
+                self.o.w("end block")
                 return
             if v.func.attr == "slogdet" and len(v.args) >= 1 and len(outs) >= 2:
                 a0 = self.expr(v.args[0])
@@ -63584,7 +63842,9 @@ class translator(ast.NodeVisitor):
         "opoly_from_pow", "chebpts1", "chebpts2", "linalg_eigvals_real", "linalg_eigvalsh", "linspace", "leggauss"} | {
         f"{f}{op}" for f in ("pow", "cheb", "leg", "herm", "herme", "lag")
         for op in ("val2d", "val3d", "grid2d", "grid3d")} | {
-        "opoly_val2d0", "opoly_val3d0", "opoly_grid2d", "opoly_grid3d", "powvalfromroots"}
+        "opoly_val2d0", "opoly_val3d0", "opoly_grid2d", "opoly_grid3d", "powvalfromroots"} | {
+        "opoly_cx", "powfromroots_complex", "polyval", "arange_int", "py_slice_bound", "slice1", "zeros_real",
+        "ones_real", "reversed_vec", "reversed_complex_vec", "reversed_real_vec"}
 
     def _npoly_call(self, node):
         """(Fortran family prefix, operation) of np.polynomial.<module>.<f>(...)."""
