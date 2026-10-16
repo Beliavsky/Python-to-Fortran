@@ -39,8 +39,9 @@ call is converted argument by argument:
 With int64, a helper function's default-integer result is widened
 (`int(arange_int(...), kind=ikind)`), so arithmetic and reductions on it
 are done in 64 bits, except where it is passed straight back to a helper's
-default-integer dummy. A value that overflows inside a helper (its own
-cumsum or prod) is not fixed this way.
+default-integer dummy. A helper whose result grows past its arguments
+(cumprod_int, factorial_int, ...: _INT64_HELPERS) is called as its 64-bit
+version instead, which a narrowed argument would not fix.
 
 Integer-result intrinsics without a KIND argument (size, len, nint, ...)
 get `kind=ikind`, and interface bodies import `ikind`.
@@ -1049,12 +1050,49 @@ def _import_ikind_in_interfaces(lines: List[str]) -> List[str]:
     return out
 
 
+# python.f90 helpers whose results grow faster than their arguments
+# (products, sums, factorials), called by their specific names, with a
+# 64-bit version: with int64 the call goes to it, rather than overflowing
+# inside the default-kind helper (cumprod_int(narrow_int(x)) wrapped at
+# 2**31 though x fit). Generic ones (cumsum, np_polymul, np_vander,
+# convolve, print_matrix) resolve by the arguments' kind.
+_INT64_HELPERS = (
+    "factorial_int", "comb_int", "perm_int", "cumprod_int", "cumsum_int",
+    "cumsum_int_axis0_2d", "cumsum_int_axis1_2d", "cumprod_int_axis0_2d",
+    "cumprod_int_axis1_2d", "gcd_int_scalar", "lcm_int_scalar", "lcm_int",
+    "np_polymul_int", "np_vander_int", "convolve_int",
+)
+
+
+def _use_int64_helpers(lines: List[str]) -> List[str]:
+    """Rename calls to the _INT64_HELPERS a unit imports from python_mod
+    (and the names in its use statement) to their _i64 versions."""
+    used = set()
+    in_use = False
+    for ln in lines:
+        code = _split_code_comment(ln)[0]
+        if re.match(r"^\s*use\s+python_mod\b", code, re.IGNORECASE) or in_use:
+            used.update(n.lower() for n in re.findall(r"[A-Za-z_]\w*", code))
+            in_use = code.rstrip().endswith("&")
+    names = [n for n in _INT64_HELPERS if n in used]
+    if not names:
+        return lines
+    pat = re.compile(r"\b(" + "|".join(names) + r")\b", re.IGNORECASE)
+    out = []
+    for ln in lines:
+        code, comment = _split_code_comment(ln)
+        out.append(pat.sub(lambda m: m.group(1) + "_i64", code) + comment)
+    return out
+
+
 def add_integer_kind(lines: List[str], kind_name: str) -> List[str]:
     """Rewrite bare `integer` declarations to `integer(kind={kind_name})`
     throughout `lines`, excluding anything passed as an actual argument to
     a known external-boundary call (see module docstring). Returns a new
     list of lines; the input is not mutated."""
     assert kind_name in ("int32", "int64"), kind_name
+    if kind_name == "int64":
+        lines = _use_int64_helpers(lines)
 
     stmts = fscan.iter_fortran_statements(lines)
     sigs, bindings = _scan_boundary_signatures()

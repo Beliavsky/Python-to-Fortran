@@ -24505,6 +24505,46 @@ def test_xp2f_int_kind_int64_helper_boundaries(tmp_path: Path) -> None:
     assert "333328333350000" in ft.stdout
 
 
+def test_xp2f_int_kind_int64_growing_helpers(tmp_path: Path) -> None:
+    # With --int-kind int64, cumprod_int(narrow_int(x)) and factorial_int(20)
+    # still wrapped at 2**31 inside the default-kind helpers, though the
+    # arguments fit: such helpers have 64-bit versions (_i64), called by
+    # name or through their generics (np_polymul, np_vander, print_matrix).
+    src = tmp_path / "xint64_growing.py"
+    src.write_text("\n".join([
+        "import math",
+        "import numpy as np",
+        "x = np.array([1000, 1000, 1000, 1000])",
+        "print(np.cumprod(x))",
+        "a = np.array([[1000, 2000], [3000, 4000], [5000, 6000]])",
+        "print(np.cumprod(a, axis=0))",
+        "print(np.cumprod(a, axis=1))",
+        "big = np.array([2000000000, 2000000000, 2000000000])",
+        "print(np.cumsum(big))",
+        "b2 = np.array([[2000000000, 2000000000], [2000000000, 2000000000]])",
+        "print(np.cumsum(b2, axis=0))",
+        "print(np.cumsum(b2, axis=1))",
+        "print(math.factorial(20))",
+        "print(math.comb(62, 31))",
+        "print(math.perm(20, 15))",
+        "print(math.lcm(100003, 100019))",
+        "print(np.lcm(np.array([100003, 6]), np.array([100019, 4])))",
+        "print(np.polymul(np.array([100000, 1]), np.array([100000, 1])))",
+        "print(np.vander(np.array([1000, 2000]), 4))",
+        "print(np.vander(np.array([0.5, 2.0]), len(x)))",
+        "print(np.convolve(np.array([100000, 100000]), np.array([100000, 100000])))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--int-kind", "int64", "--compile", "--run-diff"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    f90 = (tmp_path / "xint64_growing_p.f90").read_text(encoding="utf-8")
+    assert "cumprod_int_i64(" in f90 and "factorial_int_i64(" in f90, f90
+
+
 
 
 @pytest.mark.parametrize("lines", [

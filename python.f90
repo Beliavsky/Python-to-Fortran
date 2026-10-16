@@ -25,8 +25,11 @@ end type strvec_t
 public :: isqrt_int       !@pyapi kind=function ret=integer args=x:integer:intent(in) lib=integers desc="integer square root: return floor(sqrt(x)) for x >= 0"
 public :: mod_pow_int !@pyapi kind=function ret=integer args=base:integer:intent(in),exp:integer:intent(in),modulus:integer:intent(in) lib=integers desc="modular exponentiation: pow(base, exp, modulus) for integer inputs"
 public :: factorial_int !@pyapi kind=function ret=integer args=x:integer:intent(in) lib=integers desc="factorial for nonnegative integers"
+public :: factorial_int_i64 !@pyapi kind=function ret=integer(int64) args=x:integer(int64):intent(in) lib=integers desc="factorial of a 64-bit integer"
 public :: comb_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in) lib=integers desc="binomial coefficient for integer inputs"
+public :: comb_int_i64 !@pyapi kind=function ret=integer(int64) args=n:integer(int64):intent(in),k:integer(int64):intent(in) lib=integers desc="binomial coefficient of 64-bit integers (no intermediate overflow while the result fits)"
 public :: perm_int !@pyapi kind=function ret=integer args=n:integer:intent(in),k:integer:intent(in):optional lib=integers desc="permutations nPk for integer inputs"
+public :: perm_int_i64 !@pyapi kind=function ret=integer(int64) args=n:integer(int64):intent(in),k:integer(int64):intent(in):optional lib=integers desc="permutations nPk of 64-bit integers"
 public :: print_int_list  !@pyapi kind=subroutine args=a:integer(:):intent(in),n:integer:intent(in) desc="print integer list a(1:n) in python-style [..] format"
 public :: print_char_list  !@pyapi kind=subroutine args=a:character(:):intent(in),n:integer:intent(in) desc="print character list a(1:n) in python-style [..] format"
 public :: grow_and_set_char !@pyapi kind=subroutine args=arr:character(:)(:):intent(inout),idx:integer:intent(in),item:character(*):intent(in) desc="grow allocatable character list arr (size and/or declared length) so index idx and item both fit, then set arr(idx) = item"
@@ -211,17 +214,23 @@ public :: tile_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:)
 public :: diag_from_vec_int !@pyapi kind=function ret=integer(:,:) args=v:integer(:):intent(in) lib=arrays desc="return diagonal matrix from integer vector"
 public :: diagonal !@pyapi kind=function ret=any args=a:any:intent(in),offset:integer:intent(in):optional lib=arrays desc="numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays"
 public :: cumprod_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=arrays desc="cumulative product of integer vector"
+public :: cumprod_int_i64 !@pyapi kind=function ret=integer(int64)(:) args=x:integer(int64)(:):intent(in) lib=arrays desc="cumulative product of a 64-bit integer vector"
 public :: repeat_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat each integer element reps times"
 public :: repeat_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat rows of integer matrix reps times"
 public :: repeat_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat columns of integer matrix reps times"
 public :: diag_from_mat_real !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) lib=arrays desc="return main diagonal of real matrix"
 public :: cumsum_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) lib=arrays desc="cumulative sum of integer vector"
+public :: cumsum_int_i64 !@pyapi kind=function ret=integer(int64)(:) args=x:integer(int64)(:):intent(in) lib=arrays desc="cumulative sum of a 64-bit integer vector"
 public :: cumsum_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative sum of integer matrix along axis 0"
+public :: cumsum_int_axis0_2d_i64 !@pyapi kind=function ret=integer(int64)(:,:) args=x:integer(int64)(:,:):intent(in) lib=arrays desc="cumulative sum of a 64-bit integer matrix along axis 0"
 public :: cumsum_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative sum of integer matrix along axis 1"
+public :: cumsum_int_axis1_2d_i64 !@pyapi kind=function ret=integer(int64)(:,:) args=x:integer(int64)(:,:):intent(in) lib=arrays desc="cumulative sum of a 64-bit integer matrix along axis 1"
 public :: cumprod_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="cumulative product of real matrix along axis 0"
 public :: cumprod_real_axis1_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="cumulative product of real matrix along axis 1"
 public :: cumprod_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative product of integer matrix along axis 0"
+public :: cumprod_int_axis0_2d_i64 !@pyapi kind=function ret=integer(int64)(:,:) args=x:integer(int64)(:,:):intent(in) lib=arrays desc="cumulative product of a 64-bit integer matrix along axis 0"
 public :: cumprod_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in) lib=arrays desc="cumulative product of integer matrix along axis 1"
+public :: cumprod_int_axis1_2d_i64 !@pyapi kind=function ret=integer(int64)(:,:) args=x:integer(int64)(:,:):intent(in) lib=arrays desc="cumulative product of a 64-bit integer matrix along axis 1"
 public :: itertools_product2_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="itertools.product(a,b) for integer vectors"
 public :: itertools_combinations_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations(x,r) for integer vectors (r=2 currently)"
 public :: itertools_combinations_wr_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations_with_replacement(x,r) for integer vectors (r=2 currently)"
@@ -376,9 +385,14 @@ public :: i0_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in
 public :: sinc_scalar !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=special desc="normalized sinc(x) = sin(pi*x)/(pi*x) with sinc(0)=1"
 public :: signbit_real !@pyapi kind=function ret=logical args=x:real(dp):intent(in) lib=arrays desc="true when IEEE sign bit is set (including -0.0)"
 public :: gcd_int_scalar !@pyapi kind=function ret=integer args=a:integer:intent(in),b:integer:intent(in) lib=integers desc="greatest common divisor"
+public :: gcd_int_scalar_i64 !@pyapi kind=function ret=integer(int64) args=a:integer(int64):intent(in),b:integer(int64):intent(in) lib=integers desc="greatest common divisor of 64-bit integers"
 public :: lcm_int_scalar !@pyapi kind=function ret=integer args=a:integer:intent(in),b:integer:intent(in) lib=integers desc="least common multiple"
+public :: lcm_int_scalar_i64 !@pyapi kind=function ret=integer(int64) args=a:integer(int64):intent(in),b:integer(int64):intent(in) lib=integers desc="least common multiple of 64-bit integers"
+public :: np_polymul_int_i64 !@pyapi kind=function ret=integer(int64)(:) args=a:integer(int64)(:):intent(in),b:integer(int64)(:):intent(in) lib=polynomial desc="np.polymul of 64-bit integer coefficients"
+public :: np_vander_int_i64 !@pyapi kind=function ret=integer(int64)(:,:) args=x:integer(int64)(:):intent(in),n:integer:intent(in),increasing:logical:intent(in) lib=polynomial desc="np.vander of a 64-bit integer vector"
 public :: gcd_int !@pyapi kind=function ret=integer args=a:integer(:):intent(in) lib=integers desc="greatest common divisor of integer array"
 public :: lcm_int !@pyapi kind=function ret=integer args=a:integer(:):intent(in) lib=integers desc="least common multiple of integer array"
+public :: lcm_int_i64 !@pyapi kind=function ret=integer(int64) args=a:integer(int64)(:):intent(in) lib=integers desc="least common multiple of a 64-bit integer array"
 public :: interp_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),xp:real(dp)(:):intent(in),fp:real(dp)(:):intent(in) lib=calculus desc="1D linear interpolation with endpoint clamping"
 public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in) lib=linalg desc="solve linear system A x = b using LAPACK DGESV"
 public :: linalg_solve_safe !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in),x:real(dp)(:):intent(out),ok:logical:intent(out) lib=linalg desc="solve linear system A x = b using LAPACK DGESV and return success status"
@@ -433,6 +447,7 @@ public :: diff_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real
 public :: diff_axis1_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=arrays desc="first difference along axis 1 for a real matrix"
 public :: sliding_window_view_axis0_real_2d !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:):intent(in),window:integer:intent(in) lib=arrays desc="axis-0 sliding window view for a real matrix"
 public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional,np_same:logical:intent(in):optional lib=signal desc="1D integer convolution with mode full/same/valid"
+public :: convolve_int_i64 !@pyapi kind=function ret=integer(int64)(:) args=x:integer(int64)(:):intent(in),h:integer(int64)(:):intent(in),mode:character(*):intent(in):optional,np_same:logical:intent(in):optional lib=signal desc="1D convolution of 64-bit integer vectors, mode full/same/valid"
 public :: correlate_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),mode:character:intent(in):optional,np_same:logical:intent(in):optional lib=signal desc="1D cross-correlation with mode full/same/valid (scipy.signal.correlate; np.correlate's same with np_same)"
 public :: lfilter_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) lib=signal desc="1D IIR/FIR filter, zero initial conditions (scipy.signal.lfilter)"
 public :: filtfilt_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in),x:real(dp)(:):intent(in) lib=signal desc="zero-phase forward-backward filter, no edge padding (scipy.signal.filtfilt)"
@@ -671,11 +686,11 @@ public :: complex_amin !@pyapi kind=function ret=complex(dp) args=arr:complex(dp
 public :: complex_amax !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) lib=arrays desc="np.amax/np.max on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MAXVAL can't do since it rejects complex operands entirely"
 
 interface cumsum
-   module procedure cumsum_real, cumsum_int
+   module procedure cumsum_real, cumsum_int, cumsum_int_i64
 end interface cumsum
 
 interface cumprod
-   module procedure cumprod_real, cumprod_int
+   module procedure cumprod_real, cumprod_int, cumprod_int_i64
 end interface cumprod
 
 interface matrix_norm2
@@ -938,11 +953,11 @@ interface np_polyadd
 end interface np_polyadd
 
 interface np_vander
-   module procedure np_vander_real, np_vander_int
+   module procedure np_vander_real, np_vander_int, np_vander_int_i64
 end interface np_vander
 
 interface np_polymul
-   module procedure np_polymul_real, np_polymul_int, np_polymul_complex
+   module procedure np_polymul_real, np_polymul_int, np_polymul_int_i64, np_polymul_complex
 end interface np_polymul
 
 interface histogram
@@ -1060,6 +1075,7 @@ end interface optval
 interface convolve
    module procedure convolve_real
    module procedure convolve_int
+   module procedure convolve_int_i64
 end interface convolve
 
 interface print_matrix
@@ -1067,6 +1083,8 @@ interface print_matrix
    module procedure print_matrix_label_real_2d
    module procedure print_matrix_int_2d
    module procedure print_matrix_label_int_2d
+   module procedure print_matrix_int64_2d
+   module procedure print_matrix_label_int64_2d
    module procedure print_matrix_logical_2d
    module procedure print_matrix_complex_2d
 end interface print_matrix
@@ -1169,6 +1187,20 @@ contains
          end do
       end function factorial_int
 
+      pure integer(kind=int64) function factorial_int_i64(x) result(v)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x
+         integer(kind=int64) :: i
+         if (x < 0) then
+            v = 0
+            return
+         end if
+         v = 1
+         do i = 2, x
+            v = v * i
+         end do
+      end function factorial_int_i64
+
       pure integer function comb_int(n, k) result(v)
          integer, intent(in) :: n, k
          integer :: i, kk
@@ -1183,6 +1215,25 @@ contains
             v = (v * (n - kk + i)) / i
          end do
       end function comb_int
+
+      pure integer(kind=int64) function comb_int_i64(n, k) result(v)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: n, k
+         integer(kind=int64) :: i, kk, g, f
+         if (n < 0 .or. k < 0 .or. k > n) then
+            v = 0
+            return
+         end if
+         kk = min(k, n - k)
+         v = 1
+         do i = 1, kk
+            ! v * (n - kk + i) is divisible by i; dividing first by
+            ! g = gcd(v, i) leaves i / g dividing n - kk + i.
+            g = gcd_int_scalar_i64(v, i)
+            f = (n - kk + i) / (i / g)
+            v = (v / g) * f
+         end do
+      end function comb_int_i64
 
       pure integer function perm_int(n, k) result(v)
          integer, intent(in) :: n
@@ -1203,6 +1254,27 @@ contains
             v = v * i
          end do
       end function perm_int
+
+      pure integer(kind=int64) function perm_int_i64(n, k) result(v)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: n
+         integer(kind=int64), intent(in), optional :: k
+         integer(kind=int64) :: i, kk
+         if (present(k)) then
+            kk = k
+         else
+            kk = n
+         end if
+         if (n < 0 .or. kk < 0 .or. kk > n) then
+            v = 0
+            return
+         end if
+         v = 1
+         if (kk <= 0) return
+         do i = n - kk + 1, n
+            v = v * i
+         end do
+      end function perm_int_i64
 
       pure elemental real(kind=dp) function special_factorial(x) result(v)
          real(kind=dp), intent(in) :: x
@@ -1486,8 +1558,9 @@ contains
          end do
       end subroutine print_matrix_real_2d
 
-      subroutine print_matrix_int_2d(a)
-         integer, intent(in) :: a(:,:)
+      subroutine print_matrix_int64_2d(a)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: a(:,:)
          integer :: i, j, pad, w
          character(len=64) :: buf
 
@@ -1526,6 +1599,12 @@ contains
                write(*, "(a)") "]"
             end if
          end do
+      end subroutine print_matrix_int64_2d
+
+      subroutine print_matrix_int_2d(a)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer, intent(in) :: a(:,:)
+         call print_matrix_int64_2d(int(a, kind=int64))
       end subroutine print_matrix_int_2d
 
       subroutine print_matrix_complex_2d(a)
@@ -1890,6 +1969,14 @@ contains
          write(*, "(a)") trim(label)
          call print_matrix_int_2d(a)
       end subroutine print_matrix_label_int_2d
+
+      subroutine print_matrix_label_int64_2d(label, a)
+         use, intrinsic :: iso_fortran_env, only: int64
+         character(len=*), intent(in) :: label
+         integer(kind=int64), intent(in) :: a(:,:)
+         write(*, "(a)") trim(label)
+         call print_matrix_int64_2d(a)
+      end subroutine print_matrix_label_int64_2d
 
       pure function py_str_int32(x) result(s)
          integer, intent(in) :: x
@@ -9785,6 +9872,21 @@ contains
          end if
       end function cumprod_int
 
+      pure function cumprod_int_i64(x) result(y)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:)
+         integer(kind=int64), allocatable :: y(:)
+         integer(kind=int64) :: i, n
+         n = size(x)
+         allocate(y(1:n))
+         if (n >= 1) then
+            y(1) = x(1)
+            do i = 2, n
+               y(i) = y(i-1) * x(i)
+            end do
+         end if
+      end function cumprod_int_i64
+
       pure function repeat_int(x, reps) result(y)
          integer, intent(in) :: x(:)
          integer, intent(in) :: reps
@@ -9925,6 +10027,21 @@ contains
          end if
       end function cumsum_int
 
+      pure function cumsum_int_i64(x) result(y)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:)
+         integer(kind=int64), allocatable :: y(:)
+         integer(kind=int64) :: i, n
+         n = size(x)
+         allocate(y(1:n))
+         if (n >= 1) then
+            y(1) = x(1)
+            do i = 2, n
+               y(i) = y(i-1) + x(i)
+            end do
+         end if
+      end function cumsum_int_i64
+
       pure function cumsum_int_axis0_2d(x) result(y)
          integer, intent(in) :: x(:,:)
          integer, allocatable :: y(:,:)
@@ -9940,6 +10057,22 @@ contains
          end if
       end function cumsum_int_axis0_2d
 
+      pure function cumsum_int_axis0_2d_i64(x) result(y)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:,:)
+         integer(kind=int64), allocatable :: y(:,:)
+         integer(kind=int64) :: i, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (m >= 1) then
+            y(1,:) = x(1,:)
+            do i = 2, m
+               y(i,:) = y(i-1,:) + x(i,:)
+            end do
+         end if
+      end function cumsum_int_axis0_2d_i64
+
       pure function cumsum_int_axis1_2d(x) result(y)
          integer, intent(in) :: x(:,:)
          integer, allocatable :: y(:,:)
@@ -9954,6 +10087,22 @@ contains
             end do
          end if
       end function cumsum_int_axis1_2d
+
+      pure function cumsum_int_axis1_2d_i64(x) result(y)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:,:)
+         integer(kind=int64), allocatable :: y(:,:)
+         integer(kind=int64) :: j, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (n >= 1) then
+            y(:,1) = x(:,1)
+            do j = 2, n
+               y(:,j) = y(:,j-1) + x(:,j)
+            end do
+         end if
+      end function cumsum_int_axis1_2d_i64
 
       pure function cumprod_real_axis0_2d(x) result(y)
          real(kind=dp), intent(in) :: x(:,:)
@@ -10000,6 +10149,22 @@ contains
          end if
       end function cumprod_int_axis0_2d
 
+      pure function cumprod_int_axis0_2d_i64(x) result(y)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:,:)
+         integer(kind=int64), allocatable :: y(:,:)
+         integer(kind=int64) :: i, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (m >= 1) then
+            y(1,:) = x(1,:)
+            do i = 2, m
+               y(i,:) = y(i-1,:) * x(i,:)
+            end do
+         end if
+      end function cumprod_int_axis0_2d_i64
+
       pure function cumprod_int_axis1_2d(x) result(y)
          integer, intent(in) :: x(:,:)
          integer, allocatable :: y(:,:)
@@ -10014,6 +10179,22 @@ contains
             end do
          end if
       end function cumprod_int_axis1_2d
+
+      pure function cumprod_int_axis1_2d_i64(x) result(y)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:,:)
+         integer(kind=int64), allocatable :: y(:,:)
+         integer(kind=int64) :: j, m, n
+         m = size(x,1)
+         n = size(x,2)
+         allocate(y(1:m,1:n))
+         if (n >= 1) then
+            y(:,1) = x(:,1)
+            do j = 2, n
+               y(:,j) = y(:,j-1) * x(:,j)
+            end do
+         end if
+      end function cumprod_int_axis1_2d_i64
 
       pure function diag_from_vec_real(v) result(x)
          real(kind=dp), intent(in) :: v(:)
@@ -12471,6 +12652,23 @@ contains
          if (.not. increasing) v = v(:, n:1:-1)
       end function np_vander_int
 
+      pure function np_vander_int_i64(x, n, increasing) result(v)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: x(:)
+         integer, intent(in) :: n
+         logical, intent(in) :: increasing
+         integer(kind=int64), allocatable :: v(:,:)
+         integer(kind=int64) :: j
+         if (n < 0) error stop "np.vander: N must be non-negative"
+         allocate(v(size(x), n))
+         if (n == 0) return
+         v(:, 1) = 1
+         do j = 2, n
+            v(:, j) = v(:, j - 1) * x
+         end do
+         if (.not. increasing) v = v(:, n:1:-1)
+      end function np_vander_int_i64
+
       pure function powvander(x, deg) result(v)
          ! Pseudo-Vandermonde matrix of the power series (np.polynomial.polynomial, lowest degree first): v(i, j+1) is the basis
          ! function of degree j at x(i).
@@ -12968,6 +13166,33 @@ contains
          end function lead_trimmed
       end function np_polymul_int
 
+      pure function np_polymul_int_i64(a, b) result(c)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: a(:), b(:)
+         integer(kind=int64), allocatable :: c(:), a1(:), b1(:)
+         integer(kind=int64) :: i
+         a1 = lead_trimmed(a)
+         b1 = lead_trimmed(b)
+         allocate(c(size(a1) + size(b1) - 1), source=0_int64)
+         do i = 1, size(a1)
+            c(i:i + size(b1) - 1) = c(i:i + size(b1) - 1) + a1(i) * b1
+         end do
+      contains
+         pure function lead_trimmed(x) result(y)
+            integer(kind=int64), intent(in) :: x(:)
+            integer(kind=int64), allocatable :: y(:)
+            integer(kind=int64) :: k
+            do k = 1, size(x)
+               if (x(k) /= 0) exit
+            end do
+            if (k > size(x)) then
+               y = [0]
+            else
+               y = x(k:)
+            end if
+         end function lead_trimmed
+      end function np_polymul_int_i64
+
       pure function np_polymul_complex(a, b) result(c)
          complex(kind=dp), intent(in) :: a(:), b(:)
          complex(kind=dp), allocatable :: c(:), a1(:), b1(:)
@@ -13341,6 +13566,20 @@ contains
          g = x
       end function gcd_int_scalar
 
+      pure elemental function gcd_int_scalar_i64(a, b) result(g)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: a, b
+         integer(kind=int64) :: g, x, y, t
+         x = abs(a)
+         y = abs(b)
+         do while (y /= 0)
+            t = modulo(x, y)
+            x = y
+            y = t
+         end do
+         g = x
+      end function gcd_int_scalar_i64
+
       pure elemental function lcm_int_scalar(a, b) result(l)
          integer, intent(in) :: a, b
          integer :: l, g
@@ -13351,6 +13590,18 @@ contains
          g = gcd_int_scalar(a, b)
          l = abs((a / g) * b)
       end function lcm_int_scalar
+
+      pure elemental function lcm_int_scalar_i64(a, b) result(l)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: a, b
+         integer(kind=int64) :: l, g
+         if (a == 0 .or. b == 0) then
+            l = 0
+            return
+         end if
+         g = gcd_int_scalar_i64(a, b)
+         l = abs((a / g) * b)
+      end function lcm_int_scalar_i64
 
       pure function gcd_int(a) result(g)
          integer, intent(in) :: a(:)
@@ -13377,6 +13628,20 @@ contains
             l = lcm_int_scalar(l, a(i))
          end do
       end function lcm_int
+
+      pure function lcm_int_i64(a) result(l)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: a(:)
+         integer(kind=int64) :: l, i
+         if (size(a) == 0) then
+            l = 1
+            return
+         end if
+         l = abs(a(1))
+         do i = 2, size(a)
+            l = lcm_int_scalar_i64(l, a(i))
+         end do
+      end function lcm_int_i64
 
       pure function interp_periodic_1d(x, xp, fp, period) result(y)
          ! np.interp(x, xp, fp, period=p): x and xp are reduced modulo |p|,
@@ -15266,6 +15531,63 @@ contains
          end if
          y = full
       end function convolve_int
+
+      function convolve_int_i64(x, h, mode, np_same) result(y)
+         use, intrinsic :: iso_fortran_env, only: int64
+         ! 1-D convolution, mode full/same/valid. "same": the length of x,
+         ! centered (scipy.signal.convolve), or with np_same numpy's
+         ! np.convolve: the longer length, from (min(nx, nh) - 1) / 2.
+         integer(kind=int64), intent(in) :: x(:), h(:)
+         character(len=*), intent(in), optional :: mode
+         logical, intent(in), optional :: np_same
+         integer(kind=int64), allocatable :: y(:), full(:)
+         integer(kind=int64) :: i, j, nx, nh, ny, start, stop
+         character(len=:), allocatable :: m
+         nx = size(x)
+         nh = size(h)
+         if (nx <= 0 .or. nh <= 0) then
+            allocate(y(0))
+            return
+         end if
+         allocate(full(nx + nh - 1))
+         full = 0
+         do i = 1, nx
+            do j = 1, nh
+               full(i + j - 1) = full(i + j - 1) + x(i) * h(j)
+            end do
+         end do
+         m = "full"
+         if (present(mode)) m = to_lower(trim(mode))
+         if (m == "full") then
+            y = full
+            return
+         end if
+         if (m == "same") then
+            ny = nx
+            start = (nh - 1) / 2 + 1
+            if (present(np_same)) then
+               if (np_same) then
+                  ny = max(nx, nh)
+                  start = (min(nx, nh) - 1) / 2 + 1
+               end if
+            end if
+            stop = start + ny - 1
+            y = full(start:stop)
+            return
+         end if
+         if (m == "valid") then
+            ny = max(nx, nh) - min(nx, nh) + 1
+            if (ny <= 0) then
+               allocate(y(0))
+            else
+               start = min(nx, nh)
+               stop = start + ny - 1
+               y = full(start:stop)
+            end if
+            return
+         end if
+         y = full
+      end function convolve_int_i64
 
       function correlate_real(x, y, mode, np_same) result(out)
          ! scipy.signal.correlate(x, y) = convolve(x, conj(y[::-1])) for
