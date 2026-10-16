@@ -10,6 +10,9 @@ through xp2f.py and compared with numpy.
     python numpy_conformance/coverage_probe.py genops
     python numpy_conformance/coverage_probe.py run --ops [START STOP] ...
     python numpy_conformance/coverage_probe.py report --ops
+    python numpy_conformance/coverage_probe.py genkinds
+    python numpy_conformance/coverage_probe.py run --kinds [START STOP] ...
+    python numpy_conformance/coverage_probe.py report --kinds
 
 gen picks, for each public function of numpy, numpy.linalg, numpy.fft and
 the six numpy.polynomial modules, the first argument list from a fixed
@@ -50,6 +53,13 @@ writes, views) from the statement templates of ops_cases.py, for the
 base fixtures and each variant set; run and report them with --ops
 (coverage/ops_results.txt, coverage/ops_report.md).
 
+genkinds makes cases of the kinds of results (kinds_cases.py): dtype= in
+each spelling and astype, the kinds numpy's functions and operators
+return for integer and boolean input, assignments into arrays of another
+kind, and user functions called with arguments of different kinds and
+ranks; run and report them with --kinds (coverage/kinds_results.txt,
+coverage/kinds_report.md). Their KIND results are wrong results too.
+
 The work files (the programs and executables) are in coverage/work.
 """
 
@@ -77,6 +87,8 @@ RESULTS = OUT / "results.txt"
 VCASES = OUT / "variants.json"
 OCASES = OUT / "ops.json"
 ORESULTS = OUT / "ops_results.txt"
+KCASES = OUT / "kinds.json"
+KRESULTS = OUT / "kinds_results.txt"
 # Scratch names of the statement templates (ops_cases.py), renamed per case
 # in a grouped program as the fixtures are.
 SCRATCH = ("y", "z", "r")
@@ -302,6 +314,39 @@ def gen_ops() -> None:
                         "group": f"{g}_{k // 12}"})
     OCASES.write_text(json.dumps(out, indent=0), encoding="utf-8")
     print(len(out), "cases from", len(ops_cases.templates()), "templates")
+
+
+def gen_kinds() -> None:
+    """Result-kind cases (kinds_cases.templates) for the base fixtures,
+    kept when numpy runs them without a warning and r is a small numeric
+    array; grouped 12 to a program by kind (the function cases' names are
+    distinct, fn{k})."""
+    import numpy as np
+    sys.path.insert(0, str(HERE))
+    import kinds_cases
+    out, per_group = [], {}
+    for g, stmts in kinds_cases.templates():
+        env = {"np": np}
+        for k, src in FIX.items():
+            env[k] = eval(src, env)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                import contextlib
+                import io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exec("\n".join(stmts), env)
+        except Exception:
+            continue
+        r = env.get("r")
+        if isinstance(r, tuple) or _numeric_parts(r) is None:
+            continue
+        k = per_group.get(g, 0)
+        per_group[g] = k + 1
+        out.append({"name": "; ".join(s.replace("\n", " / ") for s in stmts), "stmts": stmts, "fixtures": {},
+                    "group": f"kinds-{g}_{k // 12}"})
+    KCASES.write_text(json.dumps(out, indent=0), encoding="utf-8")
+    print(len(out), "cases from", len(kinds_cases.templates()), "templates")
 
 
 def _rename(line: str, names, k) -> str:
@@ -570,9 +615,11 @@ def _read_results(path: Path) -> dict[str, tuple[str, str]]:
     return res
 
 
-def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool = False, ops: bool = False) -> None:
-    cases_path, results = (OCASES, ORESULTS) if ops else (VCASES, VRESULTS) if variants else (CASES, RESULTS)
-    variants = variants or ops
+def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool = False, ops: bool = False,
+        kinds: bool = False) -> None:
+    cases_path, results = ((KCASES, KRESULTS) if kinds else (OCASES, ORESULTS) if ops else
+                           (VCASES, VRESULTS) if variants else (CASES, RESULTS))
+    variants = variants or ops or kinds
     cases = json.loads(cases_path.read_text(encoding="utf-8"))[start:stop]
     WORK.mkdir(parents=True, exist_ok=True)
     done = _read_results(results)
@@ -610,19 +657,21 @@ def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool
     print(f"{len(todo)} run:", dict(counts))
 
 
-def report(variants: bool = False, ops: bool = False) -> None:
-    res = _read_results(ORESULTS if ops else VRESULTS if variants else RESULTS)
+def report(variants: bool = False, ops: bool = False, kinds: bool = False) -> None:
+    res = _read_results(KRESULTS if kinds else ORESULTS if ops else VRESULTS if variants else RESULTS)
     # Only the cases generated now (a template or variant since dropped
     # keeps its old result line).
-    cases_path = OCASES if ops else VCASES if variants else CASES
+    cases_path = KCASES if kinds else OCASES if ops else VCASES if variants else CASES
     if cases_path.exists():
         current = {c["name"] for c in json.loads(cases_path.read_text(encoding="utf-8"))}
         res = {n: v for n, v in res.items() if n in current}
     counts = Counter(st for st, _ in res.values())
     order = ["DIFF", "KIND", "RUN-FAIL", "BUILD-FAIL", "XLATE-FAIL", "PROBE-ERROR", "NOARGS", "MATCH"]
-    title = ("numpy coverage probe: methods, operators, indexing" if ops else
+    title = ("numpy coverage probe: kinds of results" if kinds else
+             "numpy coverage probe: methods, operators, indexing" if ops else
              "numpy coverage probe: input variants" if variants else "numpy coverage probe")
-    lines = [f"# {title}", "", f"{len(res)} {'cases' if ops else 'variants' if variants else 'functions'}.", "",
+    lines = [f"# {title}", "", f"{len(res)} {'cases' if ops or kinds else 'variants' if variants else 'functions'}.",
+             "",
              "| status | count |", "|---|---|"]
     lines += [f"| {st} | {counts[st]} |" for st in order if counts[st]]
     for st in order[:-2]:
@@ -634,10 +683,11 @@ def report(variants: bool = False, ops: bool = False) -> None:
     if known:
         lines += ["", "## Known differences", ""] + [f"- `{n}` ({res[n][0]}): {KNOWN.get(n) or KNOWN[n.split('[')[0]]}"
                                                        for n in known]
-    if not variants and not ops:
+    if not variants and not ops and not kinds:
         lines += ["", "## NOARGS", "", ", ".join(f"`{n}`" for n in sorted(n for n, v in res.items()
                                                                           if v[0] == "NOARGS"))]
-    (OUT / ("ops_report.md" if ops else "variant_report.md" if variants else "report.md")).write_text(
+    (OUT / ("kinds_report.md" if kinds else "ops_report.md" if ops else
+            "variant_report.md" if variants else "report.md")).write_text(
         "\n".join(lines) + "\n", encoding="utf-8")
     print(dict(counts))
 
@@ -648,6 +698,7 @@ def main() -> int:
     sub.add_parser("gen")
     sub.add_parser("genvar")
     sub.add_parser("genops")
+    sub.add_parser("genkinds")
     pr = sub.add_parser("run")
     pr.add_argument("start", nargs="?", type=int, default=0)
     pr.add_argument("stop", nargs="?", type=int, default=None)
@@ -655,9 +706,11 @@ def main() -> int:
     pr.add_argument("--redo", nargs="*", default=[])
     pr.add_argument("--variants", action="store_true", help="run the variants (genvar) instead")
     pr.add_argument("--ops", action="store_true", help="run the methods/operators/indexing cases (genops)")
+    pr.add_argument("--kinds", action="store_true", help="run the result-kind cases (genkinds)")
     rp = sub.add_parser("report")
     rp.add_argument("--variants", action="store_true")
     rp.add_argument("--ops", action="store_true")
+    rp.add_argument("--kinds", action="store_true")
     args = ap.parse_args()
     if args.cmd == "gen":
         gen()
@@ -665,10 +718,12 @@ def main() -> int:
         gen_variants()
     elif args.cmd == "genops":
         gen_ops()
+    elif args.cmd == "genkinds":
+        gen_kinds()
     elif args.cmd == "run":
-        run(args.start, args.stop, args.jobs, args.redo, args.variants, args.ops)
+        run(args.start, args.stop, args.jobs, args.redo, args.variants, args.ops, args.kinds)
     else:
-        report(args.variants, args.ops)
+        report(args.variants, args.ops, args.kinds)
     return 0
 
 

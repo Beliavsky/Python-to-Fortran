@@ -17310,6 +17310,11 @@ def detect_needed_helpers(tree):
                                            slice=ast.Slice(upper=ast.Name(id="n", ctx=ast.Load())), ctx=ast.Load()))
             if node.func.attr == "divmod" and len(node.args) == 2:
                 extra += [ast.BinOp(left=node.args[0], op=op, right=node.args[1]) for op in (ast.FloorDiv(), ast.Mod())]
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "linspace"
+                and any(k.arg == "dtype" for k in node.keywords)):
+            # An integer linspace is floored (translator._ctor_dtype_call).
+            extra.append(ast.BinOp(left=ast.Name(id="n", ctx=ast.Load()), op=ast.FloorDiv(),
+                                   right=ast.Name(id="m", ctx=ast.Load())))
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "apply_along_axis" and len(node.args) >= 3):
             # The function applied to each slice.
@@ -29014,6 +29019,18 @@ class translator(ast.NodeVisitor):
             return arg_expr
         kinds = self.local_func_arg_kinds.get(callee, [])
         want = kinds[idx] if idx < len(kinds) else None
+        have = self._expr_kind(arg_node)
+        # One signature for calls with arguments of different kinds (the
+        # function was not specialized): a conversion that loses values or
+        # kinds silently changed the results (f(b) and f(xi) passed xi as
+        # xi /= 0; a float accumulated into an integer).
+        _lossy = (want == "int" and have in {"real", "complex"}) or (want == "real" and have == "complex") \
+            or (want == "logical" and have in {"int", "real", "complex"}) \
+            or (want in {"int", "real", "complex"} and have == "logical" and int(self._rank_expr(arg_node) or 0) >= 1)
+        if _lossy:
+            raise NotImplementedError(
+                f"function '{callee}' is called with arguments of different kinds ({have} here, {want} in its "
+                f"signature) and is not specialized for them: use separate functions")
         return self._coerce_expr_kind(arg_node, arg_expr, want)
 
     def _lstsq_args(self, node):
@@ -31909,6 +31926,159 @@ class translator(ast.NodeVisitor):
             idx.append(a)
         return node.value, idx
 
+    def _asarray_dtype_call(self, node):
+        """np.asarray(a, dtype=D) / np.array(a, dtype=D) of an array a whose
+        kind is not D's: a.astype(D) (the dtype was ignored for bool and
+        complex, and for spellings other than a bare name). Not cached: a's
+        kind differs between a function's specializations."""
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            return None
+        if node.func.attr in self._DTYPE_REDUCTIONS and any(k.arg == "dtype" for k in node.keywords):
+            return self._reduction_dtype_call(node)
+        if not is_numpy_name_node(node.func.value):
+            return None
+        if node.func.attr in {"arange", "eye", "identity", "linspace"}:
+            return self._ctor_dtype_call(node)
+        if not (node.func.attr in {"asarray", "array"} and 1 <= len(node.args) <= 2):
+            return None
+        a = node.args[0]
+        literal = isinstance(a, (ast.List, ast.Tuple))
+        if isinstance(a, (ast.Constant, ast.ListComp, ast.GeneratorExp)):
+            return None
+        kws = [k for k in node.keywords if k.arg == "dtype"]
+        if len(kws) + len(node.args) - 1 != 1 or len(node.keywords) != len(kws):
+            return None
+        self._resolve_dtype_args(node)
+        d = kws[0].value if kws else node.args[1]
+        if not (isinstance(d, ast.Attribute) and is_numpy_name_node(d.value)) and not (
+                isinstance(d, ast.Name) and d.id in {"int", "float", "bool", "complex"}):
+            return None
+        name = d.attr if isinstance(d, ast.Attribute) else d.id
+        kind = ("logical" if "bool" in name else "complex" if "complex" in name else
+                "int" if "int" in name else "real" if "float" in name else None)
+        if kind is None or int(self._rank_expr(a) or 0) < 1:
+            return None
+        if literal:
+            # A list with dtype=bool or complex: np.array(list).astype (the
+            # list's numbers were kept; int and float dtypes have their
+            # own path).
+            if kind not in {"logical", "complex"} and kws:
+                return None
+            a = ast.Call(func=node.func, args=[a], keywords=[])
+        ak = self._expr_kind(a)
+        if ak is None or ak == kind:
+            return None
+        new = ast.Call(func=ast.Attribute(value=a, attr="astype", ctx=ast.Load()),
+                       args=[self._astype_arg(d)], keywords=[])
+        return ast.fix_missing_locations(ast.copy_location(new, node))
+
+    _DTYPE_REDUCTIONS = {"sum", "prod", "cumsum", "cumprod", "mean"}
+
+    def _reduction_dtype_call(self, node):
+        """sum / prod / cumsum / cumprod / mean (function or method) with a
+        dtype= of another kind than the array's, as numpy computes them: in
+        that dtype (a.astype(D) first), so a boolean sum is any and a
+        boolean product all, a running or / and for cumsum / cumprod, and
+        mean is D(sum / n) (int truncates); the dtype was ignored."""
+        f = node.func
+        if is_numpy_name_node(f.value):
+            if not node.args:
+                return None
+            a, rest = node.args[0], list(node.args[1:])
+        else:
+            a, rest = f.value, list(node.args)
+        if rest:
+            return None
+        self._resolve_dtype_args(node)
+        dk = next(k for k in node.keywords if k.arg == "dtype")
+        kind = self._dtype_node_kind(dk.value)
+        if kind is None or int(self._rank_expr(a) or 0) < 1:
+            return None
+        ak = self._expr_kind(a)
+        # mean's own result is float (complex for complex a).
+        own = ("complex" if ak == "complex" else "real") if f.attr == "mean" else ak
+        if ak is None or own == kind:
+            return None
+        kws = [k for k in node.keywords if k.arg != "dtype"]
+        if any(k.arg not in {"axis", "keepdims"} for k in kws):
+            return None
+
+        def np_(name, args, kw=()):
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name, ctx=ast.Load()),
+                            args=args, keywords=list(kw))
+
+        def astype(x, tn):
+            return ast.Call(func=ast.Attribute(value=x, attr="astype", ctx=ast.Load()),
+                            args=[ast.Name(id=tn, ctx=ast.Load())], keywords=[])
+        op = f.attr
+        if kind == "logical":
+            if op in {"sum", "mean"}:
+                new = np_("any", [a], kws)
+            elif op == "prod":
+                new = np_("all", [a], kws)
+            else:
+                if kws:
+                    return None
+                new = ast.Compare(left=np_(op, [astype(a, "bool")]), ops=[ast.Gt()], comparators=[ast.Constant(value=0)])
+        elif op == "mean" and kind == "int":
+            if kws:
+                return None
+            # numpy: the int sum over n, converted back to int (toward 0).
+            s = np_("sum", [astype(a, "int")])
+            new = ast.Call(func=ast.Name(id="int", ctx=ast.Load()),
+                           args=[ast.BinOp(left=s, op=ast.Div(), right=np_("size", [a]))], keywords=[])
+        else:
+            new = np_(op, [ast.Call(func=ast.Attribute(value=a, attr="astype", ctx=ast.Load()),
+                                    args=[self._astype_arg(dk.value)], keywords=[])], kws)
+        return ast.fix_missing_locations(ast.copy_location(new, node))
+
+    @staticmethod
+    def _dtype_node_kind(d):
+        """The kind of a resolved dtype node (np.<name> or int, float, bool,
+        complex), or None."""
+        if isinstance(d, ast.Attribute) and is_numpy_name_node(d.value):
+            name = d.attr
+        elif isinstance(d, ast.Name) and d.id in {"int", "float", "bool", "complex"}:
+            name = d.id
+        else:
+            return None
+        return ("logical" if "bool" in name else "complex" if "complex" in name else
+                "int" if "int" in name else "real" if "float" in name else None)
+
+    @staticmethod
+    def _astype_arg(d):
+        """The astype argument for a resolved dtype node: the node itself
+        (np.float32, np.int32 keep their precision), a builtin name as is."""
+        return copy.deepcopy(d)
+
+    def _ctor_dtype_call(self, node):
+        """np.arange / eye / identity with a dtype= of another kind than
+        their own (int for arange of integers, real for eye): the call
+        without it, then .astype (eye ignored complex, arange complex and
+        the string spellings)."""
+        kws = [k for k in node.keywords if k.arg == "dtype"]
+        if len(kws) != 1:
+            return None
+        self._resolve_dtype_args(node)
+        kind = self._dtype_node_kind(kws[0].value)
+        if kind is None:
+            return None
+        if node.func.attr == "arange":
+            own = "real" if any(self._expr_kind(a) == "real" for a in node.args[:3]) else "int"
+            if own == "real" and kind in {"int", "logical"}:
+                return None
+        else:
+            own = "real"
+        if own == kind:
+            return None
+        plain = ast.Call(func=node.func, args=list(node.args), keywords=[k for k in node.keywords if k.arg != "dtype"])
+        if node.func.attr == "linspace" and kind == "int":
+            # numpy rounds an integer linspace toward -inf.
+            plain = ast.BinOp(left=plain, op=ast.FloorDiv(), right=ast.Constant(value=1))
+        new = ast.Call(func=ast.Attribute(value=plain, attr="astype", ctx=ast.Load()),
+                       args=[self._astype_arg(kws[0].value)], keywords=[])
+        return ast.fix_missing_locations(ast.copy_location(new, node))
+
     def _bool_array_call(self, node):
         """abs, square, round and clip of a boolean array as numpy has them:
         abs keeps the booleans, square is of 0/1 (integers), round gives
@@ -31920,8 +32090,15 @@ class translator(ast.NodeVisitor):
         if isinstance(f, ast.Name) and f.id == "abs" and len(node.args) == 1 and not node.keywords:
             a, name = node.args[0], "abs"
         elif isinstance(f, ast.Attribute) and is_numpy_name_node(f.value) and node.args \
-                and f.attr in {"abs", "absolute", "square", "round", "around", "clip"}:
+                and f.attr in {"abs", "absolute", "square", "round", "around", "clip", "diff"}:
             a, rest, name = node.args[0], node.args[1:], f.attr
+        elif (isinstance(f, ast.Attribute) and is_numpy_name_node(f.value) and len(node.args) == 2
+              and not node.keywords and f.attr in {"minimum", "maximum", "fmin", "fmax"}):
+            return self._bool_minmax(node)
+        elif (isinstance(f, ast.Attribute) and is_numpy_name_node(f.value) and f.attr == "bool_"
+              and len(node.args) == 1 and not node.keywords and int(self._rank_expr(node.args[0]) or 0) == 0):
+            return ast.fix_missing_locations(ast.copy_location(
+                ast.Call(func=ast.Name(id="bool", ctx=ast.Load()), args=list(node.args), keywords=[]), node))
         elif isinstance(f, ast.Attribute) and not is_numpy_name_node(f.value) and f.attr in {"round", "clip"}:
             a, rest, name = f.value, list(node.args), f.attr
         if a is None or not self._maybe_logical(a):
@@ -31947,11 +32124,101 @@ class translator(ast.NodeVisitor):
         elif name in {"round", "around"}:
             # numpy gives float16 0.0/1.0 (decimals change nothing).
             new = astype(a, "float")
+        elif name == "diff":
+            # numpy: neighbours that differ (xor); the default n=1 only.
+            if rest or node.keywords or int(self._rank_expr(a) or 0) != 1:
+                return None
+            new = ast.Compare(left=ast.Subscript(value=a, slice=ast.Slice(lower=ast.Constant(value=1)), ctx=ast.Load()),
+                              ops=[ast.NotEq()],
+                              comparators=[ast.Subscript(value=copy.deepcopy(a),
+                                                         slice=ast.Slice(upper=ast.Constant(value=-1)),
+                                                         ctx=ast.Load())])
         else:
             new = np_("clip", [astype(a, "int")] + rest, list(node.keywords))
         new = ast.fix_missing_locations(ast.copy_location(new, node))
         node._xp2f_bool_fn = new
         return new
+
+    _SEQ_ARG_FUNCS = {"array", "asarray", "concatenate", "hstack", "vstack", "stack", "column_stack", "row_stack"}
+    _PAIR_ARG_FUNCS = {"outer", "kron", "convolve", "correlate", "cross", "append", "inner"}
+
+    def _mixed_kind_args(self, node):
+        """numpy's promotion where booleans meet numbers: the booleans of a
+        literal sequence (np.array([True, 2]), np.concatenate((xi, b))) or
+        of one argument of outer / kron / convolve / ... beside a number
+        become 0/1 integers (they were logical, which did not compile), and
+        integers beside floats in convolve / correlate become floats. Not
+        cached (the kinds differ between a function's specializations)."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value) and node.args):
+            return None
+        fn = node.func.attr
+
+        def as_kind(x, k, to):
+            if k == to:
+                return x
+            if int(self._rank_expr(x) or 0) >= 1:
+                return ast.Call(func=ast.Attribute(value=x, attr="astype", ctx=ast.Load()),
+                                args=[ast.Name(id=to, ctx=ast.Load())], keywords=[])
+            return ast.Call(func=ast.Name(id=to, ctx=ast.Load()), args=[x], keywords=[])
+        if fn in self._SEQ_ARG_FUNCS and isinstance(node.args[0], (ast.List, ast.Tuple)):
+            elts = node.args[0].elts
+            if not elts or any(isinstance(e, (ast.List, ast.Tuple, ast.Starred)) for e in elts):
+                return None
+            if all(isinstance(e, ast.Constant) or (isinstance(e, ast.UnaryOp) and isinstance(e.operand, ast.Constant))
+                   for e in elts) and not any(isinstance(getattr(e, "value", None), bool) for e in elts):
+                # A list of number literals has its own promotion.
+                return None
+            ks = [self._expr_kind(e) for e in elts]
+            order = ["logical", "int", "real", "complex"]
+            if len(set(ks)) < 2 or not set(ks) <= set(order):
+                return None
+            top = max(ks, key=order.index)
+            to = {"int": "int", "real": "float", "complex": "complex"}[top]
+            new_elts = [as_kind(e, k, to) if k != top else e for e, k in zip(elts, ks)]
+            seq = type(node.args[0])(elts=new_elts, ctx=ast.Load())
+            new = ast.Call(func=node.func, args=[seq] + list(node.args[1:]), keywords=list(node.keywords))
+            return ast.fix_missing_locations(ast.copy_location(new, node))
+        if fn == "tile" and len(node.args) == 2 and not node.keywords and self._maybe_logical(node.args[0])                 and self._expr_kind(node.args[0]) == "logical" and int(self._rank_expr(node.args[0]) or 0) >= 1:
+            # tile has no logical version: of 0/1, then back to booleans.
+            inner = ast.Call(func=node.func, args=[as_kind(node.args[0], "logical", "int"), node.args[1]], keywords=[])
+            return ast.fix_missing_locations(ast.copy_location(as_kind(inner, "int", "bool"), node))
+        if fn in self._PAIR_ARG_FUNCS and len(node.args) == 2:
+            a, c = node.args
+            ka, kc = self._expr_kind(a), self._expr_kind(c)
+            num = {"int", "real", "complex"}
+            if "logical" in {ka, kc} and ({ka, kc} & num):
+                a2, c2 = (as_kind(a, ka, "int") if ka == "logical" else a), (as_kind(c, kc, "int") if kc == "logical" else c)
+            elif fn in {"convolve", "correlate"} and {ka, kc} == {"int", "real"}:
+                a2, c2 = as_kind(a, ka, "float"), as_kind(c, kc, "float")
+            else:
+                return None
+            new = ast.Call(func=node.func, args=[a2, c2], keywords=list(node.keywords))
+            return ast.fix_missing_locations(ast.copy_location(new, node))
+        return None
+
+    def _bool_minmax(self, node):
+        """np.minimum / maximum / fmin / fmax with a boolean array: of two
+        booleans and / or, else the booleans as 0/1."""
+        a, c = node.args
+        if not (self._maybe_logical(a) or self._maybe_logical(c)):
+            return None
+        ka, kc = self._expr_kind(a), self._expr_kind(c)
+        if "logical" not in {ka, kc} or max(int(self._rank_expr(a) or 0), int(self._rank_expr(c) or 0)) < 1:
+            return None
+        if ka == kc == "logical":
+            op = ast.BitAnd() if node.func.attr in {"minimum", "fmin"} else ast.BitOr()
+            new = ast.BinOp(left=a, op=op, right=c)
+        else:
+            def as_int(x, k):
+                if k != "logical":
+                    return x
+                if int(self._rank_expr(x) or 0) >= 1:
+                    return ast.Call(func=ast.Attribute(value=x, attr="astype", ctx=ast.Load()),
+                                    args=[ast.Name(id="int", ctx=ast.Load())], keywords=[])
+                return ast.Call(func=ast.Name(id="int", ctx=ast.Load()), args=[x], keywords=[])
+            new = ast.Call(func=node.func, args=[as_int(a, ka), as_int(c, kc)], keywords=[])
+        return ast.fix_missing_locations(ast.copy_location(new, node))
 
     def _maybe_logical(self, n):
         """Whether n may be a boolean array (a syntactic test, no kinds)."""
@@ -31967,6 +32234,11 @@ class translator(ast.NodeVisitor):
             return n.id in self.logs or n.id in self.alloc_logs
         if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
             return True
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and is_numpy_name_node(n.func.value)
+                and n.func.attr in {"array", "asarray", "copy"} and n.args):
+            return self._maybe_logical(n.args[0])
+        if isinstance(n, ast.List):
+            return any(self._maybe_logical(e) for e in n.elts)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
             return (n.func.attr in {"isnan", "isfinite", "isinf", "isclose", "logical_and", "logical_or", "logical_not",
                                     "logical_xor", "signbit", "isin", "isposinf", "isneginf", "astype", "copy",
@@ -32353,6 +32625,12 @@ class translator(ast.NodeVisitor):
         _bool_fn = self._bool_array_call(node)
         if _bool_fn is not None:
             return _bool_fn
+        _asd = self._asarray_dtype_call(node)
+        if _asd is not None:
+            return _asd
+        _mix = self._mixed_kind_args(node)
+        if _mix is not None:
+            return _mix
         # a @ b / a.dot(b) of vectors with a complex operand: no conjugation
         # (Fortran's dot_product conjugates a).
         _dot_pair = None
@@ -33633,11 +33911,13 @@ class translator(ast.NodeVisitor):
 
     def _resolve_dtype_args(self, node):
         """A dtype given as another array's dtype (np.zeros(n, dtype=a.dtype),
-        b.astype(a.dtype)): replaced in place by numpy's name for a's kind
-        (np.int64, np.float64 or np.float32, np.complex128, np.bool_), which
-        every dtype path reads; it was ignored (the result kept its default
-        kind). The original a.dtype is kept on the node and resolved again on
-        each look: a function argument's kind is known only later."""
+        b.astype(a.dtype)), as a string ('f8', 'int64', 'complex128') or as
+        np.dtype(...): replaced in place by numpy's name for the kind
+        (np.int64 or np.int32, np.float64 or np.float32, np.complex128,
+        np.bool_), which every dtype path reads; these were ignored (the
+        result kept its default kind). The original is kept on the node and
+        resolved again on each look: a function argument's kind is known
+        only later."""
         f = node.func
         fname = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
         pos = None
@@ -33649,13 +33929,13 @@ class translator(ast.NodeVisitor):
         if srcs is None:
             srcs = {}
             for k, s in enumerate(node.keywords):
-                if s.arg == "dtype" and self._is_array_dtype_attr(s.value):
+                if s.arg == "dtype" and self._is_resolvable_dtype(s.value):
                     srcs[("kw", k)] = s.value
-            if pos is not None and len(node.args) > pos and self._is_array_dtype_attr(node.args[pos]):
+            if pos is not None and len(node.args) > pos and self._is_resolvable_dtype(node.args[pos]):
                 srcs[("arg", pos)] = node.args[pos]
             node._xp2f_dtype_src = srcs
         for (where, k), src in srcs.items():
-            new = self._dtype_of_array_attr(src) or src
+            new = self._dtype_of_array_attr(src) or self._dtype_of_spelling(src) or src
             if where == "kw":
                 node.keywords[k].value = new
             else:
@@ -33664,6 +33944,49 @@ class translator(ast.NodeVisitor):
     @staticmethod
     def _is_array_dtype_attr(v):
         return isinstance(v, ast.Attribute) and v.attr == "dtype" and not is_numpy_name_node(v.value)
+
+    @classmethod
+    def _is_resolvable_dtype(cls, v):
+        if cls._is_array_dtype_attr(v):
+            return True
+        if isinstance(v, ast.Constant) and isinstance(v.value, str):
+            return True
+        return (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr == "dtype"
+                and is_numpy_name_node(v.func.value) and len(v.args) == 1 and not v.keywords)
+
+    _DTYPE_NAMES = {("i", 4): "int32", ("i", 8): "int64", ("f", 4): "float32", ("f", 8): "float64",
+                    ("c", 16): "complex128", ("b", 1): "bool_"}
+
+    def _dtype_of_spelling(self, v):
+        """np.<name> for a dtype string or np.dtype(<spelling>) of a bool,
+        signed integer, float or complex kind; None for others (strings,
+        unsigned, structured)."""
+        if isinstance(v, ast.Call):
+            a = v.args[0]
+            if isinstance(a, ast.Attribute) and is_numpy_name_node(a.value):
+                return ast.copy_location(ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=a.attr,
+                                                       ctx=ast.Load()), v)
+            if self._is_array_dtype_attr(a):
+                return self._dtype_of_array_attr(a)
+            if isinstance(a, ast.Name) and a.id in {"int", "float", "bool", "complex"}:
+                spelling = a.id
+            elif isinstance(a, ast.Constant) and isinstance(a.value, str):
+                spelling = a.value
+            else:
+                return None
+        elif isinstance(v, ast.Constant) and isinstance(v.value, str):
+            spelling = v.value
+        else:
+            return None
+        try:
+            import numpy as _np
+            dt = _np.dtype({"int": int, "float": float, "bool": bool, "complex": complex}.get(spelling, spelling))
+        except Exception:
+            return None
+        name = self._DTYPE_NAMES.get((dt.kind, dt.itemsize))
+        if name is None:
+            return None
+        return ast.copy_location(ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name, ctx=ast.Load()), v)
 
     def _dtype_of_array_attr(self, v):
         if not (isinstance(v, ast.Attribute) and v.attr == "dtype"):
@@ -34248,6 +34571,10 @@ class translator(ast.NodeVisitor):
                 return "real"
             if lk == "int" and rk == "int":
                 return "int"
+            if {lk, rk} <= {"int", "logical"} and isinstance(
+                    node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod, ast.Pow)):
+                # Python's bools are ints (True + True == 2, xi * True).
+                return "int"
             return None
         if isinstance(node, ast.IfExp):
             bk = self._expr_kind(node.body)
@@ -34619,7 +34946,12 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "cross"
                 and len(node.args) >= 2
             ):
-                return "real"
+                # The arguments' promoted kind (np_cross3 is generic; it was
+                # always real).
+                _ck = {self._expr_kind(a) for a in node.args[:2]}
+                if "complex" in _ck:
+                    return "complex"
+                return "int" if _ck <= {"int", "logical"} else "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -35029,6 +35361,19 @@ class translator(ast.NodeVisitor):
                 if node.func.id in self.user_class_types:
                     return None
                 if node.func.id in self.local_func_arg_ranks:
+                    # A specialized function: the result kind of the version
+                    # the actual arguments select (y = f(x) after f(xi) was
+                    # declared with f(xi)'s integer result).
+                    for profile in self.local_overload_dispatch.get(node.func.id, {}).get("return_profiles", []):
+                        if profile.get("return_kind") is None:
+                            continue
+                        names = self.local_func_arg_names.get(node.func.id, [])
+                        actuals = dict(zip(names, node.args))
+                        actuals.update({kw.arg: kw.value for kw in node.keywords if kw.arg is not None})
+                        if all(name in actuals and self._rank_expr(actuals[name]) == rank
+                               and self._expr_kind(actuals[name]) == profile["kinds"][name]
+                               for name, rank in profile["ranks"].items()):
+                            return profile["return_kind"]
                     if node.func.id in self.local_return_specs:
                         spec = self.local_return_specs[node.func.id]
                         if spec in {"real", "alloc_real"}:
@@ -35913,7 +36258,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray", "ravel", "sort", "flip"}
+                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "stack", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray", "ravel", "sort", "flip"}
                 and len(node.args) >= 1
             ):
                 if node.func.attr in {"sort", "flip"} and self._expr_kind(node.args[0]) not in {"int", "logical"}:
@@ -35926,7 +36271,7 @@ class translator(ast.NodeVisitor):
                         return "int" if k == "logical" else k
                 if node.func.attr == "fabs":
                     return "real"
-                if (node.func.attr in {"hstack", "vstack", "column_stack", "concatenate"}
+                if (node.func.attr in {"hstack", "vstack", "column_stack", "concatenate", "stack"}
                         and isinstance(node.args[0], (ast.List, ast.Tuple)) and node.args[0].elts):
                     # The widest kind of the joined arrays.
                     k = self._promoted_kind(node.args[0].elts)
@@ -36077,6 +36422,8 @@ class translator(ast.NodeVisitor):
                         and a0.value.id == "np"
                     ):
                         dtype_txt = a0.attr.lower()
+                if "complex" in dtype_txt:
+                    return "complex"
                 if "float" in dtype_txt:
                     return "real"
                 if "bool" in dtype_txt:
@@ -47687,8 +48034,12 @@ class translator(ast.NodeVisitor):
             ):
                 a0 = self.expr(node.args[0])
                 a1 = self.expr(node.args[1])
+                if self._rank_expr(node.args[0]) == 0 or self._rank_expr(node.args[1]) == 0:
+                    return f"({a0}) * ({a1})"
                 if self._rank_expr(node.args[0]) <= 1 and self._rank_expr(node.args[1]) <= 1:
-                    return f"reshape(spread({a1}, dim=1, ncopies=size({a0})) * spread({a0}, dim=2, ncopies=size({a1})), [size({a0})*size({a1})])"
+                    # a0(i) * a1(j) with j varying fastest (it had i fastest:
+                    # np.kron([1, 2], [1, 10]) gave [1, 2, 10, 20]).
+                    return f"reshape(spread({a1}, dim=2, ncopies=size({a0})) * spread({a0}, dim=1, ncopies=size({a1})), [size({a0})*size({a1})])"
                 if self._rank_expr(node.args[0]) == 2 and self._rank_expr(node.args[1]) == 2:
                     _kk = self._promoted_kind(node.args[:2])
                     if _kk in {None, "int", "logical"}:
@@ -48823,6 +49174,13 @@ class translator(ast.NodeVisitor):
                             and a0.value.id == "np"
                         ):
                             dtype_txt = a0.attr.lower()
+                    if "complex" in dtype_txt:
+                        # astype(complex) kept the values real or integer.
+                        if self._expr_kind(node.func.value) == "logical":
+                            return f"cmplx(merge(1.0_dp, 0.0_dp, {arr}), kind=dp)"
+                        if self._expr_kind(node.func.value) == "complex":
+                            return arr
+                        return f"cmplx({arr}, kind=dp)"
                     if "float" in dtype_txt:
                         if self._expr_kind(node.func.value) == "logical":
                             return f"merge(1.0_dp, 0.0_dp, {arr})"
@@ -48832,6 +49190,8 @@ class translator(ast.NodeVisitor):
                             return f"merge(1, 0, {arr})"
                         return f"int({arr})"
                     if "bool" in dtype_txt:
+                        if self._expr_kind(node.func.value) == "logical":
+                            return arr
                         return f"({arr} /= 0)"
                     return arr
                 if node.func.attr == "mean" and len(node.args) == 0:
@@ -56874,6 +57234,74 @@ class translator(ast.NodeVisitor):
         # nonzero under gfortran.
         self.o.w(f"if (.not. ({truthy})) error stop {fstr(msg_txt)}")
 
+    # numpy functions whose integer result has no repeated values.
+    _UNIQUE_INDEX_FUNCS = {"where", "nonzero", "flatnonzero", "argsort", "arange", "unique", "argwhere",
+                           "permutation", "lexsort"}
+
+    def _unique_index_expr(self, n):
+        """Whether n has no repeated values: a call of _UNIQUE_INDEX_FUNCS
+        (np.where(c)[0] too), or a name last assigned one."""
+        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant):
+            n = n.value
+        if isinstance(n, ast.Call):
+            f = n.func
+            return isinstance(f, ast.Attribute) and f.attr in self._UNIQUE_INDEX_FUNCS and (
+                is_numpy_name_node(f.value) or (isinstance(f.value, ast.Attribute) and f.value.attr == "random")
+                or f.attr == "argsort")
+        if isinstance(n, ast.Name):
+            return n.id in self.__dict__.get("_unique_index_names", set())
+        return False
+
+    def _track_unique_index(self, name, value):
+        s = self.__dict__.setdefault("_unique_index_names", set())
+        if self._unique_index_expr(value):
+            s.add(name)
+        else:
+            s.discard(name)
+
+    def _emit_ordered_index_write(self, target, value):
+        """y[idx] = v of a vector y and an integer vector idx that may repeat
+        an index: numpy assigns in order (the last write wins), while a
+        Fortran vector subscript with a repeated value is not allowed in an
+        assignment (gfortran rejects one it can see). A loop in a block, idx
+        and v evaluated first (negative indices from the end). False when
+        not such an assignment."""
+        if not (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                and not isinstance(target.slice, (ast.Slice, ast.Tuple))):
+            return False
+        y, idx = target.value, target.slice
+        if int(self._rank_expr(y) or 0) != 1 or int(self._rank_expr(idx) or 0) != 1:
+            return False
+        if self._expr_kind(idx) != "int" or self._unique_index_expr(idx):
+            return False
+        ky, kv = self._expr_kind(y), self._expr_kind(value)
+        types = {"int": "integer", "real": "real(kind=dp)", "complex": "complex(kind=dp)", "logical": "logical"}
+        if ky not in types or kv not in types or (ky == "logical") != (kv == "logical"):
+            return False
+        if ky == "real" and self._expr_real_kind_tag(y) == "real32":
+            return False
+        if ky != "complex" and kv == "complex":
+            return False
+        rv = int(self._rank_expr(value) or 0)
+        if rv > 1:
+            return False
+        yt = self.expr(y)
+        it = self.expr(idx)
+        vt = self.expr(value)
+        ii, kk, vv = self._fresh_scoped_names("idx_w", "k_w", "v_w")
+        self.o.w("block")
+        self.o.w(f"integer, allocatable :: {ii}(:)")
+        self.o.w(f"integer :: {kk}")
+        self.o.w(f"{types[ky]}{', allocatable' if rv else ''} :: {vv}{'(:)' if rv else ''}")
+        self.o.w(f"{ii} = {it}")
+        self.o.w(f"{ii} = merge({ii} + size({yt}), {ii}, {ii} < 0) + 1")
+        self.o.w(f"{vv} = {vt}")
+        self.o.w(f"do {kk} = 1, size({ii})")
+        self.o.w(f"{yt}({ii}({kk})) = {vv}{f'({kk})' if rv else ''}")
+        self.o.w("end do")
+        self.o.w("end block")
+        return True
+
     def visit_Assign(self, node):
         self._emit_comments_for(node)
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -56902,6 +57330,10 @@ class translator(ast.NodeVisitor):
                 # A row broadcast over the selected rows.
                 vt = f"spread({vt}, 1, size({rt}))"
             self.o.w(f"{xt}({rt} + 1, {ct} + 1) = {vt}")
+            return
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            self._track_unique_index(node.targets[0].id, node.value)
+        if len(node.targets) == 1 and self._emit_ordered_index_write(node.targets[0], node.value):
             return
         if len(node.targets) == 1:
             node.targets[0], node.value = self._untranspose_target(node.targets[0], node.value)
@@ -57853,6 +58285,15 @@ class translator(ast.NodeVisitor):
             # Rebinding a name on a self-referential assignment would shadow the
             # currently visible value and emit invalid Fortran (e.g. x = x + ...).
             if rk is not None and _expr_uses_name(v, t.id):
+                # The value then goes to the visible variable: a narrower kind
+                # (y = y * 2.5 of an integer y) silently lost the fraction.
+                _kv, _rv = self._visible_kind_rank(t.id)
+                _lossy = {("int", "real"), ("int", "complex"), ("real", "complex"), ("logical", "int"),
+                          ("logical", "real"), ("logical", "complex"), ("int", "logical")}
+                if (_kv, rk[0]) in _lossy:
+                    raise NotImplementedError(
+                        f"rebinding '{t.id}' from {_kv} to {rk[0]} in terms of itself "
+                        f"({ast.unparse(node)}) is not supported: use a new name for the {rk[0]} value")
                 rk = None
             if rk is not None:
                 # Prefer sequential non-nested rebinding blocks for repeated
@@ -61794,14 +62235,15 @@ class translator(ast.NodeVisitor):
             name = t.id
             a0 = self.expr(v.args[0])
             r0 = self._rank_expr(v.args[0])
-            k0 = self._expr_kind(v.args[0])
+            # The call's kind: dtype= when given, else the argument's.
+            k0 = self._expr_kind(v) or self._expr_kind(v.args[0])
             fill_expr = "0"
-            if k0 == "real" or (name in self.alloc_reals):
+            if k0 == "real" or (k0 not in {"logical", "int", "complex"} and name in self.alloc_reals):
                 fill_expr = "0.0_dp"
             elif k0 == "logical":
                 fill_expr = ".false."
             if v.func.attr == "ones_like":
-                if k0 == "real" or (name in self.alloc_reals):
+                if k0 == "real" or (k0 not in {"logical", "int", "complex"} and name in self.alloc_reals):
                     fill_expr = "1.0_dp"
                 elif k0 == "logical":
                     fill_expr = ".true."
@@ -70340,7 +70782,12 @@ class translator(ast.NodeVisitor):
             if self._rank_expr(a0) == 2 and self._expr_kind(a0) in {
                 "real", "int", "alloc_real", "alloc_int", "logical", "alloc_log", "complex", "alloc_complex"
             }:
-                self.o.w(f"call print_matrix({self.expr(a0)})")
+                _pm = self.expr(a0)
+                if self._expr_real_kind_tag(a0) == "real32":
+                    # print_matrix is double precision (a float32 matrix
+                    # had no specific procedure).
+                    _pm = f"real({_pm}, kind=dp)"
+                self.o.w(f"call print_matrix({_pm})")
                 return
             if self._rank_expr(a0) == 3 and self._expr_kind(a0) in {"real", "int", "alloc_real", "alloc_int", "logical"}:
                 self.o.w(f"call print_array_3d({self.expr(a0)})")
@@ -85320,6 +85767,34 @@ def generate_flat(
     # Resolve specific result profiles before emitting any caller, including
     # callers that precede their callee in source order.
     overload_return_maps = {}
+
+    def _record_specific_result_kind(fname, pname, kinds, ranks, emitted):
+        res = None
+        decl_re = None
+        for ln in emitted:
+            if res is None:
+                m = re.match(rf"\s*(?:pure\s+|elemental\s+|recursive\s+)*function\s+{re.escape(pname)}\s*\(.*\)"
+                             rf"\s*result\s*\(\s*(\w+)\s*\)", ln, re.IGNORECASE)
+                if m:
+                    res = m.group(1)
+                    decl_re = re.compile(rf"^\s*(integer|real|logical|complex)\b[^:!]*::(.*)$", re.IGNORECASE)
+                continue
+            if re.match(r"\s*end\s+function\b", ln, re.IGNORECASE):
+                break
+            m = decl_re.match(ln)
+            if m and re.search(rf"(?<!\w){re.escape(res)}(?!\w)", m.group(2), re.IGNORECASE):
+                kind = {"integer": "int", "real": "real", "logical": "logical", "complex": "complex"}[m.group(1).lower()]
+                for prof in local_overload_dispatch.get(fname, {}).get("return_profiles", []):
+                    if prof.get("kinds") == kinds and prof.get("ranks") == ranks:
+                        prof["return_kind"] = kind
+                break
+
+    def _spec_kind(spec):
+        # A return spec ("alloc_real", "int", ...) as a kind, else None.
+        if not isinstance(spec, str):
+            return None
+        s = spec[len("alloc_"):] if spec.startswith("alloc_") else spec
+        return {"log": "logical"}.get(s, s) if s in {"int", "real", "complex", "log", "logical"} else None
     for fn in (local_funcs or []):
         if fn.name in tuple_return_funcs and local_overload_dispatch.get(fn.name, {}).get("joint"):
             names = local_func_arg_names.get(fn.name, [])
@@ -85350,7 +85825,8 @@ def generate_flat(
             if fn.name in rs:
                 overload_return_maps[pname] = (rs[fn.name], rr.get(fn.name, 0))
                 local_overload_dispatch.setdefault(fn.name, {}).setdefault("return_profiles", []).append(
-                    {"kinds": kinds, "ranks": ranks, "return_rank": rr.get(fn.name, 0)})
+                    {"kinds": kinds, "ranks": ranks, "return_rank": rr.get(fn.name, 0),
+                     "return_kind": _spec_kind(rs[fn.name])})
     # Resolve forwarded results in each signature's context. Fresh inference
     # per pass avoids retaining the merged rank of another specialization.
     for _return_pass in range(len(joint_rank_managed) + 2):
@@ -85383,7 +85859,8 @@ def generate_flat(
                     if overload_return_maps.get(pname) != result:
                         _return_changed = True
                     overload_return_maps[pname] = result
-                    profiles.append({"kinds": kinds, "ranks": ranks, "return_rank": result[1]})
+                    profiles.append({"kinds": kinds, "ranks": ranks, "return_rank": result[1],
+                                     "return_kind": _spec_kind(result[0])})
             local_overload_dispatch.setdefault(fn.name, {})["return_profiles"] = profiles
         if not _return_changed:
             break
@@ -86202,6 +86679,7 @@ def generate_flat(
                                 "out_ranks": prof_ranks,
                             }
                         )
+                    _n_lines0 = len(om.lines)
                     _emit_local_function(
                         om,
                         fn,
@@ -86253,6 +86731,11 @@ def generate_flat(
                         toplevel_str_list_values=_proc_mod_toplevel_str_list_values,
                         tuple_df_return_positions=_proc_mod_tuple_df_return_positions,
                     )
+                    # The result kind this specific was emitted with: the early
+                    # return analysis can miss it (s = 0 accumulating a real
+                    # argument), and callers declare their variables from it.
+                    _record_specific_result_kind(fn.name, pname, forced_kinds, forced_ranks,
+                                                 om.lines[_n_lines0:])
             else:
                 _emit_local_function(
                     om,

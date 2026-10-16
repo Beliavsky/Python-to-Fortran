@@ -26201,6 +26201,114 @@ def test_xp2f_boolean_array_arithmetic(tmp_path: Path) -> None:
     ))
 
 
+def test_xp2f_dtype_spellings_and_reductions(tmp_path: Path) -> None:
+    # Every dtype spelling ('f8', 'int64', np.dtype(float), a.dtype, a
+    # positional dtype) gives its kind, including complex and bool, for
+    # constructors, astype and asarray (they were ignored: reals or the
+    # input's kind); reductions with dtype= compute in it (a boolean sum is
+    # any, mean(dtype=int) truncates); linspace(dtype=int) rounds down.
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xdtype_spell", (
+        "import numpy as np\n"
+        "x = np.array([0.5, 1.5, -2.0, 3.25])\n"
+        "xi = np.array([3, 1, 4, 1])\n"
+        "b = np.array([True, False, True, True])\n"
+        "z = np.array([1.0 + 2.0j, -0.5j, 3.0])\n"
+        "print(np.zeros(3, dtype='i8'), np.full(3, 2, dtype='f8'), np.ones(2, np.dtype('int64')))\n"
+        "print(np.arange(4, dtype='f8'), np.full_like(x, 3, dtype='i8'), np.eye(2, dtype=np.dtype('int64')))\n"
+        "print(np.asarray(xi, dtype=bool), np.asarray(xi, dtype=b.dtype), np.array([1.5, 2.5], 'int64'))\n"
+        "print(np.array([1.7, -2.2, 0.0], dtype=bool), np.zeros_like(x, dtype=bool), np.ones_like(xi, dtype='f8'))\n"
+        "c = np.asarray(xi, dtype=complex)\n"
+        "print(c.real, c.imag)\n"
+        "c = np.arange(4, dtype=z.dtype)\n"
+        "print(c.real, c.imag)\n"
+        "c = np.eye(2, dtype=complex)\n"
+        "print(c.real)\n"
+        "print(c.imag)\n"
+        "c = xi.astype('complex128')\n"
+        "print(c.real, c.imag)\n"
+        "print(np.linspace(-1, 1, 5, dtype=int), np.linspace(0, 4, 5, dtype=bool))\n"
+        "print(np.sum(xi, dtype=bool), xi.sum(dtype='f8'), np.prod(xi, dtype=bool), np.cumsum(xi, dtype=b.dtype))\n"
+        "print(np.mean(xi, dtype=int), x.mean(dtype=np.int32), np.mean(xi, dtype=bool), xi.sum(dtype=np.float32))\n"
+        "s = np.sum(xi, dtype=complex)\n"
+        "print(s.real, s.imag)\n"
+        "print(np.ones((2, 2), dtype=np.float32))\n"
+    ))
+
+
+def test_xp2f_mixed_kind_promotion_and_kron(tmp_path: Path) -> None:
+    # Booleans beside numbers become 0/1 (np.array([True, 2]), concatenate,
+    # hstack, outer, kron, minimum; they did not compile), ints beside floats
+    # floats (stack, convolve); int and bool arithmetic is int (xi * True,
+    # True + True were reals); np.diff of booleans is xor; np.cross and
+    # np.stack of integers are integers; np.kron of vectors was in the wrong
+    # order ([1, 2] with [1, 10] gave [1, 2, 10, 20]).
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xmixed_kinds", (
+        "import numpy as np\n"
+        "x = np.array([0.5, 1.5, -2.0, 3.25])\n"
+        "xi = np.array([3, 1, 4, 1])\n"
+        "b = np.array([True, False, True, True])\n"
+        "print(xi * True, True + True, np.array([True, 2]), np.array([b[0], xi[0]]))\n"
+        "print(np.concatenate((xi, b)), np.hstack((b, xi)), np.minimum(b, xi), np.maximum(b, b[::-1]))\n"
+        "print(np.outer(b, xi))\n"
+        "print(np.kron(xi, b), np.kron(np.array([1, 2]), np.array([1, 10])), np.kron(x[:2], 3.0))\n"
+        "print(np.convolve(xi, x), np.diff(b), np.cross(xi[:3], xi[1:]), np.bool_(xi[0]), np.tile(b, 2))\n"
+        "print(np.stack((xi, xi)))\n"
+        "print(np.stack((xi, x)))\n"
+        "y = [True, False]\n"
+        "print(np.array(y) + 1)\n"
+    ))
+
+
+def test_xp2f_repeated_index_writes_in_order(tmp_path: Path) -> None:
+    # y[idx] = v with an index that repeats: numpy assigns in order (the
+    # last write wins); a Fortran vector subscript with a repeated value is
+    # not allowed in an assignment (gfortran rejected the ones it could
+    # see). Written as a loop, idx and v evaluated first; an index from
+    # np.where / argsort keeps the vector subscript.
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xrep_index", (
+        "import numpy as np\n"
+        "x = np.array([0.5, 1.5, -2.0, 3.25])\n"
+        "xi = np.array([3, 1, 4, 1])\n"
+        "b = np.array([True, False, True, True])\n"
+        "y = x.copy()\n"
+        "y[xi % 4] = 2\n"
+        "print(y)\n"
+        "y = x.copy()\n"
+        "y[np.array([0, 2, 0])] = np.array([7.0, 8.0, 9.0])\n"
+        "print(y)\n"
+        "y = x.copy()\n"
+        "y[np.array([-1, 0, -1])] = x[:3]\n"
+        "print(y)\n"
+        "y = x.copy()\n"
+        "y[xi % 4] = y[0] + 10\n"
+        "print(y)\n"
+        "w = b.copy()\n"
+        "w[xi % 4] = False\n"
+        "print(w)\n"
+        "y = x.copy()\n"
+        "y[[0, 0, 1]] = 5.0\n"
+        "print(y)\n"
+        "y = x.copy()\n"
+        "idx = np.where(x > 0)[0]\n"
+        "y[idx] = 0\n"
+        "print(y)\n"
+    ))
+    out_text = (tmp_path / "xrep_index_p.f90").read_text(encoding="utf-8")
+    assert "do k_w = 1, size(idx_w)" in out_text
+
+
+def test_xp2f_self_referential_kind_change_is_reported(tmp_path: Path) -> None:
+    # y = y * 2.5 of an integer y wrote the result into the integer y (the
+    # fraction lost): it is reported instead.
+    src = tmp_path / "xrebind_self.py"
+    src.write_text("import numpy as np\nxi = np.array([3, 1, 4, 1])\ny = xi.copy()\ny = y * 2.5\nprint(y)\n",
+                   encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path, capture_output=True,
+                          text=True, check=False)
+    assert proc.returncode != 0
+    assert "rebinding 'y' from int to real in terms of itself" in proc.stdout + proc.stderr
+
+
 def test_xp2f_numpy_copies_and_argument_mutation_match(tmp_path: Path) -> None:
     # No shared memory (copy(), rebinding, a Python list, fancy indexing),
     # or a function modifying its array argument in place -- including
