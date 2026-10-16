@@ -30,6 +30,8 @@ Known limitations include dynamic Python features (`isinstance` dispatch, `Union
 
 Successful compilation or execution does not establish numerical equivalence. Different numerical-library implementations can produce different results for sensitive algorithms even when the translation preserves the source operations. See [Numerical Limitations](NUMERICAL_LIMITATIONS.md), including a diagnosed eigenvector-based matrix-exponential example.
 
+Integers are declared with the compiler's default kind, 32-bit with gfortran, while Python integers are unbounded and NumPy's default integer is 64-bit. Integer results beyond 2**31 - 1 wrap silently: `n * n` with `n = 50000`, `np.prod(np.arange(1, 21))`, or a running sum of `k * k` for `k` up to 100000. Some such expressions, like `2 ** 40` or `int(3e10)`, fail to compile instead. `--int-kind int64` (see [Basic Use](#basic-use)) declares 64-bit integers and fixes most of these cases. `np.cumprod` and `math.factorial` of integers still overflow beyond 2**31 - 1 even with `--int-kind int64`, because their runtime helpers use default-kind integers.
+
 See [Timing Results](TIMING_RESULTS.md) for runtime measurements on fully passing translated numerical programs.
 
 See [Comparison with Pyccel](PYCCEL_COMPARISON.md) for how this project differs from Pyccel.
