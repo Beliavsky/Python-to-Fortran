@@ -4,10 +4,10 @@
 
 | status | count |
 |---|---|
-| DIFF | 22 |
-| RUN-FAIL | 3 |
-| XLATE-FAIL | 34 |
-| MATCH | 2567 |
+| DIFF | 18 |
+| RUN-FAIL | 2 |
+| XLATE-FAIL | 33 |
+| MATCH | 2573 |
 
 ## XLATE-FAIL
 
@@ -42,13 +42,12 @@
 - `np.polynomial.polynomial.polycompanion[complex]`: np.polynomial.polynomial.polycompanion of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polydiv[complex]`: np.polynomial.polynomial.polydiv of a complex array is not supported (the translation would drop the imaginary part)
 - `np.polynomial.polynomial.polyroots[complex]`: np.polynomial.polynomial.polyroots of a complex array is not supported (the translation would drop the imaginary part)
-- `np.real_if_close[complex]`: np.real_if_close of a complex array is not supported (the translation would drop the imaginary part)
 - `np.roots[complex]`: np.roots of a complex array is not supported (the translation would drop the imaginary part)
 - `np.searchsorted[complex]`: np.searchsorted of complex numbers is not supported
 
 ## Known differences
 
-- `np.digitize[nan]` (RUN-FAIL): bins with NaN are rejected as not monotonic
+- `np.digitize[nan]` (RUN-FAIL): bins with NaN are rejected as not monotonic (numpy's result is undefined)
 - `np.empty_like[int]` (DIFF): uninitialized values
 - `np.fft.fft2[nan]` (DIFF): NaN propagation through the FFT differs (numpy keeps some parts finite)
 - `np.fft.fft[nan]` (DIFF): NaN propagation through the FFT differs (numpy keeps some parts finite)
@@ -61,15 +60,10 @@
 - `np.fft.rfft[nan]` (DIFF): NaN propagation through the FFT differs (numpy keeps some parts finite)
 - `np.fft.rfftn[nan]` (DIFF): NaN propagation through the FFT differs (numpy keeps some parts finite)
 - `np.frexp[nan]` (DIFF): the exponent of inf and NaN is platform-dependent (0 here, numpy on Windows -1)
-- `np.interp[nan]` (DIFF): xp with NaN and inf (not increasing, as numpy requires)
+- `np.interp[nan]` (DIFF): xp with NaN and inf (not increasing, as numpy requires; its result is undefined)
 - `np.linalg.pinv[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
 - `np.linalg.qr[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
-- `np.linalg.solve[nan]` (DIFF): NaN propagation through the LAPACK factorization differs
+- `np.linalg.solve[nan]` (DIFF): the reference BLAS dtrsm skips a zero right-hand side entry (0/NaN is not formed); numpy's OpenBLAS forms it
 - `np.linalg.svd[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
 - `np.linalg.svdvals[empty]` (DIFF): empty matrices are not supported (LAPACK reports an illegal argument)
-- `np.nonzero[empty]` (DIFF): the probe reads numpy's dtype=int64 as a number
-- `np.polymul[empty]` (DIFF): empty coefficient arrays
-- `np.resize[empty]` (RUN-FAIL): resizing an empty array
-- `np.setxor1d[nan]` (DIFF): NaN treated as one value
-- `np.vander[empty]` (RUN-FAIL): an empty array
-- `np.where[empty]` (DIFF): the probe reads numpy's dtype=int64 as a number
+- `np.real_if_close[complex]` (RUN-FAIL): numpy keeps the complex array (an imaginary part is not small); the translation's result is real, so it stops

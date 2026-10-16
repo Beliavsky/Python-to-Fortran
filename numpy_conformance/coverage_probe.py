@@ -145,16 +145,13 @@ KNOWN = {
 KNOWN.update({
     "np.empty_like": "uninitialized values",
     "np.empty_like[int]": "uninitialized values",
-    "np.linalg.solve[nan]": "NaN propagation through the LAPACK factorization differs",
-    "np.setxor1d[nan]": "NaN treated as one value",
+    "np.linalg.solve[nan]": "the reference BLAS dtrsm skips a zero right-hand side entry (0/NaN is not "
+                            "formed); numpy's OpenBLAS forms it",
     "np.frexp[nan]": "the exponent of inf and NaN is platform-dependent (0 here, numpy on Windows -1)",
-    "np.interp[nan]": "xp with NaN and inf (not increasing, as numpy requires)",
-    "np.digitize[nan]": "bins with NaN are rejected as not monotonic",
-    "np.nonzero[empty]": "the probe reads numpy's dtype=int64 as a number",
-    "np.where[empty]": "the probe reads numpy's dtype=int64 as a number",
-    "np.polymul[empty]": "empty coefficient arrays",
-    "np.resize[empty]": "resizing an empty array",
-    "np.vander[empty]": "an empty array",
+    "np.interp[nan]": "xp with NaN and inf (not increasing, as numpy requires; its result is undefined)",
+    "np.digitize[nan]": "bins with NaN are rejected as not monotonic (numpy's result is undefined)",
+    "np.real_if_close[complex]": "numpy keeps the complex array (an imaginary part is not small); the "
+                                 "translation's result is real, so it stops",
 })
 # Ops cases: numpy's default (unstable) sort orders ties differently.
 for _a in ("x", "xi", "m", "mr"):
@@ -322,10 +319,17 @@ def _program(case) -> str:
     return head + f"r = {case['expr']}\nprint(r)\n"
 
 
+def _no_repr_attrs(s: str) -> str:
+    """numpy's repr of an empty array, array([], dtype=int64) or
+    array([], shape=(0, 2), ...): without the dtype= and shape= parts,
+    whose digits are not values."""
+    return re.sub(r",?\s*(?:dtype=[\w.]+|shape=\([\d, ]*\))", "", s)
+
+
 def _kinds(s: str) -> list[str]:
     """bool/float/int of each number printed (numpy prints floats with a
     point or exponent, Fortran too; nan and inf are floats)."""
-    s = _complex_parts(s)
+    s = _complex_parts(_no_repr_attrs(s))
     out = []
     for tok in re.findall(NUM, s):
         if tok in {"True", "False", "T", "F"}:
@@ -339,7 +343,7 @@ def _kinds(s: str) -> list[str]:
 
 def _numbers(s: str) -> list[float]:
     conv = {"True": "1", "False": "0", "T": "1", "F": "0", "NaN": "nan", "Infinity": "inf", "Inf": "inf"}
-    s = _complex_parts(s)
+    s = _complex_parts(_no_repr_attrs(s))
     return [float(conv.get(t, t)) for t in re.findall(NUM, s)]
 
 

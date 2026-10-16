@@ -295,7 +295,7 @@ public :: np_pad_index !@pyapi kind=function ret=integer args=i:integer:intent(i
 public :: np_window !@pyapi kind=function ret=real(dp)(:) args=kind_name:character(*):intent(in),m:integer:intent(in),beta:real(dp):intent(in):optional lib=signal desc="np.hanning / hamming / blackman / bartlett / kaiser(m[, beta]) with numpy's formulas (n = arange(1-m, m, 2) for the cosine windows); m == 1 gives [1.0] and m < 1 an empty ..."
 public :: np_poly_roots !@pyapi kind=function ret=real(dp)(:) args=r:real(dp)(:):intent(in) lib=polynomial desc="np.poly(roots): the monic polynomial with these roots, highest degree first"
 public :: np_polyadd !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in),sgn:integer:intent(in) lib=polynomial desc="np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the shorter is padded with leading zeros (generic: np_polyadd_real, np_polyadd_int)"
-public :: np_polymul !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=polynomial desc="np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real, np_polymul_int)"
+public :: np_polymul !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=polynomial desc="np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real, np_polymul_int, np_polymul_complex)"
 public :: powfromroots_complex !@pyapi kind=function ret=complex(dp)(:) args=r:complex(dp)(:):intent(in) lib=polynomial desc="np.polynomial.polynomial.polyfromroots of complex roots: the coefficients, lowest degree first, of the product of (x - r(k))"
 public :: opoly_cx !@pyapi kind=function ret=complex(dp)(:) args=re:real(dp)(:):intent(in),im:real(dp)(:):intent(in),trim:logical:intent(in) lib=polynomial desc="complex series coefficients re + 1j*im of two real series (the shorter padded with zeros), trailing zeros dropped with trim (numpy trimseq)"
 public :: np_polydiv_complex !@pyapi kind=function ret=complex(dp)(:) args=u:complex(dp)(:):intent(in),v:complex(dp)(:):intent(in),part:integer:intent(in) lib=polynomial desc="np.polydiv(u, v)[part] of complex polynomials: the quotient (part 0) or the remainder (part 1), as np_polydiv"
@@ -501,7 +501,7 @@ public :: diag !@pyapi kind=function ret=complex(dp)(:) args=a:complex(dp)(:,:):
 public :: repeat !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) lib=arrays desc="repeat each real element reps times (generic: repeat_real, repeat_int, repeat_logical, repeat_complex)"
 public :: tile !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) lib=arrays desc="tile real vector reps times (generic: tile_real, tile_int, tile_complex, tile_real_2d, tile_int_2d)"
 public :: unique !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=sorting desc="sorted unique values of real vector (generic: unique_real, unique_int, unique_char, unique_complex)"
-public :: sort_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(inout) lib=sorting desc="sort real vector x in ascending order (generic: sort_real_vec, sort_int_vec, sort_char_vec, sort_complex_vec)"
+public :: sort_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(inout) lib=sorting desc="sort real vector x in ascending order (generic: sort_real_vec, sort_int_vec, sort_char_vec, sort_complex_vec, sort_logical_vec)"
 public :: argsort !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) lib=sorting desc="argsort indices (0-based) of real vector (generic: argsort_real, argsort_int)"
 public :: argsort_idx !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in) lib=sorting desc="argsort indices (0-based) of real vector (generic: argsort_idx_real, argsort_idx_int, argsort_complex_vec)"
 public :: sorted_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=sorting desc="np.sort of a real vector: a sorted copy (generic: sorted_real_vec, sorted_int_vec, sorted_complex_vec)"
@@ -565,6 +565,7 @@ public :: np_searchsorted !@pyapi kind=function ret=integer args=a:real(dp)(:):i
 public :: np_union1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=sorting desc="np.union1d of vectors: sorted, without duplicates (generic: np_union1d_real, np_union1d_int, np_union1d_complex)"
 public :: np_intersect1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=sorting desc="np.intersect1d of vectors: sorted, without duplicates (generic: np_intersect1d_real, np_intersect1d_int, np_intersect1d_complex)"
 public :: np_setdiff1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=sorting desc="np.setdiff1d of vectors: sorted, without duplicates (generic: np_setdiff1d_real, np_setdiff1d_int, np_setdiff1d_complex)"
+public :: np_vander !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),n:integer:intent(in),increasing:logical:intent(in) lib=polynomial desc="np.vander: the columns x**(n-1), ..., 1 (increasing: 1, ..., x**(n-1)); n = 0 gives none (generic: np_vander_real, np_vander_int)"
 public :: np_setxor1d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=sorting desc="np.setxor1d of vectors: sorted, without duplicates (generic: np_setxor1d_real, np_setxor1d_int, np_setxor1d_complex)"
 public :: np_isin1 !@pyapi kind=function ret=logical(:) args=a:real(dp)(:):intent(in),b:real(dp)(:):intent(in) lib=sorting desc="a(i) in b for each element of the vector a (generic: np_isin1_real, np_isin1_int, np_isin1_complex)"
 public :: np_unique_counts !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in) lib=sorting desc="np.unique(x, return_counts=True)[1] of a vector (0-based indices) (generic: np_unique_counts_real, np_unique_counts_int, np_unique_counts_complex)"
@@ -714,7 +715,7 @@ interface unique
 end interface unique
 
 interface sort_vec
-   module procedure sort_real_vec, sort_int_vec, sort_char_vec, sort_complex_vec
+   module procedure sort_real_vec, sort_int_vec, sort_char_vec, sort_complex_vec, sort_logical_vec
 end interface sort_vec
 
 interface argsort
@@ -936,8 +937,12 @@ interface np_polyadd
    module procedure np_polyadd_real, np_polyadd_int
 end interface np_polyadd
 
+interface np_vander
+   module procedure np_vander_real, np_vander_int
+end interface np_vander
+
 interface np_polymul
-   module procedure np_polymul_real, np_polymul_int
+   module procedure np_polymul_real, np_polymul_int, np_polymul_complex
 end interface np_polymul
 
 interface histogram
@@ -4116,6 +4121,16 @@ contains
          end do
       end subroutine sort_int_vec
 
+      pure subroutine sort_logical_vec(x)
+         ! sort logical vector x as numpy sorts booleans: False first.
+         implicit none
+         logical, intent(inout) :: x(:)
+         integer :: nf
+         nf = count(.not. x)
+         x(1:nf) = .false.
+         x(nf + 1:) = .true.
+      end subroutine sort_logical_vec
+
       pure subroutine sort_char_vec(x)
          ! sort character vector x in ascending order -- see
          ! sort_real_vec above for why this is a bottom-up merge sort
@@ -5443,11 +5458,15 @@ contains
       end function np_setdiff1d_real
 
       pure function np_setxor1d_real(a, b) result(c)
-         ! np.setxor1d of vectors: sorted, without duplicates.
+         ! np.setxor1d of vectors: sorted, without duplicates. NaN equals
+         ! nothing, so numpy keeps one NaN for each of a and b holding one.
          real(kind=dp), intent(in) :: a(:), b(:)
          real(kind=dp), allocatable :: c(:)
+         integer :: nnan
          c = unique_real([a, b])
-         c = pack(c, .not. (np_isin1_real(c, a) .and. np_isin1_real(c, b)))
+         c = pack(c, .not. (np_isin1_real(c, a) .and. np_isin1_real(c, b)) .and. .not. ieee_is_nan(c))
+         nnan = merge(1, 0, any(ieee_is_nan(a))) + merge(1, 0, any(ieee_is_nan(b)))
+         c = [c, spread(ieee_value(0.0_dp, ieee_quiet_nan), 1, nnan)]
       end function np_setxor1d_real
 
       elemental logical function eq_nan_real(a, b)
@@ -5955,10 +5974,43 @@ contains
       end function np_setdiff1d_complex
 
       pure function np_setxor1d_complex(a, b) result(c)
+         ! A value with a NaN part equals nothing: numpy keeps the NaN of
+         ! unique(a) and that of unique(b), in its sort order of NaNs.
          complex(kind=dp), intent(in) :: a(:), b(:)
-         complex(kind=dp), allocatable :: c(:)
+         complex(kind=dp), allocatable :: c(:), ua(:), ub(:), na(:), nb(:)
          c = unique_complex([a, b])
-         c = pack(c, .not. (np_isin1_complex(c, a) .and. np_isin1_complex(c, b)))
+         c = pack(c, .not. (np_isin1_complex(c, a) .and. np_isin1_complex(c, b)) .and. .not. complex_isnan(c))
+         ua = unique_complex(a)
+         ub = unique_complex(b)
+         na = pack(ua, complex_isnan(ua))
+         nb = pack(ub, complex_isnan(ub))
+         if (size(na) > 0 .and. size(nb) > 0) then
+            if (complex_nan_before(nb(1), na(1))) then
+               c = [c, nb(1:1), na(1:1)]
+            else
+               c = [c, na(1:1), nb(1:1)]
+            end if
+         else
+            c = [c, na(1:min(1, size(na))), nb(1:min(1, size(nb)))]
+         end if
+      contains
+         pure logical function complex_nan_before(x, y) result(lt)
+            ! numpy's order: R + nanj, nan + Rj, nan + nanj; then by the
+            ! parts that are not NaN.
+            complex(kind=dp), intent(in) :: x, y
+            integer :: kx, ky
+            kx = merge(2, 0, ieee_is_nan(real(x, kind=dp))) + merge(1, 0, ieee_is_nan(aimag(x)))
+            ky = merge(2, 0, ieee_is_nan(real(y, kind=dp))) + merge(1, 0, ieee_is_nan(aimag(y)))
+            if (kx /= ky) then
+               lt = kx < ky
+            else if (kx == 1) then
+               lt = real(x, kind=dp) < real(y, kind=dp)
+            else if (kx == 2) then
+               lt = aimag(x) < aimag(y)
+            else
+               lt = .false.
+            end if
+         end function complex_nan_before
       end function np_setxor1d_complex
 
       pure function np_unique_counts_complex(x) result(r)
@@ -12384,6 +12436,41 @@ contains
          end do
       end function powval_2
 
+      pure function np_vander_real(x, n, increasing) result(v)
+         ! np.vander(x, n): the columns x**(n-1), ..., x, 1 (x**0 first when
+         ! increasing), each the previous times x as numpy accumulates them;
+         ! n = 0 gives no columns.
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: n
+         logical, intent(in) :: increasing
+         real(kind=dp), allocatable :: v(:,:)
+         integer :: j
+         if (n < 0) error stop "np.vander: N must be non-negative"
+         allocate(v(size(x), n))
+         if (n == 0) return
+         v(:, 1) = 1.0_dp
+         do j = 2, n
+            v(:, j) = v(:, j - 1) * x
+         end do
+         if (.not. increasing) v = v(:, n:1:-1)
+      end function np_vander_real
+
+      pure function np_vander_int(x, n, increasing) result(v)
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: n
+         logical, intent(in) :: increasing
+         integer, allocatable :: v(:,:)
+         integer :: j
+         if (n < 0) error stop "np.vander: N must be non-negative"
+         allocate(v(size(x), n))
+         if (n == 0) return
+         v(:, 1) = 1
+         do j = 2, n
+            v(:, j) = v(:, j - 1) * x
+         end do
+         if (.not. increasing) v = v(:, n:1:-1)
+      end function np_vander_int
+
       pure function powvander(x, deg) result(v)
          ! Pseudo-Vandermonde matrix of the power series (np.polynomial.polynomial, lowest degree first): v(i, j+1) is the basis
          ! function of degree j at x(i).
@@ -12828,25 +12915,84 @@ contains
       end function np_polyadd_int
 
       pure function np_polymul_real(a, b) result(c)
-         ! np.polymul(a, b): the full convolution of the coefficients.
+         ! np.polymul(a, b): the full convolution of the coefficients, each without
+         ! its leading zeros (numpy's poly1d; [] and all zeros are [0]).
          real(kind=dp), intent(in) :: a(:), b(:)
-         real(kind=dp), allocatable :: c(:)
+         real(kind=dp), allocatable :: c(:), a1(:), b1(:)
          integer :: i
-         allocate(c(max(size(a) + size(b) - 1, 0)), source=0.0_dp)
-         do i = 1, size(a)
-            c(i:i + size(b) - 1) = c(i:i + size(b) - 1) + a(i) * b
+         a1 = lead_trimmed(a)
+         b1 = lead_trimmed(b)
+         allocate(c(size(a1) + size(b1) - 1), source=0.0_dp)
+         do i = 1, size(a1)
+            c(i:i + size(b1) - 1) = c(i:i + size(b1) - 1) + a1(i) * b1
          end do
+      contains
+         pure function lead_trimmed(x) result(y)
+            real(kind=dp), intent(in) :: x(:)
+            real(kind=dp), allocatable :: y(:)
+            integer :: k
+            do k = 1, size(x)
+               if (x(k) /= 0.0_dp) exit
+            end do
+            if (k > size(x)) then
+               y = [0.0_dp]
+            else
+               y = x(k:)
+            end if
+         end function lead_trimmed
       end function np_polymul_real
 
       pure function np_polymul_int(a, b) result(c)
          integer, intent(in) :: a(:), b(:)
-         integer, allocatable :: c(:)
+         integer, allocatable :: c(:), a1(:), b1(:)
          integer :: i
-         allocate(c(max(size(a) + size(b) - 1, 0)), source=0)
-         do i = 1, size(a)
-            c(i:i + size(b) - 1) = c(i:i + size(b) - 1) + a(i) * b
+         a1 = lead_trimmed(a)
+         b1 = lead_trimmed(b)
+         allocate(c(size(a1) + size(b1) - 1), source=0)
+         do i = 1, size(a1)
+            c(i:i + size(b1) - 1) = c(i:i + size(b1) - 1) + a1(i) * b1
          end do
+      contains
+         pure function lead_trimmed(x) result(y)
+            integer, intent(in) :: x(:)
+            integer, allocatable :: y(:)
+            integer :: k
+            do k = 1, size(x)
+               if (x(k) /= 0) exit
+            end do
+            if (k > size(x)) then
+               y = [0]
+            else
+               y = x(k:)
+            end if
+         end function lead_trimmed
       end function np_polymul_int
+
+      pure function np_polymul_complex(a, b) result(c)
+         complex(kind=dp), intent(in) :: a(:), b(:)
+         complex(kind=dp), allocatable :: c(:), a1(:), b1(:)
+         integer :: i
+         a1 = lead_trimmed(a)
+         b1 = lead_trimmed(b)
+         allocate(c(size(a1) + size(b1) - 1), source=(0.0_dp, 0.0_dp))
+         do i = 1, size(a1)
+            c(i:i + size(b1) - 1) = c(i:i + size(b1) - 1) + a1(i) * b1
+         end do
+      contains
+         pure function lead_trimmed(x) result(y)
+            complex(kind=dp), intent(in) :: x(:)
+            complex(kind=dp), allocatable :: y(:)
+            integer :: k
+            do k = 1, size(x)
+               if (x(k) /= (0.0_dp, 0.0_dp)) exit
+            end do
+            if (k > size(x)) then
+               y = [(0.0_dp, 0.0_dp)]
+            else
+               y = x(k:)
+            end if
+         end function lead_trimmed
+      end function np_polymul_complex
 
       pure function np_polydiv(u, v, part) result(res)
          ! np.polydiv(u, v)[part]: the quotient (part 0) or the remainder

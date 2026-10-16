@@ -26093,6 +26093,114 @@ def test_xp2f_complex_cov_and_corrcoef(tmp_path: Path) -> None:
     ))
 
 
+def _xp2f_output_matches_numpy_with_bools(tmp_path: Path, stem: str, code: str) -> None:
+    # As _xp2f_output_matches_numpy, booleans compared too (True/False and
+    # Fortran's T/F), and each value's kind: bool, int, or float.
+    src = tmp_path / f"{stem}.py"
+    src.write_text(code, encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    py = subprocess.run([sys.executable, "-W", "ignore", str(src)], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    ft = subprocess.run([str(src.with_name(f"{stem}_p.exe"))], cwd=tmp_path, capture_output=True, text=True,
+                        check=True).stdout
+    tok = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?|\bTrue\b|\bFalse\b|\bT\b|\bF\b|\bnan\b|\bNaN\b"
+
+    def vals(s):
+        conv = {"True": "1", "False": "0", "T": "1", "F": "0", "NaN": "nan"}
+        return [float(conv.get(t, t)) for t in re.findall(tok, s)]
+
+    def kinds(s):
+        return ["bool" if t in {"True", "False", "T", "F"} else "float" if re.search(r"[.eEnN]", t) else "int"
+                for t in re.findall(tok, s)]
+    assert vals(ft) == pytest.approx(vals(py), rel=1e-7, abs=1e-8, nan_ok=True), (py, ft)
+    assert kinds(ft) == kinds(py), (py, ft)
+
+
+def test_xp2f_empty_and_nan_edge_results(tmp_path: Path) -> None:
+    # np.polymul drops each factor's leading zeros as numpy's poly1d does
+    # ([] is [0]; it convolved them); np.resize of an empty array is zeros
+    # (it divided by zero); np.vander with N = 0 (as for an empty x) has
+    # no columns (it stopped); np.setxor1d keeps a NaN for each array
+    # holding one (NaN equals nothing; it kept one).
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xedge", (
+        "import numpy as np\n"
+        "e = np.array([])\n"
+        "p = np.array([1.0, 2.0])\n"
+        "xi = np.array([1, 2, 3])\n"
+        "z = np.array([0j, 1j, 2.0])\n"
+        "print(np.polymul(e, e), np.polymul(p, e), np.polymul(e, p))\n"
+        "print(np.polymul(np.array([0.0, 1.0]), np.array([1.0, 1.0])), np.polymul(np.array([0, 3]), np.array([0, 0, 2])))\n"
+        "r = np.polymul(z, np.array([1j, 1.0]))\n"
+        "print(r.real, r.imag)\n"
+        "print(np.resize(e, 2), np.resize(e, (2, 3)), np.resize(xi, 5), np.resize(p, 3))\n"
+        "print(np.resize(np.array([True, False]), 3))\n"
+        "v = np.vander(e)\n"
+        "w = np.vander(p, 0)\n"
+        "print(v.shape[0], v.shape[1], w.shape[0], w.shape[1])\n"
+        "print(np.vander(p), np.vander(xi, 2), np.vander(xi, 4, increasing=True))\n"
+        "x = np.array([0.5, np.nan, -2.0, np.inf])\n"
+        "print(np.setxor1d(x, x), np.setxor1d(np.array([np.nan, 1.0]), np.array([2.0, np.nan])))\n"
+        "r = np.setxor1d(np.array([complex(0, np.nan), 1]), np.array([2, complex(1, np.nan)]))\n"
+        "print(r.real, r.imag)\n"
+    ))
+
+
+def test_xp2f_dtype_of_another_array(tmp_path: Path) -> None:
+    # dtype=a.dtype and b.astype(a.dtype) take a's kind (they were ignored:
+    # np.zeros(3, dtype=xi.dtype) was real, np.asarray([1.5], dtype=xi.dtype)
+    # kept 1.5); np.zeros_like / ones_like honor dtype= (they kept a's kind).
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xdtype_of", (
+        "import numpy as np\n"
+        "p = np.array([1.0, 2.0])\n"
+        "xi = np.array([1, 2, 3])\n"
+        "b = np.array([True, False])\n"
+        "print(np.zeros(3, dtype=xi.dtype), np.ones((2, 2), dtype=xi.dtype), np.zeros(2, dtype=b.dtype))\n"
+        "print(np.arange(4, dtype=xi.dtype), np.array([1.7, 2.2], dtype=xi.dtype))\n"
+        "print(p.astype(xi.dtype), xi.astype(p.dtype), np.asarray([1.5, 2.5], dtype=xi.dtype))\n"
+        "print(np.zeros_like(p, dtype=int), np.ones_like(xi, dtype=float), np.ones_like(xi, dtype=bool))\n"
+        "def f(a, n):\n"
+        "    out = np.zeros(n, dtype=a.dtype)\n"
+        "    out[0] = a[0]\n"
+        "    return out\n"
+        "print(f(xi, 3), f(p, 2))\n"
+    ))
+
+
+def test_xp2f_boolean_array_arithmetic(tmp_path: Path) -> None:
+    # numpy's arithmetic of boolean arrays: + is or and * is and (boolean
+    # results), ** // % of 0/1, @ an or of ands; abs keeps them, square is
+    # of 0/1, round gives floats and clip integers. These did not compile
+    # (Fortran's numeric operators on logical). A function called with
+    # boolean and integer arrays in two arguments is specialized for each
+    # (one shared signature turned xi into xi /= 0).
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xbool_arith", (
+        "import numpy as np\n"
+        "b = np.array([True, False, True])\n"
+        "c = np.array([True, True, True])\n"
+        "m = np.array([[True, False], [True, True]])\n"
+        "xi = np.array([1, 2, 3])\n"
+        "print(b + b, b * c, True + b, b * True, (xi > 1) * (xi < 3), b + (xi > 1))\n"
+        "print(b ** c, b // c, b % c, b / c)\n"
+        "print(b @ b, np.dot(b, b))\n"
+        "r = m @ m\n"
+        "print(r)\n"
+        "print(np.matmul(m, m.T))\n"
+        "print(m + m)\n"
+        "print(abs(b), np.abs(b), abs(xi > 2), np.square(b), b.round(), np.round(b), b.clip(0, 2), np.clip(b, 0, 2))\n"
+        "y = b.copy()\n"
+        "y.sort()\n"
+        "print(y)\n"
+        "def h(u, v):\n"
+        "    return u ** v\n"
+        "print(h(b, b), h(xi, xi))\n"
+        "def g(u, v):\n"
+        "    return u + v\n"
+        "print(g(b, c), g(xi, xi))\n"
+    ))
+
+
 def test_xp2f_numpy_copies_and_argument_mutation_match(tmp_path: Path) -> None:
     # No shared memory (copy(), rebinding, a Python list, fancy indexing),
     # or a function modifying its array argument in place -- including
