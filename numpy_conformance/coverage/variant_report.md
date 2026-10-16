@@ -4,23 +4,19 @@
 
 | status | count |
 |---|---|
-| DIFF | 23 |
+| DIFF | 22 |
 | RUN-FAIL | 3 |
-| BUILD-FAIL | 2 |
-| XLATE-FAIL | 32 |
-| MATCH | 2566 |
-
-## BUILD-FAIL
-
-- `np.linalg.eigh[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
-- `np.linalg.qr[complex]`: Type mismatch in argument 'a' at (1); passed COMPLEX(8) to REAL(8)
+| XLATE-FAIL | 34 |
+| MATCH | 2567 |
 
 ## XLATE-FAIL
 
 - `np.asarray_chkfinite[complex]`: unsupported call: np.asarray_chkfinite(x)
 - `np.diag_indices_from[3d]`: unsupported assign: r0, r1, r2 = np.diag_indices_from(m)
 - `np.histogram_bin_edges[complex]`: np.histogram of a complex array is not supported (the translation would drop the imaginary part)
+- `np.linalg.eigh[complex]`: np.linalg.eigh of a complex matrix is not supported (numpy's eigenvector phases come from LAPACK's zheevd; np.linalg.eigvalsh gives the eigenvalues)
 - `np.linalg.lstsq[complex]`: np.linalg.lstsq currently supports real inputs only
+- `np.linalg.qr[complex]`: np.linalg.qr of a complex matrix is not supported (numpy's Q and R phases come from LAPACK's zgeqrf)
 - `np.linalg.svd[complex]`: np.linalg.svd of a complex matrix supports only the singular values (svdvals or compute_uv=False)
 - `np.poly[complex]`: np.poly of complex roots is not supported
 - `np.polynomial.chebyshev.chebcompanion[complex]`: np.polynomial.chebyshev.chebcompanion of a complex array is not supported (the translation would drop the imaginary part)
@@ -52,7 +48,6 @@
 
 ## Known differences
 
-- `np.cov[complex]` (DIFF): a real number (numpy's complex result of a vector has a zero imaginary part)
 - `np.digitize[nan]` (RUN-FAIL): bins with NaN are rejected as not monotonic
 - `np.empty_like[int]` (DIFF): uninitialized values
 - `np.fft.fft2[nan]` (DIFF): NaN propagation through the FFT differs (numpy keeps some parts finite)

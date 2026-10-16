@@ -5,9 +5,9 @@
 | status | count |
 |---|---|
 | DIFF | 5 |
-| BUILD-FAIL | 83 |
-| XLATE-FAIL | 59 |
-| MATCH | 6146 |
+| BUILD-FAIL | 70 |
+| XLATE-FAIL | 28 |
+| MATCH | 6190 |
 
 ## BUILD-FAIL
 
@@ -74,19 +74,6 @@
 - `y = b.copy(); y.sort(); r = y [empty]`: There is no specific subroutine for the generic 'sort_vec' at (1)
 - `y = b.copy(); y.sort(); r = y [one]`: There is no specific subroutine for the generic 'sort_vec' at (1)
 - `y = b.copy(); y.sort(); r = y [ties]`: There is no specific subroutine for the generic 'sort_vec' at (1)
-- `y = m.copy(); y.T[0] = 4; r = y [base]`: Unclassifiable statement at (1)
-- `y = m.copy(); y.T[0] = 4; r = y [complex]`: Unclassifiable statement at (1)
-- `y = m.copy(); y.T[0] = 4; r = y [empty]`: Unclassifiable statement at (1)
-- `y = m.copy(); y.T[0] = 4; r = y [int]`: Unclassifiable statement at (1)
-- `y = m.copy(); y.T[0] = 4; r = y [nan]`: Unclassifiable statement at (1)
-- `y = m.copy(); y.T[0] = 4; r = y [one]`: Unclassifiable statement at (1)
-- `y = m.copy(); y.T[0] = 4; r = y [ties]`: Unclassifiable statement at (1)
-- `y = mr.copy(); y.T[0] = 4; r = y [base]`: Unclassifiable statement at (1)
-- `y = mr.copy(); y.T[0] = 4; r = y [complex]`: Unclassifiable statement at (1)
-- `y = mr.copy(); y.T[0] = 4; r = y [int]`: Unclassifiable statement at (1)
-- `y = mr.copy(); y.T[0] = 4; r = y [nan]`: Unclassifiable statement at (1)
-- `y = mr.copy(); y.T[0] = 4; r = y [one]`: Unclassifiable statement at (1)
-- `y = mr.copy(); y.T[0] = 4; r = y [ties]`: Unclassifiable statement at (1)
 - `y = x.copy(); y[xi % 4] = 2; r = y [base]`: Elements with the same value at (1) and (2) in vector subscript in a variable definition context (assignment)
 - `y = x.copy(); y[xi % 4] = 2; r = y [complex]`: Elements with the same value at (1) and (2) in vector subscript in a variable definition context (assignment)
 - `y = x.copy(); y[xi % 4] = 2; r = y [int]`: Elements with the same value at (1) and (2) in vector subscript in a variable definition context (assignment)
@@ -113,49 +100,18 @@
 - `r = mr.squeeze() [nan]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = mr.squeeze() [one]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = mr.squeeze() [ties]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
-- `r = np.apply_along_axis(lambda v: v.max() - v.min(), 0, m) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.apply_along_axis(lambda v: v.max() - v.min(), 0, mr) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.apply_along_axis(lambda v: v.max() - v.min(), 1, m) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.apply_along_axis(lambda v: v.max() - v.min(), 1, mr) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.apply_along_axis(np.sum, 0, m) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.apply_along_axis(np.sum, 0, mr) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.apply_along_axis(np.sum, 1, m) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.apply_along_axis(np.sum, 1, mr) [3d]`: np.apply_along_axis currently supports a matrix
-- `r = np.argwhere(m > 1) [3d]`: np.argwhere supports vectors and matrices
-- `r = np.argwhere(mr > 1) [3d]`: np.argwhere supports vectors and matrices
-- `y = m.copy(); z = y.T; z[0, 1] = 8; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y.T; z[0, 1] = 8; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y.T; z[0, 1] = 8; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y.T; z[0, 1] = 8; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y.T; z[0, 1] = 8; r = y [ties]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
+- `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [base]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
+- `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [int]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
+- `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [nan]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [one]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [ties]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y[0]; z[1] = 42; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y[0]; z[1] = 42; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y[0]; z[1] = 42; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y[0]; z[1] = 42; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = m.copy(); z = y[0]; z[1] = 42; r = y [ties]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y; z[0] = -5; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y; z[0] = -5; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y; z[0] = -5; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y; z[0] = -5; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y; z[0] = -5; r = y [one]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y; z[0] = -5; r = y [ties]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[1:3]; z[0] = 99; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[1:3]; z[0] = 99; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[1:3]; z[0] = 99; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[1:3]; z[0] = 99; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[1:3]; z[0] = 99; r = y [ties]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [one]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
-- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [ties]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
+- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [base]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
+- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [complex]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
+- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [int]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
+- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [nan]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
+- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [one]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
+- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [ties]`: modifying 'z_3' in place also changes 'y_3' in numpy, because they share memory ('z_3' and 'y_3' are the same array or views of it, e.g. a slice, row, column, .
 
 ## Known differences
 

@@ -155,7 +155,6 @@ KNOWN.update({
     "np.polymul[empty]": "empty coefficient arrays",
     "np.resize[empty]": "resizing an empty array",
     "np.vander[empty]": "an empty array",
-    "np.cov[complex]": "a real number (numpy's complex result of a vector has a zero imaginary part)",
 })
 # Ops cases: numpy's default (unstable) sort orders ties differently.
 for _a in ("x", "xi", "m", "mr"):

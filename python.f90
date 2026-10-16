@@ -144,6 +144,7 @@ public :: ones_complex !@pyapi kind=function ret=complex(dp)(:) args=n:integer:i
 public :: complex_isfinite !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) lib=arrays desc="elemental finiteness test for complex values"
 public :: complex_isinf !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) lib=arrays desc="elemental infinity test for complex values"
 public :: complex_isnan !@pyapi kind=function ret=logical args=z:complex(dp):intent(in) lib=arrays desc="elemental NaN test for complex values"
+public :: real_if_close_complex !@pyapi kind=function ret=real(dp) args=z:complex(dp):intent(in),tol:real(dp):intent(in):optional lib=arrays desc="np.real_if_close: the real part, stopping when an imaginary part is not within tol (elemental)"
 public :: zeros_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) desc="allocate and return length-n integer array initialized to 0"
 public :: ones_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) desc="allocate and return length-n integer array initialized to 1"
 public :: zeros_logical !@pyapi kind=function ret=logical(:) args=n:integer:intent(in) desc="allocate and return length-n logical array initialized to .false."
@@ -421,6 +422,8 @@ public :: isclose_scalar_real !@pyapi kind=function ret=logical args=a:real(dp):
 public :: allclose_integer !@pyapi kind=function ret=logical args=a:integer(:):intent(in),b:integer(:):intent(in),rtol:real(dp):intent(in):optional,atol:real(dp):intent(in):optional lib=arrays desc="NumPy-like allclose on 1D integer arrays"
 public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="2x2 covariance matrix for two real vectors"
 public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="covariance matrix for observations in rows (numpy rowvar=False)"
+public :: cov_matrix_rows_complex !@pyapi kind=function ret=complex(dp)(:,:) args=x:complex(dp)(:,:):intent(in),ddof:integer:intent(in):optional lib=statistics desc="covariance matrix of complex variables in columns (numpy rowvar=False): Xc^T conj(Xc) / (n - ddof)"
+public :: corrcoef_matrix_rows_complex !@pyapi kind=function ret=complex(dp)(:,:) args=x:complex(dp)(:,:):intent(in) lib=statistics desc="correlation matrix of complex variables in columns (numpy rowvar=False), real and imaginary parts clipped to [-1, 1]"
 public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) lib=statistics desc="2x2 correlation matrix for two real vectors"
 public :: corrcoef_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in) lib=statistics desc="correlation matrix for observations in rows (numpy rowvar=False)"
 public :: autocorr_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),lag:integer:intent(in):optional lib=timeseries desc="pandas-style lag-k serial autocorrelation of a 1D real vector"
@@ -8809,6 +8812,22 @@ contains
          ok = ieee_is_nan(real(z, kind=dp)) .or. ieee_is_nan(aimag(z))
       end function complex_isnan
 
+      pure elemental real(kind=dp) function real_if_close_complex(z, tol) result(x)
+         ! np.real_if_close: the real part when |imag| < tol (tol > 1 counts
+         ! machine epsilons, default 100); numpy keeps the complex array
+         ! otherwise, which has no real result here, so that stops.
+         complex(kind=dp), intent(in) :: z
+         real(kind=dp), intent(in), optional :: tol
+         real(kind=dp) :: t
+         t = 100.0_dp * epsilon(1.0_dp)
+         if (present(tol)) then
+            t = tol
+            if (tol > 1.0_dp) t = tol * epsilon(1.0_dp)
+         end if
+         if (.not. (abs(aimag(z)) < t)) error stop 'real_if_close: an imaginary part is not close to zero'
+         x = real(z, kind=dp)
+      end function real_if_close_complex
+
       pure function zeros_int(n) result(x)
          integer, intent(in) :: n
          integer, allocatable :: x(:)
@@ -14826,6 +14845,54 @@ contains
          xc = x - spread(mu, dim=1, ncopies=n)
          c = matmul(transpose(xc), xc) / real(max(1, n - d), kind=dp)
       end function cov_matrix_rows_real
+
+      function cov_matrix_rows_complex(x, ddof) result(c)
+         ! numpy's np.cov of complex variables in the columns of x
+         ! (rowvar=False): Xc^T conj(Xc) / (n - ddof), Xc the centered x. As
+         ! in numpy, n - ddof <= 0 divides by zero.
+         complex(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in), optional :: ddof
+         complex(kind=dp), allocatable :: c(:,:)
+         complex(kind=dp), allocatable :: xc(:,:), mu(:)
+         real(kind=dp) :: fact
+         integer :: n, p, d
+         n = size(x, 1)
+         p = size(x, 2)
+         d = 1
+         if (present(ddof)) d = ddof
+         allocate(c(p, p))
+         if (p <= 0) return
+         fact = real(max(0, n - d), kind=dp)
+         allocate(mu(p), xc(n, p))
+         mu = sum(x, dim=1) / real(n, kind=dp)
+         xc = x - spread(mu, dim=1, ncopies=n)
+         c = matmul(transpose(xc), conjg(xc)) / fact
+      end function cov_matrix_rows_complex
+
+      function corrcoef_matrix_rows_complex(x) result(r)
+         ! numpy's np.corrcoef of complex variables in the columns of x
+         ! (rowvar=False): c(i,j) / (s(i) s(j)), s the square roots of the
+         ! real parts of c's diagonal, with the real and imaginary parts
+         ! clipped to [-1, 1] (NaN kept, as for a constant variable).
+         complex(kind=dp), intent(in) :: x(:,:)
+         complex(kind=dp), allocatable :: r(:,:)
+         real(kind=dp), allocatable :: s(:), re_r(:,:), im_r(:,:)
+         integer :: i, p
+         r = cov_matrix_rows_complex(x, 1)
+         p = size(r, 1)
+         allocate(s(p))
+         do i = 1, p
+            s(i) = sqrt(real(r(i,i), kind=dp))
+         end do
+         r = r / spread(s, dim=2, ncopies=p) / spread(s, dim=1, ncopies=p)
+         re_r = real(r, kind=dp)
+         im_r = aimag(r)
+         where (re_r > 1.0_dp) re_r = 1.0_dp
+         where (re_r < -1.0_dp) re_r = -1.0_dp
+         where (im_r > 1.0_dp) im_r = 1.0_dp
+         where (im_r < -1.0_dp) im_r = -1.0_dp
+         r = cmplx(re_r, im_r, kind=dp)
+      end function corrcoef_matrix_rows_complex
 
       pure function corrcoef2_real(x, y) result(r)
          real(kind=dp), intent(in) :: x(:), y(:)

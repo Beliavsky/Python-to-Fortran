@@ -25960,21 +25960,17 @@ def test_xp2f_constant_promotion_sees_assignment_in_nested_block(tmp_path: Path)
 
 
 def test_xp2f_numpy_view_mutation_is_reported(tmp_path: Path) -> None:
-    # numpy views share memory: after b = a / a[1:4] / m[1] / m[:, 2] / m.T
-    # / a.reshape(...) / m.ravel(), modifying one name in place changes the
-    # other. The translation copies arrays, so it reports the pattern
-    # instead of silently printing different values.
+    # numpy views share memory: after b = a.reshape(...) / m.ravel(), or a
+    # view whose uses can't be written as subscripts of its array (a
+    # negative step, a name rebound later), modifying one name in place
+    # changes the other. The translation copies arrays, so it reports the
+    # pattern instead of silently printing different values.
     cases = [
-        "a = np.arange(6.0)\nb = a\nb[0] = 99.0\nprint(a)",
-        "a = np.arange(6.0)\nb = a[1:4]\nb[0] = 99.0\nprint(a)",
-        "m = np.arange(6.0).reshape(2, 3)\nr = m[1]\nr[0] = 99.0\nprint(m)",
-        "m = np.arange(6.0).reshape(2, 3)\nc = m[:, 2]\nc[:] = -1.0\nprint(m)",
-        "m = np.arange(6.0).reshape(2, 3)\nt = m.T\nt[0, 1] = 99.0\nprint(m)",
         "a = np.arange(6.0)\nm = a.reshape(2, 3)\nm[1, 1] = 99.0\nprint(a)",
         "m = np.arange(6.0).reshape(2, 3)\nv = m.ravel()\nv[4] = 99.0\nprint(m)",
-        "a = np.arange(4.0)\nb = a\nb += 1\nprint(a)",
-        "a = np.zeros(4)\nfor i in range(4):\n    b = a[i:]\n    b[0] += i\nprint(a)",
-        "m = np.arange(6.0).reshape(3, 2)\ntmp = m[0]\nm[0] = m[2]\nm[2] = tmp\nprint(m)",
+        "a = np.arange(6.0)\nb = a[::-1]\nb[0] = 99.0\nprint(a)",
+        "m = np.arange(6.0).reshape(2, 3)\nr = m[0]\nr[0] = 5.0\nr = m[1]\nprint(m, r)",
+        "a = np.arange(6.0)\ni = 1\nb = a[i:]\nb[0] = 0.0\ni = 3\nprint(a, b)",
     ]
     for k, body in enumerate(cases):
         src = tmp_path / f"xview_{k}.py"
@@ -25983,6 +25979,118 @@ def test_xp2f_numpy_view_mutation_is_reported(tmp_path: Path) -> None:
                               cwd=tmp_path, capture_output=True, text=True, check=False)
         assert proc.returncode != 0, body
         assert "in place also changes" in proc.stdout + proc.stderr, (body, proc.stdout + proc.stderr)
+
+
+def test_xp2f_numpy_view_writes_reach_the_array(tmp_path: Path) -> None:
+    # A view bound once (b = a, a[1:4], m[1], m[:, 2], m.T, a[::2], a row of
+    # a rank-3 array), then modified in place or read after its array is:
+    # its later uses become subscripts of the array, as numpy shares the
+    # memory. These were reported as unsupported.
+    _xp2f_output_matches_numpy(tmp_path, "xview_write", (
+        "import numpy as np\n"
+        "a = np.arange(6.0)\n"
+        "b = a\n"
+        "b[0] = 99.0\n"
+        "b += 1\n"
+        "print(a)\n"
+        "a2 = np.arange(6.0)\n"
+        "c = a2[1:4]\n"
+        "c[0] = -9.0\n"
+        "c[1:] = 7.0\n"
+        "print(a2, c.sum())\n"
+        "m = np.arange(6.0).reshape(2, 3)\n"
+        "r = m[1]\n"
+        "r[0] = 99.0\n"
+        "col = m[:, 2]\n"
+        "col[:] = -1.0\n"
+        "col *= 3.0\n"
+        "t = m.T\n"
+        "t[0, 1] = 55.0\n"
+        "print(m)\n"
+        "z = np.zeros(4)\n"
+        "for i in range(4):\n"
+        "    w = z[i:]\n"
+        "    w[0] += i\n"
+        "print(z)\n"
+        "e = np.arange(8.0)\n"
+        "ev = e[::2]\n"
+        "ev[1] = 0.5\n"
+        "print(e)\n"
+        "s = np.arange(6.0).reshape(3, 2)\n"
+        "tmp = s[0]\n"
+        "s[0] = s[2]\n"
+        "s[2] = tmp\n"
+        "print(s)\n"
+        "u = np.arange(12.0).reshape(2, 3, 2)\n"
+        "p = u[1]\n"
+        "p[0, 1] = -4.0\n"
+        "q = u[:, 2, :]\n"
+        "q += 10.0\n"
+        "print(u)\n"
+        "g = np.arange(6.0).reshape(2, 3)\n"
+        "row = g[0]\n"
+        "g[0, 2] = 8.0\n"
+        "print(row)\n"
+    ))
+
+
+def test_xp2f_transposed_targets_argwhere_and_apply_along_axis_of_rank3(tmp_path: Path) -> None:
+    # y.T[...] = v was emitted as transpose(y)(...) = v (not Fortran);
+    # np.argwhere and np.apply_along_axis rejected rank-3 arrays;
+    # apply_along_axis inside an expression was rejected, and a lambda
+    # indexing its slice (v[::-1]) gave a subscript of a subscript.
+    _xp2f_output_matches_numpy(tmp_path, "xtarg3", (
+        "import numpy as np\n"
+        "m = np.array([[2.0, 1.0, 0.5], [1.0, 3.0, -1.0], [0.0, 4.0, 2.0]])\n"
+        "t3 = np.array([[[2.0, 0.0, 1.0], [1.0, 3.0, 0.0]], [[0.0, -1.0, 5.0], [4.0, 0.0, 1.5]]])\n"
+        "y = m.copy()\n"
+        "y.T[0] = np.array([9.0, 8.0, 7.0])\n"
+        "y.T[1, 2] = -5.0\n"
+        "y.T[:, 0] += 10.0\n"
+        "y.T[1:, :2] = np.array([[1.0, 2.0], [3.0, 4.0]])\n"
+        "print(y)\n"
+        "y3 = t3.copy()\n"
+        "y3.T[0] = 0.0\n"
+        "y3.T[1, 0] = np.array([7.0, 8.0])\n"
+        "print(y3)\n"
+        "r = np.argwhere(t3)\n"
+        "print(r)\n"
+        "print(r.shape[0], r.shape[1], len(np.argwhere(t3 > 1.0)))\n"
+        "for ax in range(1):\n"
+        "    a0 = np.apply_along_axis(np.sum, 0, t3)\n"
+        "    a1 = np.apply_along_axis(np.max, -1, t3)\n"
+        "    a2 = np.apply_along_axis(np.cumsum, 1, t3)\n"
+        "    a3 = np.apply_along_axis(lambda v: v[::-1], 2, t3)\n"
+        "    a4 = np.apply_along_axis(lambda v: v[1:].sum(), 1, m)\n"
+        "    print(a0)\n"
+        "    print(a1)\n"
+        "    print(a2)\n"
+        "    print(a3)\n"
+        "    print(a4)\n"
+        "print(np.apply_along_axis(np.sum, 0, m))\n"
+        "print(np.apply_along_axis(np.sum, 2, t3) + 1.0)\n"
+    ))
+
+
+def test_xp2f_complex_cov_and_corrcoef(tmp_path: Path) -> None:
+    # np.cov / np.corrcoef of complex input (Xc^T conj(Xc) / (n - ddof));
+    # one complex vector's cov printed as a real number, the rest did not
+    # compile.
+    _xp2f_output_matches_numpy(tmp_path, "xcov_cx", (
+        "import numpy as np\n"
+        "x = np.array([0.5 + 1.0j, 1.5 + 0.0j, -2.0 - 0.5j, 3.25j])\n"
+        "y = np.array([1.0 - 1.0j, 2.0 + 0.5j, 0.0 + 1.0j, -1.0 + 0.0j])\n"
+        "xr = np.array([1.0, 2.0, 4.0, 3.5])\n"
+        "m = np.array([[2.0 + 1.0j, 1.0 + 0.0j], [1.0 - 1.0j, 3.0 + 0.5j], [0.5j, -1.0 + 0.0j]])\n"
+        "c0 = np.cov(x)\n"
+        "print(c0.real, c0.imag)\n"
+        "c1 = np.corrcoef(x)\n"
+        "print(c1.real, c1.imag)\n"
+        + "".join(f"c = {e}\nprint(c.real)\nprint(c.imag)\n" for e in (
+            "np.cov(x, ddof=0)", "np.cov(x, y)", "np.cov(x, y, bias=True)", "np.cov(m, rowvar=False)",
+            "np.cov(m.T)", "np.cov(m, rowvar=False, ddof=0)", "np.corrcoef(x, y)",
+            "np.corrcoef(m, rowvar=False)", "np.cov(xr, y)"))
+    ))
 
 
 def test_xp2f_numpy_copies_and_argument_mutation_match(tmp_path: Path) -> None:

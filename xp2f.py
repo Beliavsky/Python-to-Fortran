@@ -7257,6 +7257,72 @@ def _dynamic_real_eig_call(node):
     return None
 
 
+def hoist_apply_along_axis_calls(tree):
+    """np.apply_along_axis(...) is translated as the whole value of
+    `name = ...` (a loop); one inside a larger expression of a simple
+    statement (or an if test) is first assigned to a temporary. Calls in
+    lambdas, comprehensions, conditional branches and the right operands
+    of and/or (not always evaluated) are left alone."""
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    counter = [0]
+
+    def is_aaa(n):
+        return (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "apply_along_axis"
+                and isinstance(n.func.value, ast.Name) and n.func.value.id in {"np", "numpy"} and len(n.args) >= 3)
+
+    def fresh():
+        while True:
+            counter[0] += 1
+            nm = f"aaa_tmp_{counter[0]}"
+            if nm not in used:
+                used.add(nm)
+                return nm
+
+    def hoist(node, out):
+        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            return node
+        if isinstance(node, ast.IfExp):
+            node.test = hoist(node.test, out)
+            return node
+        if isinstance(node, ast.BoolOp):
+            node.values[0] = hoist(node.values[0], out)
+            return node
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                setattr(node, field, hoist(value, out))
+            elif isinstance(value, list):
+                setattr(node, field, [hoist(x, out) if isinstance(x, ast.AST) else x for x in value])
+        if is_aaa(node):
+            tmp = fresh()
+            out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=tmp, ctx=ast.Store())], value=node), node))
+            return ast.copy_location(ast.Name(id=tmp, ctx=ast.Load()), node)
+        return node
+
+    if not any(is_aaa(n) for n in ast.walk(tree)):
+        return tree
+    for owner in list(ast.walk(tree)):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(owner, field, None)
+            if not isinstance(stmts, list) or not stmts or not isinstance(stmts[0], ast.stmt):
+                continue
+            new_stmts = []
+            for st in stmts:
+                out = []
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) \
+                        and is_aaa(st.value):
+                    st.value.args = [hoist(a, out) for a in st.value.args]
+                elif isinstance(st, (ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Return)) \
+                        and st.value is not None:
+                    st.value = hoist(st.value, out)
+                elif isinstance(st, ast.If):
+                    st.test = hoist(st.test, out)
+                new_stmts.extend(out)
+                new_stmts.append(st)
+            setattr(owner, field, new_stmts)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_dynamic_real_eig_prints(tree):
     """numpy returns real eigenvalues (and eigenvectors) and roots when the
     input is real and every imaginary part is 0, complex ones otherwise; the
@@ -17434,14 +17500,14 @@ def detect_needed_helpers(tree):
         "flip": {"reversed_vec", "reversed_mat"},
         "argsort": {"argsort", "argsort_idx", "argsort_2d"},
         "flatnonzero": {"arange_int"},
-        "argwhere": {"arange_int", "where_indices_2d"},
+        "argwhere": {"arange_int", "where_indices_2d", "nonzero_3d"},
         "where": {"arange_int", "where_indices_2d", "where_axis_2d", "gather_where2d", "where_pair_2d"},
         "union1d": {"unique_int"},
         "tri": {"tri_int", "tri_real"},
         "moveaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
         "rollaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
-        "cov": {"cov2_real", "cov_matrix_rows_real"},
-        "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real", "np_corrcoef_1"},
+        "cov": {"cov2_real", "cov_matrix_rows_real", "cov_matrix_rows_complex"},
+        "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real", "np_corrcoef_1", "corrcoef_matrix_rows_complex"},
         "convolve": {"convolve_real", "convolve_int"},
         "correlate": {"correlate_real"},
         "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_vector", "loadtxt_int_vector", "loadtxt_logical_vector"},
@@ -17453,6 +17519,7 @@ def detect_needed_helpers(tree):
         "isfinite": {"complex_isfinite"},
         "isinf": {"complex_isinf"},
         "isnan": {"complex_isnan"},
+        "real_if_close": {"real_if_close_complex"},
         "polyval": {"polyval"},
         "polyder": {"polyder"},
         "polyfit": {"polyfit_real"},
@@ -30027,12 +30094,249 @@ class translator(ast.NodeVisitor):
             return None
         return base.id
 
+    def _inline_written_views(self, body):
+        """numpy views share memory. After `v = y[idx]` (a basic index: a
+        row, column or slice), `v = y` or `v = y.T`, when v or y is modified
+        in place later, the later uses of v become the view's expression,
+        y[idx] (v[s] composed into one subscript of y), so that writes reach
+        y as in numpy. Only when v is bound once, v is not used before, and
+        neither y nor the names in idx are rebound after; otherwise
+        _check_view_mutation reports the sharing."""
+        import copy as _copy
+        scope = ast.Module(body=list(body), type_ignores=[])
+        stores = {}
+        # a += b of an array modifies it in place (not a binding).
+        aug_targets = {id(n.target) for n in ast.walk(scope) if isinstance(n, ast.AugAssign)
+                       and isinstance(n.target, ast.Name) and int(self._rank_expr(n.target) or 0) >= 1}
+        for n in ast.walk(scope):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and id(n) not in aug_targets:
+                stores[n.id] = stores.get(n.id, 0) + 1
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                for a in getattr(getattr(n, "args", None), "args", []):
+                    stores[a.arg] = stores.get(a.arg, 0) + 1
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                for nm in n.names:
+                    stores[nm] = stores.get(nm, 0) + 2
+        nested_names = {m.id for d in ast.walk(scope) if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        for m in ast.walk(d) if isinstance(m, ast.Name)}
+        list_names = set(self.python_list_vars) | set(self.pandas_series_vars) | set(self.pandas_df_vars)
+
+        def simple_index(e):
+            # Constants, names and arithmetic of them (no calls).
+            return all(isinstance(m, (ast.Constant, ast.Name, ast.Load, ast.BinOp, ast.UnaryOp, ast.operator,
+                                      ast.unaryop, ast.Slice))
+                       for m in ast.walk(e))
+
+        def full(e):
+            return isinstance(e, ast.Slice) and e.lower is None and e.upper is None and e.step is None
+
+        def nonneg_int(e):
+            return isinstance(e, ast.Constant) and isinstance(e.value, int) and not isinstance(e.value, bool) \
+                and e.value >= 0
+
+        def plus(lo, k, step=1):
+            # lo + step * k (k and step literal ints).
+            off = step * k.value
+            if lo is None:
+                return ast.Constant(value=off)
+            if off == 0:
+                return _copy.deepcopy(lo)
+            if nonneg_int(lo):
+                return ast.Constant(value=lo.value + off)
+            return ast.BinOp(left=_copy.deepcopy(lo), op=ast.Add(), right=ast.Constant(value=off))
+
+        def view_parts(v):
+            # (y, inner index list or None for y itself, transposed) or None.
+            if isinstance(v, ast.Name):
+                return v.id, None, False
+            if isinstance(v, ast.Attribute) and v.attr == "T" and isinstance(v.value, ast.Name):
+                return v.value.id, None, True
+            if not (isinstance(v, ast.Subscript) and isinstance(v.value, ast.Name)):
+                return None
+            elts = list(v.slice.elts) if isinstance(v.slice, ast.Tuple) else [v.slice]
+            r = int(self._rank_expr(v.value) or 0)
+            if len(elts) > r or not all(simple_index(e) for e in elts):
+                return None
+            if any(not isinstance(e, ast.Slice) and int(self._rank_expr(e) or 0) != 0 for e in elts):
+                return None
+            if not any(isinstance(e, ast.Slice) for e in elts) and len(elts) >= r:
+                return None
+            return v.value.id, elts + [ast.Slice() for _ in range(r - len(elts))], False
+
+        def compose(y, inner, transposed, outer_slice):
+            # y[inner][outer] as one subscript of y, or None.
+            base = ast.Name(id=y, ctx=ast.Load())
+            if transposed:
+                base = ast.Attribute(value=base, attr="T", ctx=ast.Load())
+            if inner is None:
+                return ast.Subscript(value=base, slice=_copy.deepcopy(outer_slice), ctx=ast.Load())
+            outer = list(outer_slice.elts) if isinstance(outer_slice, ast.Tuple) else [outer_slice]
+            kept = [k for k, e in enumerate(inner) if isinstance(e, ast.Slice)]
+            if len(outer) > len(kept) or any(
+                    isinstance(o, ast.Starred) or is_none(o) or (isinstance(o, ast.Constant) and o.value is Ellipsis)
+                    for o in outer):
+                return None
+            new = [_copy.deepcopy(e) for e in inner]
+            fancy = 0
+            for k, o in zip(kept, outer):
+                e = inner[k]
+                if not isinstance(o, ast.Slice) and int(self._rank_expr(o) or 0) != 0:
+                    fancy += 1
+                if full(e):
+                    new[k] = _copy.deepcopy(o)
+                elif full(o):
+                    pass
+                elif e.step is None and nonneg_int(o):
+                    new[k] = plus(e.lower, o)
+                elif (nonneg_int(e.step) and e.step.value > 0 and nonneg_int(o)
+                      and (e.lower is None or nonneg_int(e.lower))):
+                    new[k] = plus(e.lower, o, e.step.value)
+                elif (e.step is None and isinstance(o, ast.Slice) and o.step is None
+                      and (o.lower is None or nonneg_int(o.lower)) and (o.upper is None or nonneg_int(o.upper))):
+                    # y[lo:hi][a:b] is y[lo + a:min(lo + b, hi)].
+                    if o.upper is None:
+                        upper = _copy.deepcopy(e.upper)
+                    elif e.upper is None:
+                        upper = plus(e.lower, o.upper)
+                    elif nonneg_int(e.upper) and (e.lower is None or nonneg_int(e.lower)):
+                        upper = ast.Constant(value=min(plus(e.lower, o.upper).value, e.upper.value))
+                    else:
+                        return None
+                    new[k] = ast.Slice(lower=plus(e.lower, o.lower) if o.lower is not None else _copy.deepcopy(e.lower),
+                                       upper=upper)
+                else:
+                    return None
+            if fancy > 1:
+                return None
+            return ast.Subscript(value=base, slice=new[0] if len(new) == 1 else ast.Tuple(elts=new, ctx=ast.Load()),
+                                 ctx=ast.Load())
+
+        def whole(y, inner, transposed):
+            base = ast.Name(id=y, ctx=ast.Load())
+            if transposed:
+                base = ast.Attribute(value=base, attr="T", ctx=ast.Load())
+            if inner is None:
+                return base
+            return ast.Subscript(value=base, slice=_copy.deepcopy(inner[0]) if len(inner) == 1
+                                 else ast.Tuple(elts=_copy.deepcopy(inner), ctx=ast.Load()), ctx=ast.Load())
+
+        def rewrite(after, vname, y, inner, transposed):
+            # The rewritten statements, or None when one use cannot be.
+            failed = [False]
+
+            class _Sub(ast.NodeTransformer):
+                def visit_Subscript(self, node):
+                    if isinstance(node.value, ast.Name) and node.value.id == vname:
+                        node.slice = self.visit(node.slice)
+                        c = compose(y, inner, transposed, node.slice)
+                        if c is None:
+                            failed[0] = True
+                            return node
+                        c.ctx = node.ctx
+                        if isinstance(c.value, ast.Name):
+                            c.value.ctx = ast.Load()
+                        return ast.copy_location(c, node)
+                    return self.generic_visit(node)
+
+                def visit_AugAssign(self, node):
+                    node.value = self.visit(node.value)
+                    if isinstance(node.target, ast.Name) and node.target.id == vname:
+                        w = whole(y, inner, transposed)
+                        if transposed or inner is not None:
+                            w = ast.Subscript(value=w, slice=ast.Slice(), ctx=ast.Store()) if not isinstance(
+                                w, ast.Subscript) else w
+                        w.ctx = ast.Store()
+                        node.target = ast.copy_location(w, node.target)
+                        return node
+                    node.target = self.visit(node.target)
+                    return node
+
+                def visit_Call(self, node):
+                    f = node.func
+                    if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == vname
+                            and f.attr in self_outer._MUTATING_METHODS):
+                        failed[0] = True
+                    return self.generic_visit(node)
+
+                def visit_Name(self, node):
+                    if node.id == vname and isinstance(node.ctx, ast.Load):
+                        return ast.copy_location(whole(y, inner, transposed), node)
+                    return node
+
+            self_outer = self
+            out = [_Sub().visit(_copy.deepcopy(st)) for st in after]
+            return None if failed[0] else [ast.fix_missing_locations(st) for st in out]
+
+        def written(after, names):
+            # Whether one of names is modified in place in after.
+            for n in ast.walk(ast.Module(body=list(after), type_ignores=[])):
+                tg = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, ast.AugAssign) else []
+                for g in tg:
+                    while isinstance(g, (ast.Subscript, ast.Attribute)):
+                        g = g.value
+                    if isinstance(g, ast.Name) and g.id in names and (
+                            isinstance(n, ast.AugAssign) or not isinstance(n.targets[0], ast.Name)):
+                        return True
+                if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                        and isinstance(n.func.value, ast.Name) and n.func.value.id in names
+                        and n.func.attr in self._MUTATING_METHODS):
+                    return True
+            return False
+
+        def process(stmts, before_names):
+            k = 0
+            while k < len(stmts):
+                st = stmts[k]
+                if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                        and stores.get(st.targets[0].id, 0) == 1 and st.targets[0].id not in nested_names
+                        and st.targets[0].id not in list_names):
+                    vname = st.targets[0].id
+                    parts = view_parts(st.value)
+                    after = stmts[k + 1:]
+                    if parts is not None and parts[0] != vname and parts[0] not in list_names \
+                            and int(self._rank_expr(ast.Name(id=parts[0], ctx=ast.Load())) or 0) >= 1:
+                        y, inner, transposed = parts
+                        idx_names = {m.id for e in (inner or []) for m in ast.walk(e) if isinstance(m, ast.Name)}
+                        after_stores = {m.id for s in after for m in ast.walk(s)
+                                        if isinstance(m, ast.Name) and isinstance(m.ctx, (ast.Store, ast.Del))}
+                        after_stores |= {s2.target.id for s in after for s2 in ast.walk(s)
+                                         if isinstance(s2, ast.AugAssign) and isinstance(s2.target, ast.Name)
+                                         and int(self._rank_expr(s2.target) or 0) == 0}
+                        if (vname not in before_names and not ({y} | idx_names) & after_stores
+                                and written(after, {vname, y})
+                                and any(isinstance(m, ast.Name) and m.id == vname
+                                        for s in after for m in ast.walk(s))):
+                            new_after = rewrite(after, vname, y, inner, transposed)
+                            if new_after is not None:
+                                stmts[k + 1:] = new_after
+                # A nested block sees the names used before st and in st's
+                # header (a loop's iter, an if's test).
+                header = set()
+                for field, value in ast.iter_fields(st):
+                    if field in ("body", "orelse", "finalbody", "handlers"):
+                        continue
+                    for v in (value if isinstance(value, list) else [value]):
+                        if isinstance(v, ast.AST):
+                            header |= {m.id for m in ast.walk(v) if isinstance(m, ast.Name)}
+                if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    for field in ("body", "orelse", "finalbody"):
+                        sub = getattr(st, field, None)
+                        if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                            process(sub, before_names | header)
+                    for h in getattr(st, "handlers", []) or []:
+                        process(h.body, before_names | header)
+                before_names = before_names | {m.id for m in ast.walk(st) if isinstance(m, ast.Name)}
+                k += 1
+
+        process(body, set())
+
     def _check_view_mutation(self, body):
         """numpy views share memory: after `b = a[1:4]` (or b = a, a.T,
         a.reshape(...), ...), modifying b in place changes a and vice versa.
         The translation gives every name its own copy, so when one of two
         names sharing an array is modified in place and the other is used
         afterwards, the results would differ silently: raise instead."""
+        self._inline_written_views(body)
         # Python lists are not numpy arrays (the translator aliases `y = x`
         # of a list itself); python_list_vars is only filled in later.
         def root_name(n):
@@ -30720,6 +31024,64 @@ class translator(ast.NodeVisitor):
         "mean", "std", "var", "cumsum", "cumprod", "median", "ptp", "nanmean", "nanstd",
         "nanvar", "nancumsum", "nancumprod", "nanmedian", "unique",
     }
+
+    def _cov_corrcoef_complex(self, node):
+        """np.cov / np.corrcoef with a complex argument: the variables in the
+        columns of a complex matrix for cov_matrix_rows_complex /
+        corrcoef_matrix_rows_complex (a 0-d result for one vector)."""
+        attr = node.func.attr
+        kws = {k.arg: k.value for k in node.keywords}
+        if (set(kws) - {"rowvar", "ddof", "bias"} or len(node.args) > 2
+                or (attr == "corrcoef" and set(kws) - {"rowvar"})):
+            raise NotImplementedError(f"np.{attr} of complex input supports only rowvar=, ddof= and bias=")
+        rv = kws.get("rowvar")
+        if rv is not None and not (isinstance(rv, ast.Constant) and isinstance(rv.value, bool)):
+            raise NotImplementedError(f"np.{attr}(..., rowvar=) of complex input: rowvar must be True or False")
+        rowvar = rv is None or rv.value
+
+        def cols(a):
+            # a's variables as the columns of a complex matrix.
+            txt = self.expr(a)
+            if self._expr_kind(a) != "complex":
+                txt = f"cmplx({txt}, kind=dp)"
+            r = int(self._rank_expr(a) or 0)
+            if r == 1:
+                return txt, f"size({txt})", 1
+            if r != 2:
+                raise NotImplementedError(f"np.{attr} of complex input of rank {r}")
+            return (f"transpose({txt})" if rowvar else txt), None, 2
+
+        parts = [cols(a) for a in node.args]
+        scalar = False
+        if len(parts) == 1 and parts[0][2] == 1:
+            src = f"reshape({parts[0][0]}, [{parts[0][1]}, 1])"
+            scalar = True
+        elif all(p[2] == 1 for p in parts):
+            src = f"reshape([{parts[0][0]}, {parts[1][0]}], [{parts[0][1]}, 2])"
+        elif len(parts) == 1:
+            src = parts[0][0]
+        else:
+            raise NotImplementedError(f"np.{attr}(x, y) of complex input with a matrix argument")
+        if attr == "corrcoef":
+            res = f"corrcoef_matrix_rows_complex({src})"
+        else:
+            ddof = kws.get("ddof")
+            bias = kws.get("bias")
+            if ddof is not None:
+                ddof_txt = self.expr(ddof)
+                if self._expr_kind(ddof) != "int":
+                    ddof_txt = f"int({ddof_txt})"
+            elif bias is not None:
+                if not (isinstance(bias, ast.Constant) and isinstance(bias.value, bool)):
+                    raise NotImplementedError("np.cov(..., bias=) of complex input: bias must be True or False")
+                ddof_txt = "0" if bias.value else "1"
+            else:
+                ddof_txt = "1"
+            res = f"cov_matrix_rows_complex({src}, {ddof_txt})"
+        if scalar:
+            # numpy's 0-d result.
+            return f"sum({res})"
+        return res
 
     # np.linalg functions with a complex version in python_mod
     # (linalg_<name>_complex).
@@ -31460,6 +31822,39 @@ class translator(ast.NodeVisitor):
         ta, tb = ctxt(a), ctxt(b)
         return f"(abs({ta} - ({tb})) <= {at} + {rt} * abs({tb}))"
 
+    def _untranspose_target(self, node, value):
+        """An assignment target y.T[idx] as y[idx reversed] (y.T's axes are
+        y's in reverse order), with the value transposed when two axes are
+        left; (target, value), unchanged when not of that form."""
+        if not (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "T"):
+            return node, value
+        base = node.value.value
+        r = int(self._rank_expr(base) or 0)
+        _ell = self._expand_ellipsis(node)
+        if _ell is not None:
+            node = _ell
+        elts = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if r == 0 or len(elts) > r or any(
+                isinstance(e, ast.Starred) or is_none(e) or (isinstance(e, ast.Constant) and e.value is Ellipsis)
+                or (not isinstance(e, ast.Slice) and int(self._rank_expr(e) or 0) != 0) for e in elts):
+            raise NotImplementedError("assignment to y.T[...]: supported with slices and scalar indices "
+                                      "(assign to y with the indices reversed)")
+        elts += [ast.Slice() for _ in range(r - len(elts))]
+        kept = sum(isinstance(e, ast.Slice) for e in elts)
+        if kept >= 2:
+            if kept > 2 or int(self._rank_expr(value) or 0) == 1:
+                raise NotImplementedError("assignment to y.T[...] with two or more axes left: assign the "
+                                          "transposed value to y")
+            if int(self._rank_expr(value) or 0) == 2:
+                value = ast.fix_missing_locations(ast.copy_location(ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="transpose", ctx=ast.Load()),
+                    args=[value], keywords=[]), value))
+        elts.reverse()
+        new = ast.Subscript(value=base, slice=elts[0] if len(elts) == 1 else ast.Tuple(elts=elts, ctx=ast.Load()),
+                            ctx=ast.Store())
+        return ast.fix_missing_locations(ast.copy_location(new, node)), value
+
     def _pad_partial_index(self, node):
         """x[i, j] of a rank-3 (or higher) array x means x[i, j, :]: append
         the missing full slices to the subscript tuple, in place."""
@@ -31533,7 +31928,7 @@ class translator(ast.NodeVisitor):
 
     # numpy functions of complex arrays rewritten by _complex_canonical.
     _COMPLEX_REWRITES = {
-        "less", "less_equal", "greater", "greater_equal", "isnan", "isinf", "isfinite", "nansum", "nanprod",
+        "less", "less_equal", "greater", "greater_equal", "nansum", "nanprod",
         "nanmean", "nanmax", "nanmin", "nanargmax", "nanargmin", "nanvar", "nanstd", "nanmedian", "nan_to_num",
         "where", "clip", "rint", "log2", "sinc", "convolve", "correlate", "polyadd", "polysub", "polymul",
         "polyder", "polyint", "vander", "trapezoid", "trapz", "gradient"}
@@ -31746,10 +32141,6 @@ class translator(ast.NodeVisitor):
         ops = {"less": ast.Lt, "less_equal": ast.LtE, "greater": ast.Gt, "greater_equal": ast.GtE}
         if attr in ops and len(args) == 2 and not kws:
             new = ast.Compare(left=args[0], ops=[ops[attr]()], comparators=[args[1]])
-        elif attr in {"isnan", "isinf"} and len(args) == 1 and not kws and cx[0]:
-            new = binop(np_(attr, part(x, "real")), ast.BitOr(), np_(attr, part(x, "imag")))
-        elif attr == "isfinite" and len(args) == 1 and not kws and cx[0]:
-            new = binop(np_(attr, part(x, "real")), ast.BitAnd(), np_(attr, part(x, "imag")))
         elif attr in {"nansum", "nanprod"} and len(args) == 1 and cx[0]:
             new = np_(attr[3:], np_("where", isnan(x), c(0 if attr == "nansum" else 1), x), kw=kws)
         elif attr == "nanmean" and len(args) == 1 and cx[0] and all(k.arg == "axis" for k in kws):
@@ -32845,6 +33236,9 @@ class translator(ast.NodeVisitor):
                 bias = next((k.value for k in kws if k.arg == "bias"), None)
                 if ddof is None:
                     ddof = ast.Constant(value=0 if isinstance(bias, ast.Constant) and bias.value is True else 1)
+                if self._expr_kind(args[0]) == "complex":
+                    # numpy's result is complex (a zero imaginary part).
+                    return None
                 return call("var", [args[0]], [ast.keyword(arg="ddof", value=ddof)])
             if r == 2 and rowvar and (rv is None or isinstance(rv, ast.Constant)):
                 rest = [k for k in kws if k.arg != "rowvar"]
@@ -34985,7 +35379,8 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 # Always float in numpy (complex for a complex corrcoef/cov).
-                if node.func.attr in {"corrcoef", "cov", "average"} and self._expr_kind(node.args[0]) == "complex":
+                if node.func.attr in {"corrcoef", "cov", "average"} and any(
+                        self._expr_kind(a) == "complex" for a in node.args[:(1 if node.func.attr == "average" else 2)]):
                     return "complex"
                 return "real"
             if (
@@ -40082,8 +40477,8 @@ class translator(ast.NodeVisitor):
                     parts = self._multi_index_parts(node)
                     return 1 if parts and any(int(self._rank_expr(p) or 0) >= 1 for p in parts) else 0
                 if node.func.attr == "argwhere" and len(node.args) >= 1:
-                    r0 = self._rank_expr(node.args[0])
-                    return 2 if r0 <= 1 else r0
+                    # One row of coordinates per nonzero element.
+                    return 2
                 if node.func.attr == "unravel_index" and len(node.args) >= 2:
                     return 2 if int(self._rank_expr(node.args[0]) or 0) >= 1 else 1
                 if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "atan", "asin", "acos", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh", "angle", "real", "imag", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor", "degrees", "radians", "deg2rad", "rad2deg", "exp2", "cbrt", "square", "reciprocal", "positive", "negative", "unwrap", "cumulative_sum", "cumulative_prod", "bitwise_count", "nancumsum", "nancumprod", "ediff1d", "expm1", "log1p", "sinc", "i0", "signbit", "spacing", "asarray_chkfinite", "amax", "amin", "nan_to_num", "real_if_close", "interp"} and len(node.args) >= 1:
@@ -40143,6 +40538,10 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"moveaxis", "rollaxis"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"cov", "corrcoef"}:
+                    if (len(node.args) == 1 and self._expr_kind(node.args[0]) == "complex"
+                            and int(self._rank_expr(node.args[0]) or 0) <= 1):
+                        # numpy's 0-d result of one complex vector.
+                        return 0
                     return 2
                 if node.func.attr in {"all", "any", "prod", "count_nonzero"} and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
@@ -48665,8 +49064,12 @@ class translator(ast.NodeVisitor):
                 if int(self._rank_expr(node.args[0]) or 0) == 2:
                     # One row (i, j) per true element, in C order.
                     return f"transpose(where_indices_2d({mask}))"
-                if int(self._rank_expr(node.args[0]) or 0) > 2:
-                    raise NotImplementedError("np.argwhere supports vectors and matrices")
+                if int(self._rank_expr(node.args[0]) or 0) == 3:
+                    # Columns: the coordinates along each axis, in C order.
+                    return (f"reshape([nonzero_3d({mask}, 1), nonzero_3d({mask}, 2), nonzero_3d({mask}, 3)], "
+                            f"[count({mask}), 3])")
+                if int(self._rank_expr(node.args[0]) or 0) > 3:
+                    raise NotImplementedError("np.argwhere supports arrays of rank at most 3")
                 return f"reshape(pack(arange_int(int(0), int(size({a0})), int(1)), {mask}), [count({mask}), 1])"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -49044,6 +49447,8 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "cov"
                 and len(node.args) >= 1
             ):
+                if any(self._expr_kind(a) == "complex" for a in node.args[:2]):
+                    return self._cov_corrcoef_complex(node)
                 if len(node.args) == 1:
                     rowvar = True
                     ddof_node = None
@@ -49081,6 +49486,8 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "corrcoef"
                 and len(node.args) >= 1
             ):
+                if any(self._expr_kind(a) == "complex" for a in node.args[:2]):
+                    return self._cov_corrcoef_complex(node)
                 if len(node.args) == 1:
                     if self._rank_expr(node.args[0]) <= 1:
                         # c / sqrt(c * c) for c = var(x): 1, or NaN for a
@@ -50637,11 +51044,16 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr == "real_if_close"
-                and len(node.args) == 1
+                and 1 <= len(node.args) <= 2
+                and all(k.arg == "tol" for k in node.keywords)
             ):
                 if self._expr_kind(node.args[0]) != "complex":
                     return self.expr(node.args[0])
-                return f"real({self.expr(node.args[0])}, kind=dp)"
+                # numpy keeps the complex array when an imaginary part is not
+                # within tol: the helper stops then (no real result).
+                tol = node.args[1] if len(node.args) == 2 else next((k.value for k in node.keywords), None)
+                tol_txt = "" if tol is None else f", real({self.expr(tol)}, kind=dp)"
+                return f"real_if_close_complex({self.expr(node.args[0])}{tol_txt})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -55017,7 +55429,13 @@ class translator(ast.NodeVisitor):
                     and v.func.value.id == "np"
                     and v.func.attr in {"cov", "corrcoef"}
                 ):
-                    self._mark_alloc_real(t.id, rank=2)
+                    if any(self._expr_kind(a) == "complex" for a in v.args[:2]):
+                        if self._rank_expr(v) == 0:
+                            self._mark_complex(t.id)
+                        else:
+                            self._mark_alloc_complex(t.id, rank=2)
+                    else:
+                        self._mark_alloc_real(t.id, rank=2)
 
                 # np.diag(...)
                 if (
@@ -56328,6 +56746,8 @@ class translator(ast.NodeVisitor):
                 vt = f"spread({vt}, 1, size({rt}))"
             self.o.w(f"{xt}({rt} + 1, {ct} + 1) = {vt}")
             return
+        if len(node.targets) == 1:
+            node.targets[0], node.value = self._untranspose_target(node.targets[0], node.value)
         for _tgt in node.targets:
             self._pad_partial_index(_tgt)
         if isinstance(node.value, (ast.Call, ast.Subscript)) and not (
@@ -60626,12 +61046,16 @@ class translator(ast.NodeVisitor):
             # makes a vector, a vector result one row (axis=1) or column
             # (axis=0) per slice.
             _axis_node, _arr_node = v.args[1], v.args[2]
-            if int(self._rank_expr(_arr_node) or 0) != 2:
-                raise NotImplementedError("np.apply_along_axis currently supports a matrix")
+            _r = int(self._rank_expr(_arr_node) or 0)
+            if _r not in (2, 3):
+                raise NotImplementedError("np.apply_along_axis currently supports a matrix or a rank-3 array")
             _one = self._apply_along_axis_one(v)
             if _one is None:
                 raise NotImplementedError("np.apply_along_axis currently requires a function name, a numpy "
                                           "function or a one-argument lambda, and a literal axis")
+            if _r == 3:
+                self._apply_along_axis_3d(t, v, _one)
+                return
             _ax = _signed_int_constant(_axis_node) % 2
             _name = self._aliased_name(t.id)
             _arr_txt = self.expr(_arr_node)
@@ -64367,24 +64791,87 @@ class translator(ast.NodeVisitor):
             return f"nan_quantile_axis_2d{'_q' if qvec else ''}({real_txt(x)}, {q_txt}, {axv % 2 + 1})"
         return None
 
+    def _apply_along_axis_3d(self, t, v, one):
+        """name = np.apply_along_axis(func, axis, arr) of a rank-3 arr: a
+        matrix over the other two axes (a scalar func), or a rank-3 array with
+        func's vector in place of axis."""
+        ax = _signed_int_constant(v.args[1]) % 3
+        name = self._aliased_name(t.id)
+        arr = self.expr(v.args[2])
+        oth = [d for d in range(3) if d != ax]
+        ni, nj = f"size({arr},{oth[0] + 1})", f"size({arr},{oth[1] + 1})"
+        k = self._expr_kind(v)
+        one_txt = self.expr(one)
+        one_k = self._expr_kind(one)
+        if k == "real" and one_k in ("int", "logical"):
+            one_txt = f"real({one_txt}, kind=dp)" if one_k == "int" else f"merge(1.0_dp, 0.0_dp, {one_txt})"
+        vec = int(self._rank_expr(one) or 0) == 1
+        self.o.w("block")
+        self.o.push()
+        self.o.w("integer :: i_apply_axis, j_apply_axis")
+        if vec:
+            decl = {"int": "integer", "logical": "logical", "complex": "complex(kind=dp)"}.get(k, "real(kind=dp)")
+            self.o.w(f"{decl}, allocatable :: v_apply_axis(:)")
+        self.o.w(f"if (allocated({name})) deallocate({name})")
+        if not vec:
+            self.o.w(f"allocate({name}({ni}, {nj}))")
+        self.o.w(f"do j_apply_axis = 0, {nj} - 1")
+        self.o.push()
+        self.o.w(f"do i_apply_axis = 0, {ni} - 1")
+        self.o.push()
+        if vec:
+            pos = {oth[0]: "i_apply_axis + 1", oth[1]: "j_apply_axis + 1", ax: ":"}
+            dims = {oth[0]: ni, oth[1]: nj, ax: "size(v_apply_axis)"}
+            self.o.w(f"v_apply_axis = {one_txt}")
+            self.o.w(f"if (.not. allocated({name})) allocate({name}({', '.join(dims[d] for d in range(3))}))")
+            self.o.w(f"{name}({', '.join(pos[d] for d in range(3))}) = v_apply_axis")
+        else:
+            self.o.w(f"{name}(i_apply_axis + 1, j_apply_axis + 1) = {one_txt}")
+        self.o.pop()
+        self.o.w("end do")
+        self.o.pop()
+        self.o.w("end do")
+        self.o.pop()
+        self.o.w("end block")
+
     def _apply_along_axis_one(self, call):
         """func applied to one slice of np.apply_along_axis(func, axis, arr)
-        (arr a matrix; the slice indexed by i_apply_axis, 0-based), as an
-        expression, or None."""
-        if len(call.args) < 3 or int(self._rank_expr(call.args[2]) or 0) != 2:
+        (arr a matrix or rank-3 array; the slice indexed by i_apply_axis and,
+        for rank 3, j_apply_axis, 0-based, over the other axes in order), as
+        an expression, or None."""
+        if len(call.args) < 3:
             return None
+        r = int(self._rank_expr(call.args[2]) or 0)
         ax = _signed_int_constant(call.args[1])
-        if ax is None or ax not in (0, 1, -1, -2):
+        if r not in (2, 3) or ax is None or not -r <= ax < r:
             return None
-        ax %= 2
-        i = ast.Name(id="i_apply_axis", ctx=ast.Load())
+        ax %= r
+        idx = iter([ast.Name(id="i_apply_axis", ctx=ast.Load()), ast.Name(id="j_apply_axis", ctx=ast.Load())])
         sl = ast.Subscript(value=call.args[2], ctx=ast.Load(),
-                           slice=ast.Tuple(elts=[i, ast.Slice()] if ax == 1 else [ast.Slice(), i], ctx=ast.Load()))
+                           slice=ast.Tuple(elts=[ast.Slice() if d == ax else next(idx) for d in range(r)],
+                                           ctx=ast.Load()))
         fn = call.args[0]
         if isinstance(fn, ast.Lambda):
             if len(fn.args.args) != 1:
                 return None
-            return _subst_lambda_expr_body(fn, ast.Call(func=fn, args=[sl], keywords=[]))
+            body = _subst_lambda_expr_body(fn, ast.Call(func=fn, args=[sl], keywords=[]))
+            if body is None:
+                return None
+            sl_dump = ast.dump(sl)
+            ax_pos = sl.slice.elts.index(next(e for e in sl.slice.elts if isinstance(e, ast.Slice)))
+
+            class _Compose(ast.NodeTransformer):
+                # v[s] of the slice v = arr[i, :]: arr[i, s].
+                def visit_Subscript(self, node):
+                    self.generic_visit(node)
+                    if (isinstance(node.value, ast.Subscript) and ast.dump(node.value) == sl_dump
+                            and not isinstance(node.slice, ast.Tuple)):
+                        elts = list(node.value.slice.elts)
+                        elts[ax_pos] = node.slice
+                        return ast.copy_location(ast.Subscript(value=node.value.value, ctx=node.ctx,
+                                                               slice=ast.Tuple(elts=elts, ctx=ast.Load())), node)
+                    return node
+            return ast.fix_missing_locations(_Compose().visit(body))
         if isinstance(fn, (ast.Name, ast.Attribute)):
             return ast.Call(func=fn, args=[sl], keywords=list(call.keywords))
         return None
@@ -64605,6 +65092,7 @@ class translator(ast.NodeVisitor):
 
     def visit_AugAssign(self, node):
         self._emit_comments_for(node)
+        node.target, node.value = self._untranspose_target(node.target, node.value)
         self._pad_partial_index(node.target)
         # Pattern: A.flat[::d+1] += rhs  -> diagonal update of matrix A.
         if (
@@ -80995,8 +81483,8 @@ def generate_flat(
                     and len(n.args) >= 3
                     and isinstance(n.args[0], ast.Name)
                 ):
-                    # func receives a 1D slice -- one axis fewer than arr.
-                    _slice_r = max(0, tr_ctx._rank_expr(n.args[2]) - 1)
+                    # func receives a 1D slice.
+                    _slice_r = min(1, tr_ctx._rank_expr(n.args[2]))
                     _slice_k = tr_ctx._expr_kind(n.args[2])
                     _seed(n.args[0].id, _slice_r, _slice_k)
 
@@ -86921,6 +87409,7 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_dynamic_real_eig_prints(tree)
+    tree = hoist_apply_along_axis_calls(tree)
     tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
@@ -87465,6 +87954,7 @@ def transpile_file(
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_dynamic_real_eig_prints(tree)
+    tree = hoist_apply_along_axis_calls(tree)
     tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
@@ -88290,6 +88780,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_tri_indices(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_dynamic_real_eig_prints(tree)
+    tree = hoist_apply_along_axis_calls(tree)
     tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
