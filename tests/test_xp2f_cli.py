@@ -5625,6 +5625,69 @@ def test_xp2f_rng_replay_matches_python_for_normal_simulation(tmp_path: Path) ->
     assert "Run diff: MATCH" in proc.stdout
 
 
+def test_xp2f_rng_replay_more_distributions(tmp_path: Path) -> None:
+    # Under --rng-replay these were drawn by Fortran's own generator (the
+    # draws differed from numpy's): f, gumbel, wald, vonmises, power,
+    # standard_cauchy, noncentral_chisquare / _f, negative_binomial, zipf,
+    # logseries, hypergeometric, dirichlet, multinomial; integer
+    # parameters did not compile; vector loc / scale of normal and uniform
+    # and np.random.random_sample(n) did not translate.
+    shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
+    src = tmp_path / "xrng_replay_more.py"
+    draws = [
+        "rng.f(3, 5, size=4)", "rng.gumbel(1.0, 2.0)", "rng.wald(1, 2, size=(2, 3))",
+        "rng.vonmises(0.5, 2.0, size=3)", "rng.power(2, size=2)", "rng.standard_cauchy(size=3)",
+        "rng.noncentral_chisquare(3, 2)", "rng.noncentral_f(3.0, 5.0, 2.0, size=2)",
+        "rng.negative_binomial(5, 0.4, size=4)", "rng.zipf(2.5, size=4)", "rng.logseries(0.6)",
+        "rng.hypergeometric(10, 5, 6, size=(2, 2))", "rng.dirichlet([1.0, 2.0, 3.0], size=2)",
+        "rng.multinomial(10, [0.2, 0.3, 0.5])", "rng.multinomial(10, [0.2, 0.3, 0.5], size=2)",
+        "rng.normal(mu, 1.0)", "rng.normal(mu, np.array([1.0, 2.0, 3.0]))",
+        "rng.uniform(np.array([0.0, 10.0]), np.array([1.0, 20.0]))",
+        "np.random.gumbel(1, 2, size=3)", "np.random.dirichlet([1.0, 2.0])", "np.random.zipf(3.0)",
+        "np.random.random_sample(3)", "np.random.normal(mu, 0.5)",
+    ]
+    lines = ["import numpy as np", "rng = np.random.default_rng(3)", "np.random.seed(4)",
+             "mu = np.array([0.0, 10.0, 100.0])"]
+    for k, d in enumerate(draws):
+        lines += [f"d{k} = {d}", f"print(np.sum(d{k}))"]
+    src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--run-diff", "--rng-replay"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_xp2f_random_vonmises_mu_and_large_kappa(tmp_path: Path) -> None:
+    # np.random.vonmises(mu, kappa) ignored mu (draws centered at 0) and
+    # stopped for kappa > 9.5 ("kappa too large for table"); integer n of
+    # negative_binomial did not compile. Fortran's own draws: the circular
+    # mean is mu, within [-pi, pi).
+    src = tmp_path / "xvonmises.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "rng = np.random.default_rng(11)",
+        "y = rng.vonmises(2.5, 4.0, size=20000)",
+        "print(np.arctan2(np.mean(np.sin(y)), np.mean(np.cos(y))))",
+        "print(np.min(y) >= -np.pi, np.max(y) < np.pi)",
+        "z = np.random.vonmises(-1.0, 50.0, size=20000)",
+        "print(np.arctan2(np.mean(np.sin(z)), np.mean(np.cos(z))))",
+        "k = rng.negative_binomial(5, 0.4, size=20000)",
+        "print(np.mean(k))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    exe = tmp_path / ("xvonmises_p.exe" if sys.platform == "win32" else "xvonmises_p")
+    ft = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=True).stdout.split()
+    assert abs(float(ft[0]) - 2.5) < 0.03, ft
+    assert ft[1:3] == ["T", "T"], ft
+    assert abs(float(ft[3]) + 1.0) < 0.01, ft
+    assert abs(float(ft[4]) - 7.5) < 0.2, ft
+
+
 def test_xp2f_can_print_rng_replay_wrapper_source(tmp_path: Path) -> None:
     shutil.copy2(PYTHON_HELPER_PATH, tmp_path / "python.f90")
     src = tmp_path / "xrng_replay_wrapper_small.py"

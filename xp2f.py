@@ -2403,7 +2403,11 @@ def main():
     orig_default_rng = np.random.default_rng
     _VALUE_METHODS = {"integers", "randint", "exponential", "standard_exponential", "lognormal", "gamma",
                       "standard_gamma", "beta", "chisquare", "laplace", "logistic", "standard_t", "triangular",
-                      "weibull", "pareto", "rayleigh", "poisson", "binomial", "geometric"}
+                      "weibull", "pareto", "rayleigh", "poisson", "binomial", "geometric", "f", "gumbel",
+                      "wald", "vonmises", "power", "standard_cauchy", "noncentral_chisquare", "noncentral_f",
+                      "negative_binomial", "zipf", "logseries", "hypergeometric"}
+    # A vector per sample, recorded as rows (as multivariate_normal).
+    _ROW_METHODS = {"dirichlet", "multinomial"}
 
     with open(str(replay_stem) + ".meta", "w", encoding="utf-8") as meta_fh, open(str(replay_stem) + ".bin", "wb") as bin_fh:
         def _record_values(out):
@@ -2547,6 +2551,12 @@ def main():
 
             def __getattr__(self, name):
                 attr = getattr(self._base, name)
+                if name in _ROW_METHODS:
+                    def _rows(*args, **kwargs):
+                        out = attr(*args, **kwargs)
+                        _record_values(np.asarray(out).reshape(-1, np.shape(out)[-1]))
+                        return out
+                    return _rows
                 if name in _VALUE_METHODS:
                     def _recorded(*args, **kwargs):
                         return _record_values(attr(*args, **kwargs))
@@ -2592,6 +2602,17 @@ def main():
         for _nm in _VALUE_METHODS:
             if hasattr(np.random, _nm):
                 setattr(np.random, _nm, _legacy_values(getattr(np.random, _nm)))
+
+        def _legacy_rows(fn):
+            def _recorded(*args, **kwargs):
+                out = fn(*args, **kwargs)
+                _record_values(np.asarray(out).reshape(-1, np.shape(out)[-1]))
+                return out
+            return _recorded
+
+        for _nm in _ROW_METHODS:
+            setattr(np.random, _nm, _legacy_rows(getattr(np.random, _nm)))
+        np.random.random_sample = rec_random
         np.random.choice = rec_choice
         np.random.permutation = rec_permutation
         np.random.shuffle = rec_shuffle
@@ -31606,17 +31627,30 @@ class translator(ast.NodeVisitor):
         "logistic": (["loc", "scale"], {"loc": 0.0, "scale": 1.0}), "standard_t": (["df"], {}),
         "triangular": (["left", "mode", "right"], {}), "weibull": (["a"], {}), "pareto": (["a"], {}),
         "rayleigh": (["scale"], {"scale": 1.0}),
+        "f": (["dfnum", "dfden"], {}), "gumbel": (["loc", "scale"], {"loc": 0.0, "scale": 1.0}),
+        "wald": (["mean", "scale"], {}), "vonmises": (["mu", "kappa"], {}), "power": (["a"], {}),
+        "standard_cauchy": ([], {}), "noncentral_chisquare": (["df", "nonc"], {}),
+        "noncentral_f": (["dfnum", "dfden", "nonc"], {}),
     }
-    _RNG_INT_DISTS = {"poisson": (["lam"], {"lam": 1.0}), "binomial": (["n", "p"], {}), "geometric": (["p"], {})}
+    _RNG_INT_DISTS = {"poisson": (["lam"], {"lam": 1.0}), "binomial": (["n", "p"], {}), "geometric": (["p"], {}),
+                      "negative_binomial": (["n", "p"], {}), "zipf": (["a"], {}), "logseries": (["p"], {}),
+                      "hypergeometric": (["ngood", "nbad", "nsample"], {})}
+    # Integer parameters of the distributions above.
+    _RNG_INT_PARAMS = {("binomial", "n"), ("hypergeometric", "ngood"), ("hypergeometric", "nbad"),
+                       ("hypergeometric", "nsample")}
     _RNG_ATTRS = (set(_RNG_DISTS) | set(_RNG_INT_DISTS)
                   | {"integers", "randint", "choice", "permutation", "shuffle", "multivariate_normal", "random",
-                     "normal", "uniform", "standard_normal", "rand", "randn", "random_sample"})
+                     "normal", "uniform", "standard_normal", "rand", "randn", "random_sample", "dirichlet",
+                     "multinomial"})
     _RNG_HELPERS = {"rng_take_values", "rng_integers_v", "rng_choice_idx", "rng_choice_idx_p",
                     "rng_permutation_idx", "rng_mvnormal", "rng_unit_uniform", "rng_std_normal1", "rng_pick",
                     "rng_std_gamma1", "rng_poisson_v", "rng_binomial_v", "rng_geometric_v", "runif", "rnorm",
-                    "linalg_cholesky"} | {f"rng_{k}_v" for k in ("exponential", "lognormal", "gamma", "beta",
-                                                               "chisquare", "laplace", "logistic", "standard_t",
-                                                               "triangular", "weibull", "pareto", "rayleigh")}
+                    "linalg_cholesky", "rng_dirichlet", "rng_multinomial"} | {
+                        f"rng_{k}_v" for k in ("exponential", "lognormal", "gamma", "beta", "chisquare", "laplace",
+                                               "logistic", "standard_t", "triangular", "weibull", "pareto",
+                                               "rayleigh", "f", "gumbel", "wald", "vonmises", "power",
+                                               "standard_cauchy", "noncentral_chisquare", "noncentral_f",
+                                               "negative_binomial", "zipf", "logseries", "hypergeometric")}
 
     def _rng_call(self, node):
         """(method, generator?) of rng.method(...) with rng a numpy Generator,
@@ -31667,6 +31701,17 @@ class translator(ast.NodeVisitor):
             pos = {"random": 0, "random_sample": 0, "standard_normal": 0, "normal": 2, "uniform": 2}[m]
             if len(node.args) > pos:
                 size = node.args[pos]
+            if m == "random_sample" and size is not None and not is_none(size):
+                # random_sample(n) / ((n, m)): as rand(n) / rand(n, m).
+                r = self._rng_size(size)[0]
+                return ("real", r) if r in (1, 2) else None
+            if (size is None or is_none(size)) and m in {"normal", "uniform"}:
+                # Vector loc / scale (low / high): one draw per element.
+                names = ["loc", "scale"] if m == "normal" else ["low", "high"]
+                ranks = {int(self._rank_expr(v) or 0) for k, v in self._rng_args(node, names, False).items()
+                         if k in names}
+                r = max(ranks, default=0)
+                return ("real", r) if r <= 1 else None
             return ("real", 0) if size is None or is_none(size) else None
         if m in {"rand", "randn"}:
             # rand(d0, d1, ...) / randn(...): the dimensions are the arguments.
@@ -31687,9 +31732,13 @@ class translator(ast.NodeVisitor):
             return ("int", 1)
         if m in {"integers", "randint"}:
             names = ["low", "high"]
-        elif m == "multivariate_normal":
-            size = node.args[2] if len(node.args) > 2 else next((kw.value for kw in node.keywords if kw.arg == "size"), None)
-            return ("real", 1 if size is None or is_none(size) else 2)
+        elif m in {"multivariate_normal", "dirichlet", "multinomial"}:
+            # A vector per sample: rows of samples with a size.
+            pos = {"multivariate_normal": 2, "dirichlet": 1, "multinomial": 2}[m]
+            size = node.args[pos] if len(node.args) > pos else next((kw.value for kw in node.keywords if kw.arg == "size"), None)
+            if size is not None and not is_none(size) and int(self._rank_expr(size) or 0) != 0:
+                return None
+            return ("int" if m == "multinomial" else "real", 1 if size is None or is_none(size) else 2)
         elif m in self._RNG_DISTS:
             names = self._RNG_DISTS[m][0]
         else:
@@ -31723,24 +31772,41 @@ class translator(ast.NodeVisitor):
             dims = ", ".join(f"int({self.expr(a)})" for a in node.args)
             return f"{'runif' if m == 'rand' else 'rnorm'}({dims})"
         if m in {"random", "random_sample"}:
+            size = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == "size"), None)
+            if size is not None and not is_none(size):
+                dims = size.elts if isinstance(size, (ast.Tuple, ast.List)) else [size]
+                return f"runif({', '.join(f'int({self.expr(d)})' for d in dims)})"
             return "runif()"
         if m == "standard_normal":
             return "rnorm()"
+        def vec_txt(n):
+            # A parameter that may be a vector (normal / uniform without size).
+            txt = self.expr(n)
+            return txt if self._expr_kind(n) == "real" else f"real({txt}, kind=dp)"
+
+        def draws(got, names):
+            # rnorm() / runif() of one draw, or one per element of the vector
+            # parameters (numpy broadcasts them; they must have one length).
+            vecs = [got[k] for k in names if k in got and int(self._rank_expr(got[k]) or 0) == 1]
+            return f"(size({vec_txt(vecs[0])}))" if vecs else "()"
+
         if m == "normal":
             got = self._rng_args(node, ["loc", "scale"], False)
-            loc = real_txt(got["loc"]) if "loc" in got else "0.0_dp"
-            scale = real_txt(got["scale"]) if "scale" in got else "1.0_dp"
-            return f"({loc} + {scale} * rnorm())"
+            loc = vec_txt(got["loc"]) if "loc" in got else "0.0_dp"
+            scale = vec_txt(got["scale"]) if "scale" in got else "1.0_dp"
+            return f"({loc} + {scale} * rnorm{draws(got, ['loc', 'scale'])})"
         if m == "uniform":
             got = self._rng_args(node, ["low", "high"], False)
-            lo = real_txt(got["low"]) if "low" in got else "0.0_dp"
-            hi = real_txt(got["high"]) if "high" in got else "1.0_dp"
-            return f"({lo} + ({hi} - {lo}) * runif())"
+            lo = vec_txt(got["low"]) if "low" in got else "0.0_dp"
+            hi = vec_txt(got["high"]) if "high" in got else "1.0_dp"
+            return f"({lo} + ({hi} - {lo}) * runif{draws(got, ['low', 'high'])})"
         if m in {"integers", "randint"}:
             got = self._rng_args(node, ["low", "high"], True)
             if set(got) - {"low", "high", "size", "endpoint", "dtype"}:
                 raise NotImplementedError(f"random {m} supports low, high, size, endpoint")
             low, high = got.get("low"), got.get("high")
+            if any(v is not None and not is_none(v) and int(self._rank_expr(v) or 0) != 0 for v in (low, high)):
+                raise NotImplementedError(f"random {m} with array-valued bounds is not supported")
             if high is None or is_none(high):
                 lo_t, hi_t = "0", f"int({self.expr(low)})"
             else:
@@ -31800,6 +31866,20 @@ class translator(ast.NodeVisitor):
             if size is None or is_none(size):
                 return f"reshape(rng_mvnormal({mean}, {cov}, 1), [size({mean})])"
             return f"rng_mvnormal({mean}, {cov}, int({self.expr(size)}))"
+        if m in {"dirichlet", "multinomial"}:
+            names = ["alpha"] if m == "dirichlet" else ["n", "pvals"]
+            got = self._rng_args(node, names + ["size"], False)
+            if set(got) - set(names) - {"size"} or any(nm not in got for nm in names):
+                raise NotImplementedError(f"random {m} supports {', '.join(names)}, size")
+            vec = got[names[-1]]
+            vt = self.expr(vec)
+            if self._expr_kind(vec) != "real":
+                vt = f"real({vt}, kind=dp)"
+            args = vt if m == "dirichlet" else f"int({self.expr(got['n'])}), {vt}"
+            size = got.get("size")
+            if size is None or is_none(size):
+                return f"reshape(rng_{m}({args}, 1), [size({vt})])"
+            return f"rng_{m}({args}, int({self.expr(size)}))"
         dists = dict(self._RNG_DISTS, **self._RNG_INT_DISTS)
         names, defaults = dists[m]
         got = self._rng_args(node, names, True)
@@ -31808,7 +31888,12 @@ class translator(ast.NodeVisitor):
         vals = []
         for nm in names:
             if nm in got:
-                vals.append(f"int({self.expr(got[nm])})" if (m == "binomial" and nm == "n") else real_txt(got[nm]))
+                if (m, nm) in self._RNG_INT_PARAMS:
+                    if int(self._rank_expr(got[nm]) or 0) != 0:
+                        raise NotImplementedError(f"random {m} with array-valued parameters is not supported")
+                    vals.append(f"int({self.expr(got[nm])})")
+                else:
+                    vals.append(real_txt(got[nm]))
             elif nm in defaults:
                 vals.append(f"{float(defaults[nm])!r}_dp")
             else:
@@ -60832,7 +60917,7 @@ class translator(ast.NodeVisitor):
                     p0 = v.args[0]  # a
             elif dist == "vonmises":
                 if len(v.args) >= 1:
-                    p0 = v.args[0]  # mu/loc (currently ignored)
+                    p0 = v.args[0]  # mu
                 if len(v.args) >= 2:
                     p1 = v.args[1]  # kappa
             elif dist == "pareto":
@@ -61067,7 +61152,8 @@ class translator(ast.NodeVisitor):
                 elif dist == "vonmises":
                     if p1 is None:
                         raise NotImplementedError("np.random.vonmises requires kappa")
-                    self.o.w(f"call random_von_mises_vec({vec_name}, {self.expr(p1)})")
+                    mu = f", mu=real({self.expr(p0)}, kind=dp)" if p0 is not None else ""
+                    self.o.w(f"call random_von_mises_vec({vec_name}, real({self.expr(p1)}, kind=dp){mu})")
                 elif dist == "pareto":
                     if p0 is None:
                         raise NotImplementedError("np.random.pareto requires a")
@@ -61178,7 +61264,8 @@ class translator(ast.NodeVisitor):
                 elif dist == "vonmises":
                     if p1 is None:
                         raise NotImplementedError("np.random.vonmises requires kappa")
-                    self.o.w(f"{t.id} = random_von_mises({self.expr(p1)})")
+                    mu = f", mu=real({self.expr(p0)}, kind=dp)" if p0 is not None else ""
+                    self.o.w(f"{t.id} = random_von_mises(real({self.expr(p1)}, kind=dp){mu})")
                 elif dist == "pareto":
                     if p0 is None:
                         raise NotImplementedError("np.random.pareto requires a")

@@ -13,6 +13,9 @@ through xp2f.py and compared with numpy.
     python numpy_conformance/coverage_probe.py genkinds
     python numpy_conformance/coverage_probe.py run --kinds [START STOP] ...
     python numpy_conformance/coverage_probe.py report --kinds
+    python numpy_conformance/coverage_probe.py genrandom
+    python numpy_conformance/coverage_probe.py run --random [START STOP] ...
+    python numpy_conformance/coverage_probe.py report --random
 
 gen picks, for each public function of numpy, numpy.linalg, numpy.fft and
 the six numpy.polynomial modules, the first argument list from a fixed
@@ -60,6 +63,13 @@ kind, and user functions called with arguments of different kinds and
 ranks; run and report them with --kinds (coverage/kinds_results.txt,
 coverage/kinds_report.md). Their KIND results are wrong results too.
 
+genrandom makes random-number cases (random_cases.py): distributions
+drawn by Fortran's own generator, their fractions at numpy's quantiles
+compared within 5 standard errors (a wrong distribution), and numpy's
+draws replayed exactly with --rng-replay for the call forms (a wrong
+translation of a call); run and report them with --random
+(coverage/random_results.txt, coverage/random_report.md).
+
 The work files (the programs and executables) are in coverage/work.
 """
 
@@ -89,6 +99,8 @@ OCASES = OUT / "ops.json"
 ORESULTS = OUT / "ops_results.txt"
 KCASES = OUT / "kinds.json"
 KRESULTS = OUT / "kinds_results.txt"
+RCASES = OUT / "random.json"
+RRESULTS = OUT / "random_results.txt"
 # Scratch names of the statement templates (ops_cases.py), renamed per case
 # in a grouped program as the fixtures are.
 SCRATCH = ("y", "z", "r")
@@ -349,6 +361,35 @@ def gen_kinds() -> None:
     print(len(out), "cases from", len(kinds_cases.templates()), "templates")
 
 
+def gen_random() -> None:
+    """Random-number cases (random_cases.py): the stat family, 8 to a
+    program, and the replay family (--rng-replay --run), 10 to a program;
+    kept when numpy runs them without a warning."""
+    import numpy as np
+    sys.path.insert(0, str(HERE))
+    import random_cases
+    todo = [(n, s, {"cmp": "stat", "n": nn}) for n, s, nn in random_cases.stat_cases()]
+    todo += [(n, s, {"flags": ["--rng-replay", "--run-both"]}) for n, s in random_cases.replay_cases()]
+    out, per = [], Counter()
+    for name, stmts, extra in todo:
+        env = {"np": np}
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                exec("\n".join(stmts), env)
+        except Exception:
+            continue
+        if _numeric_parts(env.get("r")) is None:
+            continue
+        fam = "stat" if "cmp" in extra else "replay"
+        k = per[fam]
+        per[fam] += 1
+        out.append(dict({"name": name, "stmts": stmts, "fixtures": {},
+                         "group": f"random-{fam}_{k // (8 if fam == 'stat' else 10)}"}, **extra))
+    RCASES.write_text(json.dumps(out, indent=0), encoding="utf-8")
+    print(len(out), "cases of", len(todo), dict(per))
+
+
 def _rename(line: str, names, k) -> str:
     return re.sub(r"(?<![.\w])(" + "|".join(names) + r")\b", lambda mm: f"{mm.group(1)}_{k}", line) if names else line
 
@@ -392,11 +433,11 @@ def _numbers(s: str) -> list[float]:
     return [float(conv.get(t, t)) for t in re.findall(NUM, s)]
 
 
-def _xp2f(src: Path):
+def _xp2f(src: Path, flags=()):
     """xp2f.py --compile of src, run again once if it printed nothing (a
     transient failure, seen under heavy parallel load)."""
     for _ in range(2):
-        p = subprocess.run([sys.executable, str(XP2F), src.name] + BUILD, cwd=WORK, capture_output=True,
+        p = subprocess.run([sys.executable, str(XP2F), src.name] + BUILD + list(flags), cwd=WORK, capture_output=True,
                            text=True, timeout=600)
         if (p.stdout + p.stderr).strip():
             break
@@ -502,11 +543,19 @@ def _blocks(out: str) -> dict[int, str]:
     return res
 
 
-def _compare(py: str, ft: str) -> tuple[str, str]:
+def _compare(py: str, ft: str, case=None) -> tuple[str, str]:
     a, b = _numbers(py), _numbers(ft)
     show = f"py={' '.join(py.split())[:80]} | ft={' '.join(ft.split())[:80]}"
     if len(a) != len(b):
         return "DIFF", f"count {len(a)} vs {len(b)}: {show}"
+    if case is not None and case.get("cmp") == "stat":
+        # Fractions of n draws from two streams: within 5 standard errors
+        # of their difference.
+        n = case["n"]
+        for u, v in zip(a, b):
+            if abs(u - v) > 5 * (2 * max(u * (1 - u), 1 / n) / n) ** 0.5:
+                return "DIFF", show
+        return "MATCH", ""
     for u, v in zip(a, b):
         if u != u and v != v:
             continue
@@ -515,6 +564,14 @@ def _compare(py: str, ft: str) -> tuple[str, str]:
     if _kinds(py) != _kinds(ft):
         return "KIND", show
     return "MATCH", ""
+
+
+def _exe_env(case, tag):
+    """The environment of a case's executable: with --rng-replay, where
+    the draws xp2f.py recorded (its Python run) are."""
+    if "--rng-replay" not in case.get("flags", ()):
+        return None
+    return dict(os.environ, XP2F_RNG_REPLAY_STEM=str(WORK / f"cv_{tag}_rng_replay"))
 
 
 def _run_group(cases) -> dict[str, tuple[str, str]]:
@@ -535,7 +592,7 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
             src.write_text(src_txt, encoding="utf-8")
             py = subprocess.run([sys.executable, "-W", "ignore", src.name], cwd=WORK, capture_output=True,
                                 text=True)
-            p = _xp2f(src)
+            p = _xp2f(src, todo[0].get("flags", ()))
             out = p.stdout + p.stderr
             if "Transpile: FAIL" in out or (p.returncode != 0 and "Build:" not in out):
                 m = re.search(r"Transpile: FAIL \((.*?)(?: at line (\d+).*)?\)\s*$", out, re.M)
@@ -555,7 +612,8 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
                     todo = []
                 break
             exe = WORK / f"cv_{tag}_p.exe"
-            r = subprocess.run([str(exe)], cwd=WORK, capture_output=True, text=True, timeout=120)
+            r = subprocess.run([str(exe)], cwd=WORK, capture_output=True, text=True, timeout=120,
+                               env=_exe_env(todo[0], tag))
             pyb, ftb = _blocks(py.stdout), _blocks(r.stdout)
             stopped = None
             if r.returncode != 0:
@@ -563,7 +621,7 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
             for k, c in enumerate(todo):
                 if stopped is not None and k >= stopped:
                     break
-                res[c["name"]] = _compare(pyb.get(k, ""), ftb.get(k, ""))
+                res[c["name"]] = _compare(pyb.get(k, ""), ftb.get(k, ""), c)
             if stopped is None:
                 todo = []
             else:
@@ -586,7 +644,7 @@ def _run_group_single(case) -> tuple[str, str]:
     src.write_text(src_txt, encoding="utf-8")
     try:
         py = subprocess.run([sys.executable, "-W", "ignore", src.name], cwd=WORK, capture_output=True, text=True)
-        p = _xp2f(src)
+        p = _xp2f(src, c.get("flags", ()))
         out = p.stdout + p.stderr
         if "Transpile: FAIL" in out or (p.returncode != 0 and "Build:" not in out):
             m = re.search(r"Transpile: FAIL \((.*?)(?: at line \d+.*)?\)\s*$", out, re.M)
@@ -596,10 +654,10 @@ def _run_group_single(case) -> tuple[str, str]:
             m = re.search(r"Error: (.*)", out)
             return "BUILD-FAIL", (m.group(1) if m else "")[:160]
         r = subprocess.run([str(WORK / f"cv_{c['group']}_p.exe")], cwd=WORK, capture_output=True, text=True,
-                           timeout=60)
+                           timeout=60, env=_exe_env(c, c["group"]))
         if r.returncode != 0:
             return "RUN-FAIL", (r.stderr.strip().splitlines() or [""])[0][:160]
-        return _compare(_blocks(py.stdout).get(0, ""), _blocks(r.stdout).get(0, ""))
+        return _compare(_blocks(py.stdout).get(0, ""), _blocks(r.stdout).get(0, ""), c)
     finally:
         for f in WORK.glob(f"cv_{c['group']}_p*"):
             if f.suffix not in {".f90", ".py"}:
@@ -616,10 +674,10 @@ def _read_results(path: Path) -> dict[str, tuple[str, str]]:
 
 
 def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool = False, ops: bool = False,
-        kinds: bool = False) -> None:
-    cases_path, results = ((KCASES, KRESULTS) if kinds else (OCASES, ORESULTS) if ops else
-                           (VCASES, VRESULTS) if variants else (CASES, RESULTS))
-    variants = variants or ops or kinds
+        kinds: bool = False, random: bool = False) -> None:
+    cases_path, results = ((RCASES, RRESULTS) if random else (KCASES, KRESULTS) if kinds else
+                           (OCASES, ORESULTS) if ops else (VCASES, VRESULTS) if variants else (CASES, RESULTS))
+    variants = variants or ops or kinds or random
     cases = json.loads(cases_path.read_text(encoding="utf-8"))[start:stop]
     WORK.mkdir(parents=True, exist_ok=True)
     done = _read_results(results)
@@ -645,6 +703,12 @@ def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool
     def one(group):
         try:
             got = _run_group(group) if variants else {group[0]["name"]: _run_one(group[0])}
+            if len(group) > 1 and "--rng-replay" in group[0].get("flags", ()):
+                # A case that consumes the replayed draws differently from
+                # numpy shifts the cases after it: run a DIFF again alone.
+                for i, c in enumerate(group):
+                    if got.get(c["name"], ("",))[0] == "DIFF":
+                        got[c["name"]] = _run_group_single(dict(c, group=f"{c['group']}_{i}"))
         except Exception as e:  # noqa: BLE001
             got = {c["name"]: ("PROBE-ERROR", repr(e)[:120]) for c in group}
         with lock:
@@ -657,20 +721,22 @@ def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool
     print(f"{len(todo)} run:", dict(counts))
 
 
-def report(variants: bool = False, ops: bool = False, kinds: bool = False) -> None:
-    res = _read_results(KRESULTS if kinds else ORESULTS if ops else VRESULTS if variants else RESULTS)
+def report(variants: bool = False, ops: bool = False, kinds: bool = False, random: bool = False) -> None:
+    res = _read_results(RRESULTS if random else KRESULTS if kinds else ORESULTS if ops else
+                        VRESULTS if variants else RESULTS)
     # Only the cases generated now (a template or variant since dropped
     # keeps its old result line).
-    cases_path = KCASES if kinds else OCASES if ops else VCASES if variants else CASES
+    cases_path = RCASES if random else KCASES if kinds else OCASES if ops else VCASES if variants else CASES
     if cases_path.exists():
         current = {c["name"] for c in json.loads(cases_path.read_text(encoding="utf-8"))}
         res = {n: v for n, v in res.items() if n in current}
     counts = Counter(st for st, _ in res.values())
     order = ["DIFF", "KIND", "RUN-FAIL", "BUILD-FAIL", "XLATE-FAIL", "PROBE-ERROR", "NOARGS", "MATCH"]
-    title = ("numpy coverage probe: kinds of results" if kinds else
+    title = ("numpy coverage probe: random numbers" if random else
+             "numpy coverage probe: kinds of results" if kinds else
              "numpy coverage probe: methods, operators, indexing" if ops else
              "numpy coverage probe: input variants" if variants else "numpy coverage probe")
-    lines = [f"# {title}", "", f"{len(res)} {'cases' if ops or kinds else 'variants' if variants else 'functions'}.",
+    lines = [f"# {title}", "", f"{len(res)} {'cases' if ops or kinds or random else 'variants' if variants else 'functions'}.",
              "",
              "| status | count |", "|---|---|"]
     lines += [f"| {st} | {counts[st]} |" for st in order if counts[st]]
@@ -683,10 +749,10 @@ def report(variants: bool = False, ops: bool = False, kinds: bool = False) -> No
     if known:
         lines += ["", "## Known differences", ""] + [f"- `{n}` ({res[n][0]}): {KNOWN.get(n) or KNOWN[n.split('[')[0]]}"
                                                        for n in known]
-    if not variants and not ops and not kinds:
+    if not variants and not ops and not kinds and not random:
         lines += ["", "## NOARGS", "", ", ".join(f"`{n}`" for n in sorted(n for n, v in res.items()
                                                                           if v[0] == "NOARGS"))]
-    (OUT / ("kinds_report.md" if kinds else "ops_report.md" if ops else
+    (OUT / ("random_report.md" if random else "kinds_report.md" if kinds else "ops_report.md" if ops else
             "variant_report.md" if variants else "report.md")).write_text(
         "\n".join(lines) + "\n", encoding="utf-8")
     print(dict(counts))
@@ -699,6 +765,7 @@ def main() -> int:
     sub.add_parser("genvar")
     sub.add_parser("genops")
     sub.add_parser("genkinds")
+    sub.add_parser("genrandom")
     pr = sub.add_parser("run")
     pr.add_argument("start", nargs="?", type=int, default=0)
     pr.add_argument("stop", nargs="?", type=int, default=None)
@@ -707,10 +774,12 @@ def main() -> int:
     pr.add_argument("--variants", action="store_true", help="run the variants (genvar) instead")
     pr.add_argument("--ops", action="store_true", help="run the methods/operators/indexing cases (genops)")
     pr.add_argument("--kinds", action="store_true", help="run the result-kind cases (genkinds)")
+    pr.add_argument("--random", action="store_true", help="run the random-number cases (genrandom)")
     rp = sub.add_parser("report")
     rp.add_argument("--variants", action="store_true")
     rp.add_argument("--ops", action="store_true")
     rp.add_argument("--kinds", action="store_true")
+    rp.add_argument("--random", action="store_true")
     args = ap.parse_args()
     if args.cmd == "gen":
         gen()
@@ -720,10 +789,12 @@ def main() -> int:
         gen_ops()
     elif args.cmd == "genkinds":
         gen_kinds()
+    elif args.cmd == "genrandom":
+        gen_random()
     elif args.cmd == "run":
-        run(args.start, args.stop, args.jobs, args.redo, args.variants, args.ops, args.kinds)
+        run(args.start, args.stop, args.jobs, args.redo, args.variants, args.ops, args.kinds, args.random)
     else:
-        report(args.variants, args.ops, args.kinds)
+        report(args.variants, args.ops, args.kinds, args.random)
     return 0
 
 

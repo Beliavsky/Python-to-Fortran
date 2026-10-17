@@ -64,8 +64,8 @@ public :: random_weibull !@pyapi kind=function ret=real(dp) args=a:real(dp):inte
 public :: random_weibull_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) lib=random desc="fill x with Weibull(a) samples"
 public :: random_neg_binomial !@pyapi kind=function ret=integer args=sk:real(dp):intent(in),p:real(dp):intent(in) lib=random desc="sample scalar negative binomial failures before sk successes"
 public :: random_neg_binomial_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),sk:real(dp):intent(in),p:real(dp):intent(in) lib=random desc="fill x with negative binomial samples"
-public :: random_von_mises !@pyapi kind=function ret=real(dp) args=kappa:real(dp):intent(in) lib=random desc="sample scalar von Mises with concentration kappa"
-public :: random_von_mises_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),kappa:real(dp):intent(in) lib=random desc="fill x with von Mises samples"
+public :: random_von_mises !@pyapi kind=function ret=real(dp) args=kappa:real(dp):intent(in),mu:real(dp):intent(in):optional lib=random desc="sample scalar von Mises with concentration kappa, centered at mu, in [-pi, pi) (numpy's algorithm)"
+public :: random_von_mises_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),kappa:real(dp):intent(in),mu:real(dp):intent(in):optional lib=random desc="fill x with von Mises samples centered at mu"
 public :: random_pareto !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) lib=random desc="sample scalar Pareto(a) in NumPy convention"
 public :: random_pareto_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) lib=random desc="fill x with Pareto(a) samples"
 public :: random_power !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) lib=random desc="sample scalar Power(a) in NumPy convention"
@@ -521,31 +521,45 @@ public :: argsort !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:inte
 public :: argsort_idx !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in) lib=sorting desc="argsort indices (0-based) of real vector (generic: argsort_idx_real, argsort_idx_int, argsort_complex_vec)"
 public :: sorted_vec !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) lib=sorting desc="np.sort of a real vector: a sorted copy (generic: sorted_real_vec, sorted_int_vec, sorted_complex_vec)"
 public :: diag_k !@pyapi kind=function ret=real(dp)(:,:) args=v:real(dp)(:):intent(in),k:integer:intent(in) lib=arrays desc="np.diag(v, k) of a vector: a square matrix with v on diagonal k (generic: diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int, diag_k_vec_complex, diag_k_mat_complex)"
-public :: rng_pick
-public :: rng_take_values
-public :: rng_integers_v
-public :: rng_choice_idx
-public :: rng_choice_idx_p
-public :: rng_permutation_idx
-public :: rng_mvnormal
-public :: rng_unit_uniform
-public :: rng_std_normal1
-public :: rng_std_gamma1
-public :: rng_exponential_v
-public :: rng_lognormal_v
-public :: rng_gamma_v
-public :: rng_beta_v
-public :: rng_chisquare_v
-public :: rng_laplace_v
-public :: rng_logistic_v
-public :: rng_standard_t_v
-public :: rng_triangular_v
-public :: rng_weibull_v
-public :: rng_pareto_v
-public :: rng_rayleigh_v
-public :: rng_poisson_v
-public :: rng_binomial_v
-public :: rng_geometric_v
+public :: rng_pick !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:):intent(in),idx:integer(:):intent(in) lib=random desc="a[idx] of a vector expression (rng.choice of an array) (generic: rng_pick_real, rng_pick_int, rng_pick_log, rng_pick_complex)"
+public :: rng_take_values !@pyapi kind=function ret=logical args=rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in),x:real(dp)(:):intent(out) lib=random desc="Under RNG replay, read the next recorded 'values' call (numpy's own results) into x and return .true.; otherwise .false"
+public :: rng_integers_v !@pyapi kind=function ret=integer(:) args=lo:integer:intent(in),hi:integer:intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="integers in [lo, hi): numpy's rng.integers / np.random.randint."
+public :: rng_choice_idx !@pyapi kind=function ret=integer(:) args=npop:integer:intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in),replace:logical:intent(in) lib=random desc="0-based indices of rng.choice(npop, size, replace)"
+public :: rng_choice_idx_p !@pyapi kind=function ret=integer(:) args=pr:real(dp)(:):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in),replace:logical:intent(in) lib=random desc="0-based indices of rng.choice(len(p), size, replace, p=pr)"
+public :: rng_permutation_idx !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) lib=random desc="a random permutation of 0 to n-1 (rng.permutation / shuffle order)"
+public :: rng_mvnormal !@pyapi kind=function ret=real(dp)(:,:) args=mean:real(dp)(:):intent(in),cov:real(dp)(:,:):intent(in),n:integer:intent(in) lib=random desc="rng.multivariate_normal(mean, cov, size=n): row i is mean + L z"
+public :: rng_unit_uniform !@pyapi kind=function ret=real(dp) args= lib=random desc="One uniform draw in [0, 1) from Fortran's generator."
+public :: rng_std_normal1 !@pyapi kind=function ret=real(dp) args= lib=random desc="one standard normal draw from Fortran's generator"
+public :: rng_std_gamma1 !@pyapi kind=function ret=real(dp) args=k:real(dp):intent(in) lib=random desc="Marsaglia-Tsang; k < 1 by boosting"
+public :: rng_exponential_v !@pyapi kind=function ret=real(dp)(:) args=scale:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's exponential draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_lognormal_v !@pyapi kind=function ret=real(dp)(:) args=mean:real(dp):intent(in),sigma:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's lognormal draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_gamma_v !@pyapi kind=function ret=real(dp)(:) args=shape:real(dp):intent(in),scale:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's gamma draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_beta_v !@pyapi kind=function ret=real(dp)(:) args=a:real(dp):intent(in),b:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's beta draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_chisquare_v !@pyapi kind=function ret=real(dp)(:) args=df:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's chisquare draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_laplace_v !@pyapi kind=function ret=real(dp)(:) args=loc:real(dp):intent(in),scale:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's laplace draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_logistic_v !@pyapi kind=function ret=real(dp)(:) args=loc:real(dp):intent(in),scale:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's logistic draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_standard_t_v !@pyapi kind=function ret=real(dp)(:) args=df:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's standard_t draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_triangular_v !@pyapi kind=function ret=real(dp)(:) args=left:real(dp):intent(in),mode:real(dp):intent(in),right:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's triangular draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_weibull_v !@pyapi kind=function ret=real(dp)(:) args=a:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's weibull draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_pareto_v !@pyapi kind=function ret=real(dp)(:) args=a:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's pareto draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_rayleigh_v !@pyapi kind=function ret=real(dp)(:) args=scale:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's rayleigh draws (rank 0/1/2 of n0 x n1, flattened column-major)"
+public :: rng_poisson_v !@pyapi kind=function ret=integer(:) args=lam:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's poisson draws: Knuth for small lam, otherwise a normal approximation-free inversion by summing exponential gaps"
+public :: rng_binomial_v !@pyapi kind=function ret=integer(:) args=nt:integer:intent(in),pp:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's binomial draws (sum of nt Bernoulli trials)"
+public :: rng_geometric_v !@pyapi kind=function ret=integer(:) args=pp:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's geometric draws (trials to the first success, >= 1)"
+public :: rng_f_v !@pyapi kind=function ret=real(dp)(:) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's F draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_gumbel_v !@pyapi kind=function ret=real(dp)(:) args=loc:real(dp):intent(in),scale:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's Gumbel draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_wald_v !@pyapi kind=function ret=real(dp)(:) args=mean:real(dp):intent(in),scale:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's Wald (inverse Gaussian) draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_vonmises_v !@pyapi kind=function ret=real(dp)(:) args=mu:real(dp):intent(in),kappa:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's von Mises draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_power_v !@pyapi kind=function ret=real(dp)(:) args=a:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's power draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_standard_cauchy_v !@pyapi kind=function ret=real(dp)(:) args=rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's standard Cauchy draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_noncentral_chisquare_v !@pyapi kind=function ret=real(dp)(:) args=df:real(dp):intent(in),nonc:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's noncentral chi-square draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_noncentral_f_v !@pyapi kind=function ret=real(dp)(:) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in),nonc:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's noncentral F draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_negative_binomial_v !@pyapi kind=function ret=integer(:) args=nn:real(dp):intent(in),pp:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's negative binomial draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_zipf_v !@pyapi kind=function ret=integer(:) args=a:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's Zipf draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_logseries_v !@pyapi kind=function ret=integer(:) args=pp:real(dp):intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's logarithmic series draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_hypergeometric_v !@pyapi kind=function ret=integer(:) args=ngood:integer:intent(in),nbad:integer:intent(in),nsample:integer:intent(in),rank:integer:intent(in),n0:integer:intent(in),n1:integer:intent(in) lib=random desc="numpy's hypergeometric draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under --rng-replay"
+public :: rng_dirichlet !@pyapi kind=function ret=real(dp)(:,:) args=alpha:real(dp)(:):intent(in),n:integer:intent(in) lib=random desc="rng.dirichlet(alpha, size=n): n rows; numpy's own under --rng-replay"
+public :: rng_multinomial !@pyapi kind=function ret=integer(:,:) args=nt:integer:intent(in),pv:real(dp)(:):intent(in),n:integer:intent(in) lib=random desc="rng.multinomial(nt, pvals, size=n): n rows of counts; numpy's own under --rng-replay"
 public :: stack_inv !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:,:):intent(in) lib=linalg desc="numpy's stacked (batched) linear algebra: linalg_inv(A) of each a(b,:,:)"
 public :: stack_cholesky !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:,:):intent(in) lib=linalg desc="numpy's stacked (batched) linear algebra: linalg_cholesky(A) of each a(b,:,:)"
 public :: stack_pinv !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:,:):intent(in) lib=linalg desc="numpy's stacked (batched) linear algebra: linalg_pinv(A) of each a(b,:,:)"
@@ -3564,71 +3578,60 @@ contains
          end do
       end subroutine random_neg_binomial_vec
 
-      real(kind=dp) function random_von_mises(kappa)
-         ! Source: Alan Miller, amiller_mirror/random.f90 (von Mises sampler).
+      real(kind=dp) function random_von_mises(kappa, mu)
+         ! np.random.vonmises(mu, kappa): numpy's algorithm (Best and Fisher,
+         ! 1979), in [-pi, pi), centered at mu (default 0).
          real(kind=dp), intent(in) :: kappa
-         integer :: j, n, nk
-         real(kind=dp) :: sump, r, th, lambda, rlast
-         real(kind=dp), save :: p(20), theta(0:20)
-         real(kind=dp), save :: last_kappa = -1.0_dp
-         logical, save :: initialized = .false.
+         real(kind=dp), intent(in), optional :: mu
+         real(kind=dp), parameter :: pi = acos(-1.0_dp)
+         real(kind=dp) :: s, r, rho, u, v, w, y, z, res, m
+         logical :: neg
          if (kappa < 0.0_dp) stop "random_von_mises: kappa must be >= 0"
-         if ((.not. initialized) .or. abs(kappa - last_kappa) > 0.0_dp) then
-            nk = int(kappa + kappa + 1.0_dp)
-            if (nk > 20) stop "random_von_mises: kappa too large for table"
-            theta(0) = 0.0_dp
-            if (kappa > 0.5_dp) then
-               sump = 0.0_dp
-               do j = 1, nk
-                  if (j < nk) then
-                     theta(j) = acos(1.0_dp - real(j, kind=dp) / kappa)
-                  else
-                     theta(nk) = acos(-1.0_dp)
-                  end if
-                  call vm_integral(theta(j-1), theta(j), p(j), kappa)
-                  sump = sump + p(j)
-               end do
-               p(1:nk) = p(1:nk) / sump
-            else
-               p(1) = 1.0_dp
-               theta(1) = acos(-1.0_dp)
-               nk = 1
-            end if
-            last_kappa = kappa
-            initialized = .true.
-         else
-            nk = int(kappa + kappa + 1.0_dp)
-            if (kappa <= 0.5_dp) nk = 1
+         m = 0.0_dp
+         if (present(mu)) m = mu
+         if (kappa < 1.0e-8_dp) then
+            call random_number(u)
+            random_von_mises = pi * (2.0_dp * u - 1.0_dp)
+            return
          end if
-         call random_number(r)
-         do j = 1, nk
-            r = r - p(j)
-            if (r < 0.0_dp) exit
-         end do
-         r = -r / p(j)
-         do
-            th = theta(j-1) + r * (theta(j) - theta(j-1))
-            lambda = kappa - real(j, kind=dp) + 1.0_dp - kappa * cos(th)
-            n = 1
-            rlast = lambda
+         if (kappa > 1.0e6_dp) then
+            ! Wrapped normal approximation, as numpy.
+            res = m + sqrt(1.0_dp / kappa) * rnorm0()
+         else
+            if (kappa < 1.0e-5_dp) then
+               s = 1.0_dp / kappa + kappa
+            else
+               r = 1.0_dp + sqrt(1.0_dp + 4.0_dp * kappa * kappa)
+               rho = (r - sqrt(2.0_dp * r)) / (2.0_dp * kappa)
+               s = (1.0_dp + rho * rho) / (2.0_dp * rho)
+            end if
             do
-               call random_number(r)
-               if (r > rlast) exit
-               n = n + 1
-               rlast = r
+               call random_number(u)
+               z = cos(pi * u)
+               w = (1.0_dp + s * z) / (s + z)
+               y = kappa * (s - w)
+               call random_number(v)
+               if (y * (2.0_dp - y) - v >= 0.0_dp) exit
+               if (log(y / v) + 1.0_dp - y >= 0.0_dp) exit
             end do
-            if (mod(n, 2) /= 0) exit
-            call random_number(r)
-         end do
-         random_von_mises = sign(th, (r - rlast) / (1.0_dp - rlast) - 0.5_dp)
+            call random_number(u)
+            res = acos(w)
+            if (u < 0.5_dp) res = -res
+            res = res + m
+         end if
+         neg = res < 0.0_dp
+         res = modulo(abs(res) + pi, 2.0_dp * pi) - pi
+         if (neg) res = -res
+         random_von_mises = res
       end function random_von_mises
 
-      subroutine random_von_mises_vec(x, kappa)
+      subroutine random_von_mises_vec(x, kappa, mu)
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: kappa
+         real(kind=dp), intent(in), optional :: mu
          integer :: i
          do i = 1, size(x)
-            x(i) = random_von_mises(kappa)
+            x(i) = random_von_mises(kappa, mu)
          end do
       end subroutine random_von_mises_vec
 
@@ -7202,6 +7205,225 @@ contains
             end if
          end do
       end function rng_geometric_v
+
+      function rng_f_v(dfnum, dfden, rank, n0, n1) result(x)
+         ! numpy's F draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: dfnum, dfden
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_f(dfnum, dfden)
+         end do
+      end function rng_f_v
+
+      function rng_gumbel_v(loc, scale, rank, n0, n1) result(x)
+         ! numpy's Gumbel draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: loc, scale
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_gumbel(loc, scale)
+         end do
+      end function rng_gumbel_v
+
+      function rng_wald_v(mean, scale, rank, n0, n1) result(x)
+         ! numpy's Wald (inverse Gaussian) draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: mean, scale
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_wald(mean, scale)
+         end do
+      end function rng_wald_v
+
+      function rng_vonmises_v(mu, kappa, rank, n0, n1) result(x)
+         ! numpy's von Mises draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: mu, kappa
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_von_mises(kappa, mu)
+         end do
+      end function rng_vonmises_v
+
+      function rng_power_v(a, rank, n0, n1) result(x)
+         ! numpy's power draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: a
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_power(a)
+         end do
+      end function rng_power_v
+
+      function rng_standard_cauchy_v(rank, n0, n1) result(x)
+         ! numpy's standard Cauchy draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_cauchy()
+         end do
+      end function rng_standard_cauchy_v
+
+      function rng_noncentral_chisquare_v(df, nonc, rank, n0, n1) result(x)
+         ! numpy's noncentral chi-square draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: df, nonc
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_noncentral_chisquare(df, nonc)
+         end do
+      end function rng_noncentral_chisquare_v
+
+      function rng_noncentral_f_v(dfnum, dfden, nonc, rank, n0, n1) result(x)
+         ! numpy's noncentral F draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: dfnum, dfden, nonc
+         integer, intent(in) :: rank, n0, n1
+         real(kind=dp), allocatable :: x(:)
+         integer :: i
+         allocate(x(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         if (rng_take_values(rank, n0, n1, x)) return
+         do i = 1, size(x)
+            x(i) = random_noncentral_f(dfnum, dfden, nonc)
+         end do
+      end function rng_noncentral_f_v
+
+      function rng_negative_binomial_v(nn, pp, rank, n0, n1) result(x)
+         ! numpy's negative binomial draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: nn, pp
+         integer, intent(in) :: rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i
+         allocate(v(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         allocate(x(size(v)))
+         if (.not. rng_take_values(rank, n0, n1, v)) then
+            do i = 1, size(v)
+               v(i) = real(random_neg_binomial(nn, pp), kind=dp)
+            end do
+         end if
+         x = nint(v)
+      end function rng_negative_binomial_v
+
+      function rng_zipf_v(a, rank, n0, n1) result(x)
+         ! numpy's Zipf draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: a
+         integer, intent(in) :: rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i
+         allocate(v(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         allocate(x(size(v)))
+         if (.not. rng_take_values(rank, n0, n1, v)) then
+            do i = 1, size(v)
+               v(i) = real(random_zipf(a), kind=dp)
+            end do
+         end if
+         x = nint(v)
+      end function rng_zipf_v
+
+      function rng_logseries_v(pp, rank, n0, n1) result(x)
+         ! numpy's logarithmic series draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: pp
+         integer, intent(in) :: rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i
+         allocate(v(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         allocate(x(size(v)))
+         if (.not. rng_take_values(rank, n0, n1, v)) then
+            do i = 1, size(v)
+               v(i) = real(random_logseries(pp), kind=dp)
+            end do
+         end if
+         x = nint(v)
+      end function rng_logseries_v
+
+      function rng_hypergeometric_v(ngood, nbad, nsample, rank, n0, n1) result(x)
+         ! numpy's hypergeometric draws (rank 0/1/2 of n0 x n1, flattened
+         ! column-major); numpy's own under --rng-replay.
+         integer, intent(in) :: ngood, nbad, nsample
+         integer, intent(in) :: rank, n0, n1
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i
+         allocate(v(merge(1, n0 * merge(n1, 1, rank == 2), rank == 0)))
+         allocate(x(size(v)))
+         if (rng_take_values(rank, n0, n1, v)) then
+            x = nint(v)
+            return
+         end if
+         do i = 1, size(x)
+            x(i) = random_hypergeometric(ngood, nbad, nsample)
+         end do
+      end function rng_hypergeometric_v
+
+      function rng_dirichlet(alpha, n) result(x)
+         ! rng.dirichlet(alpha, size=n): n rows; numpy's own under --rng-replay.
+         real(kind=dp), intent(in) :: alpha(:)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: x(:,:), flat(:)
+         integer :: i
+         allocate(x(n, size(alpha)), flat(n * size(alpha)))
+         if (rng_take_values(2, n, size(alpha), flat)) then
+            x = reshape(flat, [n, size(alpha)])
+            return
+         end if
+         do i = 1, n
+            call random_dirichlet(alpha, x(i, :))
+         end do
+      end function rng_dirichlet
+
+      function rng_multinomial(nt, pv, n) result(x)
+         ! rng.multinomial(nt, pvals, size=n): n rows of counts; numpy's own
+         ! under --rng-replay.
+         integer, intent(in) :: nt
+         real(kind=dp), intent(in) :: pv(:)
+         integer, intent(in) :: n
+         integer, allocatable :: x(:,:)
+         real(kind=dp), allocatable :: flat(:)
+         integer :: i
+         allocate(x(n, size(pv)), flat(n * size(pv)))
+         if (rng_take_values(2, n, size(pv), flat)) then
+            x = nint(reshape(flat, [n, size(pv)]))
+            return
+         end if
+         do i = 1, n
+            call random_multinomial(nt, pv, x(i, :))
+         end do
+      end function rng_multinomial
 
       pure function rng_pick_real(a, idx) result(r)
          ! a[idx] of a vector expression (rng.choice of an array).
