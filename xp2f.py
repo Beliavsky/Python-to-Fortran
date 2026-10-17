@@ -29097,6 +29097,12 @@ class translator(ast.NodeVisitor):
         _lossy = (want == "int" and have in {"real", "complex"}) or (want == "real" and have == "complex") \
             or (want == "logical" and have in {"int", "real", "complex"}) \
             or (want in {"int", "real", "complex"} and have == "logical" and int(self._rank_expr(arg_node) or 0) >= 1)
+        # A real for an integer-comment parameter has its own message there;
+        # one the function converts first (x = int(x)) truncates in Python too.
+        if _lossy and (getattr(arg_node, "_xp2f_comment_integer_target", None)
+                       or (want == "int" and have == "real"
+                           and getattr(arg_node, "_xp2f_comment_integer_converts", False))):
+            _lossy = False
         if _lossy:
             raise NotImplementedError(
                 f"function '{callee}' is called with arguments of different kinds ({have} here, {want} in its "
@@ -32100,6 +32106,10 @@ class translator(ast.NodeVisitor):
         kind = ("logical" if "bool" in name else "complex" if "complex" in name else
                 "int" if "int" in name else "real" if "float" in name else None)
         if kind is None or int(self._rank_expr(a) or 0) < 1:
+            return None
+        if isinstance(a, ast.Name) and a.id in self.list_counts and kind in {"int", "real"}:
+            # A growing list: its own path converts the first count items
+            # (a.astype(D) converted the whole buffer, NaN padding too).
             return None
         if literal:
             # A list with dtype=bool or complex: np.array(list).astype (the
@@ -85808,6 +85818,7 @@ def generate_flat(
     # Until these comment-conflicting signatures can be specialized end-to-end,
     # diagnose the unsupported call instead of changing Python arithmetic.
     comment_integer_guards = {}
+    comment_integer_converts = set()
     for fn in (local_funcs or []):
         if fn.name in local_overload_specs:
             continue
@@ -85838,6 +85849,8 @@ def generate_flat(
                 break
             if not explicit_conversion:
                 comment_integer_guards[(fn.name, i)] = names[i]
+            else:
+                comment_integer_converts.add((fn.name, i))
     # Annotated parameters are contracts: a call passing an argument the
     # annotation contradicts is reported (translator._check_annotation_
     # contracts) instead of being silently converted, since Python itself
@@ -85893,6 +85906,8 @@ def generate_flat(
                 parameter = comment_integer_guards.get((call.func.id, i))
                 if parameter is not None:
                     actual._xp2f_comment_integer_target = (call.func.id, parameter)
+                elif (call.func.id, i) in comment_integer_converts:
+                    actual._xp2f_comment_integer_converts = True
                 contract = annotation_contracts.get((call.func.id, i))
                 if contract is not None:
                     actual._xp2f_annotation_contract = (call.func.id, i) + contract

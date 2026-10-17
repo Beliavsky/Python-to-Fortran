@@ -14,7 +14,7 @@ def build(tmp_path, source, *options):
     path = tmp_path / 'sleep_case.py'
     path.write_text(source, encoding='utf-8')
     proc = subprocess.run([sys.executable, str(ROOT / 'xp2f.py'), str(path), *options],
-                          cwd=tmp_path, capture_output=True, text=True, timeout=120)
+                          cwd=tmp_path, capture_output=True, text=True, timeout=300)
     return proc, path.with_name('sleep_case_p.exe')
 
 

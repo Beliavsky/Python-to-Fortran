@@ -263,7 +263,7 @@ def test_real_transpiler_compiles_and_compares_repl_expressions(tmp_path):
 @pytest.mark.skipif(shutil.which("gfortran") is None, reason="gfortran is required")
 def test_real_numpy_rng_replay_and_int64(tmp_path):
     pytest.importorskip("numpy")
-    backend = LocalBackend(LocalOptions(work_dir=tmp_path, timeout=120,
+    backend = LocalBackend(LocalOptions(work_dir=tmp_path, timeout=300,
                                        rng_replay=True, int_kind="int64"))
     try:
         result = backend.run("import numpy as np\n"

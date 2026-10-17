@@ -27960,7 +27960,7 @@ def test_xp2f_complex_and_rank3_inputs(tmp_path: Path) -> None:
     # A numpy function without complex support stops instead of dropping
     # the imaginary part.
     for k, line in enumerate(["r = np.polynomial.chebyshev.chebroots(x)",
-                              "q, r = np.polynomial.legendre.legdiv(x, x)", "r = np.real_if_close(x)",
+                              "q, r = np.polynomial.legendre.legdiv(x, x)", "r = np.polynomial.polynomial.polyroots(x)",
                               "r = np.histogram_bin_edges(x)"]):
         src = tmp_path / f"xcplx_guard{k}.py"
         src.write_text(f"import numpy as np\nx = np.array([0.5 + 1.0j, 1.5, 2.0])\n{line}\nprint(r)\n",
