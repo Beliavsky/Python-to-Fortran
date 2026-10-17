@@ -16,6 +16,9 @@ through xp2f.py and compared with numpy.
     python numpy_conformance/coverage_probe.py genrandom
     python numpy_conformance/coverage_probe.py run --random [START STOP] ...
     python numpy_conformance/coverage_probe.py report --random
+    python numpy_conformance/coverage_probe.py genedges
+    python numpy_conformance/coverage_probe.py run --edges [START STOP] ...
+    python numpy_conformance/coverage_probe.py report --edges
 
 gen picks, for each public function of numpy, numpy.linalg, numpy.fft and
 the six numpy.polynomial modules, the first argument list from a fixed
@@ -70,6 +73,12 @@ draws replayed exactly with --rng-replay for the call forms (a wrong
 translation of a call); run and report them with --random
 (coverage/random_results.txt, coverage/random_report.md).
 
+genedges makes cases of edge values (edge_cases.py): negative operands of
+floor division and modulo, rounding ties, NaN, inf and -0.0, empty and
+one-element arrays, negative powers, shifts and bitwise operations of
+negative integers; run and report them with --edges
+(coverage/edges_results.txt, coverage/edges_report.md).
+
 The work files (the programs and executables) are in coverage/work.
 """
 
@@ -101,6 +110,8 @@ KCASES = OUT / "kinds.json"
 KRESULTS = OUT / "kinds_results.txt"
 RCASES = OUT / "random.json"
 RRESULTS = OUT / "random_results.txt"
+ECASES = OUT / "edges.json"
+ERESULTS = OUT / "edges_results.txt"
 # Scratch names of the statement templates (ops_cases.py), renamed per case
 # in a grouped program as the fixtures are.
 SCRATCH = ("y", "z", "r")
@@ -390,6 +401,37 @@ def gen_random() -> None:
     print(len(out), "cases of", len(todo), dict(per))
 
 
+def gen_edges() -> None:
+    """Edge-value cases (edge_cases.templates), kept when numpy runs them
+    without a warning and r is a small numeric value; 12 to a program by
+    group. The names a case assigns are renamed per case (scratch)."""
+    import ast
+    import math
+    import numpy as np
+    sys.path.insert(0, str(HERE))
+    import edge_cases
+    out, per = [], Counter()
+    for g, stmts in edge_cases.templates():
+        env = {"np": np, "math": math}
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                exec("\n".join(stmts), env)
+        except Exception:
+            continue
+        r = env.get("r")
+        if isinstance(r, tuple) or _numeric_parts(r) is None:
+            continue
+        names = sorted({n.id for s in stmts for n in ast.walk(ast.parse(s))
+                        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} - set(SCRATCH))
+        k = per[g]
+        per[g] += 1
+        out.append({"name": "; ".join(stmts), "stmts": stmts, "fixtures": {}, "scratch": names,
+                    "group": f"edges-{g}_{k // 12}"})
+    ECASES.write_text(json.dumps(out, indent=0), encoding="utf-8")
+    print(len(out), "cases from", len(edge_cases.templates()), "templates", dict(per))
+
+
 def _rename(line: str, names, k) -> str:
     return re.sub(r"(?<![.\w])(" + "|".join(names) + r")\b", lambda mm: f"{mm.group(1)}_{k}", line) if names else line
 
@@ -500,16 +542,19 @@ def _group_program(cases) -> tuple[str, list[tuple[int, int]]]:
     k's fixtures are named x_k, m_k, ..., and its output follows a line
     "@@case k". Returns the source and each case's (first, last) line."""
     lines, spans = ["import numpy as np"], []
+    if any("math." in s for c in cases for s in c.get("stmts", ())):
+        lines.append("import math")
     for k, c in enumerate(cases):
         first = len(lines) + 1
         fx = dict(FIX, **(c.get("fixtures") or {}))
         if "stmts" in c:
             code = "\n".join(c["stmts"])
-            used = [n for n in fx if re.search(rf"(?<![.\w]){n}\b", code)]
+            # A fixture the case assigns itself is its own name (scratch).
+            used = [n for n in fx if re.search(rf"(?<![.\w]){n}\b", code) and n not in c.get("scratch", ())]
             for n in used:
                 lines.append(f"{n}_{k} = {fx[n]}")
             lines.append(f'print("{MARK} {k}")')
-            lines += [_rename(s, used + list(SCRATCH), k) for s in c["stmts"]]
+            lines += [_rename(s, used + list(SCRATCH) + c.get("scratch", []), k) for s in c["stmts"]]
             lines.append(f"print(r_{k})")
             spans.append((first, len(lines)))
             continue
@@ -674,10 +719,10 @@ def _read_results(path: Path) -> dict[str, tuple[str, str]]:
 
 
 def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool = False, ops: bool = False,
-        kinds: bool = False, random: bool = False) -> None:
-    cases_path, results = ((RCASES, RRESULTS) if random else (KCASES, KRESULTS) if kinds else
+        kinds: bool = False, random: bool = False, edges: bool = False) -> None:
+    cases_path, results = ((ECASES, ERESULTS) if edges else (RCASES, RRESULTS) if random else (KCASES, KRESULTS) if kinds else
                            (OCASES, ORESULTS) if ops else (VCASES, VRESULTS) if variants else (CASES, RESULTS))
-    variants = variants or ops or kinds or random
+    variants = variants or ops or kinds or random or edges
     cases = json.loads(cases_path.read_text(encoding="utf-8"))[start:stop]
     WORK.mkdir(parents=True, exist_ok=True)
     done = _read_results(results)
@@ -721,22 +766,24 @@ def run(start: int, stop: int | None, jobs: int, redo: list[str], variants: bool
     print(f"{len(todo)} run:", dict(counts))
 
 
-def report(variants: bool = False, ops: bool = False, kinds: bool = False, random: bool = False) -> None:
-    res = _read_results(RRESULTS if random else KRESULTS if kinds else ORESULTS if ops else
+def report(variants: bool = False, ops: bool = False, kinds: bool = False, random: bool = False,
+           edges: bool = False) -> None:
+    res = _read_results(ERESULTS if edges else RRESULTS if random else KRESULTS if kinds else ORESULTS if ops else
                         VRESULTS if variants else RESULTS)
     # Only the cases generated now (a template or variant since dropped
     # keeps its old result line).
-    cases_path = RCASES if random else KCASES if kinds else OCASES if ops else VCASES if variants else CASES
+    cases_path = ECASES if edges else RCASES if random else KCASES if kinds else OCASES if ops else VCASES if variants else CASES
     if cases_path.exists():
         current = {c["name"] for c in json.loads(cases_path.read_text(encoding="utf-8"))}
         res = {n: v for n, v in res.items() if n in current}
     counts = Counter(st for st, _ in res.values())
     order = ["DIFF", "KIND", "RUN-FAIL", "BUILD-FAIL", "XLATE-FAIL", "PROBE-ERROR", "NOARGS", "MATCH"]
-    title = ("numpy coverage probe: random numbers" if random else
+    title = ("numpy coverage probe: edge values" if edges else
+             "numpy coverage probe: random numbers" if random else
              "numpy coverage probe: kinds of results" if kinds else
              "numpy coverage probe: methods, operators, indexing" if ops else
              "numpy coverage probe: input variants" if variants else "numpy coverage probe")
-    lines = [f"# {title}", "", f"{len(res)} {'cases' if ops or kinds or random else 'variants' if variants else 'functions'}.",
+    lines = [f"# {title}", "", f"{len(res)} {'cases' if ops or kinds or random or edges else 'variants' if variants else 'functions'}.",
              "",
              "| status | count |", "|---|---|"]
     lines += [f"| {st} | {counts[st]} |" for st in order if counts[st]]
@@ -749,10 +796,10 @@ def report(variants: bool = False, ops: bool = False, kinds: bool = False, rando
     if known:
         lines += ["", "## Known differences", ""] + [f"- `{n}` ({res[n][0]}): {KNOWN.get(n) or KNOWN[n.split('[')[0]]}"
                                                        for n in known]
-    if not variants and not ops and not kinds and not random:
+    if not variants and not ops and not kinds and not random and not edges:
         lines += ["", "## NOARGS", "", ", ".join(f"`{n}`" for n in sorted(n for n, v in res.items()
                                                                           if v[0] == "NOARGS"))]
-    (OUT / ("random_report.md" if random else "kinds_report.md" if kinds else "ops_report.md" if ops else
+    (OUT / ("edges_report.md" if edges else "random_report.md" if random else "kinds_report.md" if kinds else "ops_report.md" if ops else
             "variant_report.md" if variants else "report.md")).write_text(
         "\n".join(lines) + "\n", encoding="utf-8")
     print(dict(counts))
@@ -766,6 +813,7 @@ def main() -> int:
     sub.add_parser("genops")
     sub.add_parser("genkinds")
     sub.add_parser("genrandom")
+    sub.add_parser("genedges")
     pr = sub.add_parser("run")
     pr.add_argument("start", nargs="?", type=int, default=0)
     pr.add_argument("stop", nargs="?", type=int, default=None)
@@ -775,11 +823,13 @@ def main() -> int:
     pr.add_argument("--ops", action="store_true", help="run the methods/operators/indexing cases (genops)")
     pr.add_argument("--kinds", action="store_true", help="run the result-kind cases (genkinds)")
     pr.add_argument("--random", action="store_true", help="run the random-number cases (genrandom)")
+    pr.add_argument("--edges", action="store_true", help="run the edge-value cases (genedges)")
     rp = sub.add_parser("report")
     rp.add_argument("--variants", action="store_true")
     rp.add_argument("--ops", action="store_true")
     rp.add_argument("--kinds", action="store_true")
     rp.add_argument("--random", action="store_true")
+    rp.add_argument("--edges", action="store_true")
     args = ap.parse_args()
     if args.cmd == "gen":
         gen()
@@ -791,10 +841,13 @@ def main() -> int:
         gen_kinds()
     elif args.cmd == "genrandom":
         gen_random()
+    elif args.cmd == "genedges":
+        gen_edges()
     elif args.cmd == "run":
-        run(args.start, args.stop, args.jobs, args.redo, args.variants, args.ops, args.kinds, args.random)
+        run(args.start, args.stop, args.jobs, args.redo, args.variants, args.ops, args.kinds, args.random,
+            args.edges)
     else:
-        report(args.variants, args.ops, args.kinds, args.random)
+        report(args.variants, args.ops, args.kinds, args.random, args.edges)
     return 0
 
 

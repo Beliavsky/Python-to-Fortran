@@ -28086,3 +28086,57 @@ def test_xp2f_complex_linear_algebra(tmp_path: Path) -> None:
         'print(d.real, d.imag, s.real, s.imag, ld, w.real, w.imag)\n'
         'print(np.linalg.cond(m), np.linalg.eigvalsh(h), np.linalg.svdvals(m), np.linalg.svd(mr, compute_uv=False))\n'
     ))
+
+
+def test_xp2f_edge_value_semantics(tmp_path: Path) -> None:
+    # Edge values (the genedges probe): a // b and a % b of constants were
+    # Fortran's truncating / and mod (-5 % 3 gave -2, -5 // 4 gave -1);
+    # a ** b with b bound to a negative constant was integer 0; round(x, n)
+    # rounded the inexact x * 10**n half away from zero (round(2.675, 2)
+    # gave 2.68, round(0.125, 2) 0.13); max(1.0, nan) and min(1.0, nan)
+    # were nan; np.floor_divide / np.mod of an int and a float array were
+    # ints; divmod(a, b)[k], np.array(divmod(...)) and math.fmod did not
+    # translate.
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xedges", "\n".join([
+        "import math",
+        "import numpy as np",
+        "a = -5",
+        "print(a % 3, a // 4, 7 % -3, -7 // 2)",
+        "b = -1",
+        "c = 2",
+        "print(c ** b, 10 ** -2)",
+        "for v, nd in ((2.675, 2), (0.125, 2), (-0.125, 2), (0.375, 2), (1.25, 1), (250.0, -2), (-150.0, -2)):",
+        "    print(round(v, nd))",
+        "print(math.copysign(1.0, round(-0.04, 1)))",
+        "nan = float('nan')",
+        "one = 1.0",
+        "print(max(nan, one), max(one, nan), min(one, nan), min(nan, one), max(one, 2.0, 0.5))",
+        "x = np.array([7, -7, 5])",
+        "y = np.array([2.0, -2.0, 3.0])",
+        "print(np.floor_divide(x, y), np.mod(x, y))",
+        "print(divmod(a, 4)[0], divmod(a, -4)[1], np.array(divmod(-7.5, 2.0)))",
+        "q, m = divmod(a, 3)",
+        "print(q, m, math.fmod(a, 2), math.fmod(7.5, -2.0))",
+        "",
+    ]))
+
+
+def test_xp2f_int_power_of_unknown_sign_stops(tmp_path: Path) -> None:
+    # An integer exponent whose sign is not known: Python's int ** int is a
+    # float for a negative one (numpy raises), Fortran's integer ** gave 0;
+    # py_ipow stops with a message instead.
+    src = tmp_path / "xipow.py"
+    src.write_text("\n".join([
+        "c = 2",
+        "for k in range(-1, 2):",
+        "    print(c ** k)",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "py_ipow(c, k)" in (tmp_path / "xipow_p.f90").read_text(encoding="utf-8")
+    exe = tmp_path / ("xipow_p.exe" if sys.platform == "win32" else "xipow_p")
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert run.returncode != 0
+    assert "int ** negative int" in run.stdout + run.stderr

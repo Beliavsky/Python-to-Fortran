@@ -3124,6 +3124,10 @@ def const_int_expr_to_fortran(node, allowed_names=None, values=None):
             # this case (see is_const_negative_int).
             if is_const_negative_int(node.right):
                 return None
+            # The same for a name bound to a negative constant (b = -1; a ** b).
+            _exp_val = _const_int_expr_value(node.right, values)
+            if _exp_val is not None and _exp_val < 0:
+                return None
             # A compile-time-computable value that overflows default
             # (4-byte) INTEGER range is a hard gfortran compile error
             # ("Result of exponentiation ... exceeds the range of
@@ -3144,7 +3148,8 @@ def const_int_expr_to_fortran(node, allowed_names=None, values=None):
                 return None
             return f"({left} ** {right})"
         if isinstance(node.op, ast.FloorDiv):
-            return f"({left} / {right})"
+            # Python floors (-7 // 2 == -4); Fortran's integer / truncates.
+            return f"(({left} - modulo({left}, {right})) / {right})"
         if isinstance(node.op, ast.Div):
             # Python's `/` is ALWAYS true division -- `100 / 10 / 10 / 2`
             # is `0.5`, a float, even though every operand here is a
@@ -3162,7 +3167,8 @@ def const_int_expr_to_fortran(node, allowed_names=None, values=None):
             # codegen path instead.
             return None
         if isinstance(node.op, ast.Mod):
-            return f"mod({left}, {right})"
+            # Python's % has the sign of the divisor (-5 % 3 == 1): modulo.
+            return f"modulo({left}, {right})"
         return None
 
     return None
@@ -4873,23 +4879,41 @@ def rewrite_builtin_divmod_tuple_assign(tree):
             for m in ast.walk(n)
         )
 
+    def _divmod_call(n):
+        return (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "divmod"
+                and len(n.args) == 2 and not n.keywords and all(_pure(a) for a in n.args))
+
+    def _part(call, k, at):
+        op = ast.FloorDiv() if k == 0 else ast.Mod()
+        return ast.copy_location(ast.BinOp(left=copy.deepcopy(call.args[0]), op=op,
+                                           right=copy.deepcopy(call.args[1])), at)
+
     class _Rewriter(ast.NodeTransformer):
-        def visit_Assign(self, node):
+        def visit_Subscript(self, node):
+            # divmod(x, y)[0] -> x // y, divmod(x, y)[1] -> x % y
+            if (_divmod_call(node.value) and isinstance(node.slice, ast.Constant)
+                    and node.slice.value in (0, 1, -1, -2) and type(node.slice.value) is int):
+                return _part(node.value, node.slice.value % 2, node)
+            return self.generic_visit(node)
+
+        def visit_Call(self, node):
             self.generic_visit(node)
+            # Any other divmod(x, y): the tuple (x // y, x % y).
+            if _divmod_call(node):
+                return ast.copy_location(ast.Tuple(elts=[_part(node, 0, node), _part(node, 1, node)],
+                                                   ctx=ast.Load()), node)
+            return node
+
+        def visit_Assign(self, node):
             v = node.value
             if not (
                 len(node.targets) == 1
                 and isinstance(node.targets[0], (ast.Tuple, ast.List))
                 and len(node.targets[0].elts) == 2
                 and all(isinstance(e, ast.Name) for e in node.targets[0].elts)
-                and isinstance(v, ast.Call)
-                and isinstance(v.func, ast.Name)
-                and v.func.id == "divmod"
-                and len(v.args) == 2
-                and not v.keywords
-                and all(_pure(a) for a in v.args)
+                and _divmod_call(v)
             ):
-                return node
+                return self.generic_visit(node)
             qn, rn = (e.id for e in node.targets[0].elts)
             if qn == rn:
                 return node
@@ -17765,6 +17789,8 @@ def detect_needed_helpers(tree):
             self.generic_visit(node)
 
         def visit_Call(self, node):
+            if isinstance(node.func, ast.Name) and node.func.id in {"max", "min"} and len(node.args) >= 2:
+                needed.update({"py_max_real", "py_min_real"})
             # np.floor_divide / np.mod are translated as `//` and `%`.
             if (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
                     and node.func.attr in {"floor_divide", "mod", "remainder"}):
@@ -18951,6 +18977,8 @@ def detect_needed_helpers(tree):
                 needed.add("floor_div_real")
             if isinstance(node.op, ast.RShift):
                 needed.add("py_rshift")
+            if isinstance(node.op, ast.Pow):
+                needed.add("py_ipow")  # an integer power of unknown sign
             if isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)):
                 needed.add("unique_int")
                 needed.add("unique_char")
@@ -19016,6 +19044,8 @@ def detect_needed_helpers(tree):
             # augmented assignment needs its own detection here.
             if isinstance(node.op, ast.RShift):
                 needed.add("py_rshift")
+            if isinstance(node.op, ast.Pow):
+                needed.add("py_ipow")
             if isinstance(node.op, ast.FloorDiv):
                 needed.add("floor_div_int")
                 needed.add("floor_div_real")
@@ -20315,7 +20345,7 @@ MATH_DIRECT_IMPORT_SUPPORTED = {
     "fabs", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
     "log2", "log10", "gamma", "lgamma",
     "isfinite", "isinf", "isnan",
-    "copysign", "hypot", "ldexp", "remainder",
+    "copysign", "hypot", "ldexp", "remainder", "fmod",
     "radians", "degrees",
 }
 
@@ -22589,24 +22619,43 @@ end interface gather_where2d"""
     )
 
     py_round_ndigits_blk = """      elemental function py_round_ndigits(x, ndigits) result(rnd)
-         ! Python 3's round() rounds ties to even ("banker's rounding");
-         ! Fortran's NINT/ANINT round ties away from zero instead (e.g.
-         ! round(2.5) == 2 and round(-2.5) == -2 in Python, but
-         ! NINT(2.5) == 3 and NINT(-2.5) == -3). Adapted from pyccel's
-         ! pyc_bankers_round_float
-         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         ! Python 3's round(x, ndigits): the exact binary value of x rounded
+         ! to ndigits decimals, ties to even (round(2.675, 2) == 2.67, since
+         ! 2.675 is 2.67499999...; round(0.125, 2) == 0.12). Formatted
+         ! output in RN mode rounds the exact value so; a negative ndigits
+         ! divides by the exact power of ten. A zero keeps the sign of x.
          real(kind=dp), intent(in) :: x
          integer, intent(in) :: ndigits
          real(kind=dp) :: rnd
-         real(kind=dp) :: scaled, diff
+         real(kind=dp) :: scaled, diff, p
          integer(kind=int64) :: n
-         scaled = x * 10.0_dp**ndigits
-         n = nint(scaled, kind=int64)
-         diff = scaled - real(n, kind=dp)
-         if (ndigits <= 0 .and. (diff == 0.5_dp .or. diff == -0.5_dp)) then
-            n = nint(scaled * 0.5_dp, kind=int64) * 2_int64
+         character(len=400) :: buf
+         if (x /= x .or. abs(x) > huge(x) .or. ndigits > 300) then
+            rnd = x
+         else if (ndigits >= 0) then
+            write(buf, "(RN,F0." // trim(adjustl(int_text(ndigits))) // ")") x
+            read(buf, *) rnd
+         else if (-ndigits > 22) then
+            rnd = 0.0_dp
+         else
+            p = 10.0_dp**(-ndigits)
+            scaled = x / p
+            if (abs(scaled) >= 2.0_dp**62) then
+               rnd = x
+            else
+               n = nint(scaled, kind=int64)
+               diff = scaled - real(n, kind=dp)
+               if (diff == 0.5_dp .or. diff == -0.5_dp) n = nint(scaled * 0.5_dp, kind=int64) * 2_int64
+               rnd = real(n, kind=dp) * p
+            end if
          end if
-         rnd = real(n, kind=dp) * 10.0_dp**(-ndigits)
+         if (rnd == 0.0_dp) rnd = sign(0.0_dp, x)
+      contains
+         pure function int_text(k) result(s)
+            integer, intent(in) :: k
+            character(len=12) :: s
+            write(s, "(i0)") k
+         end function int_text
       end function py_round_ndigits"""
 
     py_round_int_pub = (
@@ -31687,6 +31736,15 @@ class translator(ast.NodeVisitor):
             return 1, f"int({self.expr(size)})", "-1"
         raise NotImplementedError("random draws need a constant-rank size")
 
+    def _int_param_value(self, node):
+        """The value of a name bound to an integer constant (b = -1), else None."""
+        if isinstance(node, ast.Name) and node.id in self.params:
+            try:
+                return int(str(self.params[node.id]).strip("() "))
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def _random_parts(self, node):
         """(kind, rank) of a random call _random_numpy translates, else None."""
         rc = self._rng_call(node)
@@ -34642,7 +34700,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.op, ast.Mult):
                 if (lk == "char" and rk == "int") or (lk == "int" and rk == "char"):
                     return "char"
-            if isinstance(node.op, ast.Pow) and lk == "int" and rk == "int" and is_const_negative_int(node.right):
+            if isinstance(node.op, ast.Pow) and lk == "int" and rk == "int" and (
+                    is_const_negative_int(node.right) or (self._int_param_value(node.right) or 0) < 0):
                 # Python's int ** int stays int only for a non-negative
                 # exponent -- a literal negative one always produces a
                 # float (10**-7 == 1e-07). See is_const_negative_int.
@@ -34883,6 +34942,10 @@ class translator(ast.NodeVisitor):
                 return self._expr_kind(node.args[0])
             if np_attr in {"shape", "size"} and len(node.args) >= 1:
                 return "int"
+            if np_attr in {"mod", "floor_divide", "remainder"} and len(node.args) == 2:
+                # The kind of a // b or a % b (an integer and a float are float).
+                op = ast.FloorDiv() if np_attr == "floor_divide" else ast.Mod()
+                return self._expr_kind(ast.copy_location(ast.BinOp(left=node.args[0], op=op, right=node.args[1]), node))
             if np_attr in {"mod", "floor_divide"} and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
             if np_attr in {"bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 1:
@@ -36584,7 +36647,7 @@ class translator(ast.NodeVisitor):
                 if node.func.value.id in self.math_aliases and node.func.attr in {
                     "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
                     "log2", "log10", "gamma", "lgamma",
-                    "copysign", "hypot", "ldexp", "remainder",
+                    "copysign", "hypot", "ldexp", "remainder", "fmod",
                 }:
                     return "real"
                 if node.func.value.id in self.math_aliases and node.func.attr in {"isfinite", "isinf", "isnan"}:
@@ -36645,7 +36708,7 @@ class translator(ast.NodeVisitor):
                 if mf in {
                     "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
                     "log2", "log10", "gamma", "lgamma",
-                    "copysign", "hypot", "ldexp", "remainder",
+                    "copysign", "hypot", "ldexp", "remainder", "fmod",
                     "radians", "degrees",
                 }:
                     return "real"
@@ -43264,6 +43327,15 @@ class translator(ast.NodeVisitor):
                         _pow_val = None
                     if _pow_val is not None and not (-(2**31) <= _pow_val <= 2**31 - 1):
                         a = f"int({a}, kind=8)"
+            if (op is ast.Pow and lk0 == "int" and rk0 == "int" and not is_const_int(node.right)
+                    and not is_const_negative_int(node.right)):
+                _ev = self._int_param_value(node.right)
+                if _ev is not None and _ev < 0:
+                    a = f"real({a}, kind=dp)"
+                elif _ev is None:
+                    # An exponent of unknown sign: Python's result is a float
+                    # for a negative one, Fortran's 0; py_ipow stops instead.
+                    return f"py_ipow({a}, {b})"
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.UnaryOp):
@@ -46089,6 +46161,16 @@ class translator(ast.NodeVisitor):
                     if self._expr_kind(node.args[1]) in {"int", "logical"}:
                         b0 = f"real({b0}, kind=dp)"
                     return f"sign(abs({a0}), {b0})"
+                if mfn == "fmod" and len(node.args) == 2:
+                    # C's fmod: the sign of x (math.fmod(-7, 2) == -1.0), as
+                    # Fortran's MOD of reals; always a float.
+                    a0 = self.expr(node.args[0])
+                    b0 = self.expr(node.args[1])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                        b0 = f"real({b0}, kind=dp)"
+                    return f"mod({a0}, {b0})"
                 if mfn == "hypot" and len(node.args) == 2:
                     a0 = self.expr(node.args[0])
                     b0 = self.expr(node.args[1])
@@ -46727,6 +46809,13 @@ class translator(ast.NodeVisitor):
                             return f"real({txt}, kind=dp)"
                         return txt
                     acc = _mx_arg_txt(node.args[0])
+                    if promote_real and all(int(self._rank_expr(a) or 0) == 0 for a in node.args):
+                        # Python keeps the first argument unless a later one is
+                        # greater (smaller): max(1.0, nan) == 1.0, where
+                        # Fortran's MAX of a NaN is processor dependent.
+                        for a in node.args[1:]:
+                            acc = f"py_{node.func.id}_real({acc}, {_mx_arg_txt(a)})"
+                        return acc
                     for a in node.args[1:]:
                         acc = f"{node.func.id}({acc}, {_mx_arg_txt(a)})"
                     return acc
@@ -50738,6 +50827,22 @@ class translator(ast.NodeVisitor):
                 if self._expr_kind(node.args[1]) in {"int", "logical"}:
                     b0 = f"real({b0}, kind=dp)"
                 return f"math_remainder({a0}, {b0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr == "fmod"
+                and len(node.args) == 2
+            ):
+                # C's fmod: the sign of x (math.fmod(-7, 2) == -1.0), as
+                # Fortran's MOD of reals; always a float.
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                    b0 = f"real({b0}, kind=dp)"
+                return f"mod({a0}, {b0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)

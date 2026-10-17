@@ -681,9 +681,12 @@ public :: ewm_mean_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):i
 public :: ewm_std_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),alpha:real(dp):intent(in) lib=timeseries desc="exponentially weighted sample standard deviation (adjust=True, bias=False, pandas' defaults)"
 public :: shift_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),periods:integer:intent(in):optional,fill_value:real(dp):intent(in):optional lib=timeseries desc="pandas-style Series.shift(periods, fill_value) for a plain 1D real vector"
 
+public :: py_max_real !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in),b:real(dp):intent(in) lib=math desc="Python's max(a, b): b if b > a, else a (max(1.0, nan) == 1.0, max(nan, 1.0) is nan)"
+public :: py_min_real !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in),b:real(dp):intent(in) lib=math desc="Python's min(a, b): b if b < a, else a (min(1.0, nan) == 1.0)"
 public :: py_round_ndigits !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),ndigits:integer:intent(in) desc="Python 3 round(x, ndigits): ties round to even (banker's rounding)"
 public :: floor_div_real !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in),y:real(dp):intent(in) lib=arrays desc="Python-style real floor division (x // y, floor of the quotient, result stays real)"
 public :: np_rint !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) lib=arrays desc="numpy rint/round: nearest integer, ties to even"
+public :: py_ipow !@pyapi kind=function ret=integer args=a:integer:intent(in),b:integer:intent(in) lib=integers desc="a ** b of integers, stopping for b < 0 (Python's int ** negative int is a float; numpy raises) (generic: py_ipow_i32, py_ipow_i64)"
 public :: py_round_int !@pyapi kind=function ret=integer args=x:real(dp):intent(in) desc="Python 3 round(x) with no ndigits: banker's rounding to the nearest integer"
 public :: csign_complex !@pyapi kind=function ret=complex(dp) args=x:complex(dp):intent(in) lib=arrays desc="np.sign() for complex input: x / abs(x), 0 at the origin"
 public :: floor_div_int !@pyapi kind=function ret=integer args=x:integer:intent(in),y:integer:intent(in) lib=integers desc="Python-style integer floor division (x // y, floors toward negative infinity)"
@@ -1034,6 +1037,11 @@ end interface py_format_int
 interface narrow_int
    module procedure narrow_int_i32, narrow_int_i64
 end interface narrow_int
+
+! a ** b of integers, which stops for a negative b instead of giving 0.
+interface py_ipow
+   module procedure py_ipow_i32, py_ipow_i64
+end interface py_ipow
 
 ! The mold selects the integer result kind, not the value to round.
 interface py_round_int
@@ -17159,25 +17167,64 @@ contains
          if (abs(x - aint(x)) == 0.5_dp) r = 2.0_dp * anint(0.5_dp * x)
       end function np_rint
 
+      pure elemental function py_max_real(a, b) result(r)
+         ! Python's max(a, b) keeps a unless b > a; Fortran's MAX with a NaN
+         ! argument is processor dependent.
+         real(kind=dp), intent(in) :: a, b
+         real(kind=dp) :: r
+         ! /= is a quiet comparison: no IEEE invalid trap for a NaN.
+         r = a
+         if (a /= a .or. b /= b) return
+         if (b > a) r = b
+      end function py_max_real
+
+      pure elemental function py_min_real(a, b) result(r)
+         ! Python's min(a, b) keeps a unless b < a.
+         real(kind=dp), intent(in) :: a, b
+         real(kind=dp) :: r
+         r = a
+         if (a /= a .or. b /= b) return
+         if (b < a) r = b
+      end function py_min_real
+
       elemental function py_round_ndigits(x, ndigits) result(rnd)
-         ! Python 3's round() rounds ties to even ("banker's rounding");
-         ! Fortran's NINT/ANINT round ties away from zero instead (e.g.
-         ! round(2.5) == 2 and round(-2.5) == -2 in Python, but
-         ! NINT(2.5) == 3 and NINT(-2.5) == -3). Adapted from pyccel's
-         ! pyc_bankers_round_float
-         ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
+         ! Python 3's round(x, ndigits): the exact binary value of x rounded
+         ! to ndigits decimals, ties to even (round(2.675, 2) == 2.67, since
+         ! 2.675 is 2.67499999...; round(0.125, 2) == 0.12). Formatted
+         ! output in RN mode rounds the exact value so; a negative ndigits
+         ! divides by the exact power of ten. A zero keeps the sign of x.
          real(kind=dp), intent(in) :: x
          integer, intent(in) :: ndigits
          real(kind=dp) :: rnd
-         real(kind=dp) :: scaled, diff
+         real(kind=dp) :: scaled, diff, p
          integer(kind=int64) :: n
-         scaled = x * 10.0_dp**ndigits
-         n = nint(scaled, kind=int64)
-         diff = scaled - real(n, kind=dp)
-         if (ndigits <= 0 .and. (diff == 0.5_dp .or. diff == -0.5_dp)) then
-            n = nint(scaled * 0.5_dp, kind=int64) * 2_int64
+         character(len=400) :: buf
+         if (x /= x .or. abs(x) > huge(x) .or. ndigits > 300) then
+            rnd = x
+         else if (ndigits >= 0) then
+            write(buf, "(RN,F0." // trim(adjustl(int_text(ndigits))) // ")") x
+            read(buf, *) rnd
+         else if (-ndigits > 22) then
+            rnd = 0.0_dp
+         else
+            p = 10.0_dp**(-ndigits)
+            scaled = x / p
+            if (abs(scaled) >= 2.0_dp**62) then
+               rnd = x
+            else
+               n = nint(scaled, kind=int64)
+               diff = scaled - real(n, kind=dp)
+               if (diff == 0.5_dp .or. diff == -0.5_dp) n = nint(scaled * 0.5_dp, kind=int64) * 2_int64
+               rnd = real(n, kind=dp) * p
+            end if
          end if
-         rnd = real(n, kind=dp) * 10.0_dp**(-ndigits)
+         if (rnd == 0.0_dp) rnd = sign(0.0_dp, x)
+      contains
+         pure function int_text(k) result(s)
+            integer, intent(in) :: k
+            character(len=12) :: s
+            write(s, "(i0)") k
+         end function int_text
       end function py_round_ndigits
 
       elemental function floor_div_real(x, y) result(q)
@@ -17219,6 +17266,23 @@ contains
          end if
          r = int(wide)
       end function py_round_int32
+
+      pure elemental function py_ipow_i32(a, b) result(r)
+         ! Python's int ** int, for an exponent of unknown sign: a negative
+         ! one gives a float in Python (numpy raises), Fortran's 0 here.
+         integer, intent(in) :: a, b
+         integer :: r
+         if (b < 0) error stop "int ** negative int: Python gives a float (write float(a) ** b)"
+         r = a ** b
+      end function py_ipow_i32
+
+      pure elemental function py_ipow_i64(a, b) result(r)
+         use, intrinsic :: iso_fortran_env, only: int64
+         integer(kind=int64), intent(in) :: a, b
+         integer(kind=int64) :: r
+         if (b < 0) error stop "int ** negative int: Python gives a float (write float(a) ** b)"
+         r = a ** b
+      end function py_ipow_i64
 
       pure elemental function py_round_int64(x, mold) result(r)
          use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
