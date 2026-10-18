@@ -4,6 +4,14 @@ import os
 
 pytest_plugins = ["pytest_runlog"]
 
+# Tests build in their own directories: share the compiled helper objects
+# (python.f90 and lapack_d.f90 take over a minute) between them and between
+# runs (xp2f._SharedObjCache; entries are keyed by compiler, flags and
+# source text). XP2F_OBJ_CACHE= (empty) turns it off.
+if "XP2F_OBJ_CACHE" not in os.environ:
+    import tempfile
+    os.environ["XP2F_OBJ_CACHE"] = os.path.join(tempfile.gettempdir(), "xp2f_obj_cache")
+
 _start_dt = datetime.datetime.now()
 
 

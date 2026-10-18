@@ -120,6 +120,12 @@ python xp2f.py path/to/program.py --int-kind int64     # declare integers with a
 python xp2f.py path/to/program.py --perf-hints          # print (never modify) a diagnostic for strided array-access patterns neither flag above can safely fix
 ```
 
+The runtime helpers (`python.f90`, `lapack_d.f90`, ...) are compiled once per
+directory and compiler flags, and reused while their source is unchanged. To
+share the compiled helpers between directories, set `XP2F_OBJ_CACHE` to a
+cache directory; its entries are keyed by the compiler, the flags and the
+helper source, and the test suite sets it (in the system temporary directory).
+
 ### Translating a library module
 
 Use `--module` for a Python file containing imports and function definitions,

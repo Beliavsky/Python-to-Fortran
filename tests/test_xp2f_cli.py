@@ -28140,3 +28140,30 @@ def test_xp2f_int_power_of_unknown_sign_stops(tmp_path: Path) -> None:
     run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=False)
     assert run.returncode != 0
     assert "int ** negative int" in run.stdout + run.stderr
+
+
+def test_xp2f_isscalar_of_array_built_from_appended_list(tmp_path: Path) -> None:
+    # Silent before: r = np.isscalar(x) for x = np.array(lst) of a list
+    # appended to in a loop was the parameter .true. (folded during the
+    # prescan, before x's rank was known, and cached).
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xisscalar_built", (
+        'import numpy as np\n'
+        'x_l = []\n'
+        'for v in [0.5, 1.5, -2.0]:\n'
+        '    x_l.append(v)\n'
+        'x = np.array(x_l, dtype=float)\n'
+        'r = np.isscalar(x)\n'
+        'c = np.iscomplexobj(x)\n'
+        'print(r, c, np.isscalar(x[0]))\n'
+    ))
+
+
+def test_xp2f_bool_array_conj_method_stays_bool(tmp_path: Path) -> None:
+    # Silent before: b.conj() of a bool array was the 0/1 integers (as
+    # np.conj(b), which numpy makes int8); the method keeps the bool array.
+    _xp2f_output_matches_numpy_with_bools(tmp_path, "xbool_conj", (
+        'import numpy as np\n'
+        'b = np.array([True, False, True])\n'
+        'r = b.conj()\n'
+        'print(r, b.conjugate().any(), np.conj(b), True.conjugate())\n'
+    ))

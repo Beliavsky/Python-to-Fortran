@@ -1,13 +1,13 @@
 # numpy coverage probe: methods, operators, indexing
 
-6293 cases.
+7370 cases.
 
 | status | count |
 |---|---|
-| DIFF | 5 |
+| DIFF | 6 |
 | BUILD-FAIL | 24 |
-| XLATE-FAIL | 28 |
-| MATCH | 6236 |
+| XLATE-FAIL | 33 |
+| MATCH | 7307 |
 
 ## BUILD-FAIL
 
@@ -38,16 +38,19 @@
 
 ## XLATE-FAIL
 
+- `r = m.squeeze() [built]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = m.squeeze() [complex]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = m.squeeze() [nan]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = m.squeeze() [ties]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = m[:, [True, False]] [base]`: unsupported expr: Slice
+- `r = m[:, [True, False]] [built]`: unsupported expr: Slice
 - `r = m[:, [True, False]] [complex]`: unsupported expr: Slice
 - `r = m[:, [True, False]] [empty]`: unsupported expr: Slice
 - `r = m[:, [True, False]] [int]`: unsupported expr: Slice
 - `r = m[:, [True, False]] [nan]`: unsupported expr: Slice
 - `r = m[:, [True, False]] [ties]`: unsupported expr: Slice
 - `r = mr.squeeze() [base]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
+- `r = mr.squeeze() [built]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = mr.squeeze() [complex]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = mr.squeeze() [empty]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = mr.squeeze() [int]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
@@ -55,12 +58,14 @@
 - `r = mr.squeeze() [one]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `r = mr.squeeze() [ties]`: np.squeeze of a matrix needs axis= (the result's rank would depend on its shape)
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
+- `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [built]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [one]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = m.copy(); z = y.reshape(-1); z[0] = 3; r = y [ties]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [base]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
+- `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [built]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [complex]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [int]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
 - `y = x.copy(); z = y[::-1]; z[0] = 7; r = y [nan]`: modifying 'z_0' in place also changes 'y_0' in numpy, because they share memory ('z_0' and 'y_0' are the same array or views of it, e.g. a slice, row, column, .
@@ -71,6 +76,7 @@
 
 - `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [3d]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
 - `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [base]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
+- `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [built]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
 - `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [int]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
 - `r = np.unravel_index(np.argsort(mr, axis=None), mr.shape)[1] [ties]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)
 - `r = xi.argsort() [ties]` (DIFF): the order of ties: numpy's default sort is not stable (the translation's is)

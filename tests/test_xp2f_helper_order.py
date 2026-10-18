@@ -68,6 +68,7 @@ def test_cold_and_warm_cache_dependency_rebuild(tmp_path, monkeypatch, capsys):
     dependency = helper(tmp_path, 'base.f90', 'module base_mod\ninteger, parameter :: value=1\nend module\n')
     consumer = helper(tmp_path, 'consumer.f90', 'module consumer_mod\nuse base_mod\ninteger, parameter :: answer=value\nend module\n')
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv('XP2F_OBJ_CACHE', raising=False)  # the directory's own caches
     objects, proc, _ = xp2f._prepare_helper_link_inputs([consumer, dependency], ['gfortran', '-O0'])
     assert proc is None, proc.stderr if proc else ''
     assert objects == ['base.o', 'consumer.o']
@@ -97,9 +98,11 @@ print(res.fun)
     if method == 'L-BFGS-B':
         code = (ROOT / 'examples' / 'xlbfgsb.py').read_text(encoding='utf-8')
     source.write_text(code, encoding='utf-8')
+    # A cold build: not from the shared helper cache.
+    env = {k: v for k, v in os.environ.items() if k != 'XP2F_OBJ_CACHE'}
     proc = subprocess.run([sys.executable, str(ROOT / 'xp2f.py'), str(source), '--compile',
                            '--compiler', 'gfortran -O0 -g -fcheck=all -fbacktrace'],
-                          cwd=tmp_path, capture_output=True, text=True, timeout=180)
+                          cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     solver, bridge = ('lbfgsb', 'lbfgsb_bridge') if method == 'L-BFGS-B' else ('fmin', 'powell_bridge')
     builds = [line for line in proc.stdout.splitlines() if line.startswith('Build helper:')]

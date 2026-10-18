@@ -1,13 +1,13 @@
 # numpy coverage probe: input variants
 
-2626 variants.
+3464 variants.
 
 | status | count |
 |---|---|
-| DIFF | 18 |
+| DIFF | 19 |
 | RUN-FAIL | 2 |
 | XLATE-FAIL | 33 |
-| MATCH | 2573 |
+| MATCH | 3410 |
 
 ## XLATE-FAIL
 
@@ -48,6 +48,7 @@
 ## Known differences
 
 - `np.digitize[nan]` (RUN-FAIL): bins with NaN are rejected as not monotonic (numpy's result is undefined)
+- `np.empty_like[built]` (DIFF): uninitialized values
 - `np.empty_like[int]` (DIFF): uninitialized values
 - `np.fft.fft2[nan]` (DIFF): NaN propagation through the FFT differs (numpy keeps some parts finite)
 - `np.fft.fft[nan]` (DIFF): NaN propagation through the FFT differs (numpy keeps some parts finite)

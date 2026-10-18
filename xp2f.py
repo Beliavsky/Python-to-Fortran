@@ -32942,6 +32942,12 @@ class translator(ast.NodeVisitor):
 
         recv_kind = None if is_numpy_name_node(func.value) else self._expr_kind(func.value)
         if (
+            attr in {"conj", "conjugate"} and recv_kind == "logical" and not node.args and not node.keywords
+            and int(self._rank_expr(func.value) or 0) >= 1 and not SOURCE_USES_PANDAS
+        ):
+            # A bool array's .conj() is a bool array (np.conj of it is int8).
+            new = ast.Call(func=np_func("copy"), args=[func.value], keywords=[])
+        elif (
             not is_numpy_name_node(func.value)
             and (attr in self._METHODS_AS_NUMPY_FUNCTIONS
                  or (attr in self._BOOL_METHODS_AS_NUMPY_FUNCTIONS and recv_kind == "logical")
@@ -33305,7 +33311,8 @@ class translator(ast.NodeVisitor):
             if isinstance(new, ast.Call):
                 # Rewrites compose: b.mean() -> np.mean(b) -> np.mean(b.astype(int)) -> ...
                 new = self._canonical_numpy_call(new) or new
-            node._xp2f_canonical = new
+            if not getattr(new, "_xp2f_nocache", False):
+                node._xp2f_canonical = new
         return new
 
     _FFT_FORWARD = {"fft", "rfft", "fft2", "rfft2"}
@@ -33750,11 +33757,17 @@ class translator(ast.NodeVisitor):
                             rest + [ast.keyword(arg="rowvar", value=ast.Constant(value=False))])
             return None
         if attr in {"isscalar", "iscomplexobj", "isrealobj"} and len(args) == 1 and not kws:
+            # Not cached (_xp2f_nocache): during the prescan an array's rank
+            # and kind may not be known yet (x = np.array(lst) of a list
+            # appended to in a loop was a scalar, so np.isscalar(x) True).
             if attr == "isscalar":
-                return ast.Constant(value=int(self._rank_expr(args[0]) or 0) == 0
-                                    and self._expr_kind(args[0]) in {"int", "real", "complex", "logical", "char"})
-            iscx = self._expr_kind(args[0]) == "complex"
-            return ast.Constant(value=iscx if attr == "iscomplexobj" else not iscx)
+                res = ast.Constant(value=int(self._rank_expr(args[0]) or 0) == 0
+                                   and self._expr_kind(args[0]) in {"int", "real", "complex", "logical", "char"})
+            else:
+                iscx = self._expr_kind(args[0]) == "complex"
+                res = ast.Constant(value=iscx if attr == "iscomplexobj" else not iscx)
+            res._xp2f_nocache = True
+            return res
         if attr == "imag" and len(args) == 1 and self._expr_kind(args[0]) in {"int", "real", "logical"}:
             # The imaginary part of a real array: zeros of its kind.
             return call("zeros_like", args)
@@ -35460,6 +35473,9 @@ class translator(ast.NodeVisitor):
                 # this same shape gets (Fortran's CONJG rejects LOGICAL
                 # outright).
                 _base_kind = self._expr_kind(node.func.value)
+                # A numpy boolean array's .conj() is the boolean array.
+                if _base_kind == "logical" and int(self._rank_expr(node.func.value) or 0) >= 1:
+                    return "logical"
                 return "int" if _base_kind == "logical" else _base_kind
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 tgt = self.vectorize_aliases[node.func.id]
@@ -45513,6 +45529,9 @@ class translator(ast.NodeVisitor):
                 # is an int subclass, returns an INT, not a bool -- the
                 # only one of the three that isn't a plain passthrough).
                 _base_kind = self._expr_kind(node.func.value)
+                if _base_kind == "logical" and int(self._rank_expr(node.func.value) or 0) >= 1:
+                    # A numpy boolean array's .conj() is the boolean array.
+                    return self.expr(node.func.value)
                 if _base_kind == "logical":
                     return f"merge(1, 0, {self.expr(node.func.value)})"
                 if _base_kind == "complex":
@@ -88099,6 +88118,111 @@ def _order_helper_files(helper_files):
     return ordered, prerequisites
 
 
+class _SharedObjCache:
+    """Helper objects shared between working directories, when the
+    environment variable XP2F_OBJ_CACHE names a directory (the test suite
+    sets it: each test builds in its own directory, and python.f90 alone
+    takes over a minute to compile at -O0 with checks). An entry is keyed
+    by the compiler, its flags and the text of the source and of the
+    helpers it uses, so an edited helper or another compiler is a new
+    entry. One process builds an entry while others that need it wait (a
+    lock file), instead of all compiling it at once."""
+
+    KEEP = 40          # entries kept (the oldest are removed)
+    WAIT = 900.0       # seconds to wait for another process's build
+
+    def __init__(self, root, key):
+        self.root = Path(root)
+        self.dir = self.root / key
+        self.lock = self.root / (key + ".lock")
+        self.locked = False
+
+    @classmethod
+    def for_source(cls, compiler_parts, src_path, prerequisites, flags_key):
+        root = os.environ.get("XP2F_OBJ_CACHE", "").strip()
+        if not root:
+            return None
+        h = hashlib.sha256()
+        exe = shutil.which(compiler_parts[0]) if compiler_parts else None
+        try:
+            st = Path(exe).stat() if exe else None
+            h.update(f"{exe}|{st.st_size if st else ''}|{st.st_mtime if st else ''}|{flags_key}".encode("utf-8"))
+            for dep in [str(src_path)] + list(prerequisites.get(str(src_path), ())):
+                h.update(b"\0" + Path(dep).name.encode("utf-8") + b"\0" + Path(dep).read_bytes())
+        except OSError:
+            return None
+        return cls(root, f"{Path(src_path).stem}-{h.hexdigest()[:20]}")
+
+    def _ready(self):
+        return (self.dir / "done").exists()
+
+    def fetch(self, obj, mod_files):
+        """Copy the entry's object and module files here. False when there
+        is none; the caller then compiles (holding the lock if it got it)
+        and calls store."""
+        import time
+        deadline = time.monotonic() + self.WAIT
+        while True:
+            if self._ready():
+                try:
+                    shutil.copyfile(self.dir / obj.name, obj)
+                    for mf in mod_files:
+                        shutil.copyfile(self.dir / mf.name, mf)
+                    os.utime(self.dir, None)
+                    return True
+                except OSError:
+                    return False
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+                os.close(os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                self.locked = True
+                return False
+            except FileExistsError:
+                pass
+            except OSError:
+                return False
+            try:
+                # A lock older than the wait is left by a process that died.
+                if time.time() - self.lock.stat().st_mtime > self.WAIT:
+                    self.lock.unlink()
+                    continue
+            except OSError:
+                continue
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(1.0)
+
+    def store(self, obj, mod_files):
+        if not self.locked:
+            return
+        tmp = self.root / f"{self.dir.name}.tmp{os.getpid()}"
+        try:
+            tmp.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(obj, tmp / obj.name)
+            for mf in mod_files:
+                shutil.copyfile(mf, tmp / mf.name)
+            (tmp / "done").write_text("", encoding="utf-8")
+            os.replace(tmp, self.dir)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.release()
+        try:
+            entries = sorted((d for d in self.root.iterdir() if d.is_dir() and (d / "done").exists()),
+                             key=lambda d: d.stat().st_mtime)
+            for d in entries[:-self.KEEP]:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+    def release(self):
+        if self.locked:
+            self.locked = False
+            try:
+                self.lock.unlink()
+            except OSError:
+                pass
+
+
 def _prepare_helper_link_inputs(helper_files, compiler_parts):
     """Return link inputs for helpers, compiling cached helper objects when needed.
 
@@ -88190,11 +88314,30 @@ def _prepare_helper_link_inputs(helper_files, compiler_parts):
             except OSError:
                 pass  # fall through to a fresh compile
 
+        shared = _SharedObjCache.for_source(compiler_parts, hp, prerequisites, flags_key)
+        if shared is not None and shared.fetch(obj, mod_files):
+            print("Helper from cache:", shared.dir / obj.name)
+            try:
+                flags_file.write_text(flags_key, encoding="utf-8")
+            except OSError:
+                pass
+            link_inputs.append(str(obj))
+            continue
+
         helper_cmd = compiler_parts + ["-c", str(hp), "-o", str(obj)]
         print("Build helper:", " ".join(helper_cmd))
-        hcp = subprocess.run(helper_cmd, capture_output=True, text=True)
+        try:
+            hcp = subprocess.run(helper_cmd, capture_output=True, text=True)
+        except BaseException:
+            if shared is not None:
+                shared.release()
+            raise
         if hcp.returncode != 0:
+            if shared is not None:
+                shared.release()
             return None, hcp, helper_cmd
+        if shared is not None:
+            shared.store(obj, mod_files)
         try:
             flags_file.write_text(flags_key, encoding="utf-8")
         except OSError:

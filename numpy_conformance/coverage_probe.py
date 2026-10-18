@@ -47,7 +47,9 @@ are not MATCH with their first error line.
 
 genvar makes variants of the cases that match: the same call with the
 fixtures rebound to integer arrays, arrays with NaN and inf, ties, one
-element and empty arrays (VARIANTS), and calls with a matrix argument
+element and empty arrays, arrays built by appending to a list in a loop
+(np.array(lst, dtype=...)) and the grown list itself (VARIANTS), and
+calls with a matrix argument
 given axis=0, axis=1, axis=-1, keepdims=True or ddof=1 (KW_VARIANTS);
 a variant is kept when numpy accepts it without a warning. They are run
 and reported with --variants (coverage/variant_results.txt,
@@ -120,6 +122,30 @@ SCRATCH = ("y", "z", "r")
 BUILD = ["--compile", "--compiler", "gfortran -O0 -g -fcheck=all -fbacktrace"]
 VRESULTS = OUT / "variant_results.txt"
 
+def _grown(values, final: str) -> str:
+    """A fixture template: a list grown by appending values in a loop,
+    then final ({l} for the list). {n} is the fixture's name."""
+    return ("{n}_l = []\nfor {n}_v in " + repr(values) + ":\n    {n}_l.append({n}_v)\n{n} = "
+            + final.replace("{l}", "{n}_l"))
+
+
+def _fix_lines(name: str, src: str) -> list[str]:
+    """The statements binding fixture name to src (an expression, or a
+    _grown template)."""
+    if "{n}" in src:
+        return src.replace("{n}", name).split("\n")
+    return [f"{name} = {src}"]
+
+
+def _fix_env(fx: dict) -> dict:
+    """A namespace with the fixtures fx bound."""
+    import numpy as np
+    env = {"np": np}
+    for k, src in fx.items():
+        exec("\n".join(_fix_lines(k, src)), env)
+    return env
+
+
 FIX = {
     "x": "np.array([0.5, 1.5, -2.0, 3.25])",
     "xi": "np.array([3, 1, 4, 1])",
@@ -147,7 +173,20 @@ VARIANTS = {
                 "mr": "np.array([[2.0 + 0.0j, 1.0j, 0.5 + 0.5j], [1.0 + 0.0j, 3.0 - 1.0j, -1.0 + 0.0j]])"},
     "3d": {"m": "np.array([[[2.0, 1.0], [1.0, 3.0]], [[0.5, -1.0], [4.0, 2.5]]])",
            "mr": "np.array([[[2.0, 1.0], [0.5, 1.0], [3.0, -1.0]], [[1.5, 0.0], [-2.0, 2.5], [1.0, 4.0]]])"},
+    # The base values, from a list grown in a loop (a buffer with spare
+    # capacity in the translation): np.array(lst, dtype=...) of it.
+    "built": {"x": _grown([0.5, 1.5, -2.0, 3.25], "np.array({l}, dtype=float)"),
+              "xi": _grown([3, 1, 4, 1], "np.array({l}, dtype=int)"),
+              "b": _grown([True, False, True, True], "np.array({l}, dtype=bool)"),
+              "m": _grown([2.0, 1.0, 1.0, 3.0], "np.array({l}, dtype=float).reshape(2, 2)"),
+              "mr": _grown([2.0, 1.0, 0.5, 1.0, 3.0, -1.0], "np.array({l}).reshape(2, 3)")},
+    # The grown list itself as the argument (function calls only: an
+    # operator on a list is a list operation).
+    "list": {"x": _grown([0.5, 1.5, -2.0, 3.25], "{l}"), "xi": _grown([3, 1, 4, 1], "{l}"),
+             "b": _grown([True, False, True, True], "{l}")},
 }
+# Variant sets for function calls only.
+CALL_ONLY = {"list"}
 # Keyword variants: added to a call with a matrix argument.
 KW_VARIANTS = {"axis0": "axis=0", "axis1": "axis=1", "axism1": "axis=-1", "keepdims": "axis=0, keepdims=True",
                "ddof": "ddof=1"}
@@ -192,7 +231,7 @@ KNOWN.update({
 for _a in ("x", "xi", "m", "mr"):
     for _s in (f"r = {_a}.argsort() [ties]", f"r = {_a}.argsort(axis=1) [ties]"):
         KNOWN[_s] = "the order of ties: numpy's default sort is not stable (the translation's is)"
-    for _v in ("base", "int", "ties", "3d"):
+    for _v in ("base", "int", "ties", "3d", "built"):
         KNOWN[f"r = np.unravel_index(np.argsort({_a}, axis=None), {_a}.shape)[1] [{_v}]"] =             "the order of ties: numpy's default sort is not stable (the translation's is)"
 for _n in ("pinv", "qr", "svd", "svdvals"):
     KNOWN[f"np.linalg.{_n}[empty]"] = "empty matrices are not supported (LAPACK reports an illegal argument)"
@@ -268,7 +307,7 @@ def gen() -> None:
 
 def _header(fixtures: dict | None = None) -> str:
     fx = dict(FIX, **(fixtures or {}))
-    return "import numpy as np\n" + "".join(f"{k} = {v}\n" for k, v in fx.items())
+    return "import numpy as np\n" + "".join(line + "\n" for k, v in fx.items() for line in _fix_lines(k, v))
 
 
 def gen_variants() -> None:
@@ -286,9 +325,7 @@ def gen_variants() -> None:
         if re.search(r"\b(m|mr)\b", c["expr"]) and c["expr"].endswith(")"):
             tries += [(v, c["expr"][:-1] + ", " + kw + ")", {}) for v, kw in KW_VARIANTS.items()]
         for v, expr, fx in tries:
-            env = {"np": np}
-            for k, src in dict(FIX, **fx).items():
-                env[k] = eval(src, env)
+            env = _fix_env(dict(FIX, **fx))
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("error")
@@ -314,14 +351,12 @@ def gen_ops() -> None:
     out, per_group = [], {}
     for g, stmts in ops_cases.templates():
         code = "\n".join(stmts)
-        for v, fx in [("base", {})] + list(VARIANTS.items()):
+        for v, fx in [("base", {})] + [(v, fx) for v, fx in VARIANTS.items() if v not in CALL_ONLY]:
             if fx and not any(re.search(rf"(?<![.\w]){n}\b", code) for n in fx):
                 # The template uses none of the rebound fixtures: the base
                 # case again.
                 continue
-            env = {"np": np}
-            for k, src in dict(FIX, **fx).items():
-                env[k] = eval(src, env)
+            env = _fix_env(dict(FIX, **fx))
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("error")
@@ -552,7 +587,7 @@ def _group_program(cases) -> tuple[str, list[tuple[int, int]]]:
             # A fixture the case assigns itself is its own name (scratch).
             used = [n for n in fx if re.search(rf"(?<![.\w]){n}\b", code) and n not in c.get("scratch", ())]
             for n in used:
-                lines.append(f"{n}_{k} = {fx[n]}")
+                lines += _fix_lines(f"{n}_{k}", fx[n])
             lines.append(f'print("{MARK} {k}")')
             lines += [_rename(s, used + list(SCRATCH) + c.get("scratch", []), k) for s in c["stmts"]]
             lines.append(f"print(r_{k})")
@@ -561,7 +596,7 @@ def _group_program(cases) -> tuple[str, list[tuple[int, int]]]:
         expr = c["expr"]
         used = [n for n in fx if re.search(rf"\b{n}\b", expr)]
         for n in used:
-            lines.append(f"{n}_{k} = {fx[n]}")
+            lines += _fix_lines(f"{n}_{k}", fx[n])
         expr = re.sub(r"\b(" + "|".join(used) + r")\b", lambda mm: f"{mm.group(1)}_{k}", expr) if used else expr
         lines.append(f'print("{MARK} {k}")')
         parts = c.get("parts", 0)
@@ -635,8 +670,13 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
             src_txt, spans = _group_program(todo)
             src = WORK / f"cv_{tag}.py"
             src.write_text(src_txt, encoding="utf-8")
-            py = subprocess.run([sys.executable, "-W", "ignore", src.name], cwd=WORK, capture_output=True,
-                                text=True)
+            for _ in range(2):
+                # Again once if Python itself failed (numpy can fail to load
+                # when memory is short).
+                py = subprocess.run([sys.executable, "-W", "ignore", src.name], cwd=WORK, capture_output=True,
+                                    text=True)
+                if py.returncode == 0:
+                    break
             p = _xp2f(src, todo[0].get("flags", ()))
             out = p.stdout + p.stderr
             if "Transpile: FAIL" in out or (p.returncode != 0 and "Build:" not in out):
@@ -666,6 +706,10 @@ def _run_group(cases) -> dict[str, tuple[str, str]]:
             for k, c in enumerate(todo):
                 if stopped is not None and k >= stopped:
                     break
+                if py.returncode != 0 and k not in pyb:
+                    # Python stopped before this case: no reference output.
+                    res[c["name"]] = ("PROBE-ERROR", "python: " + ((py.stderr.strip().splitlines() or [""])[-1])[:150])
+                    continue
                 res[c["name"]] = _compare(pyb.get(k, ""), ftb.get(k, ""), c)
             if stopped is None:
                 todo = []
