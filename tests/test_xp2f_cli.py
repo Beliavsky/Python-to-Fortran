@@ -28249,3 +28249,49 @@ def test_xp2f_int_started_accumulator_of_array_expression_element(tmp_path: Path
         'print(a, b, c, n, np.histogram(f, bins=2)[1][0])\n'
     ), check_kinds=True)
 
+
+def test_xp2f_tuple_return_specialized_per_argument_kind(tmp_path: Path) -> None:
+    # Silent before: a tuple-returning function called with an int array
+    # and a real array had one real version (scalar results looked
+    # elementwise), so np.sum of the int array printed 12.0; an int array
+    # expression result (a * 2) was declared real in the int version.
+    _xp2f_output_matches_numpy(tmp_path, "xtuple_kinds", (
+        'import numpy as np\n'
+        'def st(a):\n'
+        '    return np.sum(a), np.max(a)\n'
+        'def acc(a):\n'
+        '    d = 0\n'
+        '    for v in a:\n'
+        '        d += v\n'
+        '    return d, len(a)\n'
+        'def arr(a):\n'
+        '    return a * 2, a[0]\n'
+        'fi = np.array([3, 4, 5])\n'
+        'ff = np.array([1.5, 2.0, 0.5])\n'
+        'x, y = st(fi)\n'
+        'x2, y2 = st(ff)\n'
+        'a1, a2 = acc(fi)\n'
+        'a3, a4 = acc(ff)\n'
+        'u, w = arr(fi)\n'
+        'u2, w2 = arr(ff)\n'
+        'print(x, y, x2, y2, a1, a2, a3, a4, w, w2)\n'
+        'print(u, u2)\n'
+    ), check_kinds=True)
+
+
+def test_xp2f_matrix_rank_of_stack_of_dummy_argument(tmp_path: Path) -> None:
+    # A dummy argument not yet typed had rank 0, so np.stack([a, a]) of
+    # rank-3 arrays looked like a vector and matrix_rank became any(x != 0)
+    # (BUILD-FAIL: sum of a scalar).
+    _xp2f_output_matches_numpy(tmp_path, "xrank_stack_dummy", (
+        'import numpy as np\n'
+        'def f(a):\n'
+        '    acc = 0\n'
+        '    for k in range(2):\n'
+        '        acc += np.sum(np.linalg.matrix_rank(np.stack([a, a])))\n'
+        '    return acc\n'
+        'def v(x):\n'
+        '    return np.linalg.matrix_rank(x)\n'
+        'a = np.array([[[1.0, 2.0], [2.0, 4.0]], [[1.0, 0.0], [0.0, 1.0]]])\n'
+        'print(f(a), v(np.array([0.0, 0.0])), v(np.array([1.0, 0.0])))\n'
+    ))

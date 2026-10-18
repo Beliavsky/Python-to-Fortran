@@ -34193,7 +34193,12 @@ class translator(ast.NodeVisitor):
                             keywords=kws)
         if (attr == "matrix_rank" and isinstance(func.value, ast.Attribute) and func.value.attr == "linalg"
                 and is_numpy_name_node(func.value.value) and len(node.args) == 1
-                and int(self._rank_expr(node.args[0]) or 0) == 1):
+                and int(self._rank_expr(node.args[0]) or 0) == 1
+                # A name not typed yet (a dummy argument seen before its
+                # declaration) has rank 0, so np.stack([a, a]) of rank-3
+                # arrays looked like a vector.
+                and all(self._visible_kind_rank(n.id)[0] is not None for n in ast.walk(node.args[0])
+                        if isinstance(n, ast.Name) and n.id not in {"np", "numpy"})):
             # numpy: the rank of a vector is 1 unless it is all zeros.
             anyz = call("any", [ast.Compare(left=node.args[0], ops=[ast.NotEq()], comparators=[ast.Constant(value=0)])])
             return call("where", [anyz, ast.Constant(value=1), ast.Constant(value=0)])
@@ -71568,6 +71573,33 @@ class translator(ast.NodeVisitor):
             tuple_call = call.args[0]
             out_kinds = list(self.tuple_return_out_kinds.get(tuple_call.func.id, []))
             out_ranks = list(self.tuple_return_out_ranks.get(tuple_call.func.id, []))
+            # A function specialized per argument kind (st(int array) and
+            # st(real array)) returns the kinds of the version called.
+            _dmap = self.local_overload_dispatch.get(tuple_call.func.id, None)
+            _formal_in = list(self.local_func_arg_names.get(tuple_call.func.id, []))
+            for _prof in (self.local_overload_tuple_profiles.get(tuple_call.func.id, []) if _dmap else []):
+                _fk = _prof.get("forced_kinds") or {}
+                _fr = _prof.get("forced_ranks") or {}
+                if _dmap.get("joint"):
+                    _idxs = range(len(_formal_in))
+                else:
+                    _idxs = [int(_dmap.get("arg_index", -1))]
+                _ok_match = True
+                for _ia in _idxs:
+                    if not (0 <= _ia < len(_formal_in) and _ia < len(tuple_call.args)):
+                        _ok_match = False
+                        break
+                    _an = tuple_call.args[_ia]
+                    _nm = _formal_in[_ia]
+                    if (_fk.get(_nm) is not None and self._expr_kind(_an) != _fk.get(_nm)) or (
+                            _fr.get(_nm) is not None and int(self._rank_expr(_an) or 0) != int(_fr.get(_nm))):
+                        _ok_match = False
+                        break
+                if _ok_match:
+                    if _prof.get("out_kinds") or _prof.get("out_ranks"):
+                        out_kinds = list(_prof.get("out_kinds") or out_kinds)
+                        out_ranks = list(_prof.get("out_ranks") or out_ranks)
+                    break
             out_formals = list(self.local_tuple_return_out_names.get(tuple_call.func.id, []))
             formal_in = list(self.local_func_arg_names.get(tuple_call.func.id, []))
             tmp_names = []
@@ -80534,6 +80566,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         if er > 0:
                             if ek == "real":
                                 kinds.append("alloc_real")
+                            elif ek == "int":
+                                kinds.append("alloc_int")
                             elif ek == "logical":
                                 kinds.append("alloc_log")
                             elif ek == "complex":
@@ -86127,7 +86161,11 @@ def generate_flat(
         base_tuple_ranks = list(tuple_return_out_ranks.get(fn.name, [])) if fn.name in tuple_return_funcs else []
         elementwise_tuple = fn.name in tuple_return_funcs and ((not base_tuple_ranks) or all(int(_r) == 0 for _r in base_tuple_ranks))
         pair_iter = sorted(pair_lists[iv])
-        if elementwise_tuple:
+        # Scalar results from scalar and array calls: one elemental scalar
+        # version. Arrays only (np.sum(a), np.max(a)) is a reduction, kept
+        # per kind -- filtering it left no version, so an int array call
+        # converted to real.
+        if elementwise_tuple and any(int(r) == 0 for (_k, r) in pair_iter):
             pair_iter = [(k, r) for (k, r) in pair_iter if int(r) == 0]
         for k, r in pair_iter:
             if (
