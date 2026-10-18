@@ -495,6 +495,81 @@ SPECS["calculus"] = [
     "np.histogram({N1}, bins=3)[1]", "np.histogram({N1}, bins=3, range=(-2, 10))[0]",
 ]
 
+# np.polynomial series in 2 and 3 variables: <f>val2d/val3d at points of
+# one shape, <f>grid2d/grid3d on the Cartesian product of vectors, and
+# polyvalfromroots.
+FIXTURES["pc2"] = "np.array([[1.0, -0.5], [2.0, 0.25], [-1.5, 3.0]])"
+FIXTURES["pk2"] = "np.array([[2, -1, 1], [0, 3, -2]])"
+FIXTURES["pc3"] = "np.array([[[1.0, 0.5, -1.0], [2.0, -0.25, 0.0]], [[-0.5, 1.5, 2.0], [0.75, 1.0, -2.0]]])"
+FIXTURES["px"] = "np.array([0.3, -0.7, 1.2, 0.0])"
+FIXTURES["py"] = "np.array([-0.4, 0.9, 0.5, 1.1])"
+FIXTURES["pz"] = "np.array([0.6, 0.2, -1.0, 0.8])"
+FIXTURES["pm"] = "np.array([[0.3, -0.7], [1.2, 0.0]])"
+_npoly_md = []
+for _mod, _pre in [("polynomial", "poly"), ("chebyshev", "cheb"), ("legendre", "leg"), ("hermite", "herm"),
+                   ("hermite_e", "herme"), ("laguerre", "lag")]:
+    _f = f"np.polynomial.{_mod}.{_pre}"
+    _npoly_md += [
+        f"{_f}val2d(px, py, pc2)", f"{_f}val2d(px, py, pk2)", f"{_f}val2d(pm, pm.T, pc2)",
+        f"{_f}val2d(0.5, -0.25, pc2)", f"{_f}val2d(px[:2], py[:2], pc2[:1])",
+        f"{_f}val3d(px, py, pz, pc3)", f"{_f}val3d(0.5, -0.25, 1.5, pc3)",
+        f"{_f}grid2d(px, py[:3], pc2)", f"{_f}grid2d(px[:2], py, pk2)", f"{_f}grid2d(px, py, pc2).sum(axis=0)",
+        f"{_f}grid3d(px[:2], py[:3], pz, pc3)", f"{_f}grid3d(px, py[:2], pz[:3], pc3)[1]",
+        f"{_f}val2d(px, py, pc2) + {_f}val(px, pc2[:, 0])",
+    ]
+_npoly_md += ["np.polynomial.polynomial.polyvalfromroots(px, q1)",
+              "np.polynomial.polynomial.polyvalfromroots(0.5, q1)",
+              "np.polynomial.polynomial.polyvalfromroots(px, i1[:3])"]
+SPECS["npoly_md"] = _npoly_md
+
+# The series classes (np.polynomial.Polynomial, Chebyshev, ...): evaluation
+# through the domain-to-window map, fits, conversions, calculus, roots,
+# arithmetic and the class constructors.
+for _c in ("Polynomial", "Chebyshev", "Legendre", "Hermite", "HermiteE", "Laguerre"):
+    _B = f"np.polynomial.{_c}"
+    SPECS[f"npcls_{_c.lower()}"] = [
+        f"{_B}([1.0, 2.0, 3.0])(0.5)", f"{_B}(q1)(xc)", f"{_B}({{N1}})(p1)", f"{_B}(q1, domain=[0, 4])(xc)",
+        f"{_B}(q1, domain=[0, 4], window=[-2, 2])(1.5)", f"{_B}(q1).coef", f"{_B}(q1, domain=[0, 4]).domain",
+        f"{_B}(q1).deriv().coef", f"{_B}(q1, domain=[0, 4]).deriv(2).coef", f"{_B}(q1, domain=[0, 4]).integ().coef",
+        f"{_B}(q1).integ(2, k=[1.0, -1.0], lbnd=0.5).coef", f"{_B}(q1, domain=[1, 3]).integ(lbnd=2.0)(2.5)",
+        f"{_B}.fit(xc, {{N1}}, 2).coef", f"{_B}.fit(xc, {{N1}}, 3)(xc)", f"{_B}.fit(xc, {{N1}}, 2).domain",
+        f"{_B}.fit(xc, {{N1}}, 2, w=xc + 1.0)(1.0)", f"{_B}.fit(xc, {{N1}}, 2, domain=[-1, 6])(1.0)",
+        f"{_B}.fit(xc, {{N1}}, 2, window=[0, 1]).coef", f"{_B}.fit(xc, {{N1}}, 2).convert().coef",
+        f"{_B}(q1, domain=[0, 4]).convert(kind=np.polynomial.Polynomial).coef",
+        f"{_B}(q1).convert(domain=[0, 2]).coef", f"np.sort({_B}.fit(xc, {{N1}}, 2).roots().real)",
+        f"{_B}(q1, domain=[0, 4]).roots().imag", f"({_B}(q1) + {_B}({{N1}})).coef", f"({_B}(q1) * {_B}(p1)).coef",
+        f"({_B}(q1) - 2.0).coef", f"(3 * {_B}(q1)).coef", f"({_B}(q1) / 2).coef", f"({_B}(q1) ** 2).coef",
+        f"(-{_B}(q1))(0.25)", f"({_B}({{N1}}) // {_B}(q1)).coef", f"({_B}({{N1}}) % {_B}(q1)).coef",
+        f"{_B}.fromroots(p1).coef", f"{_B}.fromroots(p1, domain=[0, 2])(0.5)", f"{_B}.basis(3).coef",
+        f"{_B}.identity().coef", f"{_B}.identity(domain=[0, 4])(2.5)", f"{_B}({{N1}}).cutdeg(2).coef",
+        f"{_B}({{N1}}).truncate(3).coef", f"{_B}(np.array([1.0, 2.0, 1e-12, 0.0])).trim(1e-10).coef",
+        f"{_B}({{N1}}).degree()", f"len({_B}(q1))",
+        f"STMT w = {_B}.fit(xc, {{N1}}, 2); w += {_B}([1.0], domain=w.domain) => w(xc)",
+        f"STMT w1, w2 = {_B}(q1, domain=[0, 4]).linspace(5) => w2",
+    ]
+
+# np.einsum forms with no numpy equivalent in xp2f's table (generated
+# loops): three or more operands, rank 3 and 4, repeated letters, scalar
+# operands, implicit output, indexed results.
+SPECS["einsum_gen"] = [
+    'np.einsum("ij,jk,kl->il", g3, s2, g3)', 'np.einsum("ij,jk,kl", g3, s2, r3)', 'np.einsum("i,j,k->ijk", v3, q1, p1)',
+    'np.einsum("i,j,k", {N1}[:3], q1, v3)', 'np.einsum("ij,ij,ij->i", g3, s2, r3)', 'np.einsum("i,i,i", v3, q1, p1)',
+    'np.einsum("i,i,i->", {N1}, {N1}, {N1})', 'np.einsum("ij,j,j->i", {N2}, v3, q1)', 'np.einsum("ii,i->", {SQ}, v3)',
+    'np.einsum("ii,i->i", {SQ}, q1)', 'np.einsum("ij,ji->i", {SQ}, g3)', 'np.einsum("ij,jk->ki", {N2}, s2)',
+    'np.einsum("ij,kl->ijkl", {N2}, g3[:2, :2])', 'np.einsum("ij,kl->ikjl", sb1[:, None] * sb1, g3[:2, :2])',
+    'np.einsum("ijk->kji", sm3)', 'np.einsum("ijk->jik", sm3)', 'np.einsum("ijk->kij", sa3)', 'np.einsum("ijk->", sm3)',
+    'np.einsum("ijk->j", sm3)', 'np.einsum("ijk->ik", sm3)', 'np.einsum("ijk,ijk->", sm3, sm3)',
+    'np.einsum("ijk,ijk->ij", sm3, sm3)', 'np.einsum("ijk,ikl->ijl", sm3, sm3.transpose(0, 2, 1))',
+    'np.einsum("ijk,jk->i", sm3, sm2)', 'np.einsum("ijk,k,j->i", sm3, v3, sb1)', 'np.einsum("iij->j", sa3[:2, :2, :])',
+    'np.einsum("ijkl->lkji", sa4)', 'np.einsum("ijkl->", sa4)', 'np.einsum("ijkl,ijkl->il", sa4, sa4)',
+    'np.einsum("ijkl->jl", sa4)', 'np.einsum("bij,bjk,bkl->bil", sa3, sa3, sa3)',
+    'np.einsum(",i->i", {S}, v3)', 'np.einsum("i,->i", {N1}, {S})', 'np.einsum("ij,jk,kl->il", {SQ}, {SQ}, {SQ})',
+    'np.einsum("i,j->ij", {N1}, {N1}) + 1', 'np.einsum("i,j,k->ijk", v3, q1, p1)[1]', 'np.einsum("ijk->kji", sm3)[0, 1]',
+    'np.einsum("ij,jk,kl->il", g3, s2, g3, optimize=True)', 'np.einsum("i,j,k->ijk", c1, v3, c1)',
+    'np.einsum("i,i,i", c1, c1, v3)', 'np.einsum("ij,jk,k->i", {N2}, s2, {N1}[:3])',
+    "STMT w = np.einsum('i,j,k->ijk', v3, v3, q1) => w.sum(axis=0)",
+]
+
 SPECS["dtypes"] = [
     "{Q} + {Q}", "{Q} * 3", "{Q} - 100", "-{Q}", "{Q} // 3", "{Q} % 7", "{Q} ** 2", "np.abs({Q})",
     "{Q} + i1", "{Q} * 1.5", "{Q} / 2", "q8 + q16", "q8 + qu8", "qu8 + q16", "qu8 + qu16", "q8 * qu8",

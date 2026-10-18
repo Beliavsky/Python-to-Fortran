@@ -6462,6 +6462,150 @@ def rewrite_function_valued_library_args(tree):
     return tree
 
 
+def rewrite_general_einsum(tree):
+    """np.einsum with constant subscripts that _einsum_table has no numpy
+    equivalent for (three or more operands, rank above 3, outer products
+    of several vectors, ...) becomes a call of a generated module-level
+    function that loops over the output letters, sums the product of the
+    operand elements over the other letters and appends each sum to a
+    list, reshaped to the output shape at the end. One function per call,
+    so each gets its operands' types. Ellipsis stays unsupported (the
+    ranks of the operands are not known here)."""
+    np_names = {a.asname or a.name for st in tree.body if isinstance(st, ast.Import)
+                for a in st.names if a.name == "numpy"}
+    if not np_names:
+        return tree
+    existing = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    existing.update(n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    table = _einsum_table()
+    helpers = []
+
+    def helper(spec, nargs):
+        s = spec.replace(" ", "")
+        if "." in s:
+            return None
+        lhs, arrow, out = s.partition("->")
+        ins = lhs.split(",")
+        if len(ins) != nargs or not all(x.isalpha() for x in ins if x) or (out and not out.isalpha()):
+            return None
+        letters = "".join(ins)
+        if not arrow:
+            out = "".join(sorted(c for c in set(letters) if letters.count(c) == 1))
+        if len(set(out)) != len(out) or any(c not in letters for c in out):
+            return None
+        inner = [c for c in dict.fromkeys(letters) if c not in out]
+        name, k = "xp_einsum", 2
+        while name in existing:
+            name, k = f"xp_einsum_{k}", k + 1
+        existing.add(name)
+        np_name = sorted(np_names)[0]
+        args = [f"a{i}" for i in range(nargs)]
+        lines = [f"def {name}({', '.join(args)}):"]
+        arrays = [f"a{i}" for i, x in enumerate(ins) if x]
+        if arrays:
+            # numpy sums bool products with or (a bool result); stop rather
+            # than print counts.
+            lines += [f"    if {' and '.join(a + '.dtype == bool' for a in arrays)}:",
+                      "        raise NotImplementedError('np.einsum of bool arrays only is not supported')"]
+        for c in dict.fromkeys(letters):
+            i = next(j for j, x in enumerate(ins) if c in x)
+            lines.append(f"    n_{c} = a{i}.shape[{ins[i].index(c)}]")
+        terms = " * ".join(f"a{i}[{', '.join('i_' + c for c in x)}]" if x else f"a{i}"
+                           for i, x in enumerate(ins))
+        pad = "    "
+        if out:
+            lines.append("    r = []")
+        for c in out:
+            lines.append(f"{pad}for i_{c} in range(n_{c}):")
+            pad += "    "
+        if inner:
+            lines.append(f"{pad}s = 0")
+            body = pad
+            for c in inner:
+                lines.append(f"{body}for i_{c} in range(n_{c}):")
+                body += "    "
+            lines.append(f"{body}s += {terms}")
+            value = "s"
+        else:
+            value = terms
+        if out:
+            lines.append(f"{pad}r.append({value})")
+            shape = ", ".join(f"n_{c}" for c in out)
+            lines.append(f"    return {np_name}.array(r)" if len(out) == 1
+                         else f"    return {np_name}.array(r).reshape(({shape}))")
+        else:
+            lines.append(f"    return {value}")
+        helpers.append(ast.parse("\n".join(lines) + "\n").body[0])
+        return name
+
+    class _Einsum(ast.NodeTransformer):
+        def visit_Call(self, call):
+            self.generic_visit(call)
+            f = call.func
+            if not (isinstance(f, ast.Attribute) and f.attr == "einsum" and isinstance(f.value, ast.Name)
+                    and f.value.id in np_names and call.args):
+                return call
+            spec = call.args[0]
+            if (not (isinstance(spec, ast.Constant) and isinstance(spec.value, str))
+                    or any(isinstance(a, ast.Starred) for a in call.args)
+                    or any(kw.arg != "optimize" for kw in call.keywords)):
+                return call
+            norm = _normalized_einsum(spec.value, len(call.args) - 1)
+            if norm in table:
+                return call
+            name = helper(spec.value, len(call.args) - 1)
+            if name is None:
+                return call
+            return ast.copy_location(ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=call.args[1:],
+                                              keywords=[]), call)
+
+    _Einsum().visit(tree)
+    if not helpers:
+        return tree
+    names = {h.name for h in helpers}
+
+    def is_helper_call(n):
+        return isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in names
+
+    def hoist(body):
+        # np.einsum(...)[i] (the result of a program function cannot be
+        # indexed): t = xp_einsum(...) first, then t[i].
+        out = []
+        for st in body:
+            for field in ("body", "orelse", "finalbody"):
+                if isinstance(getattr(st, field, None), list) and not isinstance(st, ast.ClassDef):
+                    setattr(st, field, hoist(getattr(st, field)))
+            for h in getattr(st, "handlers", []):
+                h.body = hoist(h.body)
+            if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Expr, ast.Return)):
+                skip = {id(m) for n in ast.walk(st)
+                        if isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+                        for m in ast.walk(n)}
+                for n in list(ast.walk(st)):
+                    if isinstance(n, ast.Subscript) and is_helper_call(n.value) and id(n) not in skip:
+                        k = 1
+                        while f"xp_einsum_t{k}" in existing:
+                            k += 1
+                        t = f"xp_einsum_t{k}"
+                        existing.add(t)
+                        out.append(ast.copy_location(
+                            ast.Assign(targets=[ast.Name(id=t, ctx=ast.Store())], value=n.value), st))
+                        n.value = ast.Name(id=t, ctx=ast.Load())
+            out.append(st)
+        return out
+
+    tree.body = hoist(tree.body)
+    if helpers:
+        pos = 0
+        while pos < len(tree.body) and isinstance(tree.body[pos], (ast.Import, ast.ImportFrom)) or (
+                pos < len(tree.body) and isinstance(tree.body[pos], ast.Expr)
+                and isinstance(tree.body[pos].value, ast.Constant) and isinstance(tree.body[pos].value.value, str)):
+            pos += 1
+        tree.body[pos:pos] = helpers
+        ast.fix_missing_locations(tree)
+    return tree
+
+
 def rewrite_numpy_polynomial_aliases(tree):
     """`import numpy.polynomial.chebyshev as C`, `from numpy.polynomial import
     chebyshev as C` (C.chebval(...)) and `from numpy.polynomial.chebyshev
@@ -6531,6 +6675,472 @@ def rewrite_numpy_polynomial_aliases(tree):
             return node
 
     _Canon().visit(tree)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+_POLY_CLASSES = {"Polynomial": ("polynomial", "poly"), "Chebyshev": ("chebyshev", "cheb"),
+                 "Legendre": ("legendre", "leg"), "Hermite": ("hermite", "herm"),
+                 "HermiteE": ("hermite_e", "herme"), "Laguerre": ("laguerre", "lag")}
+
+_POLY_HELPERS = {
+    "xp_poly_compose": (
+        "def xp_poly_compose(c, a, b):\n"
+        "    n = c.shape[0]\n"
+        "    r = 0.0 * c\n"
+        "    r[0] = c[n - 1]\n"
+        "    for i in range(n - 2, -1, -1):\n"
+        "        for j in range(n - 1, 0, -1):\n"
+        "            r[j] = a * r[j] + b * r[j - 1]\n"
+        "        r[0] = a * r[0] + c[i]\n"
+        "    return np.polynomial.polynomial.polytrim(r)\n"),
+    "xp_poly_off": (
+        "def xp_poly_off(old, new):\n"
+        "    return (old[1] * new[0] - old[0] * new[1]) / (old[1] - old[0])\n"),
+    "xp_poly_scl": (
+        "def xp_poly_scl(old, new):\n"
+        "    return (new[1] - new[0]) / (old[1] - old[0])\n"),
+    "xp_poly_mapdomain": (
+        "def xp_poly_mapdomain(x, old, new):\n"
+        "    off = (old[1] * new[0] - old[0] * new[1]) / (old[1] - old[0])\n"
+        "    scl = (new[1] - new[0]) / (old[1] - old[0])\n"
+        "    return off + scl * x\n"),
+    "xp_poly_getdomain": (
+        "def xp_poly_getdomain(x):\n"
+        "    d = np.array([1.0 * np.min(x), 1.0 * np.max(x)])\n"
+        "    if d[0] == d[1]:\n"
+        "        d[0] -= 1.0\n"
+        "        d[1] += 1.0\n"
+        "    return d\n"),
+}
+
+
+class _PolyUnset(Exception):
+    pass
+
+
+def rewrite_numpy_polynomial_classes(tree):
+    """numpy's series classes (np.polynomial.Polynomial, Chebyshev, Legendre,
+    Hermite, HermiteE, Laguerre): an object p is its coefficient array p,
+    with p_xpdom and p_xpwin holding its domain and window unless every
+    assignment gives the same constant ones. p(x), p.coef/.domain/.window,
+    p.deriv/.integ/.roots/.convert/.trim/.truncate/.cutdeg/.copy/.degree,
+    len(p), x, y = p.linspace(n), arithmetic with series and scalars, and
+    the constructors P(coef, domain, window), P.fit, P.fromroots, P.basis
+    and P.identity become calls of the np.polynomial.<module> functions,
+    mapping x from the domain to the window as numpy does. Any other use of
+    an object (printing it, passing it to a function) is an error rather
+    than its coefficients."""
+    cls_alias = {}
+    keep = []
+    for st in tree.body:
+        if isinstance(st, ast.ImportFrom) and st.module and st.module.startswith("numpy.polynomial"):
+            rest = []
+            for a in st.names:
+                if a.name in _POLY_CLASSES:
+                    cls_alias[a.asname or a.name] = a.name
+                else:
+                    rest.append(a)
+            if rest:
+                st.names = rest
+                keep.append(st)
+            continue
+        keep.append(st)
+    tree.body = keep
+
+    def chain(node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return parts[::-1]
+        return None
+
+    def cls_of(node):
+        if isinstance(node, ast.Name) and node.id in cls_alias:
+            return cls_alias[node.id]
+        if isinstance(node, ast.Attribute) and node.attr in _POLY_CLASSES:
+            p = chain(node)
+            if p and p[0] in {"np", "numpy"} and (p[1:] == ["polynomial", node.attr] or p[1:] == [
+                    "polynomial", _POLY_CLASSES[node.attr][0], node.attr]):
+                return node.attr
+        return None
+
+    if not cls_alias and not any(cls_of(n) for n in ast.walk(tree) if isinstance(n, ast.Attribute)):
+        return tree
+
+    names = {}
+    ctor_methods = {"fit", "fromroots", "basis", "identity"}
+    same_methods = {"deriv", "integ", "copy", "trim", "cutdeg", "truncate"}
+
+    def call_arg(call, pos, kw):
+        if pos is not None and len(call.args) > pos:
+            return call.args[pos]
+        return next((k.value for k in call.keywords if k.arg == kw), None)
+
+    def fam(node):
+        if isinstance(node, ast.Name):
+            return names.get(node.id)
+        if isinstance(node, ast.Call):
+            f = node.func
+            c = cls_of(f)
+            if c:
+                return c
+            if isinstance(f, ast.Attribute):
+                c = cls_of(f.value)
+                if c and f.attr in ctor_methods:
+                    return c
+                c = fam(f.value)
+                if c and f.attr in same_methods:
+                    return c
+                if c and f.attr == "convert":
+                    kind = call_arg(node, 1, "kind")
+                    return cls_of(kind) if kind is not None else c
+            return None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
+                                                                ast.Mod, ast.Pow)):
+            return fam(node.left) or (fam(node.right) if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)) else None)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            return fam(node.operand)
+        return None
+
+    def assigns():
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                yield n.targets[0].id, n.value
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                yield n.target.id, ast.BinOp(left=ast.Name(id=n.target.id, ctx=ast.Load()), op=n.op, right=n.value)
+
+    changed = True
+    while changed:
+        changed = False
+        for name, value in assigns():
+            c = fam(value)
+            if c and names.get(name) != c:
+                if name in names:
+                    raise NotImplementedError(f"{name} holds numpy series of two classes ({names[name]}, {c})")
+                names[name] = c
+                changed = True
+    for name, value in assigns():
+        if name in names and fam(value) is None:
+            raise NotImplementedError(f"{name} holds a numpy series object and another value")
+
+    helpers_used = set()
+
+    def num(v):
+        return repr(float(v)) if isinstance(v, (int, float)) else f"({v})"
+
+    def arr(v):
+        return f"np.array([{float(v[0])!r}, {float(v[1])!r}])" if isinstance(v, tuple) else v
+
+    def mapparms(old, new):
+        if isinstance(old, tuple) and isinstance(new, tuple):
+            oldlen = old[1] - old[0]
+            return (old[1] * new[0] - old[0] * new[1]) / oldlen, (new[1] - new[0]) / oldlen
+        # A domain computed from data (Polynomial.fit) would be repeated six
+        # times in the formula; the helpers evaluate it once.
+        o, n = arr(old), arr(new)
+        helpers_used.update({"xp_poly_off", "xp_poly_scl"})
+        return f"xp_poly_off({o}, {n})", f"xp_poly_scl({o}, {n})"
+
+    def mapdomain(x, old, new):
+        if not (isinstance(old, tuple) and isinstance(new, tuple)):
+            helpers_used.add("xp_poly_mapdomain")
+            return f"xp_poly_mapdomain({x}, {arr(old)}, {arr(new)})"
+        off, scl = mapparms(old, new)
+        if off == 0.0 and scl == 1.0:
+            return x
+        return f"({num(off)} + {num(scl)} * ({x}))"
+
+    def const_pair(node):
+        if isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) == 2:
+            vals = []
+            for e in node.elts:
+                v = _signed_int_constant(e)
+                if v is None and isinstance(e, ast.Constant) and isinstance(e.value, float):
+                    v = e.value
+                if v is None and isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub) \
+                        and isinstance(e.operand, ast.Constant) and isinstance(e.operand.value, float):
+                    v = -e.operand.value
+                if v is None:
+                    return None
+                vals.append(float(v))
+            return tuple(vals)
+        return None
+
+    def domwin(node, default, src):
+        if node is None or (isinstance(node, ast.Constant) and node.value is None):
+            return default
+        c = const_pair(node)
+        return c if c is not None else f"(1.0 * np.asarray({src(node)}))"
+
+    def defaults(c):
+        return ((0.0, 1.0), (0.0, 1.0)) if c == "Laguerre" else ((-1.0, 1.0), (-1.0, 1.0))
+
+    def fn(c, op):
+        mod, pre = _POLY_CLASSES[c]
+        return f"np.polynomial.{mod}.{pre}{op}"
+
+    def coefs(node, src):
+        s = src(node)
+        return f"(1.0 * np.asarray({s}))" if isinstance(node, (ast.List, ast.Tuple)) else f"(1.0 * np.atleast_1d({s}))"
+
+    def pure(node):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                p = chain(n.func)
+                if not (p and p[0] in {"np", "numpy"} and "random" not in p):
+                    return False
+        return True
+
+    dom_const = {}
+
+    def value(node, src):
+        """(class, coefficient source, domain, window) of a series expression;
+        a domain or window is a (lo, hi) tuple or a source string."""
+        c = fam(node)
+        if c is None:
+            return None
+        ddom, dwin = defaults(c)
+        if isinstance(node, ast.Name):
+            d = dom_const.get(node.id)
+            if d == "unset":
+                raise _PolyUnset()
+            if d is None:
+                return c, node.id, f"{node.id}_xpdom", f"{node.id}_xpwin"
+            return c, node.id, d[0], d[1]
+        if isinstance(node, ast.Call):
+            f = node.func
+            if cls_of(f):
+                coef = call_arg(node, 0, "coef")
+                return (c, coefs(coef, src), domwin(call_arg(node, 1, "domain"), ddom, src),
+                        domwin(call_arg(node, 2, "window"), dwin, src))
+            if cls_of(f.value) and f.attr in ctor_methods:
+                if f.attr == "fit":
+                    x, y, deg = (call_arg(node, i, k) for i, k in ((0, "x"), (1, "y"), (2, "deg")))
+                    if call_arg(node, 4, "rcond") is not None or call_arg(node, 5, "full") is not None \
+                            or isinstance(deg, (ast.List, ast.Tuple)):
+                        raise NotImplementedError(f"{c}.fit with rcond, full or a list of degrees is not supported")
+                    if not pure(x):
+                        raise NotImplementedError(f"{c}.fit: assign x to a variable first")
+                    xs = src(x)
+                    dn = call_arg(node, 3, "domain")
+                    if dn is None or (isinstance(dn, ast.Constant) and dn.value is None):
+                        helpers_used.add("xp_poly_getdomain")
+                        dom = f"xp_poly_getdomain({xs})"
+                    elif isinstance(dn, ast.List) and not dn.elts:
+                        dom = ddom
+                    else:
+                        dom = domwin(dn, ddom, src)
+                    win = domwin(call_arg(node, 7, "window"), dwin, src)
+                    w = call_arg(node, 6, "w")
+                    wtxt = f", w={src(w)}" if w is not None else ""
+                    return c, f"{fn(c, 'fit')}({mapdomain(xs, dom, win)}, {src(y)}, {src(deg)}{wtxt})", dom, win
+                if f.attr == "fromroots":
+                    r = call_arg(node, 0, "roots")
+                    rs = f"np.asarray({src(r)})" if isinstance(r, (ast.List, ast.Tuple)) else src(r)
+                    dn = call_arg(node, 1, "domain")
+                    if dn is None or (isinstance(dn, ast.List) and not dn.elts):
+                        dom = ddom
+                    elif isinstance(dn, ast.Constant) and dn.value is None:
+                        if not pure(r):
+                            raise NotImplementedError(f"{c}.fromroots: assign the roots to a variable first")
+                        helpers_used.add("xp_poly_getdomain")
+                        dom = f"xp_poly_getdomain({rs})"
+                    else:
+                        dom = domwin(dn, ddom, src)
+                    win = domwin(call_arg(node, 2, "window"), dwin, src)
+                    off, scl = mapparms(dom, win)
+                    if isinstance(scl, float) and scl == 1.0:
+                        return c, f"{fn(c, 'fromroots')}({mapdomain(rs, dom, win)})", dom, win
+                    return c, f"({fn(c, 'fromroots')}({mapdomain(rs, dom, win)}) / {num(scl)} ** len({rs}))", dom, win
+                dom = domwin(call_arg(node, 1 if f.attr == "basis" else 0, "domain"), ddom, src)
+                win = domwin(call_arg(node, 2 if f.attr == "basis" else 1, "window"), dwin, src)
+                if f.attr == "basis":
+                    return c, f"np.append(np.zeros({src(call_arg(node, 0, 'deg'))}), 1.0)", dom, win
+                off, scl = mapparms(win, dom)
+                return c, f"{fn(c, 'line')}({num(off)}, {num(scl)})", dom, win
+            pv = value(f.value, src)
+            _, coef, dom, win = pv
+            off, scl = mapparms(dom, win)
+            if f.attr == "copy":
+                return pv
+            if f.attr == "deriv":
+                m = call_arg(node, 0, "m")
+                if m is None and isinstance(scl, float) and scl == 1.0:
+                    return c, f"{fn(c, 'der')}({coef})", dom, win
+                return c, f"{fn(c, 'der')}({coef}, m={src(m) if m is not None else 1}, scl={num(scl)})", dom, win
+            if f.attr == "integ":
+                m, k, lb = call_arg(node, 0, "m"), call_arg(node, 1, "k"), call_arg(node, 2, "lbnd")
+                lbs = 0.0 if lb is None or (isinstance(lb, ast.Constant) and lb.value is None) else \
+                    f"{num(off)} + {num(scl)} * ({src(lb)})"
+                iscl = 1.0 / scl if isinstance(scl, float) else f"1.0 / {num(scl)}"
+                if m is None and k is None and lbs == 0.0 and iscl == 1.0:
+                    return c, f"{fn(c, 'int')}({coef})", dom, win
+                kt = f", k={src(k)}" if k is not None else ""
+                return (c, f"{fn(c, 'int')}({coef}, m={src(m) if m is not None else 1}{kt}, lbnd={num(lbs)}, "
+                        f"scl={num(iscl)})", dom, win)
+            if f.attr == "trim":
+                tol = call_arg(node, 0, "tol")
+                return c, f"{fn(c, 'trim')}({coef}, {src(tol) if tol is not None else 0})", dom, win
+            if f.attr == "truncate":
+                return c, f"({coef})[:{src(call_arg(node, 0, 'size'))}]", dom, win
+            if f.attr == "cutdeg":
+                return c, f"({coef})[:({src(call_arg(node, 0, 'deg'))}) + 1]", dom, win
+            # convert(domain=None, kind=None, window=None)
+            kind = call_arg(node, 1, "kind")
+            if kind is not None and cls_of(kind) is None:
+                raise NotImplementedError("convert: kind must be a numpy series class")
+            tdom, twin = defaults(c)
+            tdom = domwin(call_arg(node, 0, "domain"), tdom, src)
+            twin = domwin(call_arg(node, 2, "window"), twin, src)
+            offp, sclp = mapparms(twin, tdom)
+            if all(isinstance(v, float) for v in (off, scl, offp, sclp)):
+                a, b = off + scl * offp, scl * sclp
+            else:
+                a, b = f"{num(off)} + {num(scl)} * {num(offp)}", f"{num(scl)} * {num(sclp)}"
+            pc = coef if pv[0] == "Polynomial" else f"{fn(pv[0], '2poly')}({coef})"
+            helpers_used.add("xp_poly_compose")
+            res = f"xp_poly_compose({pc}, {num(a)}, {num(b)})"
+            if c != "Polynomial":
+                mod, pre = _POLY_CLASSES[c]
+                res = f"np.polynomial.{mod}.poly2{pre}({res})"
+            return c, res, tdom, twin
+        if isinstance(node, ast.UnaryOp):
+            pv = value(node.operand, src)
+            return pv if isinstance(node.op, ast.UAdd) else (c, f"(-({pv[1]}))", pv[2], pv[3])
+        lp = value(node.left, src) if fam(node.left) else None
+        rp = value(node.right, src) if fam(node.right) else None
+        op = node.op
+        if lp and rp:
+            if lp[0] != rp[0]:
+                raise NotImplementedError("arithmetic of numpy series of different classes")
+            if isinstance(lp[2], tuple) and isinstance(rp[2], tuple) and (lp[2], lp[3]) != (rp[2], rp[3]):
+                raise NotImplementedError("arithmetic of numpy series with different domains or windows")
+            if isinstance(op, (ast.Div, ast.Pow)):
+                raise NotImplementedError("a numpy series divided by or raised to a series")
+            a, b = lp[1], rp[1]
+        elif lp:
+            a, b = lp[1], f"np.atleast_1d({src(node.right)})"
+            if isinstance(op, ast.Pow):
+                return c, f"{fn(c, 'pow')}({a}, {src(node.right)})", lp[2], lp[3]
+        else:
+            a, b = f"np.atleast_1d({src(node.left)})", rp[1]
+        base = lp or rp
+        if isinstance(op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            return c, f"{fn(c, 'div')}({a}, {b})[{1 if isinstance(op, ast.Mod) else 0}]", base[2], base[3]
+        opname = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul"}[type(op)]
+        return c, f"{fn(c, opname)}({a}, {b})", base[2], base[3]
+
+    # Constant domains and windows: a name keeps (lo, hi) pairs when every
+    # assignment gives the same ones.
+    for name in names:
+        dom_const[name] = "unset"
+    changed = True
+    while changed:
+        changed = False
+        for name, val in assigns():
+            if name not in names or dom_const[name] is None:
+                continue
+            try:
+                pv = value(val, ast.unparse)
+            except _PolyUnset:
+                continue
+            d = (pv[2], pv[3]) if isinstance(pv[2], tuple) and isinstance(pv[3], tuple) else None
+            if dom_const[name] == "unset":
+                dom_const[name] = d
+                changed = True
+            elif dom_const[name] != d:
+                dom_const[name] = None
+                changed = True
+    for name in names:
+        if dom_const[name] == "unset":
+            dom_const[name] = None
+    helpers_used.clear()
+
+    def parse_expr(text, like):
+        return ast.copy_location(ast.parse(text, mode="eval").body, like)
+
+    class _Series(ast.NodeTransformer):
+        def src(self, node):
+            return ast.unparse(self.visit(copy.deepcopy(node)))
+
+        def assign(self, st, name, val):
+            pv = value(val, self.src)
+            out = [f"{name} = {pv[1]}"]
+            if dom_const.get(name) is None:
+                out += [f"{name}_xpdom = {arr(pv[2])}", f"{name}_xpwin = {arr(pv[3])}"]
+            return [ast.copy_location(ast.parse(t).body[0], st) for t in out]
+
+        def visit_Assign(self, st):
+            if len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and st.targets[0].id in names:
+                return self.assign(st, st.targets[0].id, st.value)
+            v = st.value
+            if (len(st.targets) == 1 and isinstance(st.targets[0], ast.Tuple) and len(st.targets[0].elts) == 2
+                    and all(isinstance(e, ast.Name) for e in st.targets[0].elts) and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute) and v.func.attr == "linspace" and fam(v.func.value)):
+                c, coef, dom, win = value(v.func.value, self.src)
+                n = call_arg(v, 0, "n")
+                d = domwin(call_arg(v, 1, "domain"), dom, self.src)
+                lo, hi = (repr(d[0]), repr(d[1])) if isinstance(d, tuple) else (f"{d}[0]", f"{d}[1]")
+                xn, yn = (e.id for e in st.targets[0].elts)
+                return [ast.copy_location(ast.parse(t).body[0], st) for t in (
+                    f"{xn} = np.linspace({lo}, {hi}, {self.src(n) if n is not None else 100})",
+                    f"{yn} = {fn(c, 'val')}({mapdomain(xn, dom, win)}, {coef})")]
+            return self.generic_visit(st)
+
+        def visit_AugAssign(self, st):
+            if isinstance(st.target, ast.Name) and st.target.id in names:
+                return self.assign(st, st.target.id, ast.BinOp(
+                    left=ast.Name(id=st.target.id, ctx=ast.Load()), op=st.op, right=st.value))
+            return self.generic_visit(st)
+
+        def visit_Call(self, node):
+            f = node.func
+            if fam(f) and len(node.args) == 1 and not node.keywords:
+                c, coef, dom, win = value(f, self.src)
+                return parse_expr(f"{fn(c, 'val')}({mapdomain(self.src(node.args[0]), dom, win)}, {coef})", node)
+            if isinstance(f, ast.Attribute) and f.attr in {"roots", "degree"} and fam(f.value) \
+                    and not node.args and not node.keywords:
+                c, coef, dom, win = value(f.value, self.src)
+                if f.attr == "degree":
+                    return parse_expr(f"(len({coef}) - 1)", node)
+                return parse_expr(mapdomain(f"{fn(c, 'roots')}({coef})", win, dom), node)
+            if isinstance(f, ast.Name) and f.id == "len" and len(node.args) == 1 and fam(node.args[0]):
+                return parse_expr(f"len({value(node.args[0], self.src)[1]})", node)
+            if fam(node):
+                raise NotImplementedError(f"unsupported use of a numpy series: {ast.unparse(node)}")
+            return self.generic_visit(node)
+
+        def visit_Attribute(self, node):
+            if node.attr in {"coef", "domain", "window"} and isinstance(node.ctx, ast.Load) and fam(node.value):
+                pv = value(node.value, self.src)
+                return parse_expr({"coef": pv[1], "domain": arr(pv[2]), "window": arr(pv[3])}[node.attr], node)
+            return self.generic_visit(node)
+
+        def visit_BinOp(self, node):
+            if fam(node):
+                raise NotImplementedError(f"unsupported use of a numpy series: {ast.unparse(node)}")
+            return self.generic_visit(node)
+
+        def visit_Name(self, node):
+            if node.id in names:
+                raise NotImplementedError(f"unsupported use of the numpy series {node.id}")
+            if cls_of(node):
+                raise NotImplementedError(f"unsupported use of the numpy series class {node.id}")
+            return node
+
+    tree = _Series().visit(tree)
+    if not any(isinstance(st, ast.Import) and any(a.name == "numpy" and (a.asname or "numpy") == "np"
+                                                  for a in st.names) for st in tree.body):
+        tree.body.insert(0, ast.Import(names=[ast.alias(name="numpy", asname="np")]))
+    if helpers_used:
+        pos = 0
+        while pos < len(tree.body) and isinstance(tree.body[pos], (ast.Import, ast.ImportFrom)):
+            pos += 1
+        tree.body[pos:pos] = [ast.parse(_POLY_HELPERS[h]).body[0] for h in sorted(helpers_used)]
     ast.fix_missing_locations(tree)
     return tree
 
@@ -34766,7 +35376,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.BoolOp):
             return self._boolop_value_kind(node) or "logical"
         if isinstance(node, ast.Subscript):
-            if self._expr_kind(node.value) == "char" and self._rank_expr(node.value) == 0:
+            _value_kind = self._expr_kind(node.value)
+            if _value_kind == "char" and self._rank_expr(node.value) == 0:
                 return "char"
             _sub_root = node.value
             while isinstance(_sub_root, ast.Subscript):
@@ -34928,6 +35539,23 @@ class translator(ast.NodeVisitor):
                         return "char"
                     if nm in self.alloc_ints:
                         return "int"
+            _base = node.value
+            _np_chain = None
+            if isinstance(_base, ast.Call) and isinstance(_base.func, ast.Attribute):
+                _np_chain = self._attr_chain_parts(_base.func)
+                if not (_np_chain and _np_chain[0] in {"np", "numpy"}):
+                    _np_chain = None
+            if (
+                (isinstance(_base, (ast.BinOp, ast.UnaryOp))
+                 or (_np_chain is not None and (_np_chain[-1] not in self._TUPLE_RESULT_NUMPY or (
+                     _np_chain[-1].startswith("atleast_") and len(_base.args) == 1))))
+                and _value_kind in {"int", "real", "complex", "logical"}
+                and int(self._rank_expr(_base) or 0) >= 1
+            ):
+                # An element or section of an array expression
+                # (np.sort(x)[0], (2.0 * x)[1:]) has the expression's kind;
+                # unknown, an int-started accumulator stayed integer.
+                return _value_kind
             return None
         if isinstance(node, ast.Call):
             if (
@@ -65067,6 +65695,17 @@ class translator(ast.NodeVisitor):
             return "emath:" + node.func.attr, node
         return None
 
+    # numpy functions whose result is (or can be) a tuple of arrays.
+    _TUPLE_RESULT_NUMPY = frozenset({
+        "histogram", "histogram2d", "histogramdd", "unique", "unique_all", "unique_counts", "unique_inverse",
+        "eig", "eigh", "svd", "qr", "slogdet", "lstsq", "divmod", "modf", "frexp", "gradient", "meshgrid",
+        "split", "array_split", "hsplit", "vsplit", "dsplit", "unstack", "nonzero", "where", "unravel_index",
+        "tril_indices", "triu_indices", "diag_indices", "tril_indices_from", "triu_indices_from",
+        "diag_indices_from", "mask_indices", "indices", "polydiv", "polyfit", "linspace", "broadcast_arrays",
+        "ix_", "atleast_1d", "atleast_2d", "atleast_3d", "leggauss", "chebdiv", "legdiv", "hermdiv", "hermediv",
+        "lagdiv", "chebgauss", "hermgauss", "hermegauss", "laggauss", "polyfit", "chebfit", "legfit",
+        "hermfit", "hermefit", "lagfit", "geomspace", "logspace", "shape", "argwhere", "nanargmin",
+        "intersect1d", "fromfunction", "load", "loadtxt", "genfromtxt", "einsum_path", "cond", "eigvals"})
     _NPOLY_MODULES = {"polynomial": "poly", "chebyshev": "cheb", "legendre": "leg", "hermite": "herm",
                       "hermite_e": "herme", "laguerre": "lag"}
     _NPOLY_OPS = ("val", "vander", "fit", "der", "int", "companion", "roots", "fromroots", "mulx", "add", "sub",
@@ -88408,8 +89047,10 @@ def emit_inferred_python_text(src_text, source_name="<input>"):
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_numpy_polynomial_classes(tree)
     tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
+    tree = rewrite_general_einsum(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_dynamic_real_eig_prints(tree)
     tree = hoist_apply_along_axis_calls(tree)
@@ -88953,8 +89594,10 @@ def transpile_file(
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_numpy_polynomial_classes(tree)
     tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
+    tree = rewrite_general_einsum(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_dynamic_real_eig_prints(tree)
     tree = hoist_apply_along_axis_calls(tree)
@@ -89779,8 +90422,10 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_loadtxt_unpack(tree)
     tree = rewrite_gradient_unpack(tree)
     tree = rewrite_numpy_polynomial_aliases(tree)
+    tree = rewrite_numpy_polynomial_classes(tree)
     tree = rewrite_numpy2_names(tree)
     tree = rewrite_tri_indices(tree)
+    tree = rewrite_general_einsum(tree)
     tree = rewrite_two_result_numpy_unpack(tree)
     tree = rewrite_dynamic_real_eig_prints(tree)
     tree = hoist_apply_along_axis_calls(tree)
@@ -91155,6 +91800,9 @@ def main():
                     return True
 
                 py_raw_text = (py_run.stdout or "") + (("\n" + py_run.stderr) if py_run.stderr else "")
+                # A site-packages .pth hook (pip_system_certs) sometimes warns at
+                # interpreter startup; that line is not the program's output.
+                py_raw_text = re.sub(r"(?m)^pip_system_certs: [^\n]*\n?", "", py_raw_text)
                 ft_raw_text = (rp.stdout or "") + (("\n" + rp.stderr) if rp.stderr else "")
                 if python_round_digits is not None:
                     py_raw_text = _round_output_text(py_raw_text, python_round_digits)

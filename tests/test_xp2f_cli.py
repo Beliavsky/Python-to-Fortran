@@ -28167,3 +28167,85 @@ def test_xp2f_bool_array_conj_method_stays_bool(tmp_path: Path) -> None:
         'r = b.conj()\n'
         'print(r, b.conjugate().any(), np.conj(b), True.conjugate())\n'
     ))
+
+
+def test_xp2f_einsum_general_subscripts(tmp_path: Path) -> None:
+    # einsum forms with no numpy equivalent in the table (three operands,
+    # outer product of three vectors, rank 3 and 4, a scalar operand, an
+    # indexed result, a call in a function) are generated loops.
+    _xp2f_output_matches_numpy(tmp_path, "xeinsum_general", (
+        'import numpy as np\n'
+        'a = np.array([[1.0, 2.0, 0.5], [0.0, -1.0, 3.0], [2.0, 1.0, 1.0]])\n'
+        'x = np.array([1.0, -2.0, 0.5])\n'
+        'k = np.array([3, -1, 4])\n'
+        't = np.arange(24.0).reshape(2, 3, 4)\n'
+        'q = np.arange(16.0).reshape(2, 2, 2, 2)\n'
+        'print(np.einsum("ij,jk,kl->il", a, a, a))\n'
+        'print(np.einsum("i,j,k->ijk", x, k, x).sum(axis=0))\n'
+        'print(np.einsum("ijk->kji", t)[1, 2])\n'
+        'print(np.einsum("ijk,ijk->", t, t), np.einsum("i,i,i", k, k, k))\n'
+        'print(np.einsum("ijkl,ijkl->il", q, q))\n'
+        'print(np.einsum(",i->i", 2.5, x))\n'
+        'def f(u, v):\n'
+        '    return np.einsum("i,j,j->i", u, v, v)\n'
+        'print(f(x, x))\n'
+    ))
+
+
+def test_xp2f_numpy_series_classes(tmp_path: Path) -> None:
+    # np.polynomial.Polynomial, Chebyshev, ...: evaluation through the
+    # domain-to-window map, fit (domain from the data), convert, calculus,
+    # roots, arithmetic, fromroots/basis/identity, linspace, in a function.
+    _xp2f_output_matches_numpy(tmp_path, "xseries_classes", (
+        'import numpy as np\n'
+        'from numpy.polynomial import Polynomial as P\n'
+        'x = np.array([0.0, 0.5, 1.5, 3.0, 3.5, 5.0])\n'
+        'y = np.array([1.0, 0.2, -0.5, 2.0, 3.1, 7.0])\n'
+        'p = P([1.0, 2.0, 3.0])\n'
+        'print(p(0.5), p(x), p.degree(), len(p))\n'
+        'print(p.deriv(2).coef, p.integ(k=[2.0], lbnd=1.0).coef)\n'
+        'f = P.fit(x, y, 2)\n'
+        'print(f.coef, f.domain, f(1.25), f.convert().coef)\n'
+        'print(f.deriv()(2.0), f.integ(lbnd=0.5)(3.0), np.sort(f.roots().real))\n'
+        'print((p * p).coef, (p - 1).coef, (2 * p).coef, (p / 2).coef, (p ** 2).coef)\n'
+        'c = np.polynomial.Chebyshev([1.0, 0.5, -0.25], domain=[0, 4])\n'
+        'print(c(1.0), c.deriv()(1.0), c.convert(kind=P).coef)\n'
+        'print(P.fromroots([1.0, -2.0, 0.5]).coef, P.basis(3).coef, P.identity().coef)\n'
+        'xs, ys = f.linspace(5)\n'
+        'print(xs, ys)\n'
+        'def g(xx, yy):\n'
+        '    fit = np.polynomial.Laguerre.fit(xx, yy, 2)\n'
+        '    return fit(2.0) + fit.deriv()(1.0)\n'
+        'print(g(x, y))\n'
+    ))
+
+
+def test_xp2f_numpy_series_object_other_uses_are_errors(tmp_path: Path) -> None:
+    # A series object is held as its coefficients; printing it or passing
+    # it on must not print or pass the coefficients.
+    src = tmp_path / "xseries_print.py"
+    src.write_text('import numpy as np\np = np.polynomial.Polynomial([1.0, 2.0])\nprint(p)\n', encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path, capture_output=True, text=True,
+                          check=False)
+    assert "unsupported use of the numpy series p" in proc.stdout + proc.stderr
+
+
+def test_xp2f_int_started_accumulator_of_array_expression_element(tmp_path: Path) -> None:
+    # Silent before: d = 0; d += np.sort(f)[0] (an element of an array
+    # expression, not of a name) kept d integer.
+    _xp2f_output_matches_numpy(tmp_path, "xacc_expr_element", (
+        'import numpy as np\n'
+        'f = np.array([0.5, -1.25, 2.0])\n'
+        'i = np.array([3, -1, 4])\n'
+        'a = 0\n'
+        'b = 0\n'
+        'c = 0\n'
+        'n = 0\n'
+        'for k in range(2):\n'
+        '    a += np.sort(f)[0]\n'
+        '    b += (2.0 * f)[1]\n'
+        '    c += np.sum(np.abs(f)[:2])\n'
+        '    n += np.cumsum(i)[-1]\n'
+        'print(a, b, c, n, np.histogram(f, bins=2)[1][0])\n'
+    ), check_kinds=True)
+
