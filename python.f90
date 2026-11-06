@@ -9225,7 +9225,7 @@ contains
          allocate(x(n), source=.true.)
       end function ones_logical
 
-      pure function to_lower(s)
+      elemental function to_lower(s)
          character(len=*), intent(in) :: s
          character(len=len(s)) :: to_lower
          integer :: i, k
@@ -9239,7 +9239,7 @@ contains
          end do
       end function to_lower
 
-      pure function to_upper(s)
+      elemental function to_upper(s)
          character(len=*), intent(in) :: s
          character(len=len(s)) :: to_upper
          integer :: i, k

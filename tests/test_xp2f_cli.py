@@ -527,6 +527,55 @@ def test_xp2f_string_helper_pruning_preserves_references_and_user_functions(refe
     assert (helper in kept) == (reference != "none")
 
 
+def test_xp2f_string_comprehension_filters_transforms_and_conditionals(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xstring_comprehensions.py", [
+        "def main():",
+        "    words = ['cat', 'elephant', 'dog', 'tiger', 'ox']",
+        "    print('3.', [w for w in words if len(w) > 4])",
+        "    words = ['apple', 'banana', 'apricot', 'cherry', 'avocado']",
+        "    print('4.', [w for w in words if w.startswith('a')])",
+        "    print('7.', ['even' if x % 2 == 0 else 'odd' for x in range(1, 8)])",
+        "    words = ['Python', 'Fortran', 'C', 'Julia', 'R']",
+        "    print('8.', [w.upper() for w in words if len(w) > 3])",
+        "main()",
+    ])
+    py = subprocess.run([sys.executable, str(tmp_path / 'xstring_comprehensions.py')],
+                        capture_output=True, text=True, check=True)
+    ft = subprocess.run([str(tmp_path / 'xstring_comprehensions_p.exe')],
+                        capture_output=True, text=True, check=True)
+    assert [s.strip() for s in py.stdout.splitlines()] == [s.strip() for s in ft.stdout.splitlines()]
+
+
+def test_xp2f_string_comprehensions_preserve_lengths_and_scope(tmp_path: Path) -> None:
+    _run_xp2f_compile_diff(tmp_path, "xstring_comprehension_lengths.py", [
+        "words = ['a ', '', 'bb', '  ', \"a'b\", 'a\\\\b']",
+        "w = 'outside'",
+        "print([w for w in words if len(w) == 2])",
+        "print([w for w in words if w.startswith('a ')])",
+        "print([w for w in words if w.startswith('')])",
+        "print([w for w in words if w.startswith('   ')])",
+        "print([w for w in words if len(w) > 100])",
+        "selected = [w.upper() for w in words if len(w) == 2]",
+        "print(selected)",
+        "for text in selected:",
+        "    print(len(text))",
+        "for text in [w.upper() for w in words if len(w) == 2]:",
+        "    print(len(text))",
+        "print(w)",
+        "print(['' if i % 2 == 0 else 'x ' for i in range(4)])",
+        "labels = ['' if i % 2 == 0 else 'x ' for i in range(4)]",
+        "print(labels)",
+        "for label in labels:",
+        "    print(len(label))",
+        "print([w.lower() for w in ['AB', 'CD']])",
+    ])
+    py = subprocess.run([sys.executable, str(tmp_path / 'xstring_comprehension_lengths.py')],
+                        capture_output=True, text=True, check=True)
+    ft = subprocess.run([str(tmp_path / 'xstring_comprehension_lengths_p.exe')],
+                        capture_output=True, text=True, check=True)
+    assert [s.strip() for s in py.stdout.splitlines()] == [s.strip() for s in ft.stdout.splitlines()]
+
+
 def test_xp2f_string_sequence_lengths_match_python(tmp_path: Path) -> None:
     source = (REPO_ROOT / "reports" / "string_lengths_validation_20260925" / "probe.py").read_text(encoding="utf-8")
     _run_xp2f_compile_diff(tmp_path, "xstring_lengths.py", source.splitlines())
@@ -28295,3 +28344,46 @@ def test_xp2f_matrix_rank_of_stack_of_dummy_argument(tmp_path: Path) -> None:
         'a = np.array([[[1.0, 2.0], [2.0, 4.0]], [[1.0, 0.0], [0.0, 1.0]]])\n'
         'print(f(a), v(np.array([0.0, 0.0])), v(np.array([1.0, 0.0])))\n'
     ))
+
+
+def test_xp2f_function_versions_per_kind_reach_callers_and_callees(tmp_path: Path) -> None:
+    # Found by the numpy_conformance <spec>__shared programs (one function
+    # called with int and real arrays). Silent before: a rank-2 argument got
+    # one real version (w = a.copy(); w += 1 returned 4.0 for 4); a function
+    # called from the int and real versions of another kept one real
+    # version; r = f(int array) declared r real from the merged result; and
+    # `return 0` before `return np.max(a)` made callers declare an integer
+    # and truncate 3.5 to 3.
+    _xp2f_output_matches_numpy(tmp_path, "xkind_versions", (
+        'import numpy as np\n'
+        'def g(a):\n'
+        '    w = a.copy()\n'
+        '    w += 1\n'
+        '    return w\n'
+        'def m(a):\n'
+        '    if a.size == 0:\n'
+        '        return 0\n'
+        '    return np.max(a)\n'
+        'def inner(a):\n'
+        '    if a.size == 0:\n'
+        '        return np.sum(a)\n'
+        '    return np.sum(a * a)\n'
+        'def outer(a):\n'
+        '    return inner(a)\n'
+        'i2 = np.array([[3, -1], [1, 5]])\n'
+        'f2 = np.array([[0.5, 1.0], [2.0, 3.5]])\n'
+        'i1 = np.array([3, -1, 4])\n'
+        'f1 = np.array([0.5, 1.0, 2.0])\n'
+        'u = g(i2)\n'
+        'v = g(f2)\n'
+        'x = m(f2)\n'
+        't = 0\n'
+        'for k in range(2):\n'
+        '    t += m(i2)\n'
+        'p = outer(i1)\n'
+        'q = outer(f1)\n'
+        'r = inner(i1)\n'
+        's = inner(f1)\n'
+        'print(u, v)\n'
+        'print(x, t, p, q, r, s)\n'
+    ), check_kinds=True)

@@ -25740,6 +25740,9 @@ def rewrite_literal_string_sequence_lengths(tree):
     Keep ordinary character arrays for storage and a parallel integer array
     for the significant lengths (including spaces). Materialized iteration
     snapshots both arrays; element reads use one evaluated Python index.
+    Single-generator string comprehensions carry the same lengths through
+    filtering, ASCII case mapping and literal conditional elements. Their
+    printed representation quotes elements without trimming significant spaces.
     """
     occupied = {n.id.lower() for n in ast.walk(tree) if isinstance(n, ast.Name)}
     occupied.update(n.name.lower() for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
@@ -25753,6 +25756,8 @@ def rewrite_literal_string_sequence_lengths(tree):
         return base
 
     getter = fresh("xp2f_string_item")
+    formatter = fresh("xp2f_string_list_repr")
+    needs_formatter = False
 
     def name(n, store=False):
         return ast.Name(id=n, ctx=ast.Store() if store else ast.Load())
@@ -25787,8 +25792,12 @@ def rewrite_literal_string_sequence_lengths(tree):
         local_names = {n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | set(args)
         lengths = {k: v for k, v in (inherited or {}).items() if k not in local_names}
         assignments = [n for n in nodes if isinstance(n, ast.Assign)]
+        comp_iters = {g.iter.id for n in nodes if isinstance(n, ast.ListComp)
+                      for g in n.generators if isinstance(g.iter, ast.Name)}
         for st in assignments:
-            if len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) and padded_literal(st.value):
+            if (len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                    and literal(st.value)
+                    and (padded_literal(st.value) or st.targets[0].id in comp_iters)):
                 lengths.setdefault(st.targets[0].id, fresh(st.targets[0].id + "_lengths"))
 
         def length_expr(expr):
@@ -25796,6 +25805,40 @@ def rewrite_literal_string_sequence_lengths(tree):
                 return ast.List(elts=[ast.Constant(len(e.value)) for e in expr.elts], ctx=ast.Load())
             if isinstance(expr, ast.Name) and expr.id in lengths:
                 return name(lengths[expr.id])
+            if (isinstance(expr, ast.ListComp) and len(expr.generators) == 1
+                    and isinstance(expr.generators[0].target, ast.Name)):
+                gen = expr.generators[0]
+                def element_length(elt):
+                    if is_const_str(elt):
+                        return ast.Constant(len(elt.value))
+                    if (isinstance(elt, ast.Name) and elt.id == gen.target.id
+                            and length_expr(gen.iter) is not None):
+                        return ast.Call(func=name("len"), args=[copy.deepcopy(elt)], keywords=[])
+                    if (isinstance(elt, ast.Call) and isinstance(elt.func, ast.Attribute)
+                            and elt.func.attr in {"upper", "lower"} and not elt.args and not elt.keywords):
+                        return element_length(elt.func.value)
+                    if isinstance(elt, ast.IfExp):
+                        yes, no = element_length(elt.body), element_length(elt.orelse)
+                        if yes is not None and no is not None:
+                            return ast.IfExp(test=copy.deepcopy(elt.test), body=yes, orelse=no)
+                    return None
+                size = element_length(expr.elt)
+                if size is not None:
+                    # Data and lengths are evaluated as parallel expressions.
+                    # Do not duplicate arbitrary calls (or assignment
+                    # expressions) to construct the two arrays.
+                    for part in ast.walk(expr):
+                        if isinstance(part, ast.NamedExpr):
+                            fail(part, "assignment expressions in string comprehensions")
+                        if isinstance(part, ast.Call) and not (
+                            isinstance(part.func, ast.Name) and part.func.id in {"range", "len"}
+                            or isinstance(part.func, ast.Attribute)
+                            and part.func.attr in {"upper", "lower", "startswith"}
+                        ):
+                            fail(part, "string comprehensions with potentially side-effecting calls")
+                    result = copy.deepcopy(expr)
+                    result.elt = size
+                    return result
             if isinstance(expr, ast.Subscript) and isinstance(expr.slice, ast.Slice):
                 base = length_expr(expr.value)
                 if base is not None:
@@ -25814,11 +25857,13 @@ def rewrite_literal_string_sequence_lengths(tree):
                 break
         # Only opt in sequences whose elements are consumed here. Other
         # uses (e.g. static DataFrame column labels) keep their existing path.
-        active = set()
+        active = {st.targets[0].id for st in assignments
+                  if len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                  and st.targets[0].id in lengths and isinstance(st.value, ast.ListComp)}
         for st in body:
             for node in ast.walk(st):
                 value = (node.value if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice)
-                         else node.iter if isinstance(node, ast.For) else None)
+                         else node.iter if isinstance(node, (ast.For, ast.comprehension)) else None)
                 if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "enumerate" and value.args:
                     value = value.args[0]
                 while isinstance(value, ast.Subscript):
@@ -25842,6 +25887,13 @@ def rewrite_literal_string_sequence_lengths(tree):
             return any(isinstance(n, ast.Name) and n.id in lengths for n in ast.walk(expr))
 
         class Rewrite(ast.NodeTransformer):
+            def visit_ListComp(self, node):
+                if len(node.generators) == 1:
+                    sizes = length_expr(node.generators[0].iter)
+                    if sizes is not None:
+                        node._xp2f_string_lengths = copy.deepcopy(sizes)
+                return self.generic_visit(node)
+
             def visit_FunctionDef(self, node):
                 node.body = scope(node.body, lengths, [a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg)])
                 return node
@@ -25863,6 +25915,8 @@ def rewrite_literal_string_sequence_lengths(tree):
                         node.value = ast.Subscript(value=node.value, slice=ast.Slice(), ctx=ast.Load())
                     if isinstance(sizes, ast.Name):
                         sizes = ast.Subscript(value=sizes, slice=ast.Slice(), ctx=ast.Load())
+                    node = self.generic_visit(node)
+                    sizes = self.visit(sizes)
                     return [node, ast.copy_location(assign(lengths[node.targets[0].id], sizes), node)]
                 if any(tracked(t) for t in node.targets):
                     fail(node, "element mutation or unpacking")
@@ -25891,15 +25945,30 @@ def rewrite_literal_string_sequence_lengths(tree):
                 return self.generic_visit(node)
 
             def visit_Call(self, node):
+                nonlocal used, needs_formatter
                 if (isinstance(node.func, ast.Attribute) and not literal(node.func.value)
                         and length_expr(node.func.value) is not None):
                     fail(node, "sequence methods or mutation")
                 # Scalar elements are lowered before checking for escaping
                 # sequences, so f(items[i]) works without a changed API.
                 node = self.generic_visit(node)
+                if isinstance(node.func, ast.Name) and node.func.id == "print":
+                    for i, arg in enumerate(node.args):
+                        sizes = length_expr(arg)
+                        # Whole literal sequences keep the old diagnostic;
+                        # comprehension results can be displayed losslessly.
+                        comp_result = isinstance(arg, ast.ListComp) or (
+                            isinstance(arg, ast.Name) and any(
+                                len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                                and st.targets[0].id == arg.id and isinstance(st.value, ast.ListComp)
+                                for st in assignments))
+                        if sizes is not None and comp_result:
+                            used = needs_formatter = True
+                            node.args[i] = ast.Call(func=name(formatter),
+                                                    args=[arg, self.visit(sizes)], keywords=[])
                 seq_args = [a for a in node.args if not literal(a) and length_expr(a) is not None]
                 seq_args += [k.value for k in node.keywords if not literal(k.value) and length_expr(k.value) is not None]
-                if seq_args and isinstance(node.func, ast.Name) and node.func.id not in {"len", getter}:
+                if seq_args and isinstance(node.func, ast.Name) and node.func.id not in {"len", getter, formatter}:
                     fail(node, "passing or printing a whole string sequence")
                 return node
 
@@ -25944,7 +26013,7 @@ def rewrite_literal_string_sequence_lengths(tree):
                     sequence = ast.Subscript(value=sequence, slice=ast.Slice(), ctx=ast.Load())
                 if isinstance(sizes, ast.Name):
                     sizes = ast.Subscript(value=sizes, slice=ast.Slice(), ctx=ast.Load())
-                before = [assign(data_tmp, sequence), assign(len_tmp, sizes)]
+                before = [assign(data_tmp, self.visit(sequence)), assign(len_tmp, self.visit(sizes))]
                 first = []
                 if enum:
                     counter = fresh("string_counter")
@@ -25986,6 +26055,19 @@ def rewrite_literal_string_sequence_lengths(tree):
 ''').body[0]
         helper._xp2f_string_length_helper = True
         tree.body.insert(0, helper)
+        if needs_formatter:
+            display = ast.parse(f'''def {formatter}(items, lengths) -> str:
+    result = '['
+    for index in range(len(items)):
+        if index > 0:
+            result += ', '
+        text = items[index]
+        text = text[:lengths[index]]
+        result += '%r' % text
+    return result + ']'
+''').body[0]
+            display._xp2f_string_length_helper = True
+            tree.body.insert(1, display)
     return ast.fix_missing_locations(tree)
 
 
@@ -45506,6 +45588,24 @@ class translator(ast.NodeVisitor):
                         return self.expr(n)
                     if isinstance(n, ast.Name):
                         return self.expr(n)
+                    if isinstance(n, ast.IfExp):
+                        def safe_branch(branch):
+                            return (isinstance(branch, (ast.Constant, ast.Name)) or (
+                                isinstance(branch, ast.Call) and isinstance(branch.func, ast.Name)
+                                and branch.func.id == "len" and len(branch.args) == 1
+                                and _is_loop_var(branch.args[0]) and not branch.keywords))
+                        if not all(safe_branch(b) for b in (n.body, n.orelse)):
+                            raise NotImplementedError("ListComp conditional branches require loop lowering for nontrivial expressions")
+                        yes, no = _map_expr(n.body), _map_expr(n.orelse)
+                        if is_const_str(n.body) and is_const_str(n.orelse):
+                            width = max(len(n.body.value), len(n.orelse.value))
+                            yes = fstr(n.body.value.ljust(width))
+                            no = fstr(n.orelse.value.ljust(width))
+                        elif _kind_with_loopvar(n.body) != _kind_with_loopvar(n.orelse):
+                            raise NotImplementedError("ListComp conditional branches require matching types")
+                        elif "char" in {_kind_with_loopvar(n.body), _kind_with_loopvar(n.orelse)}:
+                            raise NotImplementedError("ListComp string conditionals currently require literal branches")
+                        return f"merge({yes}, {no}, {_map_pred(n.test)})"
                     if isinstance(n, ast.Subscript):
                         if isinstance(n.value, ast.Subscript):
                             # Chained subscript (A[i][j], ...) -- self.expr()
@@ -45529,6 +45629,26 @@ class translator(ast.NodeVisitor):
                         itxt = _map_expr(n.slice)
                         return f"{btxt}(int({itxt}) + 1)"
                     if isinstance(n, ast.Call):
+                        if (isinstance(n.func, ast.Name) and n.func.id == "len"
+                                and len(n.args) == 1 and _is_loop_var(n.args[0])
+                                and not n.keywords and base_kind == "char" and _iter_rank == 1):
+                            sizes = getattr(node, "_xp2f_string_lengths", None)
+                            if sizes is None:
+                                raise NotImplementedError("ListComp string lengths require a length-tracked sequence")
+                            return self.expr(sizes)
+                        if (isinstance(n.func, ast.Attribute) and _is_loop_var(n.func.value)
+                                and base_kind == "char" and _iter_rank == 1 and not n.keywords):
+                            if n.func.attr in {"upper", "lower"} and not n.args:
+                                return f"to_{n.func.attr}({base})"
+                            if n.func.attr == "startswith" and len(n.args) == 1 and is_const_str(n.args[0]):
+                                prefix = n.args[0].value
+                                if not prefix:
+                                    return f"spread(.true., dim=1, ncopies=size({base}))"
+                                sizes = getattr(node, "_xp2f_string_lengths", None)
+                                if sizes is None:
+                                    raise NotImplementedError("ListComp startswith requires a length-tracked sequence")
+                                return (f"(index({base}, {fstr(prefix)}) == 1 .and. "
+                                        f"{self.expr(sizes)} >= {len(prefix)})")
                         if (
                             isinstance(n.func, ast.Name)
                             and n.func.id in {"max", "min"}
@@ -45687,6 +45807,9 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("ListComp element expression is unsupported")
 
                 def _map_pred(n):
+                    if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                            and n.func.attr == "startswith"):
+                        return _map_expr(n)
                     if isinstance(n, ast.Compare) and len(n.ops) == 1 and len(n.comparators) == 1:
                         if isinstance(n.ops[0], (ast.In, ast.NotIn)):
                             # Elementwise membership mask for list comprehensions:
@@ -56128,6 +56251,20 @@ class translator(ast.NodeVisitor):
                         spec = {"alloc_real": "real", "alloc_int": "int",
                                 "alloc_log": "logical", "alloc_complex": "complex",
                                 "alloc_char": "char"}.get(spec, spec)
+                    if (self.local_overload_dispatch.get(v.func.id, {}).get("return_profiles")
+                            and spec in {"real", "int", "logical", "alloc_real", "alloc_int", "alloc_log"}):
+                        # The result kind of the version these arguments
+                        # select (r = f(int array) when f also has a real
+                        # version), not the merged one: r was real.
+                        _pk = self._expr_kind(v)
+                        if _pk == "int" and (self._aliased_name(t.id) in self.reals
+                                             or self._aliased_name(t.id) in self.alloc_reals):
+                            # Also assigned a real result (r = f(i2); r =
+                            # f(f2)): stay real, as for r = 5; r = 2.5.
+                            _pk = "real"
+                        if _pk in {"real", "int", "logical"}:
+                            spec = ({"real": "alloc_real", "int": "alloc_int", "logical": "alloc_log"}[_pk]
+                                    if rr_v > 0 else _pk)
                     if spec == "alloc_real":
                         self._mark_alloc_real(t.id, rank=max(1, rr_v))
                     elif spec == "alloc_int":
@@ -75773,6 +75910,18 @@ def _emit_local_function(
         rv0 = returns[0].value
         rr0 = max(0, int(tr._rank_expr(rv0)))
         rk0 = tr._expr_kind(rv0)
+        if rk0 == "int" and rr0 == 0:
+            # `return 0` first, a real scalar later (return np.max(a)): the
+            # result is real; the first return alone told callers integer.
+            for _r in returns[1:]:
+                if _r.value is None or is_none(_r.value):
+                    continue
+                try:
+                    if tr._expr_kind(_r.value) == "real" and int(tr._rank_expr(_r.value) or 0) == 0:
+                        rk0 = "real"
+                        break
+                except Exception:
+                    pass
         rebound_result = _straight_line_rebound_array_result(fn, tr)
         if rebound_result is not None:
             rk0, rr0 = rebound_result
@@ -80799,6 +80948,19 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         "char": "alloc_char"}[result_kind]
             if spec is None:
                 continue
+            if spec == "int" and int(rr_spec) == 0 and len(rets) > 1:
+                # `if ...: return 0` then `return np.max(a)` of a real a:
+                # the function is real (as emitted), but the first return
+                # alone made callers declare an integer and truncate 3.5.
+                for _r in rets:
+                    if _r.value is None or is_none(_r.value) or _r.value is r0:
+                        continue
+                    try:
+                        if tr._expr_kind(_r.value) == "real" and int(tr._rank_expr(_r.value) or 0) == 0:
+                            spec = "real"
+                            break
+                    except Exception:
+                        pass
             if fn.name in NUMBA_VECTORIZE_FUNCS:
                 # ELEMENTAL: a scalar result for scalar dummies.
                 rr_spec = 0
@@ -85911,6 +86073,12 @@ def generate_flat(
         triads = set(_safe_idx(call_kind_rank_islist.get(fn.name, [set()]), 0)) | set(_safe_idx(obs_triad_lists, 0))
         pairs = set(pairs) | set(_safe_idx(obs_pair_lists, 0))
         allowed_ranks = {0, 1, 2} if fn.name in returned_arrays else {0, 1}
+        # Calls of one rank that differ only in kind (g(int matrix), g(real
+        # matrix)) need a version per kind at any rank: left out, the
+        # single real version converted the int matrix (silently real).
+        _num_pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"}}
+        if len({r for _k, r in _num_pairs}) == 1 and len(_num_pairs) > 1:
+            allowed_ranks = allowed_ranks | {r for _k, r in _num_pairs}
         pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in allowed_ranks}
         _comment_kind0, _comment_rank0 = _comment_arg_spec_hint_for_fn(fn, arg0)
         if _comment_kind0 in {"int", "real", "logical", "char", "complex"}:
@@ -85938,7 +86106,13 @@ def generate_flat(
             pairs = {("complex", 0)}
             if fn.name in local_func_arg_kinds and local_func_arg_kinds[fn.name]:
                 local_func_arg_kinds[fn.name][0] = "complex"
-        if req_rank > 0:
+        # An array is required (np.max(a) makes req_rank 1): calls that all
+        # pass one higher rank (int and real matrices) keep their kinds --
+        # pinned to rank 1 none was left, and the single real version's
+        # result went into an integer at the call site.
+        if req_rank > 0 and not (
+                pairs and len({int(r) for (_k, r) in pairs}) == 1
+                and min(int(r) for (_k, r) in pairs) > req_rank):
             pairs = {(k, r) for (k, r) in pairs if int(r) == req_rank}
             triads = {(k, r, is_list) for (k, r, is_list) in triads if int(r) == req_rank}
         try:
@@ -86458,9 +86632,13 @@ def generate_flat(
             if not varying:
                 continue
             iv = varying[0]
+            # A local function called from the int and real versions of a
+            # specialized caller (h(a) -> inner(a)) needs both kinds too;
+            # one real version silently converted the int calls.
+            _kinds_ok = kinds_vary or fn.name in joint_rank_targets
             if (any(not pairs for pairs in observed)
                     or any((len({k for k, _ in pairs}) != 1
-                            and not (kinds_vary and {k for k, _ in pairs} <= _num_kinds))
+                            and not (_kinds_ok and {k for k, _ in pairs} <= _num_kinds))
                            or not {r for _, r in pairs} <= {0, 1, 2}
                            for pairs in observed)):
                 continue
