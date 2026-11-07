@@ -230,6 +230,20 @@ class _Scope:
             f.value = self.rw(f.value)[0]
             e.args = [ast.Name(id="int", ctx=ast.Load())]
             return wrap(e, dt), dt
+        # np.sum(a, dtype=np.int8) (prod, cumsum, cumprod; or the a.sum()
+        # method): numpy accumulates in int8, and wrapping the
+        # default-integer result once gives the same value (the dtype= was
+        # ignored, so the sum was 300 for 44).
+        _red = {"sum", "prod", "cumsum", "cumprod"}
+        _red_dt = next((dtype_name(kw.value) for kw in e.keywords if kw.arg == "dtype"), None)
+        if _red_dt and isinstance(f, ast.Attribute) and (
+                _is_np(f, _red | {"mean", "std", "var"})
+                or (f.attr in _red | {"mean", "std", "var"} and not _is_np(f, {f.attr}))):
+            if f.attr in {"mean", "std", "var"}:
+                raise NotImplementedError(f"{f.attr} with a small-integer dtype= is not supported")
+            e.keywords = [kw for kw in e.keywords if kw.arg != "dtype"]
+            self._generic(e)
+            return wrap(e, _red_dt), _red_dt
         # Creation with a small-integer dtype: a default-integer array.
         if _is_np(f, _CREATORS):
             for kw in e.keywords:

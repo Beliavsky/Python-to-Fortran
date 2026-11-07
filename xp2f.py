@@ -4731,8 +4731,49 @@ def rewrite_short_circuit_boolops(tree):
         return (isinstance(node, ast.BoolOp) and any(unsafe(v) for v in node.values[1:])
                 and (truth or is_bool(node)))
 
+    def comp_needs(node):
+        # A list comprehension / generator whose filter or element has an
+        # and/or to short-circuit.
+        if not (isinstance(node, (ast.ListComp, ast.GeneratorExp))
+                and not any(g.is_async for g in node.generators)):
+            return False
+        parts = [node.elt] + [c for g in node.generators for c in g.ifs] + [g.iter for g in node.generators[1:]]
+        return any(isinstance(n, ast.BoolOp) and any(unsafe(v) for v in n.values[1:])
+                   for p in parts for n in ast.walk(p))
+
+    def lower_comp(node, out):
+        # [elt for v in xs if c] -> sc_list = []; for v in xs: if c:
+        # sc_list.append(elt), the loop names renamed so they stay local.
+        lst = fresh()
+        ren = {}
+        for g in node.generators:
+            for t in ast.walk(g.target):
+                if isinstance(t, ast.Name) and t.id not in ren:
+                    ren[t.id] = fresh()
+
+        class Ren(ast.NodeTransformer):
+            def visit_Name(self, n):
+                if n.id in ren:
+                    return ast.copy_location(ast.Name(id=ren[n.id], ctx=n.ctx), n)
+                return n
+
+        def r(n, first_iter=False):
+            return n if first_iter else Ren().visit(n)
+
+        body = [ast.copy_location(ast.Expr(value=ast.Call(
+            func=ast.Attribute(value=name(lst, ast.Load(), node), attr="append", ctx=ast.Load()),
+            args=[r(node.elt)], keywords=[])), node)]
+        for k, g in reversed(list(enumerate(node.generators))):
+            for c in reversed(g.ifs):
+                body = [ast.copy_location(ast.If(test=r(c), body=body, orelse=[]), c)]
+            body = [ast.copy_location(ast.For(target=r(g.target), iter=r(g.iter, first_iter=(k == 0)),
+                                              body=body, orelse=[]), node)]
+        out.append(assign(lst, ast.copy_location(ast.List(elts=[], ctx=ast.Load()), node), node))
+        out.extend(block(body))
+        return name(lst, ast.Load(), node)
+
     def has_eager_need(node, truth):
-        if needs(node, truth):
+        if needs(node, truth) or comp_needs(node):
             return True
         if isinstance(node, _lazy):
             return False
@@ -4780,6 +4821,8 @@ def rewrite_short_circuit_boolops(tree):
             tmp = fresh()
             lower(isinstance(node.op, ast.And), list(node.values), tmp, out, truth)
             return name(tmp, ast.Load(), node)
+        if comp_needs(node):
+            return lower_comp(node, out)
         if isinstance(node, _lazy):
             return node
         if isinstance(node, ast.IfExp):
@@ -4842,8 +4885,33 @@ def rewrite_short_circuit_boolops(tree):
                 st.value = hoist(st.value, out)
         return block(out) + [st] if out else [st]
 
-    tree.body = block(tree.body)
+    def lambda_to_def(st):
+        # Module-level f = lambda v: v != 0 and 10 / v > 1: as a def, so its
+        # return value is lowered like any other.
+        if not (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                and isinstance(st.value, ast.Lambda) and has_eager_need(st.value.body, False)):
+            return st
+        lam = st.value
+        fn = ast.FunctionDef(name=st.targets[0].id, args=lam.args,
+                             body=[ast.copy_location(ast.Return(value=lam.body), lam.body)],
+                             decorator_list=[], returns=None, type_comment=None, type_params=[])
+        return ast.copy_location(fn, st)
+
+    tree.body = block([lambda_to_def(st) for st in tree.body])
     return ast.fix_missing_locations(tree)
+
+
+def _broadcast_static_shapes(a, b):
+    """numpy's broadcast of two shapes (tuples of ints), else None."""
+    n = max(len(a), len(b))
+    a = (1,) * (n - len(a)) + tuple(a)
+    b = (1,) * (n - len(b)) + tuple(b)
+    out = []
+    for x, y in zip(a, b):
+        if x != y and x != 1 and y != 1:
+            return None
+        out.append(y if x == 1 else x)
+    return tuple(out)
 
 
 _FSTRING_FLAGGED_SPEC_RE = re.compile(r"([+\- ])?(#)?(0)?(\d+)?(?:\.(\d+))?([deEfFgGx])?")
@@ -33881,6 +33949,22 @@ class translator(ast.NodeVisitor):
         _ini = self._reduction_initial_canonical(node)
         if _ini is not None:
             return _ini
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "dtype"
+                and is_numpy_name_node(node.func.value) and len(node.args) == 1 and not node.keywords):
+            # np.dtype('int64') (np.dtype(np.int64)) is compared like the
+            # string 'int64' (it was an unsupported call).
+            _dts = self._dtype_of_spelling(node)
+            if _dts is not None:
+                return ast.copy_location(ast.Constant({"bool_": "bool"}.get(_dts.attr, _dts.attr)), node)
+            _sp = node.args[0]
+            _sp = (_sp.attr if isinstance(_sp, ast.Attribute) and is_numpy_name_node(_sp.value)
+                   else _sp.value if isinstance(_sp, ast.Constant) and isinstance(_sp.value, str) else None)
+            if _sp is not None:
+                try:
+                    import numpy as _np
+                    return ast.copy_location(ast.Constant(_np.dtype(_sp).name), node)
+                except Exception:
+                    pass
         if (isinstance(node, ast.BinOp)
                 and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow))
                 and not SOURCE_USES_PANDAS):
@@ -35174,6 +35258,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Attribute) and not is_numpy_name_node(node.value) and not SOURCE_USES_PANDAS:
             if node.attr in {"ndim", "size", "itemsize", "nbytes"} and int(self._rank_expr(node.value) or 0) >= 1:
                 return "int"
+            if node.attr == "itemsize" and isinstance(node.value, ast.Attribute) and node.value.attr == "dtype":
+                return "int"
             if node.attr in {"real", "imag"} and int(self._rank_expr(node.value) or 0) >= 1:
                 k = self._expr_kind(node.value)
                 if k in num:
@@ -35319,6 +35405,90 @@ class translator(ast.NodeVisitor):
             return None
         return ast.copy_location(ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name, ctx=ast.Load()), v)
 
+    _INT32_SPELLINGS = {"int32", "i4", "intc"}
+    _INT32_SAME_FUNCS = {"abs", "absolute", "negative", "square", "max", "min", "amax", "amin", "sort", "unique",
+                         "flip", "copy", "ravel", "reshape", "transpose", "squeeze", "roll", "clip", "repeat",
+                         "tile", "diff", "cumsum", "maximum", "minimum"}
+    _INT32_SAME_METHODS = {"copy", "ravel", "flatten", "reshape", "transpose", "squeeze", "clip", "max", "min",
+                           "repeat", "sort"}
+
+    def _is_int32_spelling(self, d):
+        if isinstance(d, ast.Attribute) and is_numpy_name_node(d.value):
+            return d.attr in self._INT32_SPELLINGS
+        if isinstance(d, ast.Constant) and isinstance(d.value, str):
+            return d.value in self._INT32_SPELLINGS
+        if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "dtype"
+                and is_numpy_name_node(d.func.value) and len(d.args) == 1):
+            return self._is_int32_spelling(d.args[0])
+        return False
+
+    def _is_int32_expr(self, node, depth=0):
+        """True for an expression of numpy dtype int32 (dtype=np.int32,
+        astype(np.int32), np.int32(x), and numpy 2's promotion from those:
+        int32 with int32 or a Python int stays int32). xp2f has one
+        integer kind, so a.dtype said int64 for every int array."""
+        if depth > 20:
+            return False
+        if isinstance(node, ast.Name):
+            vals = (getattr(self, "real_assignment_exprs", None) or {}).get(node.id)
+            return bool(vals and len(vals) == 1
+                        and (getattr(self, "_name_store_counts", None) or {}).get(node.id) == 1
+                        and self._is_int32_expr(vals[0], depth + 1))
+        if isinstance(node, ast.Subscript):
+            return self._is_int32_expr(node.value, depth + 1)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+            return self._is_int32_expr(node.operand, depth + 1)
+        if isinstance(node, ast.Attribute) and node.attr == "T":
+            return self._is_int32_expr(node.value, depth + 1)
+        if isinstance(node, ast.BinOp) and not isinstance(node.op, (ast.Div, ast.MatMult)):
+            def weak(n):
+                if isinstance(n, ast.Constant):
+                    return type(n.value) is int
+                if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+                    return weak(n.operand)
+                return isinstance(n, ast.Name) and self._int_param_value(n) is not None
+            l32, r32 = self._is_int32_expr(node.left, depth + 1), self._is_int32_expr(node.right, depth + 1)
+            return (l32 and (r32 or weak(node.right))) or (r32 and weak(node.left))
+        if not isinstance(node, ast.Call):
+            return False
+        dt = next((kw.value for kw in node.keywords if kw.arg == "dtype"), None)
+        f = node.func
+        if isinstance(f, ast.Attribute) and is_numpy_name_node(f.value):
+            if f.attr in self._INT32_SPELLINGS:
+                return True
+            if dt is not None:
+                return self._is_int32_spelling(dt)
+            if f.attr in {"zeros_like", "ones_like", "full_like", "empty_like", "array", "asarray"} and node.args:
+                return self._is_int32_expr(node.args[0], depth + 1)
+            if f.attr in self._INT32_SAME_FUNCS and node.args:
+                if f.attr in {"maximum", "minimum"} and len(node.args) == 2:
+                    return self._is_int32_expr(node.args[0], depth + 1) and self._is_int32_expr(node.args[1], depth + 1)
+                return f.attr != "cumsum" and self._is_int32_expr(node.args[0], depth + 1)
+            return False
+        if isinstance(f, ast.Attribute):
+            if f.attr == "astype" and node.args:
+                return self._is_int32_spelling(node.args[0])
+            if f.attr in self._INT32_SAME_METHODS:
+                return self._is_int32_expr(f.value, depth + 1)
+        return False
+
+    def _numpy_dtype_name(self, node):
+        """numpy's dtype name of an array or scalar expression (int32,
+        int64, float32, float64, complex128, bool), else None."""
+        try:
+            k = self._expr_kind(node)
+        except Exception:
+            return None
+        if k == "int":
+            return "int32" if self._is_int32_expr(node) else "int64"
+        if k == "real":
+            return "float32" if self._expr_real_kind_tag(node) == "real32" else "float64"
+        return {"complex": "complex128", "logical": "bool"}.get(k)
+
+    _DTYPE_ITEMSIZES = {"int8": 1, "int16": 2, "int32": 4, "int64": 8, "uint8": 1, "uint16": 2, "uint32": 4,
+                        "uint64": 8, "float32": 4, "float64": 8, "complex64": 8, "complex128": 16, "bool": 1,
+                        "bool_": 1}
+
     def _dtype_of_array_attr(self, v):
         if not (isinstance(v, ast.Attribute) and v.attr == "dtype"):
             return None
@@ -35326,15 +35496,10 @@ class translator(ast.NodeVisitor):
             return None
         if isinstance(v.value, ast.Name) and is_numpy_name_node(v.value):
             return None
-        try:
-            k = self._expr_kind(v.value)
-        except Exception:
-            return None
-        name = {"int": "int64", "complex": "complex128", "logical": "bool_"}.get(k)
-        if k == "real":
-            name = "float32" if self._expr_real_kind_tag(v.value) == "real32" else "float64"
+        name = self._numpy_dtype_name(v.value)
         if name is None:
             return None
+        name = {"bool": "bool_"}.get(name, name)
         return ast.copy_location(ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name, ctx=ast.Load()), v)
 
     def _expr_kind(self, node):
@@ -42687,6 +42852,20 @@ class translator(ast.NodeVisitor):
             return None
         return axv % 2
 
+    def _literal_2d_vector_dims(self, node):
+        """(n, 1) or (1, m) of a literal column/row array, np.array([[1],
+        [2]]) / np.array([[10, 20, 30]]) (np.asarray, or the bare nested
+        list), so that it broadcasts like v.reshape(-1, 1); else None."""
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"array", "asarray"} and len(node.args) == 1):
+            node = node.args[0]
+        if not isinstance(node, ast.List):
+            return None
+        shape = self._literal_nested_shape(node)
+        if not shape or len(shape) != 2 or (shape[0] == 1) == (shape[1] == 1):
+            return None
+        return tuple(shape)
+
     def _reshape_2d_dims(self, node):
         """(d0, d1) of v.reshape(d0, d1) / v.reshape((d0, d1)) /
         np.reshape(v, (d0, d1)) of a vector v (literal ints, or None), else
@@ -42708,6 +42887,9 @@ class translator(ast.NodeVisitor):
     def _is_row2_expr(self, node):
         if isinstance(node, ast.Name) and node.id in self.broadcast_row2:
             return True
+        _ld = self._literal_2d_vector_dims(node)
+        if _ld is not None:
+            return _ld[0] == 1
         _rd = self._reshape_2d_dims(node)
         if _rd is not None and _rd[0] == 1 and _rd[1] != 1:
             # v.reshape(1, -1): a row vector (1, n).
@@ -42776,6 +42958,9 @@ class translator(ast.NodeVisitor):
     def _is_col2_expr(self, node):
         if isinstance(node, ast.Name) and node.id in self.broadcast_col2:
             return True
+        _ld = self._literal_2d_vector_dims(node)
+        if _ld is not None:
+            return _ld[1] == 1
         _rd = self._reshape_2d_dims(node)
         if _rd is not None and _rd[1] == 1 and _rd[0] != 1:
             # v.reshape(-1, 1): a column vector (n, 1).
@@ -42987,6 +43172,178 @@ class translator(ast.NodeVisitor):
                 return [f"size({base})"]
             return [f"size({base},{i})" for i in range(1, rr + 1)]
         return [self.expr(node)]
+
+    def _shape_tuple_compare(self, node):
+        """a.shape == b.shape (or == a tuple): one LOGICAL, as Python
+        compares the tuples. shape(a) == shape(b) compared elementwise --
+        two values printed for one -- and did not compile for arrays of
+        different rank (False in Python)."""
+        if not (len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq))):
+            return None
+
+        def dims(n):
+            if isinstance(n, ast.Attribute) and n.attr == "shape":
+                base = n.value
+            elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "shape"
+                  and is_numpy_name_node(n.func.value) and len(n.args) == 1):
+                base = n.args[0]
+            elif isinstance(n, ast.Tuple):
+                return [self.expr(e) for e in n.elts] if all(self._rank_expr(e) == 0 for e in n.elts) else None
+            else:
+                return None
+            r = int(self._rank_expr(base) or 0)
+            if r == 0 or self._expr_kind(base) is None:
+                return None if r != 0 else []
+            t = self.expr(base)
+            return [f"size({t})"] if r == 1 else [f"size({t},{i})" for i in range(1, r + 1)]
+
+        if not any(isinstance(n, (ast.Attribute, ast.Call)) for n in (node.left, node.comparators[0])):
+            return None
+        ld, rd = dims(node.left), dims(node.comparators[0])
+        if ld is None or rd is None:
+            return None
+        if len(ld) != len(rd):
+            eq = ".false."
+        elif not ld:
+            eq = ".true."
+        else:
+            eq = " .and. ".join(f"({x} == {y})" for x, y in zip(ld, rd))
+        return f"({eq})" if isinstance(node.ops[0], ast.Eq) else f"(.not. ({eq}))"
+
+    def _static_shape(self, node, depth=0):
+        """The shape of an array known at translation time, as a tuple of
+        ints, else None: literals (np.array of nested lists), reshape /
+        zeros / ones / empty / full / arange with constant arguments, a name
+        bound once to such a value, and elementwise arithmetic of those."""
+        if depth > 20:
+            return None
+        if isinstance(node, ast.Name):
+            vals = (getattr(self, "real_assignment_exprs", None) or {}).get(node.id)
+            if (vals and len(vals) == 1
+                    and (getattr(self, "_name_store_counts", None) or {}).get(node.id) == 1):
+                return self._static_shape(vals[0], depth + 1)
+            return None
+        if isinstance(node, ast.List):
+            shape = self._literal_nested_shape(node)
+            return tuple(shape) if shape and all(isinstance(d, int) for d in shape) else None
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            return self._static_shape(node.operand, depth + 1)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
+                                                                ast.FloorDiv, ast.Mod)):
+            ls = () if int(self._rank_expr(node.left) or 0) == 0 else self._static_shape(node.left, depth + 1)
+            rs = () if int(self._rank_expr(node.right) or 0) == 0 else self._static_shape(node.right, depth + 1)
+            if ls is None or rs is None:
+                return None
+            return _broadcast_static_shapes(ls, rs)
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            return None
+        attr = node.func.attr
+
+        def ints(nodes):
+            out = []
+            for n in nodes:
+                v = _signed_int_constant(n)
+                if v is None:
+                    v = self._int_param_value(n)
+                if v is None:
+                    return None
+                out.append(int(v))
+            return out
+
+        def dims_of(args):
+            if len(args) == 1 and isinstance(args[0], (ast.Tuple, ast.List)):
+                return ints(args[0].elts)
+            return ints(args)
+
+        if is_numpy_name_node(node.func.value):
+            if attr in {"array", "asarray"} and len(node.args) == 1:
+                return self._static_shape(node.args[0], depth + 1)
+            if attr in {"zeros", "ones", "empty", "full"} and node.args:
+                d = dims_of([node.args[0]])
+                return tuple(d) if d is not None else None
+            if attr == "arange" and node.args and not node.keywords:
+                v = ints(node.args)
+                if v is None or len(v) > 3:
+                    return None
+                start, stop, step = (0, v[0], 1) if len(v) == 1 else (v[0], v[1], v[2] if len(v) == 3 else 1)
+                if step == 0:
+                    return None
+                return (max(0, -(-(stop - start) // step)),)
+            if attr == "reshape" and len(node.args) == 2:
+                src, d = node.args[0], dims_of([node.args[1]])
+            else:
+                return None
+        elif attr == "reshape" and node.args:
+            src, d = node.func.value, dims_of(node.args)
+        else:
+            return None
+        if d is None:
+            return None
+        if -1 in d:
+            ss = self._static_shape(src, depth + 1)
+            known = 1
+            for x in d:
+                if x != -1:
+                    known *= x
+            if ss is None or d.count(-1) != 1 or known == 0:
+                return None
+            total = 1
+            for x in ss:
+                total *= x
+            d = [total // known if x == -1 else x for x in d]
+        return tuple(d)
+
+    def _static_broadcast_operands(self, left, right, a, b, pad=False):
+        """(a, b) texts broadcast to a common shape, when left and right are
+        arrays of one rank >= 2 whose shapes, known here, differ only in
+        extent-1 axes: (2, 1) + (1, 3), (2, 1, 3) + (1, 4, 1). Fortran does
+        not broadcast; each such axis is reshaped away and spread back. None
+        when nothing is known to need it. With pad, arrays of different
+        ranks too, the lower one first reshaped with leading 1s as numpy
+        does ((2, 1) with (2,))."""
+        r0, r1 = int(self._rank_expr(left) or 0), int(self._rank_expr(right) or 0)
+        r = max(r0, r1)
+        if pad:
+            if min(r0, r1) < 1:
+                return None
+        else:
+            if r < 2 or r0 != r1:
+                return None
+            if r == 2 and any(f(x) for f in (self._is_col2_expr, self._is_row2_expr) for x in (left, right)):
+                return None  # already spread by the row/column vector lowering
+        ls, rs = self._static_shape(left), self._static_shape(right)
+        if ls is None or rs is None or len(ls) != r0 or len(rs) != r1 or ls == rs:
+            return None
+        if len(ls) < r:
+            ls = (1,) * (r - len(ls)) + ls
+            a = f"reshape({a}, [{', '.join(str(d) for d in ls)}])"
+        if len(rs) < r:
+            rs = (1,) * (r - len(rs)) + rs
+            b = f"reshape({b}, [{', '.join(str(d) for d in rs)}])"
+        if ls == rs:
+            return a, b
+        target = _broadcast_static_shapes(ls, rs)
+        if target is None:
+            raise NotImplementedError(f"operands could not be broadcast together with shapes {ls} {rs}")
+
+        def bc(txt, shape, node):
+            axes = [d for d in range(r) if shape[d] == 1 and target[d] != 1]
+            if not axes:
+                return txt
+            keep = [shape[d] for d in range(r) if d not in axes]
+            if not keep:
+                # One element: as a scalar, which broadcasts itself in an
+                # operation (spread out to an array for pad's callers).
+                y = f"any({txt})" if self._expr_kind(node) == "logical" else f"sum({txt})"
+                if not pad:
+                    return y
+            else:
+                y = f"reshape({txt}, [{', '.join(str(k) for k in keep)}])"
+            for d in axes:
+                y = f"spread({y}, dim={d + 1}, ncopies={target[d]})"
+            return y
+
+        return bc(a, ls, left), bc(b, rs, right)
 
     def _broadcast_shape_dim_exprs(self, left_node, right_node):
         def _dims(n):
@@ -44558,6 +44915,10 @@ class translator(ast.NodeVisitor):
                     # An exponent of unknown sign: Python's result is a float
                     # for a negative one, Fortran's 0; py_ipow stops instead.
                     return f"py_ipow({a}, {b})"
+            if op in (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow):
+                _sb = self._static_broadcast_operands(node.left, node.right, a, b)
+                if _sb is not None:
+                    a, b = _sb
             if (op in (ast.Add, ast.Sub, ast.Mult) and lk0 == "int" and rk0 == "int"
                     and "kind=8" not in a and "kind=8" not in b):
                 # a * a with a = 50000, b + 1 with b = 2147483647: a value
@@ -44745,6 +45106,9 @@ class translator(ast.NodeVisitor):
             return f"merge({self.expr(node.body)}, {self.expr(node.orelse)}, {_test_expr()})"
 
         if isinstance(node, ast.Compare):
+            _shape_cmp = self._shape_tuple_compare(node)
+            if _shape_cmp is not None:
+                return _shape_cmp
             operands = [node.left] + list(node.comparators)
             set_comparison = (any(self._is_python_set_expr(n) for n in operands)
                               and all(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq))
@@ -45017,8 +45381,12 @@ class translator(ast.NodeVisitor):
                 _r_guard = _r_real and not _is_never_nan_literal(node.comparators[0])
                 if _l_guard or _r_guard:
                     _nan_result = ".true." if op is ast.NotEq else ".false."
-                    _a_safe = f"merge(0.0_dp, {a}, ieee_is_nan({a}))" if _l_guard else a
-                    _b_safe = f"merge(0.0_dp, {b}, ieee_is_nan({b}))" if _r_guard else b
+                    # A float32 operand needs a zero of its own kind in MERGE.
+                    def _zero(anode, txt):
+                        return f"real(0, kind({txt}))" if self._expr_real_kind_tag(anode) == "real32" else "0.0_dp"
+                    _a_safe = f"merge({_zero(node.left, a)}, {a}, ieee_is_nan({a}))" if _l_guard else a
+                    _b_safe = (f"merge({_zero(node.comparators[0], b)}, {b}, ieee_is_nan({b}))"
+                               if _r_guard else b)
                     _nan_mask_parts = [p for p, r in ((f"ieee_is_nan({a})", _l_guard), (f"ieee_is_nan({b})", _r_guard)) if r]
                     _nan_mask = " .or. ".join(_nan_mask_parts)
                     return f"merge({_nan_result}, ({_a_safe} {opmap[op]} {_b_safe}), {_nan_mask})"
@@ -49799,6 +50167,16 @@ class translator(ast.NodeVisitor):
                                 equal_nan = f"({ev} /= 0)"
                 r0 = self._rank_expr(node.args[0])
                 r1 = self._rank_expr(node.args[1])
+                # Arrays of different shapes are compared broadcast, not
+                # flattened: allclose(a (2, 1), b (2,)) compares 2 x 2 pairs.
+                _sb = self._static_broadcast_operands(node.args[0], node.args[1], f"real({a0}, kind=dp)",
+                                                      f"real({a1}, kind=dp)", pad=True)
+                if _sb is not None:
+                    _rb = max(int(r0), int(r1))
+                    return (f"allclose({self._flat_1d(_sb[0], _rb)}, {self._flat_1d(_sb[1], _rb)}, "
+                            f"real({rtol}, kind=dp), real({atol}, kind=dp), {equal_nan})")
+                if min(int(r0), int(r1)) >= 1 and int(r0) != int(r1):
+                    raise NotImplementedError("np.allclose of arrays of different ranks needs shapes known at translation time")
                 if r0 == 0:
                     aa = f"[real({a0}, kind=dp)]"
                 else:
@@ -53494,8 +53872,20 @@ class translator(ast.NodeVisitor):
                 if self._rank_expr(node.value) > 0:
                     return f"all({test})"
                 return test
+            if node.attr == "itemsize":
+                # a.itemsize / a.dtype.itemsize: bytes per element of a's dtype.
+                _arr = node.value.value if (isinstance(node.value, ast.Attribute)
+                                            and node.value.attr == "dtype") else node.value
+                _dn = self._numpy_dtype_name(_arr)
+                if _dn in self._DTYPE_ITEMSIZES:
+                    return str(self._DTYPE_ITEMSIZES[_dn])
             if node.attr == "dtype":
                 # Approximate NumPy dtype text from inferred symbol kind.
+                # From the kind first: b = a.astype(np.int64) of a real a
+                # kept a's real64 tag and said float64.
+                _dn = self._numpy_dtype_name(node.value)
+                if _dn is not None:
+                    return fstr(_dn)
                 if isinstance(node.value, ast.Name):
                     nm = self._aliased_name(node.value.id)
                     rtag = self._expr_real_kind_tag(node.value)
@@ -53708,6 +54098,14 @@ class translator(ast.NodeVisitor):
                         _record_real_assignment_exprs_in_order(getattr(_handler, "body", []) or [])
 
         _record_real_assignment_exprs_in_order(nodes)
+        # Bindings per name other than x op= ... (which keeps x's shape),
+        # for _static_shape: a name bound once has its value's shape.
+        _aug_targets = {id(n.target) for nd in nodes for n in ast.walk(nd) if isinstance(n, ast.AugAssign)}
+        self._name_store_counts = {}
+        for nd in nodes:
+            for n in ast.walk(nd):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and id(n) not in _aug_targets:
+                    self._name_store_counts[n.id] = self._name_store_counts.get(n.id, 0) + 1
 
         def _resolve_str_literal(enode):
             if isinstance(enode, ast.Constant) and isinstance(enode.value, str):
@@ -55053,9 +55451,13 @@ class translator(ast.NodeVisitor):
                     and node.value.func.value.id == "np"
                     and node.value.func.attr == "meshgrid"
                 ):
-                    for e in node.targets[0].elts:
+                    # Each output has the kind of its own input (int x
+                    # gave a real X).
+                    for e, src in zip(node.targets[0].elts, node.value.args):
                         if isinstance(e, ast.Name):
-                            self._mark_alloc_real(e.id, rank=2)
+                            _mk = self._expr_kind(src)
+                            {"int": self._mark_alloc_int, "logical": self._mark_alloc_log,
+                             "complex": self._mark_alloc_complex}.get(_mk, self._mark_alloc_real)(e.id, rank=2)
                     continue
                 if (
                     len(node.targets) == 1
@@ -56797,9 +57199,10 @@ class translator(ast.NodeVisitor):
                         self.broadcast_row2.add(t.id)
                     if isinstance(a1, ast.Constant) and a1.value == 1:
                         self.broadcast_col2.add(t.id)
-                if isinstance(t, ast.Name) and self._reshape_2d_dims(v) is not None:
-                    # c = v.reshape(-1, 1) / v.reshape(1, -1).
-                    _rd = self._reshape_2d_dims(v)
+                if isinstance(t, ast.Name) and (self._reshape_2d_dims(v) or self._literal_2d_vector_dims(v)):
+                    # c = v.reshape(-1, 1) / v.reshape(1, -1), or a literal
+                    # np.array([[1], [2]]) / np.array([[10, 20, 30]]).
+                    _rd = self._reshape_2d_dims(v) or self._literal_2d_vector_dims(v)
                     if _rd[1] == 1 and _rd[0] != 1:
                         self.broadcast_col2.add(t.id)
                     elif _rd[0] == 1 and _rd[1] != 1:
@@ -58785,7 +59188,7 @@ class translator(ast.NodeVisitor):
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             # c = v.reshape(-1, 1) / v.reshape(1, -1): c broadcasts as a
             # column / row vector in later statements.
-            _rd = self._reshape_2d_dims(node.value)
+            _rd = self._reshape_2d_dims(node.value) or self._literal_2d_vector_dims(node.value)
             if _rd is not None and _rd[1] == 1 and _rd[0] != 1:
                 self.broadcast_col2.add(node.targets[0].id)
             elif _rd is not None and _rd[0] == 1 and _rd[1] != 1:
@@ -61172,8 +61575,9 @@ class translator(ast.NodeVisitor):
                 if not isinstance(e, ast.Name):
                     raise NotImplementedError("tuple assignment targets must be names")
                 outs.append(self._aliased_name(e.id))
-            if len(outs) < 2 or len(v.args) < 2:
-                raise NotImplementedError("np.meshgrid assignment expects at least two outputs and two inputs")
+            if len(outs) != 2 or len(v.args) != 2:
+                # Only the first two outputs were assigned.
+                raise NotImplementedError("np.meshgrid assignment supports exactly two inputs and two outputs")
             xname = self.expr(v.args[0])
             yname = self.expr(v.args[1])
             indexing = "xy"
@@ -66284,6 +66688,15 @@ class translator(ast.NodeVisitor):
                     if _lhs_inner == _rhs_inner:
                         rhs_txt = f"reshape({ _lhs_inner }, [size({ _lhs_inner }), 1])"
             self.o.w(f"{lname} = {rhs_txt}")
+            if (tgt_rank == 1 and isinstance(v, ast.Subscript) and isinstance(v.slice, ast.Slice)
+                    and v.slice.lower is not None and _signed_int_constant(v.slice.lower) != 0
+                    and self._expr_kind(v) in {"int", "real", "logical", "complex"}
+                    and re.fullmatch(r"[A-Za-z_]\w*", lname)):
+                # gfortran leaves the target unallocated when the section's
+                # bounds, known only at run time, give a negative extent
+                # (a[100:200] of 8 elements, a[1:] of an empty a): numpy's
+                # result is empty.
+                self.o.w(f"if (.not. allocated({lname})) allocate({lname}(0))")
             return
 
         stmt_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
@@ -83094,6 +83507,41 @@ def generate_flat(
         user_class_types=user_class_types,
         structured_type_components=structured_type_components,
     )
+    _nested_call_kind_cache = {}
+
+    def _nested_local_call_kind(a, tr_ctx):
+        # combine(take(a), take(a)): the provisional return specs take
+        # untyped parameters as real, so take(a) of an int list looked
+        # real and combine got real dummies. Redo take's return spec
+        # with the kinds of this call's own actual arguments.
+        if not (isinstance(a, ast.Call) and isinstance(a.func, ast.Name) and a.func.id in local_fn_map
+                and not a.keywords and a.func.id not in _prov_tuple_out
+                and not any(isinstance(x, ast.Starred) for x in a.args)):
+            return None
+        try:
+            kinds = tuple(tr_ctx._expr_kind(x) for x in a.args)
+            ranks = tuple(int(tr_ctx._rank_expr(x) or 0) for x in a.args)
+        except Exception:
+            return None
+        if any(k not in {"int", "real", "logical", "complex", "char"} for k in kinds):
+            return None
+        key = (a.func.id, kinds, ranks)
+        if key not in _nested_call_kind_cache:
+            spec = None
+            try:
+                specs, _, _, _ = _local_return_maps(
+                    [local_fn_map[a.func.id]], params,
+                    arg_rank_hints={a.func.id: list(ranks)}, arg_kind_hints={a.func.id: list(kinds)},
+                    user_class_types=user_class_types, structured_type_components=structured_type_components,
+                    call_context={"specs": _prov_scalar_specs, "ranks": _prov_scalar_ranks})
+                spec = specs.get(a.func.id)
+            except Exception:
+                spec = None
+            if isinstance(spec, str):
+                spec = {"log": "logical"}.get(spec.replace("alloc_", ""), spec.replace("alloc_", ""))
+            _nested_call_kind_cache[key] = spec if spec in {"int", "real", "logical", "complex", "char"} else None
+        return _nested_call_kind_cache[key]
+
     if local_funcs:
         tr_seed = translator(
             emit(),
@@ -83502,6 +83950,9 @@ def generate_flat(
                     rr[i] = max(rr[i], ar)
                     rrs[i].add(ar)
                     ak = direct_actual[0] if direct_actual is not None else tr_ctx._expr_kind(a)
+                    _nested = _nested_local_call_kind(a, tr_ctx)
+                    if _nested is not None:
+                        ak = _nested
                     if ak is None and isinstance(a, ast.Subscript) and fn_node is not None:
                         # An element of the caller's own (not yet typed)
                         # array has that array's kind (Burkardt
@@ -86160,6 +86611,9 @@ def generate_flat(
                         _ar = int(tr_ctx._rank_expr(_a))
                     except Exception:
                         _ar = 0
+                    _nested = _nested_local_call_kind(_a, tr_ctx)
+                    if _nested is not None:
+                        _ak = _nested
                     if owner_fn is not None and isinstance(_a, ast.Name):
                         _dk, _dr = _name_direct_assign_spec(owner_fn, _a.id, tr_ctx)
                         if _a.id in {a.arg for a in owner_fn.args.args}:
@@ -87670,6 +88124,10 @@ def generate_flat(
         proc_tree = ast.Module(body=_proc_tree_top_level + list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
         proc_needed |= template_derived_needed_helpers(structured_type_components)
+        if build_list_count_map(proc_tree):
+            # As for the whole program (transpile_file): print(xs) of an
+            # appended list calls a print_*_list helper.
+            proc_needed |= {"print_int_list", "print_char_list", "print_real_list", "print_log_list"}
         for mod, syms in helper_uses.items():
             keep = sorted([s for s in syms if s in proc_needed])
             if keep:
@@ -88453,6 +88911,11 @@ def generate_flat(
         proc_main_syms = sorted([_s for _s in proc_public_syms if _s in proc_main_needed])
         main_needed = detect_needed_helpers(_main_tree)
         main_needed |= template_derived_needed_helpers(structured_type_components)
+        if list_counts:
+            # print(ys) of an appended list in the main program called
+            # print_int_list without importing it (a link error once the
+            # program also had a function).
+            main_needed |= {"print_int_list", "print_char_list", "print_real_list", "print_log_list"}
         if rng_replay_path:
             main_needed.update({"rng_replay_init", "rng_replay_close"})
         helper_uses_main = {}

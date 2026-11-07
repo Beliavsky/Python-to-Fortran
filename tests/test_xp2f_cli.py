@@ -28569,3 +28569,151 @@ def test_xp2f_shallow_copy_of_nested_list_with_row_writes_is_rejected(tmp_path: 
         "b[1] = [7, 8]",
         "print(a[1][0], b[1][0], b[0][1])",
     ])
+
+
+def test_xp2f_nested_local_call_argument_kinds(tmp_path: Path) -> None:
+    # combine(take(a), take(a)): take's provisional return (untyped
+    # parameters taken as real) gave combine real dummies, printing 12.0.
+    _xp2f_output_matches_numpy(tmp_path, "xnested_call_kind", (
+        "def take(a):\n"
+        "    x = a[0]\n"
+        "    a[0] += 1\n"
+        "    return x\n"
+        "def first(a):\n"
+        "    return a[0]\n"
+        "def combine(x, y):\n"
+        "    return 10 * x + y\n"
+        "a = [1]\n"
+        "print(combine(take(a), take(a)), a[0])\n"
+        "f = [1.5]\n"
+        "i = [2]\n"
+        "print(combine(first(f), first(f)), combine(first(i), 2.5), combine(first(i), first(i)))\n"
+    ), check_kinds=True)
+
+
+def test_xp2f_meshgrid_keeps_input_kinds(tmp_path: Path) -> None:
+    # Every meshgrid output was declared real (an int grid printed 2.0).
+    _xp2f_output_matches_numpy(tmp_path, "xmeshgrid_kind", (
+        "import numpy as np\n"
+        "x = np.array([1, 2])\n"
+        "y = np.array([10, 20, 30])\n"
+        "z = np.array([0.5, 1.5, 2.5])\n"
+        "a, b = np.meshgrid(x, y)\n"
+        "c, d = np.meshgrid(x, y, indexing='ij')\n"
+        "e, g = np.meshgrid(x, z)\n"
+        "print(a.shape[0], a.shape[1], a[2, 1], b[2, 1], c[1, 2], d[1, 2], e[1, 1], g[1, 1], a.sum())\n"
+    ), check_kinds=True)
+
+
+def test_xp2f_short_circuit_in_comprehensions_and_lambdas(tmp_path: Path) -> None:
+    # A comprehension filter or element and/or was evaluated whole:
+    # a[i] read past the end, 10 / v divided by zero.
+    _run_xp2f_compile_diff(tmp_path, "xsc_comp.py", [
+        "def picks(a, n):",
+        "    return [i for i in range(n) if i < len(a) and a[i] > 2]",
+        "xs = [0, 2, 5, 20]",
+        "a = [3, 1, 4]",
+        "v = 7",
+        "print([v for v in xs if v != 0 and 10 / v > 1])",
+        "print([v for v in xs if v == 0 or 10 // v > 1])",
+        "print(sum(1 for v in xs if v != 0 and 10 % v == 0))",
+        "print([i for i in range(5) if i < len(a) and a[i] > 2], picks(a, 5))",
+        "f = lambda w: w != 0 and 10 / w > 1",
+        "print(int(f(0)), int(f(4)), v)",
+        "print([1 if (v != 0 and 10 // v > 1) else 0 for v in xs])",
+        "print(int(any(v != 0 and 10 // v > 1 for v in xs)), int(all(v == 0 or 10 % v == 0 for v in xs)))",
+    ])
+
+
+def test_xp2f_appended_list_print_with_functions_links(tmp_path: Path) -> None:
+    # With a function (procedure module), the main program called
+    # print_int_list without importing it: a link error.
+    _run_xp2f_compile_diff(tmp_path, "xlist_print_mod.py", [
+        "def f(n):",
+        "    return n + 1",
+        "xs = [0, 2, 5]",
+        "ys = []",
+        "for v in xs:",
+        "    ys.append(v)",
+        "print(f(1))",
+        "print(ys)",
+    ])
+
+
+def test_xp2f_broadcast_of_known_extent_one_axes(tmp_path: Path) -> None:
+    # (2, 1) + (1, 3) literals did not compile; rank-3 extent-1 axes
+    # failed at run time (Fortran does not broadcast).
+    _xp2f_output_matches_numpy(tmp_path, "xbroadcast_static", (
+        "import numpy as np\n"
+        "a = np.array([[1], [2]])\n"
+        "b = np.array([[10, 20, 30]])\n"
+        "c = a + b\n"
+        "print(c.shape[0], c.shape[1], c[0, 0], c[0, 2], c[1, 0], c[1, 2])\n"
+        "p = np.arange(6).reshape(2, 1, 3)\n"
+        "q = np.array([10, 20, 30, 40]).reshape(1, 4, 1)\n"
+        "r = p + q\n"
+        "print(r.shape[0], r.shape[1], r.shape[2], r[0, 0, 0], r[0, 3, 2], r[1, 0, 0], r[1, 3, 2], r.sum())\n"
+        "e = np.arange(6).reshape(2, 3, 1) * np.arange(4).reshape(1, 1, 4)\n"
+        "print(e.sum(), e[1, 2, 3])\n"
+        "w = np.zeros((2, 1)) + 1.5\n"
+        "m = np.array([[1, 2, 3], [4, 5, 6]])\n"
+        "print((m * (np.ones((1, 3)) * 2) - w).sum())\n"
+    ), check_kinds=True)
+
+
+def test_xp2f_shape_tuple_compare_and_allclose_broadcast(tmp_path: Path) -> None:
+    # a.shape == b.shape compared elementwise (two values printed for
+    # one) and did not compile for different ranks; allclose flattened
+    # arrays of different shapes instead of broadcasting them.
+    _run_xp2f_compile_diff(tmp_path, "xshape_cmp.py", [
+        "import numpy as np",
+        "a = np.array([[1.0], [1.0]])",
+        "b = np.array([1.0, 1.0])",
+        "c = np.array([[1.0, 2.0]])",
+        "print(int(a.shape == b.shape), int(a.shape == a.shape), int(a.shape != c.shape))",
+        "print(int(a.shape == (2, 1)), int(np.shape(b) == (2,)), int(b.shape == (3,)))",
+        "print(int(np.allclose(a, b)), int(np.allclose(c, b)), int(np.allclose(a, c)))",
+        "print(int(np.allclose(np.ones((1, 1)), np.ones((2, 3)))))",
+    ])
+
+
+def test_xp2f_out_of_range_slice_assignment_is_empty(tmp_path: Path) -> None:
+    # gfortran left d unallocated for a[100:200] of 8 elements (and a[1:]
+    # of an empty a): the section's run-time extent is negative.
+    _xp2f_output_matches_numpy(tmp_path, "xempty_slice", (
+        "import numpy as np\n"
+        "a = np.arange(8)\n"
+        "d = a[100:200]\n"
+        "e = np.array([], dtype=float)\n"
+        "r = e[1:]\n"
+        "x = [1, 2, 3]\n"
+        "y = x[5:]\n"
+        "print(d.size, np.sum(a[-100:100]), r.size, len(y), np.sum(d))\n"
+    ), check_kinds=True)
+
+
+def test_xp2f_dtype_comparisons_itemsize_and_int32(tmp_path: Path) -> None:
+    # np.dtype('float64') was unsupported; every int array said int64
+    # (an int32 array compared False with np.int32); itemsize was
+    # unsupported; np.sum(a, dtype=np.int8) ignored the dtype (300 for 44).
+    _run_xp2f_compile_diff(tmp_path, "xdtypes.py", [
+        "import numpy as np",
+        "a = np.array([1, 2], dtype=np.int32)",
+        "b = np.array([0.5, 1.5])",
+        "c = a + b",
+        "f = np.array([1.0], dtype=np.float32)",
+        "g = np.arange(3)",
+        "h = a * 3 + a",
+        "k = b.astype(np.int64)",
+        "print(int(c.dtype == np.float64), int(a.dtype == np.int32), int(a.dtype == np.int64))",
+        "print(a.dtype, c.dtype, f.dtype, g.dtype, h.dtype, (a / 2).dtype, k.dtype)",
+        "print(a.dtype.itemsize, f.itemsize, g.itemsize, int(b.dtype == np.dtype('float64')))",
+        "print(int(a.dtype == np.dtype('int32')), int(g.dtype == np.dtype(np.int64)))",
+        "i8 = np.array([100, 100, 100], dtype=np.int8)",
+        "s = np.sum(i8)",
+        "t = np.sum(i8, dtype=np.int8)",
+        "print(s, t, int(s.dtype.itemsize >= 4), int(t.dtype == np.dtype('int8')))",
+        "x32 = np.array([16777216.0], dtype=np.float32)",
+        "y32 = x32 + np.float32(1.0)",
+        "print(int(y32[0] == x32[0]), int(y32.dtype == np.dtype('float32')))",
+    ])
