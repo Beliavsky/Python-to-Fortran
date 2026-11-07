@@ -5695,6 +5695,326 @@ def split_rebound_scalar_kinds(tree):
     return ast.fix_missing_locations(tree)
 
 
+_GENERATOR_DRAIN_FUNCS = {"sum", "min", "max", "any", "all", "list", "sorted", "set", "tuple"}
+
+
+def rewrite_generator_cursors(tree):
+    """g = (expr for v in it if cond) assigned to a name was unsupported.
+    The generator becomes a cursor: a position into it (it is evaluated
+    once, where g is created, as in Python), advanced past values that
+    fail the filter. The filter and expr are evaluated when a value is
+    taken, so they see the names' values then, as Python's lazy generator
+    does.
+
+    - next(g) takes the next value; past the end, StopIteration stops the
+      program. next(g, d) gives d instead, and v = next(g, None) with
+      tests v is None / v is not None uses a flag for None.
+    - for x in g: takes values until the end, continuing after any next().
+    - sum(g) (min, max, any, all, list, sorted, set, tuple) collects the
+      remaining values into a list first.
+
+    One for clause over range(...) or a sequence (indexed by position),
+    with any ifs. A generator used another way (passed to a function,
+    returned, used in a while test or a lazy branch) is an error."""
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    used |= {n.arg for n in ast.walk(tree) if isinstance(n, ast.arg)}
+    _lazy = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    _scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+    def fresh(base):
+        nm, k = base, 1
+        while nm in used:
+            k += 1
+            nm = f"{base}{k}"
+        used.add(nm)
+        return nm
+
+    def L(nm):
+        return ast.Name(id=nm, ctx=ast.Load())
+
+    def S(nm):
+        return ast.Name(id=nm, ctx=ast.Store())
+
+    def assign(nm, value):
+        return ast.Assign(targets=[S(nm)], value=value)
+
+    def is_gen_assign(st):
+        return (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                and isinstance(st.value, ast.GeneratorExp))
+
+    class Gen:
+        def __init__(self, name, ge, scope_body):
+            if len(ge.generators) != 1 or ge.generators[0].is_async:
+                raise NotImplementedError(f"generator {name} with more than one for clause is not supported")
+            comp = ge.generators[0]
+            if not isinstance(comp.target, ast.Name):
+                raise NotImplementedError(f"generator {name} with a target other than one name is not supported")
+            it = comp.iter
+            if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id in (
+                    "zip", "enumerate", "map", "filter", "reversed", "iter"):
+                raise NotImplementedError(f"generator {name} over {it.func.id}(...) is not supported")
+            self.name = name
+            self.pos = fresh(f"{name}_pos")
+            self.ok = fresh(f"{name}_ok")
+            self.val = fresh(f"{name}_val")
+            var = fresh(f"{name}_{comp.target.id}")
+
+            class Ren(ast.NodeTransformer):
+                def visit_Name(self, n):
+                    if n.id == comp.target.id:
+                        return ast.copy_location(ast.Name(id=var, ctx=n.ctx), n)
+                    return n
+            self.var = var
+            self.elt = Ren().visit(copy.deepcopy(ge.elt))
+            self.ifs = [Ren().visit(copy.deepcopy(c)) for c in comp.ifs]
+            self.init = []
+            if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" \
+                    and not it.keywords and 1 <= len(it.args) <= 3:
+                args = list(it.args)
+                start, stop, step = (ast.Constant(0), args[0], ast.Constant(1)) if len(args) == 1 else (
+                    args[0], args[1], args[2] if len(args) == 3 else ast.Constant(1))
+                self.kind = "range"
+                self.init.append(assign(self.pos, start))
+                self.stop = self._hold(stop, f"{name}_stop")
+                self.step = self._hold(step, f"{name}_step")
+            else:
+                self.kind = "seq"
+                self.init.append(assign(self.pos, ast.Constant(0)))
+                live = isinstance(it, ast.Name) and not any(
+                    isinstance(n, ast.Name) and n.id == it.id and isinstance(n.ctx, ast.Store)
+                    and getattr(n, "lineno", 0) > getattr(ge, "lineno", 0)
+                    for st in scope_body for n in ast.walk(st))
+                self.seq = it if live else self._hold(it, f"{name}_seq", force=True)
+            self.init.append(assign(self.ok, ast.Constant(False)))
+
+        def _hold(self, e, base, force=False):
+            # A value fixed where the generator is created.
+            if not force and isinstance(e, ast.Constant):
+                return e
+            nm = fresh(base)
+            self.init.append(assign(nm, e))
+            return L(nm)
+
+        def advance(self):
+            """Statements that set ok and, when true, val."""
+            if self.kind == "range":
+                step = self.step
+                if isinstance(step, ast.Constant) and isinstance(step.value, int):
+                    more = ast.Compare(left=L(self.pos), ops=[ast.Lt() if step.value > 0 else ast.Gt()],
+                                       comparators=[copy.deepcopy(self.stop)])
+                else:
+                    more = ast.BoolOp(op=ast.Or(), values=[
+                        ast.BoolOp(op=ast.And(), values=[
+                            ast.Compare(left=copy.deepcopy(step), ops=[ast.Gt()], comparators=[ast.Constant(0)]),
+                            ast.Compare(left=L(self.pos), ops=[ast.Lt()], comparators=[copy.deepcopy(self.stop)])]),
+                        ast.BoolOp(op=ast.And(), values=[
+                            ast.Compare(left=copy.deepcopy(step), ops=[ast.Lt()], comparators=[ast.Constant(0)]),
+                            ast.Compare(left=L(self.pos), ops=[ast.Gt()], comparators=[copy.deepcopy(self.stop)])])])
+                take = [assign(self.var, L(self.pos)),
+                        ast.AugAssign(target=S(self.pos), op=ast.Add(), value=copy.deepcopy(step))]
+            else:
+                more = ast.Compare(left=L(self.pos), ops=[ast.Lt()], comparators=[
+                    ast.Call(func=L("len"), args=[copy.deepcopy(self.seq)], keywords=[])])
+                take = [assign(self.var, ast.Subscript(value=copy.deepcopy(self.seq), slice=L(self.pos), ctx=ast.Load())),
+                        ast.AugAssign(target=S(self.pos), op=ast.Add(), value=ast.Constant(1))]
+            found = [assign(self.val, copy.deepcopy(self.elt)), assign(self.ok, ast.Constant(True)), ast.Break()]
+            for c in reversed(self.ifs):
+                found = [ast.If(test=copy.deepcopy(c), body=found, orelse=[])]
+            return [assign(self.ok, ast.Constant(False)), ast.While(test=more, body=take + found, orelse=[])]
+
+        def not_ok(self):
+            return ast.UnaryOp(op=ast.Not(), operand=L(self.ok))
+
+        def stop_iteration(self):
+            msg = ast.Constant(f"next() of the exhausted generator {self.name}")
+            return ast.If(test=self.not_ok(), body=[ast.Raise(exc=ast.Call(
+                func=L("StopIteration"), args=[msg], keywords=[]), cause=None)], orelse=[])
+
+    def is_gen_name(n, gens):
+        return isinstance(n, ast.Name) and n.id in gens and isinstance(n.ctx, ast.Load)
+
+    def mentions_gen(node, gens):
+        return any(is_gen_name(x, gens) for x in ast.walk(node))
+
+    def hoist(node, gens, pre):
+        """Replace next(g...) and sum(g) etc. in node by temporaries set by
+        statements appended to pre, in evaluation order."""
+        if isinstance(node, _lazy) or isinstance(node, ast.IfExp) and (
+                mentions_gen(node.body, gens) or mentions_gen(node.orelse, gens)):
+            if mentions_gen(node, gens):
+                raise NotImplementedError("a generator used inside a lambda, comprehension or conditional "
+                                          "branch is not supported")
+            return node
+        if isinstance(node, ast.BoolOp) and any(mentions_gen(v, gens) for v in node.values[1:]):
+            raise NotImplementedError("a generator used after and/or is not supported")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "next" \
+                and node.args and is_gen_name(node.args[0], gens) and len(node.args) <= 2 and not node.keywords:
+            g = gens[node.args[0].id]
+            default = hoist(node.args[1], gens, pre) if len(node.args) == 2 else None
+            tmp = fresh(f"{g.name}_next")
+            pre.extend(g.advance())
+            if default is None:
+                pre.append(g.stop_iteration())
+                pre.append(assign(tmp, L(g.val)))
+            else:
+                if isinstance(default, ast.Constant) and default.value is None:
+                    raise NotImplementedError(f"next({g.name}, None) is supported only as v = next({g.name}, "
+                                              "None) tested with v is None / v is not None")
+                pre.append(ast.If(test=L(g.ok), body=[assign(tmp, L(g.val))], orelse=[assign(tmp, default)]))
+            return L(tmp)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _GENERATOR_DRAIN_FUNCS \
+                and len(node.args) == 1 and is_gen_name(node.args[0], gens):
+            g = gens[node.args[0].id]
+            rest = fresh(f"{g.name}_rest")
+            pre.append(assign(rest, ast.List(elts=[], ctx=ast.Load())))
+            pre.append(ast.While(test=ast.Constant(True), body=g.advance() + [
+                ast.If(test=g.not_ok(), body=[ast.Break()], orelse=[]),
+                ast.Expr(value=ast.Call(func=ast.Attribute(value=L(rest), attr="append", ctx=ast.Load()),
+                                        args=[L(g.val)], keywords=[]))], orelse=[]))
+            for kw in node.keywords:
+                kw.value = hoist(kw.value, gens, pre)
+            node.args = [L(rest)]
+            return node
+        if is_gen_name(node, gens):
+            raise NotImplementedError(f"generator {node.id} is supported only with next(), a for loop, or "
+                                      f"one of {', '.join(sorted(_GENERATOR_DRAIN_FUNCS))}")
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST) and not isinstance(value, (ast.expr_context, ast.operator)):
+                if isinstance(value, ast.expr):
+                    setattr(node, field, hoist(value, gens, pre))
+                elif isinstance(value, ast.AST):
+                    hoist(value, gens, pre)
+            elif isinstance(value, list):
+                setattr(node, field, [hoist(v, gens, pre) if isinstance(v, ast.AST) else v for v in value])
+        return node
+
+    def none_flags(body, gens):
+        """v = next(g, None) where every binding of v in the scope is one,
+        and v is otherwise used only after an is None test: v_none flag."""
+        out = {}
+        nodes = [n for st in body for n in ast.walk(st)]
+        cands = {st.targets[0].id for st in nodes if isinstance(st, ast.Assign) and len(st.targets) == 1
+                 and isinstance(st.targets[0], ast.Name) and isinstance(st.value, ast.Call)
+                 and isinstance(st.value.func, ast.Name) and st.value.func.id == "next"
+                 and len(st.value.args) == 2 and is_gen_name(st.value.args[0], gens)
+                 and isinstance(st.value.args[1], ast.Constant) and st.value.args[1].value is None}
+        for v in cands:
+            stores = [n for n in nodes if isinstance(n, ast.Name) and n.id == v and isinstance(n.ctx, ast.Store)]
+            assigns = [st for st in nodes if isinstance(st, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == v for t in st.targets)]
+            if len(stores) == len(assigns) and all(
+                    len(st.targets) == 1 and isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Name)
+                    and st.value.func.id == "next" for st in assigns):
+                out[v] = fresh(f"{v}_none")
+        return out
+
+    def block(stmts, gens, flags):
+        out = []
+        for st in stmts:
+            if isinstance(st, _scopes):
+                out.append(st)
+                continue
+            if is_gen_assign(st):
+                g = Gen(st.targets[0].id, st.value, stmts)
+                gens[g.name] = g
+                out.extend(ast.copy_location(x, st) for x in g.init)
+                continue
+            if not gens:
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        setattr(st, field, block(sub, gens, flags))
+                for h in getattr(st, "handlers", None) or []:
+                    h.body = block(h.body, gens, flags)
+                out.append(st)
+                continue
+            pre = []
+            # v = next(g, None)
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                    and st.targets[0].id in flags and isinstance(st.value, ast.Call)
+                    and isinstance(st.value.func, ast.Name) and st.value.func.id == "next"
+                    and len(st.value.args) == 2 and is_gen_name(st.value.args[0], gens)):
+                g = gens[st.value.args[0].id]
+                v = st.targets[0].id
+                out.extend(ast.copy_location(x, st) for x in g.advance())
+                out.append(ast.copy_location(assign(flags[v], g.not_ok()), st))
+                out.append(ast.copy_location(ast.If(test=L(g.ok), body=[assign(v, L(g.val))], orelse=[]), st))
+                continue
+            # for x in g:
+            if isinstance(st, ast.For) and is_gen_name(st.iter, gens):
+                g = gens[st.iter.id]
+                if st.orelse:
+                    raise NotImplementedError(f"for ... else over generator {g.name} is not supported")
+                body = block(st.body, gens, flags)
+                loop = ast.While(test=ast.Constant(True), body=g.advance() + [
+                    ast.If(test=g.not_ok(), body=[ast.Break()], orelse=[]),
+                    ast.Assign(targets=[st.target], value=L(g.val))] + body, orelse=[])
+                out.append(ast.copy_location(loop, st))
+                continue
+            if isinstance(st, ast.While) and mentions_gen(st.test, gens):
+                raise NotImplementedError("a generator used in a while test is not supported")
+            if isinstance(st, (ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Return)) and st.value is not None:
+                st.value = hoist(st.value, gens, pre)
+                if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                    for t in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                        hoist(t, gens, pre)
+            elif isinstance(st, ast.If):
+                st.test = hoist(st.test, gens, pre)
+            elif isinstance(st, ast.For):
+                st.iter = hoist(st.iter, gens, pre)
+            elif isinstance(st, (ast.Assert, ast.Raise, ast.Delete)):
+                hoist(st, gens, pre)
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(st, field, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    setattr(st, field, block(sub, gens, flags))
+            for h in getattr(st, "handlers", None) or []:
+                h.body = block(h.body, gens, flags)
+            out.extend(ast.copy_location(x, st) for x in pre)
+            out.append(st)
+        return out
+
+    class Flags(ast.NodeTransformer):
+        def __init__(self, flags):
+            self.flags = flags
+
+        def visit_Compare(self, n):
+            self.generic_visit(n)
+            if len(n.ops) == 1 and isinstance(n.ops[0], (ast.Is, ast.IsNot)) and isinstance(n.left, ast.Name) \
+                    and n.left.id in self.flags and isinstance(n.comparators[0], ast.Constant) \
+                    and n.comparators[0].value is None:
+                flag = ast.copy_location(L(self.flags[n.left.id]), n)
+                return flag if isinstance(n.ops[0], ast.Is) else ast.copy_location(
+                    ast.UnaryOp(op=ast.Not(), operand=flag), n)
+            return n
+
+    def scope(body):
+        gen_names = {st.targets[0].id for st in (n for s in body for n in ast.walk(s)) if is_gen_assign(st)}
+        if not gen_names:
+            return body
+        for nm in gen_names:
+            binds = [n for s in body for n in ast.walk(s) if isinstance(n, ast.Name) and n.id == nm
+                     and not isinstance(n.ctx, ast.Load)]
+            if len(binds) != 1:
+                raise NotImplementedError(f"generator {nm} is assigned more than once")
+        probe = {nm: None for nm in gen_names}
+        flags = none_flags(body, probe)
+        new = block(body, {}, flags)
+        if flags:
+            new = [Flags(flags).visit(st) for st in new]
+        for st in new:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and n.id in gen_names:
+                    raise NotImplementedError(f"generator {n.id} is used before it is created, or in a way "
+                                              "that is not supported")
+        return new
+
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        fn.body = scope(fn.body)
+    tree.body = scope(tree.body)
+    return ast.fix_missing_locations(tree)
+
+
 def _broadcast_static_shapes(a, b):
     """numpy's broadcast of two shapes (tuples of ints), else None."""
     n = max(len(a), len(b))
@@ -19069,9 +19389,21 @@ _CANONICAL_BATCH2_TARGETS = {
 }
 
 
+def _is_str_list_syntax(node, str_list_names):
+    """A list of strings by its syntax: a literal of string constants, a
+    .split() result, or a name assigned one."""
+    if isinstance(node, ast.Name):
+        return node.id in str_list_names
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return bool(node.elts) and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in node.elts)
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "split"
+
+
 def detect_needed_helpers(tree):
     needed = set()
     extra = []
+    _str_list_names = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                       and _is_str_list_syntax(n.value, set()) for t in n.targets if isinstance(t, ast.Name)}
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in translator._METHODS_AS_NUMPY_FUNCTIONS | {"sort"}
@@ -19165,6 +19497,16 @@ def detect_needed_helpers(tree):
         ):
             # print(x, end="") of a numeric scalar writes py_str(x) without
             # advancing (see _emit_print_call_impl's fallback).
+            needed.add("py_str")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+            and len(node.args) >= 2
+            and any(_is_str_list_syntax(a, _str_list_names) for a in node.args)
+        ):
+            # print(n, ["a", "b"]) writes each item without advancing, a
+            # number as py_str(n).
             needed.add("py_str")
         if (
             isinstance(node, (ast.ListComp, ast.GeneratorExp))
@@ -68642,7 +68984,8 @@ class translator(ast.NodeVisitor):
                 and isinstance(exc.func, ast.Name)
                 and exc.func.id in {"Exception", "ValueError", "RuntimeError", "TypeError",
                                     "IndexError", "KeyError", "OSError", "FileNotFoundError",
-                                    "ZeroDivisionError", "NotImplementedError", "AssertionError"}
+                                    "ZeroDivisionError", "NotImplementedError", "AssertionError",
+                                    "StopIteration"}
                 and not exc.keywords and len(exc.args) <= 1
                 and (not exc.args or is_const_str(exc.args[0]))):
             message = exc.func.id
@@ -68654,7 +68997,8 @@ class translator(ast.NodeVisitor):
                 and isinstance(exc.func, ast.Name)
                 and exc.func.id in {"Exception", "ValueError", "RuntimeError", "TypeError",
                                     "IndexError", "KeyError", "OSError", "FileNotFoundError",
-                                    "ZeroDivisionError", "NotImplementedError", "AssertionError"}
+                                    "ZeroDivisionError", "NotImplementedError", "AssertionError",
+                                    "StopIteration"}
                 and not exc.keywords and len(exc.args) == 1
                 and (isinstance(exc.args[0], ast.JoinedStr)
                      or (self._expr_kind(exc.args[0]) == "char" and self._rank_expr(exc.args[0]) == 0))):
@@ -73645,10 +73989,37 @@ class translator(ast.NodeVisitor):
                         self.o.pop()
                         self.o.w("end block")
                     else:
+                        # ADVANCE='no' needs an explicit format (list-directed
+                        # write(*,*, advance='no') does not compile): Python's
+                        # text of a number or bool, element by element for an
+                        # array.
                         expr_txt = self.expr(a)
-                        if sep_txt != " " and self._rank_expr(a) == 0 and self._expr_kind(a) not in {"char", "str"}:
-                            expr_txt = f"py_str({expr_txt})"
-                        self.o.w(f"write({unit_txt},*, advance='no') {expr_txt}")
+                        _k = self._expr_kind(a)
+                        _r = self._rank_expr(a)
+                        if _arg_is_numeric and i_arg > 0 and sep_txt == " ":
+                            self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(' ')}")
+                        if _k in {"char", "str"}:
+                            self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {expr_txt}")
+                        elif _k in {"int", "real", "logical"} and _r == 0:
+                            self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') trim(py_str({expr_txt}))")
+                        elif _k in {"int", "real", "logical"}:
+                            _tmp_counter += 1
+                            lv = f"print_multi_i{_tmp_counter}"
+                            self.o.w("block")
+                            self.o.push()
+                            self.o.w(f"integer :: {lv}")
+                            self.o.w("character(len=:), allocatable :: print_multi_tmp(:)")
+                            self.o.w(f"print_multi_tmp = py_str({self._c_order_flat(expr_txt, _r)})")
+                            self.o.w(f"do {lv} = 1, size(print_multi_tmp)")
+                            self.o.push()
+                            self.o.w(f"if ({lv} > 1) write({unit_txt},{fstr('(a)')}, advance='no') {fstr(' ')}")
+                            self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') trim(print_multi_tmp({lv}))")
+                            self.o.pop()
+                            self.o.w("end do")
+                            self.o.pop()
+                            self.o.w("end block")
+                        else:
+                            self.o.w(f"write({unit_txt},{fstr('(*(g0,:,1x))')}, advance='no') {expr_txt}")
                 if not advance_no:
                     self.o.w(f"write({unit_txt},*)")
                 return
@@ -91567,6 +91938,7 @@ def transpile_file(
     _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
     tree = rewrite_loop_else(tree)
+    tree = rewrite_generator_cursors(tree)
     tree = rewrite_short_circuit_boolops(tree)
     reject_mutated_mutable_defaults(tree)
     tree = rewrite_static_dicts(tree)
@@ -92413,6 +92785,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
     tree = rewrite_loop_else(tree)
+    tree = rewrite_generator_cursors(tree)
     tree = rewrite_short_circuit_boolops(tree)
     reject_mutated_mutable_defaults(tree)
     tree = rewrite_static_dicts(tree)

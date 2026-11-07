@@ -28801,6 +28801,120 @@ def test_xp2f_mutated_mutable_default_is_an_error(tmp_path: Path) -> None:
     assert "modifies its mutable default argument a" in proc.stdout + proc.stderr
 
 
+def test_xp2f_rebound_name_with_another_kind_gets_its_own_variable(tmp_path: Path) -> None:
+    # v = 9.0 then for v in [3, 4]: one REAL declaration for v, so tot +=
+    # v made tot real too (7.0 for 7).
+    _run_xp2f_compile_diff(tmp_path, "xrebound_kind.py", [
+        "import math",
+        "v = 9.0",
+        "print(v)",
+        "tot = 0",
+        "for v in [3, 4]:",
+        "    tot += v",
+        "print(tot, v)",
+        "k = 'abc'",
+        "print(k)",
+        "k = len(k) * 2",
+        "print(k + 1)",
+        "r = 1",
+        "print(r)",
+        "r = math.sqrt(2.0)",
+        "print(r)",
+        "c = 5",
+        "c = c * 1.5",
+        "c = int(c)",
+        "print(c)",
+        "def f():",
+        "    x = 2.5",
+        "    y = x * 2",
+        "    x = 3",
+        "    return y, x + 1",
+        "p, q = f()",
+        "print(p, q)",
+    ])
+    generated = (tmp_path / "xrebound_kind_p.f90").read_text(encoding="utf-8")
+    assert "v_int" in generated
+    assert "k_int" in generated
+
+
+def test_xp2f_print_number_with_string_list(tmp_path: Path) -> None:
+    # print(t, ["n", "m"]) gave write(*,*, advance='no') t, which does not
+    # compile (list-directed output with ADVANCE=). A string list prints as
+    # its words (n m), as print(w) alone does.
+    src = tmp_path / "xprint_mixed_list.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "t = 7",
+        "w = ['n', 'm']",
+        "print(t, w)",
+        "print(w, t, -3)",
+        "print('x', w, 2.5, True)",
+        "print(w, np.array([1.5, 2.0]))",
+        "print(w, np.array([[1, 2], [3, 4]]), 'end')",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = [ln.split() for ln in proc.stdout.splitlines()
+             if ln.strip() and not ln.startswith(("wrote", "Auto", "Build", "Helper", "Run"))]
+    assert lines[:3] == [["7", "n", "m"], ["n", "m", "7", "-3"], ["x", "n", "m", lines[2][3], "True"]]
+    assert float(lines[2][3]) == 2.5
+    assert lines[3][:2] == ["n", "m"] and [float(x) for x in lines[3][2:]] == [1.5, 2.0]
+    assert lines[4] == ["n", "m", "1", "2", "3", "4", "end"]
+
+
+def test_xp2f_generator_assigned_to_a_name_is_a_cursor(tmp_path: Path) -> None:
+    # num = (f for f in range(20) if f not in absent) was "unsupported
+    # expr: GeneratorExp". next(), next(g, default), v = next(g, None) with
+    # v is None, a for loop and sum() take values lazily, so the filter sees
+    # later changes to the names it reads.
+    _run_xp2f_compile_diff(tmp_path, "xgenerator_cursor.py", [
+        "absent = [3, 7, 11]",
+        "num = (f for f in range(20) if f not in absent)",
+        "for i in range(30):",
+        "    v = next(num, None)",
+        "    if v is None:",
+        "        print('only', i, 'values available')",
+        "        break",
+        "    print(v)",
+        "sq = (k * 0.5 for k in range(10, 0, -3))",
+        "print(next(sq), next(sq, -1.0))",
+        "print(next(sq), next(sq), next(sq, -1.0))",
+        "xs = [4, 0, 5, 2]",
+        "inv = (10 / x for x in xs if x != 0 and 10 / x > 2)",
+        "print(next(inv))",
+        "xs.append(1)",
+        "print(sum(inv))",
+        "bad = [1, 2]",
+        "lazy = (j for j in range(6) if j not in bad)",
+        "print(next(lazy))",
+        "bad.append(3)",
+        "print(next(lazy))",
+        "for w in lazy:",
+        "    print('rest', w)",
+        "def first_two(n):",
+        "    g = (m * m for m in range(n) if m % 2 == 1)",
+        "    a = next(g)",
+        "    b = next(g, 0)",
+        "    return a + b",
+        "print(first_two(9), first_two(2))",
+    ])
+    # Past the end, next(g) stops with StopIteration; other uses are errors.
+    src = tmp_path / "xgenerator_end.py"
+    src.write_text("g = (f for f in range(2))\nprint(next(g), next(g))\nprint(next(g))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--run"],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert "StopIteration: next() of the exhausted generator g" in proc.stdout + proc.stderr
+    src = tmp_path / "xgenerator_passed.py"
+    src.write_text("def use(it):\n    return sum(it)\ng = (f for f in range(3))\nprint(use(g))\n",
+                   encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "generator g is supported only with next(), a for loop" in proc.stdout + proc.stderr
+
+
 def test_xp2f_int_kind_int64_keeps_int32_wraparound(tmp_path: Path) -> None:
     # --int-kind int64 made an int32 array 64-bit too, so a * a of
     # [50000] gave 2500000000 where numpy wraps to -1794967296.
