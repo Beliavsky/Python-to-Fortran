@@ -28692,6 +28692,115 @@ def test_xp2f_out_of_range_slice_assignment_is_empty(tmp_path: Path) -> None:
     ), check_kinds=True)
 
 
+def test_xp2f_short_circuit_in_conditional_expression_branches(tmp_path: Path) -> None:
+    # An and/or in a branch of x if c else y was evaluated whole: 1.0 / x
+    # with x = 0 (SIGFPE) and a[i] past the end.
+    _run_xp2f_compile_diff(tmp_path, "xifexp_short_circuit.py", [
+        "def h(x):",
+        "    return (x != 0 and 1.0 / x > 0.1) if x > -1 else False",
+        "def g(x):",
+        "    y = (x != 0 and 1.0 / x > 0.1) if x > -1 else False",
+        "    return y",
+        "a = [1, 2, 3]",
+        "for x in [0.0, 4.0]:",
+        "    w = (x != 0 and 1.0 / x > 0.1) if x > -1 else False",
+        "    print(int(w), int(g(x)), int(h(x)))",
+        "    print(int((x != 0 and 1.0 / x > 0.1) if x > -1 else False))",
+        "for i in range(5):",
+        "    q = (i < 3 and a[i] > 1) if i >= 0 else True",
+        "    print(int(q))",
+    ])
+
+
+def test_xp2f_tuple_axis_reductions_nonzero_item_and_sorted(tmp_path: Path) -> None:
+    # np.sum(a, axis=(0, 2)) gave sum(a, dim=[0, 2] + 1); r, c =
+    # np.nonzero(a), a.item(), the .size of a 0-d array, sorted() outside a
+    # for-loop header and x.sort(reverse=True) were unsupported.
+    _run_xp2f_compile_diff(tmp_path, "xaxes_sorted.py", [
+        "import numpy as np",
+        "b = np.arange(24).reshape(2, 3, 4)",
+        "s = np.sum(b, axis=(0, 2))",
+        "print(s.ndim, s.size, s[0], s[1], s[2])",
+        "t = b.sum(axis=(1, 2))",
+        "m = np.max(b, axis=(0, 1))",
+        "u = np.mean(b, axis=(0, 2))",
+        "print(t[0], t[1], m[0], m[3], u[0], u[2])",
+        "a = np.array([[0, 2, 0], [3, 0, 4]])",
+        "r, c = np.nonzero(a)",
+        "p, q = a.nonzero()",
+        "for k in range(len(r)):",
+        "    print(r[k], c[k], p[k], q[k])",
+        "z = np.array(7.0)",
+        "w = z + 2.0",
+        "print(z.ndim, z.size, z.item(), w.item())",
+        "one = np.array([[5]])",
+        "print(one.item(), one.size)",
+        "x = [3, 1, 3, -2, 0]",
+        "y = sorted(x)",
+        "print(x[0], y[0], y[4], len(sorted(x)))",
+        "x.sort(reverse=True)",
+        "print(x[0], x[4])",
+        "v = [3.5, 1.0, 2.25]",
+        "print(sorted(v)[0], sorted(v, reverse=True)[0])",
+        "def top(vals):",
+        "    srt = sorted(vals, reverse=True)",
+        "    return srt[0]",
+        "print(top([4, 9, 2]))",
+    ])
+
+
+def test_xp2f_local_dict_with_string_keys_is_one_variable_per_key(tmp_path: Path) -> None:
+    # The dict was a read-only map from key to value expression: d['a'] += 7
+    # became 2 = 9 (or assigned to the variable the value came from) and
+    # d['c'] = 5 became d("c" + 1) = 5; get, len and in were wrong.
+    _run_xp2f_compile_diff(tmp_path, "xstatic_dict.py", [
+        "def stats(x):",
+        "    cfg = {'scale': 2.0, 'shift': 1.0}",
+        "    cfg['shift'] += 0.5",
+        "    if 'scale' in cfg:",
+        "        cfg['scale'] *= 3.0",
+        "    return x * cfg['scale'] + cfg.get('shift', 0.0) + cfg.get('none', 10.0)",
+        "x0 = 4.0",
+        "d = {'a': x0, 'b': 3.0}",
+        "d['a'] = 9.0",
+        "print(x0, d['a'], len(d))",
+        "del d['b']",
+        "print(len(d), int('b' in d), int('b' not in d))",
+        "for key, val in d.items():",
+        "    print(key, val)",
+        "for key in d:",
+        "    print(key)",
+        "print(stats(1.0))",
+        "e = {'n': 2, 'm': 3}",
+        "e['c'] = 5",
+        "e['n'] += 7",
+        "print(len(e), e['n'], e.get('missing', -1))",
+        "tot = 0",
+        "for value in e.values():",
+        "    tot += value",
+        "print(tot, sum(e.values()))",
+    ])
+    # A new key inside a loop: an error, not a silent wrong result.
+    src = tmp_path / "xdict_loop_key.py"
+    src.write_text("d = {'a': 1}\nfor i in range(2):\n    d['b'] = i\nprint(d['a'])\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "gains key 'b' inside a loop or an if" in proc.stdout + proc.stderr
+
+
+def test_xp2f_mutated_mutable_default_is_an_error(tmp_path: Path) -> None:
+    # def f(a=[]): a.append(1) shares one list across calls (1, 2, 3); it
+    # failed to build with a type mismatch.
+    src = tmp_path / "xmutable_default.py"
+    src.write_text("def append_one(a=[]):\n    a.append(1)\n    return len(a)\n"
+                   "print(append_one(), append_one([]))\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "modifies its mutable default argument a" in proc.stdout + proc.stderr
+
+
 def test_xp2f_int_kind_int64_keeps_int32_wraparound(tmp_path: Path) -> None:
     # --int-kind int64 made an int32 array 64-bit too, so a * a of
     # [50000] gave 2500000000 where numpy wraps to -1794967296.

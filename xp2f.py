@@ -4859,6 +4859,17 @@ def rewrite_short_circuit_boolops(tree):
         out = []
         if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Try, ast.With)):
             return [st]
+        # w = A if c else B (or return A if c else B) with an and/or to
+        # short-circuit in A or B: if c: w = A / else: w = B.
+        v = getattr(st, "value", None)
+        if (isinstance(v, ast.IfExp) and (isinstance(st, ast.Return) or (
+                isinstance(st, ast.Assign) and all(isinstance(t, ast.Name) for t in st.targets)))
+                and (has_eager_need(v.body, False) or has_eager_need(v.orelse, False))):
+            def branch(val):
+                if isinstance(st, ast.Return):
+                    return ast.copy_location(ast.Return(value=val), st)
+                return ast.copy_location(ast.Assign(targets=copy.deepcopy(st.targets), value=val), st)
+            return stmt(ast.copy_location(ast.If(test=v.test, body=[branch(v.body)], orelse=[branch(v.orelse)]), st))
         if isinstance(st, ast.If):
             t = st.test
             if (isinstance(t, ast.BoolOp) and len(t.values) == 2
@@ -4898,6 +4909,789 @@ def rewrite_short_circuit_boolops(tree):
         return ast.copy_location(fn, st)
 
     tree.body = block([lambda_to_def(st) for st in tree.body])
+    return ast.fix_missing_locations(tree)
+
+
+_TUPLE_AXIS_REDUCTIONS = {"sum", "prod", "max", "min", "amax", "amin", "any", "all", "mean"}
+
+
+def rewrite_tuple_axis_reductions(tree):
+    """np.sum(a, axis=(0, 2)) (prod, max, min, any, all, mean; or the
+    a.sum(axis=...) method) is one reduction per axis, the highest axis
+    first so the lower axis numbers stay valid: np.sum(np.sum(a, axis=2),
+    axis=0). It was translated as sum(a, dim=[0, 2] + 1)."""
+
+    class T(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            f = node.func
+            if not (isinstance(f, ast.Attribute) and f.attr in _TUPLE_AXIS_REDUCTIONS):
+                return node
+            is_np = isinstance(f.value, ast.Name) and f.value.id in ("np", "numpy")
+            args = list(node.args)
+            if is_np:
+                if not args:
+                    return node
+                base, rest = args[0], args[1:]
+            else:
+                base, rest = f.value, args
+            axis = None
+            if rest:
+                if len(rest) != 1:
+                    return node
+                axis = rest[0]
+            kws = [kw for kw in node.keywords if kw.arg != "axis"]
+            for kw in node.keywords:
+                if kw.arg == "axis":
+                    axis = kw.value
+            if kws or not (isinstance(axis, ast.Tuple) and axis.elts):
+                return node
+            axes = []
+            for e in axis.elts:
+                if not (isinstance(e, ast.Constant) and type(e.value) is int):
+                    return node
+                axes.append(e.value)
+            if any(a < 0 for a in axes):
+                raise NotImplementedError("a tuple of axes with a negative axis is not supported")
+            if len(set(axes)) != len(axes):
+                raise NotImplementedError("duplicate value in axis")
+            out = base
+            for a in sorted(axes, reverse=True):
+                out = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=f.attr, ctx=ast.Load()),
+                               args=[out], keywords=[ast.keyword(arg="axis", value=ast.Constant(a))])
+            return ast.copy_location(out, node)
+
+    tree = T().visit(tree)
+    return ast.fix_missing_locations(tree)
+
+
+def rewrite_nonzero_unpack(tree):
+    """r, c = np.nonzero(a) (or a.nonzero()) is r, c = np.where(a), whose
+    matrix unpacking is supported; nonzero was not."""
+
+    class T(ast.NodeTransformer):
+        def visit_Assign(self, st):
+            v = st.value
+            if not (len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "nonzero" and not v.keywords):
+                return st
+            f = v.func
+            is_np = isinstance(f.value, ast.Name) and f.value.id in ("np", "numpy")
+            if is_np and len(v.args) == 1:
+                src = v.args[0]
+            elif not is_np and not v.args:
+                src = f.value
+            else:
+                return st
+            st.value = ast.copy_location(ast.Call(
+                func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="where", ctx=ast.Load()),
+                args=[src], keywords=[]), v)
+            return st
+
+    tree = T().visit(tree)
+    return ast.fix_missing_locations(tree)
+
+
+def rewrite_sorted_to_sort(tree):
+    """sorted(x) outside a for-loop header (b = sorted(a), print(sorted(a)))
+    becomes t = list(x); t.sort() before the statement, and x.sort(reverse=
+    True) becomes x.sort(); x.reverse() -- without key= the elements that
+    compare equal are equal, so the order among them does not matter.
+    sorted() was supported only as a for-loop iterable."""
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    counter = [0]
+    _lazy = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+    def fresh():
+        while True:
+            counter[0] += 1
+            nm = f"sorted_tmp_{counter[0]}"
+            if nm not in used:
+                used.add(nm)
+                return nm
+
+    def reverse_flag(call):
+        # True / False for reverse=<bool constant>, None when unsupported.
+        rev = False
+        for kw in call.keywords:
+            if kw.arg != "reverse" or not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool)):
+                return None
+            rev = kw.value.value
+        return rev
+
+    def is_sorted(n):
+        return (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "sorted"
+                and len(n.args) == 1 and reverse_flag(n) is not None)
+
+    def method(nm, attr, at):
+        return ast.copy_location(ast.Expr(value=ast.Call(
+            func=ast.Attribute(value=ast.Name(id=nm, ctx=ast.Load()), attr=attr, ctx=ast.Load()),
+            args=[], keywords=[])), at)
+
+    def sort_stmts(nm, call, at):
+        out = [ast.copy_location(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=ast.Call(
+            func=ast.Name(id="list", ctx=ast.Load()), args=[call.args[0]], keywords=[])), at), method(nm, "sort", at)]
+        if reverse_flag(call):
+            out.append(method(nm, "reverse", at))
+        return out
+
+    def hoist(node, pre, at):
+        if isinstance(node, _lazy):
+            return node
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.expr):
+                setattr(node, field, hoist(value, pre, at))
+            elif isinstance(value, list):
+                setattr(node, field, [hoist(v, pre, at) if isinstance(v, ast.expr) else v for v in value])
+        if is_sorted(node):
+            nm = fresh()
+            pre.extend(sort_stmts(nm, node, at))
+            return ast.copy_location(ast.Name(id=nm, ctx=ast.Load()), node)
+        return node
+
+    def block(stmts):
+        out = []
+        for st in stmts:
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(st, field, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    setattr(st, field, block(sub))
+            for h in getattr(st, "handlers", None) or []:
+                h.body = block(h.body)
+            # x.sort(reverse=True)
+            if (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+                    and isinstance(st.value.func, ast.Attribute) and st.value.func.attr == "sort"
+                    and isinstance(st.value.func.value, ast.Name) and not st.value.args
+                    and st.value.keywords and reverse_flag(st.value) is not None):
+                rev = reverse_flag(st.value)
+                st.value.keywords = []
+                out.append(st)
+                if rev:
+                    out.append(method(st.value.func.value.id, "reverse", st))
+                continue
+            # b = sorted(x): sort b itself.
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                    and is_sorted(st.value)):
+                pre = []
+                st.value.args[0] = hoist(st.value.args[0], pre, st)
+                out.extend(pre + sort_stmts(st.targets[0].id, st.value, st))
+                continue
+            if isinstance(st, (ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Return)) and st.value is not None:
+                pre = []
+                st.value = hoist(st.value, pre, st)
+                out.extend(pre)
+            out.append(st)
+        return out
+
+    tree.body = block(tree.body)
+    return ast.fix_missing_locations(tree)
+
+
+_MUTATING_METHODS = {"append", "extend", "insert", "pop", "remove", "sort", "reverse", "clear",
+                     "update", "setdefault", "popitem", "add", "discard"}
+
+
+def reject_mutated_mutable_defaults(tree):
+    """def f(a=[]): a.append(1): Python creates the default list once and
+    every call without a shares it, so the result grows across calls (1, 2,
+    3). That is not emulated; it failed to build with a type mismatch."""
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        pos = fn.args.posonlyargs + fn.args.args
+        pairs = list(zip(pos[len(pos) - len(fn.args.defaults):], fn.args.defaults))
+        pairs += [(a, d) for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults) if d is not None]
+        for arg, d in pairs:
+            mutable = isinstance(d, (ast.List, ast.Dict, ast.Set)) or (
+                isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id in ("list", "dict", "set"))
+            if not mutable:
+                continue
+            for n in ast.walk(fn):
+                hit = (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr in _MUTATING_METHODS
+                       and isinstance(n.func.value, ast.Name) and n.func.value.id == arg.arg)
+                hit = hit or (isinstance(n, ast.Subscript) and isinstance(n.ctx, (ast.Store, ast.Del))
+                              and isinstance(n.value, ast.Name) and n.value.id == arg.arg)
+                hit = hit or (isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name)
+                              and n.target.id == arg.arg)
+                if hit:
+                    raise NotImplementedError(
+                        f"function {fn.name} modifies its mutable default argument {arg.arg}: Python shares one "
+                        "default object across calls, which is not supported")
+    return tree
+
+
+def rewrite_static_dicts(tree):
+    """A dict literal with string-constant keys that stays in its scope
+    (d = {'a': 2, 'b': 3}; d['c'] = 5; d['a'] += 7; d.get('x', -1); len(d);
+    'a' in d; for v in d.values()) becomes one variable per key (d_a, d_b,
+    d_c): its key set is known at every statement, so len, in and get are
+    constants. The dict was a read-only alias map from key to value
+    expression, so d['a'] += 7 assigned to that expression (2 = 9, or to the
+    variable the value came from) and d['c'] = 5 became d("c" + 1) = 5.
+
+    Applies when the dict is bound once, by a statement directly in the
+    scope's body; is used only through constant-key subscripts, get,
+    len, in, keys/values/items in a for loop, list() or sum(); gains or
+    loses keys only in statements directly in that body (a new key inside a
+    loop or an if is an error); and is not visible to another function.
+    Other dicts are left as they were."""
+    lower_used = {n.id.lower() for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    lower_used |= {n.arg.lower() for n in ast.walk(tree) if isinstance(n, ast.arg)}
+    lower_used |= {n.name.lower() for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+
+    def const_key(n):
+        return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
+
+    def is_literal(v):
+        return isinstance(v, ast.Dict) and all(k is not None and const_key(k) is not None for k in v.keys)
+
+    def scope_nodes(body):
+        # Every node of these statements, not descending into nested scopes.
+        out = []
+        stack = list(body)
+        while stack:
+            n = stack.pop()
+            out.append(n)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            stack.extend(ast.iter_child_nodes(n))
+        return out
+
+    def parents_of(body):
+        par = {}
+        for n in scope_nodes(body):
+            for c in ast.iter_child_nodes(n):
+                par[c] = n
+        return par
+
+    def candidate(name, body, par, is_module):
+        # The dict's uses all fit, and it is bound exactly once at the top level.
+        defs = [st for st in body if isinstance(st, ast.Assign) and len(st.targets) == 1
+                and isinstance(st.targets[0], ast.Name) and st.targets[0].id == name]
+        if len(defs) != 1 or not is_literal(defs[0].value):
+            return None
+        for n in scope_nodes(body):
+            if isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+                return None
+            if not (isinstance(n, ast.Name) and n.id == name):
+                continue
+            p = par.get(n)
+            if isinstance(n.ctx, ast.Store):
+                if p is not defs[0]:
+                    return None
+                continue
+            if isinstance(n.ctx, ast.Del):
+                return None
+            if isinstance(p, ast.Subscript) and p.value is n:
+                if const_key(p.slice) is None:
+                    return None
+                continue
+            if isinstance(p, ast.Compare) and len(p.ops) == 1 and isinstance(p.ops[0], (ast.In, ast.NotIn)) \
+                    and p.comparators[0] is n and const_key(p.left) is not None:
+                continue
+            if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "len" and p.args == [n]:
+                continue
+            if isinstance(p, ast.Attribute) and p.value is n:
+                call = par.get(p)
+                if not (isinstance(call, ast.Call) and call.func is p and not call.keywords):
+                    return None
+                if p.attr == "get" and 1 <= len(call.args) <= 2 and const_key(call.args[0]) is not None:
+                    continue
+                if p.attr in ("keys", "values", "items") and not call.args:
+                    user = par.get(call)
+                    if isinstance(user, ast.For) and user.iter is call:
+                        continue
+                    if p.attr != "items" and isinstance(user, ast.Call) and isinstance(user.func, ast.Name) \
+                            and user.func.id in ("list", "sum") and user.args == [call]:
+                        continue
+                return None
+            if isinstance(p, ast.For) and p.iter is n:
+                continue
+            return None
+        inner = funcs if is_module else [x for st in body for x in ast.walk(st)
+                                         if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+        for fn in inner:
+            if any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(fn)):
+                return None
+        return defs[0]
+
+    def var_name(dname, key, taken):
+        base = f"{dname}_{key}" if key.isidentifier() and key.isascii() else f"{dname}_key"
+        nm, k = base, 1
+        while nm.lower() in lower_used or nm.lower() in taken:
+            k += 1
+            nm = f"{base}{k}"
+        lower_used.add(nm.lower())
+        taken.add(nm.lower())
+        return nm
+
+    def rewrite_scope(body, is_module):
+        par = parents_of(body)
+        names = {st.targets[0].id for st in body if isinstance(st, ast.Assign) and len(st.targets) == 1
+                 and isinstance(st.targets[0], ast.Name) and is_literal(st.value)}
+        for name in sorted(names):
+            d = candidate(name, body, par, is_module)
+            if d is None:
+                continue
+            body[:] = rewrite_dict(name, d, body)
+            par = parents_of(body)
+
+    def rewrite_dict(name, d, body):
+        keys = {}      # key -> variable, insertion-ordered
+        taken = set()
+        out = []
+
+        def var(key):
+            if key not in keys:
+                keys[key] = var_name(name, key, taken)
+            return keys[key]
+
+        def load(nm):
+            return ast.Name(id=nm, ctx=ast.Load())
+
+        class Uses(ast.NodeTransformer):
+            def __init__(self, present):
+                self.present = present
+
+            def visit_Subscript(self, n):
+                self.generic_visit(n)
+                if isinstance(n.value, ast.Name) and n.value.id == name:
+                    k = const_key(n.slice)
+                    if k not in self.present:
+                        if isinstance(n.ctx, ast.Store):
+                            raise NotImplementedError(
+                                f"dict {name} gains key {k!r} inside a loop or an if, which is not supported")
+                        raise NotImplementedError(f"KeyError: {k!r} is not a key of {name} here")
+                    return ast.copy_location(ast.Name(id=keys[k], ctx=n.ctx), n)
+                return n
+
+            def visit_Compare(self, n):
+                self.generic_visit(n)
+                if len(n.ops) == 1 and isinstance(n.ops[0], (ast.In, ast.NotIn)) and \
+                        isinstance(n.comparators[0], ast.Name) and n.comparators[0].id == name:
+                    found = const_key(n.left) in self.present
+                    return ast.copy_location(ast.Constant(found if isinstance(n.ops[0], ast.In) else not found), n)
+                return n
+
+            def visit_Call(self, n):
+                f = n.func
+                if isinstance(f, ast.Name) and f.id == "len" and len(n.args) == 1 and \
+                        isinstance(n.args[0], ast.Name) and n.args[0].id == name:
+                    return ast.copy_location(ast.Constant(len(self.present)), n)
+                if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == name:
+                    if f.attr == "get":
+                        k = const_key(n.args[0])
+                        if k in self.present:
+                            return ast.copy_location(load(keys[k]), n)
+                        if len(n.args) == 2:
+                            return self.visit(n.args[1])
+                        raise NotImplementedError(f"{name}.get({k!r}) of a missing key without a default (None)")
+                    if f.attr in ("keys", "values"):
+                        elts = [ast.Constant(k) if f.attr == "keys" else load(keys[k]) for k in self.present]
+                        return ast.copy_location(ast.List(elts=elts, ctx=ast.Load()), n)
+                self.generic_visit(n)
+                return n
+
+            def visit_For(self, n):
+                # for k in d / d.keys() / d.values(): a list of the keys or
+                # values; for k, v in d.items(): one copy of the body per key.
+                it = n.iter
+                if isinstance(it, ast.Name) and it.id == name:
+                    n.iter = ast.copy_location(ast.List(elts=[ast.Constant(k) for k in self.present],
+                                                        ctx=ast.Load()), it)
+                elif (isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and it.func.attr == "items"
+                      and isinstance(it.func.value, ast.Name) and it.func.value.id == name):
+                    if n.orelse or not (isinstance(n.target, ast.Tuple) and len(n.target.elts) == 2) or any(
+                            isinstance(x, (ast.Break, ast.Continue)) for x in scope_nodes(n.body)):
+                        raise NotImplementedError(f"for loop over {name}.items() with break/continue/else or "
+                                                  "a target other than k, v is not supported")
+                    unrolled = []
+                    for k in self.present:
+                        kt, vt = n.target.elts
+                        unrolled.append(ast.copy_location(ast.Assign(targets=[copy.deepcopy(kt)],
+                                                                     value=ast.Constant(k)), n))
+                        unrolled.append(ast.copy_location(ast.Assign(targets=[copy.deepcopy(vt)],
+                                                                     value=load(keys[k])), n))
+                        unrolled.extend(self.visit(copy.deepcopy(st)) for st in n.body)
+                    return ast.copy_location(ast.If(test=ast.Constant(True), body=unrolled or [ast.Pass()],
+                                                    orelse=[]), n)
+                self.generic_visit(n)
+                return n
+
+        for st in body:
+            if st is d:
+                for k, v in zip(d.value.keys, d.value.values):
+                    nm = var(const_key(k))
+                    out.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())],
+                                                            value=Uses(list(keys)).visit(v)), st))
+                continue
+            # A new key or a deletion directly in this body.
+            if isinstance(st, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                for t in tg:
+                    if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == name \
+                            and isinstance(st, ast.Assign):
+                        st.value = Uses(list(keys)).visit(st.value)
+                        var(const_key(t.slice))
+                        st.targets = [Uses(list(keys)).visit(x) for x in st.targets]
+                        out.append(st)
+                        break
+                else:
+                    out.append(Uses(list(keys)).visit(st))
+                continue
+            if isinstance(st, ast.Delete) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Subscript) \
+                    and isinstance(st.targets[0].value, ast.Name) and st.targets[0].value.id == name:
+                k = const_key(st.targets[0].slice)
+                if k not in keys:
+                    raise NotImplementedError(f"KeyError: {k!r} is not a key of {name} here")
+                del keys[k]
+                continue
+            out.append(Uses(list(keys)).visit(st))
+        return out
+
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        rewrite_scope(fn.body, False)
+    rewrite_scope(tree.body, True)
+    return ast.fix_missing_locations(tree)
+
+
+_KIND_ORDER = {"bool": 0, "int": 1, "real": 2, "complex": 3}
+_MATH_INT_FUNCS = {"floor", "ceil", "factorial", "gcd", "lcm", "comb", "perm", "isqrt", "trunc"}
+_MATH_BOOL_FUNCS = {"isclose", "isnan", "isinf", "isfinite"}
+
+
+def _estimate_scalar_kind(e, env):
+    """'bool', 'int', 'real', 'complex' or 'str' for an expression whose
+    Python type is clear from the source alone, else None."""
+    if isinstance(e, ast.Constant):
+        v = e.value
+        if isinstance(v, bool):
+            return "bool"
+        return {int: "int", float: "real", complex: "complex", str: "str"}.get(type(v))
+    if isinstance(e, ast.Name):
+        return env.get(e.id)
+    if isinstance(e, ast.UnaryOp):
+        if isinstance(e.op, ast.Not):
+            return "bool"
+        k = _estimate_scalar_kind(e.operand, env)
+        if isinstance(e.op, (ast.USub, ast.UAdd, ast.Invert)) and k in _KIND_ORDER:
+            return "int" if k == "bool" else k
+        return None
+    if isinstance(e, ast.BinOp):
+        a = _estimate_scalar_kind(e.left, env)
+        b = _estimate_scalar_kind(e.right, env)
+        if a == "str" or b == "str":
+            if isinstance(e.op, ast.Add) and a == b == "str":
+                return "str"
+            if isinstance(e.op, ast.Mult) and {a, b} in ({"str", "int"}, {"str", "bool"}):
+                return "str"
+            return None
+        if a not in _KIND_ORDER or b not in _KIND_ORDER:
+            return None
+        top = max(a, b, key=_KIND_ORDER.get)
+        if isinstance(e.op, ast.Div):
+            return "complex" if top == "complex" else "real"
+        if isinstance(e.op, ast.Pow):
+            if top in ("real", "complex"):
+                return top
+            r = e.right
+            return "int" if isinstance(r, ast.Constant) and type(r.value) is int and r.value >= 0 else None
+        if isinstance(e.op, (ast.BitAnd, ast.BitOr, ast.BitXor)) and a == b == "bool":
+            return "bool"
+        if isinstance(e.op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.LShift, ast.RShift)):
+            return "int" if top in ("bool", "int") else None
+        return "int" if top == "bool" else top
+    if isinstance(e, ast.Compare):
+        return "bool"
+    if isinstance(e, ast.BoolOp):
+        ks = {_estimate_scalar_kind(v, env) for v in e.values}
+        return ks.pop() if len(ks) == 1 else None
+    if isinstance(e, ast.IfExp):
+        a = _estimate_scalar_kind(e.body, env)
+        return a if a is not None and a == _estimate_scalar_kind(e.orelse, env) else None
+    if isinstance(e, ast.Call) and not e.keywords:
+        f = e.func
+        if isinstance(f, ast.Name):
+            if f.id in ("int", "len") and len(e.args) == 1:
+                return "int"
+            if f.id == "round" and len(e.args) == 1:
+                return "int"
+            if f.id == "float" and len(e.args) <= 1:
+                return "real"
+            if f.id == "bool" and len(e.args) <= 1:
+                return "bool"
+            if f.id == "str" and len(e.args) <= 1:
+                return "str"
+            if f.id == "abs" and len(e.args) == 1:
+                k = _estimate_scalar_kind(e.args[0], env)
+                return {"bool": "int", "complex": "real"}.get(k, k) if k in _KIND_ORDER else None
+            if f.id in ("min", "max") and len(e.args) >= 2:
+                ks = {_estimate_scalar_kind(a, env) for a in e.args}
+                return ks.pop() if len(ks) == 1 and None not in ks else None
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "math":
+            if f.attr in _MATH_INT_FUNCS:
+                return "int"
+            if f.attr in _MATH_BOOL_FUNCS:
+                return "bool"
+            return "real"
+    return None
+
+
+def _iter_element_kind(it, env):
+    if isinstance(it, (ast.List, ast.Tuple)) and it.elts:
+        ks = {_estimate_scalar_kind(x, env) for x in it.elts}
+        return ks.pop() if len(ks) == 1 else None
+    if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" and not it.keywords:
+        return "int"
+    return None
+
+
+def _surely_nonempty_iter(it):
+    if isinstance(it, (ast.List, ast.Tuple)):
+        return bool(it.elts) and not any(isinstance(x, ast.Starred) for x in it.elts)
+    if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range" and not it.keywords \
+            and all(isinstance(a, ast.Constant) and type(a.value) is int for a in it.args) and 1 <= len(it.args) <= 3:
+        try:
+            return len(range(*[a.value for a in it.args])) > 0
+        except ValueError:
+            return False
+    return False
+
+
+def split_rebound_scalar_kinds(tree):
+    """A name rebound with another scalar kind (v = 9.0 ... for v in [3,
+    4]) had one Fortran declaration, the wider kind: the int v was real, and
+    so was tot after tot += v (7.0 for 7). When the bindings fall into
+    separate stretches of a scope's own statements, each started by a
+    plain v = ... or for v in ... directly in that body that does not read
+    the earlier v, every use sees one kind: a stretch whose kind differs
+    from the name's first one gets its own name (v_int). Kinds come from
+    the source alone (literals, range, len, int()/float(), arithmetic of
+    such names); anything unclear, a name shared with another function,
+    and a kind that changes inside a stretch are left as they were."""
+    lower_used = {n.id.lower() for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    lower_used |= {n.arg.lower() for n in ast.walk(tree) if isinstance(n, ast.arg)}
+    lower_used |= {n.name.lower() for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    _scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+    def walk_scope(nodes):
+        # Nodes of these statements, not entering nested functions/classes.
+        stack = list(nodes)
+        while stack:
+            n = stack.pop()
+            yield n
+            if isinstance(n, _scopes):
+                continue
+            stack.extend(ast.iter_child_nodes(n))
+
+    def mentions(node, name):
+        return any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(node))
+
+    def bindings(stmts, name):
+        # (kind estimator input, is_simple) per binding of name: the value
+        # expression, ("iter", iter) for a for target, or None if unclear.
+        out = []
+        for n in walk_scope(stmts):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        out.append(("value", n.value))
+                    elif mentions(t, name) and not isinstance(t, ast.Name):
+                        if any(isinstance(x, ast.Name) and x.id == name and isinstance(x.ctx, ast.Store)
+                               for x in ast.walk(t)):
+                            out.append(None)
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == name:
+                out.append(("value", n.value) if n.value is not None else None)
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id == name:
+                out.append(("aug", n))
+            elif isinstance(n, (ast.For, ast.AsyncFor)) and mentions(n.target, name):
+                out.append(("iter", n.iter) if isinstance(n.target, ast.Name) else None)
+            elif isinstance(n, (ast.With, ast.AsyncWith)):
+                if any(it.optional_vars is not None and mentions(it.optional_vars, name) for it in n.items):
+                    out.append(None)
+            elif isinstance(n, ast.ExceptHandler) and n.name == name:
+                out.append(None)
+            elif isinstance(n, ast.NamedExpr) and n.target.id == name:
+                out.append(("value", n.value))
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                if any((a.asname or a.name.split(".")[0]) == name for a in n.names):
+                    out.append(None)
+            elif isinstance(n, ast.comprehension) and mentions(n.target, name):
+                pass  # the comprehension's own variable
+        return out
+
+    def binding_kind(b, env, name, own):
+        if b is None:
+            return None
+        tag, x = b
+        if tag == "value":
+            return _estimate_scalar_kind(x, {**env, name: own} if own else env)
+        if tag == "iter":
+            return _iter_element_kind(x, env)
+        if tag == "aug":
+            return _estimate_scalar_kind(ast.BinOp(left=ast.Name(id=name, ctx=ast.Load()), op=x.op, right=x.value),
+                                         {**env, name: own} if own else env)
+        return None
+
+    def scope_env(body, params):
+        # Names whose every binding in the scope has one clear kind.
+        names = {n.id for n in walk_scope(body) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        env = dict(params)
+        for _ in range(4):
+            new = dict(params)
+            for nm in names - set(params):
+                bs = bindings(body, nm)
+                ks = {binding_kind(b, env, nm, env.get(nm)) for b in bs}
+                if len(ks) == 1 and None not in ks:
+                    new[nm] = ks.pop()
+            if new == env:
+                break
+            env = new
+        return env
+
+    def fresh(name, kind):
+        base = f"{name}_{kind}"
+        nm, k = base, 1
+        while nm.lower() in lower_used:
+            k += 1
+            nm = f"{base}{k}"
+        lower_used.add(nm.lower())
+        return nm
+
+    class Ren(ast.NodeTransformer):
+        def __init__(self, old, new):
+            self.old, self.new = old, new
+
+        def visit_Name(self, n):
+            if n.id == self.old:
+                return ast.copy_location(ast.Name(id=self.new, ctx=n.ctx), n)
+            return n
+
+        def visit_FunctionDef(self, n):
+            return n
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+        visit_Lambda = visit_FunctionDef
+
+    def split_scope(body, params, outside):
+        # outside: names this scope shares with other scopes (not split).
+        env = scope_env(body, params)
+        names = sorted({n.id for n in walk_scope(body) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)})
+        blocked = set(outside)
+        for n in walk_scope(body):
+            if isinstance(n, (ast.Global, ast.Nonlocal)):
+                blocked |= set(n.names)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Del):
+                blocked.add(n.id)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("locals", "eval", "exec",
+                                                                                          "vars"):
+                return
+        for st in body:
+            for x in ast.walk(st):
+                if isinstance(x, _scopes):
+                    blocked |= {y.id for y in ast.walk(x) if isinstance(y, ast.Name)}
+        for name in names:
+            if name in blocked or name in env:
+                continue
+            # Stretch starts: v = ... / for v in ... directly in the body;
+            # its value or iterable still reads the previous stretch's v.
+            starts = [0]
+            for i, st in enumerate(body):
+                if i == 0:
+                    continue
+                if isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in st.targets)                         and all(isinstance(t, ast.Name) for t in st.targets):
+                    starts.append(i)
+                elif isinstance(st, ast.For) and isinstance(st.target, ast.Name) and st.target.id == name:
+                    starts.append(i)
+            if len(starts) < 2:
+                continue
+            bounds = list(zip(starts, starts[1:] + [len(body)]))
+            # A for-loop start whose loop may not run, with v used after it
+            # in its stretch (or its else): the old v is seen there.
+            stretches = [bounds[0]]
+            for (a, b) in bounds[1:]:
+                st = body[a]
+                if isinstance(st, ast.For) and not _surely_nonempty_iter(st.iter) and (
+                        any(mentions(x, name) for x in st.orelse) or any(mentions(x, name) for x in body[a + 1:b])):
+                    stretches[-1] = (stretches[-1][0], b)  # merge into the previous stretch
+                    continue
+                stretches.append((a, b))
+            if len(stretches) < 2:
+                continue
+            kinds = []
+            for idx, (a, b) in enumerate(stretches):
+                bs = bindings(body[a:b], name)
+                if idx == 0:
+                    if name in params:
+                        start = params[name]
+                    else:
+                        ks0 = {binding_kind(x, env, name, None) for x in bs} - {None}
+                        start = ks0.pop() if len(ks0) == 1 else None
+                    if name in params and params[name] is None:
+                        kinds.append(None)
+                        continue
+                else:
+                    st = body[a]
+                    prev = {**env, name: kinds[-1]} if kinds[-1] else env
+                    start = (_estimate_scalar_kind(st.value, prev) if isinstance(st, ast.Assign)
+                             else _iter_element_kind(st.iter, prev))
+                if start is None:
+                    kinds.append(None)
+                    continue
+                ks = {start} | {binding_kind(x, env, name, start) for x in bs}
+                kinds.append(start if ks == {start} else None)
+            known = [k for k in kinds if k is not None]
+            if len(set(known)) < 2:
+                continue
+            primary = known[0]
+            new_names = {}
+            own = []
+            for k in kinds:
+                if k is None or k == primary:
+                    own.append(name)
+                else:
+                    if k not in new_names:
+                        new_names[k] = fresh(name, k)
+                    own.append(new_names[k])
+            for idx, (a, b) in enumerate(stretches):
+                mine = own[idx]
+                prev = own[idx - 1] if idx else name
+                if mine == name and prev == name:
+                    continue
+                if idx:
+                    st = body[a]
+                    if isinstance(st, ast.Assign):
+                        st.value = Ren(name, prev).visit(st.value)
+                        st.targets = [Ren(name, mine).visit(t) for t in st.targets]
+                    else:
+                        st.iter = Ren(name, prev).visit(st.iter)
+                        st.target = Ren(name, mine).visit(st.target)
+                        st.body = [Ren(name, mine).visit(x) for x in st.body]
+                        st.orelse = [Ren(name, mine).visit(x) for x in st.orelse]
+                    a += 1
+                body[a:b] = [Ren(name, mine).visit(x) for x in body[a:b]]
+
+    module_shared = set()
+    for fn in ast.walk(tree):
+        if isinstance(fn, _scopes):
+            module_shared |= {x.id for x in ast.walk(fn) if isinstance(x, ast.Name)}
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                module_shared.add(fn.name)
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        params = {}
+        a = fn.args
+        for p in a.posonlyargs + a.args + a.kwonlyargs + ([a.vararg] if a.vararg else []) + (
+                [a.kwarg] if a.kwarg else []):
+            ann = p.annotation
+            params[p.arg] = {"int": "int", "float": "real", "bool": "bool", "str": "str", "complex": "complex"}.get(
+                ann.id) if isinstance(ann, ast.Name) else None
+        split_scope(fn.body, params, set())
+    split_scope(tree.body, {}, module_shared)
     return ast.fix_missing_locations(tree)
 
 
@@ -37999,7 +38793,7 @@ class translator(ast.NodeVisitor):
             ):
                 return "complex"
             if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                if node.func.attr == "copy" and len(node.args) == 0:
+                if node.func.attr in ("copy", "item") and len(node.args) == 0:
                     return self._expr_kind(node.func.value)
                 if node.func.attr == "pop" and len(node.args) <= 1:
                     return self._expr_kind(node.func.value)
@@ -42803,6 +43597,8 @@ class translator(ast.NodeVisitor):
                 return 1
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
                 return self._rank_expr(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "item" and not node.args                     and isinstance(node.func.value, ast.Name):
+                return 0
             if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist" and len(node.args) == 0:
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "transpose":
@@ -47152,6 +47948,15 @@ class translator(ast.NodeVisitor):
                 return self.expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
                 return self.expr(node.func.value)
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "item" and not node.args
+                    and not node.keywords and isinstance(node.func.value, ast.Name)):
+                # a.item(): the one element of a size-1 array (numpy raises
+                # for any other size); a 0-d array is a scalar here.
+                _it_rank = self._rank_expr(node.func.value)
+                _it = self.expr(node.func.value)
+                if _it_rank == 0:
+                    return _it
+                return f"{_it}(" + ", ".join(f"lbound({_it}, {d})" for d in range(1, _it_rank + 1)) + ")"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist" and len(node.args) == 0:
                 sv = node.func.value
                 if (
@@ -53801,6 +54606,8 @@ class translator(ast.NodeVisitor):
                 ):
                     return ".true."
             if node.attr == "size":
+                if self._rank_expr(node.value) == 0 and self._expr_kind(node.value) in {"int", "real", "logical", "complex"}:
+                    return "1"  # a 0-d array, a scalar here
                 return f"size({self.expr(node.value)})"
             if (
                 node.attr == "shape"
@@ -90761,6 +91568,12 @@ def transpile_file(
     tree = ast.parse(src)
     tree = rewrite_loop_else(tree)
     tree = rewrite_short_circuit_boolops(tree)
+    reject_mutated_mutable_defaults(tree)
+    tree = rewrite_static_dicts(tree)
+    tree = split_rebound_scalar_kinds(tree)
+    tree = rewrite_sorted_to_sort(tree)
+    tree = rewrite_tuple_axis_reductions(tree)
+    tree = rewrite_nonzero_unpack(tree)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
@@ -90781,6 +91594,8 @@ def transpile_file(
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    # An and/or in a branch just hoisted to a statement.
+    tree = rewrite_short_circuit_boolops(tree)
     tree = rewrite_histogramdd(tree)
     tree = rewrite_histogram_bin_edges(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
@@ -91599,6 +92414,12 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = ast.parse(src)
     tree = rewrite_loop_else(tree)
     tree = rewrite_short_circuit_boolops(tree)
+    reject_mutated_mutable_defaults(tree)
+    tree = rewrite_static_dicts(tree)
+    tree = split_rebound_scalar_kinds(tree)
+    tree = rewrite_sorted_to_sort(tree)
+    tree = rewrite_tuple_axis_reductions(tree)
+    tree = rewrite_nonzero_unpack(tree)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
@@ -91611,6 +92432,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = rewrite_pop_call_expr_to_temp(tree)
     tree = rewrite_mutating_call_literal_arg_to_temp(tree)
     tree = rewrite_nonatomic_ternary_to_temp(tree)
+    # An and/or in a branch just hoisted to a statement.
+    tree = rewrite_short_circuit_boolops(tree)
     tree = rewrite_histogramdd(tree)
     tree = rewrite_histogram_bin_edges(tree)
     tree = rewrite_indexed_linalg_tuple_calls(tree)
