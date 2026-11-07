@@ -1,5 +1,6 @@
 """Opt-in modular LAPACK: reproducibility and actual python_mod integration."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 
@@ -36,9 +37,15 @@ def test_modular_lapack_with_python_runtime(tmp_path, compiler, optimization):
     runtime = tmp_path / 'python_lapack_mod.f90'
     runtime.write_text(adapt_runtime((ROOT / 'python.f90').read_text(encoding='utf-8'), lapack),
                        encoding='utf-8')
-    flags = ['-O0', '-g', '-fcheck=all', '-fbacktrace', '-ffree-line-length-none'] if compiler == 'gfortran' else ['-O0']
+    flags = (['-O0', '-g', '-fcheck=all', '-fbacktrace', '-ffree-line-length-none']
+             if compiler == 'gfortran' else ['/Od'] if os.name == 'nt' else ['-O0'])
     if optimization == 'optimized':
-        flags = ['-O3', '-ffree-line-length-none'] if compiler == 'gfortran' else ['-O3']
+        # Legacy DLAMC* probes depend on rounded intermediate arithmetic.
+        # Intel's default fast FP mode can optimize away DLAMC3's purpose
+        # when these routines share a module, making DLAMCH loop forever.
+        flags = (['-O3', '-ffree-line-length-none'] if compiler == 'gfortran'
+                 else ['/O3', '/fp:precise'] if os.name == 'nt'
+                 else ['-O3', '-fp-model', 'precise'])
     # No lapack_d.f90 object is linked: unresolved old external symbols must fail.
     build = subprocess.run([compiler, *flags, str(ROOT / 'lapack_mod.f90'), str(runtime),
                             str(ROOT / 'tests' / 'xpython_lapack_test.f90'), '-o', 'check.exe'],

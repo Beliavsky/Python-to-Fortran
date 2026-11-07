@@ -1,5 +1,6 @@
 """Compile the standalone runtime tests without using the transpiler."""
 from pathlib import Path
+import os
 import re
 import shutil
 import subprocess
@@ -15,7 +16,8 @@ def compiled_runtime(request, tmp_path_factory):
     if shutil.which(compiler) is None:
         pytest.skip(f'{compiler} required')
     tmp_path = tmp_path_factory.mktemp(f'xpython_runtime_{compiler}')
-    flags = ['-O0', '-g', '-ffree-line-length-none', '-fcheck=all', '-fbacktrace'] if compiler == 'gfortran' else ['-O0']
+    flags = (['-O0', '-g', '-ffree-line-length-none', '-fcheck=all', '-fbacktrace']
+             if compiler == 'gfortran' else ['/Od'] if os.name == 'nt' else ['-O0'])
     objects = []
     # Compile the large helpers once, then reuse them for varied problem sizes.
     for name in ('python', 'lapack_d'):

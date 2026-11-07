@@ -1,5 +1,6 @@
 """Portable character-result declarations in the shared Fortran runtime."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 
@@ -33,10 +34,13 @@ contains
 end program xcase_helpers
 ''', encoding='utf-8')
     exe = tmp_path / 'xcase_helpers.exe'
-    flags = ['-ffree-line-length-none'] if compiler == 'gfortran' else []
+    # This tests semantics, not optimization. Intel defaults to optimizing
+    # both very large helpers, which can exceed the timeout under xdist.
+    flags = (['-O0', '-ffree-line-length-none'] if compiler == 'gfortran'
+             else ['/Od'] if os.name == 'nt' else ['-O0'])
     build = subprocess.run([compiler, *flags, str(ROOT / 'python.f90'),
                             str(ROOT / 'lapack_d.f90'), str(source), '-o', str(exe)],
-                           cwd=tmp_path, capture_output=True, text=True, timeout=180)
+                           cwd=tmp_path, capture_output=True, text=True, timeout=900)
     assert build.returncode == 0, build.stdout + build.stderr
     run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert run.returncode == 0, run.stdout + run.stderr

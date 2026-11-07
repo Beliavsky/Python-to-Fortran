@@ -649,6 +649,12 @@ The standalone Fortran test driver checks linear solves, Cholesky, inverse,
 determinant, eigenpairs, QR, SVD, least squares, and pseudoinverse. It also works
 with the original runtime and `lapack_d.f90`.
 
+For optimized Intel builds of the module, use `/O3 /fp:precise` on Windows
+(`-O3 -fp-model precise` on Linux). The legacy `DLAMC*` machine-constant
+probes rely on rounded intermediate arithmetic; Intel's default fast
+floating-point optimization can make `DLAMCH` loop indefinitely. For debug
+builds, Intel's Windows flag is `/Od`, not `-O0`.
+
 Run the focused tests (including optimized gfortran builds and optional ifx):
 
 ```console

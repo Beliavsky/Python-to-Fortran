@@ -47,6 +47,7 @@ import fortran_purity as fpurity
 import fortran_scan as fscan
 from python_size_specialization import specialize_singleton_returns
 from python_numpy_imports import normalize_numpy_wildcard_imports
+from python_array_aliases import normalize_direct_array_aliases
 from fortran_scan import (
     _is_wrapped_by_outer_parens,
     coalesce_simple_declarations,
@@ -20496,6 +20497,17 @@ def collect_module_global_initializers(local_funcs):
     return inits
 
 
+def module_global_emit_names(specs, params=None):
+    """Use the same legal names for module declarations and all their users."""
+    resolver = translator(None, {}, "flat", {})
+    names = list(dict.fromkeys([*(specs or {}), *(params or {})]))
+    for name in names:
+        if name and name[0].isalpha() and name not in resolver.reserved_names:
+            resolver.fortran_name_owner.setdefault(name.lower(), name)
+    aliases = {name: resolver._aliased_name(name) for name in names}
+    return {name: aliases[name] for name in (specs or {})}
+
+
 def collect_top_level_shared_decls(tree, local_funcs=None, params=None, tuple_return_out_kinds=None, tuple_return_out_ranks=None):
     """Collect top-level assigned names that should live in the proc module."""
     params = set((params or {}).keys())
@@ -30879,7 +30891,7 @@ class translator(ast.NodeVisitor):
             return None
         return base.id
 
-    def _inline_written_views(self, body):
+    def _inline_written_views(self, body, list_names=None):
         """numpy views share memory. After `v = y[idx]` (a basic index: a
         row, column or slice), `v = y` or `v = y.T`, when v or y is modified
         in place later, the later uses of v become the view's expression,
@@ -30904,7 +30916,8 @@ class translator(ast.NodeVisitor):
                     stores[nm] = stores.get(nm, 0) + 2
         nested_names = {m.id for d in ast.walk(scope) if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef))
                         for m in ast.walk(d) if isinstance(m, ast.Name)}
-        list_names = set(self.python_list_vars) | set(self.pandas_series_vars) | set(self.pandas_df_vars)
+        list_names = (set(list_names or ()) | set(self.python_list_vars)
+                      | set(self.pandas_series_vars) | set(self.pandas_df_vars))
 
         def simple_index(e):
             # Constants, names and arithmetic of them (no calls).
@@ -31121,7 +31134,6 @@ class translator(ast.NodeVisitor):
         The translation gives every name its own copy, so when one of two
         names sharing an array is modified in place and the other is used
         afterwards, the results would differ silently: raise instead."""
-        self._inline_written_views(body)
         # Python lists are not numpy arrays (the translator aliases `y = x`
         # of a list itself); python_list_vars is only filled in later.
         def root_name(n):
@@ -31138,6 +31150,21 @@ class translator(ast.NodeVisitor):
                         and n.value.func.id == "list")
                     or (isinstance(n.value, ast.Call) and root_name(n.value.func) in {"pd", "pandas"})):
                 list_names.update(tg.id for tg in n.targets if isinstance(tg, ast.Name))
+        # A list alias or list slice is still a Python list, not a NumPy
+        # view. Determine this BEFORE the view rewrite redirects writes.
+        assignments = [n for n in ast.walk(ast.Module(body=list(body), type_ignores=[]))
+                       if isinstance(n, ast.Assign)]
+        for _ in range(len(assignments) + 1):
+            before = set(list_names)
+            for n in assignments:
+                source = n.value
+                if isinstance(source, ast.Subscript) and isinstance(source.slice, ast.Slice):
+                    source = source.value
+                if isinstance(source, ast.Name) and source.id in list_names:
+                    list_names.update(t.id for t in n.targets if isinstance(t, ast.Name))
+            if list_names == before:
+                break
+        self._inline_written_views(body, list_names)
         obj = {}          # name -> id of the numpy array it is bound to
         fresh = [0]
         events = []       # ("bind", b, a, stmt) / ("rebind", x, stmt) / ("mutate", x, stmt) / ("use", x, stmt)
@@ -73528,6 +73555,13 @@ def _emit_local_function(
     )
     # Module constants, visible in the procedure by host association.
     tr.module_params = dict(params or {})
+    _global_aliases = module_global_emit_names(module_global_decls, params)
+    for _name in list(module_global_names):
+        if _name in _global_aliases:
+            _alias = _global_aliases[_name]
+            tr.name_aliases[_name] = _alias
+            tr.fortran_name_owner[_alias.lower()] = _name
+            module_global_names.add(_alias)
     tr.real_kind_map.update(getattr(fn, "_xp2f_arg_real_precision", {}))
     # A local variable inside a function whose name happens to match the
     # ENCLOSING function's own name (e.g. `def work(...): work = ...;
@@ -87536,8 +87570,10 @@ def generate_flat(
         om.w("integer, parameter :: dp = real64")
         for name, val in params.items():  # insertion order = dependency order
             om.w(f"{_int_param_decl(name, val)} ! {const_comment(name, tree)}")
-        for _gnm in sorted(module_global_decls):
-            _gk, _gr = module_global_decls[_gnm]
+        _global_aliases = module_global_emit_names(module_global_decls, params)
+        for _gsource in sorted(module_global_decls):
+            _gnm = _global_aliases[_gsource]
+            _gk, _gr = module_global_decls[_gsource]
             if _gr > 0:
                 _dims = ",".join(":" for _ in range(max(1, _gr)))
                 if _gk == "int":
@@ -87551,7 +87587,7 @@ def generate_flat(
                 else:
                     om.w(f"real(kind=dp), allocatable :: {_gnm}({_dims})")
             else:
-                _init = module_global_inits.get(_gnm)
+                _init = module_global_inits.get(_gsource)
                 if _gk == "int":
                     om.w(f"integer :: {_gnm}" + (f" = {_init}" if _init is not None else ""))
                 elif _gk == "logical":
@@ -87573,7 +87609,7 @@ def generate_flat(
         used_proc_names = set(imported_proc_syms)
         used_proc_names.update(overload_proc_names)
         used_proc_names.update(type_names)
-        used_proc_names.update(module_global_decls.keys())
+        used_proc_names.update(_global_aliases.values())
         used_proc_names.add("dp")
         # A local function's own name must dodge Fortran keywords/
         # intrinsics too, not just other already-used symbols -- e.g. a
@@ -87600,7 +87636,7 @@ def generate_flat(
                 _k += 1
             fn_alias_map[fn.name] = _alias
             used_proc_names.add(_alias)
-        proc_public_syms = sorted(set(["dp"] + [fn_alias_map.get(fn.name, fn.name) for fn in local_funcs] + overload_proc_names + type_names + sorted(module_global_decls.keys())))
+        proc_public_syms = sorted(set(["dp"] + [fn_alias_map.get(fn.name, fn.name) for fn in local_funcs] + overload_proc_names + type_names + sorted(_global_aliases.values())))
         if proc_public_syms:
             om.w("public :: " + ", ".join(proc_public_syms))
         for gname in sorted(local_generic_overloads):
@@ -87912,7 +87948,7 @@ def generate_flat(
             # the final unused-import pass removes any that were not emitted.
             for spec in local_overload_specs.get(_nm, []):
                 proc_main_needed.add(spec[0])
-        proc_main_needed |= module_global_names
+        proc_main_needed.update(module_global_emit_names(module_global_decls, params).values())
         # normalize_scipy_curve_fit_residual_helper synthesizes a residual
         # function that's only referenced via a procedure pointer in
         # generated Fortran text, never as an ast.Name Load in the Python
@@ -88098,6 +88134,11 @@ def generate_flat(
         rng_replay_path=rng_replay_path,
         local_proc_name_aliases=fn_alias_map if use_proc_module else None,
     )
+    if use_proc_module:
+        for _name, _alias in module_global_emit_names(module_global_decls, params).items():
+            tr.name_aliases[_name] = _alias
+            tr.fortran_name_owner[_alias.lower()] = _name
+            module_global_names.add(_alias)
     tr.local_df_return_info.update(_scan_local_df_return_info(local_funcs, tree.body))
     tr.tuple_df_return_positions.update(_all_tuple_df_return_positions(local_funcs))
     tr.prescan(tree.body)
@@ -88291,7 +88332,8 @@ def generate_flat(
             _gnm = stmt.targets[0].id
             _gkr = module_global_decls.get(_gnm)
             if _gkr is not None and _gkr[1] == 0 and _gkr[0] in ("int", "real"):
-                o.w(f"{_gnm} = -1" if _gkr[0] == "int" else f"{_gnm} = -1.0_dp")
+                _gemit = tr._aliased_name(_gnm)
+                o.w(f"{_gemit} = -1" if _gkr[0] == "int" else f"{_gemit} = -1.0_dp")
                 continue
         tr.visit(stmt)
     tr._emit_trailing_comments()
@@ -89795,6 +89837,7 @@ def transpile_file(
     if module_only:
         _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
     reject_undefined_names_in_functions(tree)
+    tree = normalize_direct_array_aliases(tree)
     tree = rewrite_literal_string_sequence_lengths(tree)
     tree = rewrite_nullable_string_results(tree)
     nullable_string_results = getattr(tree, "_xp2f_nullable_string_results", False)

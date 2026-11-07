@@ -53,6 +53,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -62,6 +63,35 @@ from pathlib import Path
 import xp2f
 
 PYTHON_MOD_PATH = Path(__file__).resolve().with_name("python.f90")
+
+
+def f2py_build_environment():
+    """Keep automatic Windows C selection compatible with the GNU helpers.
+
+    Meson otherwise prefers MSVC in an Intel/VS developer shell and turns
+    -lgcc into gcc.lib, although our GNU runtime is libgcc.a. Explicit
+    compiler environment settings remain the user's choice.
+    """
+    env = os.environ.copy()
+    if sys.platform != "win32":
+        return env
+    env.setdefault("FC", "gfortran")
+    if "CC" not in env:
+        for name in ("clang", "gcc"):
+            compiler = shutil.which(name)
+            if not compiler:
+                continue
+            try:
+                probe = subprocess.run([compiler, "-dumpmachine"], capture_output=True,
+                                       text=True, check=False, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            target = probe.stdout.strip().lower()
+            if probe.returncode == 0 and ("mingw" in target or "windows-gnu" in target):
+                # Meson parses CC as a command, including paths with spaces.
+                env["CC"] = subprocess.list2cmdline([compiler])
+                break
+    return env
 
 MOD_START_RE = re.compile(r"^\s*module\s+([a-z]\w*)\s*$", re.IGNORECASE)
 MOD_END_RE = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
@@ -4647,6 +4677,7 @@ def _bridge_one_target(
     proc = subprocess.run(
         f2py_cmd,
         cwd=out_dir,
+        env=f2py_build_environment(),
         capture_output=True,
         text=True,
         check=False,
