@@ -90797,7 +90797,7 @@ def transpile_file(
     tree = rewrite_named_split_lists(tree)
     tree = rewrite_unroll_array_list_loops(tree)
     tree = rewrite_function_valued_library_args(tree)
-    tree = npsmallint.rewrite_small_int_dtypes(tree)
+    tree = npsmallint.rewrite_small_int_dtypes(tree, wide_int32=(int_kind == "int64"))
     tree = rewrite_split_subscript_to_temp(tree)
     tree = rewrite_tuple_assign_subscript_targets_to_temps(tree)
     tree = rewrite_listcomp_zip_target_to_index(tree)

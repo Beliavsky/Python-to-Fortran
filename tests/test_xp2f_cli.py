@@ -28692,6 +28692,56 @@ def test_xp2f_out_of_range_slice_assignment_is_empty(tmp_path: Path) -> None:
     ), check_kinds=True)
 
 
+def test_xp2f_int_kind_int64_keeps_int32_wraparound(tmp_path: Path) -> None:
+    # --int-kind int64 made an int32 array 64-bit too, so a * a of
+    # [50000] gave 2500000000 where numpy wraps to -1794967296.
+    src = tmp_path / "xint32_wide.py"
+    src.write_text("\n".join([
+        "import numpy as np",
+        "a = np.array([50000, -70000, 3], dtype=np.int32)",
+        "b = a * a",
+        "print(b[0], b[1], b[2], int(b.dtype == np.int32), int(a.dtype == np.int64))",
+        "c = a.astype(np.int64) ** 2",
+        "print(c[0], c[1])",
+        "d = np.arange(3, dtype=np.int32) + 2147483646",
+        "print(d[0], d[1], d[2])",
+        "f = np.array([3000000000, 5]).astype(np.int32)",
+        "print(f[0], f[1], np.sum(b))",
+        "g = np.zeros(2, dtype=np.int32)",
+        "g[0] = 2147483647",
+        "g += 1",
+        "print(g[0], g[1])",
+        "k = a * np.int16(30000)",
+        "print(k[0], k[1], int(k.dtype == np.int32))",
+        "def scale(n):",
+        "    return n * 100000",
+        "print(scale(50000))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(src), "--compile", "--run-diff", "--int-kind", "int64"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Run diff: MATCH" in proc.stdout, proc.stdout + proc.stderr
+    # One function given int32 at one call and int64 at another: an error,
+    # not a 64-bit product for the int32 call.
+    mixed = tmp_path / "xint32_mixed.py"
+    mixed.write_text("\n".join([
+        "import numpy as np",
+        "def sq(x):",
+        "    return x * x",
+        "print(sq(np.array([46341], dtype=np.int32)), sq(np.array([46341])))",
+        "",
+    ]), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(XP2F_PATH), str(mixed), "--int-kind", "int64"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode != 0
+    assert "function sq is called with int32" in proc.stdout + proc.stderr
+
+
 def test_xp2f_dtype_comparisons_itemsize_and_int32(tmp_path: Path) -> None:
     # np.dtype('float64') was unsupported; every int array said int64
     # (an int32 array compared False with np.int32); itemsize was

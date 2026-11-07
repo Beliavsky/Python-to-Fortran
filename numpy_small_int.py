@@ -17,6 +17,10 @@ within a scope (module body or function); passing a small-integer value
 to a local function is an error rather than a silent loss of its dtype.
 `a.dtype` and comparisons such as `a.dtype == np.int8` are resolved here
 for small-integer arrays.
+
+With --int-kind int64 the generated integers are 64-bit, so an int32
+array (dtype=np.int32, astype(np.int32), np.int32(v)) is wrapped the same
+way, (x + 2**31) % 2**32 - 2**31: an int32 product fits in 64 bits.
 """
 import ast
 import copy
@@ -86,7 +90,7 @@ def promote(a, b):
     sbits, ubits = (ba, bb) if sa else (bb, ba)
     if sbits > ubits:
         return f"int{sbits}"
-    return f"int{2 * ubits}" if 2 * ubits < 32 else OTHER
+    return f"int{2 * ubits}" if f"int{2 * ubits}" in NARROW else OTHER
 
 
 def wrap(node, dt):
@@ -492,7 +496,19 @@ def _param_dtypes(fdef, calls, strict=True):
     return out
 
 
-def rewrite_small_int_dtypes(tree):
+def rewrite_small_int_dtypes(tree, wide_int32=False):
+    """wide_int32: the generated integers are 64-bit (--int-kind int64),
+    so int32 is wrapped like the small dtypes."""
+    if not wide_int32:
+        return _rewrite_small_int_dtypes(tree)
+    NARROW["int32"] = (32, True)
+    try:
+        return _rewrite_small_int_dtypes(tree)
+    finally:
+        del NARROW["int32"]
+
+
+def _rewrite_small_int_dtypes(tree):
     if not _mentions_small_int(tree):
         return tree
     defs = [st for st in ast.walk(tree) if isinstance(st, ast.FunctionDef)]
