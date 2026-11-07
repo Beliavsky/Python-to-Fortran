@@ -4606,6 +4606,279 @@ def reject_undefined_names_in_functions(tree):
             _check(d, module_bound | known)
 
 
+def rewrite_loop_else(tree):
+    """A for/while `else:` block runs when the loop ends without `break`:
+    with no break of its own the block follows the loop; otherwise each
+    break first sets a fresh flag and the block runs under `if not flag`.
+    (The else block was silently dropped.)"""
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    counter = [0]
+
+    def fresh():
+        while True:
+            counter[0] += 1
+            nm = f"loop_broke_{counter[0]}"
+            if nm not in used:
+                used.add(nm)
+                return nm
+
+    _scopes = (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+    def own_breaks(stmts):
+        out = []
+        stack = list(stmts)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Break):
+                out.append(n)
+            elif not isinstance(n, _scopes):
+                stack.extend(ast.iter_child_nodes(n))
+        return out
+
+    class FlagBreaks(ast.NodeTransformer):
+        def __init__(self, flag):
+            self.flag = flag
+
+        def visit_Break(self, node):
+            set_flag = ast.copy_location(
+                ast.Assign(targets=[ast.Name(id=self.flag, ctx=ast.Store())], value=ast.Constant(True)), node)
+            return [set_flag, node]
+
+        def generic_visit(self, node):
+            if isinstance(node, _scopes):
+                return node
+            return super().generic_visit(node)
+
+    class Lower(ast.NodeTransformer):
+        def _loop(self, node):
+            self.generic_visit(node)
+            if not node.orelse:
+                return node
+            orelse, node.orelse = node.orelse, []
+            if not own_breaks(node.body):
+                return [node] + orelse
+            flag = fresh()
+            body = FlagBreaks(flag).visit(ast.Module(body=node.body, type_ignores=[])).body
+            node.body = body
+            init = ast.copy_location(
+                ast.Assign(targets=[ast.Name(id=flag, ctx=ast.Store())], value=ast.Constant(False)), node)
+            guard = ast.copy_location(
+                ast.If(test=ast.UnaryOp(op=ast.Not(), operand=ast.Name(id=flag, ctx=ast.Load())),
+                       body=orelse, orelse=[]), orelse[0])
+            return [init, node, guard]
+
+        visit_For = visit_While = visit_AsyncFor = _loop
+
+    return ast.fix_missing_locations(Lower().visit(tree))
+
+
+def rewrite_short_circuit_boolops(tree):
+    """Fortran's .and./.or. need not short-circuit, so `x != 0 and 10 / x
+    > 1` divided by zero (SIGFPE) and `while i < n and a[i] > 0` read past
+    the end. An and/or whose later operands may fail or have side effects
+    (division, %, **, a subscript, a call) is evaluated with nested ifs
+    into a temporary first, as Python does: `if x: t = y` / `else: t =
+    False` for and, the mirror image for or. A while test is recomputed at
+    the top of `while True:` and ends the loop with `if not t: break`. A
+    two-operand if test is left alone (visit_If nests it).
+
+    The temporary has one kind: in a truth context (if/while/assert test,
+    `not` operand, x if c else y test) a non-boolean operand becomes
+    bool(v); used as a value, only and/or of boolean operands (comparisons,
+    not, True/False, bool(...)) is lowered -- `flag and n` keeps the
+    existing value lowering and its diagnostics. Operands of a lambda, a
+    comprehension or an x if c else y branch are not hoisted."""
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    counter = [0]
+    _safe_calls = {"len", "abs", "isinstance", "float", "int", "bool", "round", "min", "max"}
+    _lazy = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+    def fresh():
+        while True:
+            counter[0] += 1
+            nm = f"sc_tmp_{counter[0]}"
+            if nm not in used:
+                used.add(nm)
+                return nm
+
+    def unsafe(node):
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, _lazy):
+                continue
+            if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)):
+                return True
+            if isinstance(n, ast.Subscript):
+                return True
+            if isinstance(n, ast.Call) and not (isinstance(n.func, ast.Name) and n.func.id in _safe_calls):
+                return True
+            stack.extend(ast.iter_child_nodes(n))
+        return False
+
+    def is_bool(n):
+        if isinstance(n, ast.Compare):
+            return True
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            return True
+        if isinstance(n, ast.Constant):
+            return isinstance(n.value, bool)
+        if isinstance(n, ast.BoolOp):
+            return all(is_bool(v) for v in n.values)
+        return isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in {"bool", "isinstance"}
+
+    def needs(node, truth):
+        return (isinstance(node, ast.BoolOp) and any(unsafe(v) for v in node.values[1:])
+                and (truth or is_bool(node)))
+
+    def has_eager_need(node, truth):
+        if needs(node, truth):
+            return True
+        if isinstance(node, _lazy):
+            return False
+        if isinstance(node, ast.IfExp):
+            return has_eager_need(node.test, True)
+        if isinstance(node, ast.BoolOp):
+            return has_eager_need(node.values[0], truth)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return has_eager_need(node.operand, True)
+        return any(has_eager_need(c, False) for c in ast.iter_child_nodes(node))
+
+    def name(nm, ctx, at):
+        return ast.copy_location(ast.Name(id=nm, ctx=ctx), at)
+
+    def assign(tmp, value, at):
+        return ast.copy_location(ast.Assign(targets=[name(tmp, ast.Store(), at)], value=value), at)
+
+    def as_bool(v):
+        if is_bool(v):
+            return v
+        return ast.copy_location(ast.Call(func=ast.Name(id="bool", ctx=ast.Load()), args=[v], keywords=[]), v)
+
+    def lower(is_and, values, tmp, out, truth):
+        # Nested ifs, so that an if test of compile-time constants is folded
+        # by visit_If and a guarded 10 / x with x = 0 is not even compiled.
+        first = as_bool(hoist(values[0], out, truth))
+        if len(values) == 1:
+            out.append(assign(tmp, first, first))
+            return
+        inner = []
+        lower(is_and, values[1:], tmp, inner, truth)
+        if unsafe(first):
+            out.append(assign(tmp, first, first))
+            test = name(tmp, ast.Load(), first)
+            if not is_and:
+                test = ast.copy_location(ast.UnaryOp(op=ast.Not(), operand=test), first)
+            out.append(ast.copy_location(ast.If(test=test, body=inner, orelse=[]), first))
+            return
+        keep = [assign(tmp, ast.copy_location(ast.Constant(not is_and), first), first)]
+        body, orelse = (inner, keep) if is_and else (keep, inner)
+        out.append(ast.copy_location(ast.If(test=first, body=body, orelse=orelse), first))
+
+    def hoist(node, out, truth=False):
+        if needs(node, truth):
+            tmp = fresh()
+            lower(isinstance(node.op, ast.And), list(node.values), tmp, out, truth)
+            return name(tmp, ast.Load(), node)
+        if isinstance(node, _lazy):
+            return node
+        if isinstance(node, ast.IfExp):
+            node.test = hoist(node.test, out, True)
+            return node
+        if isinstance(node, ast.BoolOp):
+            node.values[0] = hoist(node.values[0], out, truth)
+            return node
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            node.operand = hoist(node.operand, out, True)
+            return node
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                setattr(node, field, hoist(value, out))
+            elif isinstance(value, list):
+                setattr(node, field, [hoist(v, out) if isinstance(v, ast.expr) else v for v in value])
+        return node
+
+    def block(stmts):
+        new = []
+        for st in stmts:
+            new.extend(stmt(st))
+        return new
+
+    def stmt(st):
+        for field in ("body", "orelse", "finalbody"):
+            sub = getattr(st, field, None)
+            if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                setattr(st, field, block(sub))
+        for h in getattr(st, "handlers", None) or []:
+            h.body = block(h.body)
+        for c in getattr(st, "cases", None) or []:
+            c.body = block(c.body)
+        out = []
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Try, ast.With)):
+            return [st]
+        if isinstance(st, ast.If):
+            t = st.test
+            if (isinstance(t, ast.BoolOp) and len(t.values) == 2
+                    and not any(needs(n, True) for v in t.values for n in ast.walk(v))):
+                return [st]
+            st.test = hoist(t, out, True)
+        elif isinstance(st, ast.While):
+            if not has_eager_need(st.test, True):
+                return [st]
+            pre = []
+            test = hoist(st.test, pre, True)
+            stop = ast.copy_location(ast.If(
+                test=ast.copy_location(ast.UnaryOp(op=ast.Not(), operand=test), st.test),
+                body=[ast.copy_location(ast.Break(), st)], orelse=[]), st.test)
+            st.test = ast.copy_location(ast.Constant(True), st.test)
+            st.body = block(pre) + [stop] + st.body
+            return [st]
+        elif isinstance(st, (ast.For, ast.AsyncFor)):
+            st.iter = hoist(st.iter, out)
+        elif isinstance(st, ast.Assert):
+            st.test = hoist(st.test, out, True)
+        elif isinstance(st, (ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Return)):
+            if st.value is not None:
+                st.value = hoist(st.value, out)
+        return block(out) + [st] if out else [st]
+
+    tree.body = block(tree.body)
+    return ast.fix_missing_locations(tree)
+
+
+_FSTRING_FLAGGED_SPEC_RE = re.compile(r"([+\- ])?(#)?(0)?(\d+)?(?:\.(\d+))?([deEfFgGx])?")
+
+
+def fstring_flagged_piece(spec, kind, expr_txt):
+    """Character expression for an f-string field whose spec has a sign or
+    zero-pad flag ({n:03d}, {x:+.2f}, {x:08.3f}), through the
+    py_format_int/py_format_real helpers of the % operator; None for
+    other specs. The f-string parsers skipped those flags (n=  7 for
+    {n:03d}). A thousands separator (, or _) is an error, not dropped."""
+    if spec and ("," in spec or "_" in spec):
+        raise NotImplementedError(f"f-string format spec with a thousands separator: {spec!r}")
+    m = _FSTRING_FLAGGED_SPEC_RE.fullmatch(spec or "")
+    if m is None or kind not in {"int", "real", "logical"}:
+        return None
+    sign, alt, zero, width, prec, code = m.groups()
+    if sign in (None, "-") and not zero:
+        return None
+    flags = (sign if sign in ("+", " ") else "") + (alt or "") + (zero or "")
+    w = int(width) if width else 0
+    if code in (None, "d", "x") and kind in {"int", "logical"} and prec is None:
+        if kind == "logical":
+            expr_txt = f"merge(1, 0, {expr_txt})"
+        return f"py_format_int({expr_txt}, {w}, '{flags}', '{code or 'd'}')"
+    if code in {"e", "E", "f", "F", "g", "G"}:
+        if kind == "logical":
+            expr_txt = f"merge(1.0_dp, 0.0_dp, {expr_txt})"
+        elif kind == "int":
+            expr_txt = f"real({expr_txt}, kind=dp)"
+        p = int(prec) if prec is not None else 6
+        return f"py_format_real({expr_txt}, {p}, {w}, '{flags}', '{code}')"
+    raise NotImplementedError(f"f-string format spec {spec!r} for a {kind} value")
+
+
 def drop_unreachable_after_raise_or_return(tree):
     """Statements after a `raise`/`return` in the same block never run
     (Burkardt tetrahedron_exactness.py: `raise Exception(...)` followed by
@@ -17976,6 +18249,13 @@ def detect_needed_helpers(tree):
             # The function applied to each slice.
             extra.append(ast.Call(func=node.args[0], args=[node.args[2]], keywords=[]))
     for node in [n for n in ast.walk(tree)] + extra:
+        # f"{n:03d}" / f"{x:+.2f}": fstring_flagged_piece's helpers.
+        if (isinstance(node, ast.FormattedValue) and isinstance(node.format_spec, ast.JoinedStr)
+                and all(is_const_str(sp) for sp in node.format_spec.values)):
+            _spec = "".join(sp.value for sp in node.format_spec.values).strip()
+            _m = _FSTRING_FLAGGED_SPEC_RE.fullmatch(_spec)
+            if _m is not None and (_m.group(1) in ("+", " ") or _m.group(3)):
+                needed.update({"py_format_int", "py_format_real"})
         # a @ b may be of stacks of matrices (translator._stacked_linalg).
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
             needed.update({"stack_matmul_ss", "stack_matmul_sm", "stack_matmul_ms", "stack_matmul_sv",
@@ -27829,6 +28109,83 @@ def _reject_mixed_function_attribute_state(exec_body, local_funcs):
                     )
 
 
+def reject_shared_nested_list_copies(tree):
+    """`b = a[:]` (a.copy(), list(a), copy.copy(a)) of a nested list a
+    copies only the outer list: Python's a and b share their rows, so
+    `b[0][0] = 9` changes a too. A nested list is a 2-D array here, copied
+    by value, so that write silently left a unchanged. Reject a shallow
+    copy when either name then has an element of a row written (x[i][j] =,
+    x[i][j] += or a mutating x[i].append(...)); copies never written that
+    way are unaffected."""
+    def nested(v):
+        if isinstance(v, ast.List):
+            return any(isinstance(e, (ast.List, ast.ListComp)) for e in v.elts)
+        if isinstance(v, ast.ListComp):
+            return isinstance(v.elt, (ast.List, ast.ListComp))
+        if isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult):
+            return nested(v.left) or nested(v.right)
+        return False
+
+    def shallow_source(v):
+        if (isinstance(v, ast.Subscript) and isinstance(v.value, ast.Name) and isinstance(v.slice, ast.Slice)
+                and v.slice.lower is None and v.slice.upper is None and v.slice.step is None):
+            return v.value.id
+        if isinstance(v, ast.Call) and len(v.args) <= 1 and not v.keywords:
+            f = v.func
+            if (isinstance(f, ast.Attribute) and f.attr == "copy" and not v.args
+                    and isinstance(f.value, ast.Name)):
+                return f.value.id
+            if isinstance(f, ast.Name) and f.id == "list" and v.args and isinstance(v.args[0], ast.Name):
+                return v.args[0].id
+            if (isinstance(f, ast.Attribute) and f.attr == "copy" and isinstance(f.value, ast.Name)
+                    and f.value.id == "copy" and v.args and isinstance(v.args[0], ast.Name)):
+                return v.args[0].id
+        return None
+
+    def row_written(n):
+        # x[i][j] (store) or x[i].append(...): the name x, else None.
+        if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Subscript) and isinstance(n.value.value, ast.Name):
+            return n.value.value.id
+        return None
+
+    _mutators = {"append", "extend", "insert", "pop", "remove", "sort", "reverse", "clear"}
+
+    def scope_nodes(body):
+        stack = list(body)
+        while stack:
+            n = stack.pop()
+            yield n
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                stack.extend(ast.iter_child_nodes(n))
+
+    scopes = [tree.body] + [n.body for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for body in scopes:
+        nodes = list(scope_nodes(body))
+        nested_names = {t.id for n in nodes if isinstance(n, ast.Assign) and nested(n.value)
+                        for t in n.targets if isinstance(t, ast.Name)}
+        copies = [(n, t.id, src) for n in nodes if isinstance(n, ast.Assign)
+                  for src in [shallow_source(n.value)] if src in nested_names
+                  for t in n.targets if isinstance(t, ast.Name)]
+        if not copies:
+            continue
+        written = set()
+        for n in nodes:
+            if isinstance(n, (ast.Assign, ast.AugAssign, ast.Delete)):
+                for t in (n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target]):
+                    nm = row_written(t)
+                    if nm:
+                        written.add(nm)
+            elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _mutators
+                  and isinstance(n.func.value, ast.Subscript) and isinstance(n.func.value.value, ast.Name)):
+                written.add(n.func.value.value.id)
+        for n, dst, src in copies:
+            if dst in written or src in written:
+                raise NotImplementedError(
+                    f"`{ast.unparse(n)}` copies only the outer list: in Python {dst} and "
+                    f"{src} share their rows, so writing an element of a row changes both, but here they are "
+                    f"separate arrays (use copy.deepcopy, or build new rows, if the rows should be independent)")
+
+
 def reject_numpy_slice_view_swaps(exec_body, local_funcs):
     """Reject a bounded live-view swap that value-copy lowering changes.
 
@@ -29640,6 +29997,9 @@ class translator(ast.NodeVisitor):
             return (node.id in self.python_list_vars) or (nm in self.python_list_vars)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return self._is_python_list_expr(node.left) and self._is_python_list_expr(node.right)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            # [x] * n and n * [x]: list repetition
+            return self._is_python_list_expr(node.left) != self._is_python_list_expr(node.right)
         if isinstance(node, ast.IfExp):
             return self._is_python_list_expr(node.body) and self._is_python_list_expr(node.orelse)
         return False
@@ -32461,6 +32821,42 @@ class translator(ast.NodeVisitor):
             return 1, f"int({self.expr(size)})", "-1"
         raise NotImplementedError("random draws need a constant-rank size")
 
+    def _const_int_eval(self, node, depth=0):
+        """The value of an int expression of literals and integer constants
+        (+ - * // % **, unary -), else None."""
+        if depth > 50:
+            return None
+        if isinstance(node, ast.Constant):
+            return node.value if type(node.value) is int else None
+        if isinstance(node, ast.Name):
+            v = self._int_param_value(node)
+            if v is None:
+                v = (getattr(self, "module_int_consts", None) or {}).get(node.id)
+            return v if type(v) is int else None
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            v = self._const_int_eval(node.operand, depth + 1)
+            return None if v is None else (-v if isinstance(node.op, ast.USub) else v)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
+                                                                ast.Mod, ast.Pow)):
+            x = self._const_int_eval(node.left, depth + 1)
+            y = self._const_int_eval(node.right, depth + 1)
+            if x is None or y is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return x + y
+            if isinstance(node.op, ast.Sub):
+                return x - y
+            if isinstance(node.op, ast.Mult):
+                return x * y
+            if isinstance(node.op, (ast.FloorDiv, ast.Mod)):
+                if y == 0:
+                    return None
+                return x // y if isinstance(node.op, ast.FloorDiv) else x % y
+            if y < 0 or (abs(x) > 1 and y > 128):
+                return None
+            return x ** y
+        return None
+
     def _int_param_value(self, node):
         """The value of a name bound to an integer constant (b = -1), else None."""
         if isinstance(node, ast.Name) and node.id in self.params:
@@ -33436,6 +33832,43 @@ class translator(ast.NodeVisitor):
         node._xp2f_complex_canonical = new
         return new
 
+    def _reduction_initial_canonical(self, node):
+        """np.min(a, initial=v) -> np.minimum(np.min(a), v), and likewise
+        for max/amin/amax and the a.min()/a.max() methods (initial= was
+        ignored, so an empty a gave +-huge and a too-small initial was
+        lost). v is cast to a's dtype, as numpy does (np.max(ints,
+        initial=7.5) is 7); minval/maxval of an empty a is +-huge, so
+        np.minimum leaves v."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and any(kw.arg == "initial" for kw in node.keywords) and not SOURCE_USES_PANDAS):
+            return None
+        attr = node.func.attr
+        if is_numpy_name_node(node.func.value):
+            if attr not in {"min", "max", "amin", "amax"} or not node.args:
+                return None
+            arr, rest = node.args[0], list(node.args[1:])
+        elif attr in {"min", "max"} and int(self._rank_expr(node.func.value) or 0) >= 1:
+            arr, rest = node.func.value, list(node.args)
+        else:
+            return None
+        if any(kw.arg == "where" for kw in node.keywords):
+            raise NotImplementedError(f"np.{attr} with where= is not supported")
+        init = next(kw.value for kw in node.keywords if kw.arg == "initial")
+        ak = self._expr_kind(arr)
+        if ak == "int" and self._expr_kind(init) != "int":
+            init = ast.Call(func=ast.Name(id="int", ctx=ast.Load()), args=[init], keywords=[])
+        elif ak == "real" and self._expr_kind(init) == "int":
+            init = ast.Call(func=ast.Name(id="float", ctx=ast.Load()), args=[init], keywords=[])
+        elif ak not in {"int", "real"}:
+            raise NotImplementedError(f"np.{attr} with initial= supports int and float arrays only")
+        red = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()),
+                                          attr="min" if "min" in attr else "max", ctx=ast.Load()),
+                       args=[arr] + rest, keywords=[kw for kw in node.keywords if kw.arg != "initial"])
+        new = ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()),
+                                          attr="minimum" if "min" in attr else "maximum", ctx=ast.Load()),
+                       args=[red, init], keywords=[])
+        return ast.fix_missing_locations(ast.copy_location(new, node))
+
     def _canonical_numpy_call(self, node):
         """An equivalent, more directly translatable form of a numpy call
         or array method, or None: x.cumsum(axis=0) -> np.cumsum(x, axis=0);
@@ -33445,6 +33878,9 @@ class translator(ast.NodeVisitor):
         _cxc = self._complex_canonical(node)
         if _cxc is not None:
             return _cxc
+        _ini = self._reduction_initial_canonical(node)
+        if _ini is not None:
+            return _ini
         if (isinstance(node, ast.BinOp)
                 and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow))
                 and not SOURCE_USES_PANDAS):
@@ -33453,7 +33889,12 @@ class translator(ast.NodeVisitor):
             # first: the kinds of nested operands are costly to recompute).
             if not (self._maybe_logical(node.left) or self._maybe_logical(node.right)):
                 return None
-            lk, rk = self._expr_kind(node.left), self._expr_kind(node.right)
+            # [True] * n and [True] + [False] are list repetition and
+            # concatenation, not numpy arithmetic.
+            if isinstance(node.op, (ast.Mult, ast.Add)) and (
+                    self._is_python_list_expr(node.left) or self._is_python_list_expr(node.right)):
+                return None
+            lk, rk =self._expr_kind(node.left), self._expr_kind(node.right)
             # Cached by the operands' kinds: a function body is translated
             # once for each kind of its arguments (h(b, c) and h(xi, xi)).
             _ck = (lk, rk, int(self._rank_expr(node.left) or 0), int(self._rank_expr(node.right) or 0))
@@ -35402,6 +35843,16 @@ class translator(ast.NodeVisitor):
             if (isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.Sub))
                     and self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right)):
                 return self._expr_kind(node.left) or self._expr_kind(node.right)
+            # List repetition keeps the element kind ([True] * n is a bool
+            # list, not 0/1), as does concatenating two bool lists.
+            if isinstance(node.op, ast.Mult):
+                _ll, _rl = self._is_python_list_expr(node.left), self._is_python_list_expr(node.right)
+                if _ll != _rl:
+                    return self._expr_kind(node.left if _ll else node.right)
+            if (isinstance(node.op, ast.Add) and self._is_python_list_expr(node.left)
+                    and self._is_python_list_expr(node.right)
+                    and self._expr_kind(node.left) == self._expr_kind(node.right) == "logical"):
+                return "logical"
             if isinstance(node.op, ast.Add):
                 lk = self._expr_kind(node.left)
                 rk = self._expr_kind(node.right)
@@ -43376,7 +43827,10 @@ class translator(ast.NodeVisitor):
                 expr_txt = self.expr(part.value)
                 spec = _joinedstr_const_spec(part.format_spec)
                 align, width, prec, code = _joinedstr_parse_spec(spec)
-                if pv_kind == "char" and not spec:
+                _flagged = fstring_flagged_piece(spec, pv_kind, expr_txt)
+                if _flagged is not None:
+                    piece = _flagged
+                elif pv_kind == "char" and not spec:
                     piece = expr_txt
                 elif pv_kind in {"int", "logical"} and not spec:
                     piece = f"py_str({expr_txt})"
@@ -44104,6 +44558,14 @@ class translator(ast.NodeVisitor):
                     # An exponent of unknown sign: Python's result is a float
                     # for a negative one, Fortran's 0; py_ipow stops instead.
                     return f"py_ipow({a}, {b})"
+            if (op in (ast.Add, ast.Sub, ast.Mult) and lk0 == "int" and rk0 == "int"
+                    and "kind=8" not in a and "kind=8" not in b):
+                # a * a with a = 50000, b + 1 with b = 2147483647: a value
+                # known here to exceed default INTEGER wrapped silently;
+                # widen as for ** above.
+                _cv = self._const_int_eval(node)
+                if _cv is not None and not (-(2**31) <= _cv <= 2**31 - 1):
+                    a = f"int({a}, kind=8)"
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.UnaryOp):
@@ -65162,15 +65624,6 @@ class translator(ast.NodeVisitor):
                 self.o.w("end block")
                 return
 
-        # logical sieve init
-        if isinstance(t, ast.Name) and isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult):
-            if isinstance(v.left, ast.List) and len(v.left.elts) == 1 and is_bool_const(v.left.elts[0]):
-                name = t.id
-                self.o.w(f"if (allocated({name})) deallocate({name})")
-                self.o.w(f"allocate({name}(0:n))")
-                self.o.w(f"{name} = .true.")
-                return
-
         # subscript assignment
         if isinstance(t, ast.Subscript):
             def _array_assignment_rhs(rhs_node, rhs_text=None):
@@ -67301,8 +67754,18 @@ class translator(ast.NodeVisitor):
                     rtxt = self.expr(test.comparators[0])
                 except NotImplementedError:
                     return None
-                lv = _num_lit_from_expr(ltxt)
-                rv = _num_lit_from_expr(rtxt)
+
+                def _param_lit(txt):
+                    # An integer parameter of the main program (x = 0): the
+                    # branch it rules out is not compiled, so a guarded
+                    # 10 / x is not a compile-time division by zero.
+                    v = _num_lit_from_expr(txt)
+                    if v is None and self.current_function_name is None and txt.strip() in (self.params or {}):
+                        v = _num_lit_from_expr(str(self.params[txt.strip()]))
+                    return v
+
+                lv = _param_lit(ltxt)
+                rv = _param_lit(rtxt)
                 if lv is None or rv is None:
                     return None
                 op = test.ops[0]
@@ -72196,6 +72659,11 @@ class translator(ast.NodeVisitor):
                     expr_txt = self.expr(part.value)
                     spec = _joinedstr_const_spec(part.format_spec)
                     align, width, prec, code = _joinedstr_parse_spec(spec)
+                    _flagged = fstring_flagged_piece(spec, pv_kind, expr_txt)
+                    if _flagged is not None:
+                        fmt_parts.append("a")
+                        items.append(_flagged)
+                        continue
                     fcode = "g0"
 
                     if pv_kind == "char":
@@ -89828,6 +90296,8 @@ def transpile_file(
     _SOURCE_TOPLEVEL_LAYOUT = source_toplevel_layout(src)
     _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
+    tree = rewrite_loop_else(tree)
+    tree = rewrite_short_circuit_boolops(tree)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)
@@ -89837,6 +90307,7 @@ def transpile_file(
     if module_only:
         _prepare_module_interfaces(tree, assume_float, assume_scalar, elemental_pass)
     reject_undefined_names_in_functions(tree)
+    reject_shared_nested_list_copies(tree)
     tree = normalize_direct_array_aliases(tree)
     tree = rewrite_literal_string_sequence_lengths(tree)
     tree = rewrite_nullable_string_results(tree)
@@ -90663,6 +91134,8 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     _SOURCE_TOPLEVEL_LAYOUT = source_toplevel_layout(src)
     _SOURCE_LINE_INFO = source_line_info(src)
     tree = ast.parse(src)
+    tree = rewrite_loop_else(tree)
+    tree = rewrite_short_circuit_boolops(tree)
     tree = normalize_numpy_wildcard_imports(tree)
     tree = rewrite_pyccel_openmp_imports(tree)
     tree = rewrite_numba(tree)

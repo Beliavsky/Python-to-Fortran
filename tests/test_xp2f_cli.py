@@ -28387,3 +28387,185 @@ def test_xp2f_function_versions_per_kind_reach_callers_and_callees(tmp_path: Pat
         'print(u, v)\n'
         'print(x, t, p, q, r, s)\n'
     ), check_kinds=True)
+
+
+def test_xp2f_bool_list_repetition_is_a_logical_list(tmp_path: Path) -> None:
+    # [True] * (n + 1) had a special case allocating prime(0:n) (whatever
+    # n was) against 1-based indexing: writes went past the end, and
+    # prime[0] = False changed element 1. A numpy rule then made
+    # [True] * n integer 0/1 (and [True] + [False] would have been .or.).
+    _run_xp2f_compile_diff(tmp_path, "xsieve_bool_list.py", [
+        "n = 30",
+        "prime = [True] * (n + 1)",
+        "prime[0] = False",
+        "prime[1] = False",
+        "for p in range(2, n + 1):",
+        "    if prime[p]:",
+        "        for multiple in range(p * p, n + 1, p):",
+        "            prime[multiple] = False",
+        "count = 0",
+        "s = 0",
+        "for i in range(n + 1):",
+        "    if prime[i]:",
+        "        count += 1",
+        "        s += i",
+        "print(count, s, sum(prime))",
+        "m = 5",
+        "flags = [False] * m",
+        "flags[2] = True",
+        "g = [True] * 3 + [False]",
+        "print(sum(flags), sum(g), len(g), int(g[3]), int(flags[2]))",
+    ])
+    generated = (tmp_path / "xsieve_bool_list_p.f90").read_text(encoding="utf-8")
+    decls = re.findall(r"(?m)^\s*logical, allocatable :: (.*)$", generated)
+    assert any("prime(:)" in d for d in decls) and any("flags(:)" in d for d in decls), generated
+
+
+def test_xp2f_loop_else_runs_only_without_break(tmp_path: Path) -> None:
+    # The else block of a for/while loop was silently dropped.
+    _run_xp2f_compile_diff(tmp_path, "xloop_else.py", [
+        "def first_factor(n):",
+        "    for d in range(2, n):",
+        "        for k in range(3):",
+        "            if k == 1:",
+        "                break",
+        "        if n % d == 0:",
+        "            break",
+        "    else:",
+        "        return n",
+        "    return d",
+        "def total(xs):",
+        "    s = 0",
+        "    for x in xs:",
+        "        s += x",
+        "    else:",
+        "        s += 100",
+        "    return s",
+        "for target in [3, 9]:",
+        "    result = -1",
+        "    for i in range(5):",
+        "        if i == target:",
+        "            result = i",
+        "            break",
+        "    else:",
+        "        result = 100",
+        "    print(result)",
+        "for stop in [2, 9]:",
+        "    i = 0",
+        "    result = 0",
+        "    while i < 4:",
+        "        if i == stop:",
+        "            result = 1",
+        "            break",
+        "        i += 1",
+        "    else:",
+        "        result = 2",
+        "    print(result, i)",
+        "for n in [7, 12, 9]:",
+        "    print(n, first_factor(n))",
+        "print(total([1, 2, 3]))",
+    ])
+
+
+def test_xp2f_and_or_short_circuit_guards(tmp_path: Path) -> None:
+    # Fortran's .and./.or. need not short-circuit: `x != 0 and 10 / x > 1`
+    # divided by zero (SIGFPE at run time; with x = 0 a constant, a
+    # compile-time "Division by zero"), and `while j >= 0 and a[j] > key`
+    # read a(0).
+    _run_xp2f_compile_diff(tmp_path, "xshort_circuit.py", [
+        "def find(a, key):",
+        "    j = len(a) - 1",
+        "    while j >= 0 and a[j] > key:",
+        "        j -= 1",
+        "    return j",
+        "def safe_ratio(p, q):",
+        "    return q != 0 and p / q > 0.5",
+        "x = 0",
+        "print(int(x != 0 and 10 / x > 1), int(x == 0 or 10 / x > 1))",
+        "a = [1, 3, 5, 7]",
+        "print(find(a, 4), find(a, 0))",
+        "print(int(safe_ratio(1.0, 0.0)), int(safe_ratio(3.0, 4.0)))",
+        "for v in [0, 4]:",
+        "    ok = v != 0 and 7 % v == 3",
+        "    y = 1 if (v != 0 and 10 // v > 1) else 0",
+        "    print(int(ok), y, int(v == 0 or 10 // v > 1))",
+        "n = 3",
+        "k = 0",
+        "while n and k < n and a[k] < 5:",
+        "    k += 1",
+        "print(k)",
+        "for t in [0, 2, 5]:",
+        "    if t == 1:",
+        "        pass",
+        "    elif t != 0 and 10 % t == 0 and 10 // t > 3:",
+        "        print('elif', t)",
+    ])
+
+
+def test_xp2f_short_circuit_keeps_mixed_value_and_or_diagnostic(tmp_path: Path) -> None:
+    # Only and/or of boolean operands is lowered when used as a value: a
+    # bool/int mix would give the temporary two kinds.
+    src = tmp_path / "xsc_mixed.py"
+    src.write_text("for e in [0, 2]:\n    print((not e) or 5 % e)\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "`and`/`or` used as a value with non-boolean operands" in proc.stdout + proc.stderr
+
+
+def test_xp2f_min_max_initial(tmp_path: Path) -> None:
+    # initial= was ignored: an empty array gave +-huge, a larger initial
+    # was lost. numpy casts initial to the array's dtype.
+    _xp2f_output_matches_numpy(tmp_path, "xmin_initial", (
+        "import numpy as np\n"
+        "a = np.array([], dtype=np.float64)\n"
+        "b = np.array([3.0, -2.0, 5.0])\n"
+        "i = np.array([1, 2])\n"
+        "m = np.array([[1, 5], [3, 2]])\n"
+        "e = np.array([], dtype=int)\n"
+        "print(np.min(a, initial=10.0), np.max(a, initial=-10.0))\n"
+        "print(np.min(b, initial=0.0), np.max(b, initial=4.0), b.max(initial=9.0), np.amin(b, initial=-5.0))\n"
+        "print(np.min(i, initial=10.0), np.max(i, initial=7.5), np.min(e, initial=3), m.max(initial=6))\n"
+        "print(np.max(m, axis=0, initial=4), np.min(m, axis=1, initial=2))\n"
+    ), check_kinds=True)
+
+
+def test_xp2f_int_constant_arithmetic_beyond_int32_is_widened(tmp_path: Path) -> None:
+    # a * a with a = 50000 and b + 1 with b = 2147483647 wrapped silently.
+    _run_xp2f_compile_diff(tmp_path, "xint32_overflow.py", [
+        "a = 50000",
+        "b = 2147483647",
+        "print(a * a, a * a + 1, 3 * a * a, 2 * a)",
+        "print(b + 1, -b - 2, b - 1, 10 ** 12)",
+    ])
+
+
+def test_xp2f_fstring_sign_and_zero_pad_flags(tmp_path: Path) -> None:
+    # {n:03d} printed n=  7; the sign and 0 flags were skipped.
+    _run_xp2f_compile_diff(tmp_path, "xfstring_flags.py", [
+        "x = 1.25",
+        "n = 7",
+        "m = -42",
+        "print(f'n={n:03d} x={x:.2f}')",
+        "print(f'[{n:5d}] [{m:05d}] [{n:<4d}] [{x:08.3f}] [{m:+d}] [{n:+04d}] [{x:+.1f}]')",
+        "s = f'<{m:05d}|{x:+.1f}>'",
+        "print(s)",
+    ])
+
+
+def test_xp2f_shallow_copy_of_nested_list_with_row_writes_is_rejected(tmp_path: Path) -> None:
+    # b = a[:] shares a's rows in Python; the 2-D array copy did not, so
+    # b[0][0] = 9 silently left a unchanged.
+    src = tmp_path / "xshallow_nested.py"
+    src.write_text("a = [[1, 2], [3, 4]]\nb = a[:]\nb[0][0] = 9\nprint(a[0][0], b[0][0])\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)], cwd=tmp_path,
+                          capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "copies only the outer list" in proc.stdout + proc.stderr
+    # Replacing whole rows is the same with either semantics.
+    _run_xp2f_compile_diff(tmp_path, "xshallow_nested_ok.py", [
+        "a = [[1, 2], [3, 4]]",
+        "b = a[:]",
+        "b[1] = [7, 8]",
+        "print(a[1][0], b[1][0], b[0][1])",
+    ])
