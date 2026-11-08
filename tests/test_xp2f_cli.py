@@ -29013,6 +29013,37 @@ def test_xp2f_errstate_and_constant_guarded_division(tmp_path: Path) -> None:
     ])
 
 
+def test_xp2f_string_startswith_and_endswith(tmp_path: Path) -> None:
+    # s.startswith / s.endswith were unsupported outside a list-comprehension
+    # filter; lengths are compared exactly (Fortran's == pads with blanks).
+    _run_xp2f_compile_diff(tmp_path, "xstart_end.py", [
+        "def main():",
+        "    s = 'Hello, world!'",
+        "    print(s.startswith('Hello'), s.startswith('hello'), s.endswith('world'))",
+        "    print(s.startswith(('Hi', 'Hello')), s.endswith(('.', '?')))",
+        "    print(s.startswith('world', 7), s.endswith('world', 0, 12), s.lower().startswith('hello'))",
+        "    files = ['test.py', 'data.csv', 'test_utils.py', '']",
+        "    for f in files:",
+        "        if f.startswith('test') and f.endswith('.py'):",
+        "            print(f)",
+        "    p = '#'",
+        "    print(files[1].endswith(('.csv', p)), files[3].startswith(''), files[3].endswith('', 1))",
+        "    t = 'ab  '",
+        "    print(t.endswith(' '), t.endswith('b'), 'ab'.endswith('b '))",
+        "    s = 'abcab'",
+        "    nt = 0",
+        "    for q in ['', 'a', 'ab', 'cab', 'abcab', 'abcabx']:",
+        "        for i in [-7, -2, 0, 1, 4, 5, 6]:",
+        "            for j in [-7, -1, 0, 2, 5, 9]:",
+        "                if s.startswith(q, i, j):",
+        "                    nt += 1",
+        "                if s.endswith(q, i, j):",
+        "                    nt += 100",
+        "    print(nt)",
+        "main()",
+    ])
+
+
 def test_xp2f_int_kind_int64_keeps_int32_wraparound(tmp_path: Path) -> None:
     # --int-kind int64 made an int32 array 64-bit too, so a * a of
     # [50000] gave 2500000000 where numpy wraps to -1794967296.

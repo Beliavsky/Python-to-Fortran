@@ -177,6 +177,8 @@ public :: str_rfind !@pyapi kind=function ret=integer args=s:character:intent(in
 public :: str_replace !@pyapi kind=function ret=character args=s:character:intent(in),old:character:intent(in),new:character:intent(in) desc="replace all occurrences"
 public :: str_reverse !@pyapi kind=function ret=character args=s:character:intent(in) desc="reverse a string (Python's s[::-1])"
 public :: str_to_chars !@pyapi kind=function ret=character args=s:character:intent(in) desc="split a string into a rank-1 array of its own 1-character substrings"
+public :: py_startswith !@pyapi kind=function ret=logical args=s:character:intent(in),prefix:character:intent(in),start:integer:intent(in):optional,end:integer:intent(in):optional desc="Python s.startswith(prefix[, start[, end]])"
+public :: py_endswith !@pyapi kind=function ret=logical args=s:character:intent(in),suffix:character:intent(in),start:integer:intent(in):optional,end:integer:intent(in):optional desc="Python s.endswith(suffix[, start[, end]])"
 public :: str_zfill !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with zeros to given width"
 public :: str_head !@pyapi kind=function ret=character args=s:character:intent(in),n:integer:intent(in) desc="first n characters of s (Python s[:n] for n >= 0)"
 public :: py_repr_str !@pyapi kind=function ret=character args=s:character:intent(in) desc="Python repr() of a string: quoted, with backslashes and quotes escaped"
@@ -9427,6 +9429,52 @@ contains
             out(i) = s(i:i)
          end do
       end function str_to_chars
+
+      pure subroutine py_affix_bounds(n, lo, hi, start, end)
+         ! Python's slice bounds s[start:end] for startswith/endswith, as
+         ! 1-based lo and hi; lo > n + 1 means start is past the end.
+         integer, intent(in) :: n
+         integer, intent(out) :: lo, hi
+         integer, intent(in), optional :: start, end
+         lo = 0
+         hi = n
+         if (present(start)) then
+            lo = start
+            if (lo < 0) lo = max(lo + n, 0)
+         end if
+         if (present(end)) then
+            hi = end
+            if (hi < 0) then
+               hi = max(hi + n, 0)
+            else
+               hi = min(hi, n)
+            end if
+         end if
+         lo = lo + 1
+      end subroutine py_affix_bounds
+
+      elemental logical function py_startswith(s, prefix, start, end)
+         ! Lengths are compared exactly: Fortran's == pads with blanks.
+         character(len=*), intent(in) :: s, prefix
+         integer, intent(in), optional :: start, end
+         integer :: lo, hi
+         call py_affix_bounds(len(s), lo, hi, start, end)
+         py_startswith = .false.
+         if (lo > len(s) + 1) return
+         if (hi - lo + 1 < len(prefix)) return
+         py_startswith = s(lo:lo + len(prefix) - 1) == prefix
+      end function py_startswith
+
+      elemental logical function py_endswith(s, suffix, start, end)
+         character(len=*), intent(in) :: s, suffix
+         integer, intent(in), optional :: start, end
+         integer :: lo, hi
+         call py_affix_bounds(len(s), lo, hi, start, end)
+         py_endswith = .false.
+         if (lo > len(s) + 1) return
+         if (hi - lo + 1 < len(suffix)) return
+         py_endswith = s(hi - len(suffix) + 1:hi) == suffix
+      end function py_endswith
 
       function str_zfill(s, width) result(out)
          character(len=*), intent(in) :: s

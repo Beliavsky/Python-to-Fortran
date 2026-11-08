@@ -21108,6 +21108,8 @@ def detect_needed_helpers(tree):
                 and len(node.args) == 1
             ):
                 needed.add("py_str")
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"startswith", "endswith"}:
+                needed.add("py_" + node.func.attr)
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}
@@ -37688,6 +37690,9 @@ class translator(ast.NodeVisitor):
                 # .shift()/.rank() chained onto one -- a pure no-op
                 # passthrough (see the matching codegen case).
                 return "real"
+            if (isinstance(node.func, ast.Attribute) and node.func.attr in {"startswith", "endswith"}
+                    and self._expr_kind(node.func.value) == "char"):
+                return "logical"
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}:
                 return "char"
             if is_numpy_sliding_window_view_axis0_call(node) and len(node.args) >= 1:
@@ -43220,6 +43225,9 @@ class translator(ast.NodeVisitor):
                 stat_fn = node.func.attr
             if stat_fn == "quantiles":
                 return 1
+            if (isinstance(node.func, ast.Attribute) and node.func.attr in {"startswith", "endswith"}
+                    and self._expr_kind(node.func.value) == "char"):
+                return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "join"}:
                 return 0
             if (
@@ -44852,6 +44860,29 @@ class translator(ast.NodeVisitor):
         sl = new[0] if len(new) == 1 else ast.Tuple(elts=new, ctx=ast.Load())
         return ast.fix_missing_locations(ast.copy_location(
             ast.Subscript(value=node.value, slice=sl, ctx=node.ctx), node))
+
+    def _str_affix_text(self, node, base_text):
+        """s.startswith(p[, start[, end]]) / s.endswith(...): py_startswith /
+        py_endswith; a tuple of options is an .or. of the single tests."""
+        attr = node.func.attr
+        if node.keywords or not 1 <= len(node.args) <= 3:
+            raise NotImplementedError(f"{attr}() expects 1 to 3 positional arguments")
+        opts = node.args[0].elts if isinstance(node.args[0], ast.Tuple) else [node.args[0]]
+        if not opts:
+            return ".false."
+        for o in opts:
+            if self._expr_kind(o) != "char" or self._rank_expr(o) != 0:
+                raise NotImplementedError(f"{attr}() needs a string or a tuple of strings")
+        extra = []
+        for k, a in zip(("start", "end"), node.args[1:]):
+            if isinstance(a, ast.Constant) and a.value is None:
+                continue
+            if self._expr_kind(a) not in {"int", None} or self._rank_expr(a) != 0:
+                raise NotImplementedError(f"{attr}() {k} must be an integer")
+            extra.append(f"{k}=int({self.expr(a)})")
+        tail = "".join(", " + e for e in extra)
+        terms = [f"py_{attr}({base_text}, {self.expr(o)}{tail})" for o in opts]
+        return terms[0] if len(terms) == 1 else "(" + " .or. ".join(terms) + ")"
 
     def _expr_text(self, node):
         if isinstance(node, ast.Call):
@@ -48653,6 +48684,8 @@ class translator(ast.NodeVisitor):
                     # pure passthrough here, same reasoning as the
                     # df["col"].to_numpy() case above.
                     return base_expr
+                if attr in {"startswith", "endswith"} and self._expr_kind(node.func.value) == "char":
+                    return self._str_affix_text(node, base_expr)
                 if attr == "index" and len(node.args) == 1:
                     arg0 = self.expr(node.args[0])
                     if self._rank_expr(node.func.value) == 0 and self._expr_kind(node.func.value) == "char":
