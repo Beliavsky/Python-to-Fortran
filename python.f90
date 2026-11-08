@@ -456,9 +456,12 @@ public :: filtfilt_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:)
 public :: lfilter_zi_real !@pyapi kind=function ret=real(dp)(:) args=b:real(dp)(:):intent(in),a:real(dp)(:):intent(in) lib=signal desc="steady-state IIR filter initial state for a unit step input (scipy.signal.lfilter_zi)"
 public :: detrend_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),dtype:character:intent(in):optional lib=signal desc="remove linear or constant trend (scipy.signal.detrend)"
 public :: find_peaks_int !@pyapi kind=function ret=integer(:) args=x:real(dp)(:):intent(in),height:real(dp):intent(in):optional,distance:integer:intent(in):optional lib=signal desc="0-based local-maxima indices (scipy.signal.find_peaks, indices only)"
-public :: loadtxt_real_vector !@pyapi kind=function ret=real(dp)(:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional lib=io desc="np.loadtxt of a one-column (or flattened) text file as a real vector"
-public :: loadtxt_int_vector !@pyapi kind=function ret=integer(:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional lib=io desc="np.loadtxt(..., dtype=int) of a text file as an integer vector"
-public :: loadtxt_logical_vector !@pyapi kind=function ret=logical(:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional lib=io desc="np.loadtxt(..., dtype=bool) of a text file as a logical vector (nonzero is true)"
+public :: loadtxt_real_matrix !@pyapi kind=function ret=real(dp)(:,:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional,usecols:integer(:):intent(in):optional,name:character(*):intent(in):optional lib=io desc="np.loadtxt as a real matrix; stops if NumPy would drop a length-1 axis"
+public :: loadtxt_int_matrix !@pyapi kind=function ret=integer(:,:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional,usecols:integer(:):intent(in):optional,name:character(*):intent(in):optional lib=io desc="np.loadtxt as a int matrix; stops if NumPy would drop a length-1 axis"
+public :: loadtxt_logical_matrix !@pyapi kind=function ret=logical(:,:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional,usecols:integer(:):intent(in):optional,name:character(*):intent(in):optional lib=io desc="np.loadtxt as a logical matrix; stops if NumPy would drop a length-1 axis"
+public :: loadtxt_real_vector !@pyapi kind=function ret=real(dp)(:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional,ndmin:integer:intent(in):optional,name:character(*):intent(in):optional lib=io desc="np.loadtxt of a one-column (or flattened) text file as a real vector"
+public :: loadtxt_int_vector !@pyapi kind=function ret=integer(:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional,ndmin:integer:intent(in):optional,name:character(*):intent(in):optional lib=io desc="np.loadtxt(..., dtype=int) of a text file as an integer vector"
+public :: loadtxt_logical_vector !@pyapi kind=function ret=logical(:) args=path:character(*):intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character(*):intent(in):optional,comments:character(*):intent(in):optional,ndmin:integer:intent(in):optional,name:character(*):intent(in):optional lib=io desc="np.loadtxt(..., dtype=bool) of a text file as a logical vector (nonzero is true)"
 public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional lib=io desc="load real matrix text file with basic numpy-like options"
 public :: loadtxt_real_1d !@pyapi kind=function ret=real(dp)(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional lib=io desc="load one selected real column as vector"
 public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional lib=io desc="load integer matrix from text file"
@@ -2633,38 +2636,100 @@ contains
          end function count_tokens
       end function loadtxt_real_2d
 
-      function loadtxt_real_vector(path, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+      subroutine loadtxt_rank_stop(path, name, vector_found)
+         ! The rank chosen at translation time does not match the file:
+         ! say what NumPy returns and how to translate it.
+         character(len=*), intent(in) :: path
+         character(len=*), intent(in), optional :: name
+         logical, intent(in) :: vector_found
+         character(len=:), allocatable :: nm
+         if (present(name)) then
+            nm = name
+         else
+            nm = '<name>'
+         end if
+         if (vector_found) then
+            error stop 'loadtxt: ' // trim(path) // ' has one row or one column, so NumPy gives a 1-D array, ' // &
+               'but ' // nm // ' was translated as a matrix: rerun xp2f.py with --loadtxt-1d ' // nm // &
+               ', or pass ndmin=1 (a vector) or ndmin=2 (a matrix) to np.loadtxt'
+         else
+            error stop 'loadtxt: ' // trim(path) // ' holds a matrix, but ' // nm // &
+               ' was translated as a 1-D array (from --loadtxt-1d, ndmin=1 or how the program uses it)'
+         end if
+      end subroutine loadtxt_rank_stop
+
+      function loadtxt_real_matrix(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols, name) result(x)
+         ! np.loadtxt without ndmin=2 drops length-1 axes: a one-row or
+         ! one-column file is 1-D (one value is 0-d), not a matrix.
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
          character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: usecols(:)
+         character(len=*), intent(in), optional :: name
+         real(kind=dp), allocatable :: x(:,:)
+         x = loadtxt_real_2d(path, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments, usecols=usecols)
+         if (size(x,1) == 1 .or. size(x,2) == 1) call loadtxt_rank_stop(path, name, .true.)
+      end function loadtxt_real_matrix
+
+      function loadtxt_int_matrix(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols, name) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: usecols(:)
+         character(len=*), intent(in), optional :: name
+         integer, allocatable :: x(:,:)
+         x = loadtxt_int_2d(path, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments, usecols=usecols)
+         if (size(x,1) == 1 .or. size(x,2) == 1) call loadtxt_rank_stop(path, name, .true.)
+      end function loadtxt_int_matrix
+
+      function loadtxt_logical_matrix(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols, name) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: usecols(:)
+         character(len=*), intent(in), optional :: name
+         logical, allocatable :: x(:,:)
+         x = loadtxt_logical_2d(path, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments, usecols=usecols)
+         if (size(x,1) == 1 .or. size(x,2) == 1) call loadtxt_rank_stop(path, name, .true.)
+      end function loadtxt_logical_matrix
+
+      function loadtxt_real_vector(path, skiprows, max_rows, skip_footer, delimiter, comments, ndmin, name) result(x)
+         ! ndmin=1: a file with one value is a vector of length 1, as in NumPy.
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer, ndmin
+         character(len=*), intent(in), optional :: delimiter, comments, name
          real(dp), allocatable :: x(:), matrix(:,:)
          matrix = loadtxt_real_2d(path, skiprows=skiprows, max_rows=max_rows, &
             skip_footer=skip_footer, delimiter=delimiter, comments=comments)
-         if (size(matrix,1) > 1 .and. size(matrix,2) > 1) then
-            error stop 'loadtxt: vector required by program context, but file contains a matrix: ' // trim(path)
-         end if
+         if (size(matrix,1) > 1 .and. size(matrix,2) > 1) call loadtxt_rank_stop(path, name, .false.)
          if (size(matrix) == 1) then
-            error stop 'loadtxt: vector required by program context, but NumPy would return a scalar: ' // trim(path)
+            if (.not. present(ndmin)) then
+               error stop 'loadtxt: vector required by program context, but NumPy would return a scalar ' // &
+                  '(pass ndmin=1 for a vector): ' // trim(path)
+            end if
          end if
          x = reshape(matrix, [size(matrix)])
       end function loadtxt_real_vector
 
-      function loadtxt_int_vector(path, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+      function loadtxt_int_vector(path, skiprows, max_rows, skip_footer, delimiter, comments, ndmin, name) result(x)
          character(len=*), intent(in) :: path
-         integer, intent(in), optional :: skiprows, max_rows, skip_footer
-         character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer, ndmin
+         character(len=*), intent(in), optional :: delimiter, comments, name
          integer, allocatable :: x(:)
          x = int(loadtxt_real_vector(path, skiprows=skiprows, max_rows=max_rows, &
-            skip_footer=skip_footer, delimiter=delimiter, comments=comments))
+            skip_footer=skip_footer, delimiter=delimiter, comments=comments, ndmin=ndmin, name=name))
       end function loadtxt_int_vector
 
-      function loadtxt_logical_vector(path, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+      function loadtxt_logical_vector(path, skiprows, max_rows, skip_footer, delimiter, comments, ndmin, name) result(x)
          character(len=*), intent(in) :: path
-         integer, intent(in), optional :: skiprows, max_rows, skip_footer
-         character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer, ndmin
+         character(len=*), intent(in), optional :: delimiter, comments, name
          logical, allocatable :: x(:)
          x = loadtxt_real_vector(path, skiprows=skiprows, max_rows=max_rows, &
-            skip_footer=skip_footer, delimiter=delimiter, comments=comments) /= 0.0_dp
+            skip_footer=skip_footer, delimiter=delimiter, comments=comments, ndmin=ndmin, name=name) /= 0.0_dp
       end function loadtxt_logical_vector
 
       function loadtxt_real_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)

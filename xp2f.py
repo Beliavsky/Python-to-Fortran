@@ -4972,6 +4972,16 @@ def rewrite_nonzero_unpack(tree):
     class T(ast.NodeTransformer):
         def visit_Assign(self, st):
             v = st.value
+            if (len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                    and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "nonzero" and not v.args and not v.keywords
+                    and not (isinstance(v.func.value, ast.Name) and v.func.value.id in ("np", "numpy"))):
+                # x = a.nonzero() is x = np.nonzero(a): the method form was
+                # read as an index vector, so x[0] was its first element.
+                st.value = ast.copy_location(ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="nonzero", ctx=ast.Load()),
+                    args=[v.func.value], keywords=[]), v)
+                return st
             if not (len(st.targets) == 1 and isinstance(st.targets[0], (ast.Tuple, ast.List))
                     and isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
                     and v.func.attr == "nonzero" and not v.keywords):
@@ -19776,7 +19786,7 @@ def detect_needed_helpers(tree):
         "empty_like": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
         "ones_like": {"ones_int", "ones_real", "ones_logical", "ones_complex"},
         "full": {"arange_int"},
-        "nonzero": {"arange_int", "where_axis_2d"},
+        "nonzero": {"arange_int", "where_indices_2d", "where_axis_2d", "gather_where2d", "where_pair_2d"},
         "sort": {"sort_vec", "sorted_vec", "sorted_2d", "reversed_vec"},
         "flip": {"reversed_vec", "reversed_mat"},
         "argsort": {"argsort", "argsort_idx", "argsort_2d"},
@@ -19791,8 +19801,8 @@ def detect_needed_helpers(tree):
         "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real", "np_corrcoef_1", "corrcoef_matrix_rows_complex"},
         "convolve": {"convolve_real", "convolve_int"},
         "correlate": {"correlate_real"},
-        "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_vector", "loadtxt_int_vector", "loadtxt_logical_vector"},
-        "genfromtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
+        "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_vector", "loadtxt_int_vector", "loadtxt_logical_vector", "loadtxt_real_matrix", "loadtxt_int_matrix", "loadtxt_logical_matrix"},
+        "genfromtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d", "loadtxt_real_matrix", "loadtxt_int_matrix", "loadtxt_logical_matrix"},
         "savetxt": {"savetxt_real_2d", "np_fmt_number"},
         "pad": {"pad2d_int", "pad2d_real", "np_pad_indices", "np_pad_vec"},
         "allclose": {"allclose"},
@@ -33418,7 +33428,8 @@ class translator(ast.NodeVisitor):
             if isinstance(uc, ast.Constant) and isinstance(uc.value, int):
                 return True
             if isinstance(uc, (ast.Tuple, ast.List)):
-                return False
+                # usecols=[k]: NumPy drops the length-1 axis, as for k.
+                return len(uc.elts) == 1 and self._rank_expr(uc.elts[0]) == 0
             return self._rank_expr(uc) == 0
         return False
 
@@ -42257,9 +42268,22 @@ class translator(ast.NodeVisitor):
                 return None
         return base
 
+    def _matrix_nonzero_as_where(self, node):
+        """np.nonzero(a) of a matrix is np.where(a): the call is changed in
+        place, so every later use takes the matrix where path (the 1-D
+        nonzero path gave a rank-1 pack with a rank-2 mask)."""
+        if (isinstance(node, ast.Call) and self._is_numpy_call(node.func, {"nonzero"})
+                and len(node.args) == 1 and not node.keywords and self._rank_expr(node.args[0]) == 2):
+            node.func = ast.copy_location(ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()),
+                                                        attr="where", ctx=ast.Load()), node.func)
+            ast.fix_missing_locations(node)
+            return True
+        return False
+
     def _is_matrix_where(self, node):
         # A matrix nonzero tuple is stored internally as a 2-by-count integer
         # array, with zero-based coordinates in NumPy's row-major order.
+        self._matrix_nonzero_as_where(node)
         return (isinstance(node, ast.Call) and self._is_numpy_call(node.func, {"where"})
                 and len(node.args) == 1 and self._rank_expr(node.args[0]) == 2)
 
@@ -53303,6 +53327,7 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"loadtxt", "genfromtxt"}
                 and len(node.args) >= 1
             ):
+                _check_loadtxt_dtype(node)
                 skiprows_txt = None
                 max_rows_txt = None
                 skip_footer_txt = None
@@ -53332,6 +53357,9 @@ class translator(ast.NodeVisitor):
                         uc = kw.value
                         if isinstance(uc, ast.Constant) and isinstance(uc.value, int):
                             scalar_usecol_txt = f"int({self.expr(uc)})"
+                        elif (isinstance(uc, (ast.Tuple, ast.List)) and len(uc.elts) == 1
+                              and self._rank_expr(uc.elts[0]) == 0):
+                            scalar_usecol_txt = f"int({self.expr(uc.elts[0])})"
                         elif isinstance(uc, (ast.Tuple, ast.List)):
                             vals = []
                             ok = True
@@ -53379,12 +53407,25 @@ class translator(ast.NodeVisitor):
                     parts.append(f"comments={comments_txt}")
                 if (not scalar_usecols) and usecols_txt is not None:
                     parts.append(f"usecols={usecols_txt}")
+                _ld_target = getattr(node, '_xp2f_loadtxt_target', None)
                 if getattr(node, '_xp2f_vector_loadtxt', False):
                     helper_name = f"{helper_base}_vector"
+                    if getattr(node, '_xp2f_loadtxt_ndmin1', False):
+                        parts.append("ndmin=1")
+                    if _ld_target:
+                        parts.append(f'name="{_ld_target}"')
                 elif scalar_usecols:
                     helper_name = f"{helper_base}_1d"
-                else:
+                elif any(kw.arg == "ndmin" and isinstance(kw.value, ast.Constant) and kw.value.value == 2
+                         for kw in node.keywords):
                     helper_name = f"{helper_base}_2d"
+                else:
+                    # NumPy drops length-1 axes unless ndmin=2: the reader
+                    # stops rather than return a one-row or one-column
+                    # matrix where Python has a 1-D array.
+                    helper_name = f"{helper_base}_matrix"
+                    if _ld_target:
+                        parts.append(f'name="{_ld_target}"')
                 return helper_name + "(" + ", ".join(parts) + ")"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -56728,7 +56769,8 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.targets[0], (ast.Tuple, ast.List))
                     and isinstance(node.value, ast.Name)
                 ):
-                    src = node.value.id
+                    # The kind sets hold the renamed name (index -> xindex).
+                    src = self._aliased_name(node.value.id)
                     ksrc = None
                     if src in self.alloc_reals or src in self.reals:
                         ksrc = "real"
@@ -56859,6 +56901,7 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.value.func.value, ast.Name)
                     and node.value.func.value.id == "np"
                     and node.value.func.attr == "nonzero"
+                    and not self._matrix_nonzero_as_where(node.value)
                 ):
                     self._mark_alloc_int(node.targets[0].id, rank=1)
                     self.nonzero_tuple_vars.add(node.targets[0].id)
@@ -68103,6 +68146,12 @@ class translator(ast.NodeVisitor):
                 and is_numpy_name_node(v.func.value)
                 and v.func.attr in {"loadtxt", "genfromtxt"}
             ):
+                if re.search(r"\bloadtxt_(?:real|int|logical)_matrix\(", rhs_txt) and "usecols=" not in rhs_txt:
+                    rhs_txt = re.sub(r"\b(loadtxt_(?:real|int|logical))_matrix\(", r"\1_vector(", rhs_txt)
+                elif re.search(r"\bloadtxt_(?:real|int|logical)_matrix\(", rhs_txt):
+                    # The plain 2-D reader has no name argument.
+                    rhs_txt = re.sub(r"\b(loadtxt_(?:real|int|logical))_matrix\(", r"\1_2d(", rhs_txt)
+                    rhs_txt = re.sub(r', name="\w+"\)', ")", rhs_txt)
                 if re.search(r"\bloadtxt_(?:real|int|logical)_2d\(", rhs_txt):
                     rhs_txt = f"reshape({rhs_txt}, [size({rhs_txt})])"
             if tgt_rank == 2 and int(self._rank_expr(v)) == 1:
@@ -71063,21 +71112,32 @@ class translator(ast.NodeVisitor):
                 if rr == 2:
                     it_expr = self.expr(node.iter)
                     iv = self._fresh_scoped_names("i")
+                    # The aliased name: a loop variable named like a
+                    # Fortran intrinsic (index, len, ...) is renamed.
+                    _row_tgt = self._aliased_name(node.target.id)
                     if node.target.id != "_":
                         k_it = self._expr_kind(node.iter)
                         if k_it == "real":
-                            self._mark_alloc_real(node.target.id, rank=1)
+                            self._mark_alloc_real(_row_tgt, rank=1)
                         elif k_it == "logical":
-                            self._mark_alloc_log(node.target.id, rank=1)
+                            self._mark_alloc_log(_row_tgt, rank=1)
                         else:
-                            self._mark_alloc_int(node.target.id, rank=1)
+                            self._mark_alloc_int(_row_tgt, rank=1)
                     self.o.w("block")
                     self.o.push()
                     self.o.w(f"integer :: {iv}")
+                    if not re.fullmatch(r"[A-Za-z]\w*(?:%\w+)*", it_expr):
+                        # An expression cannot be subscripted in Fortran.
+                        _it_tmp = self._fresh_scoped_names("row_iter")
+                        _it_decl = {"real": "real(kind=dp)", "logical": "logical",
+                                    "complex": "complex(kind=dp)"}.get(self._expr_kind(node.iter), "integer")
+                        self.o.w(f"{_it_decl}, allocatable :: {_it_tmp}(:, :)")
+                        self.o.w(f"{_it_tmp} = {it_expr}")
+                        it_expr = _it_tmp
                     self.o.w(f"do {iv} = 1, size({it_expr}, 1)")
                     self.o.push()
                     if node.target.id != "_":
-                        self.o.w(f"{node.target.id} = {it_expr}({iv}, :)")
+                        self.o.w(f"{_row_tgt} = {it_expr}({iv}, :)")
                     _visit_loop_body_and_close_rebinds()
                     self.o.pop()
                     self.o.w("end do")
@@ -71102,21 +71162,30 @@ class translator(ast.NodeVisitor):
                 if _looks_like_row_unpack:
                     it_expr = self.expr(node.iter)
                     iv = self._fresh_scoped_names("i")
+                    _row_tgt = self._aliased_name(_row_nm)
                     if _row_nm != "_":
                         k_it = self._expr_kind(node.iter)
                         if k_it == "real":
-                            self._mark_alloc_real(_row_nm, rank=1)
+                            self._mark_alloc_real(_row_tgt, rank=1)
                         elif k_it == "logical":
-                            self._mark_alloc_log(_row_nm, rank=1)
+                            self._mark_alloc_log(_row_tgt, rank=1)
                         else:
-                            self._mark_alloc_int(_row_nm, rank=1)
+                            self._mark_alloc_int(_row_tgt, rank=1)
                     self.o.w("block")
                     self.o.push()
                     self.o.w(f"integer :: {iv}")
+                    if not re.fullmatch(r"[A-Za-z]\w*(?:%\w+)*", it_expr):
+                        # An expression cannot be subscripted in Fortran.
+                        _it_tmp = self._fresh_scoped_names("row_iter")
+                        _it_decl = {"real": "real(kind=dp)", "logical": "logical",
+                                    "complex": "complex(kind=dp)"}.get(self._expr_kind(node.iter), "integer")
+                        self.o.w(f"{_it_decl}, allocatable :: {_it_tmp}(:, :)")
+                        self.o.w(f"{_it_tmp} = {it_expr}")
+                        it_expr = _it_tmp
                     self.o.w(f"do {iv} = 1, size({it_expr}, 1)")
                     self.o.push()
                     if _row_nm != "_":
-                        self.o.w(f"{_row_nm} = {it_expr}({iv}, :)")
+                        self.o.w(f"{_row_tgt} = {it_expr}({iv}, :)")
                     _visit_loop_body_and_close_rebinds()
                     self.o.pop()
                     self.o.w("end do")
@@ -72632,8 +72701,8 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"if ({cnt} > size({name},1)) then")
                         self.o.push()
                         self.o.w(
-                            f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
-                            f"[size({name},1) + 1, size({name},2)])"
+                            f"{name} = reshape([reshape(transpose({name}), [size({name})]), reshape({val}, [size({val})])], "
+                            f"[size({name},1) + 1, size({name},2)], order=[2, 1])"
                         )
                         self.o.pop()
                         self.o.w("end if")
@@ -72645,8 +72714,9 @@ class translator(ast.NodeVisitor):
                         self.o.w(f"if ({cnt} > size({name},1)) then")
                         self.o.push()
                         self.o.w(
-                            f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
-                            f"[size({name},1) + 1, size({name},2), size({name},3)])"
+                            f"{name} = reshape([reshape(reshape({name}, [size({name},3), size({name},2), size({name},1)], "
+                            f"order=[3, 2, 1]), [size({name})]), reshape(transpose({val}), [size({val})])], "
+                            f"[size({name},1) + 1, size({name},2), size({name},3)], order=[3, 2, 1])"
                         )
                         self.o.pop()
                         self.o.w("end if")
@@ -72660,8 +72730,8 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"if (allocated({name})) then")
                     self.o.push()
                     self.o.w(
-                        f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
-                        f"[size({name},1) + 1, size({name},2)])"
+                        f"{name} = reshape([reshape(transpose({name}), [size({name})]), reshape({val}, [size({val})])], "
+                        f"[size({name},1) + 1, size({name},2)], order=[2, 1])"
                     )
                     self.o.pop()
                     self.o.w("else")
@@ -72675,8 +72745,9 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"if (allocated({name})) then")
                     self.o.push()
                     self.o.w(
-                        f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
-                        f"[size({name},1) + 1, size({name},2), size({name},3)])"
+                        f"{name} = reshape([reshape(reshape({name}, [size({name},3), size({name},2), size({name},1)], "
+                        f"order=[3, 2, 1]), [size({name})]), reshape(transpose({val}), [size({val})])], "
+                        f"[size({name},1) + 1, size({name},2), size({name},3)], order=[3, 2, 1])"
                     )
                     self.o.pop()
                     self.o.w("else")
@@ -75190,8 +75261,33 @@ def _comment_token_rank_for_name(token, name):
     return max(1, len(dim_parts))
 
 
-def infer_loadtxt_vector_context(body, local_funcs, comment_map):
+def _check_loadtxt_dtype(call):
+    """np.loadtxt / genfromtxt read numbers: a string, bytes, object or
+    complex dtype would otherwise be read silently as real numbers."""
+    for kw in call.keywords:
+        if kw.arg != "dtype":
+            continue
+        v = kw.value
+        txt = ""
+        if isinstance(v, ast.Name):
+            txt = v.id
+        elif isinstance(v, ast.Attribute):
+            txt = v.attr
+        elif isinstance(v, ast.Constant) and isinstance(v.value, str):
+            txt = v.value
+        low = txt.lower().lstrip("<>|=")
+        if (re.fullmatch(r"(?:[usvc]\d*|complex\d*|c(?:single|double|longdouble)|str_?|bytes_?|unicode_?|object_?|o)", low)
+                or (isinstance(v, ast.Constant) and v.value is None)):
+            raise NotImplementedError(
+                f"np.{call.func.attr}(..., dtype={ast.unparse(v)}) is unsupported: only numeric (int, float, bool) dtypes")
+
+
+def infer_loadtxt_vector_context(body, local_funcs, comment_map, forced_1d=None):
     """Honor documented vector parameters for single-assignment text loads.
+
+    Names in forced_1d (--loadtxt-1d) and loads with ndmin=1 are read as
+    vectors too. Each load assigned to a name records it for the reader's
+    error message.
 
     Follow single-assignment tuple results across local calls and wrappers.
     The corresponding runtime reader checks the data is actually vector-shaped.
@@ -75238,6 +75334,22 @@ def infer_loadtxt_vector_context(body, local_funcs, comment_map):
                         expected.setdefault(actual.id, set()).add(ranks[parameter])
             if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and isinstance(node.slice, ast.Tuple):
                 expected.setdefault(node.value.id, set()).add(len(node.slice.elts))
+            # An element used as a subscript is a scalar, so its array is
+            # 1-D: w[a[i]], or for v in a: ... w[v] / w[v - 1].
+            if isinstance(node, ast.Subscript) and not isinstance(node.slice, (ast.Tuple, ast.Slice)):
+                inner = node.slice
+                if (isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Name)
+                        and not isinstance(inner.slice, (ast.Tuple, ast.Slice))):
+                    expected.setdefault(inner.value.id, set()).add(1)
+            if (isinstance(node, ast.For) and isinstance(node.iter, ast.Name)
+                    and isinstance(node.target, ast.Name)):
+                v = node.target.id
+                for sub in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+                    if (isinstance(sub, ast.Subscript) and not isinstance(sub.slice, (ast.Tuple, ast.Slice))
+                            and any(isinstance(x, ast.Name) and x.id == v for x in ast.walk(sub.slice))
+                            and not (isinstance(sub.value, ast.Name) and sub.value.id == v)):
+                        expected.setdefault(node.iter.id, set()).add(1)
+                        break
         scopes[scope] = (nodes, stores, expected)
 
     # Connect single-assignment tuple-unpacked results to their originating
@@ -75282,17 +75394,39 @@ def infer_loadtxt_vector_context(body, local_funcs, comment_map):
                 rhs.update(combined)
                 changed = True
 
+    forced = set(forced_1d or ())
+    used_forced = set()
     for nodes, stores, expected in scopes.values():
         for node in nodes:
             if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
                 continue
             name, call = node.targets[0].id, node.value
-            if (stores.get(name) == 1 and expected.get(name) == {1}
-                    and isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-                    and is_numpy_name_node(call.func.value) and call.func.attr == 'loadtxt'
-                    and len(call.args) == 1
-                    and not any(kw.arg in {'ndmin', 'unpack', 'usecols'} or kw.arg is None for kw in call.keywords)):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and is_numpy_name_node(call.func.value) and call.func.attr == 'loadtxt'):
+                continue
+            call._xp2f_loadtxt_target = name
+            ndmin = None
+            for kw in call.keywords:
+                if kw.arg == 'ndmin' and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, int):
+                    ndmin = kw.value.value
+            if (len(call.args) != 1
+                    or any(kw.arg in {'unpack', 'usecols'} or kw.arg is None for kw in call.keywords)
+                    or (ndmin is None and any(kw.arg == 'ndmin' for kw in call.keywords))
+                    or (ndmin is not None and ndmin not in {0, 1})):
+                if name in forced:
+                    raise NotImplementedError(
+                        f"--loadtxt-1d {name}: its np.loadtxt call uses ndmin=2, unpack, usecols or extra "
+                        "positional arguments, which already decide the result's rank")
+                continue
+            if ndmin == 1:
+                call._xp2f_loadtxt_ndmin1 = True
+            if name in forced:
+                used_forced.add(name)
                 call._xp2f_vector_loadtxt = True
+            elif ndmin == 1 or (stores.get(name) == 1 and expected.get(name) == {1}):
+                call._xp2f_vector_loadtxt = True
+    for name in sorted(forced - used_forced):
+        print(f"Warning: --loadtxt-1d {name}: no '{name} = np.loadtxt(...)' assignment found", file=sys.stderr)
 
 
 def _arg_has_rank1_subscript_use(fn, name):
@@ -82265,6 +82399,9 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
         cached = _infer_local_name_spec_cache.get(cache_key)
         if cached is not None:
             return cached
+        # Provisional entry: a name reached again while its own spec is being
+        # computed (a.append(b) and b.append(a)) gets no evidence.
+        _infer_local_name_spec_cache[cache_key] = (None, 0)
         def _all_scalar_char_assignments():
             saw_assign = False
             for _st in _walk_fn(fn_node):
@@ -82345,6 +82482,41 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         elif best_kind is None or (_kk == "complex"):
                             best_kind = _kk
                         continue
+            if (
+                isinstance(_st, ast.Call)
+                and isinstance(_st.func, ast.Attribute)
+                and _st.func.attr == "append"
+                and isinstance(_st.func.value, ast.Name)
+                and _st.func.value.id == name_nm
+                and len(_st.args) == 1
+            ):
+                # name.append(row): one rank more than the row, e.g. a list
+                # of lists built row by row; row.copy(), list(row) and
+                # row[:] of another local list have that list's spec.
+                _a = _st.args[0]
+                if (isinstance(_a, ast.Call) and isinstance(_a.func, ast.Attribute)
+                        and _a.func.attr == "copy" and not _a.args):
+                    _a = _a.func.value
+                elif (isinstance(_a, ast.Call) and isinstance(_a.func, ast.Name)
+                        and _a.func.id == "list" and len(_a.args) == 1):
+                    _a = _a.args[0]
+                elif (isinstance(_a, ast.Subscript) and isinstance(_a.slice, ast.Slice)
+                        and _a.slice.lower is None and _a.slice.upper is None and _a.slice.step is None):
+                    _a = _a.value
+                _ak, _ar = None, 0
+                if isinstance(_a, ast.Name) and _a.id != name_nm and _a.id not in fn_arg_names:
+                    _ak, _ar = _infer_local_name_spec(fn_node, _a.id, tr_ctx)
+                elif isinstance(_a, (ast.List, ast.Tuple)) and _a.elts:
+                    try:
+                        _ak = tr_ctx._expr_kind(_a)
+                        _ar = int(tr_ctx._rank_expr(_a))
+                    except Exception:
+                        _ak = None
+                if _ar and _ar + 1 > best_rank:
+                    best_rank = _ar + 1
+                    if _ak is not None:
+                        best_kind = _ak
+                continue
             if not (
                 isinstance(_st, ast.Assign)
                 and len(_st.targets) == 1
@@ -92231,6 +92403,7 @@ def transpile_file(
     assume_float=False,
     assume_scalar=False,
     source_name=None,
+    loadtxt_1d=None,
 ):
     specialization_notes = set() if report_specializations else None
     if src_override is not None:
@@ -92581,7 +92754,8 @@ def transpile_file(
     local_funcs = prune_unused_string_length_helpers(effective_tree.body, local_funcs)
     annotate_local_set_provenance(effective_tree.body, local_funcs)
 
-    infer_loadtxt_vector_context(effective_tree.body, local_funcs, comment_map)
+    infer_loadtxt_vector_context(effective_tree.body, local_funcs, comment_map,
+                                 forced_1d=[s.strip() for s in (loadtxt_1d or "").split(",") if s.strip()])
 
     params = find_parameters(effective_tree, local_funcs)
     # A local function's own translator is deliberately constructed with
@@ -93293,6 +93467,7 @@ def main():
     ap.add_argument("--out", help="output .f90 path (default: input basename with _p.f90)")
     ap.add_argument("--source-name", help="logical source filename for generated program/module names and header (does not change import resolution or output path)")
     ap.add_argument("--module", action="store_true", help="emit a Fortran procedure module without a main program; --compile creates an object file")
+    ap.add_argument("--loadtxt-1d", metavar="NAMES", default=None, help="comma-separated names of variables assigned from np.loadtxt to read as 1-D arrays, where the program gives no evidence of the rank (NumPy drops the length-1 axis of a one-column or one-row file); the reader still stops if the file holds a matrix")
     ap.add_argument("--assume-float", action="store_true", help="with --module, explicitly assume real type for unresolved arguments (with a warning)")
     ap.add_argument("--assume-scalar", action="store_true", help="with --module, explicitly assume scalar rank for unresolved arguments (with a warning)")
     ap.add_argument("--strict", action="store_true", help="strict Python-source validation mode (no transpilation)")
@@ -93829,6 +94004,7 @@ def main():
             assume_float=args.assume_float,
             assume_scalar=args.assume_scalar,
             source_name=args.source_name,
+            loadtxt_1d=args.loadtxt_1d,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:

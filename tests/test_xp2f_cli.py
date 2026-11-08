@@ -12444,7 +12444,7 @@ def test_xp2f_loadtxt_documented_vector_context(tmp_path: Path, dtype: str, comm
     helper_kind = {'float': 'real', 'int': 'int', 'bool': 'logical'}[dtype]
     assert f'loadtxt_{helper_kind}_vector' in generated
     exe = tmp_path / 'xvector_context_p.exe'
-    for contents, message in [('1 2\n3 4\n', 'file contains a matrix'), ('1\n', 'would return a scalar')]:
+    for contents, message in [('1 2\n3 4\n', 'holds a matrix, but'), ('1\n', 'would return a scalar')]:
         (tmp_path / 'values.txt').write_text(contents, encoding='utf-8')
         run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True)
         assert run.returncode != 0
@@ -12475,7 +12475,7 @@ def test_xp2f_loadtxt_vector_context_through_tuple_return(tmp_path: Path, dtype:
     generated = (tmp_path / 'xtuple_load_p.f90').read_text(encoding='utf-8')
     helper_kind = {'float': 'real', 'int': 'int', 'bool': 'logical'}[dtype]
     assert f'loadtxt_{helper_kind}_vector' in generated
-    for contents, message in [('1 2\n3 4\n', 'file contains a matrix'), ('1\n', 'would return a scalar')]:
+    for contents, message in [('1 2\n3 4\n', 'holds a matrix, but'), ('1\n', 'would return a scalar')]:
         (tmp_path / 'values.txt').write_text(contents, encoding='utf-8')
         run = subprocess.run([str(tmp_path / 'xtuple_load_p.exe')], cwd=tmp_path, capture_output=True, text=True)
         assert run.returncode != 0
@@ -12515,7 +12515,7 @@ def test_xp2f_loadtxt_matrix_context_is_preserved(tmp_path: Path) -> None:
         'print(a @ a)',
     ])
     generated = (tmp_path / 'xmatrix_context_p.f90').read_text(encoding='utf-8')
-    assert 'loadtxt_real_2d' in generated
+    assert 'loadtxt_real_matrix' in generated
     assert 'loadtxt_real_vector' not in generated
 
 
@@ -29041,6 +29041,145 @@ def test_xp2f_string_startswith_and_endswith(tmp_path: Path) -> None:
         "                    nt += 100",
         "    print(nt)",
         "main()",
+    ])
+
+
+def test_xp2f_loadtxt_rank_follows_numpy_and_rejects_string_dtype(tmp_path: Path) -> None:
+    # np.loadtxt of a one-column file is 1-D in NumPy but was read as an
+    # (n, 1) matrix (a.shape printed (3, 1)); usecols=[k] is 1-D too;
+    # dtype=str was read as real numbers.
+    (tmp_path / "col.txt").write_text("2\n0\n1\n", encoding="utf-8")
+    (tmp_path / "mat.txt").write_text("1 2\n3 4\n", encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xloadtxt_rank.py", [
+        "import numpy as np",
+        "w = ['a', 'b', 'c']",
+        "idx = np.loadtxt('col.txt', dtype=int)",
+        "print(idx.ndim)",
+        "for k in idx:",
+        "    print(w[k])",
+        "m = np.loadtxt('mat.txt')",
+        "print(m.ndim, m.shape[0], m.shape[1], m[1, 0])",
+        "z = np.loadtxt('col.txt', ndmin=2)",
+        "print(z.ndim, z.shape[0], z.shape[1])",
+        "c = np.loadtxt('mat.txt', dtype=int, usecols=[1])",
+        "print(c.ndim, len(c), c)",
+    ])
+    src = tmp_path / "xloadtxt_column.py"
+    src.write_text("import numpy as np\na = np.loadtxt('col.txt')\nprint(a.shape)\n", encoding="utf-8")
+    build = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile"],
+                           cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run([str(tmp_path / "xloadtxt_column_p.exe")], cwd=tmp_path,
+                         capture_output=True, text=True, check=False)
+    assert run.returncode != 0
+    assert "so NumPy gives a 1-D array, but a was translated as a matrix" in run.stdout + run.stderr
+    src = tmp_path / "xloadtxt_str.py"
+    src.write_text("import numpy as np\nd = np.loadtxt('mat.txt', dtype=str)\nprint(d)\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src)],
+                          cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "dtype=str) is unsupported" in proc.stdout + proc.stderr
+
+
+def test_xp2f_loadtxt_1d_option_ndmin1_and_rank_message(tmp_path: Path) -> None:
+    # A one-column file with no evidence of the rank stopped with no hint of
+    # a fix; --loadtxt-1d x reads x as a vector, and ndmin=1 does too.
+    (tmp_path / "x.txt").write_text("1.5\n2.5\n4.0\n", encoding="utf-8")
+    (tmp_path / "one.txt").write_text("7.5\n", encoding="utf-8")
+    src = tmp_path / "xload1d.py"
+    src.write_text("import numpy as np\nx = np.loadtxt('x.txt')\nprint(x.mean(), len(x))\n", encoding="utf-8")
+    exe = tmp_path / "xload1d_p.exe"
+
+    def build(*extra):
+        proc = subprocess.run([sys.executable, str(XP2F_PATH), str(src), "--compile", *extra],
+                              cwd=tmp_path, capture_output=True, text=True, check=False)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc
+
+    build()
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert run.returncode != 0
+    assert "but x was translated as a matrix: rerun xp2f.py with --loadtxt-1d x" in run.stdout + run.stderr
+    build("--loadtxt-1d", "x")
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert run.stdout.split() == ["2.6666666666666665", "3"]
+    (tmp_path / "x.txt").write_text("1 2\n3 4\n", encoding="utf-8")
+    run = subprocess.run([str(exe)], cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert run.returncode != 0
+    assert "x.txt holds a matrix, but x was translated as a 1-D array" in run.stdout + run.stderr
+    assert "no 'y = np.loadtxt(...)' assignment found" in build("--loadtxt-1d", "y").stderr
+    (tmp_path / "x.txt").write_text("1.5\n2.5\n4.0\n", encoding="utf-8")
+    _run_xp2f_compile_diff(tmp_path, "xload_ndmin1.py", [
+        "import numpy as np",
+        "x = np.loadtxt('x.txt', ndmin=1)",
+        "print(x.ndim, len(x), x.mean())",
+        "v = np.loadtxt('one.txt', ndmin=1)",
+        "print(v.ndim, len(v), v[0])",
+    ])
+
+
+def test_xp2f_appended_rows_keep_their_order_and_row_loop_names(tmp_path: Path) -> None:
+    # B.append([i, 10 + i, 20 + i]) grew B by a column-major reshape, which
+    # scrambled the earlier rows; a function returning a list built that way
+    # was an error; for index in m (a 2-D array) left index undeclared.
+    _run_xp2f_compile_diff(tmp_path, "xappend_rows.py", [
+        "import numpy as np",
+        "B = []",
+        "for i in range(3):",
+        "    B.append([i, 10 + i, 20 + i])",
+        "print(B[0], B[1], B[2])",
+        "T = []",
+        "for i in range(3):",
+        "    T.append(np.array([[i, 10 + i, 20 + i], [30 + i, 40 + i, 50 + i]]))",
+        "print(T[0][1][2], T[1][0][1], T[2][1][0], len(T))",
+        "def magic(n):",
+        "    row = []",
+        "    for j in range(0, n):",
+        "        row.append(0)",
+        "    A = []",
+        "    for i in range(0, n):",
+        "        A.append(row.copy())",
+        "    A[1][2] = 5",
+        "    return A",
+        "r = magic(3)",
+        "print(r[1], r[0])",
+        "def main():",
+        "    m = np.array([[1, 2], [3, 4]])",
+        "    for index in m:",
+        "        print(index.sum())",
+        "main()",
+        "for index in np.array([[1.0, 2.0], [3.0, 5.0]]):",
+        "    a, b = index",
+        "    print(a * b)",
+    ])
+
+
+def test_xp2f_nonzero_tuple_of_matrix_and_method_form(tmp_path: Path) -> None:
+    # k = np.nonzero(G) of a matrix was a rank-1 pack with a rank-2 mask
+    # (a build error); it is a where tuple, numbered in row-major order.
+    # q = w.nonzero() was read as the index vector, so q[0] printed 0.
+    _run_xp2f_compile_diff(tmp_path, "xnonzero_tuple.py", [
+        "import numpy as np",
+        "G = np.array([[0, 1, 1], [1, 0, 1]])",
+        "k = np.nonzero(G)",
+        "print(len(k[0]))",
+        "print(k[0])",
+        "print(k[1])",
+        "G[k] = list(range(1, len(k[0]) + 1))",
+        "print(G)",
+        "A = np.array([[0.0, 1.5, 2.0], [3.0, 0.0, 0.5]])",
+        "print(A[np.nonzero(A > 1.0)])",
+        "print(np.nonzero(A)[1])",
+        "m = A.nonzero()",
+        "print(m[0])",
+        "q = np.nonzero(A > 1.0)",
+        "A[q] = -1.0",
+        "print(A.sum())",
+        "w = np.array([3, 0, 7])",
+        "p = w.nonzero()",
+        "print(p[0])",
+        "print(w[p])",
     ])
 
 
