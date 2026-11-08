@@ -8951,7 +8951,7 @@ contains
             d = 0
          end if
          if (n <= d .or. n <= 0) then
-            var_1d = 0.0_dp
+            var_1d = ieee_value(0.0_dp, ieee_quiet_nan)  ! numpy/pandas: nan
             return
          end if
          mu = mean(x)
@@ -14984,7 +14984,7 @@ contains
             d = 0
          end if
          if (n <= d .or. n <= 0) then
-            var = 0.0_dp
+            var = ieee_value(0.0_dp, ieee_quiet_nan)  ! numpy: nan (no degrees of freedom)
             return
          end if
          mu = mean(x)
@@ -14994,7 +14994,7 @@ contains
       pure real(kind=dp) function mean(x)
          real(kind=dp), intent(in) :: x(:)
          if (size(x) <= 0) then
-            mean = 0.0_dp
+            mean = ieee_value(0.0_dp, ieee_quiet_nan)  ! numpy: nan for an empty array
          else
             mean = sum(x) / real(size(x), kind=dp)
          end if

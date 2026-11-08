@@ -71,10 +71,11 @@ def test_legacy_mean_wrapper(tmp_path):
     source.write_text("""program legacy
 use python_mod, only: mean, mean_1d
 use, intrinsic :: iso_fortran_env, only: real64
+use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
 implicit none
 real(real64) :: x(3) = [1.0_real64, 2.0_real64, 6.0_real64], empty(0)
 if (mean_1d(x) /= mean(x)) stop 1
-if (mean_1d(empty) /= 0.0_real64) stop 2
+if (.not. ieee_is_nan(mean_1d(empty))) stop 2  ! numpy: nan
 end program legacy
 """, encoding="utf-8")
     executable = tmp_path / "legacy.exe"

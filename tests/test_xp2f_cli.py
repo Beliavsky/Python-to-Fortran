@@ -28915,6 +28915,104 @@ def test_xp2f_generator_assigned_to_a_name_is_a_cursor(tmp_path: Path) -> None:
     assert "generator g is supported only with next(), a for loop" in proc.stdout + proc.stderr
 
 
+def test_xp2f_list_iadd_and_length_changing_slice_assignment(tmp_path: Path) -> None:
+    # a += [3] of a list was a = a + [3] (elementwise; a bound mismatch, or
+    # a wrong answer without bounds checks), and a[1:3] = [8, 9, 10] was a
+    # section assignment of the wrong length.
+    _run_xp2f_compile_diff(tmp_path, "xlist_resize.py", [
+        "import numpy as np",
+        "a = [1, 2]",
+        "b = a",
+        "a += [3]",
+        "print(len(a), len(b), b[-1])",
+        "m = [1]",
+        "for i in range(3):",
+        "    m += [i * 2]",
+        "print(m)",
+        "z = np.array([1.0, 2.0])",
+        "z += [10.0, 20.0]",
+        "print(z)",
+        "c = [0, 1, 2, 3, 4]",
+        "c[1:3] = [8, 9, 10]",
+        "print(len(c), c)",
+        "c[:2] = [7]",
+        "c[4:] = []",
+        "c[2:2] = [5, 6]",
+        "c[3:1] = [99]",
+        "print(c)",
+        "i = 1",
+        "j = 3",
+        "c[i:j] = [i * 10, j * 10, 0, 0]",
+        "print(c)",
+        "c[::2] = [20, 21, 22, 23, 24]",
+        "print(c)",
+        "x = np.arange(5)",
+        "x[1:3] = [8, 9]",
+        "print(x)",
+    ])
+
+
+def test_xp2f_out_argument_ufunc_at_warnings_and_empty_mean(tmp_path: Path) -> None:
+    # np.f(..., out=b), np.add.at, warnings.simplefilter were unsupported;
+    # np.mean of an empty array and np.var with no degrees of freedom gave 0
+    # where numpy gives nan.
+    _run_xp2f_compile_diff(tmp_path, "xout_at.py", [
+        "import numpy as np",
+        "import warnings",
+        "a = np.array([1.0, 2.0, 3.0])",
+        "b = np.zeros(3)",
+        "np.multiply(a, 2.0, out=b)",
+        "np.add(a, 1.0, out=a)",
+        "print(a, b)",
+        "y = np.empty((2, 3))",
+        "np.sqrt(np.arange(6.0).reshape(2, 3), out=y)",
+        "print(y[1, 2])",
+        "z = np.zeros(3)",
+        "t = np.add(np.ones(3), 2.0, out=z)",
+        "print(z, t)",
+        "c = np.zeros(4)",
+        "i = np.array([0, 2, 2, 3, 0])",
+        "np.add.at(c, i, np.array([1.0, 2.0, 3.0, 4.0, 5.0]))",
+        "print(c)",
+        "d = np.zeros((2, 3), dtype=np.int64)",
+        "np.add.at(d, (np.array([0, 1, 1, 0]), np.array([2, 0, 0, 2])), 1)",
+        "print(d)",
+        "m = np.array([5.0, 1.0, 2.0])",
+        "np.maximum.at(m, [1, 1, 2], [3.0, 4.0, 1.0])",
+        "print(m)",
+        "with warnings.catch_warnings():",
+        "    warnings.simplefilter('ignore', RuntimeWarning)",
+        "    e = np.mean(np.array([], dtype=np.float64))",
+        "    v = np.var(np.array([1.0]), ddof=1)",
+        "print(np.isnan(e), np.isnan(v), np.mean(np.array([1.0, 3.0])))",
+    ])
+
+
+def test_xp2f_errstate_and_constant_guarded_division(tmp_path: Path) -> None:
+    # Inside np.errstate the build's trap stopped a division by zero
+    # (SIGFPE) where numpy gives inf/nan, and a constant one was a
+    # compile-time error; x = 0.0; x != 0 and 1.0 / x > 0.1 also divided
+    # constants by zero at compile time.
+    _run_xp2f_compile_diff(tmp_path, "xerrstate.py", [
+        "import numpy as np",
+        "with np.errstate(divide='ignore', invalid='ignore'):",
+        "    a = np.array([1.0, 0.0, -1.0]) / 0.0",
+        "    q = np.log(np.array([0.0, 1.0]))",
+        "print(np.isposinf(a[0]), np.isnan(a[1]), np.isneginf(a[2]), np.isneginf(q[0]))",
+        "u = np.array([1.0, 0.0, -1.0, 4.0])",
+        "w = np.array([0.0, 0.0, 0.0, 2.0])",
+        "with np.errstate(all='ignore'):",
+        "    r = u / w",
+        "print(np.isposinf(r[0]), np.isnan(r[1]), r[3])",
+        "x = 0.0",
+        "g = x != 0 and 1.0 / x > 0.1",
+        "print(g)",
+        "z = 0.0",
+        "if z == 0.0 or 1.0 / z > 1:",
+        "    print('guarded')",
+    ])
+
+
 def test_xp2f_int_kind_int64_keeps_int32_wraparound(tmp_path: Path) -> None:
     # --int-kind int64 made an int32 array 64-bit too, so a * a of
     # [50000] gave 2500000000 where numpy wraps to -1794967296.

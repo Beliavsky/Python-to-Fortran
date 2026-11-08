@@ -6015,6 +6015,142 @@ def rewrite_generator_cursors(tree):
     return ast.fix_missing_locations(tree)
 
 
+_UFUNC_AT_OPS = {"add": ast.Add, "subtract": ast.Sub, "multiply": ast.Mult, "divide": ast.Div,
+                 "true_divide": ast.Div, "floor_divide": ast.FloorDiv, "power": ast.Pow}
+_WARNING_NOOPS = {"simplefilter", "filterwarnings", "resetwarnings"}
+
+
+def rewrite_numpy_out_at_and_warnings(tree):
+    """Statement forms that were unsupported:
+
+    - np.multiply(a, 2.0, out=b) (any np function with out=): b[...] =
+      np.multiply(a, 2.0); c = np.add(a, b, out=d) also sets c = d.
+    - np.add.at(b, i, v) (subtract, multiply, divide, floor_divide, power,
+      maximum, minimum): unbuffered, so a repeated index is applied each
+      time, unlike b[i] += v: for k in range(len(i)): b[i[k]] += v[k] (v
+      broadcast to i's length first unless it is a constant). A tuple of
+      index arrays indexes each axis.
+    - with warnings.catch_warnings(): body, and warnings.simplefilter /
+      filterwarnings / resetwarnings calls: the body alone (the output on
+      stdout does not change)."""
+    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    counter = [0]
+
+    def fresh(base):
+        while True:
+            counter[0] += 1
+            nm = f"{base}_{counter[0]}"
+            if nm not in used:
+                used.add(nm)
+                return nm
+
+    def is_np(n):
+        return isinstance(n, ast.Name) and n.id in ("np", "numpy")
+
+    def L(nm):
+        return ast.Name(id=nm, ctx=ast.Load())
+
+    def out_target(call):
+        for kw in call.keywords:
+            if kw.arg == "out":
+                v = kw.value
+                if isinstance(v, ast.Tuple):
+                    if len(v.elts) != 1:
+                        raise NotImplementedError("out= with more than one array is not supported")
+                    v = v.elts[0]
+                return v
+        return None
+
+    def ufunc_at(call):
+        f = call.func
+        if not (isinstance(f, ast.Attribute) and f.attr == "at" and isinstance(f.value, ast.Attribute)
+                and is_np(f.value.value) and (f.value.attr in _UFUNC_AT_OPS or f.value.attr in ("maximum", "minimum"))):
+            return None
+        if call.keywords or len(call.args) != 3:
+            raise NotImplementedError(f"np.{f.value.attr}.at needs (array, indices, values)")
+        return f.value.attr
+
+    def lower_at(op, call, at):
+        arr, idx, vals = call.args
+        out = []
+        idxs = list(idx.elts) if isinstance(idx, ast.Tuple) else [idx]
+        names = []
+        for e in idxs:
+            if isinstance(e, ast.Slice) or (isinstance(e, ast.Constant) and e.value is Ellipsis):
+                raise NotImplementedError(f"np.{op}.at with a slice index is not supported")
+            nm = fresh("at_idx")
+            out.append(ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=ast.Call(
+                func=ast.Attribute(value=L("np"), attr="asarray", ctx=ast.Load()), args=[e], keywords=[])))
+            names.append(nm)
+        k = fresh("at_k")
+        const = isinstance(vals, ast.Constant) or (isinstance(vals, ast.UnaryOp) and isinstance(vals.operand, ast.Constant))
+        if const:
+            val_k = vals
+        else:
+            vn = fresh("at_val")
+            # v + 0 * idx: v broadcast to the index length, keeping its kind.
+            out.append(ast.Assign(targets=[ast.Name(id=vn, ctx=ast.Store())], value=ast.BinOp(
+                left=ast.Call(func=ast.Attribute(value=L("np"), attr="asarray", ctx=ast.Load()), args=[vals],
+                              keywords=[]),
+                op=ast.Add(), right=ast.BinOp(left=ast.Constant(0), op=ast.Mult(), right=L(names[0])))))
+            val_k = ast.Subscript(value=L(vn), slice=L(k), ctx=ast.Load())
+        sub = [ast.Subscript(value=L(nm), slice=L(k), ctx=ast.Load()) for nm in names]
+        slc = sub[0] if len(sub) == 1 else ast.Tuple(elts=sub, ctx=ast.Load())
+        tgt = ast.Subscript(value=copy.deepcopy(arr), slice=slc, ctx=ast.Store())
+        if op in ("maximum", "minimum"):
+            cur = ast.Subscript(value=copy.deepcopy(arr), slice=copy.deepcopy(slc), ctx=ast.Load())
+            body = [ast.Assign(targets=[tgt], value=ast.Call(func=ast.Attribute(value=L("np"), attr=op, ctx=ast.Load()),
+                                                             args=[cur, val_k], keywords=[]))]
+        else:
+            body = [ast.AugAssign(target=tgt, op=_UFUNC_AT_OPS[op](), value=val_k)]
+        out.append(ast.For(target=ast.Name(id=k, ctx=ast.Store()), iter=ast.Call(
+            func=L("range"), args=[ast.Call(func=L("len"), args=[L(names[0])], keywords=[])], keywords=[]),
+            body=body, orelse=[]))
+        return [ast.copy_location(s, at) for s in out]
+
+    def is_warnings_call(n, names):
+        return (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == "warnings" and n.func.attr in names)
+
+    def block(stmts):
+        out = []
+        for st in stmts:
+            for field in ("body", "orelse", "finalbody"):
+                sub = getattr(st, field, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    setattr(st, field, block(sub))
+            for h in getattr(st, "handlers", None) or []:
+                h.body = block(h.body)
+            if isinstance(st, ast.With) and all(is_warnings_call(it.context_expr, {"catch_warnings"})
+                                                 and it.optional_vars is None for it in st.items):
+                out.extend(st.body)
+                continue
+            if isinstance(st, ast.Expr) and is_warnings_call(st.value, _WARNING_NOOPS):
+                continue
+            call = st.value if isinstance(st, (ast.Expr, ast.Assign)) else None
+            if isinstance(call, ast.Call):
+                op = ufunc_at(call)
+                if op is not None:
+                    if not isinstance(st, ast.Expr):
+                        raise NotImplementedError(f"the result of np.{op}.at (None) is not supported")
+                    out.extend(lower_at(op, call, st))
+                    continue
+                tgt = out_target(call) if isinstance(call.func, ast.Attribute) and is_np(call.func.value) else None
+                if tgt is not None and (isinstance(st, ast.Expr) or (
+                        len(st.targets) == 1 and isinstance(st.targets[0], ast.Name))):
+                    call.keywords = [kw for kw in call.keywords if kw.arg != "out"]
+                    whole = ast.Subscript(value=copy.deepcopy(tgt), slice=ast.Constant(Ellipsis), ctx=ast.Store())
+                    out.append(ast.copy_location(ast.Assign(targets=[whole], value=call), st))
+                    if isinstance(st, ast.Assign):
+                        out.append(ast.copy_location(ast.Assign(targets=st.targets, value=copy.deepcopy(tgt)), st))
+                    continue
+            out.append(st)
+        return out or [ast.Pass()]
+
+    tree.body = block(tree.body)
+    return ast.fix_missing_locations(tree)
+
+
 def _broadcast_static_shapes(a, b):
     """numpy's broadcast of two shapes (tuples of ints), else None."""
     n = max(len(a), len(b))
@@ -31201,6 +31337,8 @@ class translator(ast.NodeVisitor):
             return (node.id in self.python_list_vars) or (nm in self.python_list_vars)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return self._is_python_list_expr(node.left) and self._is_python_list_expr(node.right)
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            return self._is_python_list_expr(node.value)  # a[1:3] of a list
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
             # [x] * n and n * [x]: list repetition
             return self._is_python_list_expr(node.left) != self._is_python_list_expr(node.right)
@@ -55255,6 +55393,27 @@ class translator(ast.NodeVisitor):
             for n in ast.walk(nd):
                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and id(n) not in _aug_targets:
                     self._name_store_counts[n.id] = self._name_store_counts.get(n.id, 0) + 1
+        # Names bound exactly once (x op= ... and global counted), by x =
+        # <number>: their value, for if tests decided at translation time
+        # (x = 0.0; x != 0 and 1.0 / x > 0.1 would divide constants by zero).
+        _all_stores = {}
+        _lits = {}
+        for nd in nodes:
+            for n in ast.walk(nd):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                    _all_stores[n.id] = _all_stores.get(n.id, 0) + 1
+                elif isinstance(n, ast.Global):
+                    for _g in n.names:
+                        _all_stores[_g] = _all_stores.get(_g, 0) + 2
+                if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                    _v = n.value
+                    _neg = isinstance(_v, ast.UnaryOp) and isinstance(_v.op, ast.USub)
+                    _c = _v.operand if _neg else _v
+                    if isinstance(_c, ast.Constant) and type(_c.value) in (int, float):
+                        _lits[n.targets[0].id] = -_c.value if _neg else _c.value
+        if not hasattr(self, "_literal_once"):
+            # The first, outermost prescan (later ones see nested bodies).
+            self._literal_once = {k: v for k, v in _lits.items() if _all_stores.get(k) == 1}
 
         def _resolve_str_literal(enode):
             if isinstance(enode, ast.Constant) and isinstance(enode.value, str):
@@ -60149,8 +60308,70 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"open(newunit={opt.id}, file=trim({path_txt}), status='old', action='read')")
                 self.file_handle_vars.add(opt.id)
                 opened.append(opt.id)
-        for s in node.body:
-            self.visit(s)
+        # with np.errstate(divide='ignore', ...): the build traps division by
+        # zero, invalid and overflow (SIGFPE) where numpy gives inf/nan, so
+        # the block turns halting off for the categories not set to 'raise'
+        # and restores it after (a return or break inside skips the restore,
+        # leaving halting off). Each divisor there (and the argument of log,
+        # sqrt, ...) is multiplied by a variable equal to 1, so gfortran does
+        # not fold (and reject) a division by zero or log(0.0) of constants
+        # at compile time.
+        _flags = {}
+        for it in getattr(node, "items", []):
+            ctx = getattr(it, "context_expr", None)
+            if (isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Attribute) and ctx.func.attr == "errstate"
+                    and isinstance(ctx.func.value, ast.Name) and ctx.func.value.id in ("np", "numpy")):
+                cats = {"divide": ["ieee_divide_by_zero"], "invalid": ["ieee_invalid"],
+                        "over": ["ieee_overflow"], "under": ["ieee_underflow"]}
+                for kw in ctx.keywords:
+                    if not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)):
+                        raise NotImplementedError("np.errstate needs string constant settings")
+                    names = [f for v in cats.values() for f in v] if kw.arg == "all" else cats.get(kw.arg)
+                    if names is None:
+                        continue
+                    for f in names:
+                        _flags[f] = kw.value.value == "raise"
+        if _flags:
+            self._errstate_zero_counter = getattr(self, "_errstate_zero_counter", 0) + 1
+            zname = f"errstate_one_{self._errstate_zero_counter}"
+            body = [copy.deepcopy(s) for s in node.body]
+            for s in body:
+                for n in ast.walk(s):
+                    if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Div):
+                        n.right = ast.copy_location(ast.BinOp(left=n.right, op=ast.Mult(), right=ast.Name(
+                            id=zname, ctx=ast.Load())), n.right)
+                    elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.args
+                          and isinstance(n.func.value, ast.Name) and n.func.value.id in ("np", "numpy")
+                          and n.func.attr in ("log", "log10", "log2", "sqrt", "arcsin", "arccos", "arctanh")):
+                        n.args[0] = ast.copy_location(ast.BinOp(left=n.args[0], op=ast.Mult(), right=ast.Name(
+                            id=zname, ctx=ast.Load())), n.args[0])
+            uses_zero = any(isinstance(n, ast.Name) and n.id == zname for s in body for n in ast.walk(s))
+            if uses_zero:
+                self._mark_real(zname)
+            flag_names = sorted(_flags)
+            saved = [f"errstate_halt_{self._errstate_zero_counter}_{k + 1}" for k in range(len(flag_names))]
+            self.o.w("block")
+            self.o.push()
+            self.o.w("use, intrinsic :: ieee_arithmetic, only: ieee_get_halting_mode, ieee_set_halting_mode, "
+                     + ", ".join(flag_names))
+            self.o.w("logical :: " + ", ".join(saved))
+            if uses_zero:
+                self.o.w(f"real(kind=dp) :: {zname}")
+            for f, sv in zip(flag_names, saved):
+                self.o.w(f"call ieee_get_halting_mode({f}, {sv})")
+                self.o.w(f"call ieee_set_halting_mode({f}, {'.true.' if _flags[f] else '.false.'})")
+            if uses_zero:
+                # Set from a run-time value, so it is not made a parameter.
+                self.o.w(f"{zname} = merge(1.0_dp, 1.0_dp, {saved[0]})")
+            for s in body:
+                self.visit(s)
+            for f, sv in zip(flag_names, saved):
+                self.o.w(f"call ieee_set_halting_mode({f}, {sv})")
+            self.o.pop()
+            self.o.w("end block")
+        else:
+            for s in node.body:
+                self.visit(s)
         for nm in reversed(opened):
             self.o.w(f"close({nm})")
         for nm in pushed:
@@ -60334,6 +60555,37 @@ class translator(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         self._emit_comments_for(node)
+        _t0 = node.targets[0] if len(node.targets) == 1 else None
+        if (isinstance(_t0, ast.Subscript) and isinstance(_t0.value, ast.Name) and isinstance(_t0.slice, ast.Slice)
+                and _t0.slice.step is None and self._is_python_list_expr(_t0.value)
+                and self._is_python_list_expr(node.value)):
+            # a[1:3] = [8, 9, 10] of a Python list can change its length: a =
+            # a[:1] + [8, 9, 10] + a[3:] (it was a(2:3) = [8, 9, 10], a bound
+            # mismatch). An upper bound below the lower one inserts at the
+            # lower one, as in Python.
+            def _bound_ok(b):
+                return b is None or isinstance(b, ast.Name) or (
+                    isinstance(b, ast.Constant) and type(b.value) is int and b.value >= 0)
+            lo, hi = _t0.slice.lower, _t0.slice.upper
+            if not (_bound_ok(lo) and _bound_ok(hi)):
+                raise NotImplementedError("list slice assignment with a negative or computed bound is not supported")
+            nm = _t0.value.id
+            if lo is not None and hi is not None and not (isinstance(lo, ast.Constant) and isinstance(hi, ast.Constant)):
+                hi = ast.Call(func=ast.Name(id="max", ctx=ast.Load()), args=[copy.deepcopy(lo), hi], keywords=[])
+            elif isinstance(lo, ast.Constant) and isinstance(hi, ast.Constant) and hi.value < lo.value:
+                hi = copy.deepcopy(lo)
+            head = ast.Subscript(value=ast.Name(id=nm, ctx=ast.Load()), slice=ast.Slice(upper=copy.deepcopy(lo)),
+                                 ctx=ast.Load())
+            tail = ast.Subscript(value=ast.Name(id=nm, ctx=ast.Load()), slice=ast.Slice(lower=hi), ctx=ast.Load())
+            parts = ([head] if lo is not None else []) + [node.value] + ([tail] if hi is not None else [])
+            val = parts[0]
+            for p in parts[1:]:
+                val = ast.BinOp(left=val, op=ast.Add(), right=p)
+            new = ast.Assign(targets=[ast.Name(id=nm, ctx=ast.Store())], value=val)
+            ast.copy_location(new, node)
+            ast.fix_missing_locations(new)
+            self.visit_Assign(new)
+            return
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             # c = v.reshape(-1, 1) / v.reshape(1, -1): c broadcasts as a
             # column / row vector in later statements.
@@ -68741,6 +68993,16 @@ class translator(ast.NodeVisitor):
         self._emit_comments_for(node)
         node.target, node.value = self._untranspose_target(node.target, node.value)
         self._pad_partial_index(node.target)
+        # a += [3] of a Python list concatenates (it was a = a + [3],
+        # elementwise); an alias b = a is the same Fortran array, so it
+        # sees the new elements as Python's in-place += does.
+        if (isinstance(node.target, ast.Name) and isinstance(node.op, ast.Add)
+                and self._is_python_list_expr(node.target) and self._is_python_list_expr(node.value)):
+            load = ast.copy_location(ast.Name(id=node.target.id, ctx=ast.Load()), node.target)
+            new = ast.copy_location(ast.Assign(targets=[node.target], value=ast.copy_location(
+                ast.BinOp(left=load, op=ast.Add(), right=node.value), node)), node)
+            self.visit_Assign(new)
+            return
         # Pattern: A.flat[::d+1] += rhs  -> diagonal update of matrix A.
         if (
             isinstance(node.target, ast.Subscript)
@@ -69299,14 +69561,17 @@ class translator(ast.NodeVisitor):
                 v = _const_bool(test.operand)
                 return (not v) if v is not None else None
             if isinstance(test, ast.BoolOp) and len(test.values) >= 1:
-                vals = [_const_bool(v) for v in test.values]
-                if any(v is None for v in vals):
-                    return None
-                if isinstance(test.op, ast.And):
-                    return all(vals)
-                if isinstance(test.op, ast.Or):
-                    return any(vals)
-                return None
+                # Left to right as Python evaluates: x == 0 or 1 / x > 1 is
+                # true at the first operand, the rest never evaluated.
+                for v in test.values:
+                    cv = _const_bool(v)
+                    if cv is None:
+                        return None
+                    if isinstance(test.op, ast.Or) and cv:
+                        return True
+                    if isinstance(test.op, ast.And) and not cv:
+                        return False
+                return isinstance(test.op, ast.And)
             if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
                 # This is a best-effort constant-fold optimization; an
                 # expression that self.expr() can't lower yet (e.g. because
@@ -69330,6 +69595,14 @@ class translator(ast.NodeVisitor):
 
                 lv = _param_lit(ltxt)
                 rv = _param_lit(rtxt)
+                if self.current_function_name is None:
+                    # A main-program name bound once by a number (x = 0.0),
+                    # which becomes a parameter after translation.
+                    _once = getattr(self, "_literal_once", None) or {}
+                    if lv is None and isinstance(test.left, ast.Name) and test.left.id in _once:
+                        lv = float(_once[test.left.id])
+                    if rv is None and isinstance(test.comparators[0], ast.Name) and test.comparators[0].id in _once:
+                        rv = float(_once[test.comparators[0].id])
                 if lv is None or rv is None:
                     return None
                 op = test.ops[0]
@@ -91939,6 +92212,7 @@ def transpile_file(
     tree = ast.parse(src)
     tree = rewrite_loop_else(tree)
     tree = rewrite_generator_cursors(tree)
+    tree = rewrite_numpy_out_at_and_warnings(tree)
     tree = rewrite_short_circuit_boolops(tree)
     reject_mutated_mutable_defaults(tree)
     tree = rewrite_static_dicts(tree)
@@ -92786,6 +93060,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     tree = ast.parse(src)
     tree = rewrite_loop_else(tree)
     tree = rewrite_generator_cursors(tree)
+    tree = rewrite_numpy_out_at_and_warnings(tree)
     tree = rewrite_short_circuit_boolops(tree)
     reject_mutated_mutable_defaults(tree)
     tree = rewrite_static_dicts(tree)
