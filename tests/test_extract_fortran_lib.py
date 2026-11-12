@@ -4,7 +4,55 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from xextract_fortran_lib import (grouped_public_declarations, omit_inherited_implicit_none,
-                                 promote_library_elementals)
+                                 omit_inherited_uses, promote_library_elementals)
+
+
+def test_redundant_intrinsic_uses_are_removed_with_comments_preserved():
+    module_uses = ['use, intrinsic :: iso_fortran_env, only: real64, int64',
+                   'use, intrinsic :: ieee_arithmetic, only: ieee_is_nan']
+    source = ['subroutine example()',
+              '  USE, INTRINSIC :: ISO_FORTRAN_ENV, ONLY: INT64 ! integer kind',
+              '  use, intrinsic :: ieee_arithmetic, only: ieee_is_nan',
+              '  integer(int64) :: i', 'end subroutine example']
+    result = omit_inherited_uses(source, module_uses)
+    assert result == [source[0], '  ! integer kind', *source[3:]]
+    assert omit_inherited_uses(result, module_uses) == result
+
+
+def test_nonredundant_or_complex_uses_are_retained():
+    module_uses = ['use, intrinsic :: iso_fortran_env, only: int64']
+    source = '''subroutine example()
+use, intrinsic :: iso_fortran_env, only: int64, real32
+use, intrinsic :: iso_fortran_env, only: my_int => int64
+use, intrinsic :: iso_fortran_env
+use iso_fortran_env, only: int64
+use, intrinsic :: iso_fortran_env, only: &
+  int64
+use, intrinsic :: ieee_arithmetic, only: ieee_next_after
+end subroutine example'''.splitlines()
+    assert omit_inherited_uses(source, module_uses) == source
+
+
+def test_interface_internal_and_block_imports_are_not_removed():
+    module_uses = ['use, intrinsic :: iso_fortran_env, only: int64']
+    source = '''subroutine outer()
+interface
+  subroutine external_proc()
+    use, intrinsic :: iso_fortran_env, only: int64
+  end subroutine external_proc
+end interface
+block
+  use, intrinsic :: iso_fortran_env, only: int64
+end block
+named: block
+  use, intrinsic :: iso_fortran_env, only: int64
+end block named
+contains
+subroutine inner()
+  use, intrinsic :: iso_fortran_env, only: int64
+end subroutine inner
+end subroutine outer'''.splitlines()
+    assert omit_inherited_uses(source, module_uses) == source
 
 
 def test_public_names_grouped_and_alphabetized():

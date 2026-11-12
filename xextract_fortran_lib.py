@@ -504,6 +504,50 @@ def grouped_public_declarations(by_topic, width=100):
     return lines
 
 
+def omit_inherited_uses(lines, module_uses):
+    """Omit redundant simple intrinsic USE ONLY lists in module procedures.
+
+    Keep interfaces (no automatic host association), internal procedures and
+    BLOCK scopes (possible host shadowing), renames, unrestricted imports and
+    continued statements. Partial overlap is retained rather than rewritten.
+    """
+    pattern = re.compile(
+        r"^use\s*,\s*intrinsic\s*::\s*([a-z_]\w*)\s*,\s*only\s*:\s*"
+        r"([a-z_]\w*(?:\s*,\s*[a-z_]\w*)*)\s*$", re.I)
+    inherited = defaultdict(set)
+    for line in module_uses:
+        match = pattern.fullmatch(strip_comment(line).strip())
+        if match:
+            inherited[match[1].lower()].update(n.strip().lower() for n in match[2].split(','))
+    output = []
+    interface_depth = procedure_depth = block_depth = 0
+    continued = False
+    for line in lines:
+        code = strip_comment(line).strip()
+        was_continued, continued = continued, code.endswith('&')
+        if IFACE_END.match(code):
+            interface_depth -= 1
+        elif re.match(r"^(?:abstract\s+)?interface\b", code, re.I):
+            interface_depth += 1
+        elif not interface_depth:
+            if PROC_END.match(code) or re.fullmatch(r"end", code, re.I):
+                procedure_depth -= 1
+            elif PROC_START.match(code):
+                procedure_depth += 1
+            elif re.fullmatch(r"end\s*block(?:\s+\w+)?", code, re.I):
+                block_depth -= 1
+            elif re.fullmatch(r"(?:\w+\s*:\s*)?block", code, re.I):
+                block_depth += 1
+            elif procedure_depth == 1 and not block_depth and not was_continued:
+                match = pattern.fullmatch(code)
+                if match and {n.strip().lower() for n in match[2].split(',')} <= inherited[match[1].lower()]:
+                    if '!' in line:
+                        output.append(line[:len(line) - len(line.lstrip())] + line[line.index('!'):])
+                    continue
+        output.append(line)
+    return output
+
+
 def omit_inherited_implicit_none(lines):
     """Omit plain IMPLICIT NONE where the host already supplies it.
 
@@ -639,7 +683,7 @@ def main() -> int:
     for n in order:
         if n in need_procs:
             o.append("")
-            o += omit_inherited_implicit_none(procs[n])
+            o += omit_inherited_implicit_none(omit_inherited_uses(procs[n], uses))
     o.append(f"end module {args.module}")
     o = promote_library_elementals(o)
     f90 = args.out / f"{args.module}.f90"
