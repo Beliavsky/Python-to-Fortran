@@ -187,6 +187,7 @@ public :: str_rjust !@pyapi kind=function ret=character args=s:character:intent(
 public :: str_split !@pyapi kind=function ret=type(strvec_t) args=s:character:intent(in),sep:character:intent(in):optional desc="split into string vector"
 public :: str_join !@pyapi kind=function ret=character args=sep:character:intent(in),items:type(strvec_t):intent(in) desc="join string vector with separator"
 public :: str_count !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="count non-overlapping occurrences"
+public :: py_file_write !@pyapi kind=subroutine args=unit:integer:intent(in),s:character:intent(in) desc="write s to a formatted unit as Python's f.write(s) does: each newline ends a record, and only text after the last newline stays in an open record"
 public :: csv_split_line !@pyapi kind=function ret=character(:) args=line:character:intent(in),delimiter:character:intent(in):optional,quotechar:character:intent(in):optional desc="split one CSV line into fields (basic quote-aware parser)"
 public :: file_read !@pyapi kind=function ret=character args=u:integer:intent(in) desc="read remaining text from open unit as a single string"
 public :: str_isdigit !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are digits"
@@ -1161,7 +1162,7 @@ end interface fft_fft
 
 contains
 
-      pure integer function isqrt_int(x)
+      pure elemental integer function isqrt_int(x)
          ! integer square root: return floor(sqrt(x)) for x >= 0
          implicit none
          integer, intent(in) :: x  ! input integer (x >= 0 expected)
@@ -1180,7 +1181,7 @@ contains
          isqrt_int = r
       end function isqrt_int
 
-      pure integer function mod_pow_int(base, exp, modulus)
+      pure elemental integer function mod_pow_int(base, exp, modulus)
          ! modular exponentiation: pow(base, exp, modulus)
          implicit none
          integer, intent(in) :: base, exp, modulus
@@ -1201,7 +1202,7 @@ contains
          mod_pow_int = int(res)
       end function mod_pow_int
 
-      pure integer function factorial_int(x) result(v)
+      pure elemental integer function factorial_int(x) result(v)
          integer, intent(in) :: x
          integer :: i
          if (x < 0) then
@@ -1214,7 +1215,7 @@ contains
          end do
       end function factorial_int
 
-      pure integer(kind=int64) function factorial_int_i64(x) result(v)
+      pure elemental integer(kind=int64) function factorial_int_i64(x) result(v)
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x
          integer(kind=int64) :: i
@@ -1228,7 +1229,7 @@ contains
          end do
       end function factorial_int_i64
 
-      pure integer function comb_int(n, k) result(v)
+      pure elemental integer function comb_int(n, k) result(v)
          integer, intent(in) :: n, k
          integer :: i, kk
          if (n < 0 .or. k < 0 .or. k > n) then
@@ -1243,7 +1244,7 @@ contains
          end do
       end function comb_int
 
-      pure integer(kind=int64) function comb_int_i64(n, k) result(v)
+      pure elemental integer(kind=int64) function comb_int_i64(n, k) result(v)
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: n, k
          integer(kind=int64) :: i, kk, g, f
@@ -1262,7 +1263,7 @@ contains
          end do
       end function comb_int_i64
 
-      pure integer function perm_int(n, k) result(v)
+      pure elemental integer function perm_int(n, k) result(v)
          integer, intent(in) :: n
          integer, intent(in), optional :: k
          integer :: i, kk
@@ -1282,7 +1283,7 @@ contains
          end do
       end function perm_int
 
-      pure integer(kind=int64) function perm_int_i64(n, k) result(v)
+      pure elemental integer(kind=int64) function perm_int_i64(n, k) result(v)
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: n
          integer(kind=int64), intent(in), optional :: k
@@ -1524,7 +1525,7 @@ contains
          write(*,'(a)') ']'
       end subroutine print_log_list
 
-      function str_int_list(a, n) result(s)
+      pure function str_int_list(a, n) result(s)
          ! return integer list a(1:n) in python-style [..] format
          implicit none
          integer, intent(in) :: a(:)
@@ -2023,13 +2024,13 @@ contains
          s = trim(adjustl(buf))
       end function py_str_int64
 
-      elemental function narrow_int_i32(x) result(y)
+      pure elemental function narrow_int_i32(x) result(y)
          integer, intent(in) :: x
          integer :: y
          y = x
       end function narrow_int_i32
 
-      elemental function narrow_int_i64(x) result(y)
+      pure elemental function narrow_int_i64(x) result(y)
          ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x
@@ -2599,7 +2600,7 @@ contains
          end do
          close(u)
        contains
-         pure function preprocess_line(s, delim, cmt) result(out)
+         pure elemental function preprocess_line(s, delim, cmt) result(out)
             character(len=*), intent(in) :: s, delim, cmt
             character(len=4096) :: out
             integer :: ipos
@@ -2617,7 +2618,7 @@ contains
             end if
          end function preprocess_line
 
-         pure integer function count_tokens(s) result(n)
+         pure elemental integer function count_tokens(s) result(n)
             character(len=*), intent(in) :: s
             integer :: i
             logical :: in_tok
@@ -2636,7 +2637,7 @@ contains
          end function count_tokens
       end function loadtxt_real_2d
 
-      subroutine loadtxt_rank_stop(path, name, vector_found)
+      pure elemental subroutine loadtxt_rank_stop(path, name, vector_found)
          ! The rank chosen at translation time does not match the file:
          ! say what NumPy returns and how to translate it.
          character(len=*), intent(in) :: path
@@ -2803,7 +2804,7 @@ contains
          x = (tmp /= 0.0_dp)
       end function loadtxt_logical_1d
 
-      function np_fmt_number(x, spec) result(s)
+      pure function np_fmt_number(x, spec) result(s)
          ! x formatted like Python's `spec % x` for the printf specs numpy's
          ! savetxt uses: %[width][.prec]{e,f,g,d,i} (default %.18e).
          real(kind=dp), intent(in) :: x
@@ -2905,7 +2906,7 @@ contains
          end subroutine write_commented
       end subroutine savetxt_real_2d
 
-      pure integer function optval_int(x, default) result(v)
+      pure elemental integer function optval_int(x, default) result(v)
          integer, intent(in), optional :: x
          integer, intent(in) :: default
          if (present(x)) then
@@ -2915,7 +2916,7 @@ contains
          end if
       end function optval_int
 
-      pure real(kind=dp) function optval_real(x, default) result(v)
+      pure elemental real(kind=dp) function optval_real(x, default) result(v)
          real(kind=dp), intent(in), optional :: x
          real(kind=dp), intent(in) :: default
          if (present(x)) then
@@ -2925,7 +2926,7 @@ contains
          end if
       end function optval_real
 
-      pure complex(kind=dp) function optval_complex(x, default) result(v)
+      pure elemental complex(kind=dp) function optval_complex(x, default) result(v)
          complex(kind=dp), intent(in), optional :: x
          complex(kind=dp), intent(in) :: default
          if (present(x)) then
@@ -2935,7 +2936,7 @@ contains
          end if
       end function optval_complex
 
-      pure logical function optval_logical(x, default) result(v)
+      pure elemental logical function optval_logical(x, default) result(v)
          logical, intent(in), optional :: x
          logical, intent(in) :: default
          if (present(x)) then
@@ -2974,9 +2975,9 @@ contains
          if (stat /= 0 .or. nlen <= 0) return
          rng_replay_stem = stem_buf(:nlen)
          open(newunit=rng_replay_meta_u, file=trim(rng_replay_stem) // ".meta", status="old", action="read", iostat=stat)
-         if (stat /= 0) stop "rng replay: could not open metadata file"
+         if (stat /= 0) error stop "rng replay: could not open metadata file"
          open(newunit=rng_replay_bin_u, file=trim(rng_replay_stem) // ".bin", status="old", access="stream", form="unformatted", action="read", iostat=stat)
-         if (stat /= 0) stop "rng replay: could not open binary file"
+         if (stat /= 0) error stop "rng replay: could not open binary file"
          rng_replay_enabled = .true.
          rng_replay_call_index = 0
       end subroutine rng_replay_maybe_init
@@ -2992,11 +2993,11 @@ contains
          call rng_replay_maybe_init()
          if (.not. rng_replay_enabled) return
          read(rng_replay_meta_u, *, iostat=ios) call_id, op_file, rank_file, n0_file, n1_file
-         if (ios /= 0) stop "rng replay: metadata exhausted or unreadable"
-         if (trim(op_file) /= trim(op_name)) stop "rng replay: operation mismatch"
-         if (rank_file /= rank_expected) stop "rng replay: rank mismatch"
-         if (n0_file /= n0_expected) stop "rng replay: first extent mismatch"
-         if (n1_file /= n1_expected) stop "rng replay: second extent mismatch"
+         if (ios /= 0) error stop "rng replay: metadata exhausted or unreadable"
+         if (trim(op_file) /= trim(op_name)) error stop "rng replay: operation mismatch"
+         if (rank_file /= rank_expected) error stop "rng replay: rank mismatch"
+         if (n0_file /= n0_expected) error stop "rng replay: first extent mismatch"
+         if (n1_file /= n1_expected) error stop "rng replay: second extent mismatch"
          rng_replay_call_index = rng_replay_call_index + 1
       end subroutine rng_replay_expect
 
@@ -3034,7 +3035,7 @@ contains
       function runif1(n) result(x)
          integer, intent(in) :: n
          real(kind=dp), allocatable :: x(:)
-         if (n < 0) stop "runif: n must be >= 0"
+         if (n < 0) error stop "runif: n must be >= 0"
          allocate(x(n))
          call rng_replay_expect("uniform", 1, n, -1)
          if (rng_replay_enabled) then
@@ -3047,7 +3048,7 @@ contains
       function runif2(n, m) result(x)
          integer, intent(in) :: n, m
          real(kind=dp), allocatable :: x(:,:)
-         if (n < 0 .or. m < 0) stop "runif: n,m must be >= 0"
+         if (n < 0 .or. m < 0) error stop "runif: n,m must be >= 0"
          allocate(x(n, m))
          call rng_replay_expect("uniform", 2, n, m)
          if (rng_replay_enabled) then
@@ -3060,10 +3061,10 @@ contains
       function runif3(n, m, l) result(x)
          integer, intent(in) :: n, m, l
          real(kind=dp), allocatable :: x(:,:,:)
-         if (n < 0 .or. m < 0 .or. l < 0) stop "runif: n,m,l must be >= 0"
+         if (n < 0 .or. m < 0 .or. l < 0) error stop "runif: n,m,l must be >= 0"
          allocate(x(n, m, l))
          call rng_replay_maybe_init()
-         if (rng_replay_enabled) stop "rng replay: rank-3 uniform draws are not supported"
+         if (rng_replay_enabled) error stop "rng replay: rank-3 uniform draws are not supported"
          if (n > 0 .and. m > 0 .and. l > 0) call random_number(x)
       end function runif3
 
@@ -3151,7 +3152,7 @@ contains
       function rnorm1(n) result(x)
          integer, intent(in) :: n
          real(kind=dp), allocatable :: x(:)
-         if (n < 0) stop "rnorm: n must be >= 0"
+         if (n < 0) error stop "rnorm: n must be >= 0"
          allocate(x(n))
          call rng_replay_expect("normal", 1, n, -1)
          if (rng_replay_enabled) then
@@ -3165,7 +3166,7 @@ contains
          integer, intent(in) :: n, m
          real(kind=dp), allocatable :: x(:,:)
          real(kind=dp), allocatable :: tmp(:)
-         if (n < 0 .or. m < 0) stop "rnorm: n,m must be >= 0"
+         if (n < 0 .or. m < 0) error stop "rnorm: n,m must be >= 0"
          allocate(x(n, m))
          call rng_replay_expect("normal", 2, n, m)
          if (rng_replay_enabled) then
@@ -3184,10 +3185,10 @@ contains
          integer, intent(in) :: n, m, l
          real(kind=dp), allocatable :: x(:,:,:)
          real(kind=dp), allocatable :: tmp(:)
-         if (n < 0 .or. m < 0 .or. l < 0) stop "rnorm: n,m,l must be >= 0"
+         if (n < 0 .or. m < 0 .or. l < 0) error stop "rnorm: n,m,l must be >= 0"
          allocate(x(n, m, l))
          call rng_replay_maybe_init()
-         if (rng_replay_enabled) stop "rng replay: rank-3 normal draws are not supported"
+         if (rng_replay_enabled) error stop "rng replay: rank-3 normal draws are not supported"
          if (n > 0 .and. m > 0 .and. l > 0) then
             allocate(tmp(n * m * l))
             call random_normal_vec(tmp)
@@ -3224,10 +3225,10 @@ contains
          real(kind=dp), intent(in), optional :: scale
          real(kind=dp) :: sc, d, c, u, v, z
          real(kind=dp) :: tmpn(1)
-         if (shape <= 0.0_dp) stop "random_gamma: shape must be > 0"
+         if (shape <= 0.0_dp) error stop "random_gamma: shape must be > 0"
          sc = 1.0_dp
          if (present(scale)) sc = scale
-         if (sc <= 0.0_dp) stop "random_gamma: scale must be > 0"
+         if (sc <= 0.0_dp) error stop "random_gamma: scale must be > 0"
          if (shape < 1.0_dp) then
             call random_number(u)
             if (u <= tiny(1.0_dp)) u = tiny(1.0_dp)
@@ -3267,7 +3268,7 @@ contains
       real(kind=dp) function random_student_t(df)
          real(kind=dp), intent(in) :: df
          real(kind=dp) :: z(1), v
-         if (df <= 0.0_dp) stop "random_student_t: df must be > 0"
+         if (df <= 0.0_dp) error stop "random_student_t: df must be > 0"
          call random_normal_vec(z)
          v = random_gamma(df / 2.0_dp, 2.0_dp)
          random_student_t = z(1) / sqrt(v / df)
@@ -3285,7 +3286,7 @@ contains
       real(kind=dp) function random_f(dfnum, dfden)
          real(kind=dp), intent(in) :: dfnum, dfden
          real(kind=dp) :: x1, x2
-         if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp) stop "random_f: dfs must be > 0"
+         if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp) error stop "random_f: dfs must be > 0"
          x1 = random_gamma(dfnum / 2.0_dp, 2.0_dp) / dfnum
          x2 = random_gamma(dfden / 2.0_dp, 2.0_dp) / dfden
          random_f = x1 / x2
@@ -3304,7 +3305,7 @@ contains
          real(kind=dp), intent(in) :: mu
          real(kind=dp) :: l, p, u
          integer :: k
-         if (mu < 0.0_dp) stop "random_poisson: mu must be >= 0"
+         if (mu < 0.0_dp) error stop "random_poisson: mu must be >= 0"
          l = exp(-mu)
          k = 0
          p = 1.0_dp
@@ -3330,7 +3331,7 @@ contains
          ! Source: John Burkardt, prob.f90, geometric_sample/geometric_cdf_inv.
          real(kind=dp), intent(in) :: p
          real(kind=dp) :: u
-         if (p < 0.0_dp .or. p > 1.0_dp) stop "random_geometric: p must be in [0,1]"
+         if (p < 0.0_dp .or. p > 1.0_dp) error stop "random_geometric: p must be in [0,1]"
          if (p == 1.0_dp) then
             random_geometric = 1
             return
@@ -3358,8 +3359,8 @@ contains
          real(kind=dp), intent(in) :: p
          integer :: i
          real(kind=dp) :: u
-         if (n < 0) stop "random_binomial: n must be >= 0"
-         if (p < 0.0_dp .or. p > 1.0_dp) stop "random_binomial: p must be in [0,1]"
+         if (n < 0) error stop "random_binomial: n must be >= 0"
+         if (p < 0.0_dp .or. p > 1.0_dp) error stop "random_binomial: p must be in [0,1]"
          random_binomial = 0
          do i = 1, n
             call random_number(u)
@@ -3381,8 +3382,8 @@ contains
          integer, intent(in) :: ngood, nbad, nsample
          integer :: gg, nn, i
          real(kind=dp) :: pr, u
-         if (ngood < 0 .or. nbad < 0 .or. nsample < 0) stop "random_hypergeometric: args must be >= 0"
-         if (nsample > ngood + nbad) stop "random_hypergeometric: nsample too large"
+         if (ngood < 0 .or. nbad < 0 .or. nsample < 0) error stop "random_hypergeometric: args must be >= 0"
+         if (nsample > ngood + nbad) error stop "random_hypergeometric: nsample too large"
          gg = ngood
          nn = ngood + nbad
          random_hypergeometric = 0
@@ -3411,7 +3412,7 @@ contains
          real(kind=dp), intent(in) :: a
          real(kind=dp) :: b, const, t, u, v
          real(kind=dp), parameter :: one = 1.0_dp
-         if (a <= 1.0_dp) stop "random_zipf: a must be > 1"
+         if (a <= 1.0_dp) error stop "random_zipf: a must be > 1"
          b = 2.0_dp**(a - one)
          const = -one / (a - one)
          do
@@ -3436,7 +3437,7 @@ contains
       real(kind=dp) function random_beta(a, b)
          real(kind=dp), intent(in) :: a, b
          real(kind=dp) :: x1, x2
-         if (a <= 0.0_dp .or. b <= 0.0_dp) stop "random_beta: a,b must be > 0"
+         if (a <= 0.0_dp .or. b <= 0.0_dp) error stop "random_beta: a,b must be > 0"
          x1 = random_gamma(a, 1.0_dp)
          x2 = random_gamma(b, 1.0_dp)
          random_beta = x1 / (x1 + x2)
@@ -3481,7 +3482,7 @@ contains
 
       real(kind=dp) function random_chisquare(df)
          real(kind=dp), intent(in) :: df
-         if (df <= 0.0_dp) stop "random_chisquare: df must be > 0"
+         if (df <= 0.0_dp) error stop "random_chisquare: df must be > 0"
          random_chisquare = random_gamma(df / 2.0_dp, 2.0_dp)
       end function random_chisquare
 
@@ -3501,7 +3502,7 @@ contains
          b = 1.0_dp
          if (present(loc)) mu = loc
          if (present(scale)) b = scale
-         if (b <= 0.0_dp) stop "random_laplace: scale must be > 0"
+         if (b <= 0.0_dp) error stop "random_laplace: scale must be > 0"
          call random_number(u)
          if (u < 0.5_dp) then
             random_laplace = mu + b * log(max(2.0_dp * u, tiny(1.0_dp)))
@@ -3534,7 +3535,7 @@ contains
          s = 1.0_dp
          if (present(loc)) mu = loc
          if (present(scale)) s = scale
-         if (s <= 0.0_dp) stop "random_logistic: scale must be > 0"
+         if (s <= 0.0_dp) error stop "random_logistic: scale must be > 0"
          call random_number(u)
          u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
          random_logistic = mu + s * log(u / (1.0_dp - u))
@@ -3564,7 +3565,7 @@ contains
          s = 1.0_dp
          if (present(loc)) mu = loc
          if (present(scale)) s = scale
-         if (s <= 0.0_dp) stop "random_cauchy: scale must be > 0"
+         if (s <= 0.0_dp) error stop "random_cauchy: scale must be > 0"
          call random_number(u)
          random_cauchy = mu + s * tan(acos(-1.0_dp) * (u - 0.5_dp))
       end function random_cauchy
@@ -3589,7 +3590,7 @@ contains
       real(kind=dp) function random_weibull(a)
          ! Source: Alan Miller, amiller_mirror/random.f90 (Weibull sampler).
          real(kind=dp), intent(in) :: a
-         if (a <= 0.0_dp) stop "random_weibull: a must be > 0"
+         if (a <= 0.0_dp) error stop "random_weibull: a must be > 0"
          random_weibull = random_exponential()**(1.0_dp / a)
       end function random_weibull
 
@@ -3608,7 +3609,7 @@ contains
          real(kind=dp), parameter :: h = 0.7_dp
          real(kind=dp) :: p_alg, q, x, st, uln, v, r, s, y, g
          integer :: k, i, n
-         if (sk <= 0.0_dp .or. p <= 0.0_dp .or. p >= 1.0_dp) stop "random_neg_binomial: invalid params"
+         if (sk <= 0.0_dp .or. p <= 0.0_dp .or. p >= 1.0_dp) error stop "random_neg_binomial: invalid params"
          ! NumPy parameterization: p is success probability.
          ! Alan Miller routine expects the opposite probability in its recurrence.
          p_alg = 1.0_dp - p
@@ -3630,7 +3631,7 @@ contains
          end if
          s = 0.0_dp
          uln = -log(tiny(1.0_dp))
-         if (st > -uln / log(q)) stop "random_neg_binomial: p too large for sk"
+         if (st > -uln / log(q)) error stop "random_neg_binomial: p too large for sk"
          y = q**st
          g = st
          call random_number(r)
@@ -3661,7 +3662,7 @@ contains
          real(kind=dp), parameter :: pi = acos(-1.0_dp)
          real(kind=dp) :: s, r, rho, u, v, w, y, z, res, m
          logical :: neg
-         if (kappa < 0.0_dp) stop "random_von_mises: kappa must be >= 0"
+         if (kappa < 0.0_dp) error stop "random_von_mises: kappa must be >= 0"
          m = 0.0_dp
          if (present(mu)) m = mu
          if (kappa < 1.0e-8_dp) then
@@ -3715,7 +3716,7 @@ contains
          ! NumPy convention: support x >= 0 with shape a.
          real(kind=dp), intent(in) :: a
          real(kind=dp) :: u
-         if (a <= 0.0_dp) stop "random_pareto: a must be > 0"
+         if (a <= 0.0_dp) error stop "random_pareto: a must be > 0"
          call random_number(u)
          u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
          random_pareto = (1.0_dp - u)**(-1.0_dp / a) - 1.0_dp
@@ -3735,7 +3736,7 @@ contains
          ! NumPy convention on [0,1], shape a.
          real(kind=dp), intent(in) :: a
          real(kind=dp) :: u
-         if (a <= 0.0_dp) stop "random_power: a must be > 0"
+         if (a <= 0.0_dp) error stop "random_power: a must be > 0"
          call random_number(u)
          u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
          random_power = u**(1.0_dp / a)
@@ -3756,7 +3757,7 @@ contains
          real(kind=dp) :: s, u
          s = 1.0_dp
          if (present(scale)) s = scale
-         if (s <= 0.0_dp) stop "random_rayleigh: scale must be > 0"
+         if (s <= 0.0_dp) error stop "random_rayleigh: scale must be > 0"
          call random_number(u)
          u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
          random_rayleigh = s * sqrt(-2.0_dp * log(1.0_dp - u))
@@ -3783,7 +3784,7 @@ contains
          b = 1.0_dp
          if (present(loc)) mu = loc
          if (present(scale)) b = scale
-         if (b <= 0.0_dp) stop "random_gumbel: scale must be > 0"
+         if (b <= 0.0_dp) error stop "random_gumbel: scale must be > 0"
          call random_number(u)
          u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
          random_gumbel = mu - b * log(-log(u))
@@ -3810,7 +3811,7 @@ contains
          ! Source: John Burkardt, prob.f90, inverse_gaussian_sample.
          real(kind=dp), intent(in) :: mean, scale
          real(kind=dp) :: phi, z(1), y, t, u
-         if (mean <= 0.0_dp .or. scale <= 0.0_dp) stop "random_wald: mean,scale must be > 0"
+         if (mean <= 0.0_dp .or. scale <= 0.0_dp) error stop "random_wald: mean,scale must be > 0"
          phi = scale / mean
          call random_normal_vec(z)
          y = z(1) * z(1)
@@ -3836,7 +3837,7 @@ contains
          ! Source: John Burkardt, prob.f90, chi_square_noncentral_sample.
          real(kind=dp), intent(in) :: df, nonc
          real(kind=dp) :: x1, x2n(1), mu
-         if (df < 1.0_dp .or. nonc < 0.0_dp) stop "random_noncentral_chisquare: invalid parameters"
+         if (df < 1.0_dp .or. nonc < 0.0_dp) error stop "random_noncentral_chisquare: invalid parameters"
          x1 = random_chisquare(df - 1.0_dp)
          call random_normal_vec(x2n)
          mu = sqrt(max(nonc, 0.0_dp))
@@ -3855,7 +3856,7 @@ contains
       real(kind=dp) function random_noncentral_f(dfnum, dfden, nonc)
          real(kind=dp), intent(in) :: dfnum, dfden, nonc
          real(kind=dp) :: xn, xd
-         if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp .or. nonc < 0.0_dp) stop "random_noncentral_f: invalid parameters"
+         if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp .or. nonc < 0.0_dp) error stop "random_noncentral_f: invalid parameters"
          xn = random_noncentral_chisquare(dfnum, nonc) / dfnum
          xd = random_chisquare(dfden) / dfden
          random_noncentral_f = xn / xd
@@ -3874,7 +3875,8 @@ contains
          ! Source: John Burkardt, prob.f90, triangle_sample/triangle_cdf_inv.
          real(kind=dp), intent(in) :: left, mode, right
          real(kind=dp) :: u, cut
-         if (left > mode .or. mode > right .or. left == right) stop "random_triangular: require left<=mode<=right and left<right"
+         if (left > mode .or. mode > right .or. left == right) error stop &
+            & "random_triangular: require left<=mode<=right and left<right"
          call random_number(u)
          u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
          cut = (mode - left) / (right - left)
@@ -3898,7 +3900,7 @@ contains
          ! Source: John Burkardt, prob.f90, log_series_sample.
          real(kind=dp), intent(in) :: p
          real(kind=dp) :: u, v
-         if (p <= 0.0_dp .or. p >= 1.0_dp) stop "random_logseries: p must be in (0,1)"
+         if (p <= 0.0_dp .or. p >= 1.0_dp) error stop "random_logseries: p must be in (0,1)"
          call random_number(u)
          call random_number(v)
          u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
@@ -3922,13 +3924,13 @@ contains
          integer :: i, n
          real(kind=dp) :: s
          n = size(alpha)
-         if (size(x) /= n) stop "random_dirichlet: size mismatch"
+         if (size(x) /= n) error stop "random_dirichlet: size mismatch"
          do i = 1, n
-            if (alpha(i) <= 0.0_dp) stop "random_dirichlet: alpha entries must be > 0"
+            if (alpha(i) <= 0.0_dp) error stop "random_dirichlet: alpha entries must be > 0"
             x(i) = random_gamma(alpha(i), 1.0_dp)
          end do
          s = sum(x)
-         if (s <= tiny(1.0_dp)) stop "random_dirichlet: invalid sample sum"
+         if (s <= tiny(1.0_dp)) error stop "random_dirichlet: invalid sample sum"
          x = x / s
       end subroutine random_dirichlet
 
@@ -3936,7 +3938,7 @@ contains
          real(kind=dp), intent(in) :: alpha(:)
          real(kind=dp), intent(out) :: x(:,:)
          integer :: i
-         if (size(x, 2) /= size(alpha)) stop "random_dirichlet_samples: second dim must equal len(alpha)"
+         if (size(x, 2) /= size(alpha)) error stop "random_dirichlet_samples: second dim must equal len(alpha)"
          do i = 1, size(x, 1)
             call random_dirichlet(alpha, x(i, :))
          end do
@@ -3951,12 +3953,12 @@ contains
          real(kind=dp), allocatable :: q(:)
          real(kind=dp) :: sum2, prob
          b = size(p)
-         if (size(x) /= b) stop "random_multinomial: size mismatch"
-         if (n < 0) stop "random_multinomial: n must be >= 0"
+         if (size(x) /= b) error stop "random_multinomial: size mismatch"
+         if (n < 0) error stop "random_multinomial: n must be >= 0"
          allocate(q(1:b))
          q = max(p, 0.0_dp)
          sum2 = sum(q)
-         if (sum2 <= tiny(1.0_dp)) stop "random_multinomial: probabilities must sum to > 0"
+         if (sum2 <= tiny(1.0_dp)) error stop "random_multinomial: probabilities must sum to > 0"
          q = q / sum2
          x = 0
          ntot = n
@@ -3978,7 +3980,7 @@ contains
          real(kind=dp), intent(in) :: p(:)
          integer, intent(out) :: x(:,:)
          integer :: i
-         if (size(x, 2) /= size(p)) stop "random_multinomial_samples: second dim must equal len(p)"
+         if (size(x, 2) /= size(p)) error stop "random_multinomial_samples: second dim must equal len(p)"
          do i = 1, size(x, 1)
             call random_multinomial(n, p, x(i, :))
          end do
@@ -3991,11 +3993,11 @@ contains
          integer, intent(out) :: x(:)
          integer :: i, k, rem_draw, rem_total, rem_bad
          k = size(ngood)
-         if (size(x) /= k) stop "random_multivariate_hypergeometric: size mismatch"
-         if (k <= 0) stop "random_multivariate_hypergeometric: ngood must be nonempty"
-         if (any(ngood < 0)) stop "random_multivariate_hypergeometric: ngood entries must be >= 0"
+         if (size(x) /= k) error stop "random_multivariate_hypergeometric: size mismatch"
+         if (k <= 0) error stop "random_multivariate_hypergeometric: ngood must be nonempty"
+         if (any(ngood < 0)) error stop "random_multivariate_hypergeometric: ngood entries must be >= 0"
          rem_total = sum(ngood)
-         if (nsample < 0 .or. nsample > rem_total) stop "random_multivariate_hypergeometric: invalid nsample"
+         if (nsample < 0 .or. nsample > rem_total) error stop "random_multivariate_hypergeometric: invalid nsample"
          rem_draw = nsample
          x = 0
          do i = 1, k - 1
@@ -4016,13 +4018,13 @@ contains
          integer, intent(in) :: nsample
          integer, intent(out) :: x(:,:)
          integer :: i
-         if (size(x,2) /= size(ngood)) stop "random_multivariate_hypergeometric_samples: second dim mismatch"
+         if (size(x,2) /= size(ngood)) error stop "random_multivariate_hypergeometric_samples: second dim mismatch"
          do i = 1, size(x,1)
             call random_multivariate_hypergeometric(ngood, nsample, x(i,:))
          end do
       end subroutine random_multivariate_hypergeometric_samples
 
-      pure subroutine vm_integral(a, b, result, dk)
+      pure elemental subroutine vm_integral(a, b, result, dk)
          ! Source: Alan Miller, amiller_mirror/random.f90 (quadrature helper for von Mises).
          real(kind=dp), intent(in) :: a, b, dk
          real(kind=dp), intent(out) :: result
@@ -4059,12 +4061,12 @@ contains
          end interface
          n = size(x, 1)
          p = size(mean)
-         if (size(x, 2) /= p) stop "random_mvn_samples: output shape mismatch"
-         if (size(cov, 1) /= p .or. size(cov, 2) /= p) stop "random_mvn_samples: covariance shape mismatch"
+         if (size(x, 2) /= p) error stop "random_mvn_samples: output shape mismatch"
+         if (size(cov, 1) /= p .or. size(cov, 2) /= p) error stop "random_mvn_samples: covariance shape mismatch"
          allocate(l(p, p))
          l = cov
          call dpotrf('L', p, l, p, info)
-         if (info /= 0) stop "random_mvn_samples: covariance not positive definite"
+         if (info /= 0) error stop "random_mvn_samples: covariance not positive definite"
          do i = 1, p
             do j = i + 1, p
                l(i, j) = 0.0_dp
@@ -4088,8 +4090,8 @@ contains
          integer, intent(out) :: z(:)
          integer :: i
          real(kind=dp) :: u, p1, s
-         if (size(z) < n) stop "random_choice2: output array too small"
-         if (size(p) < 2) stop "random_choice2: p must have at least 2 elements"
+         if (size(z) < n) error stop "random_choice2: output array too small"
+         if (size(p) < 2) error stop "random_choice2: p must have at least 2 elements"
          p1 = max(0.0_dp, p(1))
          s = max(0.0_dp, p(1)) + max(0.0_dp, p(2))
          if (s > tiny(1.0_dp)) then
@@ -4113,9 +4115,9 @@ contains
          integer :: i, j, tmp
          real(kind=dp) :: u
          integer, allocatable :: pool(:)
-         if (npop < 0 .or. nsamp < 0) stop "random_choice_norep: invalid sizes"
-         if (nsamp > npop) stop "random_choice_norep: nsamp > npop"
-         if (size(z) < nsamp) stop "random_choice_norep: output array too small"
+         if (npop < 0 .or. nsamp < 0) error stop "random_choice_norep: invalid sizes"
+         if (nsamp > npop) error stop "random_choice_norep: nsamp > npop"
+         if (size(z) < nsamp) error stop "random_choice_norep: output array too small"
          if (nsamp == 0) return
          allocate(pool(1:npop))
          do i = 1, npop
@@ -4147,8 +4149,8 @@ contains
          real(kind=dp) :: u, s
          real(kind=dp), allocatable :: cdf(:)
          k = size(p)
-         if (k <= 0) stop "random_choice_prob: empty probability vector"
-         if (size(z) < n) stop "random_choice_prob: output array too small"
+         if (k <= 0) error stop "random_choice_prob: empty probability vector"
+         if (size(z) < n) error stop "random_choice_prob: output array too small"
          allocate(cdf(1:k))
          s = 0.0_dp
          do j = 1, k
@@ -4359,7 +4361,7 @@ contains
          end if
       end subroutine argsort_real
 
-      pure logical function le_nan_last(a, b)
+      pure elemental logical function le_nan_last(a, b)
          ! a <= b with NaN after every number (and NaN <= NaN, for stability).
          real(kind=dp), intent(in) :: a, b
          if (ieee_is_nan(b)) then
@@ -4625,7 +4627,7 @@ contains
          end do
       end function np_argmax_r2_dim
 
-      elemental function np_maximum(a, b) result(r)
+      pure elemental function np_maximum(a, b) result(r)
          ! np.maximum: NaN if either is NaN.
          real(kind=dp), intent(in) :: a, b
          real(kind=dp) :: r
@@ -4638,7 +4640,7 @@ contains
          end if
       end function np_maximum
 
-      elemental function np_minimum(a, b) result(r)
+      pure elemental function np_minimum(a, b) result(r)
          ! np.minimum: NaN if either is NaN.
          real(kind=dp), intent(in) :: a, b
          real(kind=dp) :: r
@@ -4651,7 +4653,7 @@ contains
          end if
       end function np_minimum
 
-      elemental function np_clip(x, lo, hi) result(r)
+      pure elemental function np_clip(x, lo, hi) result(r)
          ! np.clip: NaN stays NaN.
          real(kind=dp), intent(in) :: x, lo, hi
          real(kind=dp) :: r
@@ -4662,7 +4664,7 @@ contains
          end if
       end function np_clip
 
-      elemental function np_floor(x) result(r)
+      pure elemental function np_floor(x) result(r)
          ! np.floor of a float: NaN and infinities unchanged, no integer
          ! conversion (which overflows for large values).
          real(kind=dp), intent(in) :: x
@@ -4674,7 +4676,7 @@ contains
          if (r > x) r = r - 1.0_dp
       end function np_floor
 
-      elemental function np_ceil(x) result(r)
+      pure elemental function np_ceil(x) result(r)
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: r
          r = x
@@ -4684,7 +4686,7 @@ contains
          if (r < x) r = r + 1.0_dp
       end function np_ceil
 
-      elemental function np_sign(x) result(r)
+      pure elemental function np_sign(x) result(r)
          ! np.sign of a float: -1, 0 or 1, NaN for NaN.
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: r
@@ -5027,7 +5029,7 @@ contains
          end do
       end function nonzero_3d
 
-      elemental logical function c_lt(a, b)
+      pure elemental logical function c_lt(a, b)
          ! numpy's ordering of complex numbers: by real part, then imaginary part.
          complex(kind=dp), intent(in) :: a, b
          if (real(a, kind=dp) == real(b, kind=dp)) then
@@ -5037,7 +5039,7 @@ contains
          end if
       end function c_lt
 
-      elemental logical function c_le(a, b)
+      pure elemental logical function c_le(a, b)
          ! numpy's ordering of complex numbers: by real part, then imaginary
          ! part, a NaN after every number (as np.sort places them).
          complex(kind=dp), intent(in) :: a, b
@@ -5059,7 +5061,7 @@ contains
          end if
       end function c_le
 
-      elemental logical function c_gt(a, b)
+      pure elemental logical function c_gt(a, b)
          ! numpy's ordering of complex numbers: by real part, then imaginary part.
          complex(kind=dp), intent(in) :: a, b
          if (real(a, kind=dp) == real(b, kind=dp)) then
@@ -5069,7 +5071,7 @@ contains
          end if
       end function c_gt
 
-      elemental logical function c_ge(a, b)
+      pure elemental logical function c_ge(a, b)
          ! numpy's ordering of complex numbers: by real part, then imaginary part.
          complex(kind=dp), intent(in) :: a, b
          if (real(a, kind=dp) == real(b, kind=dp)) then
@@ -5079,20 +5081,20 @@ contains
          end if
       end function c_ge
 
-      elemental function c_maximum(a, b) result(r)
+      pure elemental function c_maximum(a, b) result(r)
          ! np.maximum of complex numbers (lexicographic).
          complex(kind=dp), intent(in) :: a, b
          complex(kind=dp) :: r
          r = merge(b, a, c_lt(a, b))
       end function c_maximum
 
-      elemental function c_minimum(a, b) result(r)
+      pure elemental function c_minimum(a, b) result(r)
          complex(kind=dp), intent(in) :: a, b
          complex(kind=dp) :: r
          r = merge(b, a, c_gt(a, b))
       end function c_minimum
 
-      elemental function c_round(z, d) result(r)
+      pure elemental function c_round(z, d) result(r)
          ! np.round of a complex number: both parts, half to even.
          complex(kind=dp), intent(in) :: z
          integer, intent(in) :: d
@@ -5101,7 +5103,7 @@ contains
          s = 10.0_dp**d
          r = cmplx(anint_even(real(z, kind=dp) * s) / s, anint_even(aimag(z) * s) / s, kind=dp)
       contains
-         elemental real(kind=dp) function anint_even(x)
+         pure elemental real(kind=dp) function anint_even(x)
             real(kind=dp), intent(in) :: x
             anint_even = anint(x)
             if (abs(x - aint(x)) == 0.5_dp) anint_even = 2.0_dp * anint(x / 2.0_dp)
@@ -5634,7 +5636,7 @@ contains
          c = [c, spread(ieee_value(0.0_dp, ieee_quiet_nan), 1, nnan)]
       end function np_setxor1d_real
 
-      elemental logical function eq_nan_real(a, b)
+      pure elemental logical function eq_nan_real(a, b)
          ! a == b, with every NaN equal to every NaN (numpy's unique).
          real(kind=dp), intent(in) :: a, b
          if (ieee_is_nan(a) .or. ieee_is_nan(b)) then
@@ -5912,7 +5914,7 @@ contains
          end if
       end function np_digitize_scalar
 
-      elemental function np_spacing(x) result(s)
+      pure elemental function np_spacing(x) result(s)
          ! np.spacing(x): the distance from x to the next float away from 0,
          ! with the sign of x (spacing(0) is the smallest subnormal; NaN for
          ! inf and NaN).
@@ -5928,7 +5930,7 @@ contains
          end if
       end function np_spacing
 
-      elemental integer function np_pad_index(i, n, mode) result(j)
+      pure elemental integer function np_pad_index(i, n, mode) result(j)
          ! The 0-based index into a vector of size n that position i (0 is
          ! its first element, i < 0 before it, i >= n after it) of np.pad
          ! takes: mode 1 'edge', 2 'wrap', 3 'reflect' (mirror without the
@@ -6047,7 +6049,7 @@ contains
          end do
       end function np_unpackbits
 
-      elemental function np_nan_to_num(x, nan, posinf, neginf) result(y)
+      pure elemental function np_nan_to_num(x, nan, posinf, neginf) result(y)
          ! np.nan_to_num(x, nan=, posinf=, neginf=): NaN, +inf and -inf
          ! replaced (no ordered comparison of a NaN, which would raise the
          ! invalid-operation flag).
@@ -6064,7 +6066,7 @@ contains
          end if
       end function np_nan_to_num
 
-      elemental function np_heaviside(x, h0) result(y)
+      pure elemental function np_heaviside(x, h0) result(y)
          ! np.heaviside(x, h0): 0 for x < 0, h0 at 0, 1 for x > 0, NaN at NaN.
          real(kind=dp), intent(in) :: x, h0
          real(kind=dp) :: y
@@ -6090,7 +6092,7 @@ contains
          if (maxval(x) > minval(x)) r = 1.0_dp
       end function np_corrcoef_1
 
-      elemental function np_chkfinite(x) result(y)
+      pure elemental function np_chkfinite(x) result(y)
          ! np.asarray_chkfinite(x): x, or an error if it is inf or NaN.
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: y
@@ -6159,7 +6161,7 @@ contains
             c = [c, na(1:min(1, size(na))), nb(1:min(1, size(nb)))]
          end if
       contains
-         pure logical function complex_nan_before(x, y) result(lt)
+         pure elemental logical function complex_nan_before(x, y) result(lt)
             ! numpy's order: R + nanj, nan + Rj, nan + nanj; then by the
             ! parts that are not NaN.
             complex(kind=dp), intent(in) :: x, y
@@ -7914,7 +7916,7 @@ contains
          if (pos < n) out(pos + 2:n + 1) = a(pos + 1:n)
       end function np_insert_real_1d
 
-      function np_delete_real_1d(a, idx) result(out)
+      pure function np_delete_real_1d(a, idx) result(out)
          real(kind=dp), intent(in) :: a(:)
          integer, intent(in) :: idx
          real(kind=dp), allocatable :: out(:)
@@ -7926,7 +7928,7 @@ contains
          end if
          pos = idx
          if (pos < 0) pos = n + pos
-         if (pos < 0 .or. pos >= n) stop "np.delete index out of range"
+         if (pos < 0 .or. pos >= n) error stop "np.delete index out of range"
          allocate(out(max(0, n - 1)))
          if (n == 1) return
          if (pos > 0) out(1:pos) = a(1:pos)
@@ -8620,7 +8622,7 @@ contains
             n = 1
          end if
       contains
-         pure real(kind=dp) function pct(q)
+         pure elemental real(kind=dp) function pct(q)
             ! The q quantile of the sorted s (numpy's linear method).
             real(kind=dp), intent(in) :: q
             real(kind=dp) :: pos
@@ -9134,7 +9136,7 @@ contains
          m = xs(n / 2 + 1)
       end function median_high_int
 
-      function mode_int(x) result(m)
+      pure function mode_int(x) result(m)
          integer, intent(in) :: x(:)
          integer :: m
          integer, allocatable :: u(:), cnt(:)
@@ -9183,7 +9185,7 @@ contains
          end do
       end function mode_real
 
-      function multimode_int(x) result(mm)
+      pure function multimode_int(x) result(mm)
          integer, intent(in) :: x(:)
          integer, allocatable :: mm(:)
          integer, allocatable :: u(:), cnt(:)
@@ -9292,7 +9294,7 @@ contains
          allocate(x(n), source=.true.)
       end function ones_logical
 
-      elemental function to_lower(s)
+      pure elemental function to_lower(s)
          character(len=*), intent(in) :: s
          character(len=len(s)) :: to_lower
          integer :: i, k
@@ -9306,7 +9308,7 @@ contains
          end do
       end function to_lower
 
-      elemental function to_upper(s)
+      pure elemental function to_upper(s)
          character(len=*), intent(in) :: s
          character(len=len(s)) :: to_upper
          integer :: i, k
@@ -9320,7 +9322,7 @@ contains
          end do
       end function to_upper
 
-      pure logical function char_in_set(ch, set_chars)
+      pure elemental logical function char_in_set(ch, set_chars)
          character(len=1), intent(in) :: ch
          character(len=*), intent(in) :: set_chars
          integer :: i
@@ -9392,7 +9394,7 @@ contains
          end if
       end function str_strip
 
-      pure logical function starts_with(s, prefix)
+      pure elemental logical function starts_with(s, prefix)
          character(len=*), intent(in) :: s, prefix
          integer :: n
          n = len(prefix)
@@ -9405,7 +9407,7 @@ contains
          end if
       end function starts_with
 
-      pure logical function ends_with(s, suffix)
+      pure elemental logical function ends_with(s, suffix)
          character(len=*), intent(in) :: s, suffix
          integer :: n, ls
          n = len(suffix)
@@ -9419,7 +9421,7 @@ contains
          end if
       end function ends_with
 
-      pure integer function str_find(s, sub)
+      pure elemental integer function str_find(s, sub)
          character(len=*), intent(in) :: s, sub
          integer :: p
          if (len(sub) == 0) then
@@ -9434,7 +9436,7 @@ contains
          end if
       end function str_find
 
-      pure integer function str_rfind(s, sub)
+      pure elemental integer function str_rfind(s, sub)
          character(len=*), intent(in) :: s, sub
          integer :: p
          if (len(sub) == 0) then
@@ -9475,7 +9477,7 @@ contains
          end if
       end function str_replace
 
-      pure function str_reverse(s) result(out)
+      pure elemental function str_reverse(s) result(out)
          character(len=*), intent(in) :: s
          character(len=len(s)) :: out
          integer :: i, n
@@ -9495,7 +9497,7 @@ contains
          end do
       end function str_to_chars
 
-      pure subroutine py_affix_bounds(n, lo, hi, start, end)
+      pure elemental subroutine py_affix_bounds(n, lo, hi, start, end)
          ! Python's slice bounds s[start:end] for startswith/endswith, as
          ! 1-based lo and hi; lo > n + 1 means start is past the end.
          integer, intent(in) :: n
@@ -9518,7 +9520,7 @@ contains
          lo = lo + 1
       end subroutine py_affix_bounds
 
-      elemental logical function py_startswith(s, prefix, start, end)
+      pure elemental logical function py_startswith(s, prefix, start, end)
          ! Lengths are compared exactly: Fortran's == pads with blanks.
          character(len=*), intent(in) :: s, prefix
          integer, intent(in), optional :: start, end
@@ -9530,7 +9532,7 @@ contains
          py_startswith = s(lo:lo + len(prefix) - 1) == prefix
       end function py_startswith
 
-      elemental logical function py_endswith(s, suffix, start, end)
+      pure elemental logical function py_endswith(s, suffix, start, end)
          character(len=*), intent(in) :: s, suffix
          integer, intent(in), optional :: start, end
          integer :: lo, hi
@@ -9636,7 +9638,7 @@ contains
          end if
       end function str_rjust
 
-      pure subroutine append_strvec(items, tok)
+      pure elemental subroutine append_strvec(items, tok)
          type(strvec_t), intent(inout) :: items
          character(len=*), intent(in) :: tok
          character(len=:), allocatable :: tmp(:)
@@ -9659,7 +9661,7 @@ contains
          call move_alloc(tmp, items%v)
       end subroutine append_strvec
 
-      pure function str_split(s, sep) result(out)
+      pure elemental function str_split(s, sep) result(out)
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: sep
          type(strvec_t) :: out
@@ -9706,6 +9708,26 @@ contains
          if (pos <= len(s) + 1) call append_strvec(out, s(pos:))
       end function str_split
 
+      subroutine py_file_write(unit, s)
+         ! f.write(s): each newline ends a record (so the file gets the
+         ! platform's line ending, as in Python's text mode), and only the
+         ! text after the last newline is left in an open record. A
+         ! non-advancing write of all of s left a record open even when s
+         ! ended with a newline, and close then added an empty line.
+         integer, intent(in) :: unit
+         character(len=*), intent(in) :: s
+         integer :: i, j
+
+         i = 1
+         do
+            j = index(s(i:), new_line('a'))
+            if (j == 0) exit
+            write(unit, '(a)') s(i:i+j-2)
+            i = i + j
+         end do
+         if (i <= len(s)) write(unit, '(a)', advance='no') s(i:)
+      end subroutine py_file_write
+
       function csv_split_line(line, delimiter, quotechar) result(fields)
          character(len=*), intent(in) :: line
          character(len=*), intent(in), optional :: delimiter, quotechar
@@ -9722,6 +9744,11 @@ contains
          end if
          if (present(quotechar)) then
             if (len_trim(quotechar) > 0) q = quotechar(1:1)
+         end if
+         ! An empty line is an empty row, as in Python's csv.reader.
+         if (len_trim(line) == 0) then
+            allocate(character(len=0) :: fields(0))
+            return
          end if
 
          nf = 1
@@ -9794,7 +9821,7 @@ contains
          end do
       end function str_join
 
-      pure integer function str_count(s, sub)
+      pure elemental integer function str_count(s, sub)
          character(len=*), intent(in) :: s, sub
          integer :: p, pos, ls
          if (len(sub) == 0) then
@@ -9813,7 +9840,7 @@ contains
          end do
       end function str_count
 
-      pure logical function str_isdigit(s)
+      pure elemental logical function str_isdigit(s)
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -9830,7 +9857,7 @@ contains
          str_isdigit = .true.
       end function str_isdigit
 
-      pure logical function str_isalpha(s)
+      pure elemental logical function str_isalpha(s)
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -9847,7 +9874,7 @@ contains
          str_isalpha = .true.
       end function str_isalpha
 
-      pure logical function str_isalnum(s)
+      pure elemental logical function str_isalnum(s)
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -9866,7 +9893,7 @@ contains
          str_isalnum = .true.
       end function str_isalnum
 
-      pure logical function str_isspace(s)
+      pure elemental logical function str_isspace(s)
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -14175,14 +14202,14 @@ contains
             end subroutine dgesv
          end interface
          n = size(a, 1)
-         if (size(a,2) /= n) stop "linalg_solve: matrix must be square"
-         if (size(b) /= n) stop "linalg_solve: rhs size mismatch"
+         if (size(a,2) /= n) error stop "linalg_solve: matrix must be square"
+         if (size(b) /= n) error stop "linalg_solve: rhs size mismatch"
          allocate(ac(1:n,1:n), source=a)
          allocate(bc(1:n,1), source=0.0_dp)
          bc(:,1) = b
          allocate(ipiv(1:n))
          call dgesv(n, 1, ac, n, ipiv, bc, n, info)
-         if (info /= 0) stop "linalg_solve: dgesv failed"
+         if (info /= 0) error stop "linalg_solve: dgesv failed"
          allocate(x(1:n))
          x = bc(:,1)
       end function linalg_solve_vec
@@ -14232,14 +14259,14 @@ contains
             end subroutine dgesv
          end interface
          n = size(a, 1)
-         if (size(a,2) /= n) stop "linalg_solve: matrix must be square"
-         if (size(b,1) /= n) stop "linalg_solve: rhs row mismatch"
+         if (size(a,2) /= n) error stop "linalg_solve: matrix must be square"
+         if (size(b,1) /= n) error stop "linalg_solve: rhs row mismatch"
          nrhs = size(b,2)
          allocate(ac(1:n,1:n), source=a)
          allocate(bc(1:n,1:nrhs), source=b)
          allocate(ipiv(1:n))
          call dgesv(n, nrhs, ac, n, ipiv, bc, n, info)
-         if (info /= 0) stop "linalg_solve: dgesv failed"
+         if (info /= 0) error stop "linalg_solve: dgesv failed"
          allocate(x(1:n,1:nrhs))
          x = bc
       end function linalg_solve_mat
@@ -14299,11 +14326,11 @@ contains
             end subroutine dpotrf
          end interface
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_cholesky: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_cholesky: matrix must be square"
          allocate(l(1:n,1:n), source=a)
          call dpotrf('L', n, l, n, info)
-         if (info < 0) stop "linalg_cholesky: dpotrf argument error"
-         if (info > 0) stop "linalg_cholesky: matrix is not positive definite"
+         if (info < 0) error stop "linalg_cholesky: dpotrf argument error"
+         if (info > 0) error stop "linalg_cholesky: matrix is not positive definite"
          do i = 1, n
             do j = i + 1, n
                l(i,j) = 0.0_dp
@@ -14436,7 +14463,7 @@ contains
          end do
       end function linalg_matrix_power_complex
 
-      function linalg_cholesky_complex(a) result(l)
+      pure function linalg_cholesky_complex(a) result(l)
          ! np.linalg.cholesky of a complex Hermitian positive-definite
          ! matrix (its lower triangle): lower L, real positive diagonal.
          complex(dp), intent(in) :: a(:,:)
@@ -14456,7 +14483,7 @@ contains
          end do
       end function linalg_cholesky_complex
 
-      subroutine linalg_eig_complex(a, w, v)
+      pure subroutine linalg_eig_complex(a, w, v)
          ! np.linalg.eig of a complex matrix (dceigv), the eigenvectors
          ! normalized as LAPACK's zgeev does: unit norm, the (first)
          ! largest component real and positive.
@@ -14497,11 +14524,11 @@ contains
             end subroutine dgetrf
          end interface
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_det: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_det: matrix must be square"
          allocate(ac(1:n,1:n), source=a)
          allocate(ipiv(1:n))
          call dgetrf(n, n, ac, n, ipiv, info)
-         if (info < 0) stop "linalg_det: dgetrf argument error"
+         if (info < 0) error stop "linalg_det: dgetrf argument error"
          if (info > 0) then
             detv = 0.0_dp
             return
@@ -14536,20 +14563,20 @@ contains
             end subroutine dgetri
          end interface
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_inv: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_inv: matrix must be square"
          allocate(ac(1:n,1:n), source=a)
          allocate(ipiv(1:n))
          call dgetrf(n, n, ac, n, ipiv, info)
-         if (info /= 0) stop "linalg_inv: dgetrf failed"
+         if (info /= 0) error stop "linalg_inv: dgetrf failed"
          allocate(work(1))
          lwork = -1
          call dgetri(n, ac, n, ipiv, work, lwork, info)
-         if (info /= 0) stop "linalg_inv: dgetri workspace query failed"
+         if (info /= 0) error stop "linalg_inv: dgetri workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dgetri(n, ac, n, ipiv, work, lwork, info)
-         if (info /= 0) stop "linalg_inv: dgetri failed"
+         if (info /= 0) error stop "linalg_inv: dgetri failed"
          allocate(ai(1:n,1:n))
          ai = ac
       end function linalg_inv
@@ -14607,19 +14634,19 @@ contains
             end subroutine dgeev
          end interface
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_eigvals: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_eigvals: matrix must be square"
          allocate(ac(1:n,1:n), source=a)
          allocate(wr(1:n), wi(1:n))
          allocate(vr_dummy(1,1), vl_dummy(1,1))
          allocate(work(1))
          lwork = -1
          call dgeev('N', 'N', n, ac, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
-         if (info /= 0) stop "linalg_eigvals: dgeev workspace query failed"
+         if (info /= 0) error stop "linalg_eigvals: dgeev workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dgeev('N', 'N', n, ac, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
-         if (info /= 0) stop "linalg_eigvals: dgeev failed"
+         if (info /= 0) error stop "linalg_eigvals: dgeev failed"
          allocate(w(1:n))
          w = cmplx(wr, wi, kind=dp)
       end function linalg_eigvals_real
@@ -14716,19 +14743,19 @@ contains
             end subroutine dsyev
          end interface
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_eigh: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_eigh: matrix must be square"
          ! As numpy (UPLO='L'), only the lower triangle of a is read.
          allocate(ac(1:n,1:n), source=a)
          allocate(w(1:n))
          allocate(work(1))
          lwork = -1
          call dsyev('V', 'L', n, ac, n, w, work, lwork, info)
-         if (info /= 0) stop "linalg_eigh: dsyev workspace query failed"
+         if (info /= 0) error stop "linalg_eigh: dsyev workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dsyev('V', 'L', n, ac, n, w, work, lwork, info)
-         if (info /= 0) stop "linalg_eigh: dsyev failed"
+         if (info /= 0) error stop "linalg_eigh: dsyev failed"
          allocate(v(1:n,1:n), source=ac)
       end subroutine linalg_eigh
 
@@ -14750,18 +14777,18 @@ contains
             end subroutine dsyev
          end interface
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_eigvalsh: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_eigvalsh: matrix must be square"
          allocate(ac(1:n,1:n), source=a)
          allocate(w(1:n))
          allocate(work(1))
          lwork = -1
          call dsyev('N', 'L', n, ac, n, w, work, lwork, info)
-         if (info /= 0) stop "linalg_eigvalsh: dsyev workspace query failed"
+         if (info /= 0) error stop "linalg_eigvalsh: dsyev workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dsyev('N', 'L', n, ac, n, w, work, lwork, info)
-         if (info /= 0) stop "linalg_eigvalsh: dsyev failed"
+         if (info /= 0) error stop "linalg_eigvalsh: dsyev failed"
       end function linalg_eigvalsh
 
       function linalg_pinv(a) result(ap)
@@ -14805,7 +14832,7 @@ contains
          real(kind=dp), allocatable :: base(:,:)
          integer :: n, i, pp
          n = size(a,1)
-         if (size(a,2) /= n) stop "linalg_matrix_power: matrix must be square"
+         if (size(a,2) /= n) error stop "linalg_matrix_power: matrix must be square"
          allocate(ap(1:n,1:n), source=0.0_dp)
          do i = 1, n
             ap(i, i) = 1.0_dp
@@ -14847,12 +14874,12 @@ contains
          allocate(work(1))
          lwork = -1
          call dgeqrf(m, n, ac, m, tau, work, lwork, info)
-         if (info /= 0) stop "linalg_qr_reduced: dgeqrf workspace query failed"
+         if (info /= 0) error stop "linalg_qr_reduced: dgeqrf workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dgeqrf(m, n, ac, m, tau, work, lwork, info)
-         if (info /= 0) stop "linalg_qr_reduced: dgeqrf failed"
+         if (info /= 0) error stop "linalg_qr_reduced: dgeqrf failed"
          allocate(r(1:k,1:n), source=0.0_dp)
          do i_r = 1, k
             do j_r = i_r, n
@@ -14864,12 +14891,12 @@ contains
          allocate(work(1))
          lwork = -1
          call dorgqr(m, k, k, ac, m, tau, work, lwork, info)
-         if (info /= 0) stop "linalg_qr_reduced: dorgqr workspace query failed"
+         if (info /= 0) error stop "linalg_qr_reduced: dorgqr workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dorgqr(m, k, k, ac, m, tau, work, lwork, info)
-         if (info /= 0) stop "linalg_qr_reduced: dorgqr failed"
+         if (info /= 0) error stop "linalg_qr_reduced: dorgqr failed"
          allocate(q(1:m,1:k), source=ac(:,1:k))
       end subroutine linalg_qr_reduced
 
@@ -14923,12 +14950,12 @@ contains
          allocate(work(1))
          lwork = -1
          call dgesvd('A', 'A', m, n, ac, m, s, u, m, vt, n, work, lwork, info)
-         if (info /= 0) stop "linalg_svd: dgesvd workspace query failed"
+         if (info /= 0) error stop "linalg_svd: dgesvd workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dgesvd('A', 'A', m, n, ac, m, s, u, m, vt, n, work, lwork, info)
-         if (info /= 0) stop "linalg_svd: dgesvd failed"
+         if (info /= 0) error stop "linalg_svd: dgesvd failed"
       end subroutine linalg_svd
 
       subroutine linalg_svd_econ(a, u, s, vt)
@@ -14959,12 +14986,12 @@ contains
          allocate(work(1))
          lwork = -1
          call dgesvd('S', 'S', m, n, ac, m, s, u, m, vt, k, work, lwork, info)
-         if (info /= 0) stop "linalg_svd_econ: dgesvd workspace query failed"
+         if (info /= 0) error stop "linalg_svd_econ: dgesvd workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(1:lwork))
          call dgesvd('S', 'S', m, n, ac, m, s, u, m, vt, k, work, lwork, info)
-         if (info /= 0) stop "linalg_svd_econ: dgesvd failed"
+         if (info /= 0) error stop "linalg_svd_econ: dgesvd failed"
       end subroutine linalg_svd_econ
 
       pure subroutine leggauss(n, x, w)
@@ -15526,7 +15553,7 @@ contains
          end do
       end function isclose_real
 
-      pure function isclose_scalar_real(a, b, rtol, atol, equal_nan) result(is_close)
+      pure elemental function isclose_scalar_real(a, b, rtol, atol, equal_nan) result(is_close)
          ! Scalar counterpart of isclose_real, same tolerance test and
          ! NaN handling -- needed because a plain (non-pointer) array-
          ! valued function's result can't be indexed at the call site in
@@ -15600,7 +15627,7 @@ contains
          c = matmul(transpose(xc), xc) / real(max(1, n - d), kind=dp)
       end function cov_matrix_rows_real
 
-      function cov_matrix_rows_complex(x, ddof) result(c)
+      pure function cov_matrix_rows_complex(x, ddof) result(c)
          ! numpy's np.cov of complex variables in the columns of x
          ! (rowvar=False): Xc^T conj(Xc) / (n - ddof), Xc the centered x. As
          ! in numpy, n - ddof <= 0 divides by zero.
@@ -15623,7 +15650,7 @@ contains
          c = matmul(transpose(xc), conjg(xc)) / fact
       end function cov_matrix_rows_complex
 
-      function corrcoef_matrix_rows_complex(x) result(r)
+      pure function corrcoef_matrix_rows_complex(x) result(r)
          ! numpy's np.corrcoef of complex variables in the columns of x
          ! (rowvar=False): c(i,j) / (s(i) s(j)), s the square roots of the
          ! real parts of c's diagonal, with the real and imaginary parts
@@ -16460,12 +16487,12 @@ contains
          allocate(work(1))
          lwork = -1
          call dgeev('N', 'N', n, ac, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
-         if (info /= 0) stop "polyroots_real: dgeev workspace query failed"
+         if (info /= 0) error stop "polyroots_real: dgeev workspace query failed"
          lwork = max(1, int(work(1)))
          deallocate(work)
          allocate(work(lwork))
          call dgeev('N', 'N', n, ac, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
-         if (info /= 0) stop "polyroots_real: dgeev failed"
+         if (info /= 0) error stop "polyroots_real: dgeev failed"
 
          allocate(r(n + ntrail), source=(0.0_dp, 0.0_dp))
          do i = 1, n
@@ -16473,7 +16500,7 @@ contains
          end do
       end function polyroots_real
 
-      pure logical function fft_is_power_of_two(n)
+      pure elemental logical function fft_is_power_of_two(n)
          integer, intent(in) :: n
          fft_is_power_of_two = n > 0 .and. iand(n, n - 1) == 0
       end function fft_is_power_of_two
@@ -17006,7 +17033,7 @@ contains
       end function file_read
 
 
-      pure function py_float(s) result(x)
+      pure elemental function py_float(s) result(x)
          character(len=*), intent(in) :: s
          real(kind=dp) :: x
          integer :: ios
@@ -17015,7 +17042,7 @@ contains
          if (ios /= 0) x = ieee_value(0.0_dp, ieee_quiet_nan)
       end function py_float
 
-      pure function py_int(s) result(x)
+      pure elemental function py_int(s) result(x)
          character(len=*), intent(in) :: s
          integer :: x
          integer :: ios
@@ -17270,7 +17297,7 @@ contains
          end if
       end function shift_1d
 
-      elemental function np_rint(x) result(r)
+      pure elemental function np_rint(x) result(r)
          ! numpy rint/round/around: the nearest integer, ties to even
          ! (np.round(2.5) == 2.0, np.round(-0.5) == -0.0); ANINT rounds
          ! ties away from zero. np.round(x, d) is np_rint(x*10**d)/10**d.
@@ -17300,7 +17327,7 @@ contains
          if (b < a) r = b
       end function py_min_real
 
-      elemental function py_round_ndigits(x, ndigits) result(rnd)
+      pure elemental function py_round_ndigits(x, ndigits) result(rnd)
          ! Python 3's round(x, ndigits): the exact binary value of x rounded
          ! to ndigits decimals, ties to even (round(2.675, 2) == 2.67, since
          ! 2.675 is 2.67499999...; round(0.125, 2) == 0.12). Formatted
@@ -17333,14 +17360,14 @@ contains
          end if
          if (rnd == 0.0_dp) rnd = sign(0.0_dp, x)
       contains
-         pure function int_text(k) result(s)
+         pure elemental function int_text(k) result(s)
             integer, intent(in) :: k
             character(len=12) :: s
             write(s, "(i0)") k
          end function int_text
       end function py_round_ndigits
 
-      elemental function floor_div_real(x, y) result(q)
+      pure elemental function floor_div_real(x, y) result(q)
          ! Python's // on floats is floor(x / y), returned as a float --
          ! not the same operation as ordinary real division, which is
          ! what plain Fortran "/" gives.
@@ -17419,7 +17446,7 @@ contains
          end if
       end function py_round_int64
 
-      elemental function csign_complex(x) result(s)
+      pure elemental function csign_complex(x) result(s)
          ! Fortran's SIGN intrinsic doesn't accept complex operands at
          ! all, so a literal `sign(1.0_dp, x)` translation of np.sign on
          ! a complex-typed value isn't valid Fortran. Adapted from
@@ -17446,7 +17473,7 @@ contains
          r = shifta(x, int(min(shift, 63_int64)))
       end function py_rshift
 
-      elemental integer function floor_div_int(x, y) result(q)
+      pure elemental integer function floor_div_int(x, y) result(q)
          ! Python // floors toward negative infinity; Fortran's own
          ! integer "/" truncates toward zero instead, giving the wrong
          ! answer whenever x and y have opposite signs and don't divide
@@ -17458,7 +17485,7 @@ contains
          q = x / y - merge(1, 0, mod(x, y) /= 0 .and. ((x < 0) .neqv. (y < 0)))
       end function floor_div_int
 
-      elemental function log1p(x) result(y)
+      pure elemental function log1p(x) result(y)
          ! A literal log(1.0_dp + x) suffers the same catastrophic
          ! cancellation as the naive expm1 formula above, for the same
          ! reason (forming 1 + x first discards x's own low-order bits
@@ -17475,7 +17502,7 @@ contains
          y = c_log1p(x)
       end function log1p
 
-      elemental function expm1(x) result(y)
+      pure elemental function expm1(x) result(y)
          ! A literal exp(x) - 1.0_dp loses most significant digits to
          ! catastrophic cancellation once x is small (confirmed against
          ! Python's own math.expm1: at x = 1e-12 the naive formula is
@@ -17496,7 +17523,7 @@ contains
          y = c_expm1(x)
       end function expm1
 
-      elemental function math_remainder(x, y) result(r)
+      pure elemental function math_remainder(x, y) result(r)
          ! math.remainder is the IEEE 754 remainder (x - n*y where n =
          ! round(x/y), ties to even) -- distinct from x % y (floors) and
          ! Fortran's own MOD (truncates). Built on the same round-half-
@@ -17515,7 +17542,7 @@ contains
          r = x - real(n, kind=dp) * y
       end function math_remainder
 
-      elemental function expm1_complex(x) result(y)
+      pure elemental function expm1_complex(x) result(y)
          ! np.expm1/cmath-style expm1 on a complex argument. Uses the
          ! standard complex identity exp(a+bi) - 1 = (exp(a)*cos(b) - 1)
          ! + i*exp(a)*sin(b), with exp(a)*cos(b) - 1 rewritten via the
@@ -17532,7 +17559,7 @@ contains
          y = cmplx(expm1(re) * cos(im) - 2.0_dp * half_sin * half_sin, exp(re) * sin(im), kind=dp)
       end function expm1_complex
 
-      elemental function log1p_complex(x) result(y)
+      pure elemental function log1p_complex(x) result(y)
          complex(kind=dp), intent(in) :: x
          complex(kind=dp) :: y
          y = log(cmplx(1.0_dp, 0.0_dp, kind=dp) + x)
@@ -17587,7 +17614,7 @@ contains
 
 
 
-pure FUNCTION dcpabs(x, y) RESULT(fn_val)
+pure elemental FUNCTION dcpabs(x, y) RESULT(fn_val)
 
 REAL (dp), INTENT(IN) :: x
 REAL (dp), INTENT(IN) :: y

@@ -23,7 +23,8 @@ its first specific procedure, and the list of specifics).
 
 Writes, in the output directory:
   <module>.f90  the module: the tagged routines and generic interfaces
-                (public), the procedures, interfaces, types, parameters and
+                (public, grouped by topic on compact declaration lines),
+                the procedures, interfaces, types, parameters and
                 variables they need (private), and python.f90's intrinsic
                 module uses;
   ROUTINES.md   the public routines by topic, from the tags' args= and desc=;
@@ -31,6 +32,8 @@ Writes, in the output directory:
                 time (LAPACK), and the tagged routines without a lib= topic.
 Then compiles the module with gfortran -c (unless --no-compile), which
 checks that nothing outside it (python_mod) is referenced.
+Eligible scalar pure procedures are promoted to pure elemental in the
+extracted module; procedures used as callbacks inside it are preserved.
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+import fortran_purity
 
 HERE = Path(__file__).resolve().parent
 PROC_START = re.compile(
@@ -399,6 +404,98 @@ def apply_topics(src: Path, table: Path) -> int:
     return 0
 
 
+TOPIC_HEADINGS = {
+    "arrays": "Array creation and manipulation",
+    "calculus": "Calculus and interpolation",
+    "fft": "Fast Fourier transforms",
+    "integers": "Integer operations",
+    "io": "Input and output",
+    "linalg": "Linear algebra",
+    "math": "Mathematical functions",
+    "polynomial": "Polynomials",
+    "random": "Random sampling",
+    "signal": "Signal processing",
+    "sorting": "Sorting and searching",
+    "special": "Special functions",
+    "statistics": "Statistics",
+    "timeseries": "Time series",
+}
+
+
+def grouped_public_declarations(by_topic, width=100):
+    """Alphabetize topics/names and pack names without continuation lines."""
+    lines = []
+    prefix = "public :: "
+    for topic in sorted(by_topic):
+        names = sorted(by_topic[topic])
+        if not names:
+            continue
+        lines += ["", "! " + TOPIC_HEADINGS.get(topic, topic.replace("_", " ").capitalize())]
+        line = prefix
+        for name in names:
+            separator = "" if line == prefix else ", "
+            if line != prefix and len(line) + len(separator) + len(name) > width:
+                lines.append(line)
+                line = prefix
+                separator = ""
+            line += separator + name
+        lines.append(line)
+    if lines:
+        lines.append("")
+    return lines
+
+
+def omit_inherited_implicit_none(lines):
+    """Omit plain IMPLICIT NONE where the host already supplies it.
+
+    Interface bodies have independent implicit typing rules. An internal
+    procedure below a host with explicit implicit typing also needs its
+    own IMPLICIT NONE, so retain it in that case.
+    """
+    output = []
+    scopes = []
+    interface_depth = 0
+    for line in lines:
+        code = strip_comment(line).strip()
+        if IFACE_END.match(code):
+            interface_depth -= 1
+        elif re.match(r"^(?:abstract\s+)?interface\b", code, re.I):
+            interface_depth += 1
+        elif not interface_depth:
+            if PROC_END.match(code) or re.fullmatch(r"end", code, re.I):
+                if scopes:
+                    scopes.pop()
+            elif PROC_START.match(code):
+                scopes.append(scopes[-1] if scopes else True)
+            elif scopes and re.fullmatch(r"implicit\s+none", code, re.I):
+                inherited = scopes[-1]
+                scopes[-1] = True
+                if inherited:
+                    # Retain useful comments attached to the removed statement.
+                    if "!" in line:
+                        indent = line[:len(line) - len(line.lstrip())]
+                        output.append(indent + line[line.index("!"):])
+                    continue
+            elif scopes and re.match(r"implicit\b", code, re.I):
+                # Conservatively retain descendants' declarations after
+                # any other IMPLICIT specification in the host.
+                scopes[-1] = False
+        output.append(line)
+    return output
+
+
+def promote_library_elementals(lines):
+    """Promote scalar pure helpers in the extracted library's own call graph.
+
+    Unlike python.f90, the extracted module need not preserve transpiler
+    callback uses outside this module. Internal procedure-argument uses
+    still prevent promotion. Compiler verification remains enabled by default.
+    """
+    lines = fortran_purity.mark_elemental_where_provable(lines)
+    return [re.sub(r"^(\s*)elemental\b", r"\1pure elemental", line, flags=re.I)
+            for line in lines]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", type=Path, default=HERE / "python.f90")
@@ -416,6 +513,9 @@ def main() -> int:
     lines, uses, decls, types, ifaces, tags, procs, order = parse(args.src.read_text(encoding="utf-8"))
     topics = {t for t in args.topics.split(",") if t}
     lib = {n: t for n, t in tags.items() if tag_field(t, "lib") and (not topics or tag_field(t, "lib") in topics)}
+    by_topic = defaultdict(list)
+    for n, t in lib.items():
+        by_topic[tag_field(t, "lib")].append(n)
     untopiced = sorted(n for n, t in tags.items() if not tag_field(t, "lib"))
     decl_names = {n: l for names, l in decls for n in names}
     # Closure over references.
@@ -467,22 +567,19 @@ def main() -> int:
     o += [l for names, l in decls if set(names) & need_decls]
     for n in sorted(need_types):
         o += types[n]
-    for n in sorted(lib):
-        o.append(f"public :: {n}")
+    o += grouped_public_declarations(by_topic)
     for n in sorted(need_ifaces):
         o += ifaces[n][0]
     o.append("contains")
     for n in order:
         if n in need_procs:
             o.append("")
-            o += procs[n]
+            o += omit_inherited_implicit_none(procs[n])
     o.append(f"end module {args.module}")
+    o = promote_library_elementals(o)
     f90 = args.out / f"{args.module}.f90"
     f90.write_text("\n".join(o) + "\n", encoding="utf-8")
     # Routine list.
-    by_topic = defaultdict(list)
-    for n, t in lib.items():
-        by_topic[tag_field(t, "lib")].append(n)
     md = [f"# {args.module}", "", f"{len(lib)} public routines, extracted from python.f90.", ""]
     for topic in sorted(by_topic):
         md += [f"## {topic}", "", "| routine | kind | arguments | description |", "|---|---|---|---|"]
