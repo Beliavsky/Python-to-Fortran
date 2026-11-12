@@ -64,6 +64,10 @@ INTRINSIC_SUBROUTINES = {"move_alloc", "random_number", "random_seed", "get_envi
                          "system_clock", "date_and_time", "execute_command_line", "get_command_argument",
                          "get_command", "mvbits"}
 TAG = re.compile(r"^public\s*::\s*([a-z_]\w*)\s*!@pyapi(.*)$", re.I)
+# Topic/description metadata can apply to a list of public names. Keep TAG
+# single-name for signature-editing commands: grouped routines may differ.
+TAGGED_PUBLIC = re.compile(
+    r"^public\s*::\s*([a-z_]\w*(?:\s*,\s*[a-z_]\w*)*)\s*!@pyapi(.*)$", re.I)
 
 
 def strip_comment(line: str) -> str:
@@ -115,9 +119,10 @@ def parse(src: str):
             ifaces[m_i.group(1).lower()] = (lines[i:j + 1], procs)
             i = j + 1
             continue
-        mt = TAG.match(l.strip())
+        mt = TAGGED_PUBLIC.match(l.strip())
         if mt:
-            tags[mt.group(1).lower()] = mt.group(2)
+            for name in mt.group(1).split(','):
+                tags[name.strip().lower()] = mt.group(2)
         if re.match(r"^\s*use\b", code, re.I):
             uses.append(l)
         elif "::" in code and not re.match(r"^\s*(public|private)\b", code, re.I):

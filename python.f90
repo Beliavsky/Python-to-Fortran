@@ -13253,6 +13253,7 @@ contains
       end function opoly_from_pow
 
       pure function chebpts1(npts) result(x)
+         !! np.polynomial.chebyshev.chebpts1/chebpts2: Chebyshev points of the first/second kind
          ! Chebyshev points of the first kind (numpy's chebpts1).
          integer, intent(in) :: npts
          real(kind=dp), allocatable :: x(:)
@@ -13263,6 +13264,7 @@ contains
       end function chebpts1
 
       pure function chebpts2(npts) result(x)
+         !! np.polynomial.chebyshev.chebpts1/chebpts2: Chebyshev points of the first/second kind
          ! Chebyshev points of the second kind (numpy's chebpts2).
          integer, intent(in) :: npts
          real(kind=dp), allocatable :: x(:)
@@ -13271,6 +13273,8 @@ contains
       end function chebpts2
 
       pure function powcompanion(c) result(m)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          ! Scaled companion matrix of the power series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: m(:,:)
@@ -13278,6 +13282,8 @@ contains
       end function powcompanion
 
       function powroots(c) result(r)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          ! Roots of the power series, complex, sorted as numpy sorts them.
          real(kind=dp), intent(in) :: c(:)
          complex(kind=dp), allocatable :: r(:)
@@ -13285,6 +13291,8 @@ contains
       end function powroots
 
       function powrealroots(c, tol, lo, hi) result(x)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          ! Real roots of the power series, ascending, polished (not in numpy).
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol, lo, hi
@@ -13293,6 +13301,8 @@ contains
       end function powrealroots
 
       pure function powfromroots(roots) result(c)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          ! The power series with these real roots.
          real(kind=dp), intent(in) :: roots(:)
          real(kind=dp), allocatable :: c(:)
@@ -13300,24 +13310,32 @@ contains
       end function powfromroots
 
       pure function powmulx(c) result(r)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_mulx(1, c)
       end function powmulx
 
       pure function powadd(c1, c2) result(r)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, 1)
       end function powadd
 
       pure function powsub(c1, c2) result(r)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, -1)
       end function powsub
 
       pure function powmul(c1, c2) result(r)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          ! Product of two power series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
@@ -13325,6 +13343,8 @@ contains
       end function powmul
 
       pure subroutine powdiv(c1, c2, quo, rem)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          ! Quotient and remainder of two power series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
@@ -13332,6 +13352,8 @@ contains
       end subroutine powdiv
 
       pure function powpow(c, power, maxpower) result(r)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in) :: power
          integer, intent(in), optional :: maxpower
@@ -13340,12 +13362,16 @@ contains
       end function powpow
 
       pure function powline(off, scl) result(c)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          real(kind=dp), intent(in) :: off, scl
          real(kind=dp), allocatable :: c(:)
          c = opoly_line(1, off, scl)
       end function powline
 
       pure function powtrim(c, tol) result(r)
+         !! np.polynomial.polynomial.poly...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol
          real(kind=dp), allocatable :: r(:)
@@ -13353,6 +13379,9 @@ contains
       end function powtrim
 
       pure function chebcompanion(c) result(m)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Scaled companion matrix of the Chebyshev series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: m(:,:)
@@ -13360,6 +13389,9 @@ contains
       end function chebcompanion
 
       function chebroots(c) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Roots of the Chebyshev series, complex, sorted as numpy sorts them.
          real(kind=dp), intent(in) :: c(:)
          complex(kind=dp), allocatable :: r(:)
@@ -13367,6 +13399,9 @@ contains
       end function chebroots
 
       function chebrealroots(c, tol, lo, hi) result(x)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Real roots of the Chebyshev series, ascending, polished (not in numpy).
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol, lo, hi
@@ -13375,6 +13410,9 @@ contains
       end function chebrealroots
 
       pure function chebfromroots(roots) result(c)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The Chebyshev series with these real roots.
          real(kind=dp), intent(in) :: roots(:)
          real(kind=dp), allocatable :: c(:)
@@ -13382,24 +13420,36 @@ contains
       end function chebfromroots
 
       pure function chebmulx(c) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_mulx(2, c)
       end function chebmulx
 
       pure function chebadd(c1, c2) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, 1)
       end function chebadd
 
       pure function chebsub(c1, c2) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, -1)
       end function chebsub
 
       pure function chebmul(c1, c2) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Product of two Chebyshev series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
@@ -13407,6 +13457,9 @@ contains
       end function chebmul
 
       pure subroutine chebdiv(c1, c2, quo, rem)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Quotient and remainder of two Chebyshev series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
@@ -13414,6 +13467,9 @@ contains
       end subroutine chebdiv
 
       pure function chebpow(c, power, maxpower) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in) :: power
          integer, intent(in), optional :: maxpower
@@ -13422,12 +13478,18 @@ contains
       end function chebpow
 
       pure function chebline(off, scl) result(c)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: off, scl
          real(kind=dp), allocatable :: c(:)
          c = opoly_line(2, off, scl)
       end function chebline
 
       pure function chebtrim(c, tol) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol
          real(kind=dp), allocatable :: r(:)
@@ -13435,6 +13497,9 @@ contains
       end function chebtrim
 
       pure function cheb2poly(c) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The Chebyshev series as a power series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
@@ -13442,6 +13507,9 @@ contains
       end function cheb2poly
 
       pure function poly2cheb(pol) result(r)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! A power series as a Chebyshev series.
          real(kind=dp), intent(in) :: pol(:)
          real(kind=dp), allocatable :: r(:)
@@ -13449,6 +13517,9 @@ contains
       end function poly2cheb
 
       subroutine chebgauss(deg, x, w)
+         !! np.polynomial.chebyshev.cheb...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Gauss quadrature nodes and weights for the Chebyshev series weight.
          integer, intent(in) :: deg
          real(kind=dp), allocatable, intent(out) :: x(:), w(:)
@@ -13456,6 +13527,9 @@ contains
       end subroutine chebgauss
 
       pure function legcompanion(c) result(m)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! Scaled companion matrix of the Legendre series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: m(:,:)
@@ -13463,6 +13537,9 @@ contains
       end function legcompanion
 
       function legroots(c) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! Roots of the Legendre series, complex, sorted as numpy sorts them.
          real(kind=dp), intent(in) :: c(:)
          complex(kind=dp), allocatable :: r(:)
@@ -13470,6 +13547,9 @@ contains
       end function legroots
 
       function legrealroots(c, tol, lo, hi) result(x)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! Real roots of the Legendre series, ascending, polished (not in numpy).
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol, lo, hi
@@ -13478,6 +13558,9 @@ contains
       end function legrealroots
 
       pure function legfromroots(roots) result(c)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! The Legendre series with these real roots.
          real(kind=dp), intent(in) :: roots(:)
          real(kind=dp), allocatable :: c(:)
@@ -13485,24 +13568,36 @@ contains
       end function legfromroots
 
       pure function legmulx(c) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_mulx(3, c)
       end function legmulx
 
       pure function legadd(c1, c2) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, 1)
       end function legadd
 
       pure function legsub(c1, c2) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, -1)
       end function legsub
 
       pure function legmul(c1, c2) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! Product of two Legendre series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
@@ -13510,6 +13605,9 @@ contains
       end function legmul
 
       pure subroutine legdiv(c1, c2, quo, rem)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! Quotient and remainder of two Legendre series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
@@ -13517,6 +13615,9 @@ contains
       end subroutine legdiv
 
       pure function legpow(c, power, maxpower) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in) :: power
          integer, intent(in), optional :: maxpower
@@ -13525,12 +13626,18 @@ contains
       end function legpow
 
       pure function legline(off, scl) result(c)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          real(kind=dp), intent(in) :: off, scl
          real(kind=dp), allocatable :: c(:)
          c = opoly_line(3, off, scl)
       end function legline
 
       pure function legtrim(c, tol) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol
          real(kind=dp), allocatable :: r(:)
@@ -13538,6 +13645,9 @@ contains
       end function legtrim
 
       pure function leg2poly(c) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! The Legendre series as a power series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
@@ -13545,6 +13655,9 @@ contains
       end function leg2poly
 
       pure function poly2leg(pol) result(r)
+         !! np.polynomial.legendre.leg...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series
          ! A power series as a Legendre series.
          real(kind=dp), intent(in) :: pol(:)
          real(kind=dp), allocatable :: r(:)
@@ -13552,6 +13665,9 @@ contains
       end function poly2leg
 
       pure function hermcompanion(c) result(m)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Scaled companion matrix of the Hermite series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: m(:,:)
@@ -13559,6 +13675,9 @@ contains
       end function hermcompanion
 
       function hermroots(c) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Roots of the Hermite series, complex, sorted as numpy sorts them.
          real(kind=dp), intent(in) :: c(:)
          complex(kind=dp), allocatable :: r(:)
@@ -13566,6 +13685,9 @@ contains
       end function hermroots
 
       function hermrealroots(c, tol, lo, hi) result(x)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Real roots of the Hermite series, ascending, polished (not in numpy).
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol, lo, hi
@@ -13574,6 +13696,9 @@ contains
       end function hermrealroots
 
       pure function hermfromroots(roots) result(c)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The Hermite series with these real roots.
          real(kind=dp), intent(in) :: roots(:)
          real(kind=dp), allocatable :: c(:)
@@ -13581,24 +13706,36 @@ contains
       end function hermfromroots
 
       pure function hermmulx(c) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_mulx(4, c)
       end function hermmulx
 
       pure function hermadd(c1, c2) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, 1)
       end function hermadd
 
       pure function hermsub(c1, c2) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, -1)
       end function hermsub
 
       pure function hermmul(c1, c2) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Product of two Hermite series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
@@ -13606,6 +13743,9 @@ contains
       end function hermmul
 
       pure subroutine hermdiv(c1, c2, quo, rem)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Quotient and remainder of two Hermite series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
@@ -13613,6 +13753,9 @@ contains
       end subroutine hermdiv
 
       pure function hermpow(c, power, maxpower) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in) :: power
          integer, intent(in), optional :: maxpower
@@ -13621,12 +13764,18 @@ contains
       end function hermpow
 
       pure function hermline(off, scl) result(c)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: off, scl
          real(kind=dp), allocatable :: c(:)
          c = opoly_line(4, off, scl)
       end function hermline
 
       pure function hermtrim(c, tol) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol
          real(kind=dp), allocatable :: r(:)
@@ -13634,6 +13783,9 @@ contains
       end function hermtrim
 
       pure function herm2poly(c) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The Hermite series as a power series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
@@ -13641,6 +13793,9 @@ contains
       end function herm2poly
 
       pure function poly2herm(pol) result(r)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! A power series as a Hermite series.
          real(kind=dp), intent(in) :: pol(:)
          real(kind=dp), allocatable :: r(:)
@@ -13648,6 +13803,9 @@ contains
       end function poly2herm
 
       subroutine hermgauss(deg, x, w)
+         !! np.polynomial.hermite.herm...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Gauss quadrature nodes and weights for the Hermite series weight.
          integer, intent(in) :: deg
          real(kind=dp), allocatable, intent(out) :: x(:), w(:)
@@ -13655,6 +13813,9 @@ contains
       end subroutine hermgauss
 
       pure function hermecompanion(c) result(m)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Scaled companion matrix of the HermiteE series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: m(:,:)
@@ -13662,6 +13823,9 @@ contains
       end function hermecompanion
 
       function hermeroots(c) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Roots of the HermiteE series, complex, sorted as numpy sorts them.
          real(kind=dp), intent(in) :: c(:)
          complex(kind=dp), allocatable :: r(:)
@@ -13669,6 +13833,9 @@ contains
       end function hermeroots
 
       function hermerealroots(c, tol, lo, hi) result(x)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Real roots of the HermiteE series, ascending, polished (not in numpy).
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol, lo, hi
@@ -13677,6 +13844,9 @@ contains
       end function hermerealroots
 
       pure function hermefromroots(roots) result(c)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The HermiteE series with these real roots.
          real(kind=dp), intent(in) :: roots(:)
          real(kind=dp), allocatable :: c(:)
@@ -13684,24 +13854,36 @@ contains
       end function hermefromroots
 
       pure function hermemulx(c) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_mulx(5, c)
       end function hermemulx
 
       pure function hermeadd(c1, c2) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, 1)
       end function hermeadd
 
       pure function hermesub(c1, c2) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, -1)
       end function hermesub
 
       pure function hermemul(c1, c2) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Product of two HermiteE series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
@@ -13709,6 +13891,9 @@ contains
       end function hermemul
 
       pure subroutine hermediv(c1, c2, quo, rem)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Quotient and remainder of two HermiteE series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
@@ -13716,6 +13901,9 @@ contains
       end subroutine hermediv
 
       pure function hermepow(c, power, maxpower) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in) :: power
          integer, intent(in), optional :: maxpower
@@ -13724,12 +13912,18 @@ contains
       end function hermepow
 
       pure function hermeline(off, scl) result(c)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: off, scl
          real(kind=dp), allocatable :: c(:)
          c = opoly_line(5, off, scl)
       end function hermeline
 
       pure function hermetrim(c, tol) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol
          real(kind=dp), allocatable :: r(:)
@@ -13737,6 +13931,9 @@ contains
       end function hermetrim
 
       pure function herme2poly(c) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The HermiteE series as a power series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
@@ -13744,6 +13941,9 @@ contains
       end function herme2poly
 
       pure function poly2herme(pol) result(r)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! A power series as a HermiteE series.
          real(kind=dp), intent(in) :: pol(:)
          real(kind=dp), allocatable :: r(:)
@@ -13751,6 +13951,9 @@ contains
       end function poly2herme
 
       subroutine hermegauss(deg, x, w)
+         !! np.polynomial.hermite_e.herme...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Gauss quadrature nodes and weights for the HermiteE series weight.
          integer, intent(in) :: deg
          real(kind=dp), allocatable, intent(out) :: x(:), w(:)
@@ -13758,6 +13961,9 @@ contains
       end subroutine hermegauss
 
       pure function lagcompanion(c) result(m)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Scaled companion matrix of the Laguerre series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: m(:,:)
@@ -13765,6 +13971,9 @@ contains
       end function lagcompanion
 
       function lagroots(c) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Roots of the Laguerre series, complex, sorted as numpy sorts them.
          real(kind=dp), intent(in) :: c(:)
          complex(kind=dp), allocatable :: r(:)
@@ -13772,6 +13981,9 @@ contains
       end function lagroots
 
       function lagrealroots(c, tol, lo, hi) result(x)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Real roots of the Laguerre series, ascending, polished (not in numpy).
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol, lo, hi
@@ -13780,6 +13992,9 @@ contains
       end function lagrealroots
 
       pure function lagfromroots(roots) result(c)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The Laguerre series with these real roots.
          real(kind=dp), intent(in) :: roots(:)
          real(kind=dp), allocatable :: c(:)
@@ -13787,24 +14002,36 @@ contains
       end function lagfromroots
 
       pure function lagmulx(c) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_mulx(6, c)
       end function lagmulx
 
       pure function lagadd(c1, c2) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, 1)
       end function lagadd
 
       pure function lagsub(c1, c2) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
          r = opoly_add(c1, c2, -1)
       end function lagsub
 
       pure function lagmul(c1, c2) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Product of two Laguerre series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable :: r(:)
@@ -13812,6 +14039,9 @@ contains
       end function lagmul
 
       pure subroutine lagdiv(c1, c2, quo, rem)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Quotient and remainder of two Laguerre series coefficient arrays.
          real(kind=dp), intent(in) :: c1(:), c2(:)
          real(kind=dp), allocatable, intent(out) :: quo(:), rem(:)
@@ -13819,6 +14049,9 @@ contains
       end subroutine lagdiv
 
       pure function lagpow(c, power, maxpower) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in) :: power
          integer, intent(in), optional :: maxpower
@@ -13827,12 +14060,18 @@ contains
       end function lagpow
 
       pure function lagline(off, scl) result(c)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: off, scl
          real(kind=dp), allocatable :: c(:)
          c = opoly_line(6, off, scl)
       end function lagline
 
       pure function lagtrim(c, tol) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), intent(in), optional :: tol
          real(kind=dp), allocatable :: r(:)
@@ -13840,6 +14079,9 @@ contains
       end function lagtrim
 
       pure function lag2poly(c) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! The Laguerre series as a power series.
          real(kind=dp), intent(in) :: c(:)
          real(kind=dp), allocatable :: r(:)
@@ -13847,6 +14089,9 @@ contains
       end function lag2poly
 
       pure function poly2lag(pol) result(r)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! A power series as a Laguerre series.
          real(kind=dp), intent(in) :: pol(:)
          real(kind=dp), allocatable :: r(:)
@@ -13854,6 +14099,9 @@ contains
       end function poly2lag
 
       subroutine laggauss(deg, x, w)
+         !! np.polynomial.laguerre.lag...: companion, roots (complex; realroots: real, not in
+         !! numpy), fromroots, mulx, add, sub, mul, div (subroutine: quo, rem), pow, line, trim,
+         !! conversions to and from the power series, Gauss quadrature
          ! Gauss quadrature nodes and weights for the Laguerre series weight.
          integer, intent(in) :: deg
          real(kind=dp), allocatable, intent(out) :: x(:), w(:)

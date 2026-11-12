@@ -59,37 +59,12 @@ def test_elemental_array_calls(tmp_path, module):
     else:
         runtime = ROOT / 'python.f90'
     program = tmp_path / 'elemental.f90'
-    program.write_text(f'''program main
-use {module}
-use, intrinsic :: iso_fortran_env, only: dp => real64, int64
-implicit none
-call checks()
-print *, 'PASS elemental arrays'
-contains
-pure subroutine checks()
-{'type(strvec_t) :: parts(2)' if module == 'python_mod' else ''}
-integer :: squares(2,2)
-squares = reshape([0,1,4,9], [2,2])
-if (any(isqrt_int(squares) /= reshape([0,1,2,3], [2,2]))) error stop 'rank-2 square roots'
-if (isqrt_int(15) /= 3) error stop 'scalar square root'
-if (any(mod_pow_int([2,3,4], 3, 5) /= [3,2,4])) error stop 'modular power'
-if (any(factorial_int([0,3,5]) /= [1,6,120])) error stop 'factorials'
-if (any(factorial_int_i64([0_int64,20_int64]) /= [1_int64,2432902008176640000_int64])) &
-    error stop 'int64 factorials'
-if (any(comb_int([5,6], 2) /= [10,15])) error stop 'combinations'
-if (any(comb_int_i64([5_int64,6_int64], 2_int64) /= [10_int64,15_int64])) error stop 'int64 combinations'
-if (any(perm_int([5,6], 2) /= [20,30])) error stop 'permutations'
-if (any(perm_int([3,4]) /= [6,24])) error stop 'permutation optional argument'
-if (any(perm_int_i64([3_int64,4_int64]) /= [6_int64,24_int64])) error stop 'int64 permutations'
-if (.not. all(isclose_scalar_real([1.0_dp,2.0_dp], [1.0_dp,2.0_dp], 1e-5_dp, 1e-8_dp, .false.))) &
-    error stop 'isclose'
-if (any(abs(np_maximum([1.0_dp,3.0_dp], 2.0_dp)-[2.0_dp,3.0_dp]) > 1e-12_dp)) error stop 'maximum'
-if (any(abs(np_minimum([1.0_dp,3.0_dp], 2.0_dp)-[1.0_dp,2.0_dp]) > 1e-12_dp)) error stop 'minimum'
-if (any(abs(np_floor([1.9_dp,-1.1_dp])-[1.0_dp,-2.0_dp]) > 1e-12_dp)) error stop 'floor'
-{' ' + RUNTIME_CHECKS if module == 'python_mod' else ''}
-end subroutine checks
-end program main
-''', encoding='utf-8')
+    text = (ROOT / "tests" / "fortran_numpy" / "elemental_arrays.f90").read_text(encoding="utf-8")
+    if module == "python_mod":
+        text = text.replace("use numpy_fortran", "use python_mod")
+        text = text.replace("pure subroutine checks()", "pure subroutine checks()\ntype(strvec_t) :: parts(2)")
+        text = text.replace("end subroutine checks", RUNTIME_CHECKS + "\nend subroutine checks")
+    program.write_text(text, encoding="utf-8")
     lapack = subprocess.run(['gfortran', '-O0', '-c', str(ROOT / 'lapack_d.f90'), '-o', 'lapack.o'],
                             cwd=tmp_path, capture_output=True, text=True, timeout=300)
     assert lapack.returncode == 0, lapack.stdout + lapack.stderr

@@ -7,6 +7,24 @@ from xextract_fortran_lib import (grouped_public_declarations, omit_inherited_im
                                  omit_inherited_uses, promote_library_elementals)
 
 
+def test_grouped_tagged_public_declarations_include_every_name():
+    from xextract_fortran_lib import parse, tag_field
+    source = '''module m
+public :: first, SECOND, third !@pyapi lib=polynomial desc="Shared polynomial family"
+contains
+subroutine first()
+end subroutine first
+subroutine second()
+end subroutine second
+subroutine third()
+end subroutine third
+end module m'''
+    tags = parse(source)[5]
+    assert set(tags) == {'first', 'second', 'third'}
+    assert all(tag_field(tag, 'lib') == 'polynomial' for tag in tags.values())
+    assert all(tag_field(tag, 'desc') == 'Shared polynomial family' for tag in tags.values())
+
+
 def test_redundant_intrinsic_uses_are_removed_with_comments_preserved():
     module_uses = ['use, intrinsic :: iso_fortran_env, only: real64, int64',
                    'use, intrinsic :: ieee_arithmetic, only: ieee_is_nan']
