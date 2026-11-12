@@ -5,6 +5,15 @@
 ! numpy's algorithms). Routines that use LAPACK (lapack_d.f90) or roots-fortran
 ! (root.f90) need those files linked too.
 module python_mod
+!! Runtime helpers for Python-to-Fortran translations and direct Fortran use.
+!!
+!! Public generic interfaces select procedures by argument type and rank.
+!! Signatures describe Fortran types and intents; Python API metadata remains
+!! on the public declarations for translator and extraction tooling.
+!!
+!! Numerical helpers can be extracted into the standalone numpy_fortran module.
+!! Some routines require LAPACK or roots-fortran at link time. See README.md
+!! (Third-Party Code) for provenance and licensing of adapted algorithms.
 use, intrinsic :: iso_fortran_env, only: real64, int64
 use, intrinsic :: ieee_arithmetic, only: ieee_is_finite, ieee_is_nan, ieee_value, ieee_quiet_nan
 implicit none
@@ -19,6 +28,7 @@ integer :: rng_replay_call_index = 0
 character(len=:), allocatable :: rng_replay_stem
 
 type :: strvec_t
+   !! string vector helper type
    character(len=:), allocatable :: v(:)
 end type strvec_t
 
@@ -709,321 +719,458 @@ public :: complex_amin !@pyapi kind=function ret=complex(dp) args=arr:complex(dp
 public :: complex_amax !@pyapi kind=function ret=complex(dp) args=arr:complex(dp)(:):intent(in) lib=arrays desc="np.amax/np.max on a complex array: numpy orders complex values lexicographically (real part first, then imaginary part as a tiebreak), which MAXVAL can't do since it rejects complex operands entirely"
 
 interface cumsum
+   !! cumulative sum of real vector (generic: cumsum_real, cumsum_int)
    module procedure cumsum_real, cumsum_int, cumsum_int_i64
 end interface cumsum
 
 interface cumprod
+   !! cumulative product of real vector (generic: cumprod_real, cumprod_int)
    module procedure cumprod_real, cumprod_int, cumprod_int_i64
 end interface cumprod
 
 interface matrix_norm2
+   !! matrix spectral norm
    module procedure matrix_norm2_real, matrix_norm2_complex
 end interface matrix_norm2
 
 interface linalg_eigvals
+   !! eigenvalues of real or complex square matrix
    module procedure linalg_eigvals_real, linalg_eigvals_complex
 end interface linalg_eigvals
 
 interface eye
+   !! return n x m matrix with ones on diagonal k (default m=n, k=0) (generic: eye_real)
    module procedure eye_real
 end interface eye
 
 interface diag
+   !! (generic: diag_from_mat_complex, diag_from_vec_complex, diag_from_vec_real,
+   !! diag_from_mat_real, diag_from_vec_int, diag_from_mat_int)
    module procedure diag_from_mat_complex, diag_from_vec_complex
    module procedure diag_from_vec_real, diag_from_mat_real
    module procedure diag_from_vec_int, diag_from_mat_int
 end interface diag
 
 interface diagonal
+   !! numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays
    module procedure diagonal_int_2d, diagonal_real_2d, diagonal_complex_2d
    module procedure diagonal_int_3d_axis12, diagonal_real_3d_axis12
 end interface diagonal
 
 interface repeat
+   !! repeat each real element reps times (generic: repeat_real, repeat_int, repeat_logical,
+   !! repeat_complex)
    module procedure repeat_real, repeat_int, repeat_logical, repeat_complex
 end interface repeat
 
 interface tile
+   !! tile real vector reps times (generic: tile_real, tile_int, tile_complex, tile_real_2d,
+   !! tile_int_2d)
    module procedure tile_real, tile_int, tile_complex
    module procedure tile_real_2d, tile_int_2d
 end interface tile
 
 interface unique
+   !! sorted unique values of real vector (generic: unique_real, unique_int, unique_char,
+   !! unique_complex)
    module procedure unique_real, unique_int, unique_char, unique_complex
 end interface unique
 
 interface sort_vec
+   !! sort real vector x in ascending order (generic: sort_real_vec, sort_int_vec, sort_char_vec,
+   !! sort_complex_vec, sort_logical_vec)
    module procedure sort_real_vec, sort_int_vec, sort_char_vec, sort_complex_vec, sort_logical_vec
 end interface sort_vec
 
 interface argsort
+   !! argsort indices (0-based) of real vector (generic: argsort_real, argsort_int)
    module procedure argsort_real, argsort_int
 end interface argsort
 
 interface argsort_idx
+   !! argsort indices (0-based) of real vector (generic: argsort_idx_real, argsort_idx_int,
+   !! argsort_complex_vec)
    module procedure argsort_idx_real, argsort_idx_int, argsort_complex_vec
 end interface argsort_idx
 
 interface sorted_vec
+   !! np.sort of a real vector: a sorted copy (generic: sorted_real_vec, sorted_int_vec,
+   !! sorted_complex_vec)
    module procedure sorted_real_vec, sorted_int_vec, sorted_complex_vec
 end interface sorted_vec
 
 interface np_amin
+   !! np.min: NaN if x holds a NaN (numpy propagates it) (generic: np_amin_r1, np_amin_r2,
+   !! np_amin_r2_dim)
    module procedure np_amin_r1, np_amin_r2, np_amin_r2_dim
 end interface np_amin
 
 interface np_amax
+   !! np.max: NaN if x holds a NaN (numpy propagates it) (generic: np_amax_r1, np_amax_r2,
+   !! np_amax_r2_dim)
    module procedure np_amax_r1, np_amax_r2, np_amax_r2_dim
 end interface np_amax
 
 interface np_argmin
+   !! np.argmin (0-based): the first NaN if x holds one, as numpy does (generic: np_argmin_r1,
+   !! np_argmin_r2_dim)
    module procedure np_argmin_r1, np_argmin_r2_dim
 end interface np_argmin
 
 interface np_argmax
+   !! np.argmax (0-based): the first NaN if x holds one, as numpy does (generic: np_argmax_r1,
+   !! np_argmax_r2_dim)
    module procedure np_argmax_r1, np_argmax_r2_dim
 end interface np_argmax
 
 interface sort_axis_3d
+   !! np.sort(x, axis=dim-1) of a rank-3 array: sorted_vec along dim (generic: sort_axis_3d_real,
+   !! sort_axis_3d_int)
    module procedure sort_axis_3d_real, sort_axis_3d_int
 end interface sort_axis_3d
 
 interface argsort_axis_3d
+   !! np.argsort(x, axis=dim-1) of a rank-3 array: argsort_idx along dim (generic:
+   !! argsort_axis_3d_real, argsort_axis_3d_int)
    module procedure argsort_axis_3d_real, argsort_axis_3d_int
 end interface argsort_axis_3d
 
 interface cumsum_axis_3d
+   !! np.cumsum(x, axis=dim-1) of a rank-3 array: cumsum_real along dim (generic:
+   !! cumsum_axis_3d_real, cumsum_axis_3d_int)
    module procedure cumsum_axis_3d_real, cumsum_axis_3d_int
 end interface cumsum_axis_3d
 
 interface cumprod_axis_3d
+   !! np.cumprod(x, axis=dim-1) of a rank-3 array: cumprod_real along dim (generic:
+   !! cumprod_axis_3d_real, cumprod_axis_3d_int)
    module procedure cumprod_axis_3d_real, cumprod_axis_3d_int
 end interface cumprod_axis_3d
 
 interface trace_3d
+   !! np.trace of a rank-3 array: sum of x[i, i, :] over i (generic: trace_3d_real, trace_3d_int)
    module procedure trace_3d_real, trace_3d_int
 end interface trace_3d
 
 interface concat_3d
+   !! np.concatenate([a, b], axis=dim-1) of rank-3 arrays (generic: concat_3d_real, concat_3d_int)
    module procedure concat_3d_real, concat_3d_int
 end interface concat_3d
 
 interface c_amin
+   !! (generic: c_amin_r1, c_amin_r2, c_amin_r2_dim)
    module procedure c_amin_r1, c_amin_r2, c_amin_r2_dim
 end interface c_amin
 
 interface c_amax
+   !! (generic: c_amax_r1, c_amax_r2, c_amax_r2_dim)
    module procedure c_amax_r1, c_amax_r2, c_amax_r2_dim
 end interface c_amax
 
 interface c_argmin
+   !! np.argmin (0-based) of complex numbers, the first extreme value (generic: c_argmin_r1,
+   !! c_argmin_r2_dim)
    module procedure c_argmin_r1, c_argmin_r2_dim
 end interface c_argmin
 
 interface c_argmax
+   !! np.argmax (0-based) of complex numbers, the first extreme value (generic: c_argmax_r1,
+   !! c_argmax_r2_dim)
    module procedure c_argmax_r1, c_argmax_r2_dim
 end interface c_argmax
 
 interface np_searchsorted
+   !! np.searchsorted(a, v, side): 0-based insertion index of v in the sorted vector a (before equal
+   !! values, or after them if right); NaN sorts after every number, as in numpy (generic:
+   !! np_searchsorted_real, np_searchsorted_real_vec, np_searchsorted_int, np_searchsorted_int_vec)
    module procedure np_searchsorted_real, np_searchsorted_real_vec, np_searchsorted_int, np_searchsorted_int_vec
 end interface np_searchsorted
 
 interface np_union1d
+   !! np.union1d of vectors: sorted, without duplicates (generic: np_union1d_real, np_union1d_int,
+   !! np_union1d_complex)
    module procedure np_union1d_real, np_union1d_int, np_union1d_complex
 end interface np_union1d
 
 interface np_intersect1d
+   !! np.intersect1d of vectors: sorted, without duplicates (generic: np_intersect1d_real,
+   !! np_intersect1d_int, np_intersect1d_complex)
    module procedure np_intersect1d_real, np_intersect1d_int, np_intersect1d_complex
 end interface np_intersect1d
 
 interface np_setdiff1d
+   !! np.setdiff1d of vectors: sorted, without duplicates (generic: np_setdiff1d_real,
+   !! np_setdiff1d_int, np_setdiff1d_complex)
    module procedure np_setdiff1d_real, np_setdiff1d_int, np_setdiff1d_complex
 end interface np_setdiff1d
 
 interface np_setxor1d
+   !! np.setxor1d of vectors: sorted, without duplicates (generic: np_setxor1d_real,
+   !! np_setxor1d_int, np_setxor1d_complex)
    module procedure np_setxor1d_real, np_setxor1d_int, np_setxor1d_complex
 end interface np_setxor1d
 
 interface np_isin1
+   !! a(i) in b for each element of the vector a (generic: np_isin1_real, np_isin1_int,
+   !! np_isin1_complex)
    module procedure np_isin1_real, np_isin1_int, np_isin1_complex
 end interface np_isin1
 
 interface np_unique_counts
+   !! np.unique(x, return_counts=True)[1] of a vector (0-based indices) (generic:
+   !! np_unique_counts_real, np_unique_counts_int, np_unique_counts_complex)
    module procedure np_unique_counts_real, np_unique_counts_int, np_unique_counts_complex
 end interface np_unique_counts
 
 interface np_unique_index
+   !! np.unique(x, return_index=True)[1] of a vector (0-based indices) (generic:
+   !! np_unique_index_real, np_unique_index_int, np_unique_index_complex)
    module procedure np_unique_index_real, np_unique_index_int, np_unique_index_complex
 end interface np_unique_index
 
 interface np_unique_inverse
+   !! np.unique(x, return_inverse=True)[1] of a vector (0-based indices) (generic:
+   !! np_unique_inverse_real, np_unique_inverse_int, np_unique_inverse_complex)
    module procedure np_unique_inverse_real, np_unique_inverse_int, np_unique_inverse_complex
 end interface np_unique_inverse
 
 interface np_digitize
+   !! np.digitize(x, bins, right): for increasing bins the i with bins[i-1] <= x < bins[i]
+   !! (bins[i-1] < x <= bins[i] if right), for decreasing bins numpy's len(bins) - ... (generic:
+   !! np_digitize_scalar, np_digitize_vec)
    module procedure np_digitize_scalar, np_digitize_vec
 end interface np_digitize
 
 interface np_gather2d
+   !! m[i, j] with integer index vectors i, j (0-based, negative from the end): [m[i[0], j[0]],
+   !! m[i[1], j[1]], ...] (generic: np_gather2d_real, np_gather2d_int, np_gather2d_log,
+   !! np_gather2d_complex)
    module procedure np_gather2d_real, np_gather2d_int, np_gather2d_log, np_gather2d_complex
 end interface np_gather2d
 
 interface np_kron2
+   !! np.kron of two matrices (generic: np_kron2_int, np_kron2_real, np_kron2_complex)
    module procedure np_kron2_int, np_kron2_real, np_kron2_complex
 end interface np_kron2
 
 interface np_cross3
+   !! np.cross of two 3-vectors (generic: np_cross3_int, np_cross3_real, np_cross3_complex)
    module procedure np_cross3_int, np_cross3_real, np_cross3_complex
 end interface np_cross3
 
 interface rng_pick
+   !! a[idx] of a vector expression (rng.choice of an array) (generic: rng_pick_real, rng_pick_int,
+   !! rng_pick_log, rng_pick_complex)
    module procedure rng_pick_real, rng_pick_int, rng_pick_log, rng_pick_complex
 end interface rng_pick
 
 interface diag_k
+   !! np.diag(v, k) of a vector: a square matrix with v on diagonal k (generic: diag_k_vec_real,
+   !! diag_k_vec_int, diag_k_mat_real, diag_k_mat_int, diag_k_vec_complex, diag_k_mat_complex)
    module procedure diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int
    module procedure diag_k_vec_complex, diag_k_mat_complex
 end interface diag_k
 
 interface triu
+   !! np.triu(a, k): zero below diagonal k (generic: triu_real, triu_int, triu_complex)
    module procedure triu_real, triu_int, triu_complex
 end interface triu
 
 interface tril
+   !! np.tril(a, k): zero above diagonal k (generic: tril_real, tril_int, tril_complex)
    module procedure tril_real, tril_int, tril_complex
 end interface tril
 
 interface reversed_vec
+   !! x[::-1] / np.flip(x) of a vector expression (a function result can't be subscripted in
+   !! Fortran) (generic: reversed_real_vec, reversed_int_vec, reversed_logical_vec,
+   !! reversed_complex_vec)
    module procedure reversed_real_vec, reversed_int_vec, reversed_logical_vec, reversed_complex_vec
 end interface reversed_vec
 interface reversed_mat
+   !! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows (axis=0), 2 the columns
+   !! (axis=1), 0 both (axis=None) (generic: reversed_real_mat, reversed_int_mat,
+   !! reversed_logical_mat, reversed_complex_mat)
    module procedure reversed_real_mat, reversed_int_mat, reversed_logical_mat, reversed_complex_mat
 end interface reversed_mat
 
 interface sorted_2d
+   !! np.sort of a real matrix along dimension dim (1 = down columns) (generic: sorted_real_2d,
+   !! sorted_int_2d, sorted_complex_2d)
    module procedure sorted_real_2d, sorted_int_2d, sorted_complex_2d
 end interface sorted_2d
 
 interface argsort_2d
+   !! np.argsort (0-based) of a real matrix along dimension dim (generic: argsort_real_2d,
+   !! argsort_int_2d, argsort_complex_2d)
    module procedure argsort_real_2d, argsort_int_2d, argsort_complex_2d
 end interface argsort_2d
 
 interface powval
+   !! np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial, lowest
+   !! degree first) at x (scalar, vector or matrix x)
    module procedure powval_0, powval_1, powval_2
 end interface powval
 
 interface powval2d
+   !! np.polynomial.polynomial.polyval2d: 2-D series value at points (x, y) (scalars, vectors or
+   !! matrices)
    module procedure powval2d_0, powval2d_1, powval2d_2
 end interface powval2d
 interface powval3d
+   !! np.polynomial.polynomial.polyval3d: 3-D series value at points (x, y, z) (scalars or vectors)
    module procedure powval3d_0, powval3d_1
 end interface powval3d
 interface chebval2d
+   !! np.polynomial.chebyshev.chebval2d: 2-D series value at points (x, y) (scalars, vectors or
+   !! matrices)
    module procedure chebval2d_0, chebval2d_1, chebval2d_2
 end interface chebval2d
 interface chebval3d
+   !! np.polynomial.chebyshev.chebval3d: 3-D series value at points (x, y, z) (scalars or vectors)
    module procedure chebval3d_0, chebval3d_1
 end interface chebval3d
 interface legval2d
+   !! np.polynomial.legendre.legval2d: 2-D series value at points (x, y) (scalars, vectors or
+   !! matrices)
    module procedure legval2d_0, legval2d_1, legval2d_2
 end interface legval2d
 interface legval3d
+   !! np.polynomial.legendre.legval3d: 3-D series value at points (x, y, z) (scalars or vectors)
    module procedure legval3d_0, legval3d_1
 end interface legval3d
 interface hermval2d
+   !! np.polynomial.hermite.hermval2d: 2-D series value at points (x, y) (scalars, vectors or
+   !! matrices)
    module procedure hermval2d_0, hermval2d_1, hermval2d_2
 end interface hermval2d
 interface hermval3d
+   !! np.polynomial.hermite.hermval3d: 3-D series value at points (x, y, z) (scalars or vectors)
    module procedure hermval3d_0, hermval3d_1
 end interface hermval3d
 interface hermeval2d
+   !! np.polynomial.hermite_e.hermeval2d: 2-D series value at points (x, y) (scalars, vectors or
+   !! matrices)
    module procedure hermeval2d_0, hermeval2d_1, hermeval2d_2
 end interface hermeval2d
 interface hermeval3d
+   !! np.polynomial.hermite_e.hermeval3d: 3-D series value at points (x, y, z) (scalars or vectors)
    module procedure hermeval3d_0, hermeval3d_1
 end interface hermeval3d
 interface lagval2d
+   !! np.polynomial.laguerre.lagval2d: 2-D series value at points (x, y) (scalars, vectors or
+   !! matrices)
    module procedure lagval2d_0, lagval2d_1, lagval2d_2
 end interface lagval2d
 interface lagval3d
+   !! np.polynomial.laguerre.lagval3d: 3-D series value at points (x, y, z) (scalars or vectors)
    module procedure lagval3d_0, lagval3d_1
 end interface lagval3d
 interface powvalfromroots
+   !! np.polynomial.polynomial.polyvalfromroots: prod(x - r) at scalar, vector or matrix x
    module procedure powvalfromroots_0, powvalfromroots_1, powvalfromroots_2
 end interface powvalfromroots
 interface chebval
+   !! np.polynomial.chebyshev.chebval: value of the Chebyshev series (np.polynomial.chebyshev) at x
+   !! (scalar, vector or matrix x)
    module procedure chebval_0, chebval_1, chebval_2
 end interface chebval
 
 interface legval
+   !! np.polynomial.legendre.legval: value of the Legendre series (np.polynomial.legendre) at x
+   !! (scalar, vector or matrix x)
    module procedure legval_0, legval_1, legval_2
 end interface legval
 
 interface hermval
+   !! np.polynomial.hermite.hermval: value of the physicists' Hermite series (np.polynomial.hermite)
+   !! at x (scalar, vector or matrix x)
    module procedure hermval_0, hermval_1, hermval_2
 end interface hermval
 
 interface hermeval
+   !! np.polynomial.hermite_e.hermeval: value of the probabilists' Hermite series
+   !! (np.polynomial.hermite_e) at x (scalar, vector or matrix x)
    module procedure hermeval_0, hermeval_1, hermeval_2
 end interface hermeval
 
 interface lagval
+   !! np.polynomial.laguerre.lagval: value of the Laguerre series (np.polynomial.laguerre) at x
+   !! (scalar, vector or matrix x)
    module procedure lagval_0, lagval_1, lagval_2
 end interface lagval
 
 interface np_polyadd
+   !! np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the shorter is padded with leading
+   !! zeros (generic: np_polyadd_real, np_polyadd_int)
    module procedure np_polyadd_real, np_polyadd_int
 end interface np_polyadd
 
 interface np_vander
+   !! np.vander: the columns x**(n-1), ..., 1 (increasing: 1, ..., x**(n-1)); n = 0 gives none
+   !! (generic: np_vander_real, np_vander_int)
    module procedure np_vander_real, np_vander_int, np_vander_int_i64
 end interface np_vander
 
 interface np_polymul
+   !! np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real,
+   !! np_polymul_int, np_polymul_complex)
    module procedure np_polymul_real, np_polymul_int, np_polymul_int_i64, np_polymul_complex
 end interface np_polymul
 
 interface histogram
+   !! 1D histogram with explicit real bin edges (generic: histogram_real_edges, histogram_int_edges)
    module procedure histogram_real_edges, histogram_int_edges
 end interface histogram
 
 interface reduceat_add
+   !! np.add.reduceat for real vector (generic: reduceat_add_real, reduceat_add_int)
    module procedure reduceat_add_real, reduceat_add_int
 end interface reduceat_add
 
 interface reduceat_mul
+   !! np.multiply.reduceat for real vector (generic: reduceat_mul_real, reduceat_mul_int)
    module procedure reduceat_mul_real, reduceat_mul_int
 end interface reduceat_mul
 
 interface reduceat_min
+   !! np.minimum.reduceat for real vector (generic: reduceat_min_real, reduceat_min_int)
    module procedure reduceat_min_real, reduceat_min_int
 end interface reduceat_min
 
 interface reduceat_max
+   !! np.maximum.reduceat for real vector (generic: reduceat_max_real, reduceat_max_int)
    module procedure reduceat_max_real, reduceat_max_int
 end interface reduceat_max
 
 interface polyval
+   !! evaluate polynomial with descending coefficients at scalar x (generic: polyval_real_scalar,
+   !! polyval_real_vec, polyval_complex_scalar, polyval_complex_vec)
    module procedure polyval_real_scalar, polyval_real_vec, polyval_complex_scalar, polyval_complex_vec
 end interface polyval
 
 interface polyder
+   !! m-th derivative coefficients for descending-order polynomial (generic: polyder_real)
    module procedure polyder_real
 end interface polyder
 
 interface runif
+   !! uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)
    module procedure runif0, runif1, runif2, runif3
 end interface runif
 
 interface rnorm
+   !! normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)
    module procedure rnorm0, rnorm1, rnorm2, rnorm3
 end interface rnorm
 
 interface allclose
+   !! NumPy-like allclose on 1D arrays
    module procedure allclose_real, allclose_integer
 end interface allclose
 
 interface py_str
+   !! python-like str() conversion for scalar int/real/logical/char
    module procedure py_str_int32, py_str_int64, py_str_real, py_str_logical, py_str_char
    module procedure py_str_int_vec, py_str_int64_vec, py_str_real_vec, py_str_logical_vec, py_str_char_vec
 end interface py_str
@@ -1046,11 +1193,14 @@ end interface narrow_int
 
 ! a ** b of integers, which stops for a negative b instead of giving 0.
 interface py_ipow
+   !! a ** b of integers, stopping for b < 0 (Python's int ** negative int is a float; numpy raises)
+   !! (generic: py_ipow_i32, py_ipow_i64)
    module procedure py_ipow_i32, py_ipow_i64
 end interface py_ipow
 
 ! The mold selects the integer result kind, not the value to round.
 interface py_round_int
+   !! Python 3 round(x) with no ndigits: banker's rounding to the nearest integer
    module procedure py_round_int32, py_round_int64
 end interface py_round_int
 
@@ -1059,6 +1209,7 @@ interface str_concat
 end interface str_concat
 
 interface linalg_solve
+   !! solve linear system A x = b using LAPACK DGESV
    module procedure linalg_solve_vec, linalg_solve_mat
    module procedure linalg_solve_complex_vec, linalg_solve_complex_mat
 end interface linalg_solve
@@ -1068,6 +1219,8 @@ public :: where_axis_2d !@pyapi kind=function ret=integer(:) args=mask:logical(:
 public :: where_pair_2d !@pyapi kind=function ret=integer(:,:) args=rows:integer(:):intent(in),cols:integer(:):intent(in) lib=arrays desc="pair 0-based row and column index vectors (a length-1 one broadcast) as a 2 x n index array"
 public :: gather_where2d !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),idx:integer(:,:):intent(in) lib=arrays desc="(generic: gather_where2d_real, gather_where2d_int, gather_where2d_complex, gather_where2d_logical)"
 interface gather_where2d
+   !! (generic: gather_where2d_real, gather_where2d_int, gather_where2d_complex,
+   !! gather_where2d_logical)
    module procedure gather_where2d_real, &
       & gather_where2d_int, &
       & gather_where2d_complex, &
@@ -1075,6 +1228,7 @@ interface gather_where2d
 end interface gather_where2d
 public :: lexsort_keys !@pyapi kind=function ret=integer(:) args=keys:integer(:,:):intent(in),reverse_keys:logical:intent(in):optional lib=sorting desc="(generic: lexsort_keys_int, lexsort_keys_real, lexsort_packed_int, lexsort_packed_real)"
 interface lexsort_keys
+   !! (generic: lexsort_keys_int, lexsort_keys_real, lexsort_packed_int, lexsort_packed_real)
    module procedure lexsort_keys_int, lexsort_keys_real
    module procedure lexsort_packed_int, lexsort_packed_real
 end interface lexsort_keys
@@ -1082,17 +1236,21 @@ end interface lexsort_keys
 public :: linalg_lstsq !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in),x:real(dp)(:):intent(out),residuals:real(dp)(:):intent(out),rnk:integer:intent(out),s:real(dp)(:):intent(out),rcond:real(dp):intent(in):optional lib=linalg desc="(generic: linalg_lstsq_vec, linalg_lstsq_mat)"
 public :: linalg_lstsq_x !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in),rcond:real(dp):intent(in):optional lib=linalg desc="(generic: linalg_lstsq_x_vec, linalg_lstsq_x_mat)"
 interface linalg_lstsq
+   !! (generic: linalg_lstsq_vec, linalg_lstsq_mat)
    module procedure linalg_lstsq_vec, linalg_lstsq_mat
 end interface linalg_lstsq
 interface linalg_lstsq_x
+   !! (generic: linalg_lstsq_x_vec, linalg_lstsq_x_mat)
    module procedure linalg_lstsq_x_vec, linalg_lstsq_x_mat
 end interface linalg_lstsq_x
 
 interface linalg_solve_safe
+   !! solve linear system A x = b using LAPACK DGESV and return success status
    module procedure linalg_solve_safe_vec
 end interface linalg_solve_safe
 
 interface optval
+   !! return x when present, otherwise default
    module procedure optval_int
    module procedure optval_real
    module procedure optval_logical
@@ -1107,6 +1265,7 @@ interface convolve
 end interface convolve
 
 interface print_matrix
+   !! print 2D real matrix with aligned columns
    module procedure print_matrix_real_2d
    module procedure print_matrix_label_real_2d
    module procedure print_matrix_int_2d
@@ -1118,6 +1277,7 @@ interface print_matrix
 end interface print_matrix
 
 interface print_array_3d
+   !! print 3D real array with numpy-style nested brackets
    module procedure print_array_3d_real
    module procedure print_array_3d_label_real
    module procedure print_array_3d_int
@@ -1150,12 +1310,16 @@ interface slice1
 end interface slice1
 
 interface np_pad_vec
+   !! np.pad of a real, integer, complex or logical vector with mode 1 edge, 2 wrap, 3 reflect, 4
+   !! symmetric
    module procedure np_pad_vec_real, np_pad_vec_int, np_pad_vec_complex, np_pad_vec_logical
 end interface np_pad_vec
 interface fft2
+   !! np.fft.fft2 of a real or complex matrix (s=(n1, n2))
    module procedure fft2_real, fft2_complex
 end interface fft2
 interface fft_fft
+   !! numpy-like fft for 1D real/complex input (naive DFT backend)
    module procedure fft_fft_real
    module procedure fft_fft_complex
 end interface fft_fft
@@ -1163,6 +1327,7 @@ end interface fft_fft
 contains
 
       pure elemental integer function isqrt_int(x)
+         !! integer square root: return floor(sqrt(x)) for x >= 0
          ! integer square root: return floor(sqrt(x)) for x >= 0
          implicit none
          integer, intent(in) :: x  ! input integer (x >= 0 expected)
@@ -1182,6 +1347,7 @@ contains
       end function isqrt_int
 
       pure elemental integer function mod_pow_int(base, exp, modulus)
+         !! modular exponentiation: pow(base, exp, modulus) for integer inputs
          ! modular exponentiation: pow(base, exp, modulus)
          implicit none
          integer, intent(in) :: base, exp, modulus
@@ -1203,6 +1369,7 @@ contains
       end function mod_pow_int
 
       pure elemental integer function factorial_int(x) result(v)
+         !! factorial for nonnegative integers
          integer, intent(in) :: x
          integer :: i
          if (x < 0) then
@@ -1216,6 +1383,7 @@ contains
       end function factorial_int
 
       pure elemental integer(kind=int64) function factorial_int_i64(x) result(v)
+         !! factorial of a 64-bit integer
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x
          integer(kind=int64) :: i
@@ -1230,6 +1398,7 @@ contains
       end function factorial_int_i64
 
       pure elemental integer function comb_int(n, k) result(v)
+         !! binomial coefficient for integer inputs
          integer, intent(in) :: n, k
          integer :: i, kk
          if (n < 0 .or. k < 0 .or. k > n) then
@@ -1245,6 +1414,7 @@ contains
       end function comb_int
 
       pure elemental integer(kind=int64) function comb_int_i64(n, k) result(v)
+         !! binomial coefficient of 64-bit integers (no intermediate overflow while the result fits)
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: n, k
          integer(kind=int64) :: i, kk, g, f
@@ -1264,6 +1434,7 @@ contains
       end function comb_int_i64
 
       pure elemental integer function perm_int(n, k) result(v)
+         !! permutations nPk for integer inputs
          integer, intent(in) :: n
          integer, intent(in), optional :: k
          integer :: i, kk
@@ -1284,6 +1455,7 @@ contains
       end function perm_int
 
       pure elemental integer(kind=int64) function perm_int_i64(n, k) result(v)
+         !! permutations nPk of 64-bit integers
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: n
          integer(kind=int64), intent(in), optional :: k
@@ -1305,6 +1477,7 @@ contains
       end function perm_int_i64
 
       pure elemental real(kind=dp) function special_factorial(x) result(v)
+         !! scipy.special.factorial approximation via gamma(x+1)
          real(kind=dp), intent(in) :: x
          if (x < 0.0_dp) then
             v = ieee_value(0.0_dp, ieee_quiet_nan)
@@ -1314,6 +1487,7 @@ contains
       end function special_factorial
 
       pure elemental real(kind=dp) function special_factorial2(x) result(v)
+         !! scipy.special.factorial2 for integer-like x
          real(kind=dp), intent(in) :: x
          integer :: n, i
          if (x < -1.0_dp) then
@@ -1340,6 +1514,7 @@ contains
       end function special_factorial2
 
       pure elemental real(kind=dp) function special_binom(n, k) result(v)
+         !! binomial coefficient via gamma
          real(kind=dp), intent(in) :: n, k
          integer :: ni, ki
          logical :: n_int, k_int
@@ -1363,6 +1538,7 @@ contains
       end function special_binom
 
       pure elemental real(kind=dp) function special_comb(n, k, exact, repetition) result(v)
+         !! scipy.special.comb(n,k,exact=False,repetition=False)
          real(kind=dp), intent(in) :: n, k
          logical, intent(in), optional :: exact, repetition
          logical :: repetition_opt, exact_opt, n_int, k_int
@@ -1412,6 +1588,7 @@ contains
       end function special_comb
 
       subroutine print_int_list(a, n)
+         !! print integer list a(1:n) in python-style [..] format
          ! print integer list a(1:n) in python-style [..] format
          implicit none
          integer, intent(in) :: a(:)  ! array containing values to print
@@ -1430,6 +1607,7 @@ contains
       end subroutine print_int_list
 
       subroutine print_char_list(a, n)
+         !! print character list a(1:n) in python-style [..] format
          ! print character list a(1:n) in python-style ['..', ...] format
          implicit none
          character(len=*), intent(in) :: a(:)  ! array containing values to print
@@ -1448,6 +1626,8 @@ contains
       end subroutine print_char_list
 
       pure subroutine grow_and_set_char(arr, idx, item)
+         !! grow allocatable character list arr (size and/or declared length) so index idx and item
+         !! both fit, then set arr(idx) = item
          ! grow allocatable character list arr to fit index idx and item's
          ! length, then set arr(idx) = item -- the shared "list.append()"
          ! growth machinery previously inlined at every append call site.
@@ -1469,6 +1649,8 @@ contains
       end subroutine grow_and_set_char
 
       pure subroutine insert_char(arr, idx, item)
+         !! insert item into allocatable character list arr at Python-style index idx, widening
+         !! declared length if needed
          ! insert item into allocatable character list arr at Python-style
          ! index idx (negative counts from the end, out-of-range clamps to
          ! the nearer end), widening arr's declared length if item is
@@ -1490,6 +1672,7 @@ contains
       end subroutine insert_char
 
       subroutine print_real_list(a, n)
+         !! print real list a(1:n) in python-style [..] format
          ! print real list a(1:n) in python-style [..] format
          implicit none
          real(kind=dp), intent(in) :: a(:)  ! array containing values to print
@@ -1508,6 +1691,7 @@ contains
       end subroutine print_real_list
 
       subroutine print_log_list(a, n)
+         !! print logical list a(1:n) in python-style [..] format
          ! print logical list a(1:n) in python-style [..] format
          implicit none
          logical, intent(in) :: a(:)  ! array containing values to print
@@ -1526,6 +1710,7 @@ contains
       end subroutine print_log_list
 
       pure function str_int_list(a, n) result(s)
+         !! return integer list a(1:n) in python-style [..] format
          ! return integer list a(1:n) in python-style [..] format
          implicit none
          integer, intent(in) :: a(:)
@@ -1545,6 +1730,7 @@ contains
       end function str_int_list
 
       subroutine print_matrix_real_2d(a)
+         !! print 2D real matrix with aligned columns
          real(kind=dp), intent(in) :: a(:,:)
          integer :: i, j, pad, w
          character(len=64) :: buf
@@ -1587,6 +1773,7 @@ contains
       end subroutine print_matrix_real_2d
 
       subroutine print_matrix_int64_2d(a)
+         !! print 2D real matrix with aligned columns
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: a(:,:)
          integer :: i, j, pad, w
@@ -1630,12 +1817,14 @@ contains
       end subroutine print_matrix_int64_2d
 
       subroutine print_matrix_int_2d(a)
+         !! print 2D real matrix with aligned columns
          use, intrinsic :: iso_fortran_env, only: int64
          integer, intent(in) :: a(:,:)
          call print_matrix_int64_2d(int(a, kind=int64))
       end subroutine print_matrix_int_2d
 
       subroutine print_matrix_complex_2d(a)
+         !! print 2D real matrix with aligned columns
          ! A 2-D complex array row by row, each element as (re,im).
          complex(kind=dp), intent(in) :: a(:,:)
          integer :: i, j
@@ -1664,6 +1853,7 @@ contains
       end subroutine print_matrix_complex_2d
 
       subroutine print_matrix_logical_2d(a)
+         !! print 2D real matrix with aligned columns
          ! A 2-D logical array in NumPy's layout: rows in order, each
          ! element right-justified in 5 columns (`[[ True False  True]`).
          logical, intent(in) :: a(:,:)
@@ -1697,6 +1887,7 @@ contains
       end subroutine print_matrix_logical_2d
 
       subroutine print_array_3d_real(a)
+         !! print 3D real array with numpy-style nested brackets
          real(kind=dp), intent(in) :: a(:,:,:)
          integer :: i, j, k, pad, w
          character(len=64) :: buf
@@ -1746,6 +1937,7 @@ contains
       end subroutine print_array_3d_real
 
       subroutine print_array_3d_int(a)
+         !! print 3D real array with numpy-style nested brackets
          integer, intent(in) :: a(:,:,:)
          integer :: i, j, k, pad, w
          character(len=64) :: buf
@@ -1795,6 +1987,7 @@ contains
       end subroutine print_array_3d_int
 
       subroutine print_array_3d_logical(a)
+         !! print 3D real array with numpy-style nested brackets
          logical, intent(in) :: a(:,:,:)
          integer :: i, j, k, pad, w
          character(len=64) :: buf
@@ -1844,6 +2037,7 @@ contains
       end subroutine print_array_3d_logical
 
       subroutine print_array_3d_label_real(label, a)
+         !! print 3D real array with numpy-style nested brackets
          character(len=*), intent(in) :: label
          real(kind=dp), intent(in) :: a(:,:,:)
          write(*, "(a)") trim(label)
@@ -1851,6 +2045,7 @@ contains
       end subroutine print_array_3d_label_real
 
       subroutine print_array_3d_label_int(label, a)
+         !! print 3D real array with numpy-style nested brackets
          character(len=*), intent(in) :: label
          integer, intent(in) :: a(:,:,:)
          write(*, "(a)") trim(label)
@@ -1968,6 +2163,7 @@ contains
       end function slice1_char
 
       pure function digits_of_str(s) result(digits)
+         !! return decimal digits in a string as an integer vector
          character(len=*), intent(in) :: s
          integer, allocatable :: digits(:)
          character(len=:), allocatable :: t
@@ -1985,6 +2181,7 @@ contains
       end function digits_of_str
 
       subroutine print_matrix_label_real_2d(label, a)
+         !! print 2D real matrix with aligned columns
          character(len=*), intent(in) :: label
          real(kind=dp), intent(in) :: a(:,:)
          write(*, "(a)") trim(label)
@@ -1992,6 +2189,7 @@ contains
       end subroutine print_matrix_label_real_2d
 
       subroutine print_matrix_label_int_2d(label, a)
+         !! print 2D real matrix with aligned columns
          character(len=*), intent(in) :: label
          integer, intent(in) :: a(:,:)
          write(*, "(a)") trim(label)
@@ -1999,6 +2197,7 @@ contains
       end subroutine print_matrix_label_int_2d
 
       subroutine print_matrix_label_int64_2d(label, a)
+         !! print 2D real matrix with aligned columns
          use, intrinsic :: iso_fortran_env, only: int64
          character(len=*), intent(in) :: label
          integer(kind=int64), intent(in) :: a(:,:)
@@ -2007,6 +2206,7 @@ contains
       end subroutine print_matrix_label_int64_2d
 
       pure function py_str_int32(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          integer, intent(in) :: x
          character(len=:), allocatable :: s
          character(len=64) :: buf
@@ -2015,6 +2215,7 @@ contains
       end function py_str_int32
 
       pure function py_str_int64(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x
@@ -2041,6 +2242,7 @@ contains
       end function narrow_int_i64
 
       pure function py_str_real(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          real(kind=dp), intent(in) :: x
          character(len=:), allocatable :: s
          character(len=128) :: buf
@@ -2049,6 +2251,7 @@ contains
       end function py_str_real
 
       function py_format_g_real(x) result(s)
+         !! Python-like %g formatting helper for real scalars
          real(kind=dp), intent(in) :: x
          character(len=:), allocatable :: s
          character(len=128) :: buf
@@ -2243,6 +2446,7 @@ contains
       end function py_format_int64
 
       pure function str_format_real_fixed(x, prec) result(s)
+         !! format real with fixed decimal places
          real(kind=dp), intent(in) :: x
          integer, intent(in) :: prec
          character(len=:), allocatable :: s
@@ -2256,6 +2460,7 @@ contains
       end function str_format_real_fixed
 
       pure function str_format_real_sci(x, prec) result(s)
+         !! format real in scientific notation matching Python's {:.Ne} f-string spec
          real(kind=dp), intent(in) :: x
          integer, intent(in) :: prec
          character(len=:), allocatable :: s
@@ -2299,6 +2504,7 @@ contains
       end function str_format_real_sci
 
       pure function py_str_logical(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          logical, intent(in) :: x
          character(len=:), allocatable :: s
          if (x) then
@@ -2309,12 +2515,14 @@ contains
       end function py_str_logical
 
       pure function py_str_char(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          character(len=*), intent(in) :: x
          character(len=:), allocatable :: s
          s = x
       end function py_str_char
 
       function py_str_int_vec(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          integer, intent(in) :: x(:)
          character(len=:), allocatable :: s(:)
          integer :: i
@@ -2325,6 +2533,7 @@ contains
       end function py_str_int_vec
 
       function py_str_int64_vec(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          ! Keep intrinsic dependencies local when xpfunc2f extracts this helper.
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:)
@@ -2337,6 +2546,7 @@ contains
       end function py_str_int64_vec
 
       function py_str_real_vec(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          real(kind=dp), intent(in) :: x(:)
          character(len=:), allocatable :: s(:)
          integer :: i
@@ -2347,6 +2557,7 @@ contains
       end function py_str_real_vec
 
       function py_str_logical_vec(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          logical, intent(in) :: x(:)
          character(len=:), allocatable :: s(:)
          integer :: i
@@ -2357,6 +2568,7 @@ contains
       end function py_str_logical_vec
 
       function py_str_char_vec(x) result(s)
+         !! python-like str() conversion for scalar int/real/logical/char
          character(len=*), intent(in) :: x(:)
          character(len=:), allocatable :: s(:)
          allocate(character(len=len(x)) :: s(size(x)))
@@ -2407,6 +2619,7 @@ contains
       end function str_concat_vv
 
       subroutine seed_rng(seed)
+         !! seed intrinsic RNG; deterministic stream when seed is provided
          integer, intent(in), optional :: seed
          integer :: nseed_rng, i_rng, s0
          integer, allocatable :: seed_buf(:)
@@ -2426,6 +2639,7 @@ contains
       end subroutine seed_rng
 
       function py_time() result(t)
+         !! wall-clock seconds from system_clock (Python time.time approximation)
          real(kind=dp) :: t
          integer :: count, rate
          call system_clock(count, rate)
@@ -2441,6 +2655,7 @@ contains
       ! compiled only with -fopenmp; otherwise these return what pyccel's
       ! pure-Python versions do (thread 0 of a team of 1).
       function py_omp_get_thread_num() result(r)
+         !! OpenMP thread number (0 without -fopenmp)
          !$ use omp_lib, only: omp_get_thread_num
          integer :: r
          r = 0
@@ -2448,6 +2663,7 @@ contains
       end function py_omp_get_thread_num
 
       function py_omp_get_num_threads() result(r)
+         !! OpenMP threads in the current team (1 without -fopenmp)
          !$ use omp_lib, only: omp_get_num_threads
          integer :: r
          r = 1
@@ -2455,6 +2671,7 @@ contains
       end function py_omp_get_num_threads
 
       function py_omp_get_max_threads() result(r)
+         !! OpenMP maximum threads (1 without -fopenmp)
          !$ use omp_lib, only: omp_get_max_threads
          integer :: r
          r = 1
@@ -2462,6 +2679,7 @@ contains
       end function py_omp_get_max_threads
 
       subroutine py_omp_set_num_threads(n)
+         !! set the OpenMP thread count (no effect without -fopenmp)
          !$ use omp_lib, only: omp_set_num_threads
          integer, intent(in) :: n
          !$ call omp_set_num_threads(n)
@@ -2469,6 +2687,7 @@ contains
       end subroutine py_omp_set_num_threads
 
       function py_ctime(t) result(s)
+         !! string timestamp approximation for Python time.ctime
          real(kind=dp), intent(in), optional :: t
          character(len=:), allocatable :: s
          integer :: vals(8)
@@ -2485,6 +2704,7 @@ contains
       end function py_ctime
 
       function loadtxt_real_2d(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols) result(x)
+         !! load real matrix text file with basic numpy-like options
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows
          integer, intent(in), optional :: max_rows, skip_footer
@@ -2660,6 +2880,7 @@ contains
       end subroutine loadtxt_rank_stop
 
       function loadtxt_real_matrix(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols, name) result(x)
+         !! np.loadtxt as a real matrix; stops if NumPy would drop a length-1 axis
          ! np.loadtxt without ndmin=2 drops length-1 axes: a one-row or
          ! one-column file is 1-D (one value is 0-d), not a matrix.
          character(len=*), intent(in) :: path
@@ -2674,6 +2895,7 @@ contains
       end function loadtxt_real_matrix
 
       function loadtxt_int_matrix(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols, name) result(x)
+         !! np.loadtxt as a int matrix; stops if NumPy would drop a length-1 axis
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
          character(len=*), intent(in), optional :: delimiter, comments
@@ -2686,6 +2908,7 @@ contains
       end function loadtxt_int_matrix
 
       function loadtxt_logical_matrix(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols, name) result(x)
+         !! np.loadtxt as a logical matrix; stops if NumPy would drop a length-1 axis
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
          character(len=*), intent(in), optional :: delimiter, comments
@@ -2698,6 +2921,7 @@ contains
       end function loadtxt_logical_matrix
 
       function loadtxt_real_vector(path, skiprows, max_rows, skip_footer, delimiter, comments, ndmin, name) result(x)
+         !! np.loadtxt of a one-column (or flattened) text file as a real vector
          ! ndmin=1: a file with one value is a vector of length 1, as in NumPy.
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer, ndmin
@@ -2716,6 +2940,7 @@ contains
       end function loadtxt_real_vector
 
       function loadtxt_int_vector(path, skiprows, max_rows, skip_footer, delimiter, comments, ndmin, name) result(x)
+         !! np.loadtxt(..., dtype=int) of a text file as an integer vector
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer, ndmin
          character(len=*), intent(in), optional :: delimiter, comments, name
@@ -2725,6 +2950,7 @@ contains
       end function loadtxt_int_vector
 
       function loadtxt_logical_vector(path, skiprows, max_rows, skip_footer, delimiter, comments, ndmin, name) result(x)
+         !! np.loadtxt(..., dtype=bool) of a text file as a logical vector (nonzero is true)
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer, ndmin
          character(len=*), intent(in), optional :: delimiter, comments, name
@@ -2734,6 +2960,7 @@ contains
       end function loadtxt_logical_vector
 
       function loadtxt_real_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         !! load one selected real column as vector
          character(len=*), intent(in) :: path
          integer, intent(in) :: usecol
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
@@ -2753,6 +2980,7 @@ contains
       end function loadtxt_real_1d
 
       function loadtxt_int_2d(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols) result(x)
+         !! load integer matrix from text file
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
          character(len=*), intent(in), optional :: delimiter, comments
@@ -2766,6 +2994,7 @@ contains
       end function loadtxt_int_2d
 
       function loadtxt_int_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         !! load one selected integer column as vector
          character(len=*), intent(in) :: path
          integer, intent(in) :: usecol
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
@@ -2779,6 +3008,7 @@ contains
       end function loadtxt_int_1d
 
       function loadtxt_logical_2d(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols) result(x)
+         !! load logical matrix from text file (nonzero=>true)
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
          character(len=*), intent(in), optional :: delimiter, comments
@@ -2792,6 +3022,7 @@ contains
       end function loadtxt_logical_2d
 
       function loadtxt_logical_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         !! load one selected logical column as vector (nonzero=>true)
          character(len=*), intent(in) :: path
          integer, intent(in) :: usecol
          integer, intent(in), optional :: skiprows, max_rows, skip_footer
@@ -2861,6 +3092,7 @@ contains
       end function np_fmt_number
 
       subroutine savetxt_real_2d(path, x, delimiter, fmt, header, footer, comments)
+         !! write real matrix text file with basic delimiter/fmt options
          ! np.savetxt(path, x, fmt, delimiter, header=, footer=, comments=).
          character(len=*), intent(in) :: path
          real(kind=dp), intent(in) :: x(:,:)
@@ -2907,6 +3139,7 @@ contains
       end subroutine savetxt_real_2d
 
       pure elemental integer function optval_int(x, default) result(v)
+         !! return x when present, otherwise default
          integer, intent(in), optional :: x
          integer, intent(in) :: default
          if (present(x)) then
@@ -2917,6 +3150,7 @@ contains
       end function optval_int
 
       pure elemental real(kind=dp) function optval_real(x, default) result(v)
+         !! return x when present, otherwise default
          real(kind=dp), intent(in), optional :: x
          real(kind=dp), intent(in) :: default
          if (present(x)) then
@@ -2927,6 +3161,7 @@ contains
       end function optval_real
 
       pure elemental complex(kind=dp) function optval_complex(x, default) result(v)
+         !! return x when present, otherwise default
          complex(kind=dp), intent(in), optional :: x
          complex(kind=dp), intent(in) :: default
          if (present(x)) then
@@ -2937,6 +3172,7 @@ contains
       end function optval_complex
 
       pure elemental logical function optval_logical(x, default) result(v)
+         !! return x when present, otherwise default
          logical, intent(in), optional :: x
          logical, intent(in) :: default
          if (present(x)) then
@@ -2947,6 +3183,7 @@ contains
       end function optval_logical
 
       pure function optval_char(x, default) result(v)
+         !! return x when present, otherwise default
          character(len=*), intent(in), optional :: x
          character(len=*), intent(in) :: default
          character(len=:), allocatable :: v
@@ -2958,6 +3195,7 @@ contains
       end function optval_char
 
       function exec_cmd_status(cmd) result(status)
+         !! execute shell command via execute_command_line and return exit status
          character(len=*), intent(in) :: cmd
          integer :: status
          integer :: cmdstat
@@ -3002,6 +3240,7 @@ contains
       end subroutine rng_replay_expect
 
       subroutine random_normal_vec(x)
+         !! fill x with N(0,1) variates using Box-Muller
          ! fill x with N(0,1) variates using Box-Muller
          implicit none
          real(kind=dp), intent(out) :: x(:)
@@ -3023,6 +3262,7 @@ contains
       end subroutine random_normal_vec
 
       function runif0() result(x)
+         !! uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)
          real(kind=dp) :: x
          call rng_replay_expect("uniform", 0, -1, -1)
          if (rng_replay_enabled) then
@@ -3033,6 +3273,7 @@ contains
       end function runif0
 
       function runif1(n) result(x)
+         !! uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)
          integer, intent(in) :: n
          real(kind=dp), allocatable :: x(:)
          if (n < 0) error stop "runif: n must be >= 0"
@@ -3046,6 +3287,7 @@ contains
       end function runif1
 
       function runif2(n, m) result(x)
+         !! uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)
          integer, intent(in) :: n, m
          real(kind=dp), allocatable :: x(:,:)
          if (n < 0 .or. m < 0) error stop "runif: n,m must be >= 0"
@@ -3059,6 +3301,7 @@ contains
       end function runif2
 
       function runif3(n, m, l) result(x)
+         !! uniform variates: scalar runif(), vector runif(n), matrix runif(n,m)
          integer, intent(in) :: n, m, l
          real(kind=dp), allocatable :: x(:,:,:)
          if (n < 0 .or. m < 0 .or. l < 0) error stop "runif: n,m,l must be >= 0"
@@ -3069,6 +3312,7 @@ contains
       end function runif3
 
       integer function random_randrange_int(start, stop, step)
+         !! random integer from range(start, stop, step)
          integer, intent(in) :: start, stop, step
          integer :: n
          real(kind=dp) :: u
@@ -3085,6 +3329,7 @@ contains
       end function random_randrange_int
 
       function random_choice_char(a) result(x)
+         !! choose one string from a character vector
          character(len=*), intent(in) :: a(:)
          character(len=len(a)) :: x
          real(kind=dp) :: u
@@ -3098,6 +3343,7 @@ contains
       end function random_choice_char
 
       function random_choices_char(a, k) result(x)
+         !! choose k strings with replacement
          character(len=*), intent(in) :: a(:)
          integer, intent(in) :: k
          character(len=len(a)), allocatable :: x(:)
@@ -3111,6 +3357,7 @@ contains
       end function random_choices_char
 
       function random_sample_char(a, k) result(x)
+         !! choose k unique strings without replacement
          character(len=*), intent(in) :: a(:)
          integer, intent(in) :: k
          character(len=len(a)), allocatable :: x(:)
@@ -3138,6 +3385,7 @@ contains
       end function random_sample_char
 
       function rnorm0() result(x)
+         !! normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)
          real(kind=dp) :: x
          real(kind=dp) :: tmp(1)
          call rng_replay_expect("normal", 0, -1, -1)
@@ -3150,6 +3398,7 @@ contains
       end function rnorm0
 
       function rnorm1(n) result(x)
+         !! normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)
          integer, intent(in) :: n
          real(kind=dp), allocatable :: x(:)
          if (n < 0) error stop "rnorm: n must be >= 0"
@@ -3163,6 +3412,7 @@ contains
       end function rnorm1
 
       function rnorm2(n, m) result(x)
+         !! normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)
          integer, intent(in) :: n, m
          real(kind=dp), allocatable :: x(:,:)
          real(kind=dp), allocatable :: tmp(:)
@@ -3182,6 +3432,7 @@ contains
       end function rnorm2
 
       function rnorm3(n, m, l) result(x)
+         !! normal variates: scalar rnorm(), vector rnorm(n), matrix rnorm(n,m)
          integer, intent(in) :: n, m, l
          real(kind=dp), allocatable :: x(:,:,:)
          real(kind=dp), allocatable :: tmp(:)
@@ -3198,6 +3449,7 @@ contains
       end function rnorm3
 
       real(kind=dp) function random_exponential(scale)
+         !! sample scalar exponential with scale (default 1)
          real(kind=dp), intent(in), optional :: scale
          real(kind=dp) :: u, s
          s = 1.0_dp
@@ -3208,6 +3460,7 @@ contains
       end function random_exponential
 
       subroutine random_exponential_vec(x, scale)
+         !! fill x with exponential samples with scale (default 1)
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in), optional :: scale
          integer :: i
@@ -3221,6 +3474,7 @@ contains
       end subroutine random_exponential_vec
 
       recursive real(kind=dp) function random_gamma(shape, scale) result(g)
+         !! sample scalar gamma(shape, scale), shape>0
          real(kind=dp), intent(in) :: shape
          real(kind=dp), intent(in), optional :: scale
          real(kind=dp) :: sc, d, c, u, v, z
@@ -3252,6 +3506,7 @@ contains
       end function random_gamma
 
       subroutine random_gamma_vec(x, shape, scale)
+         !! fill x with gamma samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: shape
          real(kind=dp), intent(in), optional :: scale
@@ -3266,6 +3521,7 @@ contains
       end subroutine random_gamma_vec
 
       real(kind=dp) function random_student_t(df)
+         !! sample scalar Student t(df)
          real(kind=dp), intent(in) :: df
          real(kind=dp) :: z(1), v
          if (df <= 0.0_dp) error stop "random_student_t: df must be > 0"
@@ -3275,6 +3531,7 @@ contains
       end function random_student_t
 
       subroutine random_student_t_vec(x, df)
+         !! fill x with Student t(df) samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: df
          integer :: i
@@ -3284,6 +3541,7 @@ contains
       end subroutine random_student_t_vec
 
       real(kind=dp) function random_f(dfnum, dfden)
+         !! sample scalar F(dfnum,dfden)
          real(kind=dp), intent(in) :: dfnum, dfden
          real(kind=dp) :: x1, x2
          if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp) error stop "random_f: dfs must be > 0"
@@ -3293,6 +3551,7 @@ contains
       end function random_f
 
       subroutine random_f_vec(x, dfnum, dfden)
+         !! fill x with F samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: dfnum, dfden
          integer :: i
@@ -3302,6 +3561,7 @@ contains
       end subroutine random_f_vec
 
       integer function random_poisson(mu)
+         !! sample scalar Poisson(mu)
          real(kind=dp), intent(in) :: mu
          real(kind=dp) :: l, p, u
          integer :: k
@@ -3319,6 +3579,7 @@ contains
       end function random_poisson
 
       subroutine random_poisson_vec(x, mu)
+         !! fill x with Poisson(mu) samples
          integer, intent(out) :: x(:)
          real(kind=dp), intent(in) :: mu
          integer :: i
@@ -3328,6 +3589,7 @@ contains
       end subroutine random_poisson_vec
 
       integer function random_geometric(p)
+         !! sample scalar Geometric(p), support on {1,2,...}
          ! Source: John Burkardt, prob.f90, geometric_sample/geometric_cdf_inv.
          real(kind=dp), intent(in) :: p
          real(kind=dp) :: u
@@ -3346,6 +3608,7 @@ contains
       end function random_geometric
 
       subroutine random_geometric_vec(x, p)
+         !! fill x with Geometric(p) samples
          integer, intent(out) :: x(:)
          real(kind=dp), intent(in) :: p
          integer :: i
@@ -3355,6 +3618,7 @@ contains
       end subroutine random_geometric_vec
 
       integer function random_binomial(n, p)
+         !! sample scalar Binomial(n,p)
          integer, intent(in) :: n
          real(kind=dp), intent(in) :: p
          integer :: i
@@ -3369,6 +3633,7 @@ contains
       end function random_binomial
 
       subroutine random_binomial_vec(x, n, p)
+         !! fill x with Binomial(n,p) samples
          integer, intent(out) :: x(:)
          integer, intent(in) :: n
          real(kind=dp), intent(in) :: p
@@ -3379,6 +3644,7 @@ contains
       end subroutine random_binomial_vec
 
       integer function random_hypergeometric(ngood, nbad, nsample)
+         !! sample scalar Hypergeometric(ngood,nbad,nsample)
          integer, intent(in) :: ngood, nbad, nsample
          integer :: gg, nn, i
          real(kind=dp) :: pr, u
@@ -3400,6 +3666,7 @@ contains
       end function random_hypergeometric
 
       subroutine random_hypergeometric_vec(x, ngood, nbad, nsample)
+         !! fill x with hypergeometric samples
          integer, intent(out) :: x(:)
          integer, intent(in) :: ngood, nbad, nsample
          integer :: i
@@ -3409,6 +3676,7 @@ contains
       end subroutine random_hypergeometric_vec
 
       integer function random_zipf(a)
+         !! sample scalar Zipf(a), a>1
          real(kind=dp), intent(in) :: a
          real(kind=dp) :: b, const, t, u, v
          real(kind=dp), parameter :: one = 1.0_dp
@@ -3426,6 +3694,7 @@ contains
       end function random_zipf
 
       subroutine random_zipf_vec(x, a)
+         !! fill x with Zipf(a) samples
          integer, intent(out) :: x(:)
          real(kind=dp), intent(in) :: a
          integer :: i
@@ -3435,6 +3704,7 @@ contains
       end subroutine random_zipf_vec
 
       real(kind=dp) function random_beta(a, b)
+         !! sample scalar beta(a,b), a,b>0
          real(kind=dp), intent(in) :: a, b
          real(kind=dp) :: x1, x2
          if (a <= 0.0_dp .or. b <= 0.0_dp) error stop "random_beta: a,b must be > 0"
@@ -3444,6 +3714,7 @@ contains
       end function random_beta
 
       subroutine random_beta_vec(x, a, b)
+         !! fill x with beta samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: a, b
          integer :: i
@@ -3453,6 +3724,7 @@ contains
       end subroutine random_beta_vec
 
       real(kind=dp) function random_lognormal(meanlog, sdlog)
+         !! sample scalar lognormal exp(N(meanlog,sdlog^2))
          real(kind=dp), intent(in), optional :: meanlog, sdlog
          real(kind=dp) :: mu, sig, z(1)
          mu = 0.0_dp
@@ -3464,6 +3736,7 @@ contains
       end function random_lognormal
 
       subroutine random_lognormal_vec(x, meanlog, sdlog)
+         !! fill x with lognormal samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in), optional :: meanlog, sdlog
          integer :: i
@@ -3481,12 +3754,14 @@ contains
       end subroutine random_lognormal_vec
 
       real(kind=dp) function random_chisquare(df)
+         !! sample scalar chi-square(df)
          real(kind=dp), intent(in) :: df
          if (df <= 0.0_dp) error stop "random_chisquare: df must be > 0"
          random_chisquare = random_gamma(df / 2.0_dp, 2.0_dp)
       end function random_chisquare
 
       subroutine random_chisquare_vec(x, df)
+         !! fill x with chi-square samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: df
          integer :: i
@@ -3496,6 +3771,7 @@ contains
       end subroutine random_chisquare_vec
 
       real(kind=dp) function random_laplace(loc, scale)
+         !! sample scalar Laplace(loc,scale)
          real(kind=dp), intent(in), optional :: loc, scale
          real(kind=dp) :: u, mu, b
          mu = 0.0_dp
@@ -3512,6 +3788,7 @@ contains
       end function random_laplace
 
       subroutine random_laplace_vec(x, loc, scale)
+         !! fill x with Laplace samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in), optional :: loc, scale
          integer :: i
@@ -3529,6 +3806,7 @@ contains
       end subroutine random_laplace_vec
 
       real(kind=dp) function random_logistic(loc, scale)
+         !! sample scalar Logistic(loc,scale)
          real(kind=dp), intent(in), optional :: loc, scale
          real(kind=dp) :: u, mu, s
          mu = 0.0_dp
@@ -3542,6 +3820,7 @@ contains
       end function random_logistic
 
       subroutine random_logistic_vec(x, loc, scale)
+         !! fill x with Logistic samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in), optional :: loc, scale
          integer :: i
@@ -3559,6 +3838,7 @@ contains
       end subroutine random_logistic_vec
 
       real(kind=dp) function random_cauchy(loc, scale)
+         !! sample scalar Cauchy(loc,scale)
          real(kind=dp), intent(in), optional :: loc, scale
          real(kind=dp) :: u, mu, s
          mu = 0.0_dp
@@ -3571,6 +3851,7 @@ contains
       end function random_cauchy
 
       subroutine random_cauchy_vec(x, loc, scale)
+         !! fill x with Cauchy samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in), optional :: loc, scale
          integer :: i
@@ -3588,6 +3869,7 @@ contains
       end subroutine random_cauchy_vec
 
       real(kind=dp) function random_weibull(a)
+         !! sample scalar Weibull(a)
          ! Source: Alan Miller, amiller_mirror/random.f90 (Weibull sampler).
          real(kind=dp), intent(in) :: a
          if (a <= 0.0_dp) error stop "random_weibull: a must be > 0"
@@ -3595,6 +3877,7 @@ contains
       end function random_weibull
 
       subroutine random_weibull_vec(x, a)
+         !! fill x with Weibull(a) samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: a
          integer :: i
@@ -3604,6 +3887,7 @@ contains
       end subroutine random_weibull_vec
 
       integer function random_neg_binomial(sk, p)
+         !! sample scalar negative binomial failures before sk successes
          ! Source: Alan Miller, amiller_mirror/random.f90 (negative binomial sampler).
          real(kind=dp), intent(in) :: sk, p
          real(kind=dp), parameter :: h = 0.7_dp
@@ -3646,6 +3930,7 @@ contains
       end function random_neg_binomial
 
       subroutine random_neg_binomial_vec(x, sk, p)
+         !! fill x with negative binomial samples
          integer, intent(out) :: x(:)
          real(kind=dp), intent(in) :: sk, p
          integer :: i
@@ -3655,6 +3940,8 @@ contains
       end subroutine random_neg_binomial_vec
 
       real(kind=dp) function random_von_mises(kappa, mu)
+         !! sample scalar von Mises with concentration kappa, centered at mu, in [-pi, pi) (numpy's
+         !! algorithm)
          ! np.random.vonmises(mu, kappa): numpy's algorithm (Best and Fisher,
          ! 1979), in [-pi, pi), centered at mu (default 0).
          real(kind=dp), intent(in) :: kappa
@@ -3702,6 +3989,7 @@ contains
       end function random_von_mises
 
       subroutine random_von_mises_vec(x, kappa, mu)
+         !! fill x with von Mises samples centered at mu
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: kappa
          real(kind=dp), intent(in), optional :: mu
@@ -3712,6 +4000,7 @@ contains
       end subroutine random_von_mises_vec
 
       real(kind=dp) function random_pareto(a)
+         !! sample scalar Pareto(a) in NumPy convention
          ! Source: John Burkardt, prob.f90, pareto_sample/pareto_cdf_inv.
          ! NumPy convention: support x >= 0 with shape a.
          real(kind=dp), intent(in) :: a
@@ -3723,6 +4012,7 @@ contains
       end function random_pareto
 
       subroutine random_pareto_vec(x, a)
+         !! fill x with Pareto(a) samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: a
          integer :: i
@@ -3732,6 +4022,7 @@ contains
       end subroutine random_pareto_vec
 
       real(kind=dp) function random_power(a)
+         !! sample scalar Power(a) in NumPy convention
          ! Source: John Burkardt, prob.f90, power_sample/power_cdf_inv.
          ! NumPy convention on [0,1], shape a.
          real(kind=dp), intent(in) :: a
@@ -3743,6 +4034,7 @@ contains
       end function random_power
 
       subroutine random_power_vec(x, a)
+         !! fill x with Power(a) samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: a
          integer :: i
@@ -3752,6 +4044,7 @@ contains
       end subroutine random_power_vec
 
       real(kind=dp) function random_rayleigh(scale)
+         !! sample scalar Rayleigh(scale), default scale=1
          ! Source: John Burkardt, prob.f90, rayleigh_sample/rayleigh_cdf_inv.
          real(kind=dp), intent(in), optional :: scale
          real(kind=dp) :: s, u
@@ -3764,6 +4057,7 @@ contains
       end function random_rayleigh
 
       subroutine random_rayleigh_vec(x, scale)
+         !! fill x with Rayleigh samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in), optional :: scale
          integer :: i
@@ -3777,6 +4071,7 @@ contains
       end subroutine random_rayleigh_vec
 
       real(kind=dp) function random_gumbel(loc, scale)
+         !! sample scalar Gumbel(loc,scale)
          ! Source: John Burkardt, prob.f90, gumbel_sample/gumbel_cdf_inv.
          real(kind=dp), intent(in), optional :: loc, scale
          real(kind=dp) :: mu, b, u
@@ -3791,6 +4086,7 @@ contains
       end function random_gumbel
 
       subroutine random_gumbel_vec(x, loc, scale)
+         !! fill x with Gumbel samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in), optional :: loc, scale
          integer :: i
@@ -3808,6 +4104,7 @@ contains
       end subroutine random_gumbel_vec
 
       real(kind=dp) function random_wald(mean, scale)
+         !! sample scalar Wald(mean,scale)
          ! Source: John Burkardt, prob.f90, inverse_gaussian_sample.
          real(kind=dp), intent(in) :: mean, scale
          real(kind=dp) :: phi, z(1), y, t, u
@@ -3825,6 +4122,7 @@ contains
       end function random_wald
 
       subroutine random_wald_vec(x, mean, scale)
+         !! fill x with Wald samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: mean, scale
          integer :: i
@@ -3834,6 +4132,7 @@ contains
       end subroutine random_wald_vec
 
       real(kind=dp) function random_noncentral_chisquare(df, nonc)
+         !! sample scalar noncentral chisquare(df,nonc)
          ! Source: John Burkardt, prob.f90, chi_square_noncentral_sample.
          real(kind=dp), intent(in) :: df, nonc
          real(kind=dp) :: x1, x2n(1), mu
@@ -3845,6 +4144,7 @@ contains
       end function random_noncentral_chisquare
 
       subroutine random_noncentral_chisquare_vec(x, df, nonc)
+         !! fill x with noncentral chisquare samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: df, nonc
          integer :: i
@@ -3854,6 +4154,7 @@ contains
       end subroutine random_noncentral_chisquare_vec
 
       real(kind=dp) function random_noncentral_f(dfnum, dfden, nonc)
+         !! sample scalar noncentral F(dfnum,dfden,nonc)
          real(kind=dp), intent(in) :: dfnum, dfden, nonc
          real(kind=dp) :: xn, xd
          if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp .or. nonc < 0.0_dp) error stop "random_noncentral_f: invalid parameters"
@@ -3863,6 +4164,7 @@ contains
       end function random_noncentral_f
 
       subroutine random_noncentral_f_vec(x, dfnum, dfden, nonc)
+         !! fill x with noncentral F samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: dfnum, dfden, nonc
          integer :: i
@@ -3872,6 +4174,7 @@ contains
       end subroutine random_noncentral_f_vec
 
       real(kind=dp) function random_triangular(left, mode, right)
+         !! sample scalar triangular(left,mode,right)
          ! Source: John Burkardt, prob.f90, triangle_sample/triangle_cdf_inv.
          real(kind=dp), intent(in) :: left, mode, right
          real(kind=dp) :: u, cut
@@ -3888,6 +4191,7 @@ contains
       end function random_triangular
 
       subroutine random_triangular_vec(x, left, mode, right)
+         !! fill x with triangular samples
          real(kind=dp), intent(out) :: x(:)
          real(kind=dp), intent(in) :: left, mode, right
          integer :: i
@@ -3897,6 +4201,7 @@ contains
       end subroutine random_triangular_vec
 
       integer function random_logseries(p)
+         !! sample scalar logarithmic-series(p)
          ! Source: John Burkardt, prob.f90, log_series_sample.
          real(kind=dp), intent(in) :: p
          real(kind=dp) :: u, v
@@ -3909,6 +4214,7 @@ contains
       end function random_logseries
 
       subroutine random_logseries_vec(x, p)
+         !! fill x with logarithmic-series samples
          integer, intent(out) :: x(:)
          real(kind=dp), intent(in) :: p
          integer :: i
@@ -3918,6 +4224,7 @@ contains
       end subroutine random_logseries_vec
 
       subroutine random_dirichlet(alpha, x)
+         !! sample one Dirichlet(alpha) vector
          ! Source: John Burkardt, prob.f90, dirichlet_sample.
          real(kind=dp), intent(in) :: alpha(:)
          real(kind=dp), intent(out) :: x(:)
@@ -3935,6 +4242,7 @@ contains
       end subroutine random_dirichlet
 
       subroutine random_dirichlet_samples(alpha, x)
+         !! fill rows of x with Dirichlet(alpha) samples
          real(kind=dp), intent(in) :: alpha(:)
          real(kind=dp), intent(out) :: x(:,:)
          integer :: i
@@ -3945,6 +4253,7 @@ contains
       end subroutine random_dirichlet_samples
 
       subroutine random_multinomial(n, p, x)
+         !! sample one Multinomial(n,p) count vector
          ! Source: John Burkardt, prob.f90, multinomial_sample.
          integer, intent(in) :: n
          real(kind=dp), intent(in) :: p(:)
@@ -3976,6 +4285,7 @@ contains
        end subroutine random_multinomial
 
       subroutine random_multinomial_samples(n, p, x)
+         !! fill rows of x with Multinomial(n,p) samples
          integer, intent(in) :: n
          real(kind=dp), intent(in) :: p(:)
          integer, intent(out) :: x(:,:)
@@ -3987,6 +4297,7 @@ contains
       end subroutine random_multinomial_samples
 
       subroutine random_multivariate_hypergeometric(ngood, nsample, x)
+         !! sample one multivariate hypergeometric count vector
          ! Source: reduction to sequential univariate hypergeometric draws.
          integer, intent(in) :: ngood(:)
          integer, intent(in) :: nsample
@@ -4014,6 +4325,7 @@ contains
       end subroutine random_multivariate_hypergeometric
 
       subroutine random_multivariate_hypergeometric_samples(ngood, nsample, x)
+         !! fill rows of x with multivariate hypergeometric samples
          integer, intent(in) :: ngood(:)
          integer, intent(in) :: nsample
          integer, intent(out) :: x(:,:)
@@ -4046,6 +4358,7 @@ contains
       end subroutine vm_integral
 
       subroutine random_mvn_samples(mean, cov, x)
+         !! fill x(nsamp,ndim) with multivariate-normal samples using Cholesky factorization
          real(kind=dp), intent(in) :: mean(:)
          real(kind=dp), intent(in) :: cov(:,:)
          real(kind=dp), intent(out) :: x(:,:)
@@ -4083,6 +4396,7 @@ contains
       end subroutine random_mvn_samples
 
       subroutine random_choice2(p, n, z)
+         !! sample n labels in {0,1} with probabilities p(1:2)
          ! sample n labels in {0,1} with probabilities p(1:2)
          implicit none
          real(kind=dp), intent(in) :: p(:)
@@ -4110,6 +4424,7 @@ contains
       end subroutine random_choice2
 
       subroutine random_choice_norep(npop, nsamp, z)
+         !! sample nsamp unique labels from 0..npop-1 without replacement
          integer, intent(in) :: npop, nsamp
          integer, intent(out) :: z(:)
          integer :: i, j, tmp
@@ -4142,6 +4457,7 @@ contains
       ! approximation, same category as this project's BFGS/least_squares/
       ! L-BFGS-B solvers: correct distributionally, not reproducible bit-for-bit.
       subroutine random_choice_prob(p, n, z)
+         !! sample n labels in 0..size(p)-1 with probabilities p
          real(kind=dp), intent(in) :: p(:)
          integer, intent(in) :: n
          integer, intent(out) :: z(:)
@@ -4178,6 +4494,7 @@ contains
       end subroutine random_choice_prob
 
       pure subroutine sort_real_vec(x)
+         !! sort real vector x in ascending order
          ! sort real vector x in ascending order, NaN last (as numpy does).
          real(kind=dp), intent(inout) :: x(:)
          integer :: nn, n
@@ -4242,6 +4559,7 @@ contains
       end subroutine sort_real_vec_nonan
 
       pure subroutine sort_int_vec(x)
+         !! sort integer vector x in ascending order
          ! sort integer vector x in ascending order -- see sort_real_vec
          ! just above for why this is a bottom-up merge sort now, not an
          ! insertion sort.
@@ -4289,6 +4607,8 @@ contains
       end subroutine sort_int_vec
 
       pure subroutine sort_logical_vec(x)
+         !! sort real vector x in ascending order (generic: sort_real_vec, sort_int_vec,
+         !! sort_char_vec, sort_complex_vec, sort_logical_vec)
          ! sort logical vector x as numpy sorts booleans: False first.
          implicit none
          logical, intent(inout) :: x(:)
@@ -4299,6 +4619,7 @@ contains
       end subroutine sort_logical_vec
 
       pure subroutine sort_char_vec(x)
+         !! sort character vector x in ascending order
          ! sort character vector x in ascending order -- see
          ! sort_real_vec above for why this is a bottom-up merge sort
          ! now, not an insertion sort.
@@ -4346,6 +4667,7 @@ contains
       end subroutine sort_char_vec
 
       pure subroutine argsort_real(x, idx)
+         !! argsort indices (0-based) of real vector
          real(kind=dp), intent(in) :: x(:)
          integer, intent(out) :: idx(:)
          integer :: i, n
@@ -4412,6 +4734,7 @@ contains
       end subroutine argsort_msort_real
 
       pure subroutine argsort_int(x, idx)
+         !! argsort indices (0-based) of integer vector
          integer, intent(in) :: x(:)
          integer, intent(out) :: idx(:)
          integer :: i, n
@@ -4464,6 +4787,7 @@ contains
       end subroutine argsort_msort_int
 
       pure function argsort_idx_real(x) result(idx)
+         !! argsort indices (0-based) of real vector
          real(kind=dp), intent(in) :: x(:)
          integer, allocatable :: idx(:)
          allocate(idx(size(x)))
@@ -4471,6 +4795,7 @@ contains
       end function argsort_idx_real
 
       pure function argsort_idx_int(x) result(idx)
+         !! argsort indices (0-based) of integer vector
          integer, intent(in) :: x(:)
          integer, allocatable :: idx(:)
          allocate(idx(size(x)))
@@ -4478,6 +4803,9 @@ contains
       end function argsort_idx_int
 
       pure function reversed_real_vec(x) result(y)
+         !! x[::-1] / np.flip(x) of a vector expression (a function result can't be subscripted in
+         !! Fortran) (generic: reversed_real_vec, reversed_int_vec, reversed_logical_vec,
+         !! reversed_complex_vec)
          ! x[::-1] / np.flip(x) of a vector expression (a function result
          ! can't be subscripted in Fortran).
          real(kind=dp), intent(in) :: x(:)
@@ -4486,6 +4814,9 @@ contains
       end function reversed_real_vec
 
       pure function reversed_int_vec(x) result(y)
+         !! x[::-1] / np.flip(x) of a vector expression (a function result can't be subscripted in
+         !! Fortran) (generic: reversed_real_vec, reversed_int_vec, reversed_logical_vec,
+         !! reversed_complex_vec)
          ! x[::-1] / np.flip(x) of a vector expression (a function result
          ! can't be subscripted in Fortran).
          integer, intent(in) :: x(:)
@@ -4494,6 +4825,9 @@ contains
       end function reversed_int_vec
 
       pure function reversed_logical_vec(x) result(y)
+         !! x[::-1] / np.flip(x) of a vector expression (a function result can't be subscripted in
+         !! Fortran) (generic: reversed_real_vec, reversed_int_vec, reversed_logical_vec,
+         !! reversed_complex_vec)
          ! x[::-1] / np.flip(x) of a vector expression (a function result
          ! can't be subscripted in Fortran).
          logical, intent(in) :: x(:)
@@ -4502,6 +4836,8 @@ contains
       end function reversed_logical_vec
 
       pure function np_amin_r1(x) result(r)
+         !! np.min: NaN if x holds a NaN (numpy propagates it) (generic: np_amin_r1, np_amin_r2,
+         !! np_amin_r2_dim)
          ! np.min: NaN if x holds a NaN (numpy propagates it).
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp) :: r
@@ -4513,6 +4849,8 @@ contains
       end function np_amin_r1
 
       pure function np_amin_r2(x) result(r)
+         !! np.min: NaN if x holds a NaN (numpy propagates it) (generic: np_amin_r1, np_amin_r2,
+         !! np_amin_r2_dim)
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp) :: r
          if (any(ieee_is_nan(x))) then
@@ -4523,6 +4861,8 @@ contains
       end function np_amin_r2
 
       pure function np_amin_r2_dim(x, dim) result(r)
+         !! np.min: NaN if x holds a NaN (numpy propagates it) (generic: np_amin_r1, np_amin_r2,
+         !! np_amin_r2_dim)
          ! Along dimension dim, NaN where that column (row) holds a NaN.
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
@@ -4539,6 +4879,8 @@ contains
       end function np_amin_r2_dim
 
       pure function np_amax_r1(x) result(r)
+         !! np.max: NaN if x holds a NaN (numpy propagates it) (generic: np_amax_r1, np_amax_r2,
+         !! np_amax_r2_dim)
          ! np.max: NaN if x holds a NaN (numpy propagates it).
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp) :: r
@@ -4550,6 +4892,8 @@ contains
       end function np_amax_r1
 
       pure function np_amax_r2(x) result(r)
+         !! np.max: NaN if x holds a NaN (numpy propagates it) (generic: np_amax_r1, np_amax_r2,
+         !! np_amax_r2_dim)
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp) :: r
          if (any(ieee_is_nan(x))) then
@@ -4560,6 +4904,8 @@ contains
       end function np_amax_r2
 
       pure function np_amax_r2_dim(x, dim) result(r)
+         !! np.max: NaN if x holds a NaN (numpy propagates it) (generic: np_amax_r1, np_amax_r2,
+         !! np_amax_r2_dim)
          ! Along dimension dim, NaN where that column (row) holds a NaN.
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
@@ -4576,6 +4922,8 @@ contains
       end function np_amax_r2_dim
 
       pure function np_argmin_r1(x) result(r)
+         !! np.argmin (0-based): the first NaN if x holds one, as numpy does (generic: np_argmin_r1,
+         !! np_argmin_r2_dim)
          ! np.argmin (0-based): the first NaN if x holds one, as numpy does.
          real(kind=dp), intent(in) :: x(:)
          integer :: r
@@ -4587,6 +4935,8 @@ contains
       end function np_argmin_r1
 
       pure function np_argmin_r2_dim(x, dim) result(r)
+         !! np.argmin (0-based): the first NaN if x holds one, as numpy does (generic: np_argmin_r1,
+         !! np_argmin_r2_dim)
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          integer, allocatable :: r(:)
@@ -4602,6 +4952,8 @@ contains
       end function np_argmin_r2_dim
 
       pure function np_argmax_r1(x) result(r)
+         !! np.argmax (0-based): the first NaN if x holds one, as numpy does (generic: np_argmax_r1,
+         !! np_argmax_r2_dim)
          ! np.argmax (0-based): the first NaN if x holds one, as numpy does.
          real(kind=dp), intent(in) :: x(:)
          integer :: r
@@ -4613,6 +4965,8 @@ contains
       end function np_argmax_r1
 
       pure function np_argmax_r2_dim(x, dim) result(r)
+         !! np.argmax (0-based): the first NaN if x holds one, as numpy does (generic: np_argmax_r1,
+         !! np_argmax_r2_dim)
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          integer, allocatable :: r(:)
@@ -4628,6 +4982,7 @@ contains
       end function np_argmax_r2_dim
 
       pure elemental function np_maximum(a, b) result(r)
+         !! np.maximum: NaN if either is NaN
          ! np.maximum: NaN if either is NaN.
          real(kind=dp), intent(in) :: a, b
          real(kind=dp) :: r
@@ -4641,6 +4996,7 @@ contains
       end function np_maximum
 
       pure elemental function np_minimum(a, b) result(r)
+         !! np.minimum: NaN if either is NaN
          ! np.minimum: NaN if either is NaN.
          real(kind=dp), intent(in) :: a, b
          real(kind=dp) :: r
@@ -4654,6 +5010,7 @@ contains
       end function np_minimum
 
       pure elemental function np_clip(x, lo, hi) result(r)
+         !! np.clip: NaN stays NaN
          ! np.clip: NaN stays NaN.
          real(kind=dp), intent(in) :: x, lo, hi
          real(kind=dp) :: r
@@ -4665,6 +5022,8 @@ contains
       end function np_clip
 
       pure elemental function np_floor(x) result(r)
+         !! np.floor of a float: NaN and infinities unchanged, no integer conversion (which
+         !! overflows for large values)
          ! np.floor of a float: NaN and infinities unchanged, no integer
          ! conversion (which overflows for large values).
          real(kind=dp), intent(in) :: x
@@ -4677,6 +5036,7 @@ contains
       end function np_floor
 
       pure elemental function np_ceil(x) result(r)
+         !! np.ceil of a float: NaN and infinities unchanged, no integer conversion
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: r
          r = x
@@ -4687,6 +5047,7 @@ contains
       end function np_ceil
 
       pure elemental function np_sign(x) result(r)
+         !! np.sign of a float: -1, 0 or 1, NaN for NaN
          ! np.sign of a float: -1, 0 or 1, NaN for NaN.
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: r
@@ -4702,6 +5063,8 @@ contains
       end function np_sign
 
       pure function sort_axis_3d_real(x, dim) result(out)
+         !! np.sort(x, axis=dim-1) of a rank-3 array: sorted_vec along dim (generic:
+         !! sort_axis_3d_real, sort_axis_3d_int)
          ! np.sort(x, axis=dim-1) of a rank-3 array: sorted_vec along dim.
          real(kind=dp), intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4731,6 +5094,8 @@ contains
       end function sort_axis_3d_real
 
       pure function sort_axis_3d_int(x, dim) result(out)
+         !! np.sort(x, axis=dim-1) of a rank-3 array: sorted_vec along dim (generic:
+         !! sort_axis_3d_real, sort_axis_3d_int)
          ! np.sort(x, axis=dim-1) of a rank-3 array: sorted_vec along dim.
          integer, intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4760,6 +5125,8 @@ contains
       end function sort_axis_3d_int
 
       pure function argsort_axis_3d_real(x, dim) result(out)
+         !! np.argsort(x, axis=dim-1) of a rank-3 array: argsort_idx along dim (generic:
+         !! argsort_axis_3d_real, argsort_axis_3d_int)
          ! np.argsort(x, axis=dim-1) of a rank-3 array: argsort_idx along dim.
          real(kind=dp), intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4789,6 +5156,8 @@ contains
       end function argsort_axis_3d_real
 
       pure function argsort_axis_3d_int(x, dim) result(out)
+         !! np.argsort(x, axis=dim-1) of a rank-3 array: argsort_idx along dim (generic:
+         !! argsort_axis_3d_real, argsort_axis_3d_int)
          ! np.argsort(x, axis=dim-1) of a rank-3 array: argsort_idx along dim.
          integer, intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4818,6 +5187,8 @@ contains
       end function argsort_axis_3d_int
 
       pure function cumsum_axis_3d_real(x, dim) result(out)
+         !! np.cumsum(x, axis=dim-1) of a rank-3 array: cumsum_real along dim (generic:
+         !! cumsum_axis_3d_real, cumsum_axis_3d_int)
          ! np.cumsum(x, axis=dim-1) of a rank-3 array: cumsum_real along dim.
          real(kind=dp), intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4847,6 +5218,8 @@ contains
       end function cumsum_axis_3d_real
 
       pure function cumsum_axis_3d_int(x, dim) result(out)
+         !! np.cumsum(x, axis=dim-1) of a rank-3 array: cumsum_real along dim (generic:
+         !! cumsum_axis_3d_real, cumsum_axis_3d_int)
          ! np.cumsum(x, axis=dim-1) of a rank-3 array: cumsum_int along dim.
          integer, intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4876,6 +5249,8 @@ contains
       end function cumsum_axis_3d_int
 
       pure function cumprod_axis_3d_real(x, dim) result(out)
+         !! np.cumprod(x, axis=dim-1) of a rank-3 array: cumprod_real along dim (generic:
+         !! cumprod_axis_3d_real, cumprod_axis_3d_int)
          ! np.cumprod(x, axis=dim-1) of a rank-3 array: cumprod_real along dim.
          real(kind=dp), intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4905,6 +5280,8 @@ contains
       end function cumprod_axis_3d_real
 
       pure function cumprod_axis_3d_int(x, dim) result(out)
+         !! np.cumprod(x, axis=dim-1) of a rank-3 array: cumprod_real along dim (generic:
+         !! cumprod_axis_3d_real, cumprod_axis_3d_int)
          ! np.cumprod(x, axis=dim-1) of a rank-3 array: cumprod_int along dim.
          integer, intent(in) :: x(:,:,:)
          integer, intent(in) :: dim
@@ -4934,6 +5311,8 @@ contains
       end function cumprod_axis_3d_int
 
       pure function trace_3d_real(x) result(out)
+         !! np.trace of a rank-3 array: sum of x[i, i, :] over i (generic: trace_3d_real,
+         !! trace_3d_int)
          ! np.trace of a rank-3 array: sum of x[i, i, :] over i.
          real(kind=dp), intent(in) :: x(:,:,:)
          real(kind=dp), allocatable :: out(:)
@@ -4946,6 +5325,8 @@ contains
       end function trace_3d_real
 
       pure function trace_3d_int(x) result(out)
+         !! np.trace of a rank-3 array: sum of x[i, i, :] over i (generic: trace_3d_real,
+         !! trace_3d_int)
          ! np.trace of a rank-3 array: sum of x[i, i, :] over i.
          integer, intent(in) :: x(:,:,:)
          integer, allocatable :: out(:)
@@ -4958,6 +5339,8 @@ contains
       end function trace_3d_int
 
       pure function concat_3d_real(a, b, dim) result(out)
+         !! np.concatenate([a, b], axis=dim-1) of rank-3 arrays (generic: concat_3d_real,
+         !! concat_3d_int)
          ! np.concatenate([a, b], axis=dim-1) of rank-3 arrays.
          real(kind=dp), intent(in) :: a(:,:,:), b(:,:,:)
          integer, intent(in) :: dim
@@ -4980,6 +5363,8 @@ contains
       end function concat_3d_real
 
       pure function concat_3d_int(a, b, dim) result(out)
+         !! np.concatenate([a, b], axis=dim-1) of rank-3 arrays (generic: concat_3d_real,
+         !! concat_3d_int)
          ! np.concatenate([a, b], axis=dim-1) of rank-3 arrays.
          integer, intent(in) :: a(:,:,:), b(:,:,:)
          integer, intent(in) :: dim
@@ -5002,6 +5387,8 @@ contains
       end function concat_3d_int
 
       pure function nonzero_3d(mask, k) result(idx)
+         !! np.nonzero(x)[k-1] of a rank-3 array (mask = x /= 0): the 0-based axis-k indices of the
+         !! true elements, in C (row-major) order
          ! np.nonzero(x)[k-1] of a rank-3 array (mask = x /= 0): the
          ! 0-based axis-k indices of the true elements, in C (row-major) order.
          logical, intent(in) :: mask(:,:,:)
@@ -5030,6 +5417,7 @@ contains
       end function nonzero_3d
 
       pure elemental logical function c_lt(a, b)
+         !! numpy's ordering of complex numbers: by real part, then imaginary part
          ! numpy's ordering of complex numbers: by real part, then imaginary part.
          complex(kind=dp), intent(in) :: a, b
          if (real(a, kind=dp) == real(b, kind=dp)) then
@@ -5040,6 +5428,8 @@ contains
       end function c_lt
 
       pure elemental logical function c_le(a, b)
+         !! numpy's ordering of complex numbers: by real part, then imaginary part, a NaN after
+         !! every number (as np.sort places them)
          ! numpy's ordering of complex numbers: by real part, then imaginary
          ! part, a NaN after every number (as np.sort places them).
          complex(kind=dp), intent(in) :: a, b
@@ -5062,6 +5452,7 @@ contains
       end function c_le
 
       pure elemental logical function c_gt(a, b)
+         !! numpy's ordering of complex numbers: by real part, then imaginary part
          ! numpy's ordering of complex numbers: by real part, then imaginary part.
          complex(kind=dp), intent(in) :: a, b
          if (real(a, kind=dp) == real(b, kind=dp)) then
@@ -5072,6 +5463,7 @@ contains
       end function c_gt
 
       pure elemental logical function c_ge(a, b)
+         !! numpy's ordering of complex numbers: by real part, then imaginary part
          ! numpy's ordering of complex numbers: by real part, then imaginary part.
          complex(kind=dp), intent(in) :: a, b
          if (real(a, kind=dp) == real(b, kind=dp)) then
@@ -5082,6 +5474,7 @@ contains
       end function c_ge
 
       pure elemental function c_maximum(a, b) result(r)
+         !! np.maximum of complex numbers (lexicographic)
          ! np.maximum of complex numbers (lexicographic).
          complex(kind=dp), intent(in) :: a, b
          complex(kind=dp) :: r
@@ -5089,12 +5482,14 @@ contains
       end function c_maximum
 
       pure elemental function c_minimum(a, b) result(r)
+         !! np.minimum of complex numbers in numpy's order (real part, then imaginary part)
          complex(kind=dp), intent(in) :: a, b
          complex(kind=dp) :: r
          r = merge(b, a, c_gt(a, b))
       end function c_minimum
 
       pure elemental function c_round(z, d) result(r)
+         !! np.round of a complex number: both parts, half to even
          ! np.round of a complex number: both parts, half to even.
          complex(kind=dp), intent(in) :: z
          integer, intent(in) :: d
@@ -5111,6 +5506,7 @@ contains
       end function c_round
 
       pure function c_amin_r1(x) result(r)
+         !! (generic: c_amin_r1, c_amin_r2, c_amin_r2_dim)
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp) :: r
          integer :: i
@@ -5121,12 +5517,14 @@ contains
       end function c_amin_r1
 
       pure function c_amin_r2(x) result(r)
+         !! (generic: c_amin_r1, c_amin_r2, c_amin_r2_dim)
          complex(kind=dp), intent(in) :: x(:,:)
          complex(kind=dp) :: r
          r = c_amin_r1(reshape(x, [size(x)]))
       end function c_amin_r2
 
       pure function c_amin_r2_dim(x, dim) result(r)
+         !! (generic: c_amin_r1, c_amin_r2, c_amin_r2_dim)
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          complex(kind=dp), allocatable :: r(:)
@@ -5142,6 +5540,7 @@ contains
       end function c_amin_r2_dim
 
       pure function c_amax_r1(x) result(r)
+         !! (generic: c_amax_r1, c_amax_r2, c_amax_r2_dim)
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp) :: r
          integer :: i
@@ -5152,12 +5551,14 @@ contains
       end function c_amax_r1
 
       pure function c_amax_r2(x) result(r)
+         !! (generic: c_amax_r1, c_amax_r2, c_amax_r2_dim)
          complex(kind=dp), intent(in) :: x(:,:)
          complex(kind=dp) :: r
          r = c_amax_r1(reshape(x, [size(x)]))
       end function c_amax_r2
 
       pure function c_amax_r2_dim(x, dim) result(r)
+         !! (generic: c_amax_r1, c_amax_r2, c_amax_r2_dim)
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          complex(kind=dp), allocatable :: r(:)
@@ -5173,6 +5574,8 @@ contains
       end function c_amax_r2_dim
 
       pure function c_argmin_r1(x) result(r)
+         !! np.argmin (0-based) of complex numbers, the first extreme value (generic: c_argmin_r1,
+         !! c_argmin_r2_dim)
          ! np.argmin (0-based) of complex numbers, the first extreme value.
          complex(kind=dp), intent(in) :: x(:)
          integer :: r, i
@@ -5184,6 +5587,8 @@ contains
       end function c_argmin_r1
 
       pure function c_argmin_r2_dim(x, dim) result(r)
+         !! np.argmin (0-based) of complex numbers, the first extreme value (generic: c_argmin_r1,
+         !! c_argmin_r2_dim)
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          integer, allocatable :: r(:)
@@ -5199,6 +5604,8 @@ contains
       end function c_argmin_r2_dim
 
       pure function c_argmax_r1(x) result(r)
+         !! np.argmax (0-based) of complex numbers, the first extreme value (generic: c_argmax_r1,
+         !! c_argmax_r2_dim)
          ! np.argmax (0-based) of complex numbers, the first extreme value.
          complex(kind=dp), intent(in) :: x(:)
          integer :: r, i
@@ -5210,6 +5617,8 @@ contains
       end function c_argmax_r1
 
       pure function c_argmax_r2_dim(x, dim) result(r)
+         !! np.argmax (0-based) of complex numbers, the first extreme value (generic: c_argmax_r1,
+         !! c_argmax_r2_dim)
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          integer, allocatable :: r(:)
@@ -5225,6 +5634,7 @@ contains
       end function c_argmax_r2_dim
 
       pure function cumsum_complex(x) result(y)
+         !! cumulative sum of a complex vector
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), allocatable :: y(:)
          integer :: i
@@ -5237,6 +5647,7 @@ contains
       end function cumsum_complex
 
       pure function cumsum_complex_2d(x, dim) result(y)
+         !! np.cumsum(x, axis=dim-1) of a complex matrix
          ! np.cumsum(x, axis=dim-1) of a complex matrix.
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
@@ -5255,6 +5666,7 @@ contains
       end function cumsum_complex_2d
 
       pure function cumprod_complex(x) result(y)
+         !! cumulative product of a complex vector
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), allocatable :: y(:)
          integer :: i
@@ -5267,6 +5679,7 @@ contains
       end function cumprod_complex
 
       pure function cumprod_complex_2d(x, dim) result(y)
+         !! np.cumprod(x, axis=dim-1) of a complex matrix
          ! np.cumprod(x, axis=dim-1) of a complex matrix.
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
@@ -5285,6 +5698,8 @@ contains
       end function cumprod_complex_2d
 
       pure function argsort_complex_vec(x) result(idx)
+         !! np.argsort (0-based, stable) of complex numbers in numpy's lexicographic order -- an
+         !! insertion-free bottom-up merge sort
          ! np.argsort (0-based, stable) of complex numbers in numpy's
          ! lexicographic order -- an insertion-free bottom-up merge sort.
          complex(kind=dp), intent(in) :: x(:)
@@ -5332,18 +5747,21 @@ contains
       end function argsort_complex_vec
 
       pure function sorted_complex_vec(x) result(y)
+         !! np.sort of a complex vector (by real part, then imaginary part, NaN last): a sorted copy
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), allocatable :: y(:)
          y = x(argsort_complex_vec(x) + 1)
       end function sorted_complex_vec
 
       pure subroutine sort_complex_vec(x)
+         !! x.sort() of a complex vector
          ! x.sort() of a complex vector.
          complex(kind=dp), intent(inout) :: x(:)
          x = x(argsort_complex_vec(x) + 1)
       end subroutine sort_complex_vec
 
       pure function sorted_complex_2d(x, dim) result(y)
+         !! np.sort of a complex matrix along dimension dim (1 = down columns)
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          complex(kind=dp), allocatable :: y(:,:)
@@ -5361,6 +5779,7 @@ contains
       end function sorted_complex_2d
 
       pure function argsort_complex_2d(x, dim) result(idx)
+         !! np.argsort (0-based) of a complex matrix along dimension dim
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          integer, allocatable :: idx(:,:)
@@ -5378,6 +5797,7 @@ contains
       end function argsort_complex_2d
 
       pure function unique_complex(x) result(y)
+         !! np.unique of complex numbers: sorted, duplicates removed
          ! np.unique of complex numbers: sorted, duplicates removed.
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), allocatable :: y(:)
@@ -5391,6 +5811,8 @@ contains
       end function unique_complex
 
       pure function median_complex(x) result(m)
+         !! np.median of complex numbers: the middle of the lexicographic order (the mean of the two
+         !! middle values for an even count)
          ! np.median of complex numbers: the middle of the lexicographic
          ! order (the mean of the two middle values for an even count).
          complex(kind=dp), intent(in) :: x(:)
@@ -5407,6 +5829,7 @@ contains
       end function median_complex
 
       pure function median_complex_2d(x, dim) result(m)
+         !! np.median of a complex matrix along dimension dim
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: dim
          complex(kind=dp), allocatable :: m(:)
@@ -5422,6 +5845,7 @@ contains
       end function median_complex_2d
 
       pure function reversed_complex_vec(x) result(y)
+         !! x[::-1] of a complex vector expression
          ! x[::-1] of a complex vector expression.
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), allocatable :: y(:)
@@ -5429,6 +5853,9 @@ contains
       end function reversed_complex_vec
 
       pure function reversed_real_mat(x, dim) result(y)
+         !! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows (axis=0), 2 the columns
+         !! (axis=1), 0 both (axis=None) (generic: reversed_real_mat, reversed_int_mat,
+         !! reversed_logical_mat, reversed_complex_mat)
          ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
          ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
          real(kind=dp), intent(in) :: x(:,:)
@@ -5445,6 +5872,9 @@ contains
       end function reversed_real_mat
 
       pure function reversed_int_mat(x, dim) result(y)
+         !! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows (axis=0), 2 the columns
+         !! (axis=1), 0 both (axis=None) (generic: reversed_real_mat, reversed_int_mat,
+         !! reversed_logical_mat, reversed_complex_mat)
          ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
          ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
          integer, intent(in) :: x(:,:)
@@ -5461,6 +5891,9 @@ contains
       end function reversed_int_mat
 
       pure function reversed_logical_mat(x, dim) result(y)
+         !! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows (axis=0), 2 the columns
+         !! (axis=1), 0 both (axis=None) (generic: reversed_real_mat, reversed_int_mat,
+         !! reversed_logical_mat, reversed_complex_mat)
          ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
          ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
          logical, intent(in) :: x(:,:)
@@ -5477,6 +5910,9 @@ contains
       end function reversed_logical_mat
 
       pure function reversed_complex_mat(x, dim) result(y)
+         !! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows (axis=0), 2 the columns
+         !! (axis=1), 0 both (axis=None) (generic: reversed_real_mat, reversed_int_mat,
+         !! reversed_logical_mat, reversed_complex_mat)
          ! np.flip(x, axis) of a matrix expression: dim 1 reverses the rows
          ! (axis=0), 2 the columns (axis=1), 0 both (axis=None).
          complex(kind=dp), intent(in) :: x(:,:)
@@ -5493,6 +5929,7 @@ contains
       end function reversed_complex_mat
 
       pure function repeat_complex(x, reps) result(y)
+         !! np.repeat of a complex vector: each element reps times
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: reps
          complex(kind=dp), allocatable :: y(:)
@@ -5504,6 +5941,7 @@ contains
       end function repeat_complex
 
       pure function tile_complex(x, reps) result(y)
+         !! np.tile of a complex vector reps times
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: reps
          complex(kind=dp), allocatable :: y(:)
@@ -5515,6 +5953,7 @@ contains
       end function tile_complex
 
       pure function diag_k_vec_complex(v, k) result(a)
+         !! np.diag(v, k) of a complex vector
          ! np.diag(v, k) of a complex vector.
          complex(kind=dp), intent(in) :: v(:)
          integer, intent(in) :: k
@@ -5533,6 +5972,7 @@ contains
       end function diag_k_vec_complex
 
       pure function diag_k_mat_complex(a, k) result(v)
+         !! np.diag(a, k) of a complex matrix: its k-th diagonal
          ! np.diag(a, k) of a complex matrix: its k-th diagonal.
          complex(kind=dp), intent(in) :: a(:,:)
          integer, intent(in) :: k
@@ -5554,6 +5994,10 @@ contains
       end function diag_k_mat_complex
 
       pure function np_searchsorted_real(a, v, right) result(idx)
+         !! np.searchsorted(a, v, side): 0-based insertion index of v in the sorted vector a (before
+         !! equal values, or after them if right); NaN sorts after every number, as in numpy
+         !! (generic: np_searchsorted_real, np_searchsorted_real_vec, np_searchsorted_int,
+         !! np_searchsorted_int_vec)
          ! np.searchsorted(a, v, side): 0-based insertion index of v in the
          ! sorted vector a (before equal values, or after them if right);
          ! NaN sorts after every number, as in numpy.
@@ -5582,6 +6026,10 @@ contains
       end function np_searchsorted_real
 
       pure function np_searchsorted_real_vec(a, v, right) result(idx)
+         !! np.searchsorted(a, v, side): 0-based insertion index of v in the sorted vector a (before
+         !! equal values, or after them if right); NaN sorts after every number, as in numpy
+         !! (generic: np_searchsorted_real, np_searchsorted_real_vec, np_searchsorted_int,
+         !! np_searchsorted_int_vec)
          real(kind=dp), intent(in) :: a(:), v(:)
          logical, intent(in) :: right
          integer, allocatable :: idx(:)
@@ -5593,6 +6041,8 @@ contains
       end function np_searchsorted_real_vec
 
       pure function np_isin1_real(a, b) result(mask)
+         !! a(i) in b for each element of the vector a (generic: np_isin1_real, np_isin1_int,
+         !! np_isin1_complex)
          ! a(i) in b for each element of the vector a.
          real(kind=dp), intent(in) :: a(:), b(:)
          logical, allocatable :: mask(:)
@@ -5604,6 +6054,8 @@ contains
       end function np_isin1_real
 
       pure function np_union1d_real(a, b) result(c)
+         !! np.union1d of vectors: sorted, without duplicates (generic: np_union1d_real,
+         !! np_union1d_int, np_union1d_complex)
          ! np.union1d of vectors: sorted, without duplicates.
          real(kind=dp), intent(in) :: a(:), b(:)
          real(kind=dp), allocatable :: c(:)
@@ -5611,6 +6063,8 @@ contains
       end function np_union1d_real
 
       pure function np_intersect1d_real(a, b) result(c)
+         !! np.intersect1d of vectors: sorted, without duplicates (generic: np_intersect1d_real,
+         !! np_intersect1d_int, np_intersect1d_complex)
          ! np.intersect1d of vectors: sorted, without duplicates.
          real(kind=dp), intent(in) :: a(:), b(:)
          real(kind=dp), allocatable :: c(:)
@@ -5618,6 +6072,8 @@ contains
       end function np_intersect1d_real
 
       pure function np_setdiff1d_real(a, b) result(c)
+         !! np.setdiff1d of vectors: sorted, without duplicates (generic: np_setdiff1d_real,
+         !! np_setdiff1d_int, np_setdiff1d_complex)
          ! np.setdiff1d of vectors: sorted, without duplicates.
          real(kind=dp), intent(in) :: a(:), b(:)
          real(kind=dp), allocatable :: c(:)
@@ -5625,6 +6081,8 @@ contains
       end function np_setdiff1d_real
 
       pure function np_setxor1d_real(a, b) result(c)
+         !! np.setxor1d of vectors: sorted, without duplicates (generic: np_setxor1d_real,
+         !! np_setxor1d_int, np_setxor1d_complex)
          ! np.setxor1d of vectors: sorted, without duplicates. NaN equals
          ! nothing, so numpy keeps one NaN for each of a and b holding one.
          real(kind=dp), intent(in) :: a(:), b(:)
@@ -5647,6 +6105,8 @@ contains
       end function eq_nan_real
 
       pure function np_unique_counts_real(x) result(r)
+         !! np.unique(x, return_counts=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_counts_real, np_unique_counts_int, np_unique_counts_complex)
          ! np.unique(x, return_counts=True)[1] of a vector (0-based indices).
          real(kind=dp), intent(in) :: x(:)
          integer, allocatable :: r(:)
@@ -5660,6 +6120,8 @@ contains
       end function np_unique_counts_real
 
       pure function np_unique_index_real(x) result(r)
+         !! np.unique(x, return_index=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_index_real, np_unique_index_int, np_unique_index_complex)
          ! np.unique(x, return_index=True)[1] of a vector (0-based indices).
          real(kind=dp), intent(in) :: x(:)
          integer, allocatable :: r(:)
@@ -5673,6 +6135,8 @@ contains
       end function np_unique_index_real
 
       pure function np_unique_inverse_real(x) result(r)
+         !! np.unique(x, return_inverse=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_inverse_real, np_unique_inverse_int, np_unique_inverse_complex)
          ! np.unique(x, return_inverse=True)[1] of a vector (0-based indices).
          real(kind=dp), intent(in) :: x(:)
          integer, allocatable :: r(:)
@@ -5686,6 +6150,10 @@ contains
       end function np_unique_inverse_real
 
       pure function np_searchsorted_int(a, v, right) result(idx)
+         !! np.searchsorted(a, v, side): 0-based insertion index of v in the sorted vector a (before
+         !! equal values, or after them if right); NaN sorts after every number, as in numpy
+         !! (generic: np_searchsorted_real, np_searchsorted_real_vec, np_searchsorted_int,
+         !! np_searchsorted_int_vec)
          ! np.searchsorted(a, v, side): 0-based insertion index of v in the
          ! sorted vector a (before equal values, or after them if right).
          integer, intent(in) :: a(:), v
@@ -5705,6 +6173,10 @@ contains
       end function np_searchsorted_int
 
       pure function np_searchsorted_int_vec(a, v, right) result(idx)
+         !! np.searchsorted(a, v, side): 0-based insertion index of v in the sorted vector a (before
+         !! equal values, or after them if right); NaN sorts after every number, as in numpy
+         !! (generic: np_searchsorted_real, np_searchsorted_real_vec, np_searchsorted_int,
+         !! np_searchsorted_int_vec)
          integer, intent(in) :: a(:), v(:)
          logical, intent(in) :: right
          integer, allocatable :: idx(:)
@@ -5716,6 +6188,8 @@ contains
       end function np_searchsorted_int_vec
 
       pure function np_isin1_int(a, b) result(mask)
+         !! a(i) in b for each element of the vector a (generic: np_isin1_real, np_isin1_int,
+         !! np_isin1_complex)
          ! a(i) in b for each element of the vector a.
          integer, intent(in) :: a(:), b(:)
          logical, allocatable :: mask(:)
@@ -5727,6 +6201,8 @@ contains
       end function np_isin1_int
 
       pure function np_union1d_int(a, b) result(c)
+         !! np.union1d of vectors: sorted, without duplicates (generic: np_union1d_real,
+         !! np_union1d_int, np_union1d_complex)
          ! np.union1d of vectors: sorted, without duplicates.
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:)
@@ -5734,6 +6210,8 @@ contains
       end function np_union1d_int
 
       pure function np_intersect1d_int(a, b) result(c)
+         !! np.intersect1d of vectors: sorted, without duplicates (generic: np_intersect1d_real,
+         !! np_intersect1d_int, np_intersect1d_complex)
          ! np.intersect1d of vectors: sorted, without duplicates.
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:)
@@ -5741,6 +6219,8 @@ contains
       end function np_intersect1d_int
 
       pure function np_setdiff1d_int(a, b) result(c)
+         !! np.setdiff1d of vectors: sorted, without duplicates (generic: np_setdiff1d_real,
+         !! np_setdiff1d_int, np_setdiff1d_complex)
          ! np.setdiff1d of vectors: sorted, without duplicates.
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:)
@@ -5748,6 +6228,8 @@ contains
       end function np_setdiff1d_int
 
       pure function np_setxor1d_int(a, b) result(c)
+         !! np.setxor1d of vectors: sorted, without duplicates (generic: np_setxor1d_real,
+         !! np_setxor1d_int, np_setxor1d_complex)
          ! np.setxor1d of vectors: sorted, without duplicates.
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:)
@@ -5756,6 +6238,8 @@ contains
       end function np_setxor1d_int
 
       pure function np_unique_counts_int(x) result(r)
+         !! np.unique(x, return_counts=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_counts_real, np_unique_counts_int, np_unique_counts_complex)
          ! np.unique(x, return_counts=True)[1] of a vector (0-based indices).
          integer, intent(in) :: x(:)
          integer, allocatable :: r(:)
@@ -5769,6 +6253,8 @@ contains
       end function np_unique_counts_int
 
       pure function np_unique_index_int(x) result(r)
+         !! np.unique(x, return_index=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_index_real, np_unique_index_int, np_unique_index_complex)
          ! np.unique(x, return_index=True)[1] of a vector (0-based indices).
          integer, intent(in) :: x(:)
          integer, allocatable :: r(:)
@@ -5782,6 +6268,8 @@ contains
       end function np_unique_index_int
 
       pure function np_unique_inverse_int(x) result(r)
+         !! np.unique(x, return_inverse=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_inverse_real, np_unique_inverse_int, np_unique_inverse_complex)
          ! np.unique(x, return_inverse=True)[1] of a vector (0-based indices).
          integer, intent(in) :: x(:)
          integer, allocatable :: r(:)
@@ -5795,6 +6283,9 @@ contains
       end function np_unique_inverse_int
 
       pure function np_gather2d_real(m, i, j) result(r)
+         !! m[i, j] with integer index vectors i, j (0-based, negative from the end): [m[i[0],
+         !! j[0]], m[i[1], j[1]], ...] (generic: np_gather2d_real, np_gather2d_int, np_gather2d_log,
+         !! np_gather2d_complex)
          ! m[i, j] with integer index vectors i, j (0-based, negative from
          ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
          real(kind=dp), intent(in) :: m(:,:)
@@ -5812,6 +6303,9 @@ contains
       end function np_gather2d_real
 
       pure function np_gather2d_int(m, i, j) result(r)
+         !! m[i, j] with integer index vectors i, j (0-based, negative from the end): [m[i[0],
+         !! j[0]], m[i[1], j[1]], ...] (generic: np_gather2d_real, np_gather2d_int, np_gather2d_log,
+         !! np_gather2d_complex)
          ! m[i, j] with integer index vectors i, j (0-based, negative from
          ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
          integer, intent(in) :: m(:,:)
@@ -5829,6 +6323,9 @@ contains
       end function np_gather2d_int
 
       pure function np_gather2d_log(m, i, j) result(r)
+         !! m[i, j] with integer index vectors i, j (0-based, negative from the end): [m[i[0],
+         !! j[0]], m[i[1], j[1]], ...] (generic: np_gather2d_real, np_gather2d_int, np_gather2d_log,
+         !! np_gather2d_complex)
          ! m[i, j] with integer index vectors i, j (0-based, negative from
          ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
          logical, intent(in) :: m(:,:)
@@ -5846,6 +6343,9 @@ contains
       end function np_gather2d_log
 
       pure function np_gather2d_complex(m, i, j) result(r)
+         !! m[i, j] with integer index vectors i, j (0-based, negative from the end): [m[i[0],
+         !! j[0]], m[i[1], j[1]], ...] (generic: np_gather2d_real, np_gather2d_int, np_gather2d_log,
+         !! np_gather2d_complex)
          ! m[i, j] with integer index vectors i, j (0-based, negative from
          ! the end): [m[i[0], j[0]], m[i[1], j[1]], ...].
          complex(kind=dp), intent(in) :: m(:,:)
@@ -5863,6 +6363,7 @@ contains
       end function np_gather2d_complex
 
       pure function np_bincount_weights(x, w, minlength) result(c)
+         !! np.bincount(x, weights=w, minlength=...): c(v+1) = sum of w where x == v
          ! np.bincount(x, weights=w, minlength=...): c(v+1) = sum of w where x == v.
          integer, intent(in) :: x(:)
          real(kind=dp), intent(in) :: w(:)
@@ -5879,6 +6380,9 @@ contains
       end function np_bincount_weights
 
       pure integer function np_digitize_scalar(x, bins, right) result(r)
+         !! np.digitize(x, bins, right): for increasing bins the i with bins[i-1] <= x < bins[i]
+         !! (bins[i-1] < x <= bins[i] if right), for decreasing bins numpy's len(bins) - ...
+         !! (generic: np_digitize_scalar, np_digitize_vec)
          ! np.digitize(x, bins, right): for increasing bins the i with
          ! bins[i-1] <= x < bins[i] (bins[i-1] < x <= bins[i] if right), for
          ! decreasing bins numpy's len(bins) - searchsorted(bins[::-1], x);
@@ -5915,6 +6419,8 @@ contains
       end function np_digitize_scalar
 
       pure elemental function np_spacing(x) result(s)
+         !! np.spacing(x): the distance from x to the next float away from 0, with the sign of x
+         !! (spacing(0) is the smallest subnormal; NaN for inf and NaN)
          ! np.spacing(x): the distance from x to the next float away from 0,
          ! with the sign of x (spacing(0) is the smallest subnormal; NaN for
          ! inf and NaN).
@@ -5931,6 +6437,8 @@ contains
       end function np_spacing
 
       pure elemental integer function np_pad_index(i, n, mode) result(j)
+         !! np.pad index map: 0-based source index of padded position i for mode 1 edge, 2 wrap, 3
+         !! reflect, 4 symmetric
          ! The 0-based index into a vector of size n that position i (0 is
          ! its first element, i < 0 before it, i >= n after it) of np.pad
          ! takes: mode 1 'edge', 2 'wrap', 3 'reflect' (mirror without the
@@ -5958,6 +6466,8 @@ contains
       end function np_pad_index
 
       pure function np_pad_indices(n, before, after, mode) result(idx)
+         !! np.pad: 1-based source indices of a vector of size n padded by before/after elements
+         !! (mode 1 edge, 2 wrap, 3 reflect, 4 symmetric)
          ! The 1-based indices into a vector of size n that np.pad(x,
          ! (before, after), mode) takes (mode as for np_pad_index).
          integer, intent(in) :: n, before, after, mode
@@ -5970,6 +6480,8 @@ contains
       end function np_pad_indices
 
       pure function np_pad_vec_real(x, before, after, mode) result(y)
+         !! np.pad of a real, integer, complex or logical vector with mode 1 edge, 2 wrap, 3
+         !! reflect, 4 symmetric
          ! np.pad(x, (before, after), mode) of a vector (mode as for
          ! np_pad_index).
          real(kind=dp), intent(in) :: x(:)
@@ -5979,6 +6491,8 @@ contains
       end function np_pad_vec_real
 
       pure function np_pad_vec_int(x, before, after, mode) result(y)
+         !! np.pad of a real, integer, complex or logical vector with mode 1 edge, 2 wrap, 3
+         !! reflect, 4 symmetric
          ! np.pad(x, (before, after), mode) of a vector (mode as for
          ! np_pad_index).
          integer, intent(in) :: x(:)
@@ -5988,6 +6502,8 @@ contains
       end function np_pad_vec_int
 
       pure function np_pad_vec_complex(x, before, after, mode) result(y)
+         !! np.pad of a real, integer, complex or logical vector with mode 1 edge, 2 wrap, 3
+         !! reflect, 4 symmetric
          ! np.pad(x, (before, after), mode) of a vector (mode as for
          ! np_pad_index).
          complex(kind=dp), intent(in) :: x(:)
@@ -5997,6 +6513,8 @@ contains
       end function np_pad_vec_complex
 
       pure function np_pad_vec_logical(x, before, after, mode) result(y)
+         !! np.pad of a real, integer, complex or logical vector with mode 1 edge, 2 wrap, 3
+         !! reflect, 4 symmetric
          ! np.pad(x, (before, after), mode) of a vector (mode as for
          ! np_pad_index).
          logical, intent(in) :: x(:)
@@ -6006,6 +6524,8 @@ contains
       end function np_pad_vec_logical
 
       pure function np_packbits(bits, little) result(y)
+         !! np.packbits: pack a logical vector into bytes (values 0..255), big- or little-endian bit
+         !! order
          ! np.packbits of a flat logical array: groups of 8 bits as integers
          ! 0..255, the first bit the most significant (the least if
          ! little), the last group padded with zero bits.
@@ -6023,6 +6543,7 @@ contains
       end function np_packbits
 
       pure function np_unpackbits(x, little, count) result(bits)
+         !! np.unpackbits: the bits (0/1) of bytes 0..255, with numpy's count=
          ! np.unpackbits of a flat array of integers 0..255: 8 bits each
          ! (0 or 1), the most significant first (the least if little);
          ! count keeps the first count bits (count < 0: drops -count; more
@@ -6050,6 +6571,7 @@ contains
       end function np_unpackbits
 
       pure elemental function np_nan_to_num(x, nan, posinf, neginf) result(y)
+         !! np.nan_to_num: NaN and infinities replaced (elemental)
          ! np.nan_to_num(x, nan=, posinf=, neginf=): NaN, +inf and -inf
          ! replaced (no ordered comparison of a NaN, which would raise the
          ! invalid-operation flag).
@@ -6067,6 +6589,7 @@ contains
       end function np_nan_to_num
 
       pure elemental function np_heaviside(x, h0) result(y)
+         !! np.heaviside step function, NaN at NaN (elemental)
          ! np.heaviside(x, h0): 0 for x < 0, h0 at 0, 1 for x > 0, NaN at NaN.
          real(kind=dp), intent(in) :: x, h0
          real(kind=dp) :: y
@@ -6082,6 +6605,8 @@ contains
       end function np_heaviside
 
       pure function np_corrcoef_1(x) result(r)
+         !! np.corrcoef of one vector: 1, or NaN for a constant or non-finite vector (var / sqrt(var
+         !! * var))
          ! np.corrcoef of one vector: 1, or NaN for a constant or non-finite
          ! vector (var / sqrt(var * var)).
          real(kind=dp), intent(in) :: x(:)
@@ -6093,6 +6618,7 @@ contains
       end function np_corrcoef_1
 
       pure elemental function np_chkfinite(x) result(y)
+         !! np.asarray_chkfinite(x): x, or an error if it is inf or NaN
          ! np.asarray_chkfinite(x): x, or an error if it is inf or NaN.
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: y
@@ -6101,6 +6627,9 @@ contains
       end function np_chkfinite
 
       pure function np_digitize_vec(x, bins, right) result(r)
+         !! np.digitize(x, bins, right): for increasing bins the i with bins[i-1] <= x < bins[i]
+         !! (bins[i-1] < x <= bins[i] if right), for decreasing bins numpy's len(bins) - ...
+         !! (generic: np_digitize_scalar, np_digitize_vec)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), intent(in) :: bins(:)
          logical, intent(in) :: right
@@ -6113,6 +6642,8 @@ contains
       end function np_digitize_vec
 
       pure function np_isin1_complex(a, b) result(mask)
+         !! a(i) in b for each element of the vector a (generic: np_isin1_real, np_isin1_int,
+         !! np_isin1_complex)
          complex(kind=dp), intent(in) :: a(:), b(:)
          logical, allocatable :: mask(:)
          integer :: i
@@ -6123,24 +6654,32 @@ contains
       end function np_isin1_complex
 
       pure function np_union1d_complex(a, b) result(c)
+         !! np.union1d of vectors: sorted, without duplicates (generic: np_union1d_real,
+         !! np_union1d_int, np_union1d_complex)
          complex(kind=dp), intent(in) :: a(:), b(:)
          complex(kind=dp), allocatable :: c(:)
          c = unique_complex([a, b])
       end function np_union1d_complex
 
       pure function np_intersect1d_complex(a, b) result(c)
+         !! np.intersect1d of vectors: sorted, without duplicates (generic: np_intersect1d_real,
+         !! np_intersect1d_int, np_intersect1d_complex)
          complex(kind=dp), intent(in) :: a(:), b(:)
          complex(kind=dp), allocatable :: c(:)
          c = unique_complex(pack(a, np_isin1_complex(a, b)))
       end function np_intersect1d_complex
 
       pure function np_setdiff1d_complex(a, b) result(c)
+         !! np.setdiff1d of vectors: sorted, without duplicates (generic: np_setdiff1d_real,
+         !! np_setdiff1d_int, np_setdiff1d_complex)
          complex(kind=dp), intent(in) :: a(:), b(:)
          complex(kind=dp), allocatable :: c(:)
          c = unique_complex(pack(a, .not. np_isin1_complex(a, b)))
       end function np_setdiff1d_complex
 
       pure function np_setxor1d_complex(a, b) result(c)
+         !! np.setxor1d of vectors: sorted, without duplicates (generic: np_setxor1d_real,
+         !! np_setxor1d_int, np_setxor1d_complex)
          ! A value with a NaN part equals nothing: numpy keeps the NaN of
          ! unique(a) and that of unique(b), in its sort order of NaNs.
          complex(kind=dp), intent(in) :: a(:), b(:)
@@ -6181,6 +6720,8 @@ contains
       end function np_setxor1d_complex
 
       pure function np_unique_counts_complex(x) result(r)
+         !! np.unique(x, return_counts=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_counts_real, np_unique_counts_int, np_unique_counts_complex)
          complex(kind=dp), intent(in) :: x(:)
          integer, allocatable :: r(:)
          complex(kind=dp), allocatable :: u(:)
@@ -6193,6 +6734,8 @@ contains
       end function np_unique_counts_complex
 
       pure function np_unique_index_complex(x) result(r)
+         !! np.unique(x, return_index=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_index_real, np_unique_index_int, np_unique_index_complex)
          complex(kind=dp), intent(in) :: x(:)
          integer, allocatable :: r(:)
          complex(kind=dp), allocatable :: u(:)
@@ -6205,6 +6748,8 @@ contains
       end function np_unique_index_complex
 
       pure function np_unique_inverse_complex(x) result(r)
+         !! np.unique(x, return_inverse=True)[1] of a vector (0-based indices) (generic:
+         !! np_unique_inverse_real, np_unique_inverse_int, np_unique_inverse_complex)
          complex(kind=dp), intent(in) :: x(:)
          integer, allocatable :: r(:)
          complex(kind=dp), allocatable :: u(:)
@@ -6217,6 +6762,7 @@ contains
       end function np_unique_inverse_complex
 
       pure function np_kron2_int(a, b) result(r)
+         !! np.kron of two matrices (generic: np_kron2_int, np_kron2_real, np_kron2_complex)
          ! np.kron of two matrices.
          integer, intent(in) :: a(:,:), b(:,:)
          integer, allocatable :: r(:,:)
@@ -6233,6 +6779,7 @@ contains
       end function np_kron2_int
 
       pure function np_cross3_int(a, b) result(c)
+         !! np.cross of two 3-vectors (generic: np_cross3_int, np_cross3_real, np_cross3_complex)
          ! np.cross of two 3-vectors.
          integer, intent(in) :: a(:), b(:)
          integer :: c(3)
@@ -6240,6 +6787,7 @@ contains
       end function np_cross3_int
 
       pure function np_kron2_real(a, b) result(r)
+         !! np.kron of two matrices (generic: np_kron2_int, np_kron2_real, np_kron2_complex)
          ! np.kron of two matrices.
          real(kind=dp), intent(in) :: a(:,:), b(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -6256,6 +6804,7 @@ contains
       end function np_kron2_real
 
       pure function np_cross3_real(a, b) result(c)
+         !! np.cross of two 3-vectors (generic: np_cross3_int, np_cross3_real, np_cross3_complex)
          ! np.cross of two 3-vectors.
          real(kind=dp), intent(in) :: a(:), b(:)
          real(kind=dp) :: c(3)
@@ -6263,6 +6812,7 @@ contains
       end function np_cross3_real
 
       pure function np_kron2_complex(a, b) result(r)
+         !! np.kron of two matrices (generic: np_kron2_int, np_kron2_real, np_kron2_complex)
          ! np.kron of two matrices.
          complex(kind=dp), intent(in) :: a(:,:), b(:,:)
          complex(kind=dp), allocatable :: r(:,:)
@@ -6279,6 +6829,7 @@ contains
       end function np_kron2_complex
 
       pure function np_cross3_complex(a, b) result(c)
+         !! np.cross of two 3-vectors (generic: np_cross3_int, np_cross3_real, np_cross3_complex)
          ! np.cross of two 3-vectors.
          complex(kind=dp), intent(in) :: a(:), b(:)
          complex(kind=dp) :: c(3)
@@ -6286,6 +6837,7 @@ contains
       end function np_cross3_complex
 
       function matrix_normm2_real(a) result(value)
+         !! np.linalg.norm(a, -2): the smallest singular value
          ! np.linalg.norm(a, -2): the smallest singular value.
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp) :: value
@@ -6296,6 +6848,7 @@ contains
       end function matrix_normm2_real
 
       function stack_inv(a) result(r)
+         !! numpy's stacked (batched) linear algebra: linalg_inv(A) of each a(b,:,:)
          ! numpy's stacked (batched) linear algebra: linalg_inv(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:), m(:,:)
@@ -6312,6 +6865,7 @@ contains
       end function stack_inv
 
       function stack_cholesky(a) result(r)
+         !! numpy's stacked (batched) linear algebra: linalg_cholesky(A) of each a(b,:,:)
          ! numpy's stacked (batched) linear algebra: linalg_cholesky(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:), m(:,:)
@@ -6328,6 +6882,7 @@ contains
       end function stack_cholesky
 
       function stack_pinv(a) result(r)
+         !! numpy's stacked (batched) linear algebra: linalg_pinv(A) of each a(b,:,:)
          ! numpy's stacked (batched) linear algebra: linalg_pinv(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:), m(:,:)
@@ -6344,6 +6899,7 @@ contains
       end function stack_pinv
 
       function stack_matrix_power(a, p) result(r)
+         !! numpy's stacked (batched) linear algebra: linalg_matrix_power(A, p) of each a(b,:,:)
          ! numpy's stacked (batched) linear algebra: linalg_matrix_power(A, p) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          integer, intent(in) :: p
@@ -6361,6 +6917,7 @@ contains
       end function stack_matrix_power
 
       function stack_det(a) result(r)
+         !! numpy's stacked linear algebra: linalg_det(A) of each a(b,:,:)
          ! numpy's stacked linear algebra: linalg_det(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:)
@@ -6372,6 +6929,7 @@ contains
       end function stack_det
 
       function stack_cond(a) result(r)
+         !! numpy's stacked linear algebra: linalg_cond(A) of each a(b,:,:)
          ! numpy's stacked linear algebra: linalg_cond(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:)
@@ -6383,6 +6941,7 @@ contains
       end function stack_cond
 
       function stack_matrix_rank(a) result(r)
+         !! numpy's stacked linear algebra: linalg_matrix_rank(A) of each a(b,:,:)
          ! numpy's stacked linear algebra: linalg_matrix_rank(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          integer, allocatable :: r(:)
@@ -6394,6 +6953,7 @@ contains
       end function stack_matrix_rank
 
       function stack_norm2(a) result(r)
+         !! numpy's stacked linear algebra: matrix_norm2_real(A) of each a(b,:,:)
          ! numpy's stacked linear algebra: matrix_norm2_real(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:)
@@ -6405,6 +6965,7 @@ contains
       end function stack_norm2
 
       function stack_normm2(a) result(r)
+         !! numpy's stacked linear algebra: matrix_normm2_real(A) of each a(b,:,:)
          ! numpy's stacked linear algebra: matrix_normm2_real(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:)
@@ -6416,6 +6977,7 @@ contains
       end function stack_normm2
 
       function stack_eigvalsh(a) result(r)
+         !! numpy's stacked linear algebra: linalg_eigvalsh(A) of each a(b,:,:)
          ! numpy's stacked linear algebra: linalg_eigvalsh(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:,:), w(:)
@@ -6432,6 +6994,7 @@ contains
       end function stack_eigvalsh
 
       function stack_eigvals(a) result(r)
+         !! numpy's stacked linear algebra: linalg_eigvals_real(A) of each a(b,:,:)
          ! numpy's stacked linear algebra: linalg_eigvals_real(A) of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          complex(kind=dp), allocatable :: r(:,:), w(:)
@@ -6448,6 +7011,7 @@ contains
       end function stack_eigvals
 
       pure function stack_trace(a) result(r)
+         !! np.linalg.trace of a stack: the trace of each a(b,:,:)
          ! np.linalg.trace of a stack: the trace of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:)
@@ -6462,6 +7026,7 @@ contains
       end function stack_trace
 
       pure function stack_diagonal(a) result(r)
+         !! np.linalg.diagonal of a stack: the diagonal of each a(b,:,:)
          ! np.linalg.diagonal of a stack: the diagonal of each a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -6475,6 +7040,7 @@ contains
       end function stack_diagonal
 
       pure function stack_fro(a) result(r)
+         !! The Frobenius norm of each a(b,:,:) (norm(a, axis=(-2, -1)))
          ! The Frobenius norm of each a(b,:,:) (norm(a, axis=(-2, -1))).
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable :: r(:)
@@ -6486,6 +7052,7 @@ contains
       end function stack_fro
 
       function stack_solve_v(a, x) result(r)
+         !! np.linalg.solve(a, x) with a 1-D x: solve each a(b,:,:) y = x
          ! np.linalg.solve(a, x) with a 1-D x: solve each a(b,:,:) y = x.
          real(kind=dp), intent(in) :: a(:,:,:), x(:)
          real(kind=dp), allocatable :: r(:,:)
@@ -6497,6 +7064,7 @@ contains
       end function stack_solve_v
 
       function stack_solve_m(a, x) result(r)
+         !! np.linalg.solve(a, x) with a matrix x, used for every a(b,:,:)
          ! np.linalg.solve(a, x) with a matrix x, used for every a(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:), x(:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -6508,6 +7076,7 @@ contains
       end function stack_solve_m
 
       function stack_solve_s(a, x) result(r)
+         !! np.linalg.solve(a, x) of two stacks: a(b,:,:) y = x(b,:,:)
          ! np.linalg.solve(a, x) of two stacks: a(b,:,:) y = x(b,:,:).
          real(kind=dp), intent(in) :: a(:,:,:), x(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -6519,6 +7088,7 @@ contains
       end function stack_solve_s
 
       pure function stack_matmul_ss(a, x) result(r)
+         !! a @ x of two stacks of matrices
          ! a @ x of two stacks of matrices.
          real(kind=dp), intent(in) :: a(:,:,:), x(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -6530,6 +7100,7 @@ contains
       end function stack_matmul_ss
 
       pure function stack_matmul_sm(a, x) result(r)
+         !! a @ x of a stack and a matrix
          ! a @ x of a stack and a matrix.
          real(kind=dp), intent(in) :: a(:,:,:), x(:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -6541,6 +7112,7 @@ contains
       end function stack_matmul_sm
 
       pure function stack_matmul_ms(a, x) result(r)
+         !! a @ x of a matrix and a stack
          ! a @ x of a matrix and a stack.
          real(kind=dp), intent(in) :: a(:,:), x(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -6552,6 +7124,7 @@ contains
       end function stack_matmul_ms
 
       pure function stack_matmul_sv(a, x) result(r)
+         !! a @ x of a stack and a vector
          ! a @ x of a stack and a vector.
          real(kind=dp), intent(in) :: a(:,:,:), x(:)
          real(kind=dp), allocatable :: r(:,:)
@@ -6563,6 +7136,7 @@ contains
       end function stack_matmul_sv
 
       pure function stack_matmul_vs(a, x) result(r)
+         !! a @ x of a vector and a stack
          ! a @ x of a vector and a stack.
          real(kind=dp), intent(in) :: a(:), x(:,:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -6574,6 +7148,7 @@ contains
       end function stack_matmul_vs
 
       subroutine stack_eigh(a, w, v)
+         !! w, v = np.linalg.eigh(a) of a stack
          ! w, v = np.linalg.eigh(a) of a stack.
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable, intent(out) :: w(:,:), v(:,:,:)
@@ -6588,6 +7163,7 @@ contains
       end subroutine stack_eigh
 
       subroutine stack_eig(a, w, v)
+         !! w, v = np.linalg.eig(a) of a stack
          ! w, v = np.linalg.eig(a) of a stack.
          real(kind=dp), intent(in) :: a(:,:,:)
          complex(kind=dp), allocatable, intent(out) :: w(:,:), v(:,:,:)
@@ -6602,6 +7178,7 @@ contains
       end subroutine stack_eig
 
       subroutine stack_qr(a, q, r)
+         !! q, r = np.linalg.qr(a) (reduced) of a stack
          ! q, r = np.linalg.qr(a) (reduced) of a stack.
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable, intent(out) :: q(:,:,:), r(:,:,:)
@@ -6617,6 +7194,7 @@ contains
       end subroutine stack_qr
 
       subroutine stack_svd(a, u, s, vt)
+         !! u, s, vt = np.linalg.svd(a) of a stack
          ! u, s, vt = np.linalg.svd(a) of a stack.
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable, intent(out) :: u(:,:,:), s(:,:), vt(:,:,:)
@@ -6633,6 +7211,7 @@ contains
       end subroutine stack_svd
 
       subroutine stack_svd_econ(a, u, s, vt)
+         !! u, s, vt = np.linalg.svd(a, full_matrices=False) of a stack
          ! u, s, vt = np.linalg.svd(a, full_matrices=False) of a stack.
          real(kind=dp), intent(in) :: a(:,:,:)
          real(kind=dp), allocatable, intent(out) :: u(:,:,:), s(:,:), vt(:,:,:)
@@ -6649,6 +7228,8 @@ contains
       end subroutine stack_svd_econ
 
       logical function rng_take_values(rank, n0, n1, x)
+         !! Under RNG replay, read the next recorded 'values' call (numpy's own results) into x and
+         !! return .true.; otherwise .false
          ! Under RNG replay, read the next recorded "values" call (numpy's
          ! own results) into x and return .true.; otherwise .false.
          integer, intent(in) :: rank, n0, n1
@@ -6659,12 +7240,14 @@ contains
       end function rng_take_values
 
       function rng_unit_uniform() result(u)
+         !! One uniform draw in [0, 1) from Fortran's generator.
          ! One uniform draw in [0, 1) from Fortran's generator.
          real(kind=dp) :: u
          call random_number(u)
       end function rng_unit_uniform
 
       function rng_std_normal1() result(z)
+         !! one standard normal draw from Fortran's generator
          real(kind=dp) :: z
          real(kind=dp) :: v(1)
          call random_normal_vec(v)
@@ -6672,6 +7255,7 @@ contains
       end function rng_std_normal1
 
       recursive function rng_std_gamma1(k) result(g)
+         !! Marsaglia-Tsang; k < 1 by boosting
          ! Marsaglia-Tsang; k < 1 by boosting.
          real(kind=dp), intent(in) :: k
          real(kind=dp) :: g, d, c, z, v, u
@@ -6697,6 +7281,7 @@ contains
       end function rng_std_gamma1
 
       function rng_integers_v(lo, hi, rank, n0, n1) result(x)
+         !! integers in [lo, hi): numpy's rng.integers / np.random.randint.
          ! integers in [lo, hi): numpy's rng.integers / np.random.randint.
          integer, intent(in) :: lo, hi, rank, n0, n1
          integer, allocatable :: x(:)
@@ -6720,6 +7305,7 @@ contains
       end function rng_integers_v
 
       function rng_choice_idx(npop, rank, n0, n1, replace) result(idx)
+         !! 0-based indices of rng.choice(npop, size, replace)
          ! 0-based indices of rng.choice(npop, size, replace).
          integer, intent(in) :: npop, rank, n0, n1
          logical, intent(in) :: replace
@@ -6753,6 +7339,7 @@ contains
       end function rng_choice_idx
 
       function rng_choice_idx_p(pr, rank, n0, n1, replace) result(idx)
+         !! 0-based indices of rng.choice(len(p), size, replace, p=pr)
          ! 0-based indices of rng.choice(len(p), size, replace, p=pr).
          real(kind=dp), intent(in) :: pr(:)
          integer, intent(in) :: rank, n0, n1
@@ -6787,6 +7374,7 @@ contains
       end function rng_choice_idx_p
 
       function rng_permutation_idx(n) result(idx)
+         !! a random permutation of 0 to n-1 (rng.permutation / shuffle order)
          ! A random permutation of 0 .. n-1 (rng.permutation / shuffle order).
          integer, intent(in) :: n
          integer, allocatable :: idx(:)
@@ -6809,6 +7397,7 @@ contains
       end function rng_permutation_idx
 
       function rng_mvnormal(mean, cov, n) result(x)
+         !! rng.multivariate_normal(mean, cov, size=n): row i is mean + L z
          ! rng.multivariate_normal(mean, cov, size=n): row i is mean + L z.
          real(kind=dp), intent(in) :: mean(:), cov(:,:)
          integer, intent(in) :: n
@@ -6828,6 +7417,7 @@ contains
       end function rng_mvnormal
 
       function rng_exponential_v(scale, rank, n0, n1) result(x)
+         !! numpy's exponential draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's exponential draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: scale
          integer, intent(in) :: rank, n0, n1
@@ -6860,6 +7450,7 @@ contains
       end function rng_exponential_v
 
       function rng_lognormal_v(mean, sigma, rank, n0, n1) result(x)
+         !! numpy's lognormal draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's lognormal draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: mean, sigma
          integer, intent(in) :: rank, n0, n1
@@ -6892,6 +7483,7 @@ contains
       end function rng_lognormal_v
 
       function rng_gamma_v(shape, scale, rank, n0, n1) result(x)
+         !! numpy's gamma draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's gamma draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: shape, scale
          integer, intent(in) :: rank, n0, n1
@@ -6924,6 +7516,7 @@ contains
       end function rng_gamma_v
 
       function rng_beta_v(a, b, rank, n0, n1) result(x)
+         !! numpy's beta draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's beta draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: a, b
          integer, intent(in) :: rank, n0, n1
@@ -6956,6 +7549,7 @@ contains
       end function rng_beta_v
 
       function rng_chisquare_v(df, rank, n0, n1) result(x)
+         !! numpy's chisquare draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's chisquare draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: df
          integer, intent(in) :: rank, n0, n1
@@ -6988,6 +7582,7 @@ contains
       end function rng_chisquare_v
 
       function rng_laplace_v(loc, scale, rank, n0, n1) result(x)
+         !! numpy's laplace draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's laplace draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: loc, scale
          integer, intent(in) :: rank, n0, n1
@@ -7020,6 +7615,7 @@ contains
       end function rng_laplace_v
 
       function rng_logistic_v(loc, scale, rank, n0, n1) result(x)
+         !! numpy's logistic draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's logistic draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: loc, scale
          integer, intent(in) :: rank, n0, n1
@@ -7052,6 +7648,7 @@ contains
       end function rng_logistic_v
 
       function rng_standard_t_v(df, rank, n0, n1) result(x)
+         !! numpy's standard_t draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's standard_t draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: df
          integer, intent(in) :: rank, n0, n1
@@ -7084,6 +7681,7 @@ contains
       end function rng_standard_t_v
 
       function rng_triangular_v(left, mode, right, rank, n0, n1) result(x)
+         !! numpy's triangular draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's triangular draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: left, mode, right
          integer, intent(in) :: rank, n0, n1
@@ -7116,6 +7714,7 @@ contains
       end function rng_triangular_v
 
       function rng_weibull_v(a, rank, n0, n1) result(x)
+         !! numpy's weibull draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's weibull draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: a
          integer, intent(in) :: rank, n0, n1
@@ -7148,6 +7747,7 @@ contains
       end function rng_weibull_v
 
       function rng_pareto_v(a, rank, n0, n1) result(x)
+         !! numpy's pareto draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's pareto draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: a
          integer, intent(in) :: rank, n0, n1
@@ -7180,6 +7780,7 @@ contains
       end function rng_pareto_v
 
       function rng_rayleigh_v(scale, rank, n0, n1) result(x)
+         !! numpy's rayleigh draws (rank 0/1/2 of n0 x n1, flattened column-major)
          ! numpy's rayleigh draws (rank 0/1/2 of n0 x n1, flattened column-major).
          real(kind=dp), intent(in) :: scale
          integer, intent(in) :: rank, n0, n1
@@ -7212,6 +7813,8 @@ contains
       end function rng_rayleigh_v
 
       function rng_poisson_v(lam, rank, n0, n1) result(x)
+         !! numpy's poisson draws: Knuth for small lam, otherwise a normal approximation-free
+         !! inversion by summing exponential gaps
          ! numpy's poisson draws: Knuth for small lam, otherwise a normal
          ! approximation-free inversion by summing exponential gaps.
          real(kind=dp), intent(in) :: lam
@@ -7240,6 +7843,7 @@ contains
       end function rng_poisson_v
 
       function rng_binomial_v(nt, pp, rank, n0, n1) result(x)
+         !! numpy's binomial draws (sum of nt Bernoulli trials)
          ! numpy's binomial draws (sum of nt Bernoulli trials).
          integer, intent(in) :: nt
          real(kind=dp), intent(in) :: pp
@@ -7260,6 +7864,7 @@ contains
       end function rng_binomial_v
 
       function rng_geometric_v(pp, rank, n0, n1) result(x)
+         !! numpy's geometric draws (trials to the first success, >= 1)
          ! numpy's geometric draws (trials to the first success, >= 1).
          real(kind=dp), intent(in) :: pp
          integer, intent(in) :: rank, n0, n1
@@ -7284,6 +7889,8 @@ contains
       end function rng_geometric_v
 
       function rng_f_v(dfnum, dfden, rank, n0, n1) result(x)
+         !! numpy's F draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under
+         !! --rng-replay
          ! numpy's F draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: dfnum, dfden
@@ -7298,6 +7905,8 @@ contains
       end function rng_f_v
 
       function rng_gumbel_v(loc, scale, rank, n0, n1) result(x)
+         !! numpy's Gumbel draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under
+         !! --rng-replay
          ! numpy's Gumbel draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: loc, scale
@@ -7312,6 +7921,8 @@ contains
       end function rng_gumbel_v
 
       function rng_wald_v(mean, scale, rank, n0, n1) result(x)
+         !! numpy's Wald (inverse Gaussian) draws (rank 0/1/2 of n0 x n1, flattened column-major);
+         !! numpy's own under --rng-replay
          ! numpy's Wald (inverse Gaussian) draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: mean, scale
@@ -7326,6 +7937,8 @@ contains
       end function rng_wald_v
 
       function rng_vonmises_v(mu, kappa, rank, n0, n1) result(x)
+         !! numpy's von Mises draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own
+         !! under --rng-replay
          ! numpy's von Mises draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: mu, kappa
@@ -7340,6 +7953,8 @@ contains
       end function rng_vonmises_v
 
       function rng_power_v(a, rank, n0, n1) result(x)
+         !! numpy's power draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under
+         !! --rng-replay
          ! numpy's power draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: a
@@ -7354,6 +7969,8 @@ contains
       end function rng_power_v
 
       function rng_standard_cauchy_v(rank, n0, n1) result(x)
+         !! numpy's standard Cauchy draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's
+         !! own under --rng-replay
          ! numpy's standard Cauchy draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          integer, intent(in) :: rank, n0, n1
@@ -7367,6 +7984,8 @@ contains
       end function rng_standard_cauchy_v
 
       function rng_noncentral_chisquare_v(df, nonc, rank, n0, n1) result(x)
+         !! numpy's noncentral chi-square draws (rank 0/1/2 of n0 x n1, flattened column-major);
+         !! numpy's own under --rng-replay
          ! numpy's noncentral chi-square draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: df, nonc
@@ -7381,6 +8000,8 @@ contains
       end function rng_noncentral_chisquare_v
 
       function rng_noncentral_f_v(dfnum, dfden, nonc, rank, n0, n1) result(x)
+         !! numpy's noncentral F draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own
+         !! under --rng-replay
          ! numpy's noncentral F draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: dfnum, dfden, nonc
@@ -7395,6 +8016,8 @@ contains
       end function rng_noncentral_f_v
 
       function rng_negative_binomial_v(nn, pp, rank, n0, n1) result(x)
+         !! numpy's negative binomial draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's
+         !! own under --rng-replay
          ! numpy's negative binomial draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: nn, pp
@@ -7413,6 +8036,8 @@ contains
       end function rng_negative_binomial_v
 
       function rng_zipf_v(a, rank, n0, n1) result(x)
+         !! numpy's Zipf draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's own under
+         !! --rng-replay
          ! numpy's Zipf draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: a
@@ -7431,6 +8056,8 @@ contains
       end function rng_zipf_v
 
       function rng_logseries_v(pp, rank, n0, n1) result(x)
+         !! numpy's logarithmic series draws (rank 0/1/2 of n0 x n1, flattened column-major);
+         !! numpy's own under --rng-replay
          ! numpy's logarithmic series draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: pp
@@ -7449,6 +8076,8 @@ contains
       end function rng_logseries_v
 
       function rng_hypergeometric_v(ngood, nbad, nsample, rank, n0, n1) result(x)
+         !! numpy's hypergeometric draws (rank 0/1/2 of n0 x n1, flattened column-major); numpy's
+         !! own under --rng-replay
          ! numpy's hypergeometric draws (rank 0/1/2 of n0 x n1, flattened
          ! column-major); numpy's own under --rng-replay.
          integer, intent(in) :: ngood, nbad, nsample
@@ -7468,6 +8097,7 @@ contains
       end function rng_hypergeometric_v
 
       function rng_dirichlet(alpha, n) result(x)
+         !! rng.dirichlet(alpha, size=n): n rows; numpy's own under --rng-replay
          ! rng.dirichlet(alpha, size=n): n rows; numpy's own under --rng-replay.
          real(kind=dp), intent(in) :: alpha(:)
          integer, intent(in) :: n
@@ -7484,6 +8114,7 @@ contains
       end function rng_dirichlet
 
       function rng_multinomial(nt, pv, n) result(x)
+         !! rng.multinomial(nt, pvals, size=n): n rows of counts; numpy's own under --rng-replay
          ! rng.multinomial(nt, pvals, size=n): n rows of counts; numpy's own
          ! under --rng-replay.
          integer, intent(in) :: nt
@@ -7503,6 +8134,8 @@ contains
       end function rng_multinomial
 
       pure function rng_pick_real(a, idx) result(r)
+         !! a[idx] of a vector expression (rng.choice of an array) (generic: rng_pick_real,
+         !! rng_pick_int, rng_pick_log, rng_pick_complex)
          ! a[idx] of a vector expression (rng.choice of an array).
          real(kind=dp), intent(in) :: a(:)
          integer, intent(in) :: idx(:)
@@ -7511,6 +8144,8 @@ contains
       end function rng_pick_real
 
       pure function rng_pick_int(a, idx) result(r)
+         !! a[idx] of a vector expression (rng.choice of an array) (generic: rng_pick_real,
+         !! rng_pick_int, rng_pick_log, rng_pick_complex)
          ! a[idx] of a vector expression (rng.choice of an array).
          integer, intent(in) :: a(:)
          integer, intent(in) :: idx(:)
@@ -7519,6 +8154,8 @@ contains
       end function rng_pick_int
 
       pure function rng_pick_log(a, idx) result(r)
+         !! a[idx] of a vector expression (rng.choice of an array) (generic: rng_pick_real,
+         !! rng_pick_int, rng_pick_log, rng_pick_complex)
          ! a[idx] of a vector expression (rng.choice of an array).
          logical, intent(in) :: a(:)
          integer, intent(in) :: idx(:)
@@ -7527,6 +8164,8 @@ contains
       end function rng_pick_log
 
       pure function rng_pick_complex(a, idx) result(r)
+         !! a[idx] of a vector expression (rng.choice of an array) (generic: rng_pick_real,
+         !! rng_pick_int, rng_pick_log, rng_pick_complex)
          ! a[idx] of a vector expression (rng.choice of an array).
          complex(kind=dp), intent(in) :: a(:)
          integer, intent(in) :: idx(:)
@@ -7535,6 +8174,9 @@ contains
       end function rng_pick_complex
 
       pure function diag_k_vec_real(v, k) result(a)
+         !! np.diag(v, k) of a vector: a square matrix with v on diagonal k (generic:
+         !! diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int, diag_k_vec_complex,
+         !! diag_k_mat_complex)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.
          real(kind=dp), intent(in) :: v(:)
          integer, intent(in) :: k
@@ -7552,6 +8194,9 @@ contains
       end function diag_k_vec_real
 
       pure function diag_k_mat_real(a, k) result(v)
+         !! np.diag(v, k) of a vector: a square matrix with v on diagonal k (generic:
+         !! diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int, diag_k_vec_complex,
+         !! diag_k_mat_complex)
          ! np.diag(a, k) of a matrix: its diagonal k (above the main for k > 0).
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in) :: k
@@ -7573,6 +8218,7 @@ contains
       end function diag_k_mat_real
 
       pure function triu_real(a, k) result(b)
+         !! np.triu(a, k): zero below diagonal k (generic: triu_real, triu_int, triu_complex)
          ! np.triu(a, k): zero below diagonal k.
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in), optional :: k
@@ -7589,6 +8235,7 @@ contains
       end function triu_real
 
       pure function triu_complex(a, k) result(b)
+         !! np.triu(a, k): zero below diagonal k (generic: triu_real, triu_int, triu_complex)
          ! np.triu(a, k): zero below diagonal k.
          complex(kind=dp), intent(in) :: a(:,:)
          integer, intent(in), optional :: k
@@ -7605,6 +8252,7 @@ contains
       end function triu_complex
 
       pure function tril_real(a, k) result(b)
+         !! np.tril(a, k): zero above diagonal k (generic: tril_real, tril_int, tril_complex)
          ! np.tril(a, k): zero above diagonal k.
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in), optional :: k
@@ -7621,6 +8269,7 @@ contains
       end function tril_real
 
       pure function tril_complex(a, k) result(b)
+         !! np.tril(a, k): zero above diagonal k (generic: tril_real, tril_int, tril_complex)
          ! np.tril(a, k): zero above diagonal k.
          complex(kind=dp), intent(in) :: a(:,:)
          integer, intent(in), optional :: k
@@ -7637,6 +8286,9 @@ contains
       end function tril_complex
 
       pure function diag_k_vec_int(v, k) result(a)
+         !! np.diag(v, k) of a vector: a square matrix with v on diagonal k (generic:
+         !! diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int, diag_k_vec_complex,
+         !! diag_k_mat_complex)
          ! np.diag(v, k) of a vector: a square matrix with v on diagonal k.
          integer, intent(in) :: v(:)
          integer, intent(in) :: k
@@ -7654,6 +8306,9 @@ contains
       end function diag_k_vec_int
 
       pure function diag_k_mat_int(a, k) result(v)
+         !! np.diag(v, k) of a vector: a square matrix with v on diagonal k (generic:
+         !! diag_k_vec_real, diag_k_vec_int, diag_k_mat_real, diag_k_mat_int, diag_k_vec_complex,
+         !! diag_k_mat_complex)
          ! np.diag(a, k) of a matrix: its diagonal k (above the main for k > 0).
          integer, intent(in) :: a(:,:)
          integer, intent(in) :: k
@@ -7675,6 +8330,7 @@ contains
       end function diag_k_mat_int
 
       pure function triu_int(a, k) result(b)
+         !! np.triu(a, k): zero below diagonal k (generic: triu_real, triu_int, triu_complex)
          ! np.triu(a, k): zero below diagonal k.
          integer, intent(in) :: a(:,:)
          integer, intent(in), optional :: k
@@ -7691,6 +8347,7 @@ contains
       end function triu_int
 
       pure function tril_int(a, k) result(b)
+         !! np.tril(a, k): zero above diagonal k (generic: tril_real, tril_int, tril_complex)
          ! np.tril(a, k): zero above diagonal k.
          integer, intent(in) :: a(:,:)
          integer, intent(in), optional :: k
@@ -7707,6 +8364,7 @@ contains
       end function tril_int
 
       pure function quantile_axis_3d(x, q, dim) result(out)
+         !! np.quantile(x, q, axis) of a rank-3 array
          ! np.quantile(x, q, axis=dim-1) of a rank-3 array (np.median with
          ! q = 0.5): one quantile per position along the other two axes.
          real(kind=dp), intent(in) :: x(:,:,:)
@@ -7740,6 +8398,8 @@ contains
       end function quantile_axis_3d
 
       pure function quantile_axis_2d(x, q, dim) result(out)
+         !! np.quantile(x, q, axis) of a matrix: linear quantile of each column (dim=1) or row
+         !! (dim=2)
          ! np.quantile(x, q, axis=dim-1) of a matrix (np.median with q = 0.5).
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), intent(in) :: q
@@ -7760,6 +8420,7 @@ contains
       end function quantile_axis_2d
 
       pure function quantile_axis_2d_q(x, q, dim) result(out)
+         !! np.quantile(x, q, axis=dim-1) of a matrix at several probabilities: row k for q(k)
          ! np.quantile(x, q, axis=dim-1) of a matrix for a vector q: numpy's
          ! shape (size(q), the other extent), row k for q(k).
          real(kind=dp), intent(in) :: x(:,:), q(:)
@@ -7773,6 +8434,7 @@ contains
       end function quantile_axis_2d_q
 
       pure function sorted_real_vec(x) result(y)
+         !! np.sort of a real vector: a sorted copy
          ! np.sort(x) of a vector: a sorted copy.
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
@@ -7781,6 +8443,7 @@ contains
       end function sorted_real_vec
 
       pure function sorted_real_2d(x, dim) result(y)
+         !! np.sort of a real matrix along dimension dim (1 = down columns)
          ! np.sort(x, axis) of a matrix: each column (dim = 1) or row
          ! (dim = 2) sorted.
          real(kind=dp), intent(in) :: x(:,:)
@@ -7805,6 +8468,7 @@ contains
       end function sorted_real_2d
 
       pure function argsort_real_2d(x, dim) result(idx)
+         !! np.argsort (0-based) of a real matrix along dimension dim
          ! np.argsort(x, axis) of a matrix: 0-based positions within each
          ! column (dim = 1) or row (dim = 2).
          real(kind=dp), intent(in) :: x(:,:)
@@ -7824,6 +8488,7 @@ contains
       end function argsort_real_2d
 
       pure function sorted_int_vec(x) result(y)
+         !! np.sort of an integer vector: a sorted copy
          ! np.sort(x) of a vector: a sorted copy.
          integer, intent(in) :: x(:)
          integer, allocatable :: y(:)
@@ -7832,6 +8497,7 @@ contains
       end function sorted_int_vec
 
       pure function sorted_int_2d(x, dim) result(y)
+         !! np.sort of an integer matrix along dimension dim (1 = down columns)
          ! np.sort(x, axis) of a matrix: each column (dim = 1) or row
          ! (dim = 2) sorted.
          integer, intent(in) :: x(:,:)
@@ -7856,6 +8522,7 @@ contains
       end function sorted_int_2d
 
       pure function argsort_int_2d(x, dim) result(idx)
+         !! np.argsort (0-based) of an integer matrix along dimension dim
          ! np.argsort(x, axis) of a matrix: 0-based positions within each
          ! column (dim = 1) or row (dim = 2).
          integer, intent(in) :: x(:,:)
@@ -7875,6 +8542,7 @@ contains
       end function argsort_int_2d
 
       pure function arange_int(start, stop, step) result(x)
+         !! integer arange(start, stop, step)
          integer, intent(in) :: start, stop, step
          integer, allocatable :: x(:)
          integer :: n, i, s
@@ -7900,6 +8568,7 @@ contains
       end function arange_int
 
       pure function np_insert_real_1d(a, idx, val) result(out)
+         !! numpy insert for rank-1 real array and scalar value
          real(kind=dp), intent(in) :: a(:)
          integer, intent(in) :: idx
          real(kind=dp), intent(in) :: val
@@ -7917,6 +8586,7 @@ contains
       end function np_insert_real_1d
 
       pure function np_delete_real_1d(a, idx) result(out)
+         !! numpy delete for rank-1 real array and scalar index
          real(kind=dp), intent(in) :: a(:)
          integer, intent(in) :: idx
          real(kind=dp), allocatable :: out(:)
@@ -7936,6 +8606,7 @@ contains
       end function np_delete_real_1d
 
       pure function linspace(start, stop, num) result(x)
+         !! linspace(start, stop, num)
          real(kind=dp), intent(in) :: start, stop
          integer, intent(in) :: num
          real(kind=dp), allocatable :: x(:)
@@ -7953,6 +8624,7 @@ contains
       end function linspace
 
       function logspace(start, stop, num, endpoint, base) result(x)
+         !! logspace(start, stop, num=50, endpoint=True, base=10)
          real(kind=dp), intent(in) :: start, stop
          integer, intent(in), optional :: num
          logical, intent(in), optional :: endpoint
@@ -7988,6 +8660,7 @@ contains
       end function logspace
 
       function geomspace(start, stop, num, endpoint) result(x)
+         !! geomspace(start, stop, num=50, endpoint=True)
          real(kind=dp), intent(in) :: start, stop
          integer, intent(in), optional :: num
          logical, intent(in), optional :: endpoint
@@ -8026,6 +8699,7 @@ contains
       end function geomspace
 
       pure function bincount_int(x, minlength) result(c)
+         !! count occurrences of nonnegative integers
          integer, intent(in) :: x(:)
          integer, intent(in), optional :: minlength
          integer, allocatable :: c(:)
@@ -8050,6 +8724,7 @@ contains
       end function bincount_int
 
       pure function searchsorted_left_int(a, v) result(idx)
+         !! searchsorted left indices for integer vectors
          integer, intent(in) :: a(:), v(:)
          integer, allocatable :: idx(:)
          integer :: i, lo, hi, mid, n
@@ -8071,6 +8746,7 @@ contains
       end function searchsorted_left_int
 
       pure function searchsorted_right_int(a, v) result(idx)
+         !! searchsorted right indices for integer vectors
          integer, intent(in) :: a(:), v(:)
          integer, allocatable :: idx(:)
          integer :: i, lo, hi, mid, n
@@ -8092,6 +8768,7 @@ contains
       end function searchsorted_right_int
 
       pure function searchsorted_left_int_scalar(a, v) result(idx)
+         !! searchsorted left index for scalar integer query
          integer, intent(in) :: a(:), v
          integer :: idx
          integer :: lo, hi, mid, n
@@ -8110,6 +8787,7 @@ contains
       end function searchsorted_left_int_scalar
 
       pure function searchsorted_right_int_scalar(a, v) result(idx)
+         !! searchsorted right index for scalar integer query
          integer, intent(in) :: a(:), v
          integer :: idx
          integer :: lo, hi, mid, n
@@ -8128,6 +8806,7 @@ contains
       end function searchsorted_right_int_scalar
 
       pure function setdiff1d_int(a, b) result(c)
+         !! sorted unique values in a not in b
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:)
          integer, allocatable :: ua(:), ub(:), tmp(:)
@@ -8150,6 +8829,7 @@ contains
       end function setdiff1d_int
 
       function intersect1d_int(a, b) result(c)
+         !! sorted unique intersection of a and b
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:)
          integer, allocatable :: ua(:), ub(:), tmp(:)
@@ -8172,6 +8852,7 @@ contains
       end function intersect1d_int
 
       function setdiff1d_char(a, b) result(c)
+         !! unique values in a not in b (character)
          character(len=*), intent(in) :: a(:), b(:)
          character(len=:), allocatable :: c(:)
          character(len=:), allocatable :: ua(:), ub(:), tmp(:)
@@ -8196,6 +8877,7 @@ contains
       end function setdiff1d_char
 
       function intersect1d_char(a, b) result(c)
+         !! unique intersection of a and b (character)
          character(len=*), intent(in) :: a(:), b(:)
          character(len=:), allocatable :: c(:)
          character(len=:), allocatable :: ua(:), ub(:), tmp(:)
@@ -8220,6 +8902,7 @@ contains
       end function intersect1d_char
 
       subroutine unique_int_inv_counts(a, u, inv, cnt)
+         !! unique values with inverse and counts
          integer, intent(in) :: a(:)
          integer, allocatable, intent(out) :: u(:), inv(:), cnt(:)
          integer :: i, j, n
@@ -8239,6 +8922,7 @@ contains
       end subroutine unique_int_inv_counts
 
       pure function lexsort2_int(key0, key1) result(idx)
+         !! lexsort((key0,key1)): sort by key1 then key0, return 0-based indices
          integer, intent(in) :: key0(:), key1(:)
          integer, allocatable :: idx(:)
          integer :: i, j, n, t
@@ -8262,6 +8946,7 @@ contains
       end function lexsort2_int
 
       pure function lexsort2_real(key0, key1) result(idx)
+         !! lexsort((key0,key1)) for real keys: sort by key1 then key0, return 0-based indices
          real(kind=dp), intent(in) :: key0(:), key1(:)
          integer, allocatable :: idx(:)
          integer :: i, j, n, tmp
@@ -8285,6 +8970,8 @@ contains
       end function lexsort2_real
 
       pure function ravel_multi_index_2d(rc, shape, forder) result(i)
+         !! np.ravel_multi_index(tuple(rc), shape): the flat index (C order, or Fortran order with
+         !! forder) of a 0-based multi-index
          ! np.ravel_multi_index(tuple(rc), shape): the flat index (C order, or
          ! Fortran order with forder) of the 0-based multi-index rc.
          integer, intent(in) :: rc(:), shape(:)
@@ -8310,6 +8997,7 @@ contains
       end function ravel_multi_index_2d
 
       pure function ravel_multi_index_vec(rc, shape, forder) result(i)
+         !! np.ravel_multi_index of index arrays, rc(k, :) the k-th coordinates
          ! np.ravel_multi_index of index arrays: rc(k, :) holds the k-th
          ! coordinate of each multi-index.
          integer, intent(in) :: rc(:,:), shape(:)
@@ -8322,6 +9010,8 @@ contains
       end function ravel_multi_index_vec
 
       pure function unravel_index_2d(i, shape, forder) result(rc)
+         !! np.unravel_index(i, shape): the 0-based multi-index of a flat index (C order, or Fortran
+         !! order with forder)
          ! np.unravel_index(i, shape): the 0-based multi-index of flat index i
          ! (C order, or Fortran order with forder).
          integer, intent(in) :: i
@@ -8349,6 +9039,7 @@ contains
       end function unravel_index_2d
 
       pure function unravel_index_vec(i, shape, forder) result(rc)
+         !! np.unravel_index of a vector of flat indices: row k the k-th coordinate array
          ! np.unravel_index of a vector of flat indices: rc(k, :) is the
          ! k-th coordinate array.
          integer, intent(in) :: i(:), shape(:)
@@ -8361,6 +9052,7 @@ contains
       end function unravel_index_vec
 
       pure function unravel_index_part(i, shape, k, forder) result(v)
+         !! np.unravel_index(i, shape)[k-1]: the k-th coordinate array of a vector of flat indices
          ! np.unravel_index(i, shape)[k-1] of a vector of flat indices.
          integer, intent(in) :: i(:), shape(:), k
          logical, intent(in), optional :: forder
@@ -8374,6 +9066,7 @@ contains
       end function unravel_index_part
 
       pure function kron_2d(a, b) result(k)
+         !! 2D Kronecker product for integer matrices
          integer, intent(in) :: a(:,:), b(:,:)
          integer, allocatable :: k(:,:)
          integer :: i, j, p, q, ra, ca, rb, cb
@@ -8392,6 +9085,7 @@ contains
       end function kron_2d
 
       pure subroutine histogram_real_edges(x, bins, h, edges)
+         !! 1D histogram with explicit real bin edges
          real(kind=dp), intent(in) :: x(:), bins(:)
          integer, allocatable, intent(out) :: h(:)
          real(kind=dp), allocatable, intent(out) :: edges(:)
@@ -8419,6 +9113,7 @@ contains
       end subroutine histogram_real_edges
 
       pure function histogram_counts(x, nbins) result(h)
+         !! np.histogram(x, bins=n)[0]: counts in n equal bins spanning min(x)..max(x)
          ! np.histogram(x, bins=nbins)[0]: nbins equal bins from min(x) to
          ! max(x) (widened by 0.5 each side when they are equal, as numpy does).
          real(kind=dp), intent(in) :: x(:)
@@ -8445,6 +9140,7 @@ contains
       end function histogram_counts
 
       pure function histogram_counts_edges(x, edges) result(h)
+         !! np.histogram(x, bins=edges)[0]
          ! np.histogram(x, bins=edges)[0].
          real(kind=dp), intent(in) :: x(:), edges(:)
          integer, allocatable :: h(:)
@@ -8453,6 +9149,7 @@ contains
       end function histogram_counts_edges
 
       pure subroutine histogram_int_edges(x, bins, h, edges)
+         !! 1D histogram with explicit integer bin edges
          integer, intent(in) :: x(:), bins(:)
          integer, allocatable, intent(out) :: h(:), edges(:)
          integer :: i, j, nb
@@ -8479,6 +9176,9 @@ contains
       end subroutine histogram_int_edges
 
       pure function np_hist_edges(x, n, lo_in, hi_in) result(edges)
+         !! n equal bins over [min(x), max(x)] (or [lo_in, hi_in]), widened by 0.5 each side when
+         !! the ends are equal, with np.linspace's arithmetic (start + i * step, the last edge
+         !! exactly ...
          ! n equal bins over [min(x), max(x)] (or [lo_in, hi_in]), widened by
          ! 0.5 each side when the ends are equal, with np.linspace's
          ! arithmetic (start + i * step, the last edge exactly the end).
@@ -8512,6 +9212,7 @@ contains
       end function np_hist_edges
 
       pure subroutine histogram_np(x, bins, h, edges, weights, density)
+         !! np.histogram with bin edges, weights= and density=: float counts
          ! numpy.histogram(x, bins=edges, weights=, density=): float counts
          ! (or sums of weights) per bin, the last bin including its right
          ! edge; density divides by the bin widths and the total.
@@ -8547,6 +9248,8 @@ contains
       end subroutine histogram_np
 
       pure integer function np_hist_bin_count(x, method, integer_data, lo_in, hi_in) result(n)
+         !! number of histogram bins chosen by numpy's estimators auto, fd, doane, scott, rice,
+         !! sturges, sqrt
          ! The number of equal bins numpy's histogram estimator method
          ! ('auto', 'fd', 'doane', 'scott', 'rice', 'sturges', 'sqrt') picks
          ! for x (only the values in [lo_in, hi_in] if given); integer_data:
@@ -8638,6 +9341,9 @@ contains
       end function np_hist_bin_count
 
       pure subroutine histogram2d_np(x, y, xbins, ybins, h, weights, density)
+         !! numpy.histogram2d(x, y, bins=[xbins, ybins], weights=, density=): float counts (or sums
+         !! of weights); per axis the last bin includes its right edge; density divides by the bin
+         !! ...
          ! numpy.histogram2d(x, y, bins=[xbins, ybins], weights=, density=):
          ! float counts (or sums of weights); per axis the last bin includes
          ! its right edge; density divides by the bin areas and the total.
@@ -8700,6 +9406,7 @@ contains
       end subroutine histogram2d_np
 
       pure subroutine histogram2d_real_edges(x, y, xbins, ybins, h)
+         !! 2D histogram with explicit real bin edges on both axes
          ! 2D histogram with explicit real bin edges on both axes,
          ! matching numpy.histogram2d(x, y, bins=[xbins, ybins]): same
          ! per-axis binning rule as histogram_real_edges (last bin is
@@ -8745,6 +9452,7 @@ contains
       end subroutine histogram2d_real_edges
 
       pure function reduceat_add_real(x, idx) result(y)
+         !! np.add.reduceat for real vector
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -8769,6 +9477,7 @@ contains
       end function reduceat_add_real
 
       pure function reduceat_add_int(x, idx) result(y)
+         !! np.add.reduceat for integer vector
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -8793,6 +9502,7 @@ contains
       end function reduceat_add_int
 
       pure function reduceat_mul_real(x, idx) result(y)
+         !! np.multiply.reduceat for real vector
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -8817,6 +9527,7 @@ contains
       end function reduceat_mul_real
 
       pure function reduceat_mul_int(x, idx) result(y)
+         !! np.multiply.reduceat for integer vector
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -8841,6 +9552,7 @@ contains
       end function reduceat_mul_int
 
       pure function reduceat_min_real(x, idx) result(y)
+         !! np.minimum.reduceat for real vector
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -8865,6 +9577,7 @@ contains
       end function reduceat_min_real
 
       pure function reduceat_min_int(x, idx) result(y)
+         !! np.minimum.reduceat for integer vector
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -8889,6 +9602,7 @@ contains
       end function reduceat_min_int
 
       pure function reduceat_max_real(x, idx) result(y)
+         !! np.maximum.reduceat for real vector
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          real(kind=dp), allocatable :: y(:)
@@ -8913,6 +9627,7 @@ contains
       end function reduceat_max_real
 
       pure function reduceat_max_int(x, idx) result(y)
+         !! np.maximum.reduceat for integer vector
          integer, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          integer, allocatable :: y(:)
@@ -8937,6 +9652,7 @@ contains
       end function reduceat_max_int
 
       pure function reduceat_logical_and(x, idx) result(y)
+         !! np.logical_and.reduceat for logical vector
          logical, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          logical, allocatable :: y(:)
@@ -8961,6 +9677,7 @@ contains
       end function reduceat_logical_and
 
       pure function reduceat_logical_or(x, idx) result(y)
+         !! np.logical_or.reduceat for logical vector
          logical, intent(in) :: x(:)
          integer, intent(in) :: idx(:)
          logical, allocatable :: y(:)
@@ -8985,12 +9702,14 @@ contains
       end function reduceat_logical_or
 
       pure real(kind=dp) function mean_1d(x)
+         !! mean of 1D real vector
          real(kind=dp), intent(in) :: x(:)
          ! Compatibility name for previously generated translations.
          mean_1d = mean(x)
       end function mean_1d
 
       pure real(kind=dp) function weighted_mean_1d(x, w)
+         !! weighted mean of 1D real vector
          real(kind=dp), intent(in) :: x(:), w(:)
          integer :: n
          real(kind=dp) :: sw
@@ -9009,6 +9728,7 @@ contains
       end function weighted_mean_1d
 
       pure real(kind=dp) function var_1d(x, ddof)
+         !! variance of 1D real vector with optional ddof (numpy-style)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: ddof
          integer :: n, d
@@ -9028,6 +9748,7 @@ contains
       end function var_1d
 
       pure real(kind=dp) function skew_1d(x)
+         !! pandas-style bias-corrected (adjusted Fisher-Pearson) sample skewness of 1D real vector
          ! pandas Series/DataFrame.skew() -- the adjusted (bias-corrected)
          ! Fisher-Pearson standardized moment coefficient: G1 =
          ! sqrt(n*(n-1))/(n-2) * m3/m2**1.5, where m2/m3 are the 2nd/3rd
@@ -9052,6 +9773,8 @@ contains
       end function skew_1d
 
       pure real(kind=dp) function kurt_1d(x)
+         !! pandas-style bias-corrected (adjusted Fisher-Pearson) excess sample kurtosis of 1D real
+         !! vector
          ! pandas Series/DataFrame.kurt() -- the adjusted (bias-corrected)
          ! excess kurtosis: G2 = ((n-1)/((n-2)*(n-3))) * ((n+1)*g2 + 6),
          ! where g2 = m4/m2**2 - 3 is the population excess kurtosis (m2/m4
@@ -9078,6 +9801,7 @@ contains
       end function kurt_1d
 
       function median_1d_real(x) result(m)
+         !! median of 1D real vector
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp) :: m
          real(kind=dp), allocatable :: xs(:)
@@ -9099,6 +9823,7 @@ contains
       end function median_1d_real
 
       function median_low_int(x) result(m)
+         !! median_low of 1D integer vector
          integer, intent(in) :: x(:)
          integer :: m
          integer, allocatable :: xs(:)
@@ -9120,6 +9845,7 @@ contains
       end function median_low_int
 
       pure function median_high_int(x) result(m)
+         !! median_high of 1D integer vector
          integer, intent(in) :: x(:)
          integer :: m
          integer, allocatable :: xs(:)
@@ -9137,6 +9863,7 @@ contains
       end function median_high_int
 
       pure function mode_int(x) result(m)
+         !! mode of 1D integer vector
          integer, intent(in) :: x(:)
          integer :: m
          integer, allocatable :: u(:), cnt(:)
@@ -9163,6 +9890,7 @@ contains
       end function mode_int
 
       pure function mode_real(x) result(m)
+         !! mode of 1D real vector
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp) :: m
          integer :: i, j, cnt, best_c
@@ -9186,6 +9914,7 @@ contains
       end function mode_real
 
       pure function multimode_int(x) result(mm)
+         !! multimode of 1D integer vector
          integer, intent(in) :: x(:)
          integer, allocatable :: mm(:)
          integer, allocatable :: u(:), cnt(:)
@@ -9205,6 +9934,7 @@ contains
       end function multimode_int
 
       pure function zeros_real(n) result(x)
+         !! allocate and return length-n real array initialized to 0
          integer, intent(in) :: n
          real(kind=dp), allocatable :: x(:)
          if (n < 0) error stop 'zeros_real: n must be >= 0'
@@ -9212,6 +9942,7 @@ contains
       end function zeros_real
 
       pure function ones_real(n) result(x)
+         !! allocate and return length-n real array initialized to 1
          integer, intent(in) :: n
          real(kind=dp), allocatable :: x(:)
          if (n < 0) error stop 'ones_real: n must be >= 0'
@@ -9219,6 +9950,7 @@ contains
       end function ones_real
 
       pure function zeros_complex(n) result(x)
+         !! allocate and return length-n complex array initialized to 0
          integer, intent(in) :: n
          complex(kind=dp), allocatable :: x(:)
          if (n < 0) error stop 'zeros_complex: n must be >= 0'
@@ -9226,6 +9958,7 @@ contains
       end function zeros_complex
 
       pure function ones_complex(n) result(x)
+         !! allocate and return length-n complex array initialized to 1
          integer, intent(in) :: n
          complex(kind=dp), allocatable :: x(:)
          if (n < 0) error stop 'ones_complex: n must be >= 0'
@@ -9233,11 +9966,13 @@ contains
       end function ones_complex
 
       pure elemental logical function complex_isfinite(z) result(ok)
+         !! elemental finiteness test for complex values
          complex(kind=dp), intent(in) :: z
          ok = ieee_is_finite(real(z, kind=dp)) .and. ieee_is_finite(aimag(z))
       end function complex_isfinite
 
       pure elemental logical function complex_isinf(z) result(ok)
+         !! elemental infinity test for complex values
          complex(kind=dp), intent(in) :: z
          logical :: re_inf, im_inf
          re_inf = (.not. ieee_is_finite(real(z, kind=dp))) .and. (.not. ieee_is_nan(real(z, kind=dp)))
@@ -9246,11 +9981,14 @@ contains
       end function complex_isinf
 
       pure elemental logical function complex_isnan(z) result(ok)
+         !! elemental NaN test for complex values
          complex(kind=dp), intent(in) :: z
          ok = ieee_is_nan(real(z, kind=dp)) .or. ieee_is_nan(aimag(z))
       end function complex_isnan
 
       pure elemental real(kind=dp) function real_if_close_complex(z, tol) result(x)
+         !! np.real_if_close: the real part, stopping when an imaginary part is not within tol
+         !! (elemental)
          ! np.real_if_close: the real part when |imag| < tol (tol > 1 counts
          ! machine epsilons, default 100); numpy keeps the complex array
          ! otherwise, which has no real result here, so that stops.
@@ -9267,6 +10005,7 @@ contains
       end function real_if_close_complex
 
       pure function zeros_int(n) result(x)
+         !! allocate and return length-n integer array initialized to 0
          integer, intent(in) :: n
          integer, allocatable :: x(:)
          if (n < 0) error stop 'zeros_int: n must be >= 0'
@@ -9274,6 +10013,7 @@ contains
       end function zeros_int
 
       pure function ones_int(n) result(x)
+         !! allocate and return length-n integer array initialized to 1
          integer, intent(in) :: n
          integer, allocatable :: x(:)
          if (n < 0) error stop 'ones_int: n must be >= 0'
@@ -9281,6 +10021,7 @@ contains
       end function ones_int
 
       pure function zeros_logical(n) result(x)
+         !! allocate and return length-n logical array initialized to .false.
          integer, intent(in) :: n
          logical, allocatable :: x(:)
          if (n < 0) error stop 'zeros_logical: n must be >= 0'
@@ -9288,6 +10029,7 @@ contains
       end function zeros_logical
 
       pure function ones_logical(n) result(x)
+         !! allocate and return length-n logical array initialized to .true.
          integer, intent(in) :: n
          logical, allocatable :: x(:)
          if (n < 0) error stop 'ones_logical: n must be >= 0'
@@ -9295,6 +10037,7 @@ contains
       end function ones_logical
 
       pure elemental function to_lower(s)
+         !! lowercase string
          character(len=*), intent(in) :: s
          character(len=len(s)) :: to_lower
          integer :: i, k
@@ -9309,6 +10052,7 @@ contains
       end function to_lower
 
       pure elemental function to_upper(s)
+         !! uppercase string
          character(len=*), intent(in) :: s
          character(len=len(s)) :: to_upper
          integer :: i, k
@@ -9336,6 +10080,7 @@ contains
       end function char_in_set
 
       pure function str_lstrip(s, chars) result(out)
+         !! strip leading characters
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: chars
          character(len=:), allocatable :: out
@@ -9359,6 +10104,7 @@ contains
       end function str_lstrip
 
       pure function str_rstrip(s, chars) result(out)
+         !! strip trailing characters
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: chars
          character(len=:), allocatable :: out
@@ -9381,6 +10127,7 @@ contains
       end function str_rstrip
 
       pure function str_strip(s, chars) result(out)
+         !! strip leading/trailing characters
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: chars
          character(len=:), allocatable :: out
@@ -9395,6 +10142,7 @@ contains
       end function str_strip
 
       pure elemental logical function starts_with(s, prefix)
+         !! prefix test
          character(len=*), intent(in) :: s, prefix
          integer :: n
          n = len(prefix)
@@ -9408,6 +10156,7 @@ contains
       end function starts_with
 
       pure elemental logical function ends_with(s, suffix)
+         !! suffix test
          character(len=*), intent(in) :: s, suffix
          integer :: n, ls
          n = len(suffix)
@@ -9422,6 +10171,7 @@ contains
       end function ends_with
 
       pure elemental integer function str_find(s, sub)
+         !! 0-based find index or -1
          character(len=*), intent(in) :: s, sub
          integer :: p
          if (len(sub) == 0) then
@@ -9437,6 +10187,7 @@ contains
       end function str_find
 
       pure elemental integer function str_rfind(s, sub)
+         !! 0-based reverse find index or -1
          character(len=*), intent(in) :: s, sub
          integer :: p
          if (len(sub) == 0) then
@@ -9452,6 +10203,7 @@ contains
       end function str_rfind
 
       function str_replace(s, old, new) result(out)
+         !! replace all occurrences
          character(len=*), intent(in) :: s, old, new
          character(len=:), allocatable :: out
          character(len=:), allocatable :: acc
@@ -9478,6 +10230,7 @@ contains
       end function str_replace
 
       pure elemental function str_reverse(s) result(out)
+         !! reverse a string (Python's s[::-1])
          character(len=*), intent(in) :: s
          character(len=len(s)) :: out
          integer :: i, n
@@ -9488,6 +10241,7 @@ contains
       end function str_reverse
 
       pure function str_to_chars(s) result(out)
+         !! split a string into a rank-1 array of its own 1-character substrings
          character(len=*), intent(in) :: s
          character(len=1), allocatable :: out(:)
          integer :: i
@@ -9521,6 +10275,7 @@ contains
       end subroutine py_affix_bounds
 
       pure elemental logical function py_startswith(s, prefix, start, end)
+         !! Python s.startswith(prefix[, start[, end]])
          ! Lengths are compared exactly: Fortran's == pads with blanks.
          character(len=*), intent(in) :: s, prefix
          integer, intent(in), optional :: start, end
@@ -9533,6 +10288,7 @@ contains
       end function py_startswith
 
       pure elemental logical function py_endswith(s, suffix, start, end)
+         !! Python s.endswith(suffix[, start[, end]])
          character(len=*), intent(in) :: s, suffix
          integer, intent(in), optional :: start, end
          integer :: lo, hi
@@ -9544,6 +10300,7 @@ contains
       end function py_endswith
 
       function str_zfill(s, width) result(out)
+         !! left-pad string with zeros to given width
          character(len=*), intent(in) :: s
          integer, intent(in) :: width
          character(len=:), allocatable :: out
@@ -9568,6 +10325,7 @@ contains
       end function str_zfill
 
       pure function str_head(s, n) result(out)
+         !! first n characters of s (Python s[:n] for n >= 0)
          character(len=*), intent(in) :: s
          integer, intent(in) :: n
          character(len=:), allocatable :: out
@@ -9575,6 +10333,7 @@ contains
       end function str_head
 
       pure function py_repr_str(s) result(out)
+         !! Python repr() of a string: quoted, with backslashes and quotes escaped
          ! Python repr() of a str: single quotes unless the text contains a
          ! single quote and no double quote; escape backslashes, the chosen
          ! quote and the common control characters.
@@ -9607,6 +10366,7 @@ contains
       end function py_repr_str
 
       pure function str_ljust(s, width) result(out)
+         !! right-pad string with spaces to given width
          character(len=*), intent(in) :: s
          integer, intent(in) :: width
          character(len=:), allocatable :: out
@@ -9623,6 +10383,7 @@ contains
       end function str_ljust
 
       pure function str_rjust(s, width) result(out)
+         !! left-pad string with spaces to given width
          character(len=*), intent(in) :: s
          integer, intent(in) :: width
          character(len=:), allocatable :: out
@@ -9662,6 +10423,7 @@ contains
       end subroutine append_strvec
 
       pure elemental function str_split(s, sep) result(out)
+         !! split into string vector
          character(len=*), intent(in) :: s
          character(len=*), intent(in), optional :: sep
          type(strvec_t) :: out
@@ -9709,6 +10471,8 @@ contains
       end function str_split
 
       subroutine py_file_write(unit, s)
+         !! write s to a formatted unit as Python's f.write(s) does: each newline ends a record, and
+         !! only text after the last newline stays in an open record
          ! f.write(s): each newline ends a record (so the file gets the
          ! platform's line ending, as in Python's text mode), and only the
          ! text after the last newline is left in an open record. A
@@ -9729,6 +10493,7 @@ contains
       end subroutine py_file_write
 
       function csv_split_line(line, delimiter, quotechar) result(fields)
+         !! split one CSV line into fields (basic quote-aware parser)
          character(len=*), intent(in) :: line
          character(len=*), intent(in), optional :: delimiter, quotechar
          character(len=:), allocatable :: fields(:)
@@ -9807,6 +10572,7 @@ contains
       end function csv_split_line
 
       pure function str_join(sep, items) result(out)
+         !! join string vector with separator
          character(len=*), intent(in) :: sep
          type(strvec_t), intent(in) :: items
          character(len=:), allocatable :: out
@@ -9822,6 +10588,7 @@ contains
       end function str_join
 
       pure elemental integer function str_count(s, sub)
+         !! count non-overlapping occurrences
          character(len=*), intent(in) :: s, sub
          integer :: p, pos, ls
          if (len(sub) == 0) then
@@ -9841,6 +10608,7 @@ contains
       end function str_count
 
       pure elemental logical function str_isdigit(s)
+         !! true when all chars are digits
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -9858,6 +10626,7 @@ contains
       end function str_isdigit
 
       pure elemental logical function str_isalpha(s)
+         !! true when all chars are letters
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -9875,6 +10644,7 @@ contains
       end function str_isalpha
 
       pure elemental logical function str_isalnum(s)
+         !! true when all chars are alnum
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -9894,6 +10664,7 @@ contains
       end function str_isalnum
 
       pure elemental logical function str_isspace(s)
+         !! true when all chars are whitespace
          character(len=*), intent(in) :: s
          integer :: i, k
          if (len(s) <= 0) then
@@ -9911,6 +10682,7 @@ contains
       end function str_isspace
 
       pure function rank_min_real(x) result(r)
+         !! pandas-style Series.rank(method='min') for a plain 1D real vector
          ! pandas Series.rank(method="min"): tied values share the
          ! smallest rank within their tie group -- rank(i) = 1 + (count
          ! of non-NaN elements strictly less than x(i)). NaN entries are
@@ -9937,6 +10709,7 @@ contains
       end function rank_min_real
 
       pure function rank_max_real(x) result(r)
+         !! pandas-style Series.rank(method='max') for a plain 1D real vector
          ! pandas Series.rank(method="max"): tied values share the
          ! largest rank within their tie group -- rank(i) = count of
          ! non-NaN elements <= x(i) (equivalently: 1 + count strictly
@@ -9961,6 +10734,7 @@ contains
       end function rank_max_real
 
       pure function rank_average_real(x) result(r)
+         !! pandas-style Series.rank(method='average') for a plain 1D real vector
          ! pandas Series.rank(method="average", the default): tied
          ! values share the mean of the ranks they'd occupy, which is
          ! just (rank_min(i) + rank_max(i)) / 2 for every tie group. See
@@ -9988,6 +10762,7 @@ contains
       end function rank_average_real
 
       pure function rank_first_real(x) result(r)
+         !! pandas-style Series.rank(method='first') for a plain 1D real vector
          ! pandas Series.rank(method="first"): ties are broken by order
          ! of appearance -- among equal values, the one occurring
          ! earlier in x gets the lower rank. rank(i) = 1 + (count of
@@ -10018,6 +10793,7 @@ contains
       end function rank_first_real
 
       pure function rank_dense_real(x) result(r)
+         !! pandas-style Series.rank(method='dense') for a plain 1D real vector
          ! pandas Series.rank(method="dense"): like method="min" but
          ! without gaps between tie groups -- rank(i) = 1 + (count of
          ! DISTINCT non-NaN values strictly less than x(i)). Builds the
@@ -10066,6 +10842,7 @@ contains
       end function rank_dense_real
 
       pure function cumsum_real(x) result(y)
+         !! cumulative sum of real vector
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
          integer :: i, n
@@ -10080,6 +10857,7 @@ contains
       end function cumsum_real
 
       pure function cumsum_real_axis0_2d(x) result(y)
+         !! cumulative sum of real matrix along axis 0
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: y(:,:)
          integer :: i, m, n
@@ -10095,6 +10873,7 @@ contains
       end function cumsum_real_axis0_2d
 
       pure function cumsum_real_axis1_2d(x) result(y)
+         !! cumulative sum of real matrix along axis 1
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: y(:,:)
          integer :: j, m, n
@@ -10110,6 +10889,7 @@ contains
       end function cumsum_real_axis1_2d
 
       pure function unique_int(x) result(y)
+         !! sorted unique values of integer vector
          integer, intent(in) :: x(:)
          integer, allocatable :: y(:)
          integer, allocatable :: tmp(:)
@@ -10150,6 +10930,7 @@ contains
       end function unique_int
 
       pure function unique_char(x) result(y)
+         !! unique values of character vector (first-occurrence order)
          character(len=*), intent(in) :: x(:)
          character(len=:), allocatable :: y(:)
          integer :: i, j, n, m, llen
@@ -10186,6 +10967,7 @@ contains
       end function unique_char
 
       pure function tile_int(x, reps) result(y)
+         !! tile integer vector reps times
          integer, intent(in) :: x(:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:)
@@ -10201,6 +10983,7 @@ contains
       end function tile_int
 
       pure function tile_int_2d(x, reps0, reps1) result(y)
+         !! tile integer matrix reps0 x reps1 times
          integer, intent(in) :: x(:,:)
          integer, intent(in) :: reps0, reps1
          integer, allocatable :: y(:,:)
@@ -10218,6 +11001,7 @@ contains
       end function tile_int_2d
 
       pure function diag_from_vec_int(v) result(x)
+         !! return diagonal matrix from integer vector
          integer, intent(in) :: v(:)
          integer, allocatable :: x(:,:)
          integer :: i, n
@@ -10229,6 +11013,7 @@ contains
       end function diag_from_vec_int
 
       pure function cumprod_int(x) result(y)
+         !! cumulative product of integer vector
          integer, intent(in) :: x(:)
          integer, allocatable :: y(:)
          integer :: i, n
@@ -10243,6 +11028,7 @@ contains
       end function cumprod_int
 
       pure function cumprod_int_i64(x) result(y)
+         !! cumulative product of a 64-bit integer vector
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:)
          integer(kind=int64), allocatable :: y(:)
@@ -10258,6 +11044,7 @@ contains
       end function cumprod_int_i64
 
       pure function repeat_int(x, reps) result(y)
+         !! repeat each integer element reps times
          integer, intent(in) :: x(:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:)
@@ -10275,6 +11062,7 @@ contains
       end function repeat_int
 
       pure function repeat_int_axis0_2d(x, reps) result(y)
+         !! repeat rows of integer matrix reps times
          integer, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:,:)
@@ -10291,6 +11079,7 @@ contains
       end function repeat_int_axis0_2d
 
       pure function repeat_int_axis1_2d(x, reps) result(y)
+         !! repeat columns of integer matrix reps times
          integer, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          integer, allocatable :: y(:,:)
@@ -10307,6 +11096,8 @@ contains
       end function repeat_int_axis1_2d
 
       pure function diag_from_mat_complex(a) result(v)
+         !! (generic: diag_from_mat_complex, diag_from_vec_complex, diag_from_vec_real,
+         !! diag_from_mat_real, diag_from_vec_int, diag_from_mat_int)
          complex(kind=dp), intent(in) :: a(:,:)
          complex(kind=dp), allocatable :: v(:)
          integer :: i, n
@@ -10318,6 +11109,8 @@ contains
       end function diag_from_mat_complex
 
       pure function diag_from_vec_complex(v) result(a)
+         !! (generic: diag_from_mat_complex, diag_from_vec_complex, diag_from_vec_real,
+         !! diag_from_mat_real, diag_from_vec_int, diag_from_mat_int)
          complex(kind=dp), intent(in) :: v(:)
          complex(kind=dp), allocatable :: a(:,:)
          integer :: i, n
@@ -10329,6 +11122,7 @@ contains
       end function diag_from_vec_complex
 
       pure function diag_from_mat_real(a) result(v)
+         !! return main diagonal of real matrix
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable :: v(:)
          integer :: i, n
@@ -10340,6 +11134,7 @@ contains
       end function diag_from_mat_real
 
       pure function diagonal_real_2d(a, offset) result(v)
+         !! numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in), optional :: offset
          real(kind=dp), allocatable :: v(:)
@@ -10362,6 +11157,7 @@ contains
       end function diagonal_real_2d
 
       pure function diagonal_complex_2d(a, offset) result(v)
+         !! numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays
          complex(kind=dp), intent(in) :: a(:,:)
          integer, intent(in), optional :: offset
          complex(kind=dp), allocatable :: v(:)
@@ -10384,6 +11180,7 @@ contains
       end function diagonal_complex_2d
 
       pure function cumsum_int(x) result(y)
+         !! cumulative sum of integer vector
          integer, intent(in) :: x(:)
          integer, allocatable :: y(:)
          integer :: i, n
@@ -10398,6 +11195,7 @@ contains
       end function cumsum_int
 
       pure function cumsum_int_i64(x) result(y)
+         !! cumulative sum of a 64-bit integer vector
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:)
          integer(kind=int64), allocatable :: y(:)
@@ -10413,6 +11211,7 @@ contains
       end function cumsum_int_i64
 
       pure function cumsum_int_axis0_2d(x) result(y)
+         !! cumulative sum of integer matrix along axis 0
          integer, intent(in) :: x(:,:)
          integer, allocatable :: y(:,:)
          integer :: i, m, n
@@ -10428,6 +11227,7 @@ contains
       end function cumsum_int_axis0_2d
 
       pure function cumsum_int_axis0_2d_i64(x) result(y)
+         !! cumulative sum of a 64-bit integer matrix along axis 0
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:,:)
          integer(kind=int64), allocatable :: y(:,:)
@@ -10444,6 +11244,7 @@ contains
       end function cumsum_int_axis0_2d_i64
 
       pure function cumsum_int_axis1_2d(x) result(y)
+         !! cumulative sum of integer matrix along axis 1
          integer, intent(in) :: x(:,:)
          integer, allocatable :: y(:,:)
          integer :: j, m, n
@@ -10459,6 +11260,7 @@ contains
       end function cumsum_int_axis1_2d
 
       pure function cumsum_int_axis1_2d_i64(x) result(y)
+         !! cumulative sum of a 64-bit integer matrix along axis 1
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:,:)
          integer(kind=int64), allocatable :: y(:,:)
@@ -10475,6 +11277,7 @@ contains
       end function cumsum_int_axis1_2d_i64
 
       pure function cumprod_real_axis0_2d(x) result(y)
+         !! cumulative product of real matrix along axis 0
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: y(:,:)
          integer :: i, m, n
@@ -10490,6 +11293,7 @@ contains
       end function cumprod_real_axis0_2d
 
       pure function cumprod_real_axis1_2d(x) result(y)
+         !! cumulative product of real matrix along axis 1
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: y(:,:)
          integer :: j, m, n
@@ -10505,6 +11309,7 @@ contains
       end function cumprod_real_axis1_2d
 
       pure function cumprod_int_axis0_2d(x) result(y)
+         !! cumulative product of integer matrix along axis 0
          integer, intent(in) :: x(:,:)
          integer, allocatable :: y(:,:)
          integer :: i, m, n
@@ -10520,6 +11325,7 @@ contains
       end function cumprod_int_axis0_2d
 
       pure function cumprod_int_axis0_2d_i64(x) result(y)
+         !! cumulative product of a 64-bit integer matrix along axis 0
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:,:)
          integer(kind=int64), allocatable :: y(:,:)
@@ -10536,6 +11342,7 @@ contains
       end function cumprod_int_axis0_2d_i64
 
       pure function cumprod_int_axis1_2d(x) result(y)
+         !! cumulative product of integer matrix along axis 1
          integer, intent(in) :: x(:,:)
          integer, allocatable :: y(:,:)
          integer :: j, m, n
@@ -10551,6 +11358,7 @@ contains
       end function cumprod_int_axis1_2d
 
       pure function cumprod_int_axis1_2d_i64(x) result(y)
+         !! cumulative product of a 64-bit integer matrix along axis 1
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:,:)
          integer(kind=int64), allocatable :: y(:,:)
@@ -10567,6 +11375,7 @@ contains
       end function cumprod_int_axis1_2d_i64
 
       pure function diag_from_vec_real(v) result(x)
+         !! return diagonal matrix from real vector
          real(kind=dp), intent(in) :: v(:)
          real(kind=dp), allocatable :: x(:,:)
          integer :: i, n
@@ -10578,6 +11387,7 @@ contains
       end function diag_from_vec_real
 
       pure function diagonal_real_3d_axis12(a, offset) result(v)
+         !! numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays
          real(kind=dp), intent(in) :: a(:,:,:)
          integer, intent(in), optional :: offset
          real(kind=dp), allocatable :: v(:,:)
@@ -10604,6 +11414,7 @@ contains
       end function diagonal_real_3d_axis12
 
       pure function repeat_real(x, reps) result(y)
+         !! repeat each real element reps times
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:)
@@ -10621,6 +11432,7 @@ contains
       end function repeat_real
 
       pure function repeat_real_axis0_2d(x, reps) result(y)
+         !! repeat rows of real matrix reps times
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:,:)
@@ -10637,6 +11449,7 @@ contains
       end function repeat_real_axis0_2d
 
       pure function repeat_real_axis1_2d(x, reps) result(y)
+         !! repeat columns of real matrix reps times
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:,:)
@@ -10653,6 +11466,7 @@ contains
       end function repeat_real_axis1_2d
 
       pure function repeat_logical(x, reps) result(y)
+         !! repeat each logical element reps times
          logical, intent(in) :: x(:)
          integer, intent(in) :: reps
          logical, allocatable :: y(:)
@@ -10670,6 +11484,7 @@ contains
       end function repeat_logical
 
       pure function repeat_logical_axis0_2d(x, reps) result(y)
+         !! repeat rows of logical matrix reps times
          logical, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          logical, allocatable :: y(:,:)
@@ -10686,6 +11501,7 @@ contains
       end function repeat_logical_axis0_2d
 
       pure function repeat_logical_axis1_2d(x, reps) result(y)
+         !! repeat columns of logical matrix reps times
          logical, intent(in) :: x(:,:)
          integer, intent(in) :: reps
          logical, allocatable :: y(:,:)
@@ -10702,6 +11518,7 @@ contains
       end function repeat_logical_axis1_2d
 
       pure function diag_from_mat_int(a) result(v)
+         !! return main diagonal of integer matrix
          integer, intent(in) :: a(:,:)
          integer, allocatable :: v(:)
          integer :: i, n
@@ -10713,6 +11530,7 @@ contains
       end function diag_from_mat_int
 
       pure function diagonal_int_2d(a, offset) result(v)
+         !! numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays
          integer, intent(in) :: a(:,:)
          integer, intent(in), optional :: offset
          integer, allocatable :: v(:)
@@ -10735,6 +11553,7 @@ contains
       end function diagonal_int_2d
 
       pure function diagonal_int_3d_axis12(a, offset) result(v)
+         !! numpy-like diagonal for 2D matrices and 3D axis1=1,axis2=2 arrays
          integer, intent(in) :: a(:,:,:)
          integer, intent(in), optional :: offset
          integer, allocatable :: v(:,:)
@@ -10761,6 +11580,7 @@ contains
       end function diagonal_int_3d_axis12
 
       pure function tile_real(x, reps) result(y)
+         !! tile real vector reps times
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: reps
          real(kind=dp), allocatable :: y(:)
@@ -10776,6 +11596,7 @@ contains
       end function tile_real
 
       pure function tile_real_2d(x, reps0, reps1) result(y)
+         !! tile real matrix reps0 x reps1 times
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in) :: reps0, reps1
          real(kind=dp), allocatable :: y(:,:)
@@ -10793,6 +11614,7 @@ contains
       end function tile_real_2d
 
       pure function eye_real(n, m, k) result(x)
+         !! return n x m matrix with ones on diagonal k (default m=n, k=0)
          ! np.eye(n, m, k): ones on diagonal k (above the main one for k > 0).
          integer, intent(in) :: n
          integer, intent(in), optional :: m, k
@@ -10810,6 +11632,7 @@ contains
       end function eye_real
 
       pure function unique_real(x) result(y)
+         !! sorted unique values of real vector
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
          real(kind=dp), allocatable :: tmp(:)
@@ -10849,6 +11672,7 @@ contains
       end function unique_real
 
       pure function cumprod_real(x) result(y)
+         !! cumulative product of real vector
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
          integer :: i, n
@@ -10863,6 +11687,7 @@ contains
       end function cumprod_real
 
       pure function gradient_1d(x) result(g)
+         !! 1D gradient with unit spacing (numpy-style edge handling)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: g(:)
          integer :: n
@@ -11013,6 +11838,7 @@ contains
       end function opoly_grid3d
 
       pure function powvalfromroots_0(x, r) result(y)
+         !! np.polynomial.polynomial.polyvalfromroots: prod(x - r) at scalar, vector or matrix x
          ! np.polynomial.polynomial.polyvalfromroots: prod(x - r).
          real(kind=dp), intent(in) :: x, r(:)
          real(kind=dp) :: y
@@ -11020,6 +11846,7 @@ contains
       end function powvalfromroots_0
 
       pure function powvalfromroots_1(x, r) result(y)
+         !! np.polynomial.polynomial.polyvalfromroots: prod(x - r) at scalar, vector or matrix x
          real(kind=dp), intent(in) :: x(:), r(:)
          real(kind=dp) :: y(size(x))
          integer :: i
@@ -11029,6 +11856,7 @@ contains
       end function powvalfromroots_1
 
       pure function powvalfromroots_2(x, r) result(y)
+         !! np.polynomial.polynomial.polyvalfromroots: prod(x - r) at scalar, vector or matrix x
          real(kind=dp), intent(in) :: x(:,:), r(:)
          real(kind=dp) :: y(size(x, 1), size(x, 2))
          integer :: i, j
@@ -11040,6 +11868,8 @@ contains
       end function powvalfromroots_2
 
       pure function powval2d_0(x, y, c) result(r)
+         !! np.polynomial.polynomial.polyval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          ! np.polynomial.polynomial.polyval2d: sum_ij c(i, j) P_i(x) P_j(y).
          real(kind=dp), intent(in) :: x, y, c(:,:)
          real(kind=dp) :: r
@@ -11047,6 +11877,8 @@ contains
       end function powval2d_0
 
       pure function powval2d_1(x, y, c) result(r)
+         !! np.polynomial.polynomial.polyval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11057,6 +11889,8 @@ contains
       end function powval2d_1
 
       pure function powval2d_2(x, y, c) result(r)
+         !! np.polynomial.polynomial.polyval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
          real(kind=dp) :: r(size(x, 1), size(x, 2))
          integer :: i, j
@@ -11069,6 +11903,8 @@ contains
       end function powval2d_2
 
       pure function powval3d_0(x, y, z, c) result(r)
+         !! np.polynomial.polynomial.polyval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          ! np.polynomial.polynomial.polyval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
          real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
          real(kind=dp) :: r
@@ -11076,6 +11912,8 @@ contains
       end function powval3d_0
 
       pure function powval3d_1(x, y, z, c) result(r)
+         !! np.polynomial.polynomial.polyval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11086,6 +11924,7 @@ contains
       end function powval3d_1
 
       pure function powgrid2d(x, y, c) result(r)
+         !! np.polynomial.polynomial.polygrid2d: 2-D series on the grid x by y
          ! np.polynomial.polynomial.polygrid2d: r(a, b) = polyval2d(x(a), y(b), c).
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -11093,6 +11932,7 @@ contains
       end function powgrid2d
 
       pure function powgrid3d(x, y, z, c) result(r)
+         !! np.polynomial.polynomial.polygrid3d: 3-D series on the grid x by y by z
          ! np.polynomial.polynomial.polygrid3d: r(a, b, d) = polyval3d(x(a), y(b), z(d), c).
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -11100,6 +11940,8 @@ contains
       end function powgrid3d
 
       pure function chebval2d_0(x, y, c) result(r)
+         !! np.polynomial.chebyshev.chebval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          ! np.polynomial.chebyshev.chebval2d: sum_ij c(i, j) P_i(x) P_j(y).
          real(kind=dp), intent(in) :: x, y, c(:,:)
          real(kind=dp) :: r
@@ -11107,6 +11949,8 @@ contains
       end function chebval2d_0
 
       pure function chebval2d_1(x, y, c) result(r)
+         !! np.polynomial.chebyshev.chebval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11117,6 +11961,8 @@ contains
       end function chebval2d_1
 
       pure function chebval2d_2(x, y, c) result(r)
+         !! np.polynomial.chebyshev.chebval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
          real(kind=dp) :: r(size(x, 1), size(x, 2))
          integer :: i, j
@@ -11129,6 +11975,8 @@ contains
       end function chebval2d_2
 
       pure function chebval3d_0(x, y, z, c) result(r)
+         !! np.polynomial.chebyshev.chebval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          ! np.polynomial.chebyshev.chebval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
          real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
          real(kind=dp) :: r
@@ -11136,6 +11984,8 @@ contains
       end function chebval3d_0
 
       pure function chebval3d_1(x, y, z, c) result(r)
+         !! np.polynomial.chebyshev.chebval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11146,6 +11996,7 @@ contains
       end function chebval3d_1
 
       pure function chebgrid2d(x, y, c) result(r)
+         !! np.polynomial.chebyshev.chebgrid2d: 2-D series on the grid x by y
          ! np.polynomial.chebyshev.chebgrid2d: r(a, b) = chebval2d(x(a), y(b), c).
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -11153,6 +12004,7 @@ contains
       end function chebgrid2d
 
       pure function chebgrid3d(x, y, z, c) result(r)
+         !! np.polynomial.chebyshev.chebgrid3d: 3-D series on the grid x by y by z
          ! np.polynomial.chebyshev.chebgrid3d: r(a, b, d) = chebval3d(x(a), y(b), z(d), c).
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -11160,6 +12012,8 @@ contains
       end function chebgrid3d
 
       pure function legval2d_0(x, y, c) result(r)
+         !! np.polynomial.legendre.legval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          ! np.polynomial.legendre.legval2d: sum_ij c(i, j) P_i(x) P_j(y).
          real(kind=dp), intent(in) :: x, y, c(:,:)
          real(kind=dp) :: r
@@ -11167,6 +12021,8 @@ contains
       end function legval2d_0
 
       pure function legval2d_1(x, y, c) result(r)
+         !! np.polynomial.legendre.legval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11177,6 +12033,8 @@ contains
       end function legval2d_1
 
       pure function legval2d_2(x, y, c) result(r)
+         !! np.polynomial.legendre.legval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
          real(kind=dp) :: r(size(x, 1), size(x, 2))
          integer :: i, j
@@ -11189,6 +12047,8 @@ contains
       end function legval2d_2
 
       pure function legval3d_0(x, y, z, c) result(r)
+         !! np.polynomial.legendre.legval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          ! np.polynomial.legendre.legval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
          real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
          real(kind=dp) :: r
@@ -11196,6 +12056,8 @@ contains
       end function legval3d_0
 
       pure function legval3d_1(x, y, z, c) result(r)
+         !! np.polynomial.legendre.legval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11206,6 +12068,7 @@ contains
       end function legval3d_1
 
       pure function leggrid2d(x, y, c) result(r)
+         !! np.polynomial.legendre.leggrid2d: 2-D series on the grid x by y
          ! np.polynomial.legendre.leggrid2d: r(a, b) = legval2d(x(a), y(b), c).
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -11213,6 +12076,7 @@ contains
       end function leggrid2d
 
       pure function leggrid3d(x, y, z, c) result(r)
+         !! np.polynomial.legendre.leggrid3d: 3-D series on the grid x by y by z
          ! np.polynomial.legendre.leggrid3d: r(a, b, d) = legval3d(x(a), y(b), z(d), c).
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -11220,6 +12084,8 @@ contains
       end function leggrid3d
 
       pure function hermval2d_0(x, y, c) result(r)
+         !! np.polynomial.hermite.hermval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          ! np.polynomial.hermite.hermval2d: sum_ij c(i, j) P_i(x) P_j(y).
          real(kind=dp), intent(in) :: x, y, c(:,:)
          real(kind=dp) :: r
@@ -11227,6 +12093,8 @@ contains
       end function hermval2d_0
 
       pure function hermval2d_1(x, y, c) result(r)
+         !! np.polynomial.hermite.hermval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11237,6 +12105,8 @@ contains
       end function hermval2d_1
 
       pure function hermval2d_2(x, y, c) result(r)
+         !! np.polynomial.hermite.hermval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
          real(kind=dp) :: r(size(x, 1), size(x, 2))
          integer :: i, j
@@ -11249,6 +12119,8 @@ contains
       end function hermval2d_2
 
       pure function hermval3d_0(x, y, z, c) result(r)
+         !! np.polynomial.hermite.hermval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          ! np.polynomial.hermite.hermval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
          real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
          real(kind=dp) :: r
@@ -11256,6 +12128,8 @@ contains
       end function hermval3d_0
 
       pure function hermval3d_1(x, y, z, c) result(r)
+         !! np.polynomial.hermite.hermval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11266,6 +12140,7 @@ contains
       end function hermval3d_1
 
       pure function hermgrid2d(x, y, c) result(r)
+         !! np.polynomial.hermite.hermgrid2d: 2-D series on the grid x by y
          ! np.polynomial.hermite.hermgrid2d: r(a, b) = hermval2d(x(a), y(b), c).
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -11273,6 +12148,7 @@ contains
       end function hermgrid2d
 
       pure function hermgrid3d(x, y, z, c) result(r)
+         !! np.polynomial.hermite.hermgrid3d: 3-D series on the grid x by y by z
          ! np.polynomial.hermite.hermgrid3d: r(a, b, d) = hermval3d(x(a), y(b), z(d), c).
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -11280,6 +12156,8 @@ contains
       end function hermgrid3d
 
       pure function hermeval2d_0(x, y, c) result(r)
+         !! np.polynomial.hermite_e.hermeval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          ! np.polynomial.hermite_e.hermeval2d: sum_ij c(i, j) P_i(x) P_j(y).
          real(kind=dp), intent(in) :: x, y, c(:,:)
          real(kind=dp) :: r
@@ -11287,6 +12165,8 @@ contains
       end function hermeval2d_0
 
       pure function hermeval2d_1(x, y, c) result(r)
+         !! np.polynomial.hermite_e.hermeval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11297,6 +12177,8 @@ contains
       end function hermeval2d_1
 
       pure function hermeval2d_2(x, y, c) result(r)
+         !! np.polynomial.hermite_e.hermeval2d: 2-D series value at points (x, y) (scalars, vectors
+         !! or matrices)
          real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
          real(kind=dp) :: r(size(x, 1), size(x, 2))
          integer :: i, j
@@ -11309,6 +12191,8 @@ contains
       end function hermeval2d_2
 
       pure function hermeval3d_0(x, y, z, c) result(r)
+         !! np.polynomial.hermite_e.hermeval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          ! np.polynomial.hermite_e.hermeval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
          real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
          real(kind=dp) :: r
@@ -11316,6 +12200,8 @@ contains
       end function hermeval3d_0
 
       pure function hermeval3d_1(x, y, z, c) result(r)
+         !! np.polynomial.hermite_e.hermeval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11326,6 +12212,7 @@ contains
       end function hermeval3d_1
 
       pure function hermegrid2d(x, y, c) result(r)
+         !! np.polynomial.hermite_e.hermegrid2d: 2-D series on the grid x by y
          ! np.polynomial.hermite_e.hermegrid2d: r(a, b) = hermeval2d(x(a), y(b), c).
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -11333,6 +12220,7 @@ contains
       end function hermegrid2d
 
       pure function hermegrid3d(x, y, z, c) result(r)
+         !! np.polynomial.hermite_e.hermegrid3d: 3-D series on the grid x by y by z
          ! np.polynomial.hermite_e.hermegrid3d: r(a, b, d) = hermeval3d(x(a), y(b), z(d), c).
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -11340,6 +12228,8 @@ contains
       end function hermegrid3d
 
       pure function lagval2d_0(x, y, c) result(r)
+         !! np.polynomial.laguerre.lagval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          ! np.polynomial.laguerre.lagval2d: sum_ij c(i, j) P_i(x) P_j(y).
          real(kind=dp), intent(in) :: x, y, c(:,:)
          real(kind=dp) :: r
@@ -11347,6 +12237,8 @@ contains
       end function lagval2d_0
 
       pure function lagval2d_1(x, y, c) result(r)
+         !! np.polynomial.laguerre.lagval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11357,6 +12249,8 @@ contains
       end function lagval2d_1
 
       pure function lagval2d_2(x, y, c) result(r)
+         !! np.polynomial.laguerre.lagval2d: 2-D series value at points (x, y) (scalars, vectors or
+         !! matrices)
          real(kind=dp), intent(in) :: x(:,:), y(:,:), c(:,:)
          real(kind=dp) :: r(size(x, 1), size(x, 2))
          integer :: i, j
@@ -11369,6 +12263,8 @@ contains
       end function lagval2d_2
 
       pure function lagval3d_0(x, y, z, c) result(r)
+         !! np.polynomial.laguerre.lagval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          ! np.polynomial.laguerre.lagval3d: sum_ijk c(i, j, k) P_i(x) P_j(y) P_k(z).
          real(kind=dp), intent(in) :: x, y, z, c(:,:,:)
          real(kind=dp) :: r
@@ -11376,6 +12272,8 @@ contains
       end function lagval3d_0
 
       pure function lagval3d_1(x, y, z, c) result(r)
+         !! np.polynomial.laguerre.lagval3d: 3-D series value at points (x, y, z) (scalars or
+         !! vectors)
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp) :: r(size(x))
          integer :: i
@@ -11386,6 +12284,7 @@ contains
       end function lagval3d_1
 
       pure function laggrid2d(x, y, c) result(r)
+         !! np.polynomial.laguerre.laggrid2d: 2-D series on the grid x by y
          ! np.polynomial.laguerre.laggrid2d: r(a, b) = lagval2d(x(a), y(b), c).
          real(kind=dp), intent(in) :: x(:), y(:), c(:,:)
          real(kind=dp), allocatable :: r(:,:)
@@ -11393,6 +12292,7 @@ contains
       end function laggrid2d
 
       pure function laggrid3d(x, y, z, c) result(r)
+         !! np.polynomial.laguerre.laggrid3d: 3-D series on the grid x by y by z
          ! np.polynomial.laguerre.laggrid3d: r(a, b, d) = lagval3d(x(a), y(b), z(d), c).
          real(kind=dp), intent(in) :: x(:), y(:), z(:), c(:,:,:)
          real(kind=dp), allocatable :: r(:,:,:)
@@ -12961,6 +13861,8 @@ contains
       end subroutine laggauss
 
       pure function powval_0(x, c) result(y)
+         !! np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial,
+         !! lowest degree first) at x (scalar, vector or matrix x)
          ! Value of the power series (np.polynomial.polynomial, lowest degree first) with coefficients c at x.
          real(kind=dp), intent(in) :: x, c(:)
          real(kind=dp) :: y
@@ -12968,6 +13870,8 @@ contains
       end function powval_0
 
       pure function powval_1(x, c) result(y)
+         !! np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial,
+         !! lowest degree first) at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:), c(:)
          real(kind=dp) :: y(size(x))
          integer :: i
@@ -12977,6 +13881,8 @@ contains
       end function powval_1
 
       pure function powval_2(x, c) result(y)
+         !! np.polynomial.polynomial.polyval: value of the power series (np.polynomial.polynomial,
+         !! lowest degree first) at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:,:), c(:)
          real(kind=dp) :: y(size(x, 1), size(x, 2))
          integer :: i, j
@@ -12988,6 +13894,8 @@ contains
       end function powval_2
 
       pure function np_vander_real(x, n, increasing) result(v)
+         !! np.vander: the columns x**(n-1), ..., 1 (increasing: 1, ..., x**(n-1)); n = 0 gives none
+         !! (generic: np_vander_real, np_vander_int)
          ! np.vander(x, n): the columns x**(n-1), ..., x, 1 (x**0 first when
          ! increasing), each the previous times x as numpy accumulates them;
          ! n = 0 gives no columns.
@@ -13007,6 +13915,8 @@ contains
       end function np_vander_real
 
       pure function np_vander_int(x, n, increasing) result(v)
+         !! np.vander: the columns x**(n-1), ..., 1 (increasing: 1, ..., x**(n-1)); n = 0 gives none
+         !! (generic: np_vander_real, np_vander_int)
          integer, intent(in) :: x(:)
          integer, intent(in) :: n
          logical, intent(in) :: increasing
@@ -13023,6 +13933,7 @@ contains
       end function np_vander_int
 
       pure function np_vander_int_i64(x, n, increasing) result(v)
+         !! np.vander of a 64-bit integer vector
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: x(:)
          integer, intent(in) :: n
@@ -13040,6 +13951,7 @@ contains
       end function np_vander_int_i64
 
       pure function powvander(x, deg) result(v)
+         !! np.polynomial.polynomial.polyvander: pseudo-Vandermonde matrix
          ! Pseudo-Vandermonde matrix of the power series (np.polynomial.polynomial, lowest degree first): v(i, j+1) is the basis
          ! function of degree j at x(i).
          real(kind=dp), intent(in) :: x(:)
@@ -13049,6 +13961,7 @@ contains
       end function powvander
 
       pure function powder(c, m, scl) result(d)
+         !! np.polynomial.polynomial.polyder: derivative coefficients
          ! m-th derivative (default 1) of the power series (np.polynomial.polynomial, lowest degree first), scaled by scl per step.
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in), optional :: m
@@ -13058,6 +13971,7 @@ contains
       end function powder
 
       pure function powint(c, m, k, lbnd, scl) result(r)
+         !! np.polynomial.polynomial.polyint: integral coefficients
          ! m-th integral (default 1) of the power series (np.polynomial.polynomial, lowest degree first); constants k, lower bound
          ! lbnd, scale scl per step.
          real(kind=dp), intent(in) :: c(:)
@@ -13068,6 +13982,7 @@ contains
       end function powint
 
       function powfit(x, y, deg, rcond, w) result(c)
+         !! np.polynomial.polynomial.polyfit: least-squares fit, coefficients lowest degree first
          ! Least-squares fit of the power series (np.polynomial.polynomial, lowest degree first) of degree deg to (x, y),
          ! optionally weighted by w; coefficients lowest degree first.
          real(kind=dp), intent(in) :: x(:), y(:)
@@ -13078,6 +13993,8 @@ contains
       end function powfit
 
       pure function chebval_0(x, c) result(y)
+         !! np.polynomial.chebyshev.chebval: value of the Chebyshev series (np.polynomial.chebyshev)
+         !! at x (scalar, vector or matrix x)
          ! Value of the Chebyshev series (np.polynomial.chebyshev) with coefficients c at x.
          real(kind=dp), intent(in) :: x, c(:)
          real(kind=dp) :: y
@@ -13085,6 +14002,8 @@ contains
       end function chebval_0
 
       pure function chebval_1(x, c) result(y)
+         !! np.polynomial.chebyshev.chebval: value of the Chebyshev series (np.polynomial.chebyshev)
+         !! at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:), c(:)
          real(kind=dp) :: y(size(x))
          integer :: i
@@ -13094,6 +14013,8 @@ contains
       end function chebval_1
 
       pure function chebval_2(x, c) result(y)
+         !! np.polynomial.chebyshev.chebval: value of the Chebyshev series (np.polynomial.chebyshev)
+         !! at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:,:), c(:)
          real(kind=dp) :: y(size(x, 1), size(x, 2))
          integer :: i, j
@@ -13105,6 +14026,7 @@ contains
       end function chebval_2
 
       pure function chebvander(x, deg) result(v)
+         !! np.polynomial.chebyshev.chebvander: pseudo-Vandermonde matrix
          ! Pseudo-Vandermonde matrix of the Chebyshev series (np.polynomial.chebyshev): v(i, j+1) is the basis
          ! function of degree j at x(i).
          real(kind=dp), intent(in) :: x(:)
@@ -13114,6 +14036,7 @@ contains
       end function chebvander
 
       pure function chebder(c, m, scl) result(d)
+         !! np.polynomial.chebyshev.chebder: derivative coefficients
          ! m-th derivative (default 1) of the Chebyshev series (np.polynomial.chebyshev), scaled by scl per step.
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in), optional :: m
@@ -13123,6 +14046,7 @@ contains
       end function chebder
 
       pure function chebint(c, m, k, lbnd, scl) result(r)
+         !! np.polynomial.chebyshev.chebint: integral coefficients
          ! m-th integral (default 1) of the Chebyshev series (np.polynomial.chebyshev); constants k, lower bound
          ! lbnd, scale scl per step.
          real(kind=dp), intent(in) :: c(:)
@@ -13133,6 +14057,7 @@ contains
       end function chebint
 
       function chebfit(x, y, deg, rcond, w) result(c)
+         !! np.polynomial.chebyshev.chebfit: least-squares fit, coefficients lowest degree first
          ! Least-squares fit of the Chebyshev series (np.polynomial.chebyshev) of degree deg to (x, y),
          ! optionally weighted by w; coefficients lowest degree first.
          real(kind=dp), intent(in) :: x(:), y(:)
@@ -13143,6 +14068,8 @@ contains
       end function chebfit
 
       pure function legval_0(x, c) result(y)
+         !! np.polynomial.legendre.legval: value of the Legendre series (np.polynomial.legendre) at
+         !! x (scalar, vector or matrix x)
          ! Value of the Legendre series (np.polynomial.legendre) with coefficients c at x.
          real(kind=dp), intent(in) :: x, c(:)
          real(kind=dp) :: y
@@ -13150,6 +14077,8 @@ contains
       end function legval_0
 
       pure function legval_1(x, c) result(y)
+         !! np.polynomial.legendre.legval: value of the Legendre series (np.polynomial.legendre) at
+         !! x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:), c(:)
          real(kind=dp) :: y(size(x))
          integer :: i
@@ -13159,6 +14088,8 @@ contains
       end function legval_1
 
       pure function legval_2(x, c) result(y)
+         !! np.polynomial.legendre.legval: value of the Legendre series (np.polynomial.legendre) at
+         !! x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:,:), c(:)
          real(kind=dp) :: y(size(x, 1), size(x, 2))
          integer :: i, j
@@ -13170,6 +14101,7 @@ contains
       end function legval_2
 
       pure function legvander(x, deg) result(v)
+         !! np.polynomial.legendre.legvander: pseudo-Vandermonde matrix
          ! Pseudo-Vandermonde matrix of the Legendre series (np.polynomial.legendre): v(i, j+1) is the basis
          ! function of degree j at x(i).
          real(kind=dp), intent(in) :: x(:)
@@ -13179,6 +14111,7 @@ contains
       end function legvander
 
       pure function legder(c, m, scl) result(d)
+         !! np.polynomial.legendre.legder: derivative coefficients
          ! m-th derivative (default 1) of the Legendre series (np.polynomial.legendre), scaled by scl per step.
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in), optional :: m
@@ -13188,6 +14121,7 @@ contains
       end function legder
 
       pure function legint(c, m, k, lbnd, scl) result(r)
+         !! np.polynomial.legendre.legint: integral coefficients
          ! m-th integral (default 1) of the Legendre series (np.polynomial.legendre); constants k, lower bound
          ! lbnd, scale scl per step.
          real(kind=dp), intent(in) :: c(:)
@@ -13198,6 +14132,7 @@ contains
       end function legint
 
       function legfit(x, y, deg, rcond, w) result(c)
+         !! np.polynomial.legendre.legfit: least-squares fit, coefficients lowest degree first
          ! Least-squares fit of the Legendre series (np.polynomial.legendre) of degree deg to (x, y),
          ! optionally weighted by w; coefficients lowest degree first.
          real(kind=dp), intent(in) :: x(:), y(:)
@@ -13208,6 +14143,8 @@ contains
       end function legfit
 
       pure function hermval_0(x, c) result(y)
+         !! np.polynomial.hermite.hermval: value of the physicists' Hermite series
+         !! (np.polynomial.hermite) at x (scalar, vector or matrix x)
          ! Value of the physicists' Hermite series (np.polynomial.hermite) with coefficients c at x.
          real(kind=dp), intent(in) :: x, c(:)
          real(kind=dp) :: y
@@ -13215,6 +14152,8 @@ contains
       end function hermval_0
 
       pure function hermval_1(x, c) result(y)
+         !! np.polynomial.hermite.hermval: value of the physicists' Hermite series
+         !! (np.polynomial.hermite) at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:), c(:)
          real(kind=dp) :: y(size(x))
          integer :: i
@@ -13224,6 +14163,8 @@ contains
       end function hermval_1
 
       pure function hermval_2(x, c) result(y)
+         !! np.polynomial.hermite.hermval: value of the physicists' Hermite series
+         !! (np.polynomial.hermite) at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:,:), c(:)
          real(kind=dp) :: y(size(x, 1), size(x, 2))
          integer :: i, j
@@ -13235,6 +14176,7 @@ contains
       end function hermval_2
 
       pure function hermvander(x, deg) result(v)
+         !! np.polynomial.hermite.hermvander: pseudo-Vandermonde matrix
          ! Pseudo-Vandermonde matrix of the physicists' Hermite series (np.polynomial.hermite): v(i, j+1) is the basis
          ! function of degree j at x(i).
          real(kind=dp), intent(in) :: x(:)
@@ -13244,6 +14186,7 @@ contains
       end function hermvander
 
       pure function hermder(c, m, scl) result(d)
+         !! np.polynomial.hermite.hermder: derivative coefficients
          ! m-th derivative (default 1) of the physicists' Hermite series (np.polynomial.hermite), scaled by scl per step.
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in), optional :: m
@@ -13253,6 +14196,7 @@ contains
       end function hermder
 
       pure function hermint(c, m, k, lbnd, scl) result(r)
+         !! np.polynomial.hermite.hermint: integral coefficients
          ! m-th integral (default 1) of the physicists' Hermite series (np.polynomial.hermite); constants k, lower bound
          ! lbnd, scale scl per step.
          real(kind=dp), intent(in) :: c(:)
@@ -13263,6 +14207,7 @@ contains
       end function hermint
 
       function hermfit(x, y, deg, rcond, w) result(c)
+         !! np.polynomial.hermite.hermfit: least-squares fit, coefficients lowest degree first
          ! Least-squares fit of the physicists' Hermite series (np.polynomial.hermite) of degree deg to (x, y),
          ! optionally weighted by w; coefficients lowest degree first.
          real(kind=dp), intent(in) :: x(:), y(:)
@@ -13273,6 +14218,8 @@ contains
       end function hermfit
 
       pure function hermeval_0(x, c) result(y)
+         !! np.polynomial.hermite_e.hermeval: value of the probabilists' Hermite series
+         !! (np.polynomial.hermite_e) at x (scalar, vector or matrix x)
          ! Value of the probabilists' Hermite series (np.polynomial.hermite_e) with coefficients c at x.
          real(kind=dp), intent(in) :: x, c(:)
          real(kind=dp) :: y
@@ -13280,6 +14227,8 @@ contains
       end function hermeval_0
 
       pure function hermeval_1(x, c) result(y)
+         !! np.polynomial.hermite_e.hermeval: value of the probabilists' Hermite series
+         !! (np.polynomial.hermite_e) at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:), c(:)
          real(kind=dp) :: y(size(x))
          integer :: i
@@ -13289,6 +14238,8 @@ contains
       end function hermeval_1
 
       pure function hermeval_2(x, c) result(y)
+         !! np.polynomial.hermite_e.hermeval: value of the probabilists' Hermite series
+         !! (np.polynomial.hermite_e) at x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:,:), c(:)
          real(kind=dp) :: y(size(x, 1), size(x, 2))
          integer :: i, j
@@ -13300,6 +14251,7 @@ contains
       end function hermeval_2
 
       pure function hermevander(x, deg) result(v)
+         !! np.polynomial.hermite_e.hermevander: pseudo-Vandermonde matrix
          ! Pseudo-Vandermonde matrix of the probabilists' Hermite series (np.polynomial.hermite_e): v(i, j+1) is the basis
          ! function of degree j at x(i).
          real(kind=dp), intent(in) :: x(:)
@@ -13309,6 +14261,7 @@ contains
       end function hermevander
 
       pure function hermeder(c, m, scl) result(d)
+         !! np.polynomial.hermite_e.hermeder: derivative coefficients
          ! m-th derivative (default 1) of the probabilists' Hermite series (np.polynomial.hermite_e), scaled by scl per step.
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in), optional :: m
@@ -13318,6 +14271,7 @@ contains
       end function hermeder
 
       pure function hermeint(c, m, k, lbnd, scl) result(r)
+         !! np.polynomial.hermite_e.hermeint: integral coefficients
          ! m-th integral (default 1) of the probabilists' Hermite series (np.polynomial.hermite_e); constants k, lower bound
          ! lbnd, scale scl per step.
          real(kind=dp), intent(in) :: c(:)
@@ -13328,6 +14282,7 @@ contains
       end function hermeint
 
       function hermefit(x, y, deg, rcond, w) result(c)
+         !! np.polynomial.hermite_e.hermefit: least-squares fit, coefficients lowest degree first
          ! Least-squares fit of the probabilists' Hermite series (np.polynomial.hermite_e) of degree deg to (x, y),
          ! optionally weighted by w; coefficients lowest degree first.
          real(kind=dp), intent(in) :: x(:), y(:)
@@ -13338,6 +14293,8 @@ contains
       end function hermefit
 
       pure function lagval_0(x, c) result(y)
+         !! np.polynomial.laguerre.lagval: value of the Laguerre series (np.polynomial.laguerre) at
+         !! x (scalar, vector or matrix x)
          ! Value of the Laguerre series (np.polynomial.laguerre) with coefficients c at x.
          real(kind=dp), intent(in) :: x, c(:)
          real(kind=dp) :: y
@@ -13345,6 +14302,8 @@ contains
       end function lagval_0
 
       pure function lagval_1(x, c) result(y)
+         !! np.polynomial.laguerre.lagval: value of the Laguerre series (np.polynomial.laguerre) at
+         !! x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:), c(:)
          real(kind=dp) :: y(size(x))
          integer :: i
@@ -13354,6 +14313,8 @@ contains
       end function lagval_1
 
       pure function lagval_2(x, c) result(y)
+         !! np.polynomial.laguerre.lagval: value of the Laguerre series (np.polynomial.laguerre) at
+         !! x (scalar, vector or matrix x)
          real(kind=dp), intent(in) :: x(:,:), c(:)
          real(kind=dp) :: y(size(x, 1), size(x, 2))
          integer :: i, j
@@ -13365,6 +14326,7 @@ contains
       end function lagval_2
 
       pure function lagvander(x, deg) result(v)
+         !! np.polynomial.laguerre.lagvander: pseudo-Vandermonde matrix
          ! Pseudo-Vandermonde matrix of the Laguerre series (np.polynomial.laguerre): v(i, j+1) is the basis
          ! function of degree j at x(i).
          real(kind=dp), intent(in) :: x(:)
@@ -13374,6 +14336,7 @@ contains
       end function lagvander
 
       pure function lagder(c, m, scl) result(d)
+         !! np.polynomial.laguerre.lagder: derivative coefficients
          ! m-th derivative (default 1) of the Laguerre series (np.polynomial.laguerre), scaled by scl per step.
          real(kind=dp), intent(in) :: c(:)
          integer, intent(in), optional :: m
@@ -13383,6 +14346,7 @@ contains
       end function lagder
 
       pure function lagint(c, m, k, lbnd, scl) result(r)
+         !! np.polynomial.laguerre.lagint: integral coefficients
          ! m-th integral (default 1) of the Laguerre series (np.polynomial.laguerre); constants k, lower bound
          ! lbnd, scale scl per step.
          real(kind=dp), intent(in) :: c(:)
@@ -13393,6 +14357,7 @@ contains
       end function lagint
 
       function lagfit(x, y, deg, rcond, w) result(c)
+         !! np.polynomial.laguerre.lagfit: least-squares fit, coefficients lowest degree first
          ! Least-squares fit of the Laguerre series (np.polynomial.laguerre) of degree deg to (x, y),
          ! optionally weighted by w; coefficients lowest degree first.
          real(kind=dp), intent(in) :: x(:), y(:)
@@ -13403,6 +14368,8 @@ contains
       end function lagfit
 
       pure function np_window(kind_name, m, beta) result(w)
+         !! np.hanning / hamming / blackman / bartlett / kaiser(m[, beta]) with numpy's formulas (n
+         !! = arange(1-m, m, 2) for the cosine windows); m == 1 gives [1.0] and m < 1 an empty ...
          ! np.hanning / hamming / blackman / bartlett / kaiser(m[, beta]) with
          ! numpy's formulas (n = arange(1-m, m, 2) for the cosine windows);
          ! m == 1 gives [1.0] and m < 1 an empty array, as numpy does.
@@ -13445,6 +14412,7 @@ contains
       end function np_window
 
       pure function np_poly_roots(r) result(c)
+         !! np.poly(roots): the monic polynomial with these roots, highest degree first
          ! np.poly(roots): the monic polynomial with these roots, highest
          ! degree first.
          real(kind=dp), intent(in) :: r(:)
@@ -13459,6 +14427,8 @@ contains
       end function np_poly_roots
 
       pure function np_polyadd_real(a, b, sgn) result(c)
+         !! np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the shorter is padded with
+         !! leading zeros (generic: np_polyadd_real, np_polyadd_int)
          ! np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the
          ! shorter is padded with leading zeros.
          real(kind=dp), intent(in) :: a(:), b(:)
@@ -13472,6 +14442,8 @@ contains
       end function np_polyadd_real
 
       pure function np_polyadd_int(a, b, sgn) result(c)
+         !! np.polyadd(a, b) (sgn = 1) / np.polysub(a, b) (sgn = -1): the shorter is padded with
+         !! leading zeros (generic: np_polyadd_real, np_polyadd_int)
          integer, intent(in) :: a(:), b(:)
          integer, intent(in) :: sgn
          integer, allocatable :: c(:)
@@ -13483,6 +14455,8 @@ contains
       end function np_polyadd_int
 
       pure function np_polymul_real(a, b) result(c)
+         !! np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real,
+         !! np_polymul_int, np_polymul_complex)
          ! np.polymul(a, b): the full convolution of the coefficients, each without
          ! its leading zeros (numpy's poly1d; [] and all zeros are [0]).
          real(kind=dp), intent(in) :: a(:), b(:)
@@ -13511,6 +14485,8 @@ contains
       end function np_polymul_real
 
       pure function np_polymul_int(a, b) result(c)
+         !! np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real,
+         !! np_polymul_int, np_polymul_complex)
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: c(:), a1(:), b1(:)
          integer :: i
@@ -13537,6 +14513,7 @@ contains
       end function np_polymul_int
 
       pure function np_polymul_int_i64(a, b) result(c)
+         !! np.polymul of 64-bit integer coefficients
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: a(:), b(:)
          integer(kind=int64), allocatable :: c(:), a1(:), b1(:)
@@ -13564,6 +14541,8 @@ contains
       end function np_polymul_int_i64
 
       pure function np_polymul_complex(a, b) result(c)
+         !! np.polymul(a, b): the full convolution of the coefficients (generic: np_polymul_real,
+         !! np_polymul_int, np_polymul_complex)
          complex(kind=dp), intent(in) :: a(:), b(:)
          complex(kind=dp), allocatable :: c(:), a1(:), b1(:)
          integer :: i
@@ -13590,6 +14569,8 @@ contains
       end function np_polymul_complex
 
       pure function np_polydiv(u, v, part) result(res)
+         !! np.polydiv(u, v)[part]: the quotient (part 0) or the remainder (part 1), with numpy's
+         !! algorithm (leading remainder terms close to zero, allclose with rtol 1e-14, are dropped)
          ! np.polydiv(u, v)[part]: the quotient (part 0) or the remainder
          ! (part 1), with numpy's algorithm (leading remainder terms close to
          ! zero, allclose with rtol 1e-14, are dropped).
@@ -13622,6 +14603,8 @@ contains
       end function np_polydiv
 
       pure function np_polydiv_complex(u, v, part) result(res)
+         !! np.polydiv(u, v)[part] of complex polynomials: the quotient (part 0) or the remainder
+         !! (part 1), as np_polydiv
          ! np.polydiv(u, v)[part] of complex polynomials: the quotient (part 0) or the remainder
          ! (part 1), with numpy's algorithm (leading remainder terms close to
          ! zero, allclose with rtol 1e-14, are dropped).
@@ -13654,6 +14637,8 @@ contains
       end function np_polydiv_complex
 
       pure function np_polyint(p, m, k) result(y)
+         !! np.polyint(p, m, k): m antiderivatives, integration constants k (a scalar for all, or
+         !! one per integration; default 0)
          ! np.polyint(p, m, k): m antiderivatives, integration constants k
          ! (a scalar for all, or one per integration; default 0).
          real(kind=dp), intent(in) :: p(:)
@@ -13695,6 +14680,7 @@ contains
       end function nan_quantile_vec
 
       pure function nan_quantile_axis_2d(x, q, dim) result(out)
+         !! np.nanquantile(x, q, axis=dim-1) of a matrix
          ! np.nanquantile(x, q, axis=dim-1) of a matrix.
          real(kind=dp), intent(in) :: x(:,:), q
          integer, intent(in) :: dim
@@ -13714,6 +14700,7 @@ contains
       end function nan_quantile_axis_2d
 
       pure function nan_quantile_qvec(x, q) result(v)
+         !! np.nanquantile(x, q) of a vector at several probabilities q
          ! np.nanquantile(x, q) of a vector at each probability of q.
          real(kind=dp), intent(in) :: x(:), q(:)
          real(kind=dp) :: v(size(q))
@@ -13724,6 +14711,7 @@ contains
       end function nan_quantile_qvec
 
       pure function nan_quantile_axis_2d_q(x, q, dim) result(out)
+         !! np.nanquantile(x, q, axis=dim-1) of a matrix at several probabilities: row k for q(k)
          ! np.nanquantile(x, q, axis=dim-1) of a matrix for a vector q: numpy's
          ! shape (size(q), the other extent), row k for q(k).
          real(kind=dp), intent(in) :: x(:,:), q(:)
@@ -13737,6 +14725,8 @@ contains
       end function nan_quantile_axis_2d_q
 
       pure function np_trapezoid_1d(y, dx, x) result(s)
+         !! np.trapezoid(y, x=x | dx=dx) of a vector, summed as numpy does: sum(d * (y[1:] + y[:-1])
+         !! / 2)
          ! np.trapezoid(y, x=x | dx=dx) of a vector, summed as numpy does:
          ! sum(d * (y[1:] + y[:-1]) / 2).
          real(kind=dp), intent(in) :: y(:)
@@ -13757,6 +14747,9 @@ contains
       end function np_trapezoid_1d
 
       pure function np_gradient_1d(f, edge_order, dx, x) result(g)
+         !! np.gradient(f, [dx | x], edge_order=...) of a vector, with numpy's formulas:
+         !! second-order interior differences (for uneven coordinates x too), first- or second-order
+         !! one-sided ...
          ! np.gradient(f, [dx | x], edge_order=...) of a vector, with numpy's
          ! formulas: second-order interior differences (for uneven
          ! coordinates x too), first- or second-order one-sided edges.
@@ -13832,6 +14825,8 @@ contains
       end function np_gradient_1d
 
       pure function np_gradient_2d(f, dim, edge_order, dx, x) result(g)
+         !! np.gradient(f, ..., axis=dim-1) of a matrix: each column (dim 1) or row (dim 2)
+         !! differentiated by np_gradient_1d
          ! np.gradient(f, ..., axis=dim-1) of a matrix: each column (dim 1)
          ! or row (dim 2) differentiated by np_gradient_1d.
          real(kind=dp), intent(in) :: f(:,:)
@@ -13853,6 +14848,7 @@ contains
       end function np_gradient_2d
 
       pure function unwrap_1d(x) result(y)
+         !! unwrap 1D phase vector using numpy-like default discontinuity pi
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
          integer :: n, i
@@ -13876,6 +14872,7 @@ contains
       end function unwrap_1d
 
       pure function bitwise_count_int(x) result(y)
+         !! population count for each integer element
          integer, intent(in) :: x(:)
          integer, allocatable :: y(:)
          integer :: i
@@ -13887,6 +14884,7 @@ contains
       end function bitwise_count_int
 
       pure elemental function i0_scalar(x) result(y)
+         !! modified Bessel function I0 approximation (elemental)
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: y
          real(kind=dp) :: ax, t
@@ -13905,6 +14903,7 @@ contains
       end function i0_scalar
 
       pure elemental function sinc_scalar(x) result(y)
+         !! normalized sinc(x) = sin(pi*x)/(pi*x) with sinc(0)=1
          real(kind=dp), intent(in) :: x
          real(kind=dp) :: y, pix
          if (abs(x) < 1.0e-12_dp) then
@@ -13916,6 +14915,7 @@ contains
       end function sinc_scalar
 
       pure elemental function signbit_real(x) result(y)
+         !! true when IEEE sign bit is set (including -0.0)
          real(kind=dp), intent(in) :: x
          logical :: y
          integer(kind=int64) :: bits
@@ -13924,6 +14924,7 @@ contains
       end function signbit_real
 
       pure elemental function gcd_int_scalar(a, b) result(g)
+         !! greatest common divisor
          integer, intent(in) :: a, b
          integer :: g, x, y, t
          x = abs(a)
@@ -13937,6 +14938,7 @@ contains
       end function gcd_int_scalar
 
       pure elemental function gcd_int_scalar_i64(a, b) result(g)
+         !! greatest common divisor of 64-bit integers
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: a, b
          integer(kind=int64) :: g, x, y, t
@@ -13951,6 +14953,7 @@ contains
       end function gcd_int_scalar_i64
 
       pure elemental function lcm_int_scalar(a, b) result(l)
+         !! least common multiple
          integer, intent(in) :: a, b
          integer :: l, g
          if (a == 0 .or. b == 0) then
@@ -13962,6 +14965,7 @@ contains
       end function lcm_int_scalar
 
       pure elemental function lcm_int_scalar_i64(a, b) result(l)
+         !! least common multiple of 64-bit integers
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: a, b
          integer(kind=int64) :: l, g
@@ -13974,6 +14978,7 @@ contains
       end function lcm_int_scalar_i64
 
       pure function gcd_int(a) result(g)
+         !! greatest common divisor of integer array
          integer, intent(in) :: a(:)
          integer :: g, i
          if (size(a) == 0) then
@@ -13987,6 +14992,7 @@ contains
       end function gcd_int
 
       pure function lcm_int(a) result(l)
+         !! least common multiple of integer array
          integer, intent(in) :: a(:)
          integer :: l, i
          if (size(a) == 0) then
@@ -14000,6 +15006,7 @@ contains
       end function lcm_int
 
       pure function lcm_int_i64(a) result(l)
+         !! least common multiple of a 64-bit integer array
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: a(:)
          integer(kind=int64) :: l, i
@@ -14014,6 +15021,8 @@ contains
       end function lcm_int_i64
 
       pure function interp_periodic_1d(x, xp, fp, period) result(y)
+         !! np.interp(x, xp, fp, period=p): x and xp are reduced modulo |p|, xp sorted (fp with it)
+         !! and extended by one point at each end across the period boundary, as numpy does
          ! np.interp(x, xp, fp, period=p): x and xp are reduced modulo |p|,
          ! xp sorted (fp with it) and extended by one point at each end
          ! across the period boundary, as numpy does.
@@ -14041,6 +15050,7 @@ contains
       end function interp_periodic_1d
 
       pure function interp_periodic_0d(x, xp, fp, period) result(y)
+         !! np.interp(x, xp, fp, period=p) at a scalar x
          real(kind=dp), intent(in) :: x, xp(:), fp(:), period
          real(kind=dp) :: y, r(1)
          r = interp_periodic_1d([x], xp, fp, period)
@@ -14048,6 +15058,7 @@ contains
       end function interp_periodic_0d
 
       pure function interp_0d(x, xp, fp, left, right) result(y)
+         !! np.interp of a scalar x
          ! np.interp of a scalar x.
          real(kind=dp), intent(in) :: x, xp(:), fp(:)
          real(kind=dp), intent(in), optional :: left, right
@@ -14057,6 +15068,7 @@ contains
       end function interp_0d
 
       pure function interp_1d(x, xp, fp, left, right) result(y)
+         !! 1D linear interpolation with endpoint clamping
          ! np.interp(x, xp, fp, left=, right=) as numpy computes it: j is the
          ! last index with xp(j) <= x (so with repeated xp values the last
          ! one is used), y = fp(j) where x == xp(j), else
@@ -14119,6 +15131,7 @@ contains
       end function interp_1d
 
       subroutine linalg_lstsq_mat(a, b, x, residuals, rnk, s, rcond)
+         !! (generic: linalg_lstsq_vec, linalg_lstsq_mat)
          real(dp), intent(in) :: a(:,:), b(:,:)
          real(dp), allocatable, intent(out) :: x(:,:), residuals(:), s(:)
          integer, intent(out) :: rnk
@@ -14163,6 +15176,7 @@ contains
       end subroutine linalg_lstsq_mat
 
       subroutine linalg_lstsq_vec(a, b, x, residuals, rnk, s, rcond)
+         !! (generic: linalg_lstsq_vec, linalg_lstsq_mat)
          real(dp), intent(in) :: a(:,:), b(:)
          real(dp), allocatable, intent(out) :: x(:), residuals(:), s(:)
          integer, intent(out) :: rnk
@@ -14173,6 +15187,7 @@ contains
       end subroutine linalg_lstsq_vec
 
       function linalg_lstsq_x_mat(a, b, rcond) result(x)
+         !! (generic: linalg_lstsq_x_vec, linalg_lstsq_x_mat)
          real(dp), intent(in) :: a(:,:), b(:,:)
          real(dp), optional, intent(in) :: rcond
          real(dp), allocatable :: x(:,:), residuals(:), s(:)
@@ -14181,6 +15196,7 @@ contains
       end function linalg_lstsq_x_mat
 
       function linalg_lstsq_x_vec(a, b, rcond) result(x)
+         !! (generic: linalg_lstsq_x_vec, linalg_lstsq_x_mat)
          real(dp), intent(in) :: a(:,:), b(:)
          real(dp), optional, intent(in) :: rcond
          real(dp), allocatable :: x(:), residuals(:), s(:)
@@ -14189,6 +15205,7 @@ contains
       end function linalg_lstsq_x_vec
 
       function linalg_solve_vec(a, b) result(x)
+         !! solve linear system A x = b using LAPACK DGESV
          real(kind=dp), intent(in) :: a(:,:), b(:)
          real(kind=dp), allocatable :: x(:)
          real(kind=dp), allocatable :: ac(:,:), bc(:,:)
@@ -14215,6 +15232,7 @@ contains
       end function linalg_solve_vec
 
       subroutine linalg_solve_safe_vec(a, b, x, ok)
+         !! solve linear system A x = b using LAPACK DGESV and return success status
          real(kind=dp), intent(in) :: a(:,:), b(:)
          real(kind=dp), allocatable, intent(out) :: x(:)
          logical, intent(out) :: ok
@@ -14246,6 +15264,7 @@ contains
       end subroutine linalg_solve_safe_vec
 
       function linalg_solve_mat(a, b) result(x)
+         !! solve linear system A x = b using LAPACK DGESV
          real(kind=dp), intent(in) :: a(:,:), b(:,:)
          real(kind=dp), allocatable :: x(:,:)
          real(kind=dp), allocatable :: ac(:,:), bc(:,:)
@@ -14272,6 +15291,7 @@ contains
       end function linalg_solve_mat
 
       function linalg_solve_complex_vec(a, b) result(x)
+         !! solve linear system A x = b using LAPACK DGESV
          complex(dp), intent(in) :: a(:,:), b(:)
          complex(dp), allocatable :: x(:), xm(:,:)
          xm = linalg_solve_complex_mat(a, reshape(b, [size(b), 1]))
@@ -14279,6 +15299,7 @@ contains
       end function linalg_solve_complex_vec
 
       function linalg_solve_complex_mat(a, b) result(x)
+         !! solve linear system A x = b using LAPACK DGESV
          complex(dp), intent(in) :: a(:,:), b(:,:)
          complex(dp), allocatable :: x(:,:)
          real(dp), allocatable :: ac(:,:), bc(:,:)
@@ -14314,6 +15335,7 @@ contains
       end function linalg_solve_complex_mat
 
       function linalg_cholesky(a) result(l)
+         !! lower-triangular Cholesky factor using LAPACK DPOTRF
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable :: l(:,:)
          integer :: n, i, j, info
@@ -14339,6 +15361,7 @@ contains
       end function linalg_cholesky
 
       pure function complex_embed(a) result(e)
+         !! the real matrix [Re(A), -Im(A); Im(A), Re(A)] of a complex matrix A
          ! The real matrix [Re(A), -Im(A); Im(A), Re(A)] of a complex A: sums,
          ! products, inverses, conjugate transposes and pseudo-inverses of
          ! complex matrices are those of their embeddings.
@@ -14363,6 +15386,7 @@ contains
       end function complex_unembed
 
       function linalg_inv_complex(a) result(ai)
+         !! np.linalg.inv of a complex matrix (through its real embedding)
          ! np.linalg.inv of a complex matrix (through its real embedding).
          complex(dp), intent(in) :: a(:,:)
          complex(dp), allocatable :: ai(:,:)
@@ -14371,6 +15395,7 @@ contains
       end function linalg_inv_complex
 
       function linalg_pinv_complex(a) result(ap)
+         !! np.linalg.pinv of a complex matrix (through its real embedding)
          ! np.linalg.pinv of a complex matrix (through its real embedding,
          ! whose singular values are A's, each twice).
          complex(dp), intent(in) :: a(:,:)
@@ -14379,6 +15404,7 @@ contains
       end function linalg_pinv_complex
 
       function linalg_cond_complex(a) result(cnd)
+         !! np.linalg.cond (2-norm) of a complex matrix
          ! np.linalg.cond (2-norm) of a complex matrix.
          complex(dp), intent(in) :: a(:,:)
          real(dp) :: cnd
@@ -14386,6 +15412,7 @@ contains
       end function linalg_cond_complex
 
       function linalg_eigvalsh_complex(a) result(w)
+         !! np.linalg.eigvalsh of a complex Hermitian matrix (its lower triangle)
          ! np.linalg.eigvalsh of a complex Hermitian matrix (its lower
          ! triangle, as numpy): the embedding is symmetric, with each
          ! eigenvalue twice.
@@ -14408,6 +15435,7 @@ contains
       end function linalg_eigvalsh_complex
 
       pure function linalg_det_complex(a) result(detv)
+         !! np.linalg.det of a complex matrix (LU with partial pivoting)
          ! np.linalg.det of a complex matrix: LU with partial pivoting.
          complex(dp), intent(in) :: a(:,:)
          complex(dp) :: detv
@@ -14438,6 +15466,7 @@ contains
       end function linalg_det_complex
 
       function linalg_matrix_power_complex(a, p) result(ap)
+         !! np.linalg.matrix_power of a complex matrix
          ! np.linalg.matrix_power of a complex matrix (by squaring; a
          ! negative power of the inverse).
          complex(dp), intent(in) :: a(:,:)
@@ -14464,6 +15493,8 @@ contains
       end function linalg_matrix_power_complex
 
       pure function linalg_cholesky_complex(a) result(l)
+         !! np.linalg.cholesky of a complex Hermitian positive-definite matrix: lower L with a real
+         !! positive diagonal
          ! np.linalg.cholesky of a complex Hermitian positive-definite
          ! matrix (its lower triangle): lower L, real positive diagonal.
          complex(dp), intent(in) :: a(:,:)
@@ -14484,6 +15515,8 @@ contains
       end function linalg_cholesky_complex
 
       pure subroutine linalg_eig_complex(a, w, v)
+         !! np.linalg.eig of a complex matrix, eigenvectors normalized as zgeev (unit norm, largest
+         !! component real)
          ! np.linalg.eig of a complex matrix (dceigv), the eigenvectors
          ! normalized as LAPACK's zgeev does: unit norm, the (first)
          ! largest component real and positive.
@@ -14511,6 +15544,7 @@ contains
       end subroutine linalg_eig_complex
 
       function linalg_det(a) result(detv)
+         !! determinant of square matrix using LAPACK DGETRF
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp) :: detv
          real(kind=dp), allocatable :: ac(:,:)
@@ -14544,6 +15578,7 @@ contains
       end function linalg_det
 
       function linalg_inv(a) result(ai)
+         !! matrix inverse using LAPACK DGETRF/DGETRI
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable :: ai(:,:)
          real(kind=dp), allocatable :: ac(:,:), work(:)
@@ -14582,6 +15617,7 @@ contains
       end function linalg_inv
 
       function linalg_cond(a) result(cnd)
+         !! 2-norm condition number using SVD singular values
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp) :: cnd
          real(kind=dp), allocatable :: u(:,:), s(:), vt(:,:)
@@ -14602,6 +15638,7 @@ contains
       end function linalg_cond
 
       integer function linalg_matrix_rank(a) result(rnk)
+         !! numerical matrix rank using SVD singular values and NumPy-like tolerance
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable :: u(:,:), s(:), vt(:,:)
          real(kind=dp) :: smax, tol
@@ -14620,6 +15657,7 @@ contains
       end function linalg_matrix_rank
 
       function linalg_eigvals_real(a) result(w)
+         !! eigenvalues of real or complex square matrix
          real(kind=dp), intent(in) :: a(:,:)
          complex(kind=dp), allocatable :: w(:)
          real(kind=dp), allocatable :: ac(:,:), wr(:), wi(:), vr_dummy(:,:), vl_dummy(:,:), work(:)
@@ -14652,6 +15690,7 @@ contains
       end function linalg_eigvals_real
 
       pure function linalg_eigvals_complex(a) result(w)
+         !! eigenvalues of real or complex square matrix
          use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
          complex(dp), intent(in) :: a(:,:)
          complex(dp), allocatable :: w(:)
@@ -14682,6 +15721,7 @@ contains
       end function linalg_eigvals_complex
 
       subroutine linalg_eig(a, w, v)
+         !! complex right eigenpairs of real square matrix using LAPACK DGEEV
          real(kind=dp), intent(in) :: a(:,:)
          complex(kind=dp), allocatable, intent(out) :: w(:), v(:,:)
          real(kind=dp), allocatable :: ac(:,:), wr(:), wi(:), vr(:,:), vl_dummy(:,:), work(:)
@@ -14729,6 +15769,7 @@ contains
       end subroutine linalg_eig
 
       subroutine linalg_eigh(a, w, v)
+         !! eigenpairs of real symmetric matrix using LAPACK DSYEV
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable, intent(out) :: w(:), v(:,:)
          real(kind=dp), allocatable :: ac(:,:), work(:)
@@ -14760,6 +15801,7 @@ contains
       end subroutine linalg_eigh
 
       function linalg_eigvalsh(a) result(w)
+         !! eigenvalues only of real symmetric matrix using LAPACK DSYEV (jobz='N')
          ! Eigenvalues only of a real symmetric matrix, matching
          ! numpy.linalg.eigvalsh -- same LAPACK DSYEV as linalg_eigh but
          ! with jobz='N' (skip computing eigenvectors).
@@ -14792,6 +15834,7 @@ contains
       end function linalg_eigvalsh
 
       function linalg_pinv(a) result(ap)
+         !! Moore-Penrose pseudo-inverse via economy SVD
          ! Moore-Penrose pseudo-inverse via economy SVD (A = U S V^T):
          ! pinv(A) = V * diag(1/s_i, s_i > tol else 0) * U^T, matching
          ! numpy.linalg.pinv's default rcond-based singular-value cutoff
@@ -14823,6 +15866,7 @@ contains
       end function linalg_pinv
 
       function linalg_matrix_power(a, p) result(ap)
+         !! integer matrix power (identity at p=0, repeated matmul of inv(a) for p<0)
          ! Integer matrix power, matching numpy.linalg.matrix_power: p=0
          ! gives the identity, p>0 repeated matmul, p<0 repeated matmul
          ! of linalg_inv(a).
@@ -14850,6 +15894,7 @@ contains
       end function linalg_matrix_power
 
       subroutine linalg_qr_reduced(a, q, r)
+         !! reduced QR factorization using LAPACK DGEQRF/DORGQR
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable, intent(out) :: q(:,:), r(:,:)
          real(kind=dp), allocatable :: ac(:,:), tau(:), work(:)
@@ -14901,6 +15946,7 @@ contains
       end subroutine linalg_qr_reduced
 
       function matrix_norm2_real(a) result(value)
+         !! matrix spectral norm
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp) :: value
          real(kind=dp), allocatable :: u(:,:), s(:), vt(:,:)
@@ -14910,6 +15956,7 @@ contains
       end function matrix_norm2_real
 
       function matrix_norm2_complex(a) result(value)
+         !! matrix spectral norm
          complex(kind=dp), intent(in) :: a(:,:)
          real(kind=dp) :: value
          real(kind=dp), allocatable :: block_a(:,:)
@@ -14927,6 +15974,7 @@ contains
       end function matrix_norm2_complex
 
       subroutine linalg_svd(a, u, s, vt)
+         !! full SVD using LAPACK DGESVD
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable, intent(out) :: u(:,:), s(:), vt(:,:)
          real(kind=dp), allocatable :: ac(:,:), work(:)
@@ -14959,6 +16007,7 @@ contains
       end subroutine linalg_svd
 
       subroutine linalg_svd_econ(a, u, s, vt)
+         !! economy/reduced SVD (full_matrices=False) using LAPACK DGESVD
          ! Economy/reduced SVD, matching numpy's
          ! np.linalg.svd(a, full_matrices=False): u is (m, k), vt is
          ! (k, n), k = min(m, n) -- vs linalg_svd's full (m, m)/(n, n).
@@ -14995,6 +16044,8 @@ contains
       end subroutine linalg_svd_econ
 
       pure subroutine leggauss(n, x, w)
+         !! Gauss-Legendre quadrature nodes x and weights w on [-1,1] for degree n, matching
+         !! numpy.polynomial.legendre.leggauss
          ! Gauss-Legendre quadrature nodes and weights on [-1, 1], matching
          ! numpy.polynomial.legendre.leggauss(n). Classic Newton-iteration
          ! algorithm (nodes are the roots of the degree-n Legendre
@@ -15034,6 +16085,7 @@ contains
       end subroutine leggauss
 
       pure real(kind=dp) function quantile_linear(x, q)
+         !! 1D quantile with linear interpolation (NumPy-like default)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), intent(in) :: q
          real(kind=dp), allocatable :: xs(:)
@@ -15074,6 +16126,7 @@ contains
       end function quantile_linear
 
       pure function quantile_linear_vec(x, q) result(out)
+         !! 1D quantiles at multiple probabilities with linear interpolation (NumPy-like default)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), intent(in) :: q(:)
          real(kind=dp) :: out(size(q))
@@ -15084,6 +16137,7 @@ contains
       end function quantile_linear_vec
 
       pure function statistics_quantiles_real(x, n) result(q)
+         !! statistics.quantiles default exclusive method for 1D real vector
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: n
          real(kind=dp), allocatable :: q(:)
@@ -15113,6 +16167,7 @@ contains
       end function statistics_quantiles_real
 
       pure real(kind=dp) function var(x, ddof)
+         !! variance of 1D real vector with optional ddof (numpy-style)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: ddof
          integer :: n, d
@@ -15132,6 +16187,7 @@ contains
       end function var
 
       pure real(kind=dp) function mean(x)
+         !! mean of 1D real vector
          real(kind=dp), intent(in) :: x(:)
          if (size(x) <= 0) then
             mean = ieee_value(0.0_dp, ieee_quiet_nan)  ! numpy: nan for an empty array
@@ -15141,6 +16197,7 @@ contains
       end function mean
 
       pure real(kind=dp) function std(x, ddof)
+         !! standard deviation of 1D real vector with optional ddof (numpy-style)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: ddof
          if (present(ddof)) then
@@ -15151,12 +16208,14 @@ contains
       end function std
 
       pure elemental real(kind=dp) function log2(x)
+         !! base-2 logarithm
          real(kind=dp), intent(in) :: x
          real(kind=dp), parameter :: log2_base = log(2.0_dp)
          log2 = log(x) / log2_base
       end function log2
 
       pure real(kind=dp) function nansum(x)
+         !! sum ignoring NaN values
          real(kind=dp), intent(in) :: x(:)
          integer :: i
          nansum = 0.0_dp
@@ -15166,6 +16225,7 @@ contains
       end function nansum
 
       pure real(kind=dp) function nanmean(x)
+         !! mean ignoring NaN values
          real(kind=dp), intent(in) :: x(:)
          integer :: i, cnt
          nanmean = 0.0_dp
@@ -15184,6 +16244,7 @@ contains
       end function nanmean
 
       pure real(kind=dp) function nanvar(x, ddof)
+         !! variance ignoring NaN values with optional ddof
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: ddof
          integer :: i, cnt, d
@@ -15214,6 +16275,7 @@ contains
       end function nanvar
 
       pure real(kind=dp) function nanstd(x, ddof)
+         !! standard deviation ignoring NaN values with optional ddof
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: ddof
          if (present(ddof)) then
@@ -15224,6 +16286,7 @@ contains
       end function nanstd
 
       pure real(kind=dp) function nanmin(x)
+         !! minimum ignoring NaN values
          real(kind=dp), intent(in) :: x(:)
          integer :: i
          logical :: found
@@ -15242,6 +16305,7 @@ contains
       end function nanmin
 
       pure real(kind=dp) function nanmax(x)
+         !! maximum ignoring NaN values
          real(kind=dp), intent(in) :: x(:)
          integer :: i
          logical :: found
@@ -15260,6 +16324,7 @@ contains
       end function nanmax
 
       pure integer function nanargmin(x)
+         !! 0-based argmin ignoring NaN values; -1 when all NaN
          real(kind=dp), intent(in) :: x(:)
          integer :: i, best
          logical :: found
@@ -15283,6 +16348,7 @@ contains
       end function nanargmin
 
       pure integer function nanargmax(x)
+         !! 0-based argmax ignoring NaN values; -1 when all NaN
          real(kind=dp), intent(in) :: x(:)
          integer :: i, best
          logical :: found
@@ -15306,6 +16372,7 @@ contains
       end function nanargmax
 
       pure subroutine unique_int_counts(a, u, cnt)
+         !! unique values with counts
          integer, intent(in) :: a(:)
          integer, allocatable, intent(out) :: u(:), cnt(:)
          integer :: i, j
@@ -15323,6 +16390,7 @@ contains
       end subroutine unique_int_counts
 
       pure function tri_int(n, m, k) result(t)
+         !! lower-triangular ones matrix with diagonal offset k
          integer, intent(in) :: n, m
          integer, intent(in), optional :: k
          integer, allocatable :: t(:,:)
@@ -15339,6 +16407,7 @@ contains
       end function tri_int
 
       pure function tri_real(n, m, k) result(t)
+         !! lower-triangular ones matrix with diagonal offset k
          integer, intent(in) :: n, m
          integer, intent(in), optional :: k
          real(kind=dp), allocatable :: t(:,:)
@@ -15355,6 +16424,7 @@ contains
       end function tri_real
 
       pure function moveaxis3_int(a, src, dst) result(b)
+         !! move one axis for rank-3 integer arrays (NumPy-style indices)
          integer, intent(in) :: a(:,:,:)
          integer, intent(in) :: src, dst
          integer, allocatable :: b(:,:,:)
@@ -15375,6 +16445,7 @@ contains
       end function moveaxis3_int
 
       pure function moveaxis3_real(a, src, dst) result(b)
+         !! move one axis for rank-3 real arrays (NumPy-style indices)
          real(kind=dp), intent(in) :: a(:,:,:)
          integer, intent(in) :: src, dst
          real(kind=dp), allocatable :: b(:,:,:)
@@ -15395,6 +16466,7 @@ contains
       end function moveaxis3_real
 
       pure function moveaxis3_logical(a, src, dst) result(b)
+         !! move one axis for rank-3 logical arrays (NumPy-style indices)
          logical, intent(in) :: a(:,:,:)
          integer, intent(in) :: src, dst
          logical, allocatable :: b(:,:,:)
@@ -15415,6 +16487,7 @@ contains
       end function moveaxis3_logical
 
       pure function pad2d_int(a, pt, pb, pl, pr, c) result(out)
+         !! 2D constant pad for integer matrix
          integer, intent(in) :: a(:,:)
          integer, intent(in) :: pt, pb, pl, pr, c
          integer, allocatable :: out(:,:)
@@ -15426,6 +16499,7 @@ contains
       end function pad2d_int
 
       pure function pad2d_real(a, pt, pb, pl, pr, c) result(out)
+         !! 2D constant pad for real matrix
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in) :: pt, pb, pl, pr
          real(kind=dp), intent(in) :: c
@@ -15438,6 +16512,7 @@ contains
       end function pad2d_real
 
       pure logical function allclose_real(a, b, rtol, atol, equal_nan)
+         !! NumPy-like allclose on 1D arrays
          real(kind=dp), intent(in) :: a(:), b(:)
          real(kind=dp), intent(in), optional :: rtol, atol
          logical, intent(in), optional :: equal_nan
@@ -15477,6 +16552,7 @@ contains
       end function allclose_real
 
       pure logical function allclose_integer(a, b, rtol, atol)
+         !! NumPy-like allclose on 1D integer arrays
          integer, intent(in) :: a(:), b(:)
          real(kind=dp), intent(in), optional :: rtol, atol
          real(kind=dp) :: rtolv, atolv
@@ -15499,6 +16575,8 @@ contains
       end function allclose_integer
 
       pure function isclose_real(a, b, rtol, atol, equal_nan) result(mask)
+         !! element-wise version of allclose (NumPy's isclose), a or b may have length 1 to
+         !! broadcast
          ! Element-wise version of allclose_real's same tolerance test
          ! (abs(a-b) <= atol + rtol*abs(b)) and the same NaN handling
          ! (a NaN element is never "close" unless equal_nan is true and
@@ -15554,6 +16632,7 @@ contains
       end function isclose_real
 
       pure elemental function isclose_scalar_real(a, b, rtol, atol, equal_nan) result(is_close)
+         !! scalar counterpart of isclose_real, for np.isclose() with two scalar arguments
          ! Scalar counterpart of isclose_real, same tolerance test and
          ! NaN handling -- needed because a plain (non-pointer) array-
          ! valued function's result can't be indexed at the call site in
@@ -15587,6 +16666,7 @@ contains
       end function isclose_scalar_real
 
       pure function cov2_real(x, y, ddof) result(c)
+         !! 2x2 covariance matrix for two real vectors
          real(kind=dp), intent(in) :: x(:), y(:)
          integer, intent(in), optional :: ddof
          real(kind=dp), allocatable :: c(:,:)
@@ -15607,6 +16687,7 @@ contains
       end function cov2_real
 
       pure function cov_matrix_rows_real(x, ddof) result(c)
+         !! covariance matrix for observations in rows (numpy rowvar=False)
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in), optional :: ddof
          real(kind=dp), allocatable :: c(:,:)
@@ -15628,6 +16709,8 @@ contains
       end function cov_matrix_rows_real
 
       pure function cov_matrix_rows_complex(x, ddof) result(c)
+         !! covariance matrix of complex variables in columns (numpy rowvar=False): Xc^T conj(Xc) /
+         !! (n - ddof)
          ! numpy's np.cov of complex variables in the columns of x
          ! (rowvar=False): Xc^T conj(Xc) / (n - ddof), Xc the centered x. As
          ! in numpy, n - ddof <= 0 divides by zero.
@@ -15651,6 +16734,8 @@ contains
       end function cov_matrix_rows_complex
 
       pure function corrcoef_matrix_rows_complex(x) result(r)
+         !! correlation matrix of complex variables in columns (numpy rowvar=False), real and
+         !! imaginary parts clipped to [-1, 1]
          ! numpy's np.corrcoef of complex variables in the columns of x
          ! (rowvar=False): c(i,j) / (s(i) s(j)), s the square roots of the
          ! real parts of c's diagonal, with the real and imaginary parts
@@ -15676,6 +16761,7 @@ contains
       end function corrcoef_matrix_rows_complex
 
       pure function corrcoef2_real(x, y) result(r)
+         !! 2x2 correlation matrix for two real vectors
          real(kind=dp), intent(in) :: x(:), y(:)
          real(kind=dp), allocatable :: r(:,:)
          real(kind=dp), allocatable :: c(:,:)
@@ -15697,6 +16783,7 @@ contains
       end function corrcoef2_real
 
       pure real(kind=dp) function corr2_1d(x, y)
+         !! Pearson correlation of two 1D real vectors as a plain scalar
          ! Pearson correlation of two 1D real vectors, as a plain scalar
          ! -- a thin wrapper around corrcoef2_real (whose 2x2 matrix
          ! result can't be subscripted inline in the same expression as
@@ -15710,6 +16797,7 @@ contains
       end function corr2_1d
 
       pure real(kind=dp) function autocorr_1d(x, lag)
+         !! pandas-style lag-k serial autocorrelation of a 1D real vector
          ! pandas Series.autocorr(lag) -- lag-k serial correlation of a
          ! vector with itself.
          real(kind=dp), intent(in) :: x(:)
@@ -15726,6 +16814,7 @@ contains
       end function autocorr_1d
 
       pure function corrcoef_matrix_rows_real(x) result(r)
+         !! correlation matrix for observations in rows (numpy rowvar=False)
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: r(:,:)
          real(kind=dp), allocatable :: c(:,:), s(:)
@@ -15749,6 +16838,7 @@ contains
       end function corrcoef_matrix_rows_real
 
       function convolve_real(x, h, mode, np_same) result(y)
+         !! 1D convolution with mode full/same/valid (same: scipy's, or np.convolve's with np_same)
          ! 1-D convolution, mode full/same/valid. "same": the length of x,
          ! centered (scipy.signal.convolve), or with np_same numpy's
          ! np.convolve: the longer length, from (min(nx, nh) - 1) / 2.
@@ -15805,6 +16895,7 @@ contains
       end function convolve_real
 
       pure function diff_axis0_real_2d(x) result(y)
+         !! first difference along axis 0 for a real matrix
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: y(:,:)
          if (size(x, 1) <= 1) then
@@ -15815,6 +16906,7 @@ contains
       end function diff_axis0_real_2d
 
       pure function diff_axis1_real_2d(x) result(y)
+         !! first difference along axis 1 for a real matrix
          real(kind=dp), intent(in) :: x(:,:)
          real(kind=dp), allocatable :: y(:,:)
          if (size(x, 2) <= 1) then
@@ -15826,6 +16918,7 @@ contains
 
 
       pure function sliding_window_view_axis0_real_2d(a, window) result(out)
+         !! axis-0 sliding window view for a real matrix
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in) :: window
          real(kind=dp), allocatable :: out(:,:,:)
@@ -15847,6 +16940,7 @@ contains
 
 
       function convolve_int(x, h, mode, np_same) result(y)
+         !! 1D integer convolution with mode full/same/valid
          ! 1-D convolution, mode full/same/valid. "same": the length of x,
          ! centered (scipy.signal.convolve), or with np_same numpy's
          ! np.convolve: the longer length, from (min(nx, nh) - 1) / 2.
@@ -15903,6 +16997,7 @@ contains
       end function convolve_int
 
       function convolve_int_i64(x, h, mode, np_same) result(y)
+         !! 1D convolution of 64-bit integer vectors, mode full/same/valid
          use, intrinsic :: iso_fortran_env, only: int64
          ! 1-D convolution, mode full/same/valid. "same": the length of x,
          ! centered (scipy.signal.convolve), or with np_same numpy's
@@ -15960,6 +17055,8 @@ contains
       end function convolve_int_i64
 
       function correlate_real(x, y, mode, np_same) result(out)
+         !! 1D cross-correlation with mode full/same/valid (scipy.signal.correlate; np.correlate's
+         !! same with np_same)
          ! scipy.signal.correlate(x, y) = convolve(x, conj(y[::-1])) for
          ! real inputs -- reuse convolve_real with y time-reversed. "same"
          ! with np_same: np.correlate's, the longer length, from
@@ -15991,6 +17088,7 @@ contains
       end function correlate_real
 
       pure function lfilter_real(b, a, x, zi) result(y)
+         !! 1D IIR/FIR filter, zero initial conditions (scipy.signal.lfilter)
          ! scipy.signal.lfilter(b, a, x), zero initial conditions unless
          ! zi is given: Direct Form II Transposed IIR/FIR recursion (the
          ! same structure scipy's own Fortran/C backend uses). b and a
@@ -16029,6 +17127,7 @@ contains
       end function lfilter_real
 
       function lfilter_zi_real(b, a) result(zi)
+         !! steady-state IIR filter initial state for a unit step input (scipy.signal.lfilter_zi)
          ! scipy.signal.lfilter_zi(b, a): steady-state initial filter
          ! state for a unit step input, found by solving
          ! (I - companion(a).T) @ zi = b(2:) - a(2:)*b(1) for normalized
@@ -16068,6 +17167,7 @@ contains
       end function lfilter_zi_real
 
       function filtfilt_real(b, a, x) result(y)
+         !! zero-phase forward-backward filter, no edge padding (scipy.signal.filtfilt)
          ! scipy.signal.filtfilt(b, a, x): zero-phase filtering, forward
          ! pass then backward pass, each seeded with lfilter_zi-based
          ! steady-state initial conditions scaled by the pass's first
@@ -16087,6 +17187,7 @@ contains
       end function filtfilt_real
 
       pure function detrend_real(x, dtype) result(y)
+         !! remove linear or constant trend (scipy.signal.detrend)
          ! scipy.signal.detrend(x, type='linear'|'constant').
          real(kind=dp), intent(in) :: x(:)
          character(len=*), intent(in), optional :: dtype
@@ -16128,6 +17229,7 @@ contains
       end function detrend_real
 
       pure function find_peaks_int(x, height, distance) result(peaks)
+         !! 0-based local-maxima indices (scipy.signal.find_peaks, indices only)
          ! scipy.signal.find_peaks(x, height=None, distance=None), peak
          ! indices only (0-based, numpy-compatible) -- the properties
          ! dict scipy also returns is not reproduced. Peaks are strict
@@ -16184,6 +17286,7 @@ contains
       end function find_peaks_int
 
       pure real(kind=dp) function polyval_real_scalar(p, x) result(y)
+         !! evaluate polynomial with descending coefficients at scalar x
          real(kind=dp), intent(in) :: p(:)
          real(kind=dp), intent(in) :: x
          integer :: i
@@ -16198,6 +17301,7 @@ contains
       end function polyval_real_scalar
 
       pure function polyval_real_vec(p, x) result(y)
+         !! evaluate polynomial with descending coefficients at vector x
          real(kind=dp), intent(in) :: p(:)
          real(kind=dp), intent(in) :: x(:)
          real(kind=dp), allocatable :: y(:)
@@ -16209,6 +17313,8 @@ contains
       end function polyval_real_vec
 
       pure function powfromroots_complex(r) result(c)
+         !! np.polynomial.polynomial.polyfromroots of complex roots: the coefficients, lowest degree
+         !! first, of the product of (x - r(k))
          ! np.polynomial.polynomial.polyfromroots of complex roots: the
          ! coefficients (lowest degree first) of the product of (x - r(k)).
          complex(kind=dp), intent(in) :: r(:)
@@ -16225,6 +17331,8 @@ contains
       end function powfromroots_complex
 
       pure function opoly_cx(re, im, trim) result(z)
+         !! complex series coefficients re + 1j*im of two real series (the shorter padded with
+         !! zeros), trailing zeros dropped with trim (numpy trimseq)
          ! The complex coefficients re + 1j*im of two real series of
          ! possibly different lengths (the shorter padded with zeros), with
          ! trim the trailing zero coefficients dropped (at least one kept),
@@ -16246,6 +17354,8 @@ contains
       end function opoly_cx
 
       pure complex(kind=dp) function polyval_complex_scalar(p, x) result(y)
+         !! evaluate polynomial with descending coefficients at scalar x (generic:
+         !! polyval_real_scalar, polyval_real_vec, polyval_complex_scalar, polyval_complex_vec)
          ! np.polyval(p, x) of complex coefficients or a complex x (Horner).
          complex(kind=dp), intent(in) :: p(:)
          complex(kind=dp), intent(in) :: x
@@ -16259,6 +17369,8 @@ contains
       end function polyval_complex_scalar
 
       pure function polyval_complex_vec(p, x) result(y)
+         !! evaluate polynomial with descending coefficients at scalar x (generic:
+         !! polyval_real_scalar, polyval_real_vec, polyval_complex_scalar, polyval_complex_vec)
          complex(kind=dp), intent(in) :: p(:)
          complex(kind=dp), intent(in) :: x(:)
          complex(kind=dp), allocatable :: y(:)
@@ -16270,6 +17382,8 @@ contains
       end function polyval_complex_vec
 
       function polyfit_real(x, y, deg) result(coeffs)
+         !! least-squares polynomial fit (deg+1 coefficients, highest degree first), matching
+         !! numpy.polyfit
          ! Least-squares polynomial fit, matching numpy.polyfit(x, y, deg):
          ! returns deg+1 coefficients, highest degree first (same
          ! convention as polyval/roots). Builds the Vandermonde matrix and
@@ -16295,6 +17409,8 @@ contains
       end function polyfit_real
 
       pure function digitize_real(x, bins) result(idx)
+         !! bin index of each x(i) against increasing bin edges, matching numpy.digitize
+         !! (right=False)
          ! Bin index of each x(i) against increasing bin edges, matching
          ! numpy.digitize(x, bins) with its default right=False: idx(i)
          ! is the count of bin edges <= x(i) (0 if x(i) < bins(1), size
@@ -16320,6 +17436,7 @@ contains
       end function digitize_real
 
       pure function isin_real(a, b) result(mask)
+         !! element-wise membership test, matching numpy.isin (and numpy.in1d) for real arrays
          ! mask(i) = a(i) is present (exactly) in b, matching
          ! numpy.isin(a, b) (and its older alias numpy.in1d) for real
          ! arrays.
@@ -16333,6 +17450,7 @@ contains
       end function isin_real
 
       pure function isin_int(a, b) result(mask)
+         !! element-wise membership test, matching numpy.isin (and numpy.in1d) for integer arrays
          ! Integer counterpart of isin_real.
          integer, intent(in) :: a(:), b(:)
          logical, allocatable :: mask(:)
@@ -16344,6 +17462,7 @@ contains
       end function isin_int
 
       subroutine np_save_1d_real(filename, x)
+         !! write a 1D real array to a binary .npy file, matching numpy.save
          ! Writes a 1D float64 array to a real .npy file (NumPy's binary
          ! array format: an 8-byte preamble of a magic string, a 2-byte
          ! version, and a 2-byte little-endian header length, followed by
@@ -16377,6 +17496,7 @@ contains
       end subroutine np_save_1d_real
 
       function np_load_1d_real(filename) result(x)
+         !! read a 1D real array from a binary .npy file, matching numpy.load
          ! Reads a 1D float64 array from a .npy file written by
          ! numpy.save (or np_save_1d_real). The array length is derived
          ! from the file size minus the preamble+header size rather than
@@ -16404,6 +17524,7 @@ contains
       end function np_load_1d_real
 
       pure function polyder_real(p, m) result(dpcoef)
+         !! m-th derivative coefficients for descending-order polynomial
          real(kind=dp), intent(in) :: p(:)
          integer, intent(in), optional :: m
          real(kind=dp), allocatable :: dpcoef(:)
@@ -16439,6 +17560,7 @@ contains
       end function polyder_real
 
       function polyroots_real(p_in) result(r)
+         !! roots of real-coefficient polynomial (descending order) via LAPACK DGEEV
          ! np.roots(p): leading and trailing zero coefficients are
          ! stripped, the roots of the rest are the eigenvalues of its
          ! companion matrix, and a zero root follows for each trailing zero.
@@ -16605,6 +17727,7 @@ contains
 
 
       pure function fft_fft_real(x, n) result(y)
+         !! numpy-like fft for 1D real/complex input (naive DFT backend)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -16634,6 +17757,7 @@ contains
 
 
       pure function fft_fft_complex(x, n) result(y)
+         !! numpy-like fft for 1D real/complex input (naive DFT backend)
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -16663,6 +17787,7 @@ contains
 
 
       pure function fft_ifft(x, n) result(y)
+         !! numpy-like ifft for 1D complex input (naive DFT backend)
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -16692,6 +17817,7 @@ contains
 
 
       pure function fft_rfft(x, n) result(y)
+         !! numpy-like rfft for 1D real input
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          complex(kind=dp), allocatable :: y(:)
@@ -16707,6 +17833,7 @@ contains
 
 
       pure function fft_irfft(x, n) result(y)
+         !! numpy-like irfft for 1D Hermitian spectrum
          complex(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: n
          real(kind=dp), allocatable :: y(:)
@@ -16742,6 +17869,8 @@ contains
 
 
       pure function fft_axis_2d(x, dim, n, inverse) result(y)
+         !! FFT (or inverse) of each column (dim=1) or row (dim=2) of a matrix, cropped or
+         !! zero-padded to n
          ! The complex FFT (inverse if inverse) of each column (dim=1, numpy
          ! axis 0) or row (dim=2, axis 1) of x, cropped or zero-padded to
          ! length n (default: unchanged).
@@ -16778,6 +17907,7 @@ contains
       end function fft_axis_2d
 
       pure function rfft_axis_2d(x, dim, n) result(y)
+         !! np.fft.rfft of each column (dim=1) or row (dim=2) of a real matrix
          ! np.fft.rfft of each column (dim=1) or row (dim=2) of a real x:
          ! the n/2 + 1 nonnegative-frequency terms (n default size(x, dim)).
          real(kind=dp), intent(in) :: x(:,:)
@@ -16801,6 +17931,7 @@ contains
       end function rfft_axis_2d
 
       pure function irfft_axis_2d(x, dim, n) result(y)
+         !! np.fft.irfft of each column (dim=1) or row (dim=2) of a matrix
          ! np.fft.irfft of each column (dim=1) or row (dim=2) of x: real
          ! signals of length n (default 2*(size(x, dim) - 1)).
          complex(kind=dp), intent(in) :: x(:,:)
@@ -16824,6 +17955,7 @@ contains
       end function irfft_axis_2d
 
       pure function fft2_complex(x, n1, n2) result(y)
+         !! np.fft.fft2 of a real or complex matrix (s=(n1, n2))
          ! np.fft.fft2 (or fftn) of a matrix, each axis cropped or padded to
          ! n1, n2 (numpy's s=).
          complex(kind=dp), intent(in) :: x(:,:)
@@ -16833,6 +17965,7 @@ contains
       end function fft2_complex
 
       pure function fft2_real(x, n1, n2) result(y)
+         !! np.fft.fft2 of a real or complex matrix (s=(n1, n2))
          real(kind=dp), intent(in) :: x(:,:)
          integer, intent(in), optional :: n1, n2
          complex(kind=dp), allocatable :: y(:,:)
@@ -16840,6 +17973,7 @@ contains
       end function fft2_real
 
       pure function ifft2(x, n1, n2) result(y)
+         !! np.fft.ifft2 of a matrix
          ! np.fft.ifft2 (or ifftn) of a matrix.
          complex(kind=dp), intent(in) :: x(:,:)
          integer, intent(in), optional :: n1, n2
@@ -16848,6 +17982,7 @@ contains
       end function ifft2
 
       pure function rfft2(x, n1, n2) result(y)
+         !! np.fft.rfft2 of a real matrix
          ! np.fft.rfft2 (or rfftn) of a real matrix: rfft along axis 1, then
          ! fft along axis 0; size(y, 2) = n2/2 + 1.
          real(kind=dp), intent(in) :: x(:,:)
@@ -16857,6 +17992,7 @@ contains
       end function rfft2
 
       pure function irfft2(x, n1, n2) result(y)
+         !! np.fft.irfft2: inverse of rfft2
          ! np.fft.irfft2 (or irfftn): the inverse of rfft2; n2 (default
          ! 2*(size(x, 2) - 1)) is the length of the real signal's axis 1.
          complex(kind=dp), intent(in) :: x(:,:)
@@ -16867,6 +18003,7 @@ contains
 
 
       pure function fft_fftfreq(n, d) result(f)
+         !! numpy-like fftfreq(n,d)
          integer, intent(in) :: n
          real(kind=dp), intent(in), optional :: d
          real(kind=dp), allocatable :: f(:)
@@ -16894,6 +18031,7 @@ contains
 
 
       pure function fft_rfftfreq(n, d) result(f)
+         !! numpy-like rfftfreq(n,d)
          integer, intent(in) :: n
          real(kind=dp), intent(in), optional :: d
          real(kind=dp), allocatable :: f(:)
@@ -16917,6 +18055,7 @@ contains
 
 
       pure function itertools_product2_int(a, b) result(out)
+         !! itertools.product(a,b) for integer vectors
          integer, intent(in) :: a(:), b(:)
          integer, allocatable :: out(:,:)
          integer :: i, j, k, na, nb
@@ -16936,6 +18075,7 @@ contains
 
 
       pure function itertools_combinations_int(x, r) result(out)
+         !! itertools.combinations(x,r) for integer vectors (r=2 currently)
          integer, intent(in) :: x(:), r
          integer, allocatable :: out(:,:)
          integer :: i, j, k, n
@@ -16962,6 +18102,7 @@ contains
 
 
       pure function itertools_combinations_wr_int(x, r) result(out)
+         !! itertools.combinations_with_replacement(x,r) for integer vectors (r=2 currently)
          integer, intent(in) :: x(:), r
          integer, allocatable :: out(:,:)
          integer :: i, j, k, n
@@ -16988,6 +18129,7 @@ contains
 
 
       pure function itertools_permutations_int(x, r) result(out)
+         !! itertools.permutations(x,r) for integer vectors (r=2 currently)
          integer, intent(in) :: x(:), r
          integer, allocatable :: out(:,:)
          integer :: i, j, k, n
@@ -17015,6 +18157,7 @@ contains
 
 
       function file_read(u) result(s)
+         !! read remaining text from open unit as a single string
          integer, intent(in) :: u
          character(len=:), allocatable :: s
          character(len=4096) :: line
@@ -17034,6 +18177,7 @@ contains
 
 
       pure elemental function py_float(s) result(x)
+         !! parse string to real(dp), NaN on read failure
          character(len=*), intent(in) :: s
          real(kind=dp) :: x
          integer :: ios
@@ -17043,6 +18187,7 @@ contains
       end function py_float
 
       pure elemental function py_int(s) result(x)
+         !! parse string to integer, 0 on read failure
          character(len=*), intent(in) :: s
          integer :: x
          integer :: ios
@@ -17053,6 +18198,7 @@ contains
 
 
       function sys_argv_init() result(argv)
+         !! capture process command arguments (including argv[0])
          character(len=:), allocatable :: argv(:)
          integer :: i, narg, l, maxlen
 
@@ -17070,6 +18216,7 @@ contains
 
 
       pure subroutine sys_argv_delete(argv, idx1)
+         !! delete argv element at 1-based index
          character(len=:), allocatable, intent(inout) :: argv(:)
          integer, intent(in) :: idx1
          character(len=:), allocatable :: tmp(:)
@@ -17090,6 +18237,8 @@ contains
       end subroutine sys_argv_delete
 
       pure function rolling_mean_1d(x, window) result(y)
+         !! rolling mean over a trailing window (NaN until the window fills), Alan Miller's online
+         !! update/downdate algorithm
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: window
          real(kind=dp), allocatable :: y(:)
@@ -17120,6 +18269,8 @@ contains
       end function rolling_mean_1d
 
       pure function rolling_std_1d(x, window, ddof) result(y)
+         !! rolling sample standard deviation over a trailing window (NaN until the window fills),
+         !! Alan Miller's online update/downdate algorithm
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in) :: window
          integer, intent(in), optional :: ddof
@@ -17155,6 +18306,7 @@ contains
       end function rolling_std_1d
 
       pure function expanding_mean_1d(x) result(y)
+         !! expanding (growing-window, min_periods=1) running mean
          ! pandas Series/DataFrame.expanding().mean() -- a growing-window
          ! (from row 1 through row i) running mean, one value per row from
          ! the very first row on (min_periods=1, pandas' default) --
@@ -17175,6 +18327,7 @@ contains
       end function expanding_mean_1d
 
       pure function expanding_std_1d(x, ddof) result(y)
+         !! expanding (growing-window) sample standard deviation
          ! pandas Series/DataFrame.expanding().std() -- growing-window
          ! sample standard deviation (NaN while fewer than ddof+1 rows
          ! have accumulated, pandas' default ddof=1 meaning row 1 alone is
@@ -17201,6 +18354,7 @@ contains
       end function expanding_std_1d
 
       pure function ewm_mean_1d(x, alpha) result(y)
+         !! exponentially weighted moving average (adjust=True, pandas' default)
          ! pandas Series/DataFrame.ewm(...).mean() with adjust=True
          ! (pandas' default): y(t) = sum_{j<=t} w_j*x(j) / sum_{j<=t} w_j,
          ! weight w_j = (1-alpha)**(t-j) (most recent observation weighted
@@ -17226,6 +18380,8 @@ contains
       end function ewm_mean_1d
 
       pure function ewm_std_1d(x, alpha) result(y)
+         !! exponentially weighted sample standard deviation (adjust=True, bias=False, pandas'
+         !! defaults)
          ! pandas Series/DataFrame.ewm(...).std() with adjust=True and
          ! bias=False (both pandas' defaults) -- an exponentially
          ! weighted sample standard deviation, Bessel-corrected the same
@@ -17263,6 +18419,7 @@ contains
       end function ewm_std_1d
 
       pure function shift_1d(x, periods, fill_value) result(y)
+         !! pandas-style Series.shift(periods, fill_value) for a plain 1D real vector
          ! pandas Series.shift(periods[, fill_value]) -- shift values by
          ! `periods` positions (positive shifts toward higher indices,
          ! negative toward lower), filling the vacated positions with
@@ -17298,6 +18455,7 @@ contains
       end function shift_1d
 
       pure elemental function np_rint(x) result(r)
+         !! numpy rint/round: nearest integer, ties to even
          ! numpy rint/round/around: the nearest integer, ties to even
          ! (np.round(2.5) == 2.0, np.round(-0.5) == -0.0); ANINT rounds
          ! ties away from zero. np.round(x, d) is np_rint(x*10**d)/10**d.
@@ -17308,6 +18466,7 @@ contains
       end function np_rint
 
       pure elemental function py_max_real(a, b) result(r)
+         !! Python's max(a, b): b if b > a, else a (max(1.0, nan) == 1.0, max(nan, 1.0) is nan)
          ! Python's max(a, b) keeps a unless b > a; Fortran's MAX with a NaN
          ! argument is processor dependent.
          real(kind=dp), intent(in) :: a, b
@@ -17319,6 +18478,7 @@ contains
       end function py_max_real
 
       pure elemental function py_min_real(a, b) result(r)
+         !! Python's min(a, b): b if b < a, else a (min(1.0, nan) == 1.0)
          ! Python's min(a, b) keeps a unless b < a.
          real(kind=dp), intent(in) :: a, b
          real(kind=dp) :: r
@@ -17328,6 +18488,7 @@ contains
       end function py_min_real
 
       pure elemental function py_round_ndigits(x, ndigits) result(rnd)
+         !! Python 3 round(x, ndigits): ties round to even (banker's rounding)
          ! Python 3's round(x, ndigits): the exact binary value of x rounded
          ! to ndigits decimals, ties to even (round(2.675, 2) == 2.67, since
          ! 2.675 is 2.67499999...; round(0.125, 2) == 0.12). Formatted
@@ -17368,6 +18529,7 @@ contains
       end function py_round_ndigits
 
       pure elemental function floor_div_real(x, y) result(q)
+         !! Python-style real floor division (x // y, floor of the quotient, result stays real)
          ! Python's // on floats is floor(x / y), returned as a float --
          ! not the same operation as ordinary real division, which is
          ! what plain Fortran "/" gives.
@@ -17397,6 +18559,7 @@ contains
       end function floor_div_real
 
       pure elemental integer function py_round_int32(x, mold) result(r)
+         !! Python 3 round(x) with no ndigits: banker's rounding to the nearest integer
          real(kind=dp), intent(in) :: x
          integer, intent(in), optional :: mold
          integer(kind=int64) :: wide
@@ -17408,6 +18571,8 @@ contains
       end function py_round_int32
 
       pure elemental function py_ipow_i32(a, b) result(r)
+         !! a ** b of integers, stopping for b < 0 (Python's int ** negative int is a float; numpy
+         !! raises) (generic: py_ipow_i32, py_ipow_i64)
          ! Python's int ** int, for an exponent of unknown sign: a negative
          ! one gives a float in Python (numpy raises), Fortran's 0 here.
          integer, intent(in) :: a, b
@@ -17417,6 +18582,8 @@ contains
       end function py_ipow_i32
 
       pure elemental function py_ipow_i64(a, b) result(r)
+         !! a ** b of integers, stopping for b < 0 (Python's int ** negative int is a float; numpy
+         !! raises) (generic: py_ipow_i32, py_ipow_i64)
          use, intrinsic :: iso_fortran_env, only: int64
          integer(kind=int64), intent(in) :: a, b
          integer(kind=int64) :: r
@@ -17425,6 +18592,7 @@ contains
       end function py_ipow_i64
 
       pure elemental function py_round_int64(x, mold) result(r)
+         !! Python 3 round(x) with no ndigits: banker's rounding to the nearest integer
          use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
          real(kind=dp), intent(in) :: x
          integer(kind=int64), intent(in) :: mold
@@ -17447,6 +18615,7 @@ contains
       end function py_round_int64
 
       pure elemental function csign_complex(x) result(s)
+         !! np.sign() for complex input: x / abs(x), 0 at the origin
          ! Fortran's SIGN intrinsic doesn't accept complex operands at
          ! all, so a literal `sign(1.0_dp, x)` translation of np.sign on
          ! a complex-typed value isn't valid Fortran. Adapted from
@@ -17474,6 +18643,7 @@ contains
       end function py_rshift
 
       pure elemental integer function floor_div_int(x, y) result(q)
+         !! Python-style integer floor division (x // y, floors toward negative infinity)
          ! Python // floors toward negative infinity; Fortran's own
          ! integer "/" truncates toward zero instead, giving the wrong
          ! answer whenever x and y have opposite signs and don't divide
@@ -17486,6 +18656,7 @@ contains
       end function floor_div_int
 
       pure elemental function log1p(x) result(y)
+         !! log(1 + x), full precision for small abs(x) via the C library's own log1p()
          ! A literal log(1.0_dp + x) suffers the same catastrophic
          ! cancellation as the naive expm1 formula above, for the same
          ! reason (forming 1 + x first discards x's own low-order bits
@@ -17503,6 +18674,7 @@ contains
       end function log1p
 
       pure elemental function expm1(x) result(y)
+         !! exp(x) - 1, full precision for small abs(x) via the C library's own expm1()
          ! A literal exp(x) - 1.0_dp loses most significant digits to
          ! catastrophic cancellation once x is small (confirmed against
          ! Python's own math.expm1: at x = 1e-12 the naive formula is
@@ -17524,6 +18696,7 @@ contains
       end function expm1
 
       pure elemental function math_remainder(x, y) result(r)
+         !! Python 3 math.remainder(x, y): IEEE 754 remainder, x - round(x/y)*y with ties to even
          ! math.remainder is the IEEE 754 remainder (x - n*y where n =
          ! round(x/y), ties to even) -- distinct from x % y (floors) and
          ! Fortran's own MOD (truncates). Built on the same round-half-
@@ -17543,6 +18716,7 @@ contains
       end function math_remainder
 
       pure elemental function expm1_complex(x) result(y)
+         !! np.expm1 for complex input: exp(x) - 1, precise for small abs(real(x))
          ! np.expm1/cmath-style expm1 on a complex argument. Uses the
          ! standard complex identity exp(a+bi) - 1 = (exp(a)*cos(b) - 1)
          ! + i*exp(a)*sin(b), with exp(a)*cos(b) - 1 rewritten via the
@@ -17560,12 +18734,16 @@ contains
       end function expm1_complex
 
       pure elemental function log1p_complex(x) result(y)
+         !! np.log1p for complex input: log(1 + x)
          complex(kind=dp), intent(in) :: x
          complex(kind=dp) :: y
          y = log(cmplx(1.0_dp, 0.0_dp, kind=dp) + x)
       end function log1p_complex
 
       pure function complex_amin(arr) result(m)
+         !! np.amin/np.min on a complex array: numpy orders complex values lexicographically (real
+         !! part first, then imaginary part as a tiebreak), which MINVAL can't do since it rejects
+         !! complex operands entirely
          complex(kind=dp), intent(in) :: arr(:)
          complex(kind=dp) :: m
          complex(kind=dp) :: a
@@ -17581,6 +18759,9 @@ contains
       end function complex_amin
 
       pure function complex_amax(arr) result(m)
+         !! np.amax/np.max on a complex array: numpy orders complex values lexicographically (real
+         !! part first, then imaginary part as a tiebreak), which MAXVAL can't do since it rejects
+         !! complex operands entirely
          ! Adapted from pyccel's own amax_4/amax_8
          ! (pyccel/stdlib/math/pyc_math_f90.F90, MIT licensed).
          complex(kind=dp), intent(in) :: arr(:)
@@ -18531,6 +19712,8 @@ GO TO 1001
 END SUBROUTINE dcmqr2
 
       pure function where_pair_2d(rows, cols) result(idx)
+         !! pair 0-based row and column index vectors (a length-1 one broadcast) as a 2 x n index
+         !! array
          integer, intent(in) :: rows(:), cols(:)
          integer, allocatable :: idx(:,:)
          integer :: n, k
@@ -18551,6 +19734,8 @@ END SUBROUTINE dcmqr2
       end function where_pair_2d
 
       pure function where_indices_2d(mask) result(idx)
+         !! np.argwhere of a logical matrix: the 0-based (row, column) of each true element, in C
+         !! order
          logical, intent(in) :: mask(:,:)
          integer :: idx(2,count(mask))
          integer :: i, j, k
@@ -18565,6 +19750,8 @@ END SUBROUTINE dcmqr2
       end function where_indices_2d
 
       pure function where_axis_2d(mask, axis) result(idx)
+         !! np.nonzero(mask)[axis] of a logical matrix: 0-based row (axis 0) or column (axis 1)
+         !! indices of the true elements, in C order
          logical, intent(in) :: mask(:,:)
          integer, intent(in) :: axis
          integer :: idx(count(mask))
@@ -18584,6 +19771,8 @@ END SUBROUTINE dcmqr2
       end function where_axis_2d
 
       pure function gather_where2d_real(a, idx) result(values)
+         !! (generic: gather_where2d_real, gather_where2d_int, gather_where2d_complex,
+         !! gather_where2d_logical)
          real(kind=dp), intent(in) :: a(:,:)
          integer, intent(in) :: idx(:,:)
          real(kind=dp) :: values(size(idx,2))
@@ -18594,6 +19783,8 @@ END SUBROUTINE dcmqr2
       end function gather_where2d_real
 
       pure function gather_where2d_int(a, idx) result(values)
+         !! (generic: gather_where2d_real, gather_where2d_int, gather_where2d_complex,
+         !! gather_where2d_logical)
          integer, intent(in) :: a(:,:)
          integer, intent(in) :: idx(:,:)
          integer :: values(size(idx,2))
@@ -18604,6 +19795,8 @@ END SUBROUTINE dcmqr2
       end function gather_where2d_int
 
       pure function gather_where2d_complex(a, idx) result(values)
+         !! (generic: gather_where2d_real, gather_where2d_int, gather_where2d_complex,
+         !! gather_where2d_logical)
          complex(kind=dp), intent(in) :: a(:,:)
          integer, intent(in) :: idx(:,:)
          complex(kind=dp) :: values(size(idx,2))
@@ -18614,6 +19807,8 @@ END SUBROUTINE dcmqr2
       end function gather_where2d_complex
 
       pure function gather_where2d_logical(a, idx) result(values)
+         !! (generic: gather_where2d_real, gather_where2d_int, gather_where2d_complex,
+         !! gather_where2d_logical)
          logical, intent(in) :: a(:,:)
          integer, intent(in) :: idx(:,:)
          logical :: values(size(idx,2))
@@ -18624,6 +19819,7 @@ END SUBROUTINE dcmqr2
       end function gather_where2d_logical
 
       pure function lexsort_keys_int(keys, reverse_keys) result(idx)
+         !! (generic: lexsort_keys_int, lexsort_keys_real, lexsort_packed_int, lexsort_packed_real)
          integer, intent(in) :: keys(:,:)
          logical, optional, intent(in) :: reverse_keys
          integer, allocatable :: idx(:), work(:)
@@ -18695,6 +19891,7 @@ END SUBROUTINE dcmqr2
       end function lexsort_keys_int
 
       pure function lexsort_keys_real(keys, reverse_keys) result(idx)
+         !! (generic: lexsort_keys_int, lexsort_keys_real, lexsort_packed_int, lexsort_packed_real)
          use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
          real(dp), intent(in) :: keys(:,:)
          logical, optional, intent(in) :: reverse_keys
@@ -18775,6 +19972,7 @@ END SUBROUTINE dcmqr2
       end function lexsort_keys_real
 
       pure function lexsort_packed_int(values, lengths) result(idx)
+         !! (generic: lexsort_keys_int, lexsort_keys_real, lexsort_packed_int, lexsort_packed_real)
          integer, intent(in) :: values(:)
          integer, intent(in) :: lengths(:)
          integer, allocatable :: idx(:)
@@ -18787,6 +19985,7 @@ END SUBROUTINE dcmqr2
       end function lexsort_packed_int
 
       pure function lexsort_packed_real(values, lengths) result(idx)
+         !! (generic: lexsort_keys_int, lexsort_keys_real, lexsort_packed_int, lexsort_packed_real)
          real(dp), intent(in) :: values(:)
          integer, intent(in) :: lengths(:)
          integer, allocatable :: idx(:)

@@ -544,6 +544,14 @@ Important caveats:
 - `xsummarize_xp2f_progress.py`: summarizes progress from `burkardt_python_results*.txt` files.
 - `tests/`: focused tests for the Python-to-Fortran tooling.
 
+## Fortran helper API documentation
+
+The comments in `python.f90` and the generated `numpy_fortran.f90` support
+[FORD](https://forddocs.readthedocs.io/en/stable/). Build the runtime and
+standalone-library references with `python xbuild_fortran_docs.py` and
+`python xbuild_fortran_docs.py --library`. See [the documentation build guide](docs/ford/README.md)
+for installation, output locations and comment conventions.
+
 ## Third-Party Code
 
 Some Fortran sources in this repository come from other projects, kept with

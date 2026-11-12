@@ -42,6 +42,7 @@ import argparse
 import re
 import subprocess
 import sys
+import textwrap
 from collections import defaultdict
 from pathlib import Path
 
@@ -154,6 +155,64 @@ def tag_field(tag: str, key: str) -> str | None:
     if not m:
         return None
     return m.group(2) if m.group(2) is not None else m.group(1)
+
+
+def add_ford_api_summaries(src: str) -> str:
+    """Seed missing FORD summaries from API metadata, keeping authored docs.
+
+    Generic descriptions also document their specifics. Comments follow the
+    complete (possibly continued) declaration so extraction preserves them.
+    This does not infer argument semantics or convert implementation comments.
+    """
+    lines, _, _, types, ifaces, tags, procs, _ = parse(src)
+    descriptions = {}
+    for name, tag in tags.items():
+        desc = tag_field(tag, "desc")
+        if desc:
+            descriptions[name] = desc
+    for name, (_, specifics) in ifaces.items():
+        if name in descriptions:
+            for specific in specifics:
+                descriptions.setdefault(specific, descriptions[name])
+    starts = {body[0]: (name, body) for name, body in procs.items()}
+    starts.update({body[0]: (name, body) for name, (body, _) in ifaces.items()})
+    starts.update({body[0]: (name, body) for name, body in types.items()})
+    insertions = {}
+    for i, line in enumerate(lines):
+        if line not in starts:
+            continue
+        name, body = starts[line]
+        if name not in descriptions:
+            continue
+        end = i
+        while strip_comment(lines[end]).rstrip().endswith("&"):
+            end += 1
+        # Respect both inline/following !! and preceding !> documentation.
+        following = []
+        for item in lines[end + 1:]:
+            if item.strip() and not item.lstrip().startswith("!"):
+                break
+            following.append(item)
+        preceding = []
+        for item in reversed(lines[:i]):
+            if item.strip() and not item.lstrip().startswith("!"):
+                break
+            preceding.append(item)
+        if (any("!!" in item for item in lines[i:end + 1])
+                or any(item.lstrip().startswith(("!!", "!*")) for item in following)
+                or any(item.lstrip().startswith(("!>", "!|")) for item in preceding)):
+            continue
+        indent = re.match(r"\s*", line).group() + "   "
+        desc = descriptions[name].strip()
+        insertions[end] = textwrap.wrap(desc, width=100 - len(indent) - 3,
+                                       break_long_words=False, break_on_hyphens=False)
+    out = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        if i in insertions:
+            indent = re.match(r"\s*", lines[i]).group() + "   "
+            out.extend(indent + "!! " + text for text in insertions[i])
+    return "\n".join(out) + "\n"
 
 
 def _split_top(s: str) -> list[str]:
@@ -510,7 +569,8 @@ def main() -> int:
         return apply_topics(args.src, args.apply_topics)
     if args.fill_tags:
         return fill_tags(args.src)
-    lines, uses, decls, types, ifaces, tags, procs, order = parse(args.src.read_text(encoding="utf-8"))
+    source = add_ford_api_summaries(args.src.read_text(encoding="utf-8"))
+    lines, uses, decls, types, ifaces, tags, procs, order = parse(source)
     topics = {t for t in args.topics.split(",") if t}
     lib = {n: t for n, t in tags.items() if tag_field(t, "lib") and (not topics or tag_field(t, "lib") in topics)}
     by_topic = defaultdict(list)
@@ -563,6 +623,11 @@ def main() -> int:
          "! regenerate from python.f90. See that project's README (Third-Party Code)",
          "! for the sources and licenses of code adapted from other projects.",
          f"module {args.module}"]
+    o += ["!! Standalone numerical helpers extracted from `python.f90`.",
+          "!!", "!! Public routines are grouped by topic in ROUTINES.md. Generic interfaces",
+          "!! select the appropriate type and rank; consult each specific signature.",
+          "!! LAPACK-backed routines require the external LAPACK procedures at link time.",
+          "!! Regenerate this module rather than editing it; documentation lives in python.f90."]
     o += uses + ["implicit none", "private"]
     o += [l for names, l in decls if set(names) & need_decls]
     for n in sorted(need_types):
